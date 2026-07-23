@@ -13,12 +13,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 from zlc_data import (
+    AxisId,
     BoundFit,
     FitParameterConstraint,
     FitSpec,
+    Selection,
 )
 
 from .authority import describe_authoritative_transform
+from .data_figure import DataFigure
+from .figure import AxisViewRole, ViewIntent
 from .form import FormFieldProps, FormSpec
 
 
@@ -63,6 +67,131 @@ class FitAuthoringOption:
             raise ValueError("Fit authoring batch sizes differ from its batch axes")
         if not self.axis_summary or not self.authority_summary:
             raise ValueError("Fit authoring summaries must be non-empty")
+
+
+def fit_projection_metadata(
+    figure: DataFigure,
+    intent: ViewIntent,
+) -> tuple[tuple[AxisId, ...], tuple[tuple[AxisId, AxisViewRole], ...]]:
+    """Project one Figure's declared view roles into exact Fit axes.
+
+    Both DataFigure windows and embedded TaskConsole panels call this owner;
+    neither GUI shell is allowed to reinterpret rank, shape, X/Y, or batch
+    roles for itself.
+    """
+
+    if not isinstance(figure, DataFigure):
+        raise TypeError("fit projection requires DataFigure")
+    if not isinstance(intent, ViewIntent):
+        raise TypeError("fit projection requires ViewIntent")
+    if len(figure.document.layers) != 1:
+        raise ValueError("Fit projection requires exactly one Figure layer")
+    layer = figure.document.layers[0]
+    roles = tuple(
+        sorted(
+            (
+                (binding.axis_id, binding.role)
+                for binding in layer.view.axis_bindings
+            ),
+            key=lambda item: item[0].value,
+        )
+    )
+    if intent is ViewIntent.CURVE:
+        fit_axes = tuple(
+            axis_id for axis_id, role in roles if role is AxisViewRole.X
+        )
+    elif intent is ViewIntent.IMAGE:
+        x_axes = tuple(
+            axis_id for axis_id, role in roles if role is AxisViewRole.IMAGE_X
+        )
+        y_axes = tuple(
+            axis_id for axis_id, role in roles if role is AxisViewRole.IMAGE_Y
+        )
+        fit_axes = (*x_axes, *y_axes)
+    else:
+        fit_axes = ()
+    expected = (
+        1
+        if intent is ViewIntent.CURVE
+        else 2
+        if intent is ViewIntent.IMAGE
+        else 0
+    )
+    if len(fit_axes) != expected:
+        raise ValueError("typed figure has ambiguous fitted display axes")
+    return fit_axes, roles
+
+
+def validate_fit_authoring_options(
+    options: tuple[FitAuthoringOption, ...],
+    *,
+    fit_axis_ids: tuple[AxisId, ...],
+    axis_roles: tuple[tuple[AxisId, AxisViewRole], ...],
+    selection: Selection | None,
+    allow_prepared_transform: bool = False,
+) -> tuple[FitAuthoringOption, ...]:
+    """Keep only results that can map back onto the exact visible Figure."""
+
+    prepared_options = tuple(options)
+    if not prepared_options or any(
+        not isinstance(option, FitAuthoringOption)
+        for option in prepared_options
+    ):
+        raise ValueError("Fit preparation produced no FitAuthoringOption")
+    if any(not isinstance(axis_id, AxisId) for axis_id in fit_axis_ids):
+        raise TypeError("fit_axis_ids must contain AxisId values")
+    if any(
+        not isinstance(axis_id, AxisId)
+        or not isinstance(role, AxisViewRole)
+        for axis_id, role in axis_roles
+    ):
+        raise TypeError("axis_roles must contain AxisId/AxisViewRole pairs")
+    if selection is not None and not isinstance(selection, Selection):
+        raise TypeError("selection must be Selection or None")
+
+    role_by_axis = dict(axis_roles)
+    accepted_batch_roles = {
+        AxisViewRole.BATCH,
+        AxisViewRole.FACET,
+        AxisViewRole.SELECTED,
+        AxisViewRole.SLIDER,
+    }
+    prepared = []
+    for option in prepared_options:
+        if option.spec.fit_axis_ids != fit_axis_ids:
+            continue
+        batch_sizes = dict(option.batch_axis_sizes)
+
+        def batch_axis_is_replayable(axis_id: AxisId) -> bool:
+            role = role_by_axis.get(axis_id)
+            if role in accepted_batch_roles:
+                return True
+            return bool(
+                role is AxisViewRole.REDUCED
+                and batch_sizes[axis_id] == 1
+            )
+
+        if any(
+            not batch_axis_is_replayable(axis_id)
+            for axis_id in option.spec.batch_axis_ids
+        ):
+            continue
+        transform = option.spec.committed_transform
+        if selection is None:
+            if transform is not None and not allow_prepared_transform:
+                continue
+        else:
+            if transform is None:
+                continue
+            if tuple(transform.spec.operations) != (selection,):
+                continue
+        prepared.append(option)
+    if not prepared:
+        raise ValueError(
+            "the visible panel cannot map an authoritative Fit result without "
+            "reducing or guessing a named batch axis"
+        )
+    return tuple(prepared)
 
 
 def fit_axis_summary(bound: BoundFit) -> str:
@@ -201,5 +330,7 @@ __all__ = [
     "fit_authority_summary",
     "fit_axis_summary",
     "fit_constraint_form",
+    "fit_projection_metadata",
     "fit_spec_from_form",
+    "validate_fit_authoring_options",
 ]

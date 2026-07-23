@@ -1,0 +1,265 @@
+"""Figure-owned fit preparation and the TaskConsole's one solver lane.
+
+The Figure owns the fit request and publishes its parameters.  This module has
+no QWidget, Measurement, ROI processor, artifact window, or persistence
+authority.  Qt freezes an exact source/spec request; the worker executes the
+existing named-axis ``zlc_data`` fit; Qt may accept the immutable result only
+if the panel still shows that source revision.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+import threading
+
+from zlc_data import (
+    FitNumericPolicy,
+    FitResultBatch,
+    FitSpec,
+    OwnedSnapshot,
+    Selection,
+    bind_fit,
+    fit_model_catalog,
+    suggest_fit_draft,
+)
+from zlc_frontend import (
+    DataFigure,
+    FitAuthoringOption,
+    fit_authoring_option,
+    fit_projection_metadata,
+    validate_fit_authoring_options,
+)
+from zlc_frontend.figure import ViewIntent
+from zlc_frontend.qt_widgets import QtOwnerWake
+
+
+__all__ = [
+    "PanelFitLane",
+    "PanelFitRequest",
+    "fit_options_for_figure",
+]
+
+
+def fit_options_for_figure(
+    figure: DataFigure,
+    selection: Selection | None,
+    *,
+    seed_spec: FitSpec | None = None,
+) -> tuple[FitAuthoringOption, ...]:
+    """Bind every compatible catalog model to one exact visible Figure.
+
+    Axis roles come from the Figure's authored ViewSpec, never rank or shape.
+    ``selection`` is authoritative input intent; display zoom/relim state is
+    intentionally absent.
+    """
+
+    if not isinstance(figure, DataFigure):
+        raise TypeError("fit preparation requires DataFigure")
+    if selection is not None and not isinstance(selection, Selection):
+        raise TypeError("fit selection must be Selection or None")
+    if seed_spec is not None and not isinstance(seed_spec, FitSpec):
+        raise TypeError("seed_spec must be FitSpec or None")
+    if len(figure.document.layers) != 1 or len(figure.datasets.entries) != 1:
+        raise ValueError("Figure Fit requires exactly one dataset layer")
+    layer = figure.document.layers[0]
+    intent = layer.view.intent
+    if intent not in (ViewIntent.CURVE, ViewIntent.IMAGE):
+        raise ValueError("Fit is available only for curve and image Figures")
+
+    # The frontend owner projects X/Y/FACET/BATCH roles for every Figure host;
+    # TaskConsole does not maintain a second interpretation.
+    fit_axis_ids, axis_roles = fit_projection_metadata(figure, intent)
+    resolved = figure.datasets.resolve(layer.dataset_id)
+    schema = resolved.block.schema
+    options = []
+    for definition in fit_model_catalog():
+        constraints = (
+            seed_spec.constraints
+            if seed_spec is not None and seed_spec.model_id == definition.model_id
+            else ()
+        )
+        numeric_policy = (
+            seed_spec.numeric_policy
+            if seed_spec is not None and seed_spec.model_id == definition.model_id
+            else FitNumericPolicy()
+        )
+        try:
+            bound = suggest_fit_draft(
+                schema,
+                definition.model_id,
+                fit_axis_ids=fit_axis_ids,
+                selection=selection,
+                constraints=constraints,
+                numeric_policy=numeric_policy,
+            )
+        except (TypeError, ValueError):
+            continue
+        options.append(fit_authoring_option(bound))
+    prepared = tuple(options)
+    if not prepared:
+        raise ValueError("the Figure's declared axes admit no fit model")
+    return validate_fit_authoring_options(
+        prepared,
+        fit_axis_ids=fit_axis_ids,
+        axis_roles=axis_roles,
+        selection=selection,
+        allow_prepared_transform=True,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PanelFitRequest:
+    panel_id: str
+    request_revision: int
+    source: object
+    spec: FitSpec
+    cancelled: threading.Event = field(
+        default_factory=threading.Event,
+        compare=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        identity = str(self.panel_id).strip()
+        if not identity:
+            raise ValueError("panel_id must not be empty")
+        object.__setattr__(self, "panel_id", identity)
+        if (
+            isinstance(self.request_revision, bool)
+            or not isinstance(self.request_revision, int)
+            or self.request_revision <= 0
+        ):
+            raise ValueError("fit request_revision must be positive int")
+        snapshot = getattr(self.source, "snapshot", None)
+        if not isinstance(snapshot, OwnedSnapshot):
+            raise TypeError("panel Fit source must own an immutable snapshot")
+        if not isinstance(self.spec, FitSpec):
+            raise TypeError("panel Fit request requires FitSpec")
+        if self.spec.input_schema_fingerprint != snapshot.ref.schema_fingerprint:
+            raise ValueError("panel Fit spec belongs to another source schema")
+
+
+class PanelFitLane:
+    """One serial worker for explicit/continuous Figure fit requests.
+
+    A panel may replace its not-yet-started request with a newer source
+    revision.  Work already executing is allowed to finish; the panel's exact
+    revision check rejects it if the visible source has advanced.  This avoids
+    starvation when a camera publishes faster than a fit while never showing
+    or publishing a stale result.
+    """
+
+    def __init__(self, qt_parent, *, accept_completion) -> None:
+        if not callable(accept_completion):
+            raise TypeError("accept_completion must be callable")
+        self._accept_completion = accept_completion
+        self._pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="zlc-task-console-fit",
+        )
+        self._lock = threading.Lock()
+        self._future: Future | None = None
+        self._active: PanelFitRequest | None = None
+        self._completion = None
+        self._pending: dict[str, PanelFitRequest] = {}
+        self._closing = False
+        self._wake = QtOwnerWake(qt_parent)
+        self._wake.bind(self._owner_cycle)
+
+    @property
+    def closing(self) -> bool:
+        return self._closing
+
+    def enqueue(self, request: PanelFitRequest) -> None:
+        if not isinstance(request, PanelFitRequest):
+            raise TypeError("fit lane requires PanelFitRequest")
+        with self._lock:
+            if self._closing:
+                return
+            busy = self._future is not None or self._completion is not None
+            if busy:
+                self._pending[request.panel_id] = request
+                return
+        self._start(request)
+
+    def forget(self, panel_id: str) -> None:
+        identity = str(panel_id).strip()
+        with self._lock:
+            pending = self._pending.pop(identity, None)
+            active = self._active
+        if pending is not None:
+            pending.cancelled.set()
+        if active is not None and active.panel_id == identity:
+            active.cancelled.set()
+
+    def _start(self, request: PanelFitRequest) -> None:
+        future = self._pool.submit(self._execute, request)
+        with self._lock:
+            if self._closing:
+                request.cancelled.set()
+                return
+            if self._future is not None:
+                raise RuntimeError("Fit lane admitted overlapping work")
+            self._active = request
+            self._future = future
+        future.add_done_callback(self._finished)
+
+    @staticmethod
+    def _execute(request: PanelFitRequest):
+        snapshot = request.source.snapshot
+        try:
+            result = bind_fit(request.spec, snapshot.block.schema).run(
+                snapshot,
+                cancel_check=request.cancelled.is_set,
+            )
+        except BaseException as error:
+            return request, None, f"{type(error).__name__}: {error}"
+        if not isinstance(result, FitResultBatch):
+            return request, None, "TypeError: fit engine returned another result type"
+        return request, result, None
+
+    def _finished(self, future: Future) -> None:
+        try:
+            completion = future.result()
+        except BaseException as error:
+            completion = (None, None, f"{type(error).__name__}: {error}")
+        with self._lock:
+            if self._closing:
+                return
+            self._completion = completion
+        self._wake.request_owner_wake()
+
+    def _owner_cycle(self) -> None:
+        if self._closing:
+            return
+        with self._lock:
+            completion = self._completion
+            if completion is None:
+                return
+            self._completion = None
+            self._future = None
+            self._active = None
+        self._accept_completion(completion)
+        with self._lock:
+            if self._closing or not self._pending:
+                return
+            panel_id = next(iter(self._pending))
+            request = self._pending.pop(panel_id)
+        self._start(request)
+
+    def shutdown(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self._wake.detach()
+        with self._lock:
+            active = self._active
+            pending = tuple(self._pending.values())
+            self._pending.clear()
+            self._completion = None
+        if active is not None:
+            active.cancelled.set()
+        for request in pending:
+            request.cancelled.set()
+        self._pool.shutdown(wait=False, cancel_futures=True)

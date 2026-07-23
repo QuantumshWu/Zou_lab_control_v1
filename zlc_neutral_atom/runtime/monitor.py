@@ -43,7 +43,15 @@ class CameraMonitorInterrupted(RuntimeError):
 
 @dataclass(frozen=True)
 class CameraMonitorCapabilitySnapshot(CaptureCapabilitySnapshot):
-    """Broker-attested camera facts admitting display-only observation."""
+    """The same camera capability, with its live acquisition mode attached.
+
+    ``capability_fingerprint`` remains the fingerprint inherited from
+    :class:`CaptureCapabilitySnapshot`: capture and live observation are two
+    operations on one physical camera, not two device identities.  The mode is
+    still checked by the monitor command path, but must not mint a second
+    capability digest that a finite capture artifact cannot reconstruct from
+    the camera's persisted physical evidence.
+    """
 
     acquisition_mode: CameraAcquisitionMode
 
@@ -51,7 +59,6 @@ class CameraMonitorCapabilitySnapshot(CaptureCapabilitySnapshot):
         super().__post_init__()
         if not isinstance(self.acquisition_mode, CameraAcquisitionMode):
             raise TypeError("acquisition_mode must be CameraAcquisitionMode")
-
 
 @dataclass(frozen=True)
 class PrepareCameraMonitorCommand:
@@ -143,6 +150,18 @@ class CameraMonitorPayloadAck:
 
 
 @dataclass(frozen=True)
+class CameraMonitorNoFrameAck:
+    """A passive external-trigger poll completed without a hardware frame."""
+
+    session_id: str
+    binding_instance_id: str
+
+    def __post_init__(self) -> None:
+        canonical_text(self.session_id, "session_id")
+        canonical_text(self.binding_instance_id, "binding_instance_id")
+
+
+@dataclass(frozen=True)
 class BoundCameraMonitorPort:
     """Drive authority restricted to one continuous display-only monitor."""
 
@@ -198,6 +217,7 @@ __all__ = [
     "BoundCameraMonitorPort",
     "CameraMonitorCapabilitySnapshot",
     "CameraMonitorInterrupted",
+    "CameraMonitorNoFrameAck",
     "CameraMonitorPayloadAck",
     "CameraMonitorPreparedAck",
     "CameraMonitorStartedAck",

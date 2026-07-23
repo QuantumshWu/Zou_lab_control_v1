@@ -34,6 +34,7 @@ from zlc_data import (
     Invalid,
     OwnedSnapshot,
     MONITOR_HISTORY,
+    READOUT_EVENT,
     StreamGenerationId,
     PointLayout,
     REPEAT,
@@ -1753,11 +1754,9 @@ class MonitorDataset(Generic[PayloadT]):
             edge.validate_payload_stream(self._source)
             if self.schema.repeat_axis.size != 1:
                 raise DatasetError("append_window requires a single repeat storage row")
-            history_axis = (
-                self.schema.point_axes[0]
-                if len(self.schema.point_axes) == 1
-                else None
-            )
+            point_axes = self.schema.point_axes
+            history_axis = point_axes[0] if point_axes else None
+            event_axis = point_axes[1] if len(point_axes) == 2 else None
             history_coordinates_are_slots = (
                 history_axis is not None
                 and (
@@ -1779,15 +1778,30 @@ class MonitorDataset(Generic[PayloadT]):
             if (
                 history_axis is None
                 or history_axis.role != MONITOR_HISTORY
+                or len(point_axes) not in (1, 2)
+                or (
+                    event_axis is not None
+                    and event_axis.role != READOUT_EVENT
+                )
                 or self.schema.point_layout.mode is not AxisLayoutMode.RECT_C
+                or self.schema.point_layout.logical_shape
+                != (
+                    (history_axis.size,)
+                    if event_axis is None
+                    else (history_axis.size, event_axis.size)
+                )
                 or not history_coordinates_are_slots
             ):
                 raise DatasetError(
-                    "append_window requires one dense MONITOR_HISTORY axis with "
-                    "newest-first slot coordinates 0..history-1"
+                    "append_window requires dense MONITOR_HISTORY storage, "
+                    "optionally followed by one READOUT_EVENT axis"
                 )
+            self._append_history_capacity = history_axis.size
+            self._append_group_size = 1 if event_axis is None else event_axis.size
         else:
             edge.validate_stream(self._source)
+            self._append_history_capacity = 0
+            self._append_group_size = 0
         self.stream_id = self._source.stream_id
         self.generation = self._source.generation
         total_cells = self.schema.repeat_axis.size * self.schema.point_layout.storage_size
@@ -1809,6 +1823,14 @@ class MonitorDataset(Generic[PayloadT]):
             self._head: EventRef | None = None
             self._next_slot = 0
             self._count = 0
+            self._append_group: list[
+                tuple[
+                    Envelope[PayloadT],
+                    Value,
+                    np.ndarray | bool,
+                    object | None,
+                ]
+            ] = []
             self._append_replacement: _AppendWindowReplacement[PayloadT] | None = None
             self._aborted = False
         except BaseException:
@@ -1861,6 +1883,10 @@ class MonitorDataset(Generic[PayloadT]):
                 if self._cycle_schedule is not None:
                     raise DatasetError(
                         "prepare_append_replacement requires an append window"
+                    )
+                if self._append_group_size != 1:
+                    raise DatasetError(
+                        "append replacement does not apply to grouped readout windows"
                     )
                 if self._append_replacement is not None:
                     raise DatasetError("append replacement is already pending")
@@ -1982,7 +2008,7 @@ class MonitorDataset(Generic[PayloadT]):
                     self._validity = replacement.validity
                     self._cell_metadata = replacement.cell_metadata
                     self._event_refs = replacement.event_refs
-                    capacity = self.schema.point_layout.storage_size
+                    capacity = self._append_history_capacity
                     self._next_slot = 1 % capacity
                     self._count = 1
                     self._missed_events = 0
@@ -2016,6 +2042,56 @@ class MonitorDataset(Generic[PayloadT]):
                 )
             sequence_gap = envelope.sequence - expected_sequence
             if self._cycle_schedule is None:
+                if self._append_group_size > 1:
+                    if sequence_gap > 0 or update.missed > 0:
+                        self._append_group.clear()
+                        self._missed_events += max(update.missed, sequence_gap)
+                        self._last_sequence = envelope.sequence
+                        raise DatasetError(
+                            "grouped monitor lost an event; READOUT_EVENT phase is unknown"
+                        )
+                    self._append_group.append(
+                        (envelope, value, validity_mask, metadata)
+                    )
+                    self._last_sequence = envelope.sequence
+                    if len(self._append_group) < self._append_group_size:
+                        return self._ref_locked(self._revision)
+                    if len(self._append_group) != self._append_group_size:
+                        raise DatasetError(
+                            "grouped monitor accumulated too many readout events"
+                        )
+                    next_slot = self._next_slot
+                    for event_index, (
+                        grouped_envelope,
+                        grouped_value,
+                        grouped_validity,
+                        grouped_metadata,
+                    ) in enumerate(self._append_group):
+                        point_index = (
+                            next_slot * self._append_group_size + event_index
+                        )
+                        cell = (0, point_index)
+                        _write_cell(
+                            cell,
+                            grouped_value,
+                            grouped_validity,
+                            self._values,
+                            self._written,
+                            self._validity,
+                        )
+                        self._cell_metadata[point_index] = grouped_metadata
+                        self._event_refs[point_index] = grouped_envelope.ref
+                    self._append_group.clear()
+                    self._next_slot = (
+                        next_slot + 1
+                    ) % self._append_history_capacity
+                    self._count = min(
+                        self._count + 1,
+                        self._append_history_capacity,
+                    )
+                    self._head = envelope.ref
+                    self._revision += 1
+                    return self._ref_locked(self._revision)
                 values = self._values
                 written = self._written
                 validity = self._validity
@@ -2064,7 +2140,7 @@ class MonitorDataset(Generic[PayloadT]):
             cell_metadata[flat_cell] = metadata
             event_refs[flat_cell] = envelope.ref
             if self._cycle_schedule is None:
-                capacity = self.schema.point_layout.storage_size
+                capacity = self._append_history_capacity
                 self._next_slot = (next_slot + 1) % capacity
                 self._count = min(count + 1, capacity)
             self._missed_events = missed_events
@@ -2116,6 +2192,7 @@ class MonitorDataset(Generic[PayloadT]):
     def close(self) -> None:
         with self._lock:
             self._aborted = True
+            self._append_group.clear()
             self._append_replacement = None
         self._monitor.close()
 
@@ -2131,10 +2208,15 @@ class MonitorDataset(Generic[PayloadT]):
         return False
 
     def _append_order_locked(self) -> tuple[int, ...]:
-        capacity = self.schema.point_layout.storage_size
+        capacity = self._append_history_capacity
         used = tuple((self._next_slot - 1 - age) % capacity for age in range(self._count))
         used_set = set(used)
-        return used + tuple(slot for slot in range(capacity) if slot not in used_set)
+        slots = used + tuple(slot for slot in range(capacity) if slot not in used_set)
+        return tuple(
+            slot * self._append_group_size + event_index
+            for slot in slots
+            for event_index in range(self._append_group_size)
+        )
 
     def _clear_locked(self) -> None:
         self._values.fill(0)
@@ -2151,9 +2233,10 @@ class MonitorDataset(Generic[PayloadT]):
         current_gap = False
         if self._cycle_schedule is None:
             retained = tuple(reference for reference in event_refs if reference is not None)
+            retained = tuple(sorted(retained, key=lambda reference: reference.sequence))
             current_gap = any(
                 newer.sequence != older.sequence + 1
-                for newer, older in zip(retained, retained[1:])
+                for older, newer in zip(retained, retained[1:])
             )
         return MonitorCoverage(
             written_cells=int(np.count_nonzero(written)),

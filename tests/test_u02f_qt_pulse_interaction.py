@@ -200,11 +200,8 @@ def test_pulse_wheel_zoom_is_x_only_and_typed() -> None:
         application.processEvents()
 
 
-def test_pulse_cross_pins_and_clears_and_hover_never_snaps() -> None:
-    """Right click pins a continuous cross readout; right double-click clears
-    it.  Pointer motion must never raise and never fabricates a hover sample --
-    a pulse timeline has rows, not sampled series.
-    """
+def test_pulse_cross_pins_and_clears() -> None:
+    """Right click pins a continuous cross; right double-click clears it."""
 
     from PyQt5 import QtCore, QtGui, QtTest
 
@@ -213,10 +210,6 @@ def test_pulse_cross_pins_and_clears_and_hover_never_snaps() -> None:
     try:
         plot = _target(board).plot
         binding = board._numeric_bindings["pulse"]
-
-        QtTest.QTest.mouseMove(board, _point(plot, 0.40, 0.30))
-        application.processEvents()
-        assert binding.hover is None, "a pulse row is not a sample to snap to"
 
         position = _point(plot, 0.33, 0.61)
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=position)

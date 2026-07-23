@@ -6,6 +6,7 @@ not re-export it and therefore never loads PyQt as a side effect.
 
 from ..image_view import ImageViewportTransform
 from ..selector import (
+    CrossGesture,
     CurveInteractionIntent,
     CurveRangeGesture,
     CurveViewportCommit,
@@ -178,6 +179,7 @@ __all__ = [
     "CARD_TITLE_PX",
     "COMBO_TRI_SIZE",
     "COMBO_WIDTH",
+    "CrossGesture",
     "DIVIDER",
     "EDIT_PADDING_H",
     "ElidedLabel",

@@ -42,11 +42,7 @@ from zlc_frontend.console_state import (
     TaskConsoleState as _TaskConsoleState,
     task_files_dir as _task_files_dir,
 )
-from zlc_frontend.form import (
-    lenient_float as _safe_float,
-    python_to_text as _py_to_text,
-    text_to_python as _text_to_py,
-)
+from zlc_frontend.form import lenient_float as _safe_float
 from zlc_frontend.panel_params import panel_param_decls as _panel_param_decls
 from zlc_frontend.render_style import panel_display_size
 from .panel_types import RELIM_PARAM as _RELIM_PARAM
@@ -95,8 +91,8 @@ class PanelEditor(QtWidgets.QWidget):
     Setting popup AND do NOT duplicate it (Setting owns source / size / colormap
     / relim / unit):
 
-      * the panel's exact FINAL-artifact Fit entrance, with all fit authoring
-        delegated to the one shared :class:`DataFigure` host;
+      * another editable view of the panel's Figure-owned Fit request; the
+        same card state also backs Setting and no second window is opened;
       * manual x/y limits + Save Fig;
       * for a panel that came from a measurement, that measurement's
         AUTO-generated parameter form (the same ParamDecl form the launcher
@@ -113,7 +109,12 @@ class PanelEditor(QtWidgets.QWidget):
         self.console = console
         self.setStyleSheet("background: transparent;")
         self._board = None
-        self._candidate_board = None
+        self._snapshot_figure = None
+        self._snapshot_display = None
+        self._snapshot_size_name = None
+        self._snapshot_pixel_ratio = None
+        self._snapshot_title = None
+        self._snapshot_value_label = None
         self._follow_next_front = False
         card.front_presented.connect(self._on_card_front_presented)
         card.selectors_enabled_changed.connect(
@@ -123,10 +124,9 @@ class PanelEditor(QtWidgets.QWidget):
         # pure VIEW, and the node that produces its data lives on the Logic tab.
         self.meas_panel = None
         self._node = None                       # the node that produces this panel's data
-        self._node_widgets = {}                 # acquisition-param name -> editable field
-        self._node_now_labels = {}              # acquisition-param name -> "now: X" reference
         self.xmin = self.xmax = self.ymin = self.ymax = None
         self.clo = self.chi = None
+        self._fit_pane = None
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -143,11 +143,6 @@ class PanelEditor(QtWidgets.QWidget):
 
         def section(text):
             col.addWidget(FluentSectionLabel(text))
-
-        def labeled(text):
-            label = FluentLabel(text)
-            label.setStyleSheet("color: %s; background: transparent; border: none;" % GREY)
-            return label
 
         def inline(*widgets, trailing=None):
             host = QtWidgets.QWidget()
@@ -172,59 +167,31 @@ class PanelEditor(QtWidgets.QWidget):
         self.title_edit.editingFinished.connect(self._commit_title)
         col.addWidget(FluentSettingRow("title", self.title_edit, label_width=label_w))
 
-        # ---- Acquisition: the editable parameters of the SOURCE behind this panel,
-        # prefilled with the current value and trailed by a live "now:" reference.
-        # Apply pushes them to that source in place; it starts nothing.
-        self._node = console._producing_node(card)
-        for name, current in console._node_params(self._node):
-            if not self._node_widgets:
-                section("Acquisition")
-            edit = FluentLineEdit(_py_to_text(current))
-            edit.setMinimumWidth(scaled_px(150, minimum=120))
-            self._node_widgets[name] = edit
-            now = labeled("now: %s" % _py_to_text(current))
-            self._node_now_labels[name] = now
-            holder = QtWidgets.QWidget()
-            row = QtWidgets.QHBoxLayout(holder)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(scaled_px(6, minimum=4))
-            row.addWidget(edit, 1)
-            row.addWidget(now, 0)
-            col.addWidget(FluentSettingRow(name, holder,
-                                           label_width=scaled_px(170, minimum=140)))
-        if self._node_widgets:
-            self.node_apply_button = FluentButton("Apply", color=ACCENT)
-            self.node_apply_button.setToolTip(
-                "Apply the edited acquisition parameters to the data source in place -- "
-                "the panel keeps streaming.")
-            self.node_apply_button.clicked.connect(self._restart_node)
-            col.addWidget(self.node_apply_button)
-
-        # ---- Source: the producing node's own declarative form, when it exposes no live
-        # acquisition parameters above.  Apply rebuilds + restarts that node; it is
+        # ---- Source: the producing node's declarative form.  Figure-owned Area,
+        # Cross and Fit state never appears here as a Measurement parameter.  Apply
+        # rebuilds + restarts that node; it is
         # started and stopped from its OWN Logic-tab Edit, so no Start/Stop here.
         self._source_row = None
         self.source_form = None
-        if not self._node_widgets:
-            self._source_row = console._producing_row(card)
-            source_spec = (console._spec_for_logic(self._source_row.node)
-                           if self._source_row is not None else None)
-            if source_spec is not None:
-                section("Source: %s" % source_spec.name)
-                self.source_form = MeasurementPanel(
-                    [source_spec], single=True, controls=False,
-                    signals_provider=getattr(console, "_signal_names", None),
-                    sources_provider=getattr(console, "_signal_providers", None),
-                    formats_provider=getattr(console, "_signal_formats", None),
-                    short_names_provider=getattr(console, "_signal_short_names", None))
-                self.source_form.seed_values(self._source_row.node.values or {})
-                col.addWidget(self.source_form)
-                self.source_apply_button = FluentButton("Apply", color=ACCENT)
-                self.source_apply_button.setToolTip(
-                    "Apply these parameters to the source node (rebuild + restart it); "
-                    "the plot keeps reading its published signal.")
-                self.source_apply_button.clicked.connect(self._apply_source_form)
-                col.addWidget(self.source_apply_button)
+        self._source_row = console._producing_row(card)
+        source_spec = (console._spec_for_logic(self._source_row.node)
+                       if self._source_row is not None else None)
+        if source_spec is not None:
+            section("Source: %s" % source_spec.name)
+            self.source_form = MeasurementPanel(
+                [source_spec], single=True, controls=False,
+                signals_provider=getattr(console, "_signal_names", None),
+                sources_provider=getattr(console, "_signal_providers", None),
+                formats_provider=getattr(console, "_signal_formats", None),
+                short_names_provider=getattr(console, "_signal_short_names", None))
+            self.source_form.seed_values(self._source_row.node.values or {})
+            col.addWidget(self.source_form)
+            self.source_apply_button = FluentButton("Apply", color=ACCENT)
+            self.source_apply_button.setToolTip(
+                "Apply these parameters to the source node (rebuild + restart it); "
+                "the plot keeps reading its published signal.")
+            self.source_apply_button.clicked.connect(self._apply_source_form)
+            col.addWidget(self.source_apply_button)
 
         # ---- Parameters: the plot's own functional params, auto-discovered from the
         # kind's declarations, so a kind that gains a knob shows it with no wiring here.
@@ -318,24 +285,10 @@ class PanelEditor(QtWidgets.QWidget):
         self.canvas_holder.setContentsMargins(0, 0, 0, 0)
         col.addLayout(self.canvas_holder)
 
-        # ---- Analysis: open the Fit pane belonging to this exact frozen
-        # DataFigure.  It must not delegate to the live card, which may already
-        # have presented another immutable revision.
-        self.analysis_button = None
-        if self.card is not None and self.card.fit_analysis_sink is not None:
+        if card._fit_capable_kind():
             section("Analysis")
-            self.analysis_button = FluentButton(
-                "Analyze → Fit",
-                color=ORANGE,
-            )
-            self.analysis_button.setEnabled(False)
-            self.analysis_button.setToolTip(
-                "Fit the exact immutable snapshot shown in this Edit tab"
-            )
-            self.analysis_button.clicked.connect(
-                self._open_snapshot_analysis
-            )
-            col.addWidget(self.analysis_button)
+            self._fit_pane = card.make_fit_authoring_pane(page)
+            col.addWidget(self._fit_pane)
 
         # ---- Limits: the view-window pins.  A box holds the STORED pin (empty =
         # autoscale) and is re-seeded only on build / show / Clear, so the refresh tick
@@ -425,124 +378,88 @@ class PanelEditor(QtWidgets.QWidget):
         self.rebuild()
 
     def rebuild(self) -> None:
-        """Freeze the card's actually-presented source into its shared viewer.
+        """Copy the card's immutable front into one stable shared host.
 
-        The live card is the source of exact data/display/geometry facts.  A
-        normal DataFigure then gets an independent immutable interaction
-        session; a calibrated SiteMap copies the already-rendered physical
-        join because it cannot truthfully be retyped as a one-input Figure.
+        Edit is another view of the same Figure, not a nested DataFigureWindow
+        and not another renderer.  The card's worker remains the sole composer;
+        this host receives the exact accepted frame and forwards explicit
+        gestures back to the card-owned display state.
         """
 
-        from zlc_frontend.qt_widgets import SinglePanelHost
+        from zlc_frontend.qt_widgets import FacetedPanelHost
 
         card = self.card
-        front = (
-            None
-            if card is None or card.board is None
-            else card.board.front_frame
-        )
+        source_host = None if card is None else card.board
+        front = None if source_host is None else source_host.front_frame
         overview_png = (
             None
-            if front is not None or card is None or card.board is None
-            else getattr(card.board, "overview_png", None)
+            if source_host is None
+            else getattr(source_host, "overview_png", None)
         )
         if front is None and overview_png is None:
             self.status.setText("open the panel with data first")
             return
-        if card.config.kind == "sites" and front is not None:
-            candidate = self._candidate_board
-            self._candidate_board = None
-            if candidate is not None:
-                self._retire_snapshot_surface(candidate)
-            board = self._board
-            if not isinstance(board, SinglePanelHost):
-                self._retire_snapshot_surface(board)
-                board = SinglePanelHost(
-                    card.panel_id,
-                    empty_text="no snapshot yet",
-                )
-                board.rectangleSelected.connect(
-                    self._accept_site_rectangle
-                )
-                board.viewCommitted.connect(
-                    self._discard_site_display_commit
-                )
-                board.colorLimitsCommitted.connect(
-                    self._discard_site_display_commit
-                )
-                self._board = board
-                self.canvas_holder.addWidget(board)
-            size_name, _pixel_ratio = card.frozen_panel_geometry()
-            board.set_logical_size(
-                tuple(int(value) for value in panel_display_size(size_name))
-            )
-            board.present_frame(front)
-            board.set_selectors_enabled(card.selectors_enabled)
-            if self.analysis_button is not None:
-                self.analysis_button.setEnabled(False)
-            self.status.setText("")
-            return
-
         try:
-            figure = card.frozen_data_figure()
-            display = card.frozen_display_state()
             size_name, pixel_ratio = card.frozen_panel_geometry()
             title, value_label = card.frozen_panel_labels()
-            initial_payload = card.frozen_render_payload()
+            if card.config.kind == "sites":
+                figure = display = None
+            else:
+                figure = card.frozen_data_figure()
+                display = card.frozen_display_state()
         except Exception as error:
             self.status.setText("%s: %s" % (type(error).__name__, error))
             return
 
-        from zlc_workbench.data_figure.app import create_data_figure_pane
-        from zlc_workbench.data_figure.projection import (
-            _classify_typed_grid,
+        board = self._ensure_snapshot_surface()
+        logical_size = tuple(
+            int(value) for value in panel_display_size(size_name)
         )
+        if isinstance(board, FacetedPanelHost) and overview_png is not None:
+            regions = tuple(getattr(source_host, "overview_regions", ()) or ())
+            board.present_overview(
+                overview_png,
+                regions,
+                logical_size=logical_size,
+            )
+        elif front is not None:
+            board.present_frame(front, logical_size=logical_size)
+        else:
+            self.status.setText("the panel has no complete focused frame")
+            return
+        board.set_selectors_enabled(card.selectors_enabled)
+        self._snapshot_figure = figure
+        self._snapshot_display = display
+        self._snapshot_size_name = size_name
+        self._snapshot_pixel_ratio = pixel_ratio
+        self._snapshot_title = title
+        self._snapshot_value_label = value_label
+        self.refresh_limit_hints()
+        self.status.setText("")
 
-        local_fit = card.has_local_fit_source()
-        grid_intent, grid_panel_count, _grid_reason = (
-            _classify_typed_grid(figure)
-        )
-        is_grid_overview = (
-            grid_intent is not None and grid_panel_count is not None
-        )
-        grid_display = (
-            display if is_grid_overview else None
-        )
-        initial_display = None if grid_display is not None else display
-        candidate = create_data_figure_pane(
-            figure,
-            initial_display=initial_display,
-            initial_grid_display=grid_display,
-            local_fit=local_fit,
-            local_fit_initial_selection=(
-                card.fit_selection_candidate() if local_fit else None
-            ),
-            embedded=True,
-            surface_only=True,
-            size_name=size_name,
-            pixel_ratio=pixel_ratio,
-            presentation_title=title,
-            presentation_value_label=value_label,
-            initial_payload=(
-                None if is_grid_overview else initial_payload
-            ),
-        )
-        candidate.set_interaction_enabled(card.selectors_enabled)
-        old_candidate = self._candidate_board
-        self._candidate_board = candidate
-        if old_candidate is not None:
-            self._retire_snapshot_surface(old_candidate)
-        candidate.hide()
-        self.canvas_holder.addWidget(candidate)
-        candidate.initialReady.connect(
-            lambda pane=candidate, fit=local_fit:
-            self._accept_snapshot_surface(pane, fit)
-        )
-        candidate.initialFailed.connect(
-            lambda detail, pane=candidate:
-            self._reject_snapshot_surface(pane, detail)
-        )
-        self.status.setText("building frozen interactive snapshot…")
+    def _ensure_snapshot_surface(self):
+        """Construct the one host type this panel needs, at most once."""
+
+        from zlc_frontend.qt_widgets import FacetedPanelHost, SinglePanelHost
+
+        wanted = FacetedPanelHost if self.card.config.kind == "grid" else SinglePanelHost
+        board = self._board
+        if isinstance(board, wanted):
+            return board
+        self._retire_snapshot_surface(board)
+        board = wanted(self.card.panel_id, empty_text="no snapshot yet")
+        if isinstance(board, FacetedPanelHost):
+            board.focusRequested.connect(self._forward_grid_focus)
+            board.overviewRequested.connect(self._forward_grid_overview)
+        board.rangeSelected.connect(self._forward_range)
+        board.rectangleSelected.connect(self._forward_rectangle)
+        board.crossSelected.connect(self._forward_cross)
+        board.viewCommitted.connect(self._forward_view_commit)
+        board.colorLimitsCommitted.connect(self._forward_color_limits)
+        board.thresholdsCommitted.connect(self._forward_thresholds)
+        self._board = board
+        self.canvas_holder.addWidget(board)
+        return board
 
     def _retire_snapshot_surface(self, board) -> None:
         if board is None:
@@ -557,80 +474,41 @@ class PanelEditor(QtWidgets.QWidget):
             board.setParent(None)
             board.deleteLater()
 
-    def _accept_snapshot_surface(
-        self,
-        pane,
-        local_fit: bool,
-    ) -> None:
-        if pane is not self._candidate_board:
-            self._retire_snapshot_surface(pane)
-            return
-        presentation = pane.visible_presentation
-        if presentation is None:
-            self._reject_snapshot_surface(
-                pane,
-                "the interactive snapshot admitted no stable front",
-            )
-            return
-        old = self._board
-        self._candidate_board = None
-        self._board = pane
-        if old is not None and old is not pane:
-            self._retire_snapshot_surface(old)
-        pane.show()
-        if self.analysis_button is not None:
-            self.analysis_button.setEnabled(bool(local_fit))
-        self.refresh_limit_hints()
-        self.status.setText("")
-
-    def _reject_snapshot_surface(self, pane, detail: str) -> None:
-        if pane is not self._candidate_board:
-            return
-        self._candidate_board = None
-        self._retire_snapshot_surface(pane)
-        self.status.setText(f"snapshot failed: {detail}")
-
     def _sync_snapshot_selectors(self, enabled: bool) -> None:
-        for board in (self._board, self._candidate_board):
-            if board is None:
-                continue
-            setter = getattr(board, "set_interaction_enabled", None)
-            if setter is None:
-                setter = getattr(board, "set_selectors_enabled", None)
-            if callable(setter):
-                setter(bool(enabled))
+        if self._board is not None:
+            self._board.set_selectors_enabled(bool(enabled))
 
-    def _accept_site_rectangle(self, gesture) -> None:
-        from zlc_frontend.selector import RectangleGesture
-        from zlc_frontend.qt_widgets import SinglePanelHost
+    def _follow_card_answer(self) -> None:
+        self._follow_next_front = True
 
-        board = self._board
-        if not isinstance(board, SinglePanelHost) or not isinstance(
-            gesture,
-            RectangleGesture,
-        ):
-            return
-        if gesture.origin != board.visible_interaction_origin():
-            return
-        board.board.set_image_rectangle_candidate(
-            gesture.normalized_bounds
-        )
+    def _forward_range(self, gesture) -> None:
+        self.card.accept_range_from(self._board, gesture)
 
-    def _discard_site_display_commit(self, command) -> None:
-        origin = getattr(command, "origin", None)
-        board = self._board
-        if origin is not None and board is not None:
-            board.discard_pending_interaction(origin)
+    def _forward_rectangle(self, gesture) -> None:
+        self.card.accept_rectangle_from(self._board, gesture)
 
-    def _open_snapshot_analysis(self) -> None:
-        pane = self._board
-        opener = getattr(pane, "open_analysis", None)
-        if not callable(opener) or not opener():
-            self.status.setText(
-                "Fit is unavailable for this frozen panel projection"
-            )
-            return
-        self.status.setText("")
+    def _forward_cross(self, gesture) -> None:
+        self.card.accept_cross_from(self._board, gesture)
+
+    def _forward_view_commit(self, commit) -> None:
+        self._follow_card_answer()
+        self.card.accept_view_commit_from(self._board, commit)
+
+    def _forward_color_limits(self, commit) -> None:
+        self._follow_card_answer()
+        self.card.accept_color_limits_from(self._board, commit)
+
+    def _forward_thresholds(self, commit) -> None:
+        self._follow_card_answer()
+        self.card.accept_thresholds_from(self._board, commit)
+
+    def _forward_grid_focus(self, panel_index: int, selection) -> None:
+        self._follow_card_answer()
+        self.card._focus_grid_cell(panel_index, selection)
+
+    def _forward_grid_overview(self) -> None:
+        self._follow_card_answer()
+        self.card._return_to_grid_overview()
 
     def _on_card_front_presented(self) -> None:
         if not self._follow_next_front:
@@ -641,10 +519,11 @@ class PanelEditor(QtWidgets.QWidget):
     def teardown(self) -> None:
         """Release this tab's frozen Qt presentation surface."""
 
-        self._retire_snapshot_surface(self._candidate_board)
-        self._candidate_board = None
         self._retire_snapshot_surface(self._board)
         self._board = None
+        if self.card is not None and self._fit_pane is not None:
+            self.card.release_fit_authoring_pane(self._fit_pane)
+        self._fit_pane = None
         if self.card is not None:
             try:
                 self.card.front_presented.disconnect(self._on_card_front_presented)
@@ -736,54 +615,6 @@ class PanelEditor(QtWidgets.QWidget):
         self.card._commit_title()
         self._update_save_preview()               # default save name follows the title
 
-    def refresh_node_now_labels(self) -> None:
-        """Update the 'now: <value>' references beside each Acquisition field to the
-        source's CURRENT values.  The console calls this each tick for the visible
-        Edit tab (one general hook, not a per-field signal), so after the loop
-        applies a queued edit the references catch up on their own -- no manual
-        wiring per parameter, and the frozen snapshot / Refresh / Fit controls are
-        untouched."""
-        if self._node is None or not self._node_now_labels:
-            return
-        for name, current in self.console._node_params(self._node):
-            label = self._node_now_labels.get(name)
-            if label is not None:
-                label.setText(f"now: {_py_to_text(current)}")
-
-    def _restart_node(self) -> None:
-        """Apply the edited Acquisition params to the data source, routed through the
-        node's safe entry (queued + applied BETWEEN shots in the loop's own thread,
-        never a GUI-thread stop/start); Apply also STARTs an idle source so it goes
-        live.
-
-        Re-snapshot timing is the subtle part.  An IDLE node applies + publishes the
-        new-param frame SYNCHRONOUSLY (inside ``apply_acquisition_parameters``), so we
-        refresh + re-snapshot right away.  A RUNNING node only publishes the new-param
-        frame on its NEXT loop iteration, so reading the hub now would snapshot the
-        STALE pre-edit frame -- so we wait for the node's acquisition epoch to advance
-        (the first frame computed with the new params is on the hub) and re-snapshot
-        THAT, polled off the GUI critical path (no acquire from this thread)."""
-        if self._node is None:
-            return
-        new_params = {name: _text_to_py(w.text()) for name, w in self._node_widgets.items()}
-        running = bool(getattr(self._node, "running", False))
-        epoch0 = int(getattr(self._node, "acquisition_epoch", lambda: 0)())
-        try:
-            self.console._restart_node(self._node, new_params)
-        except Exception as exc:
-            self.status.setText(f"apply failed: {exc}")
-            return
-        self.refresh_node_now_labels()        # reuse the same refresh the tick uses
-        if running:
-            # queued: the loop has not yet produced a new-param frame -- defer the snapshot
-            self.status.setText("acquisition parameters queued — Monitor updates on the next frame")
-            self._await_fresh_frame(self._node, epoch0)
-        else:
-            # idle: apply published a fresh frame synchronously, so it is already here
-            self._follow_next_front = True
-            self.console.refresh_once()
-            self.status.setText("acquisition started with the new parameters")
-
     def _apply_source_form(self) -> None:
         """Apply the SOURCE node's edited parameter form (#2) to the producing node --
         rebuild + restart it (or live where it accepts), then re-snapshot."""
@@ -801,28 +632,10 @@ class PanelEditor(QtWidgets.QWidget):
         self.console.refresh_once()
         self.status.setText("source parameters applied")
 
-    def _await_fresh_frame(self, node, epoch0: int, *, _tries: int = 0) -> None:
-        """Poll (off the GUI critical path) until the running node has published its
-        FIRST frame computed with the just-queued params -- detected by its
-        ``acquisition_epoch`` advancing past ``epoch0`` -- then refresh + re-snapshot
-        the Edit panel.  Bounded so a wedged/slow node never spins forever (it falls
-        back to a refresh after the cap).  Aborts if the editor moved to another node
-        or was torn down."""
-        if self._node is not node or node is None:
-            return
-        epoch = int(getattr(node, "acquisition_epoch", lambda: epoch0 + 1)())
-        if epoch > epoch0 or _tries >= 600:    # ~600 * 25 ms = 15 s safety cap
-            self._follow_next_front = True
-            self.console.refresh_once()
-            self.refresh_node_now_labels()
-            return
-        from PyQt5 import QtCore
-        QtCore.QTimer.singleShot(25, lambda: self._await_fresh_frame(node, epoch0, _tries=_tries + 1))
-
     def refresh_on_show(self) -> None:
         """When this panel's Edit tab becomes visible, refresh anything that may have changed
         since it was last shown: re-seed the display knobs from config.params, snap the manual-limit
-        fields to current view, re-read the producing source's 'now' acquisition values, and refresh
+        fields to current view and refresh
         any embedded source form's dynamic combos (the ONE hook the tab-switch handler calls -- nothing
         special-cases PanelEditor versus LogicNodeEditor)."""
         card = self.card
@@ -846,7 +659,6 @@ class PanelEditor(QtWidgets.QWidget):
             )
         self._seed_limit_boxes()        # re-seed the pin from config.params (may have changed in Setting)
         self.refresh_limit_hints()
-        self.refresh_node_now_labels()
         hook = getattr(getattr(self, "source_form", None), "refresh_on_show", None)
         if callable(hook):
             hook()
@@ -886,26 +698,13 @@ class PanelEditor(QtWidgets.QWidget):
             rows.append(("view_ylim", self.ymin, self.ymax))
         return tuple(rows)
 
-    def _data_figure_presentation(self):
-        """Return the shared pane's exact public presentation, if applicable."""
-
-        board = self._board
-        if board is None:
-            return None
-        if not hasattr(type(board), "visible_presentation"):
-            return None
-        return board.visible_presentation
-
     def _visible_snapshot_pixels(self):
         """Return the immutable front or overview that is actually on screen."""
 
-        presentation = self._data_figure_presentation()
-        if presentation is not None:
-            return presentation.frame, presentation.overview_png
         board = self._board
         return (
             None if board is None else getattr(board, "front_frame", None),
-            None,
+            None if board is None else getattr(board, "overview_png", None),
         )
 
     def _front_view_bounds(self):
@@ -1132,7 +931,6 @@ class PanelEditor(QtWidgets.QWidget):
     def save(self) -> None:
         """Write the exact visible pixels and their exact typed data revision."""
 
-        presentation = self._data_figure_presentation()
         front, overview_png = self._visible_snapshot_pixels()
         if front is None and overview_png is None:
             self.status.setText("no snapshot to save")
@@ -1154,12 +952,8 @@ class PanelEditor(QtWidgets.QWidget):
                 self.status.setText("saved %s" % target.name)
                 self.status.setToolTip(str(stem.parent))
                 return
-            if presentation is None:
-                raise RuntimeError(
-                    "the editor has no exact typed presentation to save"
-                )
-            figure = presentation.figure
-            display = presentation.display_state
+            figure = self._snapshot_figure
+            display = self._snapshot_display
             if figure is None or display is None:
                 raise RuntimeError("the editor has no exact typed figure to save")
             figure.save_archive(
@@ -1167,17 +961,11 @@ class PanelEditor(QtWidgets.QWidget):
                 display=display,
                 metadata={
                     "panel_kind": str(self.card.config.kind),
-                    "title": str(
-                        presentation.presentation_title or ""
-                    ),
-                    "size_name": presentation.size_name,
-                    "pixel_ratio": presentation.pixel_ratio,
-                    "presentation_title": (
-                        presentation.presentation_title
-                    ),
-                    "presentation_value_label": (
-                        presentation.presentation_value_label
-                    ),
+                    "title": str(self._snapshot_title or ""),
+                    "size_name": self._snapshot_size_name,
+                    "pixel_ratio": self._snapshot_pixel_ratio,
+                    "presentation_title": self._snapshot_title,
+                    "presentation_value_label": self._snapshot_value_label,
                 },
             )
             self.console._last_save_dir = str(stem.parent)

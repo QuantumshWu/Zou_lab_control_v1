@@ -67,6 +67,7 @@ from zlc_neutral_atom.runtime.pipeline import BoundMeasurement
 from zlc_neutral_atom.runtime.monitor import (
     CameraMonitorCapabilitySnapshot,
     CameraMonitorInterrupted,
+    CameraMonitorNoFrameAck,
     CameraMonitorPayloadAck,
     CameraMonitorPreparedAck,
     CameraMonitorStartedAck,
@@ -1010,6 +1011,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         max_blocking_call_seconds: float | None = None,
         exact_external_trigger_qualification_digest: str | None = None,
         acquisition_mode: CameraAcquisitionMode = CameraAcquisitionMode.FREE_RUNNING,
+        monitor_acquisition_mode: CameraAcquisitionMode | None = None,
     ) -> None:
         super().__init__(
             camera,
@@ -1021,6 +1023,13 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             ),
             acquisition_mode=acquisition_mode,
         )
+        if monitor_acquisition_mode is None:
+            monitor_acquisition_mode = acquisition_mode
+        if not isinstance(monitor_acquisition_mode, CameraAcquisitionMode):
+            raise TypeError(
+                "monitor_acquisition_mode must be CameraAcquisitionMode"
+            )
+        self._monitor_acquisition_mode = monitor_acquisition_mode
 
     def _make_capability_snapshot(
         self,
@@ -1032,7 +1041,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             binding_stamp=binding_stamp,
             payload_contract=payload_contract,
             camera_capability_evidence=capability_evidence,
-            acquisition_mode=self._acquisition_mode,
+            acquisition_mode=self._monitor_acquisition_mode,
         )
 
     def execute_command(self, binding: BoundDevice, command: object) -> object:
@@ -1149,7 +1158,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         self,
         binding: BoundDevice,
         command: ReadCameraMonitorCommand,
-    ) -> CameraMonitorPayloadAck:
+    ) -> CameraMonitorPayloadAck | CameraMonitorNoFrameAck:
         if command.timeout_seconds > self._max_blocking_call_seconds:
             raise ValueError("camera monitor timeout exceeds the endpoint blocking bound")
         with self._lock:
@@ -1168,6 +1177,21 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             )
             with self._lock:
                 self._require_current_operation(binding, session, operation_epoch)
+                if not records:
+                    capability = self._capability_snapshot()
+                    if (
+                        not isinstance(capability, CameraMonitorCapabilitySnapshot)
+                        or capability.acquisition_mode
+                        is not CameraAcquisitionMode.EXTERNAL_TRIGGERED
+                    ):
+                        raise RuntimeError(
+                            "free-running camera monitor produced no frame before "
+                            "its hardware call deadline"
+                        )
+                    return CameraMonitorNoFrameAck(
+                        command.session_id,
+                        binding.binding_instance_id,
+                    )
                 if len(records) != 1:
                     raise RuntimeError("camera monitor returned a short read")
                 payload = self._sample(records[0], command.session_id, payload_contract)

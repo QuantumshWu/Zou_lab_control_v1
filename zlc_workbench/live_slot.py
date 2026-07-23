@@ -1,0 +1,228 @@
+"""Raw live-dataset attachment owned by one Workbench consumer.
+
+The slot carries acquisition revisions across the worker/UI ownership boundary.
+It deliberately has no selector, ROI, reduction, Fit, or render policy: those
+are Figure-owned branches over an accepted immutable front.
+"""
+
+from __future__ import annotations
+
+import threading
+from typing import Callable
+
+from zlc_frontend.figure import DatasetId
+from zlc_neutral_atom.monitor_application import (
+    CameraMonitorLiveDataset,
+    CameraMonitorViewSpec,
+)
+from zlc_neutral_atom.runtime.dataset import MonitorDataset, MonitorDatasetSnapshot
+from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
+from zlc_storage import canonical_text
+
+
+class LiveDatasetSlot:
+    """One materializer lifetime plus coalesced revision notifications."""
+
+    def __init__(
+        self,
+        spec: CapturePreviewSpec | CameraMonitorViewSpec,
+        *,
+        dataset_id: DatasetId,
+        retain_on_terminal: bool = True,
+    ) -> None:
+        if not isinstance(spec, (CapturePreviewSpec, CameraMonitorViewSpec)):
+            raise TypeError("spec must be a supported live dataset spec")
+        if not isinstance(dataset_id, DatasetId):
+            raise TypeError("dataset_id must be DatasetId")
+        if not isinstance(retain_on_terminal, bool):
+            raise TypeError("retain_on_terminal must be bool")
+        self.spec = spec
+        self.dataset_id = dataset_id
+        self._retain_on_terminal = retain_on_terminal
+        self._lock = threading.Lock()
+        self._dataset: MonitorDataset | CameraMonitorLiveDataset | None = None
+        self._run_id: str | None = None
+        self._causation_domain_id: str | None = None
+        self._listener: Callable[[], None] | None = None
+        self._listener_claimed = False
+        self._pending_change = False
+        self._failure: str | None = None
+        self._notification_failure: str | None = None
+        self._terminal = False
+        self._withdrawn = False
+        self._closed = False
+
+    @property
+    def failure(self) -> str | None:
+        with self._lock:
+            return self._failure
+
+    @property
+    def notification_failure(self) -> str | None:
+        with self._lock:
+            return self._notification_failure
+
+    @property
+    def terminal(self) -> bool:
+        with self._lock:
+            return self._terminal
+
+    @property
+    def dataset_bound(self) -> bool:
+        with self._lock:
+            return not self._closed and self._dataset is not None
+
+    @property
+    def withdrawn(self) -> bool:
+        with self._lock:
+            return self._withdrawn
+
+    def set_change_listener(self, listener: Callable[[], None]) -> None:
+        if not callable(listener):
+            raise TypeError("listener must be callable")
+        replay = False
+        with self._lock:
+            if self._listener_claimed:
+                raise RuntimeError("live slot already has a change listener")
+            if self._closed:
+                raise RuntimeError("live slot is closed")
+            self._listener_claimed = True
+            self._listener = listener
+            replay, self._pending_change = self._pending_change, False
+        if replay:
+            listener()
+
+    def bind(
+        self,
+        dataset: MonitorDataset | CameraMonitorLiveDataset,
+        *,
+        run_id: str,
+        causation_domain_id: str,
+    ) -> None:
+        expected = (
+            CameraMonitorLiveDataset
+            if isinstance(self.spec, CameraMonitorViewSpec)
+            else MonitorDataset
+        )
+        if not isinstance(dataset, expected):
+            raise TypeError(f"dataset must be {expected.__name__}")
+        run_id = canonical_text(run_id, "run_id")
+        causation_domain_id = canonical_text(
+            causation_domain_id,
+            "causation_domain_id",
+        )
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("live slot is closed")
+            if self._terminal:
+                raise RuntimeError("live slot is terminal")
+            if self._dataset is not None:
+                raise RuntimeError("live slot already owns a materializer")
+            self._dataset = dataset
+            self._run_id = run_id
+            self._causation_domain_id = causation_domain_id
+
+    def updated(self) -> None:
+        with self._lock:
+            if self._closed or self._dataset is None:
+                raise RuntimeError("live slot has no active materializer")
+            listener = self._listener
+            if listener is None:
+                self._pending_change = True
+                return
+        listener()
+
+    def notification_failed(self, message: str) -> None:
+        message = canonical_text(message, "live notification failure")
+        with self._lock:
+            if self._closed or self._dataset is None:
+                return
+            if self._failure is not None or self._notification_failure is not None:
+                return
+            self._notification_failure = message
+            listener = self._listener
+            if listener is None:
+                self._pending_change = True
+        if listener is not None:
+            try:
+                listener()
+            except BaseException:
+                pass
+
+    def freeze_current(self) -> tuple[str, str, MonitorDatasetSnapshot]:
+        with self._lock:
+            if self._closed or self._dataset is None:
+                raise RuntimeError("live slot has no active materializer")
+            dataset = self._dataset
+            run_id = self._run_id
+            causation = self._causation_domain_id
+        snapshot = (
+            dataset.materialize()
+            if isinstance(dataset, CameraMonitorLiveDataset)
+            else dataset.materialize(None)
+        )
+        with self._lock:
+            if self._closed or self._dataset is not dataset:
+                raise RuntimeError("live slot lifetime ended while freezing a snapshot")
+        assert run_id is not None and causation is not None
+        return run_id, causation, snapshot
+
+    def fail(self, message: str) -> None:
+        message = canonical_text(message, "preview failure")
+        dataset, listener = self._detach(message)
+        try:
+            if dataset is not None:
+                dataset.close()
+        finally:
+            if listener is not None:
+                try:
+                    listener()
+                except BaseException:
+                    pass
+
+    def source_terminal(self) -> None:
+        if self._retain_on_terminal:
+            with self._lock:
+                self._terminal = True
+            return
+        dataset, listener = self._detach(None, withdrawn=True)
+        try:
+            if dataset is not None:
+                dataset.close()
+        finally:
+            if listener is not None:
+                try:
+                    listener()
+                except BaseException:
+                    pass
+
+    def close(self) -> None:
+        dataset, _listener = self._detach(None, closed=True)
+        if dataset is not None:
+            dataset.close()
+
+    def _detach(
+        self,
+        failure: str | None,
+        *,
+        closed: bool = False,
+        withdrawn: bool = False,
+    ) -> tuple[MonitorDataset | CameraMonitorLiveDataset | None, Callable | None]:
+        with self._lock:
+            if closed and self._closed:
+                return None, None
+            dataset, self._dataset = self._dataset, None
+            if failure is not None:
+                self._failure = failure
+            self._terminal = True
+            self._withdrawn = self._withdrawn or withdrawn
+            self._closed = self._closed or closed
+            listener = self._listener
+            if closed:
+                self._listener = None
+            elif listener is None and not self._listener_claimed:
+                self._pending_change = True
+            return dataset, listener
+
+
+__all__ = ["LiveDatasetSlot"]

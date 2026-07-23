@@ -719,13 +719,19 @@ def _allocate_exact_capture(
         raise
 
 
-def _require_direct_capture(measurement: BoundMeasurement) -> None:
-    """Reject a hardware-timed source outside its timing coordinator."""
+def _require_passive_external_capture(measurement: BoundMeasurement) -> None:
+    """Admit an exact camera reader whose trigger owner is outside this Run.
+
+    A Camera Measurement is a pure grabber, just as it was in Main: it arms the
+    selected camera and drains the next exact frame group, while an independently
+    running hardware pulse owns trigger timing.  This compiler therefore claims
+    no sequencer and never prepares or fires one.
+    """
 
     camera_spec = decode_camera_capture_spec(measurement.capture_spec)
-    if camera_spec.mode is CameraAcquisitionMode.EXTERNAL_TRIGGERED:
+    if camera_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
         raise ValueError(
-            "external-trigger capture requires a pulse timing coordinator"
+            "passive finite Camera measurement requires an external-trigger source"
         )
 
 
@@ -734,13 +740,17 @@ def compile_pipeline(
     *,
     preview: CapturePreviewPort | None = None,
 ) -> RunPlan:
-    """Compile the one supported finite exact path into one flat RunPlan."""
+    """Compile Main's passive finite Camera path into one flat RunPlan.
+
+    This plan owns only the camera.  Independently running hardware owns the
+    trigger timing; explicit pulse-owned capture uses ``TriggeredCaptureSpec``.
+    """
 
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
     preview_spec = _admit_capture_preview(spec, preview)
     try:
-        _require_direct_capture(spec.measurement)
+        _require_passive_external_capture(spec.measurement)
     except BaseException as error:
         _notify_preview_failure(preview, error)
         raise

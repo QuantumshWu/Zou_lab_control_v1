@@ -154,10 +154,10 @@ def configured_devices(
                 "Externally triggered readout camera",
             ),
             ConfiguredDeviceRow(
-                "monitor_camera",
+                "mot_camera",
                 "camera",
-                "VirtualMonitorCamera",
-                "Free-running MOT monitor camera",
+                "VirtualCamera",
+                "MOT camera; free-running live and externally triggered finite acquisition",
             ),
         )
 

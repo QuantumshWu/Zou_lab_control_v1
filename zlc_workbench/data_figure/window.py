@@ -212,7 +212,6 @@ class DataFigureWindow(FrozenRasterWindow):
         typed_front_committed=None,
         initial_display: _TypedDisplayState | None = None,
         embedded: bool = False,
-        surface_only: bool = False,
         logical_panel_size: tuple[int, int] | None = None,
         size_name: str | None = None,
         pixel_ratio: float = 1.0,
@@ -236,10 +235,6 @@ class DataFigureWindow(FrozenRasterWindow):
             _state_intent(initial_display)
         if not isinstance(embedded, bool):
             raise TypeError("embedded must be bool")
-        if not isinstance(surface_only, bool):
-            raise TypeError("surface_only must be bool")
-        if surface_only and not embedded:
-            raise ValueError("surface_only requires embedded=True")
         if logical_panel_size is not None:
             logical_panel_size = tuple(logical_panel_size)
             if (
@@ -275,7 +270,6 @@ class DataFigureWindow(FrozenRasterWindow):
         self._typed_front_committed = typed_front_committed
         self._initial_display = initial_display
         self._embedded = embedded
-        self._surface_only = surface_only
         self._logical_panel_size = logical_panel_size
         self._size_name = size_name
         self._pixel_ratio = pixel_ratio
@@ -439,7 +433,6 @@ class DataFigureWindow(FrozenRasterWindow):
             pane.optionsReleased.connect(self._fit_option_widgets_released)
             pane.hide()
             self._fit_pane = pane
-        self._sync_surface_only_chrome()
         self._set_typed_controls_enabled(False)
         if not self._submit_future(
             initial_loader,
@@ -452,25 +445,6 @@ class DataFigureWindow(FrozenRasterWindow):
                 0,
                 lambda detail=failure: self._emit_initial_failed(detail),
             )
-
-    def _sync_surface_only_chrome(self) -> None:
-        if not self._surface_only:
-            return
-        for widget in (
-            self._mode,
-            self._status,
-            self._summary,
-            self._diagnostic,
-            self._close_button,
-            self._interaction_switch,
-            self._settings_button,
-            self._analyze_button,
-            self._overview_button,
-            self._export_button,
-        ):
-            widget.hide()
-        self._layout.setSpacing(0)
-        self._tabs.tabBar().setVisible(self._fit_analysis_is_open())
 
     def _emit_initial_ready(self) -> None:
         """Publish the one-time boundary after an actual front is admitted."""
@@ -519,7 +493,6 @@ class DataFigureWindow(FrozenRasterWindow):
             widget.hide()
         self._export_button.show()
         self._set_typed_controls_enabled(True)
-        self._sync_surface_only_chrome()
 
     @QtCore.pyqtSlot(float, float)
     def _focus_grid_region(self, x: float, y: float) -> None:
@@ -627,7 +600,6 @@ class DataFigureWindow(FrozenRasterWindow):
         self._overview_button.hide()
         self._export_button.show()
         self._set_typed_controls_enabled(True)
-        self._sync_surface_only_chrome()
 
     def keyPressEvent(self, event) -> None:
         if event.key() == QtCore.Qt.Key_Escape and self._grid_overview is not None:
@@ -1143,7 +1115,6 @@ class DataFigureWindow(FrozenRasterWindow):
         """Open the existing Fit pane without exposing its private lifecycle."""
 
         self._open_fit_analysis()
-        self._sync_surface_only_chrome()
         return self._fit_analysis_is_open()
 
     def _submit_fit_future(self, kind: str, function, *args) -> bool:
@@ -1950,14 +1921,13 @@ class DataFigureWindow(FrozenRasterWindow):
             self._overview_button.setVisible(self._grid_overview is not None)
             self._tabs.tabBar().setVisible(False)
             self._set_typed_controls_enabled(True)
-            self._sync_surface_only_chrome()
             return
         try:
             self._ensure_typed_controls(expected_state)
             edit, _setting = self._editors()
-            if not self._surface_only and self._tabs.indexOf(edit) < 0:
+            if self._tabs.indexOf(edit) < 0:
                 self._tabs.addTab(edit, "Edit")
-            self._tabs.tabBar().setVisible(not self._surface_only)
+            self._tabs.tabBar().setVisible(True)
             edit.show()
             for widget in (
                 self._interaction_switch,
@@ -1992,7 +1962,6 @@ class DataFigureWindow(FrozenRasterWindow):
                         "Analyze unavailable: grid focus is a display projection; "
                         "Fit authority requires an axis-complete source view."
                     )
-            self._sync_surface_only_chrome()
         except BaseException as error:
             self._typed_ui_faulted = True
             self._set_typed_controls_enabled(False)

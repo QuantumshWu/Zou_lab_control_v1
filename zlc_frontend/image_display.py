@@ -199,14 +199,13 @@ def image_viewport_for_display_state(
     )
     if state.revision < reference.viewport_revision:
         raise ValueError("image display revision cannot precede its viewport")
-    candidate = ImageViewportTransform(reference.axes, state.revision, expected)
     if state.revision == reference.viewport_revision:
-        if candidate != reference:
+        if expected != reference.visible_bounds:
             raise ValueError(
                 "image display coordinate views differ from viewport bounds"
             )
         return reference
-    return candidate
+    return reference._replacement_with_visible_bounds(expected, state.revision)
 
 
 def image_display_for_viewport(

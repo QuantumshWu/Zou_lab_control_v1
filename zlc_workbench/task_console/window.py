@@ -61,6 +61,7 @@ from zlc_data.console_records import (
     PanelConfig,
     UPDATE_INTERVALS,
     console_signal_key,
+    panel_signal_key,
 )
 from zlc_data.shape_text import indexed_unique_name
 from .panel_board import (
@@ -75,6 +76,7 @@ from .data_plane import ConsoleDataPlane
 from .panel_card import PanelCard
 from .panel_editor import PanelEditor
 from .render_lane import ConsoleRenderLane
+from .panel_fit import PanelFitLane
 
 
 # ====================================================================== console
@@ -89,9 +91,6 @@ class TaskConsole(QtWidgets.QWidget):
         catalog_view: object | None = None,
         run_factory=None,
         data_plane=None,
-        fit_window_factory=None,
-        local_fit_window_factory=None,
-        rectangle_selection_sink=None,
         scale: float | None = None,
         window_ratio: float = WINDOW_SCREEN_FRACTION,
         window_px: tuple[int, int] | None = None,
@@ -106,6 +105,10 @@ class TaskConsole(QtWidgets.QWidget):
         # every widget in one tick describes the same instant.
         self._data = data_plane if data_plane is not None else ConsoleDataPlane()
         self._tick_data = self._data.freeze()
+        self._signal_metadata_front = self._tick_data
+        self._signal_schema_fingerprints = self._front_schema_fingerprints(
+            self._tick_data
+        )
         # EMBEDDED mode (the figure viewer hosts a whole TaskConsole in one pane): a stripped,
         # RESIZABLE console -- no Logic tab, no whole-board Pause/Save image/Save/Load buttons (a
         # loaded static figure has nothing to acquire, freeze, or persist as a layout) -- and, crucially,
@@ -128,32 +131,6 @@ class TaskConsole(QtWidgets.QWidget):
         if run_factory is not None and not callable(run_factory):
             raise TypeError("run_factory must be callable or None")
         self._run_factory = run_factory
-        if fit_window_factory is not None and not callable(fit_window_factory):
-            raise TypeError("fit_window_factory must be callable or None")
-        self._fit_window_factory = fit_window_factory
-        if (
-            local_fit_window_factory is not None
-            and not callable(local_fit_window_factory)
-        ):
-            raise TypeError(
-                "local_fit_window_factory must be callable or None"
-            )
-        self._local_fit_window_factory = local_fit_window_factory
-        if rectangle_selection_sink is not None and not callable(
-            rectangle_selection_sink
-        ):
-            raise TypeError("rectangle_selection_sink must be callable or None")
-        self._rectangle_selection_sink = rectangle_selection_sink
-        # Accepted runtime controls are observed by the ordinary Qt tick.  The
-        # gesture callback never waits for hardware or for a derived stream to
-        # publish its first value.
-        self._rectangle_controls: dict[
-            tuple[int, int],
-            tuple[object, PanelCard, object],
-        ] = {}
-        self._latest_rectangle_control_by_card: dict[int, tuple[int, int]] = {}
-        self._analysis_window = None
-        self._analysis_source = None
         self._panel_teardown_phases: dict[int, set[str]] = {}
         # CATALOG SEAM (contract 1): the ONE capability vocabulary this window offers.
         # ``ConsoleCatalogView`` projects the domain DefinitionCatalog into addable
@@ -171,6 +148,7 @@ class TaskConsole(QtWidgets.QWidget):
         # enumerating every provider/card merely to learn that nothing changed.
         self._signal_info_dirty = True
         self._card_signal_bindings: dict[int, tuple[str, tuple[str, ...]]] = {}
+        self._card_output_names: dict[str, frozenset[str]] = {}
         # The Logic-tab nodes.  Each entry maps a LogicNodeRow -> the live state for
         # that node: its built node (None until Started) + its Edit tab.
         self.logic_nodes: list[LogicNodeRow] = []
@@ -215,6 +193,10 @@ class TaskConsole(QtWidgets.QWidget):
         self._render_lane = ConsoleRenderLane(
             self,
             accept_completion=self._accept_render_completion,
+        )
+        self._fit_lane = PanelFitLane(
+            self,
+            accept_completion=self._accept_fit_completion,
         )
 
         self._build_ui()
@@ -536,7 +518,6 @@ class TaskConsole(QtWidgets.QWidget):
         for card in self.cards:            # force every panel to redraw on its next beat
             card._render_version = -1
         self._recompute_tick_interval()    # the loaded panels' rates set the timer base
-        self._sync_fit_analysis_entries()
         self._update_summary()
 
     def _new_panel_card(self, config: PanelConfig) -> PanelCard:
@@ -549,8 +530,7 @@ class TaskConsole(QtWidgets.QWidget):
             formats_provider=self._signal_formats,
             short_names_provider=self._signal_short_names,
             axis_labels_provider=self._signal_axis_labels,
-            render_request=self._request_card_render,
-            fit_analysis_sink=self._open_panel_fit)
+            render_request=self._request_card_render)
         card.set_raster_pixel_ratio(self._raster_pixel_ratio)
         return card
 
@@ -558,8 +538,6 @@ class TaskConsole(QtWidgets.QWidget):
         card.setParent(self.board)
         card.show()
         card.changed.connect(self._mark_dirty)
-        card.changed.connect(self._sync_fit_analysis_entries)
-        card.front_presented.connect(self._sync_fit_analysis_entries)
         # ``changed`` also covers title/size/display edits.  Read only this
         # card's tiny binding delta and rebuild legends only when its signal
         # actually changed; ordinary display edits never enumerate providers.
@@ -571,11 +549,14 @@ class TaskConsole(QtWidgets.QWidget):
         card.update_interval_changed.connect(self._recompute_tick_interval)
         card.remove_requested.connect(self._remove_panel)
         card.edit_requested.connect(self._edit_card)
-        card.rectangle_selected.connect(
-            lambda gesture, current=card: self._submit_rectangle_selection(
-                current,
-                gesture,
-            )
+        card.figure_outputs_changed.connect(
+            lambda c=card: self._publish_figure_outputs(c)
+        )
+        card.fit_requested.connect(
+            lambda c=card: self._request_card_fit(c)
+        )
+        card.fit_cancel_requested.connect(
+            lambda c=card: self._fit_lane.forget(c.panel_id)
         )
         # a panel added (or loaded) while the header's "Selectors" switch is ON inherits it --
         # the guard covers construction order (state panels may attach before the header exists).
@@ -585,8 +566,63 @@ class TaskConsole(QtWidgets.QWidget):
         self.cards.append(card)
         self._card_signal_bindings[id(card)] = self._card_signal_binding(card)
         self._signal_topology_changed()
-        self._sync_fit_analysis_entries()
         self._recompute_tick_interval()        # a new panel's rate may change the timer base
+
+    def _publish_figure_outputs(self, card: PanelCard) -> None:
+        """Materialize Area/Cross outputs from the exact visible panel front."""
+
+        if card not in self.cards:
+            return
+        from .panel_outputs import (
+            materialize_area_outputs,
+            materialize_cross_outputs,
+            materialize_fit_outputs,
+        )
+
+        source, area, cross, fit_result = card.frozen_figure_output_state()
+        outputs = {}
+        failures = []
+        if source is not None and area is not None:
+            try:
+                outputs.update(
+                    materialize_area_outputs(card.panel_id, source, area)
+                )
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                failures.append(f"Area: {error}")
+        if source is not None and cross is not None:
+            point, axes = cross
+            try:
+                outputs.update(
+                    materialize_cross_outputs(
+                        card.panel_id,
+                        source,
+                        point,
+                        axes,
+                    )
+                )
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                failures.append(f"Cross: {error}")
+        if source is not None and fit_result is not None:
+            try:
+                outputs.update(
+                    materialize_fit_outputs(
+                        card.panel_id,
+                        source,
+                        fit_result,
+                    )
+                )
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                failures.append(f"Fit: {error}")
+        if outputs:
+            self._data.publish_panel(card.panel_id, outputs)
+        else:
+            self._data.withdraw_panel(card.panel_id)
+        names = frozenset(outputs)
+        if self._card_output_names.get(card.panel_id, frozenset()) != names:
+            self._card_output_names[card.panel_id] = names
+            self._signal_topology_changed()
+        if failures:
+            card.set_status("; ".join(failures), error=True)
 
     # ----------------------------------------------------------------- control
     # ---- producing-node discovery: a panel's data comes from a logic node; its Edit
@@ -608,93 +644,6 @@ class TaskConsole(QtWidgets.QWidget):
             return None
         return entry["node"]
 
-    def _submit_rectangle_selection(
-        self,
-        card: "PanelCard",
-        gesture: object,
-    ) -> None:
-        """Route one typed image rectangle through the composition seam.
-
-        ``PanelCard`` owns gesture-to-Selection conversion because it owns the
-        exact painted viewport.  This window only resolves the card's exact
-        producer instance.  The injected composition callback decides whether
-        that producer admits a runtime ROI control; no plot widget imports a
-        camera or a processor.
-        """
-
-        if card not in self.cards:
-            return
-        sink = self._rectangle_selection_sink
-        if sink is None:
-            card.set_status("rectangle is display-only for this console", error=False)
-            return
-        node = self._producing_node(card)
-        if node is None:
-            card.set_status(
-                "ROI signal needs a running Camera monitor source",
-                error=True,
-            )
-            return
-        try:
-            selection = card.selection_for_rectangle_gesture(gesture)
-            receipt = sink(node, selection)
-            ack = receipt.snapshot()
-        except Exception as error:
-            card.set_status(f"ROI control rejected: {error}", error=True)
-            return
-        revision = int(ack.revision)
-        control_key = (id(node), revision)
-        self._rectangle_controls[control_key] = (node, card, receipt)
-        self._latest_rectangle_control_by_card[id(card)] = control_key
-        card.set_status(
-            f"ROI control accepted r{revision}; applying",
-            error=False,
-        )
-
-    def _drain_rectangle_controls(self) -> None:
-        """Fold terminal ROI receipts without blocking the GUI owner."""
-
-        for control_key in tuple(sorted(self._rectangle_controls)):
-            _node, card, receipt = self._rectangle_controls[control_key]
-            revision = control_key[1]
-            try:
-                ack = receipt.snapshot()
-            except Exception as error:
-                del self._rectangle_controls[control_key]
-                if card in self.cards:
-                    card.set_status(
-                        f"ROI control observation failed: {error}",
-                        error=True,
-                    )
-                continue
-            if not bool(getattr(ack, "terminal", False)):
-                continue
-            del self._rectangle_controls[control_key]
-            if (
-                card not in self.cards
-                or self._latest_rectangle_control_by_card.get(id(card))
-                != control_key
-            ):
-                continue
-            status = getattr(getattr(ack, "status", None), "value", "")
-            if status == "APPLIED":
-                card.set_status(
-                    "ROI signal applied; roi_value updates with the next frame",
-                    error=False,
-                )
-            elif status == "SUPERSEDED":
-                successor = getattr(ack, "superseded_by", None)
-                card.set_status(
-                    f"ROI control r{revision} superseded by r{successor}",
-                    error=False,
-                )
-            else:
-                reason = str(getattr(ack, "reason", "") or status or "rejected")
-                card.set_status(
-                    f"ROI control {status or 'REJECTED'}: {reason}",
-                    error=True,
-                )
-
     def _producing_row(self, card: "PanelCard"):
         """The Logic-tab ROW whose RUNNING node produces this panel's signal (None if
         the producing node has no row -- e.g. a node passed via ``running_nodes=`` from
@@ -709,11 +658,11 @@ class TaskConsole(QtWidgets.QWidget):
         return None
 
     def _apply_source_params(self, row: "LogicNodeRow", values: dict) -> None:
-        """Apply edited SOURCE parameters (from a plot Edit's source form, #2) to the
-        producing node: live where the node accepts it (a camera's exposure/ROI), else
-        rebuild + restart the node with the new values.  Keeps the node's own Logic-tab
-        Edit form in sync so the two never diverge.  Returns False if a task lock
-        dropped the edit (so the caller does not falsely report success)."""
+        """Apply the plot Edit's source form through the normal node restart path.
+
+        Area, Cross and Fit belong to the Figure and are absent from this form;
+        there is no second live-acquisition parameter protocol behind the panel.
+        """
         if self._task_locked:
             return False
         row.node.values = dict(values)
@@ -723,25 +672,8 @@ class TaskConsole(QtWidgets.QWidget):
         node = self._logic_nodes.get(id(row))
         if node is None:
             return True                                    # not running -> values remembered for next Start
-        try:
-            live_keys = set(node.acquisition_parameters())
-        except Exception:
-            live_keys = set()
-        if any(k not in live_keys for k in values) or not live_keys:
-            self._start_logic_node(row)                   # rebuild + restart with the new values
-        elif hasattr(node, "apply_acquisition_parameters"):
-            node.apply_acquisition_parameters(**{k: v for k, v in values.items() if k in live_keys})
+        self._start_logic_node(row)
         return True
-
-    @staticmethod
-    def _node_params(node) -> list:
-        """``[(name, current_value)]`` for the editable parameters of the data
-        SOURCE behind ``node`` -- a camera's exposure/ROI, or the node's own
-        analysis settings.  The node declares them via ``acquisition_parameters()``
-        (the source decides what is tunable, not __init__ reflection)."""
-        if node is None or not hasattr(node, "acquisition_parameters"):
-            return []
-        return list(node.acquisition_parameters().items())
 
     @staticmethod
     def _node_label(node) -> str:
@@ -866,6 +798,64 @@ class TaskConsole(QtWidgets.QWidget):
                     kind=str(catalog_spec.kind),
                 )
 
+        # Figure outputs exist only after a completed Area/Cross/Fit intent.
+        # They are ordinary picker signals, but their stable producer identity
+        # is the persisted panel_id rather than its editable title.
+        from .catalog_bridge import ConsoleSignalDecl
+        from .panel_outputs import (
+            AREA_DATA_OUTPUT,
+            CROSS_X_OUTPUT,
+            CROSS_Y_OUTPUT,
+            FIT_OUTPUT_PREFIX,
+            FitParameterMetadata,
+            SelectorAxisMetadata,
+        )
+
+        for card in self.cards:
+            prefix = f"@panel/{card.panel_id}/"
+            for key in sorted(
+                name for name in published_names if name.startswith(prefix)
+            ):
+                output_name = key[len(prefix) :]
+                value = self._tick_data.value(key)
+                metadata = None if value is None else value.presentation
+                if output_name == AREA_DATA_OUTPUT:
+                    short = "Area data"
+                elif output_name.startswith("area.range."):
+                    short = (
+                        f"{metadata.name} range"
+                        if hasattr(metadata, "name")
+                        else "Area range"
+                    )
+                elif output_name in (CROSS_X_OUTPUT, CROSS_Y_OUTPUT):
+                    short = (
+                        metadata.name
+                        if isinstance(metadata, SelectorAxisMetadata)
+                        else output_name.rsplit(".", 1)[-1]
+                    )
+                elif output_name.startswith(FIT_OUTPUT_PREFIX):
+                    short = (
+                        metadata.parameter_name
+                        if isinstance(metadata, FitParameterMetadata)
+                        else output_name[len(FIT_OUTPUT_PREFIX) :]
+                    )
+                else:
+                    short = output_name
+                add(
+                    panel_signal_key(card.panel_id, output_name),
+                    state="retained-view",
+                    label=str(card.config.title or PANEL_KINDS[card.config.kind]),
+                    node=card,
+                    declaration=ConsoleSignalDecl(
+                        output_name,
+                        short,
+                        short,
+                        "" if value is None else str(value.unit or ""),
+                        "Figure-derived signal",
+                    ),
+                    kind="figure",
+                )
+
         return topology
 
     def _signal_providers(self) -> dict:
@@ -935,6 +925,53 @@ class TaskConsole(QtWidgets.QWidget):
             )
         return labels
 
+    @staticmethod
+    def _front_schema_fingerprints(front) -> dict[str, str | None]:
+        """Exact present-signal keys and their schema identities for one front."""
+
+        fingerprints: dict[str, str | None] = {}
+        for name in front.names():
+            key = str(name)
+            value = front.value(key)
+            schema = None if value is None else value.schema
+            fingerprint = None if schema is None else schema.fingerprint
+            fingerprints[key] = (
+                None if fingerprint is None else str(fingerprint)
+            )
+        return fingerprints
+
+    def _promote_data_front(self, front) -> set[str]:
+        """Promote one immutable front and reconcile only metadata transitions.
+
+        Ordinary revisions with an unchanged schema do no Qt metadata work.
+        Presence changes and schema-fingerprint changes update the affected
+        Logic legend plus any Setting picker that is currently visible, without
+        invoking the topology owner or rebuilding a picker model.
+        """
+
+        self._tick_data = front
+        if front is self._signal_metadata_front:
+            return set()
+        previous = self._signal_schema_fingerprints
+        current = self._front_schema_fingerprints(front)
+        self._signal_metadata_front = front
+        self._signal_schema_fingerprints = current
+        changed = {
+            key
+            for key in set(previous).union(current)
+            if previous.get(key) != current.get(key)
+            or (key in previous) != (key in current)
+        }
+        if not changed:
+            return set()
+
+        for row in self.logic_nodes:
+            if changed.intersection(self._declared_signal_keys(row)):
+                self._update_row_publishes(row)
+        for card in self.cards:
+            card.reconcile_visible_signal_metadata()
+        return changed
+
     def _live_node_formats(self, node) -> list[tuple[str, str, str]]:
         """``[(name, shape, description)]`` for a RUNNING node -- one ROW per output, each
         shape read off a real value via ``shape_text.describe_shape`` (auto, never hand-typed)
@@ -972,7 +1009,8 @@ class TaskConsole(QtWidgets.QWidget):
         never a hand-typed map.  Running node: live data-plane shapes (measurement /
         processor).  A task lists its declared FINAL artifact names at every
         lifecycle state; those names never pretend to be live data-plane signals.
-        Stopped data-plane node: the NAMES it will publish (shape ``—`` until it runs)."""
+        A stopped data-plane node keeps the exact schema of any retained view or
+        FINAL value; only an output that has never published is shown as ``—``."""
         if row.node.kind == "task":
             spec = self._spec_for_logic(row.node)
             outputs = getattr(spec, "declared_outputs", ()) or ()
@@ -986,14 +1024,22 @@ class TaskConsole(QtWidgets.QWidget):
             return
         spec = self._spec_for_logic(row.node)
         outputs = tuple(getattr(spec, "declared_outputs", ()) or ())
+        keys = tuple(self._declared_signal_keys(row))
         row.set_publishes(
             [
                 (
                     str(output.short or output.name),
-                    "—",
+                    (
+                        "—"
+                        if (value := self._tick_data.value(key)) is None
+                        else self._describe_from_schema(
+                            value.values,
+                            value.schema,
+                        )
+                    ),
                     str(output.description or output.axis_label),
                 )
-                for output in outputs
+                for key, output in zip(keys, outputs, strict=True)
             ]
         )
 
@@ -1198,28 +1244,6 @@ class TaskConsole(QtWidgets.QWidget):
             card.set_signal_info("\n".join(parts))
         self._signal_info_dirty = False
 
-    def _restart_node(self, node, new_params: dict):
-        """Apply edited acquisition parameters to the producing node so the
-        Monitor re-acquires under them.  This goes through the node's SAFE entry
-        ``apply_acquisition_parameters``: while the acquisition loop runs it owns
-        the source, so the edit is queued and the loop applies it BETWEEN shots
-        (the source re-arms in its owner thread -- a streaming camera picks up the
-        new ROI/exposure -- with no GUI-thread stall and no second ``acquire()``
-        racing on one camera; an in-place reconfigure of a running stream would be
-        ignored, while stopping/starting the thread from here would block the GUI
-        and could deadlock).  An idle node is reconfigured and stepped once.
-        Returns the node.  Raises if the node has no editable acquisition params."""
-        if node is None or not hasattr(node, "apply_acquisition_parameters"):
-            raise RuntimeError("this panel's data source exposes no editable acquisition parameters")
-        node.apply_acquisition_parameters(**new_params)
-        # Edit's Apply makes the source LIVE: if its acquisition loop is not
-        # running (a fresh node, or one the user stopped), start it so the Monitor
-        # streams under the new params.  start() is idempotent, so a node that is
-        # already running just keeps its loop (the edit was queued above).
-        if not getattr(node, "running", False):
-            self._begin_run(node)
-        return node
-
     def _begin_run(self, node) -> None:
         """Start one ConsoleRunNode and register it as running.
 
@@ -1232,7 +1256,6 @@ class TaskConsole(QtWidgets.QWidget):
         """
 
         node.start()
-        self._sync_fit_analysis_entries()
         if node not in self.running_nodes:
             self.running_nodes.append(node)
 
@@ -1526,13 +1549,9 @@ class TaskConsole(QtWidgets.QWidget):
             phases.add("shutdown")
         if "removed" not in phases:
             self.cards.remove(card)
-            self._latest_rectangle_control_by_card.pop(id(card), None)
-            self._rectangle_controls = {
-                revision: pending
-                for revision, pending in self._rectangle_controls.items()
-                if pending[1] is not card
-            }
             self._card_signal_bindings.pop(id(card), None)
+            self._data.withdraw_panel(card.panel_id)
+            self._card_output_names.pop(card.panel_id, None)
             self._signal_topology_changed()
             phases.add("removed")
         if "qt_detached" not in phases:
@@ -1546,7 +1565,6 @@ class TaskConsole(QtWidgets.QWidget):
             phases.add("arranged")
         phases.add("detached")
         self._panel_teardown_phases.pop(id(card), None)
-        self._sync_fit_analysis_entries()
         return True
 
     # ====================================================================== logic nodes
@@ -1594,7 +1612,6 @@ class TaskConsole(QtWidgets.QWidget):
         self._signal_topology_changed()
         self.logic_hint.hide()
         self._update_row_publishes(row)                       # show its outputs + shapes up front
-        self._sync_fit_analysis_entries()
         if focus and hasattr(self.tabs, "setCurrentWidget"):
             self._edit_logic_node(row)
         return row
@@ -1603,156 +1620,6 @@ class TaskConsole(QtWidgets.QWidget):
         row = self._attach_logic_node(node, focus=focus)
         self._mark_dirty()
         return row
-
-    # -------------------------------------------------------------- analysis
-    def _fit_source_for_card(self, card: "PanelCard"):
-        """Resolve one card binding to exactly one durable Capture/Scan result.
-
-        A card stores only declared dataset names, so two logic rows declaring
-        the same name are ambiguous and must not be guessed.  With exactly one
-        matching row, its successful Run result is the authority.  A display
-        selection remains only a candidate until the operator clicks Analyze.
-        """
-
-        if self._fit_window_factory is None:
-            return None
-        if card.config.kind in ("sites", "grid"):
-            return None
-        reads = self._card_reads(card)
-        if not reads:
-            return None
-        matched_nodes = []
-        for row in self.logic_nodes:
-            spec = self._spec_for_logic(row.node)
-            if spec is None:
-                continue
-            outputs = set(self._declared_signal_keys(row))
-            if reads.isdisjoint(outputs):
-                continue
-            matched_nodes.append(self._last_node.get(id(row)))
-        if len(matched_nodes) != 1:
-            return None
-        node = matched_nodes[0]
-        if node is None:
-            return None
-        handle = getattr(node, "handle", None)
-        run_id_value = getattr(handle, "run_id", None)
-        run_id = getattr(run_id_value, "value", run_id_value)
-        if card.visible_run_id() != run_id:
-            return None
-        from zlc_neutral_atom.artifacts import CaptureArtifactRef
-        from zlc_neutral_atom.scan import ScanArtifactRef
-
-        result = node.final_result
-        return (
-            result
-            if isinstance(result, (CaptureArtifactRef, ScanArtifactRef))
-            else None
-        )
-
-    def _sync_fit_analysis_entries(self, *_args) -> None:
-        """Project current exact-source availability onto every card button."""
-
-        for card in tuple(self.cards):
-            durable = self._fit_source_for_card(card) is not None
-            local = (
-                self._local_fit_window_factory is not None
-                and card.has_local_fit_source()
-            )
-            card.set_fit_analysis_available(
-                durable or local
-            )
-
-    def _open_panel_fit(self, card: "PanelCard") -> None:
-        """Open the sole Fit host for the card's exact accepted source."""
-
-        source = self._fit_source_for_card(card)
-        selection = card.fit_selection_candidate()
-        figure = None
-        if source is None and self._local_fit_window_factory is not None:
-            try:
-                figure = card.frozen_data_figure()
-            except (TypeError, ValueError, RuntimeError) as error:
-                card.set_fit_analysis_available(False)
-                card.set_status(str(error), error=True)
-                return
-        if source is None and figure is None:
-            card.set_fit_analysis_available(False)
-            card.set_status(
-                "Fit requires one current frozen panel or durable Capture/Scan",
-                error=True,
-            )
-            return
-        if source is not None:
-            analysis_source = ("artifact", source, selection)
-        else:
-            analysis_source = (
-                "panel",
-                figure.document.document_id,
-                figure.document.revision,
-                tuple(
-                    (entry.dataset_id, entry.snapshot.ref)
-                    for entry in figure.datasets.entries
-                ),
-                selection,
-            )
-        current = self._analysis_window
-        if (
-            current is not None
-            and self._analysis_source == analysis_source
-            and not bool(getattr(current, "closed", False))
-        ):
-            restore = getattr(current, "restore_window", None)
-            if callable(restore):
-                restore()
-            else:
-                current.show()
-                current.raise_()
-                current.activateWindow()
-            return
-        if source is not None:
-            factory = self._fit_window_factory
-            if factory is None:
-                raise RuntimeError(
-                    "this TaskConsole has no durable Fit window capability"
-                )
-            if selection is None:
-                window = factory(source)
-            else:
-                from zlc_data import DataTransformSpec, commit_transform
-
-                figure = card.frozen_data_figure()
-                layer = figure.document.layers[0]
-                schema = figure.datasets.resolve(layer.dataset_id).block.schema
-                transform = commit_transform(
-                    schema,
-                    DataTransformSpec((selection,)),
-                )
-                window = factory(
-                    source,
-                    committed_transform=transform,
-                )
-            status = "opened exact Fit Analysis for the durable Capture/Scan"
-        else:
-            factory = self._local_fit_window_factory
-            if factory is None:
-                raise RuntimeError(
-                    "this TaskConsole has no local Fit window capability"
-                )
-            window = factory(
-                figure,
-                initial_selection=selection,
-                archive_metadata={
-                    "panel_kind": str(card.config.kind),
-                    "panel_title": str(card.config.title),
-                    "signal": str(card.config.signal),
-                },
-                open_analysis=True,
-            )
-            status = "opened exact Fit Analysis for the frozen panel"
-        self._analysis_window = window
-        self._analysis_source = analysis_source
-        card.set_status(status, error=False)
 
     def _edit_logic_node(self, row: "LogicNodeRow") -> None:
         """Open (or focus) a logic node's OWN closable Edit tab (param form + Start/Stop)."""
@@ -1797,12 +1664,6 @@ class TaskConsole(QtWidgets.QWidget):
                 editor.set_running(still_running)
                 editor.set_status(status, error=True)
             return
-        if editor is not None:
-            # The form's collect_values returns only its DECLARED widgets, so a stored value the form
-            # does not own (a drag-set ROI ``selection`` is DATA, not a form field) would be dropped on
-            # an Edit-triggered restart.  Preserve those: form values WIN for keys it owns, stored fills
-            # the rest -- the same "don't lose a param the UI can't show" rule the retarget seam relies on.
-            values = {**dict(row.node.values or {}), **values}
         # Build the replacement before stopping the current run.  Invalid form
         # values therefore cannot destroy a valid running node.
         try:
@@ -1853,7 +1714,6 @@ class TaskConsole(QtWidgets.QWidget):
         self._logic_nodes[id(row)] = node
         self._last_node[id(row)] = node           # survives Stop, for signal-source labelling
         self._signal_topology_changed()
-        self._sync_fit_analysis_entries()         # a new generation revoked the previous FINAL ref
         row.set_state("running", status="running")
         self._update_row_publishes(row)            # now show the LIVE node's published shapes
         if editor is not None:
@@ -1861,11 +1721,54 @@ class TaskConsole(QtWidgets.QWidget):
             editor.set_status("running", error=False)
         self.status_dot.set_color(GREEN)
         self._mark_dirty()
+        self._ensure_default_result_panel(row)
         # A TASK (one-shot orchestration) takes over the console while it runs.
         # Status is honest lifecycle text; live plots appear only when a task
         # exposes a formal monitor dataset through the ordinary data plane.
         if self._declared_layer(node) == "task":
             self._set_task_running(row)
+
+    def _ensure_default_result_panel(self, row: "LogicNodeRow") -> None:
+        """Open a task's ordinary declared result panel exactly once.
+
+        The catalog chooses only an output and an existing plot kind.  This
+        creates no task-specific viewer and does not publish data: the panel
+        waits for the task's normal FINAL projection on the data plane.
+        """
+
+        spec = self._spec_for_logic(row.node)
+        default = None if spec is None else getattr(spec, "default_panel", None)
+        if default is None:
+            return
+        output_name, kind = default
+        key = console_signal_key(row.node.title, output_name)
+        if any(card.config.signal == key for card in self.cards):
+            return
+        declaration = next(
+            (
+                item
+                for item in tuple(spec.declared_outputs)
+                if item.name == output_name
+            ),
+            None,
+        )
+        if declaration is None:
+            raise RuntimeError(
+                f"default panel output {output_name!r} is not declared"
+            )
+        card = self._new_panel_card(
+            PanelConfig(
+                kind=kind,
+                title=str(declaration.short or declaration.name),
+                row=GAP,
+                col=GAP,
+                size="2x2",
+                signal=key,
+            )
+        )
+        self._attach_card(card)
+        self._arrange()
+        self._mark_dirty()
 
     @staticmethod
     def _declared_layer(node) -> str:
@@ -1999,15 +1902,44 @@ class TaskConsole(QtWidgets.QWidget):
                 card.present()
         return reset
 
+    def _request_card_fit(self, card: PanelCard) -> None:
+        """Freeze one active Figure fit and hand it to the solver owner."""
+
+        if card not in self.cards or self._fit_lane.closing:
+            return
+        request = card.freeze_fit_request()
+        if request is not None:
+            self._fit_lane.enqueue(request)
+
+    def _accept_fit_completion(self, completion: object) -> None:
+        """Route one immutable fit result back to its exact panel/source."""
+
+        request, result, error = completion
+        if request is None:
+            self.status_strip.show_message(
+                f"Fit failed: {error}",
+                severity="error",
+            )
+            return
+        card = next(
+            (item for item in self.cards if item.panel_id == request.panel_id),
+            None,
+        )
+        if card is None:
+            return
+        card.accept_fit_completion(request, result, error)
+
     def _forget_card_render(self, card: PanelCard) -> None:
         """Revoke queued results without waiting for immutable worker work."""
 
         card._render_request_revision += 1
         card._requested_signature = None
         self._render_lane.forget(card.panel_id)
+        self._fit_lane.forget(card.panel_id)
 
     def _shutdown_render_lane(self) -> None:
         self._render_lane.shutdown()
+        self._fit_lane.shutdown()
 
     def _stop_logic_node(
         self,
@@ -2079,7 +2011,6 @@ class TaskConsole(QtWidgets.QWidget):
         row.deleteLater()
         if not self.logic_nodes:
             self.logic_hint.show()
-        self._sync_fit_analysis_entries()
         if _rebuild:
             self._mark_dirty()
         return True
@@ -2166,7 +2097,6 @@ class TaskConsole(QtWidgets.QWidget):
             if editor is not None:
                 editor.set_running(True)
                 editor.set_status("running", error=False)
-        self._sync_fit_analysis_entries()
 
     def _mark_dirty(self, *_args) -> None:
         if self._building:
@@ -2304,7 +2234,6 @@ class TaskConsole(QtWidgets.QWidget):
         # one-shot node's run-complete / error transition is never missed if the node
         # self-stops between version bumps.
         self._poll_logic_nodes()
-        self._drain_rectangle_controls()
         # PAUSE = freeze the board: skip the render below (no card advances its
         # _render_version) while node polling/banners stay alive.  On Resume each
         # card compares only the revisions of the producers it actually reads.
@@ -2314,7 +2243,7 @@ class TaskConsole(QtWidgets.QWidget):
         self._tick_count += 1
         # One immutable front for this GUI pass.  It is a per-producer-latest
         # observation, not a board-wide physical-shot join.
-        self._tick_data = self._data.freeze()
+        self._promote_data_front(self._data.freeze())
         elapsed = self._tick_count * self._base_interval_ms
         # COLLECT every panel whose own source revisions changed and whose beat is
         # due.  ``update_ms`` gates when that card recomposes; batching
@@ -2331,11 +2260,8 @@ class TaskConsole(QtWidgets.QWidget):
             batch.append((card, key))
         if batch:
             self._enqueue_render_batch(batch, self._tick_data)
-        # keep the visible Edit tab's 'now:' acquisition references live, so a queued
-        # parameter edit shows as applied once the loop picks it up.
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
-            editor.refresh_node_now_labels()
             editor.refresh_limit_hints()  # #3a: tick updates only the grey placeholder hint, never the text
         self._update_summary()
 
@@ -2344,7 +2270,7 @@ class TaskConsole(QtWidgets.QWidget):
 
         self._poll_logic_nodes()
         self._refresh_signal_info()
-        self._tick_data = self._data.freeze()
+        self._promote_data_front(self._data.freeze())
         self._enqueue_render_batch(
             tuple(
                 (card, self._panel_frame_key(card, self._tick_data))
@@ -2355,7 +2281,6 @@ class TaskConsole(QtWidgets.QWidget):
         )
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
-            editor.refresh_node_now_labels()
             editor.refresh_limit_hints()  # #3a: tick updates only the grey placeholder hint, never the text
         self._update_summary()
 
@@ -2591,9 +2516,6 @@ def show_task_console(
     catalog_view: object | None = None,
     run_factory=None,
     data_plane=None,
-    fit_window_factory=None,
-    local_fit_window_factory=None,
-    rectangle_selection_sink=None,
     scale: float | None = None,
     window_ratio: float = WINDOW_SCREEN_FRACTION,
     title: str = "TaskConsole@Zou lab",
@@ -2626,10 +2548,7 @@ def show_task_console(
     console = TaskConsole(state=state, running_nodes=running_nodes,
                           catalog_view=catalog_view, run_factory=run_factory,
                           data_plane=data_plane,
-                          fit_window_factory=fit_window_factory,
-                          local_fit_window_factory=local_fit_window_factory,
                           scale=scale,
-                          rectangle_selection_sink=rectangle_selection_sink,
                           window_ratio=window_ratio)
     console._on_close = on_close
     # Closing the window must stop the node owner threads (else they keep running, blocked in

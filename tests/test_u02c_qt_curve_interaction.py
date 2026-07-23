@@ -338,20 +338,13 @@ def test_curve_uses_draw_frozen_bbox_and_horizontal_span() -> None:
         application.processEvents()
 
 
-def test_curve_hover_all_series_and_continuous_cross() -> None:
+def test_curve_continuous_cross_pins_and_clears() -> None:
     from PyQt5 import QtCore, QtGui, QtTest
 
     application, board = _board(_frame(1), [], [])
     try:
         plot = _curve_target(board).plot
-        # data (2, 1) is invalid in site 0 but exact and valid in site 1.
-        position = _point(plot, 0.625, 0.40)
-        QtTest.QTest.mouseMove(board, position)
         binding = board._numeric_bindings["curve"]
-        assert binding.hover is not None
-        assert binding.hover.series_label == "site 1"
-        assert (binding.hover.x, binding.hover.y) == (2.0, 1.0)
-
         arbitrary = _point(plot, 0.33, 0.61)
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=arbitrary)
         cross = binding.cross
@@ -372,7 +365,7 @@ def test_curve_hover_all_series_and_continuous_cross() -> None:
         application.processEvents()
 
 
-def test_curve_cross_and_hover_overlay_show_both_axis_units(monkeypatch) -> None:
+def test_curve_cross_overlay_uses_the_shared_selector_label(monkeypatch) -> None:
     from PyQt5 import QtCore, QtGui, QtTest
 
     curve_commands = []
@@ -380,24 +373,13 @@ def test_curve_cross_and_hover_overlay_show_both_axis_units(monkeypatch) -> None
     try:
         plot = _curve_target(board).plot
         position = _point(plot, 0.55, 0.45)
-        QtTest.QTest.mouseMove(board, position)
         binding = board._numeric_bindings["curve"]
-        assert binding.hover is not None
 
-        hover_labels = []
         cross_labels = []
-
-        def capture_hover(_painter, label, _plot, _color, **_kwargs):
-            hover_labels.append(label)
 
         def capture_cross(_painter, label, _plot, _color, **_kwargs):
             cross_labels.append(label)
 
-        monkeypatch.setattr(
-            type(board),
-            "_paint_curve_label",
-            staticmethod(capture_hover),
-        )
         monkeypatch.setattr(
             type(board),
             "_paint_selector_text",
@@ -407,11 +389,6 @@ def test_curve_cross_and_hover_overlay_show_both_axis_units(monkeypatch) -> None
             board.size(),
             QtGui.QImage.Format_ARGB32_Premultiplied,
         )
-        painter = QtGui.QPainter(image)
-        try:
-            board._paint_numeric_binding_overlay(painter, binding)
-        finally:
-            painter.end()
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=position)
         assert binding.cross is not None
         painter = QtGui.QPainter(image)
@@ -419,12 +396,8 @@ def test_curve_cross_and_hover_overlay_show_both_axis_units(monkeypatch) -> None
             board._paint_numeric_binding_overlay(painter, binding)
         finally:
             painter.end()
-        # The hover overlay (the design's ADDED capability) names both units;
-        # the pinned cross prints the reference's exact "(x, y)" wording.  The
-        # right click that pins the cross clears the hover, so each paints once.
-        assert len(hover_labels) == 1
-        assert all("x=" in label and " ms" in label for label in hover_labels)
-        assert all("y=" in label and " count" in label for label in hover_labels)
+        # The locked cross uses the same exact selector label owner as the
+        # other numeric plots.
         assert len(cross_labels) == 1
         assert cross_labels[0].startswith("(") and cross_labels[0].endswith(")")
         assert ", " in cross_labels[0]

@@ -49,7 +49,8 @@ from zlc_frontend.selector import (
 from zlc_neutral_atom.capture_application import CaptureRequest, PreparedFiniteCapture
 from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
 from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot, RunState
-from zlc_workbench.live import LiveBoardController, LiveDatasetSlot
+from zlc_workbench.live_board import LiveBoardController
+from zlc_workbench.live_slot import LiveDatasetSlot
 from zlc_workbench.run_owner import QtRunOwnerMailbox
 from zlc_workbench.workspace import BoardController, BoardModel, PanelSlot
 from .projection import (
@@ -238,7 +239,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         self._board_widget.set_selectors_enabled(bool(enabled))
         if enabled:
             self._interaction_status.setText(
-                "Area: DISPLAY ONLY · A/C/Z/H and exact hover armed"
+                "Area: DISPLAY ONLY · A/C/Z/H armed"
             )
         elif self._board_widget.selector_fault is not None:
             self._interaction_status.setText(

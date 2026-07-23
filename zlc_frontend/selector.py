@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import math
 from typing import TypeAlias
 
-from zlc_storage import canonical_text, nonnegative_integer
+from zlc_storage import canonical_text, finite_real, nonnegative_integer
 
 from .figure import EvaluatedInput
 from .curve_display import CurveViewportTransform, NumericViewportTransform
@@ -129,6 +129,37 @@ class PanelInteractionOrigin:
             != self.source_identity.schema_fingerprint
         ):
             raise ValueError("interaction input differs from its source identity")
+
+
+@dataclass(frozen=True, slots=True)
+class CrossGesture:
+    """Set or clear one Cross cursor on an exact immutable painted front.
+
+    ``point`` is the continuous physical coordinate at the completed right
+    click.  ``None`` is authored only by a double-right-click and clears the
+    Cross.  The gesture is never emitted from pointer motion and therefore is
+    not a hover channel.
+    """
+
+    origin: PanelInteractionOrigin
+    point: tuple[float, float] | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.origin, PanelInteractionOrigin):
+            raise TypeError("origin must be PanelInteractionOrigin")
+        point = self.point
+        if point is None:
+            return
+        if not isinstance(point, tuple) or len(point) != 2:
+            raise TypeError("cross point must be a pair or None")
+        object.__setattr__(
+            self,
+            "point",
+            (
+                finite_real(point[0], "cross x"),
+                finite_real(point[1], "cross y"),
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +313,7 @@ HistogramInteractionIntent: TypeAlias = (
 
 
 __all__ = [
+    "CrossGesture",
     "CurveInteractionIntent",
     "CurveRangeGesture",
     "CurveViewportCommit",

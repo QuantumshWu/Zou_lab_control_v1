@@ -2328,6 +2328,84 @@ class FluentTreeComboBox(FluentComboBox):
         # not flush until it is closed + reopened (#1).  (A no-op on a not-yet-shown combo.)
         self.repaint()
 
+    def reconcile_signal_tree_metadata(self, groups) -> bool:
+        """Update existing signal-leaf labels without rebuilding the tree.
+
+        ``groups`` has the same shape as :meth:`set_signal_tree`, but this path is
+        deliberately metadata-only: the exact leaf-key set must already match.
+        That makes a waiting/ready or schema-label transition a ``dataChanged``
+        update on the existing items.  Current selection, model indexes, expanded
+        parents, popup scroll position, and the combo widget itself therefore
+        remain stable.
+
+        Returns ``False`` when ``groups`` describes different topology.  The
+        caller must leave that to its explicit topology owner; this method never
+        clears, inserts, removes, or silently rebuilds the model.
+        """
+
+        desired: dict[str, tuple[str, str]] = {}
+        for _producer, leaves in groups:
+            for leaf_label, bare, full_label in leaves:
+                key = str(bare)
+                if not key or key in desired:
+                    return False
+                desired[key] = (str(leaf_label), str(full_label))
+
+        existing: dict[str, QtGui.QStandardItem] = {}
+
+        def visit(parent: QtCore.QModelIndex) -> None:
+            for row in range(self._model.rowCount(parent)):
+                index = self._model.index(row, 0, parent)
+                item = self._model.itemFromIndex(index)
+                if item is None:
+                    continue
+                payload = item.data(QtCore.Qt.UserRole)
+                if payload:
+                    key = str(payload)
+                    if key in existing:
+                        existing.clear()
+                        return
+                    existing[key] = item
+                if item.hasChildren():
+                    visit(index)
+                    if not existing and desired:
+                        return
+
+        visit(QtCore.QModelIndex())
+        if set(existing) != set(desired):
+            return False
+
+        selected = self.current_signal()
+        view = self.view()
+        vertical = horizontal = None
+        if isinstance(view, QtWidgets.QTreeView):
+            vertical = view.verticalScrollBar().value()
+            horizontal = view.horizontalScrollBar().value()
+
+        with signals_blocked(self):
+            for key, item in existing.items():
+                leaf_label, full_label = desired[key]
+                if item.text() != leaf_label:
+                    item.setText(leaf_label)
+                if item.data(QtCore.Qt.UserRole + 1) != full_label:
+                    item.setData(full_label, QtCore.Qt.UserRole + 1)
+            self._full_by_bare = {
+                key: full_label
+                for key, (_leaf_label, full_label) in desired.items()
+            }
+
+        # No structural operation occurred, so these should already be stable.
+        # Restoring scroll values makes that contract explicit even if Qt's
+        # delegate recomputes geometry after a wider shape label is painted.
+        if isinstance(view, QtWidgets.QTreeView):
+            view.verticalScrollBar().setValue(int(vertical or 0))
+            view.horizontalScrollBar().setValue(int(horizontal or 0))
+            view.viewport().update()
+        if self.current_signal() != selected:
+            raise RuntimeError("signal metadata reconciliation changed selection")
+        self.repaint()
+        return True
+
     def current_signal(self) -> str:
         """The selected leaf's bare signal name ('' for none / a header)."""
         data = self.currentData(QtCore.Qt.UserRole)

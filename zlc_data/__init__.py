@@ -86,9 +86,11 @@ from .transform import (
     TransformedSchema,
     ValidityPolicy,
     apply_transform,
+    apply_value_transform,
     commit_transform,
     materialize_transformed_snapshot,
     resolve_transformed_schema,
+    resolve_value_transform_schema,
 )
 from .transform_codec import (
     committed_transform_from_tree,
@@ -194,6 +196,7 @@ __all__ = [
     "axis_layout_to_tree",
     "axis_to_tree",
     "apply_transform",
+    "apply_value_transform",
     "bind_fit",
     "commit_transform",
     "committed_transform_from_tree",
@@ -209,6 +212,7 @@ __all__ = [
     "encode_fit_spec",
     "exact_integer_text",
     "resolve_transformed_schema",
+    "resolve_value_transform_schema",
     "materialize_transformed_snapshot",
     "resolve_selection_indices",
     "canonical_value_array",

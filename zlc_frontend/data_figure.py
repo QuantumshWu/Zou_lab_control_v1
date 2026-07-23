@@ -202,7 +202,10 @@ def _validated_fit_result_mapping(
         else:
             raise ValueError("only one- and two-axis fit overlays are supported")
         for axis in result.batch_axis_specs:
-            if layer.view.binding(axis.axis_id).role not in allowed_batch_roles:
+            role = layer.view.binding(axis.axis_id).role
+            if role not in allowed_batch_roles and not (
+                role is AxisViewRole.REDUCED and axis.size == 1
+            ):
                 raise ValueError(
                     f"fit batch axis {axis.axis_id} is not uniquely displayed or selected"
                 )
@@ -648,6 +651,48 @@ class DataFigure:
             self._document,
             self._evaluated,
             dict(self._fit_results),
+            size=size,
+            width=width,
+            height=height,
+            dpi=dpi,
+            display_state=display_state,
+            title=title,
+            value_label=value_label,
+        )
+
+    def transient_fit_to_panel_png_bytes_with_panel_regions(
+        self,
+        result: FitResultBatch,
+        *,
+        size: str,
+        width: int,
+        height: int,
+        dpi: float,
+        display_state: object,
+        title: str,
+        value_label: str,
+    ) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
+        """Encode one draft Fit grid without attaching it to this DataFigure."""
+
+        if not isinstance(result, FitResultBatch):
+            raise TypeError("transient grid fit must be FitResultBatch")
+        if len(self._document.layers) != 1:
+            raise ValueError("transient grid fit requires exactly one layer")
+        layer = self._document.layers[0]
+        validated = dict(
+            _validated_fit_result_mapping(
+                self._document,
+                self._evaluated,
+                self._source_schemas,
+                {layer.layer_id: result},
+            )
+        )
+        from .matplotlib_render import encode_evaluated_panel_with_regions
+
+        return encode_evaluated_panel_with_regions(
+            self._document,
+            self._evaluated,
+            validated,
             size=size,
             width=width,
             height=height,

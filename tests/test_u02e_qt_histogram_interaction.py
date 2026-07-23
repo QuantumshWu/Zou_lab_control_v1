@@ -359,7 +359,7 @@ def _accepted_histogram_frame(sequence: int, command, **kwargs):
     )
 
 
-def test_curve_and_histogram_bind_simultaneously_with_exact_log_bin_hover() -> None:
+def test_curve_and_histogram_bind_simultaneously_with_locked_cross() -> None:
     from PyQt5 import QtCore, QtGui, QtTest
     from zlc_frontend.histogram_display import HistogramCountScale
     from zlc_frontend.selector import CurveViewportCommit, HistogramViewportCommit
@@ -380,19 +380,10 @@ def test_curve_and_histogram_bind_simultaneously_with_exact_log_bin_hover() -> N
         bin_left = float(target.payload.bin_edges[bin_index])
         bin_right = float(target.payload.bin_edges[bin_index + 1])
         bin_count = int(target.payload.bin_counts[0][bin_index])
-        hover_position = _data_point(
+        cross_position = _data_point(
             target,
             0.5 * (bin_left + bin_right),
             float(bin_count),
-        )
-        QtTest.QTest.mouseMove(board, hover_position)
-        hover = histogram_binding.hover
-        assert hover is not None
-        assert (hover.series_label, hover.left, hover.right, hover.count) == (
-            "ROI A",
-            bin_left,
-            bin_right,
-            bin_count,
         )
 
         labels: list[str] = []
@@ -440,9 +431,9 @@ def test_curve_and_histogram_bind_simultaneously_with_exact_log_bin_hover() -> N
         assert len(histogram_commands) == 1
         assert board.discard_pending_curve_interaction(curve_commands[-1].origin)
 
-        QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=hover_position)
+        QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=cross_position)
         assert histogram_binding.cross is not None
-        _double_click(board, hover_position, QtCore.Qt.RightButton)
+        _double_click(board, cross_position, QtCore.Qt.RightButton)
         assert histogram_binding.cross is None
     finally:
         board.close()

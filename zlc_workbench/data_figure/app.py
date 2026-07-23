@@ -111,7 +111,6 @@ def _figure_window_factory(
     initial_display: _TypedDisplayState | None = None,
     initial_grid_display: _GridDisplayState | None = None,
     embedded: bool = False,
-    surface_only: bool = False,
     size_name: str | None = None,
     pixel_ratio: float = 1.0,
     presentation_title: str | None = None,
@@ -126,10 +125,6 @@ def _figure_window_factory(
         _payload_intent(initial_payload)
     if not isinstance(embedded, bool):
         raise TypeError("embedded must be bool")
-    if not isinstance(surface_only, bool):
-        raise TypeError("surface_only must be bool")
-    if surface_only and not embedded:
-        raise ValueError("surface_only requires embedded=True")
     for name, value in (
         ("presentation_title", presentation_title),
         ("presentation_value_label", presentation_value_label),
@@ -363,7 +358,6 @@ def _figure_window_factory(
         typed_front_committed=commit_front,
         initial_display=initial_display,
         embedded=embedded,
-        surface_only=surface_only,
         logical_panel_size=logical_size,
         size_name=size_name,
         pixel_ratio=pixel_ratio,
@@ -383,7 +377,6 @@ def create_data_figure_pane(
     local_fit_archive_metadata: Mapping[str, object] | None = None,
     open_fit_analysis: bool = False,
     embedded: bool = True,
-    surface_only: bool = False,
     size_name: str | None = None,
     pixel_ratio: float = 1.0,
     presentation_title: str | None = None,
@@ -431,7 +424,6 @@ def create_data_figure_pane(
         initial_grid_display=initial_grid_display,
         initial_fit_result_identity=initial_fit_result_identity,
         embedded=embedded,
-        surface_only=surface_only,
         size_name=size_name,
         pixel_ratio=pixel_ratio,
         presentation_title=presentation_title,

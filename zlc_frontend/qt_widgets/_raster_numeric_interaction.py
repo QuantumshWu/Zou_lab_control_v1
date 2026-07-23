@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 import math
 from typing import Callable, Literal, TypeAlias
 
-import numpy as np
 from PyQt5 import QtCore, QtGui
 
 from ..curve_display import CurveViewportTransform, NumericViewportTransform
@@ -39,15 +38,12 @@ from ._raster_front import (
 )
 from ._rectangle_selector import (
     RectangleDrag,
+    paint_cross_selector,
     paint_rectangle_selector,
-    paint_selector_hover_label,
     paint_selector_text,
     selector_pen_color,
     selector_precision,
 )
-from .style import ORANGE, SELECTOR_DOT_PX, SELECTOR_LINE_PX
-
-
 _NumericKind: TypeAlias = Literal["curve", "histogram", "pulse"]
 _NumericPayload: TypeAlias = (
     CurvePanelPayload | HistogramPanelPayload | PulsePanelPayload
@@ -197,34 +193,6 @@ class _NumericCross:
     y: float
 
 
-@dataclass(frozen=True, slots=True)
-class _CurveSample:
-    """Nearest valid sample borrowed from one exact immutable curve payload."""
-
-    series_label: str
-    x: float
-    y: float
-
-
-@dataclass(frozen=True, slots=True)
-class _HistogramBinSample:
-    """One bin borrowed from a frozen HistogramPanelPayload projection."""
-
-    series_label: str
-    left: float
-    right: float
-    count: int
-    right_closed: bool
-
-    @property
-    def x(self) -> float:
-        return 0.5 * (self.left + self.right)
-
-    @property
-    def y(self) -> float:
-        return float(self.count)
-
-
 @dataclass(slots=True)
 class _NumericPanelBinding:
     """The sole mutable state for one bound numeric panel."""
@@ -250,8 +218,6 @@ class _NumericPanelBinding:
     pan_origin: _NumericViewport | None = None
     pan_candidate: tuple[float, float] | None = None
     cross: _NumericCross | None = None
-    hover: _CurveSample | _HistogramBinSample | None = None
-    hover_position: QtCore.QPointF | None = None
     fault: RuntimeError | None = None
 
 
@@ -425,129 +391,6 @@ def _numeric_normalized_point(
     return x, y
 
 
-def _numeric_sample_for_target(
-    target: _NumericTarget,
-    point: QtCore.QPointF,
-) -> _CurveSample | _HistogramBinSample | None:
-    if isinstance(target.payload, HistogramPanelPayload):
-        return _histogram_sample_for_target(target, point)
-    if isinstance(target.payload, PulsePanelPayload):
-        return None
-    return _curve_sample_for_numeric_target(target, point)
-
-
-def _curve_sample_for_numeric_target(
-    target: _NumericTarget,
-    point: QtCore.QPointF,
-) -> _CurveSample | None:
-    payload = target.payload
-    assert isinstance(payload, CurvePanelPayload)
-    viewport = payload.viewport
-    bounds = target.bounds
-    best: tuple[float, int, int, _CurveSample] | None = None
-    coordinates = np.asarray(
-        payload.series[0].data.x_axis.coordinates,
-        dtype=np.float64,
-    )
-    x_low, x_high = viewport.x_limits
-    y_low, y_high = viewport.y_limits
-    left, top, right, bottom = viewport.plot_bounds
-    x_widget = bounds.x() + (
-        left
-        + (coordinates - x_low) / (x_high - x_low) * (right - left)
-    ) * bounds.width()
-    for series_index, (series, label) in enumerate(
-        zip(payload.series, payload.series_labels)
-    ):
-        curve = series.data
-        values = np.asarray(curve.values, dtype=np.float64)
-        valid = np.asarray(curve.validity, dtype=bool)
-        visible = (
-            valid
-            & np.isfinite(values)
-            & (coordinates >= x_low)
-            & (coordinates <= x_high)
-            & (values >= y_low)
-            & (values <= y_high)
-        )
-        sample_indices = np.flatnonzero(visible)
-        if not sample_indices.size:
-            continue
-        visible_values = values[sample_indices]
-        y_widget = bounds.y() + (
-            top
-            + (y_high - visible_values) / (y_high - y_low) * (bottom - top)
-        ) * bounds.height()
-        distances = (
-            (x_widget[sample_indices] - point.x()) ** 2
-            + (y_widget - point.y()) ** 2
-        )
-        local_index = int(np.argmin(distances))
-        sample_index = int(sample_indices[local_index])
-        sample = _CurveSample(
-            label,
-            float(coordinates[sample_index]),
-            float(values[sample_index]),
-        )
-        candidate = (
-            float(distances[local_index]),
-            series_index,
-            sample_index,
-            sample,
-        )
-        if best is None or candidate[:3] < best[:3]:
-            best = candidate
-    return None if best is None else best[3]
-
-
-def _histogram_sample_for_target(
-    target: _NumericTarget,
-    point: QtCore.QPointF,
-) -> _HistogramBinSample | None:
-    payload = target.payload
-    assert isinstance(payload, HistogramPanelPayload)
-    viewport = payload.viewport
-    normalized = _numeric_normalized_point(target, point)
-    x_value, _count_value = viewport.widget_normalized_to_data(*normalized)
-    edges = np.asarray(payload.bin_edges, dtype=np.float64)
-    index = int(np.searchsorted(edges, x_value, side="right") - 1)
-    if x_value == float(edges[-1]):
-        index = len(edges) - 2
-    if not 0 <= index < len(edges) - 1:
-        return None
-    best: tuple[float, int, _HistogramBinSample] | None = None
-    for series_index, (counts, label) in enumerate(
-        zip(payload.bin_counts, payload.series_labels, strict=True)
-    ):
-        count = int(counts[index])
-        if viewport.count_scale.value == "log" and count <= 0:
-            continue
-        if not viewport.count_limits[0] <= count <= viewport.count_limits[1]:
-            continue
-        sample = _HistogramBinSample(
-            label,
-            float(edges[index]),
-            float(edges[index + 1]),
-            count,
-            index == len(edges) - 2,
-        )
-        widget = viewport.data_to_widget_normalized(sample.x, sample.y)
-        widget_y = target.bounds.y() + widget[1] * target.bounds.height()
-        candidate = (abs(widget_y - point.y()), series_index, sample)
-        if best is None or candidate[:2] < best[:2]:
-            best = candidate
-    return None if best is None else best[2]
-
-
-def _set_numeric_hover(
-    binding: _NumericPanelBinding,
-    sample: _CurveSample | _HistogramBinSample | None,
-) -> None:
-    binding.hover = sample
-    if sample is None:
-        binding.hover_position = None
-
-
 def _numeric_interaction_armed(
     selector_enabled: bool,
     binding: _NumericPanelBinding,
@@ -600,7 +443,6 @@ def _clear_numeric_transient(
         binding.pending_viewport = None
         binding.pending_origin = None
     binding.cross = None
-    _set_numeric_hover(binding, None)
 
 
 def _commit_histogram_thresholds(
@@ -662,7 +504,6 @@ def _commit_histogram_thresholds(
         if binding.fault is None:
             binding.fault = detached_render_fault(error)
         binding.binding_enabled = False
-        _set_numeric_hover(binding, None)
         return False
     return True
 
@@ -687,10 +528,13 @@ def _commit_numeric_viewport(
             hold=painted_hold,
         )[0]
     )
-    if payload is None or x_limits == payload.viewport.x_limits:
+    if payload is None:
         return False
     assert isinstance(payload, _NUMERIC_PAYLOAD_TYPES[binding.kind])
-    base_revision = payload.viewport.display_revision
+    authored_viewport = binding.pending_viewport or payload.viewport
+    if x_limits == authored_viewport.x_limits:
+        return False
+    base_revision = authored_viewport.display_revision
     if binding.viewport is not None:
         base_revision = max(
             base_revision,
@@ -722,7 +566,7 @@ def _commit_numeric_viewport(
             f"{binding.kind} interaction origin has no exact payload"
         )
     candidate = replace(
-        payload.viewport,
+        authored_viewport,
         display_revision=base_revision + 1,
         x_limits=x_limits,
         **(
@@ -747,7 +591,6 @@ def _commit_numeric_viewport(
         if binding.fault is None:
             binding.fault = detached_render_fault(error)
         binding.binding_enabled = False
-        _set_numeric_hover(binding, None)
         return False
     return True
 
@@ -775,17 +618,6 @@ def _paint_numeric_overlays(
             continue
         plot, payload, bounds = target.plot, target.payload, target.bounds
         viewport = payload.viewport
-        x_unit_value = (
-            viewport.x_axis.unit
-            if isinstance(viewport, NumericViewportTransform)
-            else payload.value_unit
-        )
-        x_unit = "" if x_unit_value is None else f" {x_unit_value}"
-        y_unit = (
-            ""
-            if isinstance(payload, (HistogramPanelPayload, PulsePanelPayload))
-            else "" if payload.value_unit is None else f" {payload.value_unit}"
-        )
 
         def widget_point(x: float, y: float) -> QtCore.QPointF:
             normalized = viewport.data_to_widget_normalized(x, y)
@@ -838,23 +670,6 @@ def _paint_numeric_overlays(
             if cross is not None:
                 selector_color = selector_pen_color()
                 point = widget_point(cross.x, cross.y)
-                if plot.contains(point):
-                    painter.setPen(QtGui.QPen(selector_color, SELECTOR_LINE_PX))
-                    painter.drawLine(
-                        QtCore.QPointF(point.x(), plot.top()),
-                        QtCore.QPointF(point.x(), plot.bottom()),
-                    )
-                    painter.drawLine(
-                        QtCore.QPointF(plot.left(), point.y()),
-                        QtCore.QPointF(plot.right(), point.y()),
-                    )
-                    painter.setBrush(QtGui.QBrush(selector_color))
-                    painter.setPen(QtCore.Qt.NoPen)
-                    painter.drawEllipse(
-                        point,
-                        SELECTOR_DOT_PX / 2.0,
-                        SELECTOR_DOT_PX / 2.0,
-                    )
                 dx = selector_precision(
                     viewport.x_limits[1] - viewport.x_limits[0]
                 )
@@ -864,45 +679,13 @@ def _paint_numeric_overlays(
                     else viewport.count_limits
                 )
                 dy = selector_precision(y_span[1] - y_span[0])
-                paint_selector_text(
+                paint_cross_selector(
                     painter,
-                    f"({cross.x:.{dx}f}, {cross.y:.{dy}f})",
                     plot,
-                    selector_color,
-                    corner="top_right",
+                    point,
+                    f"({cross.x:.{dx}f}, {cross.y:.{dy}f})",
+                    color=selector_color,
                 )
 
-            sample = binding.hover
-            position = binding.hover_position
-            if sample is not None and position is not None:
-                point = None
-                try:
-                    point = widget_point(sample.x, sample.y)
-                except ValueError:
-                    pass
-                if point is not None and plot.contains(point):
-                    painter.setPen(QtGui.QPen(QtGui.QColor(ORANGE), 1.5))
-                    painter.setBrush(QtGui.QBrush(QtGui.QColor(ORANGE)))
-                    painter.drawEllipse(point, 3.5, 3.5)
-                label = (
-                    (
-                        f"{sample.series_label}  "
-                        f"[{sample.left:.6g}, {sample.right:.6g}"
-                        f"{']' if sample.right_closed else ')'}{x_unit}  "
-                        f"count={sample.count}"
-                    )
-                    if isinstance(sample, _HistogramBinSample)
-                    else (
-                        f"{sample.series_label}  x={sample.x:.6g}{x_unit}  "
-                        f"y={sample.y:.6g}{y_unit}"
-                    )
-                )
-                paint_selector_hover_label(
-                    painter,
-                    label,
-                    plot,
-                    QtGui.QColor(ORANGE),
-                    anchor=position,
-                )
         finally:
             painter.restore()

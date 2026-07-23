@@ -57,6 +57,7 @@ class SinglePanelHost(QtWidgets.QWidget):
     rangeSelected = QtCore.pyqtSignal(object)
     viewCommitted = QtCore.pyqtSignal(object)
     thresholdsCommitted = QtCore.pyqtSignal(object)
+    crossSelected = QtCore.pyqtSignal(object)
     # image family only: a completed DISPLAY ONLY rectangle (RectangleGesture)
     # and a clim-rail commit's fixed colour limits.  The window echoes a
     # rectangle candidate through ``board.set_image_rectangle_candidate``.
@@ -84,6 +85,7 @@ class SinglePanelHost(QtWidgets.QWidget):
         # -- the board refuses to arm with no healthy binding, and a refusal
         # inside a Qt slot would kill the process.
         self._selectors_on = False
+        self._board.crossSelected.connect(self.crossSelected.emit)
 
     @property
     def board(self) -> QtRasterBoard:
@@ -239,10 +241,10 @@ class SinglePanelHost(QtWidgets.QWidget):
             self._panel_id, self._group, source, stamp, raster, payload)
         self._sequence += 1
         self._retire_incompatible_binding(payload)
-        self._board.present(BoardFrame(
-            f"{self._group}-board", 0, self._sequence, (panel,)))
-        self._ensure_binding(payload)
-        self.set_logical_size(logical)
+        self.present_frame(
+            BoardFrame(f"{self._group}-board", 0, self._sequence, (panel,)),
+            logical_size=logical,
+        )
         return logical
 
     def set_logical_size(self, logical_size: tuple[int, int]) -> None:
@@ -271,7 +273,12 @@ class SinglePanelHost(QtWidgets.QWidget):
         self._board.setFixedSize(width, height)
         self.setFixedSize(width, height)
 
-    def present_frame(self, frame: BoardFrame) -> None:
+    def present_frame(
+        self,
+        frame: BoardFrame,
+        *,
+        logical_size: tuple[int, int] | None = None,
+    ) -> None:
         """Present one ALREADY-COHERENT frame (e.g. a worker compose product).
 
         ``present_panel`` derives the identity boilerplate for windows that
@@ -288,9 +295,21 @@ class SinglePanelHost(QtWidgets.QWidget):
                 "SinglePanelHost requires its one configured panel"
             )
         payload = frame.panels[0].display_payload
-        self._retire_incompatible_binding(payload)
-        self._board.present(frame)
-        self._ensure_binding(payload)
+        geometry_changes = logical_size is not None and (
+            self.width(), self.height()
+        ) != logical_size
+        if geometry_changes:
+            self.setUpdatesEnabled(False)
+        try:
+            self._retire_incompatible_binding(payload)
+            self._board.present(frame)
+            self._ensure_binding(payload)
+            if logical_size is not None:
+                self.set_logical_size(logical_size)
+        finally:
+            if geometry_changes:
+                self.setUpdatesEnabled(True)
+                self.update()
 
     # ------------------------------------------------------------------ #
     # gesture plumbing

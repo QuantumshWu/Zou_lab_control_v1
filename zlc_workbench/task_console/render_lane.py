@@ -35,6 +35,8 @@ class PanelRenderRequest:
     view: object
     faceted: bool
     focus: object
+    fit_result: object | None = None
+    fit_result_identity: str | None = None
 
 
 class ConsoleRenderLane:
@@ -188,6 +190,8 @@ class ConsoleRenderLane:
                         display=request.display,
                         provenance=request.provenance,
                         focus=request.focus,
+                        fit_result=request.fit_result,
+                        fit_result_identity=request.fit_result_identity,
                     )
                     frame = None
                     figure = faceted_result.figure
@@ -196,6 +200,8 @@ class ConsoleRenderLane:
                         request.value.snapshot,
                         display=request.display,
                         provenance=request.provenance,
+                        fit_result=request.fit_result,
+                        fit_result_identity=request.fit_result_identity,
                     )
                     faceted_result = None
             except PanelRenderError as error:
@@ -242,6 +248,14 @@ class ConsoleRenderLane:
             self._reset_pending.clear()
             pending = tuple(self._pending.values())
             self._pending.clear()
+        # A result superseded by a newer request for the same panel is stale
+        # to Qt, not stale to the worker-owned renderer.  The pending request's
+        # ``source_key`` below is the authority: an equal key reuses the Agg
+        # surface/blit cache; a different key replaces it in ``_compose``.
+        # Closing the composer merely because a fast wheel gesture overtook one
+        # raster answer made every zoom burst pay first-frame construction and
+        # permanently prevented the steady blit path from warming up.
+        reset.difference_update(request.panel_id for request in pending)
         if pending or reset:
             self._start(pending, tuple(sorted(reset)))
 

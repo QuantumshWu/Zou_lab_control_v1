@@ -68,6 +68,7 @@ from .image_view import (
     NormalizedRectangle,
 )
 from .selector import (
+    CrossGesture,
     CurveInteractionIntent,
     CurveRangeGesture,
     CurveViewportCommit,
@@ -94,7 +95,9 @@ from .fit_editor import (
     fit_authority_summary,
     fit_axis_summary,
     fit_constraint_form,
+    fit_projection_metadata,
     fit_spec_from_form,
+    validate_fit_authoring_options,
 )
 from .render import (
     AtomicBoardFront,
@@ -173,6 +176,7 @@ __all__ = [
     "BoardPresenter",
     "coordinate_label",
     "CoherenceStamp",
+    "CrossGesture",
     "CurveDisplayState",
     "CurveFitOverlay",
     "CurveInteractionIntent",
@@ -295,7 +299,9 @@ __all__ = [
     "fit_authority_summary",
     "fit_authoring_option",
     "fit_constraint_form",
+    "fit_projection_metadata",
     "fit_spec_from_form",
+    "validate_fit_authoring_options",
     "suggest_view",
     "suggest_fit_view",
     "validate_view_spec",

@@ -100,10 +100,12 @@ from .render_style import (
 )
 
 from ._mpl_common import (
+    _AggBlitCache,
+    _agg_chrome_key,
+    _agg_layout_key,
     _display_series_label,
     _render_dpi,
     _require_evaluated_identity,
-    raster_from_agg,
     release_agg_figure,
 )
 from ._mpl_curve import (
@@ -123,6 +125,7 @@ class SinglePanelAggRenderer:
 
     __slots__ = (
         "_axis",
+        "_blit_cache",
         "_document",
         "_figure",
         "_artists",
@@ -228,6 +231,7 @@ class SinglePanelAggRenderer:
         self._document = document
         self._figure = figure
         self._axis = axis
+        self._blit_cache = _AggBlitCache()
         self._side_axis = side_axis
         self._artists = ()
         self._fit_artists = ()
@@ -966,8 +970,35 @@ class SinglePanelAggRenderer:
         return tuple(labels)
 
     def _draw_raster(self, figure) -> RasterBuffer:
-        return raster_from_agg(
+        dynamic = (
+            *self._artists,
+            *self._fit_artists,
+            *self._fit_diagnostic_artists,
+            self._distribution_artist,
+            self._gauss_artist,
+            self._gauss_text,
+            *self._hist_fit_artists,
+            self._hist_stats_text,
+            *self._hist_threshold_artists,
+            self._latest_text,
+        )
+        return self._blit_cache.raster(
             figure,
+            dynamic,
+            layout_key=_agg_layout_key(
+                figure,
+                extra=(self._topology, self._rolling_distribution),
+            ),
+            chrome_key=_agg_chrome_key(
+                figure,
+                extra=(
+                    self._topology,
+                    self._rolling_distribution,
+                    self._value_label,
+                    self._title_override,
+                    self._side_count_ceiling,
+                ),
+            ),
             physical_size=self._size,
         )
 
@@ -986,6 +1017,7 @@ class SinglePanelAggRenderer:
         self._fit_artists = ()
         self._fit_diagnostic_artists = ()
         self._topology = None
+        self._blit_cache.clear()
         # Collect before the worker reports done so the FINAL renderer cannot
         # overlap a provisional Agg surface.
         release_agg_figure(figure)

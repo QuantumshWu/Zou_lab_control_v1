@@ -24,6 +24,7 @@ from ..render import (
     detached_render_fault,
 )
 from ..selector import (
+    CrossGesture,
     CurveInteractionIntent,
     CurveRangeGesture,
     HistogramInteractionIntent,
@@ -71,7 +72,6 @@ from ._raster_image_interaction import (
     _rail_value,
     _selector_target,
     _set_cross_sample,
-    _set_hover_sample,
     _sample_for_target,
     _clim_rail_target,
     _viewport_for_target,
@@ -94,13 +94,11 @@ from ._raster_numeric_interaction import (
     _numeric_payload,
     _held_panel_from_numeric_target,
     _paint_numeric_overlays,
-    _numeric_sample_for_target,
     _numeric_target,
     _numeric_target_at,
     _numeric_normalized_point,
     _numeric_interaction_armed,
     _numeric_viewport_for_presented_panel,
-    _set_numeric_hover,
     _span_data_candidate,
     _span_rect_widget_extents,
     _threshold_line_hit,
@@ -116,6 +114,7 @@ class QtRasterBoard(QtWidgets.QWidget):
     """Atomic multi-panel presenter for immutable worker-owned raster fronts."""
 
     imagePanelLeftDoubleClicked = QtCore.pyqtSignal(str)
+    crossSelected = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
@@ -136,7 +135,6 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._image_bindings: dict[str, _ImagePanelBinding] = {}
         self._numeric_bindings: dict[str, _NumericPanelBinding] = {}
         self._closed = False
-        self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.ClickFocus)
         self.setMinimumSize(128, 64)
 
@@ -464,45 +462,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                     )
             if binding.pending_viewport is None:
                 binding.pending_origin = None
-        image_hover_positions = {
-            panel_id: binding.hover_position
-            for panel_id, binding in self._image_bindings.items()
-        }
-        numeric_hover_positions = {
-            panel_id: binding.hover_position
-            for panel_id, binding in self._numeric_bindings.items()
-        }
         self._front = (frame, prepared)
-        for panel_id, binding in self._image_bindings.items():
-            hover_position = image_hover_positions.get(panel_id)
-            target = self._selector_target(binding)
-            sample = None
-            if (
-                _image_interaction_armed(self._selector_enabled, binding)
-                and not _image_interaction_is_pending(binding)
-                and hover_position is not None
-                and target is not None
-                and target[0].contains(hover_position.toPoint())
-            ):
-                sample = self._sample_for_target(target, hover_position)
-            if sample is not None and hover_position is not None:
-                binding.hover_position = QtCore.QPointF(hover_position)
-            _set_hover_sample(binding, sample)
-        for panel_id, binding in self._numeric_bindings.items():
-            position = numeric_hover_positions.get(panel_id)
-            target = self._numeric_target(binding)
-            sample = None
-            if (
-                _numeric_interaction_armed(self._selector_enabled, binding)
-                and binding.pending_viewport is None
-                and position is not None
-                and target is not None
-                and target.plot.contains(position)
-            ):
-                sample = _numeric_sample_for_target(target, position)
-            if sample is not None and position is not None:
-                binding.hover_position = QtCore.QPointF(position)
-            _set_numeric_hover(binding, sample)
         self.update()
 
     def clear(self) -> None:
@@ -1016,14 +976,12 @@ class QtRasterBoard(QtWidgets.QWidget):
         for binding in self._image_bindings.values():
             if not image and binding.interaction_ready:
                 self._cancel_image_gesture(binding, clear_draft=True)
-                _set_hover_sample(binding, None)
             binding.interaction_ready = image
         readiness = {"curve": curve, "histogram": histogram, "pulse": pulse}
         for binding in self._numeric_bindings.values():
             ready = readiness[binding.kind]
             if not ready and binding.interaction_ready:
                 self._cancel_numeric_gesture(binding, clear_span=True)
-                _set_numeric_hover(binding, None)
             binding.interaction_ready = ready
         self.update()
 
@@ -1054,10 +1012,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 clear_image_draft=True,
                 clear_numeric_spans=True,
             )
-            for binding in self._image_bindings.values():
-                _set_hover_sample(binding, None)
-            for binding in self._numeric_bindings.values():
-                _set_numeric_hover(binding, None)
         self.update()
 
     def set_image_interaction_readiness(
@@ -1073,7 +1027,6 @@ class QtRasterBoard(QtWidgets.QWidget):
         binding = self._require_image_binding(panel_id)
         if not ready and binding.interaction_ready:
             self._cancel_image_gesture(binding, clear_draft=True)
-            _set_hover_sample(binding, None)
         binding.interaction_ready = ready
         self.update()
 
@@ -1398,10 +1351,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             and _numeric_interaction_armed(self._selector_enabled, numeric_target.binding)
         ):
             binding = numeric_target.binding
-            if (
-                binding.pending_viewport is not None
-                or self._selector_hold is not None
-            ):
+            if self._selector_hold is not None:
                 event.accept()
                 return
             point = _numeric_normalized_point(
@@ -1411,7 +1361,12 @@ class QtRasterBoard(QtWidgets.QWidget):
             if event.button() == QtCore.Qt.RightButton:
                 x, y = viewport.widget_normalized_to_data(*point)
                 binding.cross = _NumericCross(x, y)
-                _set_numeric_hover(binding, None)
+                self.crossSelected.emit(
+                    CrossGesture(
+                        self._numeric_interaction_origin(binding),
+                        (x, y),
+                    )
+                )
                 self.update()
                 event.accept()
                 return
@@ -1422,7 +1377,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 binding.pan_anchor = point[0]
                 binding.pan_origin = viewport
                 binding.pan_candidate = viewport.x_limits
-                _set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
                 return
@@ -1440,7 +1394,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                     binding.threshold_drag = grabbed
                     binding.threshold_candidate = tuple(
                         numeric_target.payload.thresholds)
-                    _set_numeric_hover(binding, None)
                     self.update()
                     event.accept()
                     return
@@ -1490,7 +1443,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                     pressed = viewport.widget_normalized_to_data(*point)
                     binding.span_rect = (
                         pressed[0], pressed[1], pressed[0], pressed[1])
-                _set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
                 return
@@ -1526,7 +1478,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 binding.clim_origin_limits = rail_target[4].color_limits
                 binding.clim_candidate = rail_target[4].color_limits
                 binding.clim_domain = _color_rail_domain(rail_target[4])
-                _set_hover_sample(binding, None)
                 self.update()
                 event.accept()
                 return
@@ -1539,7 +1490,20 @@ class QtRasterBoard(QtWidgets.QWidget):
                 super().mousePressEvent(event)
                 return
             _set_cross_sample(binding, sample)
-            _set_hover_sample(binding, None)
+            self.crossSelected.emit(
+                CrossGesture(
+                    self._require_interaction_origin(
+                        panel_id=binding.panel_id,
+                        payload_type=(ImagePanelPayload, SiteMapPanelPayload),
+                        hold=None,
+                        kind="image cross",
+                    ),
+                    (
+                        float(sample.x_coordinate),
+                        float(sample.y_coordinate),
+                    ),
+                )
+            )
             self.update()
             event.accept()
             return
@@ -1555,7 +1519,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 max(1, target[0].height()),
             )
             binding.pan_candidate = binding.pan_origin
-            _set_hover_sample(binding, None)
             self.update()
             event.accept()
             return
@@ -1771,57 +1734,6 @@ class QtRasterBoard(QtWidgets.QWidget):
             event.accept()
             return
 
-        numeric_target = self._numeric_target_at(event.localPos())
-        hovered_numeric = None
-        if (
-            numeric_target is not None
-            and _numeric_interaction_armed(self._selector_enabled, numeric_target.binding)
-            and numeric_target.binding.pending_viewport is None
-        ):
-            hovered_numeric = numeric_target.binding
-            sample = _numeric_sample_for_target(
-                numeric_target,
-                event.localPos(),
-            )
-            hovered_numeric.hover_position = (
-                None if sample is None else QtCore.QPointF(event.localPos())
-            )
-            _set_numeric_hover(hovered_numeric, sample)
-            for binding in self._image_bindings.values():
-                _set_hover_sample(binding, None)
-        for binding in self._numeric_bindings.values():
-            if binding is not hovered_numeric:
-                _set_numeric_hover(binding, None)
-        if hovered_numeric is not None:
-            self.update()
-            super().mouseMoveEvent(event)
-            return
-        hovered_image = self._image_target_at(event.localPos())
-        if hovered_image is not None:
-            binding, target, _rail = hovered_image
-            sample = (
-                None
-                if not _image_interaction_armed(self._selector_enabled, binding)
-                or _image_interaction_is_pending(binding)
-                or target is None
-                or not target[0].contains(event.pos())
-                else self._sample_for_target(target, event.localPos())
-            )
-            binding.hover_position = (
-                None if sample is None else QtCore.QPointF(event.localPos())
-            )
-            _set_hover_sample(binding, sample)
-            for other in self._image_bindings.values():
-                if other is not binding:
-                    _set_hover_sample(other, None)
-            self.update()
-        else:
-            changed = False
-            for binding in self._image_bindings.values():
-                changed = changed or binding.hover is not None
-                _set_hover_sample(binding, None)
-            if changed:
-                self.update()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -1988,10 +1900,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             and _numeric_interaction_armed(self._selector_enabled, numeric_target.binding)
         ):
             binding = numeric_target.binding
-            if (
-                binding.pending_viewport is not None
-                or self._selector_hold is not None
-            ):
+            if self._selector_hold is not None:
                 event.accept()
                 return
             delta = event.angleDelta().y()
@@ -1999,7 +1908,11 @@ class QtRasterBoard(QtWidgets.QWidget):
                 super().wheelEvent(event)
                 return
             point = _numeric_normalized_point(numeric_target, event.posF())
-            viewport = numeric_target.payload.viewport
+            # The painted front remains the exact command origin, while rapid
+            # wheel steps accumulate on the newest authored viewport.  Making
+            # the wheel wait for each Agg answer is what made zoom feel
+            # proportional to render latency.
+            viewport = binding.pending_viewport or numeric_target.payload.viewport
             anchor_x = viewport.widget_normalized_to_data(*point)[0]
             factor = 1.0 / 1.1 if delta < 0 else 1.1
             try:
@@ -2008,7 +1921,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 candidate = None
             if candidate is not None:
                 self._commit_numeric_viewport(binding, candidate)
-            _set_numeric_hover(binding, None)
             self.update()
             event.accept()
             return
@@ -2026,7 +1938,11 @@ class QtRasterBoard(QtWidgets.QWidget):
         position = event.pos()
         hits_image = target is not None and target[0].contains(position)
         hits_rail = rail_target is not None and rail_target[0].contains(position)
-        if _image_interaction_is_pending(binding) or self._selector_hold is not None:
+        # A colour-limit commit and an active drag are different authored
+        # transactions, so keep those serialized.  A pending *viewport* is
+        # deliberately replaceable: the next wheel step accumulates on it and
+        # the latest-only render lane answers the newest intent.
+        if binding.pending_color_limits is not None or self._selector_hold is not None:
             if hits_image or hits_rail:
                 event.accept()
             else:
@@ -2048,7 +1964,6 @@ class QtRasterBoard(QtWidgets.QWidget):
             scale,
         )
         self._commit_viewport(binding, candidate)
-        _set_hover_sample(binding, None)
         self.update()
         event.accept()
 
@@ -2094,7 +2009,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                     if binding.applied_span is None
                     else binding.applied_span,
                 )
-                _set_numeric_hover(binding, None)
                 self.update()
                 event.accept()
                 return
@@ -2106,7 +2020,12 @@ class QtRasterBoard(QtWidgets.QWidget):
                 return
             if event.button() == QtCore.Qt.RightButton:
                 binding.cross = None
-                _set_numeric_hover(binding, None)
+                self.crossSelected.emit(
+                    CrossGesture(
+                        self._numeric_interaction_origin(binding),
+                        None,
+                    )
+                )
                 self.update()
                 event.accept()
                 return
@@ -2138,7 +2057,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 (0.0, 0.0, 1.0, 1.0) if area is None else area
             )
             self._commit_viewport(binding, candidate)
-            _set_hover_sample(binding, None)
             self.update()
             event.accept()
             return
@@ -2153,19 +2071,21 @@ class QtRasterBoard(QtWidgets.QWidget):
             return
         if event.button() == QtCore.Qt.RightButton:
             _set_cross_sample(binding, None)
-            _set_hover_sample(binding, None)
+            self.crossSelected.emit(
+                CrossGesture(
+                    self._require_interaction_origin(
+                        panel_id=binding.panel_id,
+                        payload_type=(ImagePanelPayload, SiteMapPanelPayload),
+                        hold=None,
+                        kind="image cross",
+                    ),
+                    None,
+                )
+            )
             self.update()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
-
-    def leaveEvent(self, event: QtCore.QEvent) -> None:
-        for binding in self._image_bindings.values():
-            _set_hover_sample(binding, None)
-        for binding in self._numeric_bindings.values():
-            _set_numeric_hover(binding, None)
-        self.update()
-        super().leaveEvent(event)
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() == QtCore.Qt.Key_Escape and self._selector_hold is not None:
@@ -2197,10 +2117,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 clear_image_draft=True,
                 clear_numeric_spans=True,
             )
-        for binding in self._image_bindings.values():
-            _set_hover_sample(binding, None)
-        for binding in self._numeric_bindings.values():
-            _set_numeric_hover(binding, None)
         super().resizeEvent(event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
@@ -2231,14 +2147,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                     clear_image_draft=True,
                     clear_numeric_spans=True,
                 )
-            for binding in getattr(self, "_image_bindings", {}).values():
-                if binding.hover is not None:
-                    _set_hover_sample(binding, None)
-                    changed = True
-            for binding in getattr(self, "_numeric_bindings", {}).values():
-                if binding.hover is not None:
-                    _set_numeric_hover(binding, None)
-                    changed = True
             if changed:
                 self.update()
         return super().event(event)

@@ -21,15 +21,20 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     BlockId,
+    CellValidity,
     ComponentValidity,
     DataBlock,
     DatasetSchema,
+    Invalid,
     OwnedSnapshot,
     StreamGenerationId,
     ValidityContract,
     Value,
     ValuePayloadContract,
     ValueSchema,
+    Valid,
+    INVALID,
+    VALID,
 )
 from zlc_neutral_atom.acquisition.camera import (
     CameraDatasetEventAdapter,
@@ -1214,6 +1219,109 @@ def resolve_occupancy_stream_schema(
     )
 
 
+def apply_occupancy_snapshot(
+    source: OwnedSnapshot,
+    calibration: ResolvedCalibration,
+    *,
+    model_kind: ReadoutModelKind | None = None,
+) -> tuple[OwnedSnapshot, OwnedSnapshot]:
+    """Classify one already-published camera dataset without reacquiring it.
+
+    This is the reactive Processor path: the caller supplies one immutable
+    camera revision and an admitted calibration.  The function preserves the
+    source repeat/point axes and revision, adds only the calibration's SITE
+    axis, and returns counts/occupied as one pair.  It has no camera, pulse,
+    timeout, buffering, or scheduling authority.
+
+    Physical camera-role admission remains the composition root's job because
+    a materialized :class:`OwnedSnapshot` intentionally carries data lineage,
+    not a device capability.  This owner still rejects any structural frame
+    mismatch against the calibration's complete frame schema.
+    """
+
+    if not isinstance(source, OwnedSnapshot):
+        raise TypeError("source must be an OwnedSnapshot")
+    if type(calibration) is not ResolvedCalibration:
+        raise TypeError("calibration must be an admitted ResolvedCalibration")
+    calibration._require_authority()
+    artifact = calibration.artifact
+    model = artifact.select_model(model_kind)
+    resolved = _resolve_occupancy_stream_schema_parts(
+        calibration,
+        source.block.schema,
+        model.kind,
+    )
+    source_block = source.block
+    source_schema = source_block.schema
+    counts_schema = resolved.counts_schema
+    occupied_schema = resolved.occupied_schema
+    counts_values = np.zeros(counts_schema.physical_shape, dtype="<f8")
+    occupied_values = np.zeros(occupied_schema.physical_shape, dtype=bool)
+    validity_values = np.zeros(counts_schema.physical_shape, dtype=bool)
+
+    def source_cell_validity(repeat_index: int, point_index: int):
+        validity = source_block.validity
+        if isinstance(validity, CellValidity):
+            return VALID if validity.mask[repeat_index, point_index] else INVALID
+        if isinstance(validity, ComponentValidity):
+            return ComponentValidity(
+                validity.axis_ids,
+                validity.mask[repeat_index, point_index],
+            )
+        if isinstance(validity, (Valid, Invalid)):
+            return validity
+        raise TypeError("camera dataset has unsupported validity")
+
+    for repeat_index in range(source_schema.repeat_axis.size):
+        for point_index in range(source_schema.point_layout.storage_size):
+            frame = Value(
+                source_block.values[repeat_index, point_index],
+                source_cell_validity(repeat_index, point_index),
+                source_schema.cell_schema,
+            )
+            result = _apply_readout_model(model, frame)
+            validity = result.occupied.validity
+            if not isinstance(validity, ComponentValidity):
+                raise TypeError("readout result requires ComponentValidity")
+            location = (repeat_index, point_index)
+            counts_values[location] = result.signals.values
+            occupied_values[location] = result.occupied.values
+            validity_values[location] = validity.mask
+
+    site_axis = resolved.selected_model.feature.site_axis
+    validity = ComponentValidity((site_axis.axis_id,), validity_values)
+    reference = calibration.reference
+    generation_digest = canonical_digest(
+        {
+            "owner": "zlc_neutral_atom.reactive-occupancy",
+            "source_generation": source.ref.stream_generation.value,
+            "source_schema": source.ref.schema_fingerprint,
+            "calibration_repository": reference.repository_id,
+            "calibration_manifest": reference.manifest_digest,
+            "model_kind": model.kind.value,
+        }
+    )
+    generation = StreamGenerationId(f"reactive-occupancy-{generation_digest}")
+    counts = DataBlock(
+        OCCUPANCY_COUNTS_BLOCK_ID,
+        source_block.revision,
+        counts_values,
+        validity,
+        counts_schema,
+    )
+    occupied = DataBlock(
+        OCCUPANCY_OCCUPIED_BLOCK_ID,
+        source_block.revision,
+        occupied_values,
+        validity,
+        occupied_schema,
+    )
+    return (
+        OwnedSnapshot(counts.ref(generation), counts),
+        OwnedSnapshot(occupied.ref(generation), occupied),
+    )
+
+
 def bind_occupancy_stream_processor(
     spec: OccupancyStreamProcessorSpec,
     capture_input: CaptureProcessorInputBinding,
@@ -1282,6 +1390,7 @@ def bind_occupancy_stream_processor(
 
 
 __all__ = [
+    "apply_occupancy_snapshot",
     "OCCUPANCY_COUNTS_BLOCK_ID",
     "OCCUPANCY_OCCUPIED_BLOCK_ID",
     "OCCUPANCY_STREAM_PROCESSOR_DEFINITION",

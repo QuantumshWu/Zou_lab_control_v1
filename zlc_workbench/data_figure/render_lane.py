@@ -17,6 +17,7 @@ from zlc_frontend import (
     CurvePanelPayload,
     DataFigure,
     FitAuthoringOption,
+    fit_projection_metadata,
     HistogramPanelPayload,
     ImagePanelPayload,
     MeterDisplayState,
@@ -25,6 +26,7 @@ from zlc_frontend import (
     PanelPresentationIdentity,
     RadialGaussianImageFitOverlay,
     SourceIdentity,
+    validate_fit_authoring_options,
 )
 from zlc_frontend.curve_display import CurveDisplayState
 from zlc_frontend.display_range import RelimMode, validated_display_range
@@ -56,12 +58,10 @@ from .projection import (
     _classify_single_typed,
     _classify_typed_grid,
     _figure_summary,
-    _fit_projection_metadata,
     _payload_intent,
     _grid_state_intent,
     _state_intent,
     _require_not_cancelled,
-    _validate_fit_replay_options,
     _validate_rendered_authored_payload,
     _typed_join_digest,
 )
@@ -251,7 +251,7 @@ def _prepare_fit_options(
         raise ValueError("Fit options require one source schema and unique models")
     if any(option.spec.fit_axis_ids != fit_axis_ids for option in options):
         raise ValueError("Fit option axes differ from the exact displayed axes")
-    return _validate_fit_replay_options(
+    return validate_fit_authoring_options(
         options,
         fit_axis_ids=fit_axis_ids,
         axis_roles=axis_roles,
@@ -420,6 +420,7 @@ def _render_typed_front(
                 data_range=data_range,
                 title=title,
                 value_label=value_label,
+                distribution_identity=evaluated_input.ref,
                 fit_overlay=image_fit_overlay,
             )
         finally:
@@ -520,7 +521,7 @@ def _render_typed_front(
         ),
     )
     _validate_rendered_authored_payload(payload, state, fit_result_identity)
-    fit_axis_ids, axis_roles = _fit_projection_metadata(figure, intent)
+    fit_axis_ids, axis_roles = fit_projection_metadata(figure, intent)
     data_contract = _build_typed_front_contract(
         intent,
         frame,

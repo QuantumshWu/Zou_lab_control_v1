@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import os
+from pathlib import Path
 import threading
 import time
-from typing import Mapping
+from typing import Callable, Mapping
 import uuid
+
+import numpy as np
 
 from zlc_data.param_decl import ParamDecl
 from zlc_neutral_atom.pulse_programs import DEFAULT_MOT_FIELD_PULSE_PATH
@@ -25,30 +30,17 @@ from zlc_neutral_atom.runtime.run import (
 )
 from zlc_neutral_atom.scan import ScanArtifactRef
 from zlc_neutral_atom.scan.repository import MaterializedScanData
-
-
-def _preferred(
-    roles: tuple[str, ...],
-    *candidates: str,
-) -> str:
-    if not roles:
-        raise ValueError("MOT task requires at least one configured role")
-    for candidate in candidates:
-        if candidate in roles:
-            return candidate
-    return roles[0]
+from zlc_storage.paths import resolve_under_project
 
 
 def mot_field_params(
     camera_roles: tuple[str, ...],
-    sequencer_roles: tuple[str, ...],
 ) -> tuple[ParamDecl, ...]:
     """Return the familiar one-click MOT controls, with no generic timeout."""
 
     camera_roles = tuple(
         role for role in camera_roles if role == "mot_camera"
     ) or ("mot_camera",)
-    sequencer_roles = tuple(sequencer_roles)
     return (
         ParamDecl(
             "pulse",
@@ -153,10 +145,22 @@ def mot_field_params(
             tooltip="The 1x..2x annulus supplies the local background",
         ),
         ParamDecl(
+            "folder",
+            "Report folder",
+            "path",
+            default="mot_field",
+            required=True,
+            path_mode="dir",
+            tooltip=(
+                "Raw intensity block, exact Bx/By/Bz axes, and refined "
+                "optimum are written to mot_field_scan.npz"
+            ),
+        ),
+        ParamDecl(
             "camera_role",
             "Camera role",
             "choice",
-            default=_preferred(camera_roles, "mot_camera"),
+            default=camera_roles[0],
             required=True,
             choices=camera_roles,
             tooltip=(
@@ -164,47 +168,89 @@ def mot_field_params(
                 "the MOT; a free-running monitor cannot prove point association"
             ),
         ),
-        ParamDecl(
-            "sequencer_role",
-            "Sequencer role",
-            "choice",
-            default=_preferred(sequencer_roles, "sequencer"),
-            required=True,
-            choices=sequencer_roles,
-        ),
-        ParamDecl(
-            "trigger_channel",
-            "Trigger channel",
-            "text",
-            default=None,
-            required=False,
-            tooltip="Leave blank to use the camera/pulse binding's declared trigger",
-        ),
     )
 
 
-def build_mot_field_request(experiment, values: Mapping[str, object]):
-    """Freeze the form through the notebook facade's typed request owner."""
+def _finite(value: object, field: str) -> float:
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError(f"{field} must be finite")
+    return number
 
-    roi_cx = float(values.get("roi_cx", 0.0))
-    roi_cy = float(values.get("roi_cy", 0.0))
-    options = {
-        "center_x": float(values.get("center_x", 0.0)),
-        "center_y": float(values.get("center_y", 0.0)),
-        "center_z": float(values.get("center_z", 0.0)),
-        "span": float(values.get("span", 12.0)),
-        "points": int(values.get("points", 7)),
-        "roi_cx": None if roi_cx == 0.0 else roi_cx,
-        "roi_cy": None if roi_cy == 0.0 else roi_cy,
-        "roi_radius": float(values.get("roi_radius", 8.0)),
-        "camera_role": str(values["camera_role"]),
-        "sequencer_role": str(values["sequencer_role"]),
-    }
-    trigger = values.get("trigger_channel")
-    if trigger not in (None, ""):
-        options["trigger_channel"] = str(trigger)
-    pulse = values.get("pulse") or DEFAULT_MOT_FIELD_PULSE_PATH
-    return experiment.readout.mot_field_request(pulse, **options)
+
+@dataclass(frozen=True)
+class MotFieldTaskIntent:
+    """Complete user-facing MOT task intent before hardware binding."""
+
+    pulse: str
+    center_x: float
+    center_y: float
+    center_z: float
+    span: float
+    points: int
+    roi_cx: float
+    roi_cy: float
+    roi_radius: float
+    folder: str
+    camera_role: str
+
+    def __post_init__(self) -> None:
+        pulse = str(self.pulse).strip()
+        if not pulse:
+            raise ValueError("pulse must not be blank")
+        center_x = _finite(self.center_x, "center_x")
+        center_y = _finite(self.center_y, "center_y")
+        center_z = _finite(self.center_z, "center_z")
+        span = _finite(self.span, "span")
+        if span < 0.0:
+            raise ValueError("span must be non-negative")
+        if not isinstance(self.points, int) or isinstance(self.points, bool):
+            raise TypeError("points must be an integer")
+        if self.points < 2:
+            raise ValueError("points must be at least 2")
+        roi_cx = _finite(self.roi_cx, "roi_cx")
+        roi_cy = _finite(self.roi_cy, "roi_cy")
+        if roi_cx < 0.0 or roi_cy < 0.0:
+            raise ValueError("ROI centre coordinates must be non-negative")
+        roi_radius = _finite(self.roi_radius, "roi_radius")
+        if roi_radius <= 0.0:
+            raise ValueError("roi_radius must be positive")
+        folder = str(self.folder).strip()
+        if not folder:
+            raise ValueError("folder must not be blank")
+        camera_role = str(self.camera_role).strip()
+        if camera_role != "mot_camera":
+            raise ValueError("MOT field task requires the mot_camera role")
+        object.__setattr__(self, "pulse", pulse)
+        object.__setattr__(self, "center_x", center_x)
+        object.__setattr__(self, "center_y", center_y)
+        object.__setattr__(self, "center_z", center_z)
+        object.__setattr__(self, "span", span)
+        object.__setattr__(self, "roi_cx", roi_cx)
+        object.__setattr__(self, "roi_cy", roi_cy)
+        object.__setattr__(self, "roi_radius", roi_radius)
+        object.__setattr__(self, "folder", folder)
+        object.__setattr__(self, "camera_role", camera_role)
+
+
+def build_mot_field_intent(
+    values: Mapping[str, object],
+) -> MotFieldTaskIntent:
+    """Freeze the visible task form without exposing hardware wiring knobs."""
+
+    return MotFieldTaskIntent(
+        pulse=str(values.get("pulse") or DEFAULT_MOT_FIELD_PULSE_PATH),
+        center_x=float(values.get("center_x", 0.0)),
+        center_y=float(values.get("center_y", 0.0)),
+        center_z=float(values.get("center_z", 0.0)),
+        span=float(values.get("span", 12.0)),
+        points=values.get("points", 7),
+        roi_cx=float(values.get("roi_cx", 0.0)),
+        roi_cy=float(values.get("roi_cy", 0.0)),
+        roi_radius=float(values.get("roi_radius", 8.0)),
+        folder=str(values.get("folder", "mot_field")),
+        camera_role=str(values.get("camera_role", "mot_camera")),
+    )
 
 
 class _ScanEnded(Exception):
@@ -221,6 +267,53 @@ def _summary(error: BaseException) -> str:
     return type(error).__name__ if not text else f"{type(error).__name__}: {text}"
 
 
+def write_mot_field_report(
+    result: MotFieldResult,
+    folder: str | Path,
+) -> Path:
+    """Atomically write the Task Console's authoritative MOT report data.
+
+    The exact scan repository remains the owner of camera frames and run
+    lineage.  This small operator-facing report preserves the analyzed 3-D
+    intensity block, all three physical DAC coordinate axes, and the refined
+    optimum.  Plot panels consume :class:`MotFieldResult` separately; report
+    persistence therefore has no frontend or matplotlib dependency.
+    """
+
+    if not isinstance(result, MotFieldResult):
+        raise TypeError("result must be MotFieldResult")
+    directory = resolve_under_project(folder)
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / "mot_field_scan.npz"
+    axes = tuple(
+        np.asarray(
+            tuple(axis.coordinate_at(index) for index in range(axis.size))
+        )
+        for axis in result.point_axes
+    )
+    temporary = directory / f".{target.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        with temporary.open("wb") as stream:
+            np.savez(
+                stream,
+                intensity=np.asarray(result.intensity),
+                bx=axes[0],
+                by=axes[1],
+                bz=axes[2],
+                best=np.asarray(result.best_field, dtype=np.float64),
+                best_intensity=np.asarray(
+                    result.best_intensity,
+                    dtype=np.float64,
+                ),
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
 class MotFieldTaskHandle:
     """Run-like owner of one exact Scan Run followed by pure MOT analysis."""
 
@@ -228,6 +321,7 @@ class MotFieldTaskHandle:
         self,
         request: MotFieldRequest,
         *,
+        report_folder: str | Path,
         start_scan,
         materialize_scan,
     ) -> None:
@@ -237,6 +331,7 @@ class MotFieldTaskHandle:
             raise TypeError("MOT task callbacks must be callable")
         self.run_id = RunId(f"mot-field-task-{uuid.uuid4().hex}")
         self._request = request
+        self._report_folder = resolve_under_project(report_folder)
         self._start_scan = start_scan
         self._materialize_scan = materialize_scan
         self._condition = threading.Condition(threading.RLock())
@@ -247,6 +342,7 @@ class MotFieldTaskHandle:
         self._terminal: RunSnapshot | None = None
         self._scan_ref: ScanArtifactRef | None = None
         self._result: MotFieldResult | None = None
+        self._report_path: Path | None = None
         self._thread = threading.Thread(
             target=self._coordinate,
             name=f"zlc-mot-field-{self.run_id.value[-12:]}",
@@ -258,6 +354,13 @@ class MotFieldTaskHandle:
     def source_scan_ref(self) -> ScanArtifactRef | None:
         with self._condition:
             return self._scan_ref
+
+    @property
+    def report_path(self) -> Path | None:
+        """Return the committed report path, or ``None`` before success."""
+
+        with self._condition:
+            return self._report_path
 
     def _checkpoint(self) -> None:
         with self._condition:
@@ -323,7 +426,14 @@ class MotFieldTaskHandle:
             result = analyze_mot_scan(self._request, materialized)
             self._checkpoint()
             with self._condition:
+                self._phase = "writing-report"
+            report_path = write_mot_field_report(
+                result,
+                self._report_folder,
+            )
+            with self._condition:
                 self._result = result
+                self._report_path = report_path
             self._finish(
                 RunState.SUCCEEDED,
                 "mot-field-complete",
@@ -427,21 +537,38 @@ class MotFieldTaskHandle:
 
 
 def start_mot_field_task(
-    request: MotFieldRequest,
+    intent: MotFieldTaskIntent,
     *,
+    bind_request: Callable[[MotFieldTaskIntent], MotFieldRequest],
     start_scan,
     materialize_scan,
 ) -> MotFieldTaskHandle:
+    """Bind one visible intent at the composition root and start its task.
+
+    Device-role resolution stays in the root-supplied ``bind_request`` callable;
+    the Task Console owns only the visible intent and its report folder.
+    """
+
+    if not isinstance(intent, MotFieldTaskIntent):
+        raise TypeError("intent must be MotFieldTaskIntent")
+    if not callable(bind_request):
+        raise TypeError("bind_request must be callable")
+    request = bind_request(intent)
+    if not isinstance(request, MotFieldRequest):
+        raise TypeError("bind_request must return MotFieldRequest")
     return MotFieldTaskHandle(
         request,
+        report_folder=intent.folder,
         start_scan=start_scan,
         materialize_scan=materialize_scan,
     )
 
 
 __all__ = [
+    "MotFieldTaskIntent",
     "MotFieldTaskHandle",
-    "build_mot_field_request",
+    "build_mot_field_intent",
     "mot_field_params",
     "start_mot_field_task",
+    "write_mot_field_report",
 ]

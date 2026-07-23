@@ -604,6 +604,7 @@ def _render_evaluated_figure(
                             ),
                             analysis_edges=shared_histogram_analysis_edges,
                             show_stats=False,
+                            infer_fit_threshold=False,
                             threshold_linewidth=1.4,
                         )
                     target.set_xlabel(panel_value_label)

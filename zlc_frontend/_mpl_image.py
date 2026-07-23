@@ -9,7 +9,7 @@ import warnings
 from numbers import Integral, Number
 import matplotlib
 import numpy as np
-from zlc_data import FitBatchStatus, FitResultBatch
+from zlc_data import DatasetRevisionRef, FitBatchStatus, FitResultBatch
 from zlc_storage import positive_integer
 from .figure import (
     EvaluatedAxis,
@@ -36,7 +36,7 @@ from .image_display import (
     evaluated_image_data_range,
     image_viewport_for_display_state,
 )
-from .image_view import image_viewport_for_evaluated_image
+from .image_view import ImageViewportTransform, image_viewport_for_evaluated_image
 from .display_range import (
     RelimMode,
     deadband_display_range,
@@ -96,9 +96,11 @@ from .site_map import (
 )
 
 from ._mpl_common import (
+    _AggBlitCache,
+    _agg_chrome_key,
+    _agg_layout_key,
     _fit_status,
     _render_dpi,
-    raster_from_agg,
     release_agg_figure,
 )
 
@@ -661,62 +663,6 @@ def save_radial_gaussian_image_fit_panels(
         figure = None
         gc.collect()
 
-def _image_panel_extent(
-    image: EvaluatedImage,
-    *,
-    site_map: bool,
-) -> tuple[float, float, float, float]:
-    """Return main's pixel-edge extent ``left,right,bottom,top``."""
-
-    x_edges, x_centers, _x_labels = _image_axis(image.x_axis)
-    y_edges, y_centers, _y_labels = _image_axis(image.y_axis)
-    if site_map:
-        return (
-            float(x_edges[0]),
-            float(x_edges[-1]),
-            float(y_edges[-1]),
-            float(y_edges[0]),
-        )
-
-    def main_edges(centers: np.ndarray) -> tuple[float, float]:
-        if len(centers) == 1:
-            half_step = 0.5
-        else:
-            half_step = 0.5 * (
-                float(centers[-1]) - float(centers[0])
-            ) / len(centers)
-        return (
-            float(centers[0]) - half_step,
-            float(centers[-1]) + half_step,
-        )
-
-    x_start, x_stop = main_edges(x_centers)
-    y_start, y_stop = main_edges(y_centers)
-    return (
-        x_start,
-        x_stop,
-        y_stop,
-        y_start,
-    )
-
-def _image_view_limits(
-    viewport,
-    extent: tuple[float, float, float, float],
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    left, top, right, bottom = viewport.visible_bounds
-    x0, x1, y_bottom, y_top = extent
-    x_limits = (
-        x0 + left * (x1 - x0),
-        x0 + right * (x1 - x0),
-    )
-    # ``visible_bounds`` is first-row -> last-row, while imshow's extent stores
-    # bottom before top.  Main's upper origin therefore keeps this order.
-    y_limits = (
-        y_top + bottom * (y_bottom - y_top),
-        y_top + top * (y_bottom - y_top),
-    )
-    return x_limits, y_limits
-
 def _decimate_image_view(
     grid: np.ndarray,
     extent: tuple[float, float, float, float],
@@ -802,16 +748,21 @@ def _normalized_axis_bbox(axis, width: int, height: int):
         1.0 - y / height,
     )
 
+
 class ImagePanelAggRenderer:
     """Worker-affine full-panel image renderer using main's exact visible owner."""
 
     __slots__ = (
         "_axis",
         "_bin_count",
+        "_blit_cache",
         "_colorbar",
+        "_colorbar_state",
         "_count_ceiling",
         "_distribution",
         "_distribution_artist",
+        "_distribution_cache_key",
+        "_distribution_cache_value",
         "_figure",
         "_fit_center_artist",
         "_fit_diagnostic_artist",
@@ -990,13 +941,17 @@ class ImagePanelAggRenderer:
         self._fit_diagnostic_artist = fit_diagnostic_artist
         self._fit_ring_artist = fit_ring_artist
         self._axis = axis
+        self._blit_cache = _AggBlitCache()
         self._distribution = distribution
         self._image_artist = image_artist
         self._layout = layout
         self._distribution_artist = distribution_artist
+        self._distribution_cache_key = None
+        self._distribution_cache_value = None
         self._guide_lines = guide_lines
         self._limit_lines = limit_lines
         self._colorbar = colorbar
+        self._colorbar_state = None
         self._site_artist = site_artist
         self._site_map = site_map
         self._size = (width, height)
@@ -1017,6 +972,7 @@ class ImagePanelAggRenderer:
         value_label: str = "Signal",
         distribution_guides: bool = True,
         distribution_bins: int | None = None,
+        distribution_identity: DatasetRevisionRef | None = None,
         site_centers_xy: np.ndarray | None = None,
         site_radius: float | None = None,
         site_occupied: np.ndarray | None = None,
@@ -1027,16 +983,31 @@ class ImagePanelAggRenderer:
         self._require_owner()
         if not isinstance(image, EvaluatedImage):
             raise TypeError("image must be EvaluatedImage")
+        if not isinstance(viewport, ImageViewportTransform):
+            raise TypeError("viewport must be ImageViewportTransform")
         if not isinstance(display, ImageDisplayState):
             raise TypeError("display must be ImageDisplayState")
+        if distribution_identity is not None and not isinstance(
+            distribution_identity,
+            DatasetRevisionRef,
+        ):
+            raise TypeError(
+                "distribution_identity must be DatasetRevisionRef or None"
+            )
         with render_style_context():
             width, height = self._size
-            extent = _image_panel_extent(image, site_map=self._site_map)
-            x_limits, y_limits = _image_view_limits(viewport, extent)
+            extent = viewport.data_extent
+            visible_extent = viewport.visible_data_extent
+            display_extent = viewport.display_extent
+            visible_x_limits = visible_extent[:2]
+            visible_y_limits = visible_extent[2:]
+            x_limits = display_extent[:2]
+            y_limits = display_extent[2:]
             values = np.asarray(image.values)
             validity = np.asarray(image.validity, dtype=bool)
             finite_validity = validity & np.isfinite(values)
-            if np.all(finite_validity):
+            all_finite_validity = bool(np.all(finite_validity))
+            if all_finite_validity:
                 display_values = values
             else:
                 display_values = np.asarray(values, dtype=np.float64).copy()
@@ -1048,16 +1019,23 @@ class ImagePanelAggRenderer:
             shown, shown_extent = _decimate_image_view(
                 display_values,
                 extent,
-                x_limits,
-                y_limits,
+                visible_x_limits,
+                visible_y_limits,
                 display_pixel_shape,
             )
-            cmap = matplotlib.colormaps[display.colormap.value].copy()
-            cmap.set_bad(PALETTE["bad"])
-            self._image_artist.set_cmap(cmap)
+            colormap_name = str(display.colormap.value)
+            if self._image_artist.get_cmap().name != colormap_name:
+                cmap = matplotlib.colormaps[colormap_name].copy()
+                cmap.set_bad(PALETTE["bad"])
+                self._image_artist.set_cmap(cmap)
+            else:
+                cmap = self._image_artist.get_cmap()
             self._image_artist.set_data(shown)
             self._image_artist.set_extent(shown_extent)
-            self._image_artist.set_clim(*color_limits)
+            if tuple(float(value) for value in self._image_artist.get_clim()) != tuple(
+                float(value) for value in color_limits
+            ):
+                self._image_artist.set_clim(*color_limits)
             self._axis.set_xlim(*x_limits)
             self._axis.set_ylim(*y_limits)
             self._axis.set_xlabel(_axis_label(image.x_axis))
@@ -1082,7 +1060,9 @@ class ImagePanelAggRenderer:
             self._axis.set_xlim(*x_limits)
             self._axis.set_ylim(*y_limits)
 
-            finite_values = np.asarray(values[finite_validity])
+            # The side distribution is part of the pixel contract.  It must use
+            # every valid value; display performance comes from the worker-owned
+            # Agg/blit lifecycle, never from silently sampling the data.
             bin_count = (
                 max(8, min(max(image.values.size, 1) // 4, 50))
                 if distribution_bins is None
@@ -1091,15 +1071,44 @@ class ImagePanelAggRenderer:
                     "distribution_bins",
                 )
             )
-            counts, edges = np.histogram(
+            distribution_cache_key = (
                 (
-                    finite_values
-                    if finite_values.size
-                    else np.asarray([color_limits[0]])
-                ),
-                bins=bin_count,
-                range=color_limits,
+                    distribution_identity,
+                    bin_count,
+                    tuple(float(value) for value in color_limits),
+                )
+                if distribution_identity is not None
+                else None
             )
+            if (
+                distribution_cache_key is not None
+                and distribution_cache_key == self._distribution_cache_key
+            ):
+                counts, edges = self._distribution_cache_value
+            else:
+                # The common camera contract is fully valid and finite.  Its
+                # immutable C-contiguous plane can enter np.histogram directly;
+                # boolean indexing used to copy every one of the 2.3M values
+                # before the same exact calculation.  Exceptional validity
+                # still follows the original finite-mask path byte-for-byte.
+                finite_values = (
+                    values.reshape(-1)
+                    if all_finite_validity
+                    else np.asarray(values[finite_validity])
+                )
+                counts, edges = np.histogram(
+                    (
+                        finite_values
+                        if finite_values.size
+                        else np.asarray([color_limits[0]])
+                    ),
+                    bins=bin_count,
+                    range=color_limits,
+                )
+                self._distribution_cache_key = distribution_cache_key
+                self._distribution_cache_value = (
+                    None if distribution_cache_key is None else (counts, edges)
+                )
             vertices = np.empty((bin_count, 4, 2), dtype=np.float64)
             for index, count in enumerate(counts):
                 low, high = edges[index], edges[index + 1]
@@ -1140,17 +1149,64 @@ class ImagePanelAggRenderer:
                 ):
                     line.set_ydata((value, value))
 
-            self._colorbar.update_normal(self._image_artist)
-            self._colorbar.set_label(str(value_label))
-            if colorbar_endpoints is True or (
+            # ``set_cmap`` / ``set_clim`` notify the attached colorbar when the
+            # mapping actually changes.  Calling ``update_normal`` regardless
+            # rebuilt its QuadMesh on every camera frame and defeated the
+            # otherwise steady Agg path.
+            endpoints_enabled = colorbar_endpoints is True or (
                 colorbar_endpoints is None and self._render_count > 0
-            ):
-                self._colorbar.set_ticks(color_limits)
-                self._colorbar.set_ticklabels(
-                    [_compact_engineering(value) for value in color_limits]
-                )
-            raster = raster_from_agg(
+            )
+            colorbar_state = (
+                colormap_name,
+                tuple(float(value) for value in color_limits),
+                str(value_label),
+                bool(endpoints_enabled),
+            )
+            if colorbar_state != self._colorbar_state:
+                previous_colorbar_state = self._colorbar_state
+                self._colorbar.set_label(str(value_label))
+                if endpoints_enabled:
+                    self._colorbar.set_ticks(color_limits)
+                    self._colorbar.set_ticklabels(
+                        [_compact_engineering(value) for value in color_limits]
+                    )
+                elif (
+                    previous_colorbar_state is not None
+                    and previous_colorbar_state[3]
+                ):
+                    from matplotlib.ticker import AutoLocator, ScalarFormatter
+
+                    self._colorbar.locator = AutoLocator()
+                    self._colorbar.formatter = ScalarFormatter()
+                    self._colorbar.update_ticks()
+                self._colorbar_state = colorbar_state
+            raster = self._blit_cache.raster(
                 self._figure,
+                (
+                    self._image_artist,
+                    self._distribution_artist,
+                    *self._guide_lines,
+                    *self._limit_lines,
+                    self._site_artist,
+                    self._fit_center_artist,
+                    self._fit_ring_artist,
+                    self._fit_diagnostic_artist,
+                ),
+                layout_key=_agg_layout_key(
+                    self._figure,
+                    extra=(self._site_map,),
+                ),
+                chrome_key=_agg_chrome_key(
+                    self._figure,
+                    extra=(
+                        self._site_map,
+                        str(display.colormap.value),
+                        tuple(float(value) for value in color_limits),
+                        str(value_label),
+                        bool(endpoints_enabled),
+                        self._count_ceiling,
+                    ),
+                ),
                 physical_size=self._size,
             )
             actual_width, actual_height = raster.width, raster.height
@@ -1339,6 +1395,9 @@ class ImagePanelAggRenderer:
         figure, self._figure = self._figure, None
         if figure is None:
             return
+        self._blit_cache.clear()
+        self._distribution_cache_key = None
+        self._distribution_cache_value = None
         release_agg_figure(figure)
         gc.collect()
 

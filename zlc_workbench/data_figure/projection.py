@@ -13,7 +13,6 @@ from zlc_frontend import (
     CurvePanelPayload,
     DataFigure,
     FigurePanelRegion,
-    FitAuthoringOption,
     HistogramPanelPayload,
     ImagePanelPayload,
     MeterDisplayState,
@@ -565,89 +564,6 @@ def _payload_intent(payload: _TypedPanelPayload) -> ViewIntent:
     if isinstance(payload, MeterPanelPayload):
         return ViewIntent.METER
     raise TypeError("unknown typed payload")
-
-def _fit_projection_metadata(
-    figure: DataFigure,
-    intent: ViewIntent,
-) -> tuple[tuple[AxisId, ...], tuple[tuple[AxisId, AxisViewRole], ...]]:
-    layer = figure.document.layers[0]
-    roles = tuple(
-        sorted(
-            ((binding.axis_id, binding.role) for binding in layer.view.axis_bindings),
-            key=lambda item: item[0].value,
-        )
-    )
-    if intent is ViewIntent.CURVE:
-        fit_axes = tuple(
-            axis_id for axis_id, role in roles if role is AxisViewRole.X
-        )
-    elif intent is ViewIntent.IMAGE:
-        x_axes = tuple(
-            axis_id for axis_id, role in roles if role is AxisViewRole.IMAGE_X
-        )
-        y_axes = tuple(
-            axis_id for axis_id, role in roles if role is AxisViewRole.IMAGE_Y
-        )
-        fit_axes = (*x_axes, *y_axes)
-    else:
-        fit_axes = ()
-    expected = 1 if intent is ViewIntent.CURVE else 2 if intent is ViewIntent.IMAGE else 0
-    if len(fit_axes) != expected:
-        raise ValueError("typed figure has ambiguous fitted display axes")
-    return fit_axes, roles
-
-def _validate_fit_replay_options(
-    options: tuple[FitAuthoringOption, ...],
-    *,
-    fit_axis_ids: tuple[AxisId, ...],
-    axis_roles: tuple[tuple[AxisId, AxisViewRole], ...],
-    selection: Selection | None,
-    allow_prepared_transform: bool = False,
-) -> tuple[FitAuthoringOption, ...]:
-    """Reject a solve whose named result rows cannot map to this exact panel."""
-
-    role_by_axis = dict(axis_roles)
-    accepted_batch_roles = {
-        AxisViewRole.BATCH,
-        AxisViewRole.FACET,
-        AxisViewRole.SELECTED,
-        AxisViewRole.SLIDER,
-    }
-    prepared = []
-    for option in options:
-        if option.spec.fit_axis_ids != fit_axis_ids:
-            continue
-        batch_sizes = dict(option.batch_axis_sizes)
-        def batch_axis_is_replayable(axis_id: AxisId) -> bool:
-            role = role_by_axis.get(axis_id)
-            if role in accepted_batch_roles:
-                return True
-            return bool(
-                role is AxisViewRole.REDUCED
-                and batch_sizes[axis_id] == 1
-            )
-
-        if any(
-            not batch_axis_is_replayable(axis_id)
-            for axis_id in option.spec.batch_axis_ids
-        ):
-            continue
-        transform = option.spec.committed_transform
-        if selection is None:
-            if transform is not None and not allow_prepared_transform:
-                continue
-        else:
-            if transform is None:
-                continue
-            if tuple(transform.spec.operations) != (selection,):
-                continue
-        prepared.append(option)
-    if not prepared:
-        raise ValueError(
-            "the visible panel cannot map an authoritative Fit result without "
-            "reducing or guessing a named batch axis"
-        )
-    return tuple(prepared)
 
 @dataclass(frozen=True, slots=True)
 class _TypedFigureFront:

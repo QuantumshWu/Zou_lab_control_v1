@@ -46,13 +46,13 @@ CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT = canonical_digest(
 )
 CAMERA_MEASUREMENT_KEY = DefinitionKey(
     "zlc_neutral_atom.acquisition",
-    "camera-capture",
+    "camera-measurement",
 )
 CAMERA_MEASUREMENT_DEFINITION = MeasurementDefinition(
     CAMERA_MEASUREMENT_KEY,
-    "Camera capture",
-    "zlc.camera-capture-request",
-    "zlc.camera-capture-binding",
+    "Camera",
+    "zlc.camera-measurement-request",
+    "zlc.camera-measurement-binding",
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
 )
 CAMERA_MEASUREMENT_DEFINITIONS = (CAMERA_MEASUREMENT_DEFINITION,)

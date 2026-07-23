@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import math
 from contextlib import contextmanager
@@ -40,12 +41,11 @@ from zlc_data import (
     FitResultBatch,
     FitSpec,
     OwnedSnapshot,
-    ReductionMethod,
     Selection,
-    ValidityPolicy,
     bind_fit,
     commit_transform,
     expand_value_validity,
+    expand_dataset_validity,
     fit_model_catalog,
     fit_spec_for,
     suggest_fit_draft,
@@ -65,24 +65,25 @@ from zlc_neutral_atom.capture_application import (
     CaptureRequest,
     PlanDescriptor,
     PreparedFiniteCapture,
+    PreparedFiniteCameraMeasurement,
     bind_finite_capture_request,
     bind_finite_capture_spec,
     prepare_finite_capture,
+    prepare_finite_camera_measurement,
+)
+from zlc_neutral_atom.camera_measurement import CameraMeasurementRequest
+from zlc_neutral_atom.capture_reference import (
+    capture_artifact_ref_from_tree,
+    capture_artifact_ref_to_tree,
 )
 from zlc_neutral_atom.monitor_application import (
-    CameraMonitorDescriptor,
-    CameraMonitorRequest,
-    PreparedCameraMonitor,
-    prepare_camera_monitor,
+    PreparedLiveCameraMeasurement,
+    prepare_live_camera_measurement,
 )
 from zlc_neutral_atom.mot_field import (
     MotFieldRequest,
     MotFieldResult,
     build_mot_scan_program,
-)
-from zlc_neutral_atom.occupancy_application import (
-    PreparedFiniteOccupancy,
-    prepare_finite_occupancy,
 )
 from zlc_neutral_atom.pulse_application import (
     AppliedPulseSnapshot,
@@ -103,6 +104,7 @@ from zlc_neutral_atom.readout.calibration import (
     GridOrder,
     ReadoutModelKind,
     ResolvedCalibration,
+    ThresholdMethod,
 )
 from zlc_neutral_atom.readout.calibration_reference import (
     CalibrationArtifactRef,
@@ -720,81 +722,33 @@ class ReadoutFacade:
             ("readout", "camera"),
         )
 
-    def _resolve_monitor_camera_role(
-        self,
-        services: _ExperimentServices,
-        requested: str | None,
-    ) -> str:
-        if self._binding is not None:
-            if requested is not None and requested != self._binding.value:
-                raise ValueError("bound readout facade cannot target another camera")
-            requested = self._binding.value
-        return _resolve_role(
-            services.catalog,
-            requested,
-            "camera",
-            ("monitor_camera",),
-        )
-
-    def camera_monitor_request(
+    def camera_measurement_request(
         self,
         *,
         camera_role: str | None = None,
-        history_capacity: int = 8,
-        roi: Selection | None = None,
-        roi_reduction: ReductionMethod = ReductionMethod.MEAN,
-        roi_validity_policy: ValidityPolicy = ValidityPolicy.REQUIRE_ALL,
-        scalar_history_capacity: int = 300,
-    ) -> CameraMonitorRequest:
-        """Freeze one free-running monitor request without starting hardware."""
+        repeat: int = 0,
+        frames_per_cycle: int = 1,
+    ) -> CameraMeasurementRequest:
+        """Freeze Main's one Camera semantic: 0=live, K=finite."""
 
+        if isinstance(repeat, bool) or not isinstance(repeat, int):
+            raise TypeError("repeat must be an integer")
+        if repeat < 0:
+            raise ValueError("repeat must be non-negative")
+        if (
+            isinstance(frames_per_cycle, bool)
+            or not isinstance(frames_per_cycle, int)
+            or frames_per_cycle < 1
+        ):
+            raise ValueError("frames_per_cycle must be a positive integer")
         with _service_guard(self._token) as services:
-            role = self._resolve_monitor_camera_role(services, camera_role)
-            return CameraMonitorRequest(
-                camera_ref=services.catalog.require(role).ref,
-                history_capacity=history_capacity,
-                roi=roi,
-                roi_reduction=roi_reduction,
-                roi_validity_policy=roi_validity_policy,
-                scalar_history_capacity=scalar_history_capacity,
+            role = self._resolve_camera_role(services, camera_role)
+            camera_ref = services.catalog.require(role).ref
+            return CameraMeasurementRequest(
+                camera_ref=camera_ref,
+                repeat=repeat,
+                frames_per_cycle=frames_per_cycle,
             )
-
-    def inspect_camera_monitor(
-        self,
-        request: CameraMonitorRequest,
-    ) -> CameraMonitorDescriptor:
-        if not isinstance(request, CameraMonitorRequest):
-            raise TypeError("request must be CameraMonitorRequest")
-        self._require_binding(ReadoutBindingKey(request.camera_ref.role))
-        with _service_guard(self._token) as services:
-            return _prepare_camera_monitor_for_services(services, request).descriptor
-
-    def camera_monitor_gui(
-        self,
-        request: CameraMonitorRequest | None = None,
-        **request_options,
-    ):
-        """Open raw IMAGE plus an optional typed derived ROI scalar history."""
-
-        if request is None:
-            request = self.camera_monitor_request(**request_options)
-        elif request_options:
-            raise TypeError(
-                "camera_monitor_gui request options are only valid without a request"
-            )
-        if not isinstance(request, CameraMonitorRequest):
-            raise TypeError("request must be CameraMonitorRequest")
-        self._require_binding(ReadoutBindingKey(request.camera_ref.role))
-
-        def prepare(candidate: CameraMonitorRequest) -> PreparedCameraMonitor:
-            if not isinstance(candidate, CameraMonitorRequest):
-                raise TypeError("camera monitor prepare requires CameraMonitorRequest")
-            with _service_guard(self._token) as services:
-                return _prepare_camera_monitor_for_services(services, candidate)
-
-        from Zou_lab_control.workbench import open_camera_monitor_workbench
-
-        return open_camera_monitor_workbench(prepare, request)
 
     def capture_request(
         self,
@@ -1312,11 +1266,91 @@ class ReadoutFacade:
 
         return _start_scan(self._token, _mot_field_scan_request(request))
 
+    def _sitemap_profile(
+        self,
+        camera_role: str | None,
+    ) -> tuple[str, SitemapAcquisitionProfile]:
+        """Resolve the one installation-owned sitemap profile for a camera."""
+
+        with _service_guard(self._token) as services:
+            selected_camera = self._resolve_camera_role(services, camera_role)
+            camera_ref = services.catalog.require(selected_camera).ref
+            profile = services.runtime.sitemap_profile(camera_ref)
+        if not isinstance(profile, SitemapAcquisitionProfile):
+            raise TypeError("installation returned an invalid sitemap profile")
+        if profile.readout_binding != ReadoutBindingKey(selected_camera):
+            raise ValueError(
+                "installation sitemap profile differs from the selected camera"
+            )
+        return selected_camera, profile
+
+    def sitemap_camera_roles(self) -> tuple[str, ...]:
+        """Installed camera roles with a complete live calibration profile."""
+
+        with _service_guard(self._token) as services:
+            roles = tuple(services.runtime.sitemap_camera_roles())
+            cameras = set(services.catalog.roles("camera"))
+        if any(role not in cameras for role in roles):
+            raise RuntimeError(
+                "installation sitemap capabilities differ from its camera catalog"
+            )
+        return roles
+
+    @staticmethod
+    def _sitemap_analysis(
+        profile: SitemapAcquisitionProfile,
+        *,
+        threshold_method: ThresholdMethod | str,
+        roi_radius: int | None,
+    ) -> CalibrationAnalysisRequest:
+        """Apply operator analysis intent to the installation's one profile."""
+
+        if isinstance(threshold_method, str):
+            try:
+                threshold_method = ThresholdMethod(threshold_method.strip().lower())
+            except ValueError as error:
+                raise ValueError(
+                    "threshold_method must be 'otsu' or 'bimodal'"
+                ) from error
+        if not isinstance(threshold_method, ThresholdMethod):
+            raise TypeError("threshold_method must be ThresholdMethod or str")
+        if roi_radius is not None:
+            if isinstance(roi_radius, bool) or not isinstance(roi_radius, int):
+                raise TypeError("roi_radius must be an integer or None")
+            if roi_radius < 1:
+                raise ValueError("roi_radius must be positive")
+        return replace(
+            profile.analysis_request(CAPTURE_READOUT_EVENT_AXIS_ID),
+            threshold_method=threshold_method,
+            **({} if roi_radius is None else {"box_radius": roi_radius}),
+        )
+
+    def sitemap_analysis_request(
+        self,
+        *,
+        camera_role: str | None = None,
+        threshold_method: ThresholdMethod | str = ThresholdMethod.OTSU,
+        roi_radius: int | None = None,
+    ) -> CalibrationAnalysisRequest:
+        """Freeze sitemap analysis intent without manufacturing a live capture."""
+
+        _selected_camera, profile = self._sitemap_profile(camera_role)
+        return self._sitemap_analysis(
+            profile,
+            threshold_method=threshold_method,
+            roi_radius=roi_radius,
+        )
+
     def sitemap_request(
         self,
         *,
         frames: int = 20,
         camera_role: str | None = None,
+        pulse: PulseDocument | str | Path | None = None,
+        reference_exposure_s: float | None = None,
+        readout_exposure_s: float | None = None,
+        threshold_method: ThresholdMethod | str = ThresholdMethod.OTSU,
+        roi_radius: int | None = None,
         calibration_timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS,
     ) -> SitemapCalibrationRequest:
         """Freeze one installation-qualified capture-then-calibration request.
@@ -1333,19 +1367,39 @@ class ReadoutFacade:
             calibration_timeout_seconds,
             "calibration_timeout_seconds",
         )
-        with _service_guard(self._token) as services:
-            selected_camera = self._resolve_camera_role(services, camera_role)
-            camera_ref = services.catalog.require(selected_camera).ref
-            profile = services.runtime.sitemap_profile(camera_ref)
-            if not isinstance(profile, SitemapAcquisitionProfile):
-                raise TypeError("installation returned an invalid sitemap profile")
-            if profile.readout_binding != ReadoutBindingKey(selected_camera):
-                raise ValueError(
-                    "installation sitemap profile differs from the selected camera"
-                )
-        document = profile.document_for_repeats(repeat_groups)
+        selected_camera, profile = self._sitemap_profile(camera_role)
+
+        selected_pulse = (
+            None
+            if pulse is None
+            else pulse
+            if isinstance(pulse, PulseDocument)
+            else load_pulse_document(Path(pulse).expanduser())
+        )
+        if (reference_exposure_s is None) != (readout_exposure_s is None):
+            raise ValueError(
+                "reference_exposure_s and readout_exposure_s must be set together"
+            )
+        if reference_exposure_s is None:
+            selected_profile = (
+                profile
+                if selected_pulse is None
+                else replace(profile, pulse_document=selected_pulse)
+            )
+            document = selected_profile.document_for_repeats(repeat_groups)
+        else:
+            document = profile.configured_document_for_repeats(
+                repeat_groups,
+                reference_exposure_s=reference_exposure_s,
+                readout_exposure_s=readout_exposure_s,
+                pulse_document=selected_pulse,
+            )
         grouping = profile.repeat_major_grouping(repeat_groups)
-        analysis = profile.analysis_request(CAPTURE_READOUT_EVENT_AXIS_ID)
+        analysis = self._sitemap_analysis(
+            profile,
+            threshold_method=threshold_method,
+            roi_radius=roi_radius,
+        )
         capture_request = self.capture_request(
             document,
             execution_form=PulseExecutionForm.STATIC_ONCE,
@@ -1393,6 +1447,144 @@ class ReadoutFacade:
             raise SitemapCalibrationInterrupted(source) from error
         except Exception as error:
             raise SitemapCalibrationFailed(source) from error
+
+    def _resolve_saved_calibration_capture(
+        self,
+        source_path: str | Path,
+        *,
+        expected_camera_role: str,
+    ) -> CaptureArtifactRef:
+        """Admit a task-exported raw capture bundle without inventing lineage.
+
+        The raw arrays are an operator copy; the canonical capture in
+        the CaptureRepository remains the authority for camera/pulse lineage.
+        The bundle therefore resolves only while that repository artifact is
+        available; copying anonymous arrays into another workspace cannot
+        manufacture the missing physical evidence.
+        A directory of anonymous ``.npy`` images is intentionally insufficient
+        for a formal calibration because it cannot prove exposure, event order,
+        camera binding, or the fired pulse.
+        """
+
+        folder = Path(source_path).expanduser().resolve()
+        metadata_path = folder / "capture.json"
+        if not metadata_path.is_file():
+            raise FileNotFoundError(
+                f"saved calibration source has no {metadata_path.name}; "
+                "plain frames have no camera/pulse lineage"
+            )
+        tree = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(tree, dict) or set(tree) != {
+            "schema",
+            "capture_ref",
+            "dataset_schema_fingerprint",
+            "values_file",
+            "validity_file",
+        }:
+            raise ValueError("saved calibration capture metadata is not current")
+        if tree["schema"] != "zlc.calibration-task.capture-export.v1":
+            raise ValueError("saved calibration capture metadata has unknown schema")
+        reference = capture_artifact_ref_from_tree(tree["capture_ref"])
+        values_path = folder / str(tree["values_file"])
+        validity_path = folder / str(tree["validity_file"])
+        if not values_path.is_file() or not validity_path.is_file():
+            raise FileNotFoundError("saved calibration raw arrays are incomplete")
+        with _service_guard(self._token) as services:
+            admitted = services.capture_repository.admit(reference)
+            if admitted.artifact.camera_provenance.binding.value != expected_camera_role:
+                raise ValueError(
+                    "saved calibration capture belongs to camera role "
+                    f"{admitted.artifact.camera_provenance.binding.value!r}, not "
+                    f"{expected_camera_role!r}"
+                )
+            snapshot = admitted.materialize_snapshot()
+        block = snapshot.block
+        if tree["dataset_schema_fingerprint"] != block.schema.fingerprint:
+            raise ValueError("saved calibration schema differs from its capture authority")
+        values = np.load(values_path, allow_pickle=False)
+        validity = np.load(validity_path, allow_pickle=False)
+        expected_validity = expand_dataset_validity(block.validity, block.schema)
+        if (
+            values.dtype != block.values.dtype
+            or values.shape != block.values.shape
+            or not np.array_equal(values, block.values, equal_nan=True)
+            or validity.dtype != np.dtype(bool)
+            or validity.shape != expected_validity.shape
+            or not np.array_equal(validity, expected_validity)
+        ):
+            raise ValueError(
+                "saved calibration raw arrays differ from the lineage-bearing capture"
+            )
+        return reference
+
+    def _write_calibration_task_outputs(
+        self,
+        source: CaptureArtifactRef,
+        calibration: CalibrationArtifactRef,
+        *,
+        folder: str | Path,
+        save_frames: bool,
+    ) -> None:
+        """Write task-owned pointers and optional raw export.
+
+        CaptureRepository and CalibrationRepository continue to own canonical
+        artifacts and the calibration report.  This task folder contains only
+        explicit references to those artifacts plus, when requested, a checked
+        raw-array export suitable for a later saved-source task.
+        """
+
+        if not isinstance(source, CaptureArtifactRef):
+            raise TypeError("source must be CaptureArtifactRef")
+        if not isinstance(calibration, CalibrationArtifactRef):
+            raise TypeError("calibration must be CalibrationArtifactRef")
+        if type(save_frames) is not bool:
+            raise TypeError("save_frames must be bool")
+        root = Path(folder).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "calibration_ref.json").write_text(
+            json.dumps(
+                {
+                    "schema": "zlc.calibration-task.result.v1",
+                    "calibration_ref": calibration_artifact_ref_to_tree(calibration),
+                    "source_capture_ref": capture_artifact_ref_to_tree(source),
+                    "artifact_owner": "CalibrationRepository",
+                    "report_owner": "CalibrationRepository",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        if not save_frames:
+            return
+        frames = root / "frames"
+        frames.mkdir(parents=True, exist_ok=True)
+        with _service_guard(self._token) as services:
+            admitted = services.capture_repository.admit(source)
+            snapshot = admitted.materialize_snapshot()
+        block = snapshot.block
+        validity = np.asarray(
+            expand_dataset_validity(block.validity, block.schema),
+            dtype=bool,
+        )
+        np.save(frames / "values.npy", block.values, allow_pickle=False)
+        np.save(frames / "validity.npy", validity, allow_pickle=False)
+        (frames / "capture.json").write_text(
+            json.dumps(
+                {
+                    "schema": "zlc.calibration-task.capture-export.v1",
+                    "capture_ref": capture_artifact_ref_to_tree(source),
+                    "dataset_schema_fingerprint": block.schema.fingerprint,
+                    "values_file": "values.npy",
+                    "validity_file": "validity.npy",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     def calibration_request(
         self,
@@ -3198,77 +3390,41 @@ def _prepare_temperature_release_recapture_for_workbench(
         )
 
 
-def _prepare_finite_occupancy_for_workbench(
-    experiment: Experiment,
-    capture_request: CaptureRequest,
-    calibration_ref: CalibrationArtifactRef,
-    *,
-    model_kind: ReadoutModelKind | None = None,
-) -> PreparedFiniteOccupancy:
-    """Bind one console-local capture intent and one admitted FINAL calibration.
-
-    The returned command still starts exactly one top-level Run.  Resolving a
-    producer row never starts or subscribes to that row's earlier Run.
-    """
-
-    if not isinstance(experiment, Experiment):
-        raise TypeError("experiment must be Experiment")
-    if not isinstance(capture_request, CaptureRequest):
-        raise TypeError("capture_request must be CaptureRequest")
-    if not isinstance(calibration_ref, CalibrationArtifactRef):
-        raise TypeError("calibration_ref must be CalibrationArtifactRef")
-    if model_kind is not None and not isinstance(model_kind, ReadoutModelKind):
-        raise TypeError("model_kind must be ReadoutModelKind or None")
-    with _service_guard(experiment._authority_token) as services:
-        binding = bind_finite_capture_request(
-            capture_request,
-            pulse_port=services.runtime.pulse_port(
-                capture_request.sequencer_ref
-            ),
-            camera_port=services.runtime.camera_port(
-                capture_request.camera_ref
-            ),
-        )
-        calibration = _calibration_repository(services).admit(
-            calibration_ref,
-            services.capture_repository,
-        )
-        return prepare_finite_occupancy(
-            binding,
-            calibration,
-            model_kind=model_kind,
+def _prepare_camera_measurement_for_services(
+    services: _ExperimentServices,
+    request: CameraMeasurementRequest,
+) -> PreparedLiveCameraMeasurement | PreparedFiniteCameraMeasurement:
+    if not isinstance(request, CameraMeasurementRequest):
+        raise TypeError("request must be CameraMeasurementRequest")
+    if request.repeat == 0:
+        return prepare_live_camera_measurement(
+            request,
+            monitor_port=services.runtime.camera_monitor_port(request.camera_ref),
             start_run=services.runtime.start,
         )
-
-
-def _prepare_camera_monitor_for_services(
-    services: _ExperimentServices,
-    request: CameraMonitorRequest,
-) -> PreparedCameraMonitor:
-    if not isinstance(request, CameraMonitorRequest):
-        raise TypeError("request must be CameraMonitorRequest")
-    return prepare_camera_monitor(
+    return prepare_finite_camera_measurement(
         request,
-        monitor_port=services.runtime.camera_monitor_port(request.camera_ref),
+        camera_port=services.runtime.camera_port(request.camera_ref),
+        repository=services.capture_repository,
         start_run=services.runtime.start,
     )
 
 
-def _prepare_camera_monitor_for_workbench(
+def _prepare_camera_measurement_for_workbench(
     experiment: Experiment,
-    request: CameraMonitorRequest,
-) -> PreparedCameraMonitor:
+    request: CameraMeasurementRequest,
+) -> PreparedLiveCameraMeasurement | PreparedFiniteCameraMeasurement:
     """Private friend seam; no notebook authority escapes to the Workbench.
 
-    The Workbench needs the PREPARED monitor rather than a started one: it owns
-    the view factory (its LiveDatasetSlot) and passes it to ``start_with_view``,
-    which the notebook's own ``camera_monitor`` entry point never does.
+    The Workbench owns the optional live/preview slot factory, while the domain
+    command owns whether this one request runs continuously or stops after K
+    complete hardware-triggered cycles.
     """
 
     if not isinstance(experiment, Experiment):
         raise TypeError("experiment must be Experiment")
     with _service_guard(experiment._authority_token) as services:
-        return _prepare_camera_monitor_for_services(services, request)
+        return _prepare_camera_measurement_for_services(services, request)
 
 
 def _prepare_pulse_for_services(
@@ -3897,6 +4053,7 @@ def device_manager(
     repository: str | Path | None = None,
     name: str = "neutral_atom",
     seed: int | None | object = _CONNECT_SEED_UNSET,
+    on_initialized=None,
 ):
     """Open the standalone config editor before any installation is composed."""
 
@@ -3907,6 +4064,7 @@ def device_manager(
         document=document,
         repository=repository,
         name=name,
+        on_initialized=on_initialized,
     )
 
 
@@ -3919,11 +4077,10 @@ __all__ = [
     "CalibrationArtifactRequest",
     "CalibrationArtifactRef",
     "CalibrationCaptureLayout",
-    "CameraMonitorDescriptor",
-    "CameraMonitorRequest",
     "CaptureArtifactRef",
     "FitResultArtifactRef",
     "CaptureRequest",
+    "CameraMeasurementRequest",
     "connect",
     "device_manager",
     "DetectionRequest",

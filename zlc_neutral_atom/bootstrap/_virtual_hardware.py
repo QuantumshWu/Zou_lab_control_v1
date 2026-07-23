@@ -460,6 +460,7 @@ class VirtualSequencer:
         self._firing_artifact: CompiledPulseArtifact | None = None
         self._last_fired_artifact: CompiledPulseArtifact | None = None
         self._fire_started_monotonic: float | None = None
+        self._fire_generation = 0
         self._logical_deadline: float | None = None
         self._state = "safe"
         self._open = True
@@ -480,6 +481,26 @@ class VirtualSequencer:
 
         with self._lock:
             return self._firing_artifact or self._last_fired_artifact
+
+    def active_fire(
+        self,
+        playback: PulsePlayback,
+    ) -> tuple[int, float] | None:
+        """Return the exact running FIRE generation and its hardware epoch."""
+
+        if not isinstance(playback, PulsePlayback):
+            raise TypeError("playback must be PulsePlayback")
+        with self._lock:
+            if self._firing is not playback or self._fire_started_monotonic is None:
+                return None
+            return self._fire_generation, self._fire_started_monotonic
+
+    def is_active_fire(self, playback: PulsePlayback, generation: int) -> bool:
+        with self._lock:
+            return (
+                self._firing is playback
+                and self._fire_generation == generation
+            )
 
     def ensure_open(self) -> "VirtualSequencer":
         if not self._open:
@@ -535,6 +556,7 @@ class VirtualSequencer:
             self._firing = playback if playback.repeat_forever else None
             self._last_fired_artifact = artifact
             self._firing_artifact = artifact if playback.repeat_forever else None
+            self._fire_generation += 1
             self._fire_started_monotonic = time.monotonic()
             self._logical_deadline = (
                 None
@@ -842,10 +864,12 @@ class VirtualMotFrameSource:
 
 
 class VirtualCamera:
-    """Externally-triggered camera with one bounded producer queue.
+    """One installed camera supporting live and finite acquisition.
 
-    A finite arm is used by exact capture.  A ``None`` arm passively observes
-    any later finite sequencer FIRE without owning or scheduling its triggers.
+    A finite arm observes the sequencer's hardware-timed trigger edges.  A
+    ``None`` arm uses the camera's own exposure cadence for the live view.
+    These modes are mutually exclusive because they are two operations on the
+    same physical camera, not two public camera roles.
     """
 
     max_pending_records = 16
@@ -858,6 +882,7 @@ class VirtualCamera:
         capture_trigger_channels: Sequence[str],
         exposure: float = 20e-3,
         timeout: float = 2.0,
+        free_running_live: bool = False,
     ) -> None:
         if not isinstance(frame_source, (VirtualAtomArray, VirtualMotFrameSource)):
             raise TypeError("virtual camera requires a supported frame source")
@@ -871,16 +896,22 @@ class VirtualCamera:
         )
         self.exposure = _positive(exposure, "exposure")
         self.timeout = _positive(timeout, "timeout")
+        if not isinstance(free_running_live, bool):
+            raise TypeError("free_running_live must be bool")
+        self.free_running_live = free_running_live
         self.roi = None
         self._condition = threading.Condition(threading.RLock())
         self._pending: deque[CameraFrameRecord] = deque()
         self._armed = False
+        self._armed_at_monotonic: float | None = None
         self._accepting = False
         self._expected: int | None = 0
         self._capacity = self.max_pending_records
         self._produced = 0
         self._worker: threading.Thread | None = None
         self._worker_stop: threading.Event | None = None
+        self._continuous_fire_generation: int | None = None
+        self._queued_continuous_playback: PulsePlayback | None = None
         self._active_fire_end_ordinal = 0
         self._worker_error: BaseException | None = None
         self._terminal: CameraCaptureTerminalRecord | None = None
@@ -915,6 +946,7 @@ class VirtualCamera:
             "exposure": self.exposure,
             "roi": self.roi,
             "timeout": self.timeout,
+            "free_running_live": self.free_running_live,
             "frame_source_type": (
                 f"{type(self.frame_source).__module__}."
                 f"{type(self.frame_source).__qualname__}"
@@ -990,6 +1022,7 @@ class VirtualCamera:
             raise ValueError("max_inflight_frames cannot exceed expected_frames")
         if capacity > self.max_pending_records:
             raise ValueError("max_inflight_frames exceeds camera max_pending_records")
+        continuous_playback = None
         with self._condition:
             if self._armed:
                 raise RuntimeError("virtual camera already owns an armed capture")
@@ -997,21 +1030,107 @@ class VirtualCamera:
                 raise RuntimeError("previous virtual camera producer is still running")
             self._pending.clear()
             self._armed = True
+            self._armed_at_monotonic = time.monotonic()
             self._accepting = True
             self._expected = expected
             self._capacity = capacity
             self._produced = 0
             self._worker = None
             self._worker_stop = None
+            self._continuous_fire_generation = None
+            self._queued_continuous_playback = None
             self._active_fire_end_ordinal = 0
             self._worker_error = None
             self._terminal = None
+            if expected is None and self.free_running_live:
+                live_stop = threading.Event()
+                self._worker_stop = live_stop
+
+                def produce_live() -> None:
+                    next_frame = time.monotonic() + self.exposure
+                    try:
+                        while not live_stop.is_set():
+                            if live_stop.wait(
+                                max(0.0, next_frame - time.monotonic())
+                            ):
+                                break
+                            with self._condition:
+                                if not self._armed or not self._accepting:
+                                    break
+                                if len(self._pending) >= self._capacity:
+                                    raise RuntimeError(
+                                        "virtual camera retention exhausted "
+                                        "before live host drain"
+                                    )
+                                ordinal = self._produced
+                            if isinstance(self.frame_source, VirtualMotFrameSource):
+                                image = self.frame_source.render_current_output()
+                            else:
+                                image = self.frame_source.render_image(
+                                    self.exposure,
+                                    self.exposure,
+                                )
+                            record = CameraFrameRecord(
+                                image=image,
+                                source_ordinal=ordinal,
+                                produced_count=ordinal + 1,
+                                frame_stamp=ordinal + 1,
+                                camera_stamp=ordinal + 1,
+                                timestamp_seconds=None,
+                                timestamp_microseconds=None,
+                                host_received_at_ns=time.time_ns(),
+                            )
+                            with self._condition:
+                                if (
+                                    not self._armed
+                                    or not self._accepting
+                                    or live_stop.is_set()
+                                ):
+                                    break
+                                self._pending.append(record)
+                                self._produced = ordinal + 1
+                                self._condition.notify_all()
+                            next_frame += self.exposure
+                    except BaseException as error:
+                        with self._condition:
+                            self._worker_error = error
+                            self._accepting = False
+                            self._condition.notify_all()
+                    finally:
+                        with self._condition:
+                            self._condition.notify_all()
+
+                worker = threading.Thread(
+                    target=produce_live,
+                    name="zlc-target-virtual-camera-live",
+                    daemon=False,
+                )
+                self._worker = worker
+                try:
+                    worker.start()
+                except BaseException:
+                    self._worker = None
+                    self._worker_stop = None
+                    self._armed = False
+                    self._armed_at_monotonic = None
+                    self._accepting = False
+                    raise
+            elif expected is None:
+                continuous_playback = self.sequencer.firing
+        # A qCMOS-like passive monitor may be armed either before or after the
+        # continuous pulse starts.  In both orders the same hardware-trigger
+        # listener owns frame production; arming never fires the sequencer.
+        if continuous_playback is not None:
+            self._on_fire(continuous_playback)
 
     def _on_fire(self, playback: PulsePlayback) -> None:
         if playback.repeat_forever:
+            self._start_continuous_triggered_live(playback)
             return
         with self._condition:
             if not self._armed:
+                return
+            if self._expected is None and self.free_running_live:
                 return
             if self._worker_error is not None:
                 raise RuntimeError(
@@ -1159,6 +1278,183 @@ class VirtualCamera:
                 self._condition.notify_all()
                 raise
 
+    def _start_continuous_triggered_live(self, playback: PulsePlayback) -> None:
+        """Follow one already-running cyclic trigger wire until SAFE or disarm."""
+
+        active_fire = self.sequencer.active_fire(playback)
+        if active_fire is None:
+            return
+        fire_generation, fired_at = active_fire
+        trigger_offsets = tuple(
+            _trigger_starts(playback, self.capture_trigger_channels)
+        )
+        if not trigger_offsets:
+            return
+        with self._condition:
+            if not self._armed or self._expected is not None:
+                return
+            if self.free_running_live:
+                # The MOT camera has its own sensor cadence; pulse output does
+                # not become a second producer for the same physical camera.
+                return
+            if self._worker_error is not None:
+                raise RuntimeError(
+                    "virtual camera rejects continuous FIRE after a source failure"
+                ) from self._worker_error
+            if not self._accepting:
+                return
+            if self._worker is not None and self._worker.is_alive():
+                if self._continuous_fire_generation == fire_generation:
+                    return
+                self._queued_continuous_playback = playback
+                if self._worker_stop is not None:
+                    self._worker_stop.set()
+                self._condition.notify_all()
+                return
+            stop = threading.Event()
+            self._worker_stop = stop
+            self._continuous_fire_generation = fire_generation
+            self._queued_continuous_playback = None
+            armed_at = self._armed_at_monotonic
+            if armed_at is None:
+                raise RuntimeError("virtual camera lost its arm epoch")
+
+            def produce() -> None:
+                scale = self.sequencer.sleep_scale
+                cycle = (
+                    0
+                    if scale <= 0.0
+                    else max(
+                        0,
+                        int(
+                            math.floor(
+                                max(0.0, (armed_at - fired_at) / scale)
+                                / playback.repeat_period
+                            )
+                        ),
+                    )
+                )
+                replacement = None
+                try:
+                    while not stop.is_set():
+                        if not self.sequencer.is_active_fire(
+                            playback,
+                            fire_generation,
+                        ):
+                            break
+                        frames = iter(
+                            self.frame_source.iter_frames(
+                                playback,
+                                len(trigger_offsets),
+                                trigger_channels=self.capture_trigger_channels,
+                                default_exposure=self.exposure,
+                                trigger_group_sizes=(len(trigger_offsets),),
+                            )
+                        )
+                        for offset in trigger_offsets:
+                            logical_edge = cycle * playback.repeat_period + offset
+                            edge_at = fired_at + logical_edge * scale
+                            if edge_at < armed_at:
+                                # The sensor was not armed at this hardware edge.
+                                # Advance the deterministic virtual source, but
+                                # never turn a pre-arm trigger into a host frame.
+                                try:
+                                    next(frames)
+                                except StopIteration as exc:
+                                    raise RuntimeError(
+                                        "virtual atom source ended before a cyclic trigger"
+                                    ) from exc
+                                continue
+                            deadline = edge_at + self.exposure * scale
+                            while not stop.is_set():
+                                if not self.sequencer.is_active_fire(
+                                    playback,
+                                    fire_generation,
+                                ):
+                                    return
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0.0:
+                                    break
+                                stop.wait(min(remaining, 0.05))
+                            if stop.is_set():
+                                return
+                            try:
+                                image = next(frames)
+                            except StopIteration as exc:
+                                raise RuntimeError(
+                                    "virtual atom source ended before a cyclic trigger"
+                                ) from exc
+                            with self._condition:
+                                if (
+                                    not self._armed
+                                    or not self._accepting
+                                    or not self.sequencer.is_active_fire(
+                                        playback,
+                                        fire_generation,
+                                    )
+                                ):
+                                    return
+                                if len(self._pending) >= self._capacity:
+                                    raise RuntimeError(
+                                        "virtual camera retention exhausted before live host drain"
+                                    )
+                                ordinal = self._produced
+                                self._pending.append(
+                                    CameraFrameRecord(
+                                        image,
+                                        ordinal,
+                                        ordinal + 1,
+                                        ordinal + 1,
+                                        ordinal + 1,
+                                        None,
+                                        None,
+                                        time.time_ns(),
+                                    )
+                                )
+                                self._produced = ordinal + 1
+                                self._condition.notify_all()
+                        sentinel = object()
+                        if next(frames, sentinel) is not sentinel:
+                            raise RuntimeError(
+                                "virtual atom source exceeded cyclic trigger count"
+                            )
+                        cycle += 1
+                        # Zero-time simulation still needs a bounded sensor
+                        # cadence so a monitor cannot spin and starve its host.
+                        if self.sequencer.sleep_scale == 0.0:
+                            stop.wait(min(self.exposure, 0.02))
+                except BaseException as error:
+                    with self._condition:
+                        self._worker_error = error
+                        self._accepting = False
+                        self._condition.notify_all()
+                finally:
+                    with self._condition:
+                        if self._worker is threading.current_thread():
+                            self._worker = None
+                            self._worker_stop = None
+                            self._continuous_fire_generation = None
+                            replacement = self._queued_continuous_playback
+                            self._queued_continuous_playback = None
+                        self._condition.notify_all()
+                    if replacement is not None:
+                        self._start_continuous_triggered_live(replacement)
+
+            worker = threading.Thread(
+                target=produce,
+                name="zlc-target-virtual-camera-continuous-trigger",
+                daemon=False,
+            )
+            self._worker = worker
+            try:
+                worker.start()
+            except BaseException as error:
+                self._worker = None
+                self._worker_stop = None
+                self._worker_error = error
+                self._condition.notify_all()
+                raise
+
     def read_frame_records(
         self,
         n: int,
@@ -1167,7 +1463,8 @@ class VirtualCamera:
         stop: object | None = None,
         exact: bool = False,
     ) -> list[CameraFrameRecord]:
-        del exact
+        if not isinstance(exact, bool):
+            raise TypeError("exact must be bool")
         wanted = _positive_int(n, "n")
         deadline = time.monotonic() + (
             self.timeout if timeout is None else max(0.0, float(timeout))
@@ -1189,7 +1486,7 @@ class VirtualCamera:
                     # an ill-behaved iterator must not turn an exact read into an
                     # unbounded join, and cancellation must not return a frame
                     # whose finite-source cardinality was never established.
-                    while (
+                    while exact and (
                         self._worker is not None
                         and self._worker.is_alive()
                         and self._produced >= self._active_fire_end_ordinal
@@ -1229,7 +1526,7 @@ class VirtualCamera:
                 if remaining <= 0.0:
                     break
                 self._condition.wait(min(0.05, remaining))
-        if len(result) != wanted:
+        if len(result) != wanted and exact:
             raise TimeoutError(
                 f"virtual camera returned {len(result)} of {wanted} exact frame(s)"
             )
@@ -1242,6 +1539,7 @@ class VirtualCamera:
             worker = self._worker
             stop = self._worker_stop
             self._accepting = False
+            self._queued_continuous_playback = None
             if stop is not None:
                 stop.set()
             self._condition.notify_all()
@@ -1257,6 +1555,8 @@ class VirtualCamera:
                 worker is None or not worker.is_alive(),
             )
             self._armed = False
+            self._armed_at_monotonic = None
+            self._continuous_fire_generation = None
             self._pending.clear()
             self._terminal = terminal
             self._condition.notify_all()
@@ -1274,304 +1574,6 @@ class VirtualCamera:
                 self.finish_record_capture()
         finally:
             self.sequencer.remove_fire_listener(self._on_fire)
-            self._open = False
-
-
-class VirtualMonitorCamera:
-    """Hardware-clocked virtual Basler MOT monitor with a bounded record queue.
-
-    The producer thread models the sensor exposure clock.  Host reads never
-    schedule exposures and the queue never silently overwrites: if the current
-    runtime cannot drain the admitted queue, the source fails and the live
-    front is invalidated instead of relabelling pre-broker loss as GUI loss.
-    Frames preserve the deployed simulator's MOT physics: the sensor observes
-    the compiled three-axis DAC outputs, not task set-points, and renders a
-    noisy Mono8 fluorescence spot whose efficiency is Gaussian in coil space.
-    """
-
-    max_pending_records = 4
-
-    def __init__(
-        self,
-        sequencer: VirtualSequencer,
-        *,
-        frame_shape: tuple[int, int] = (1200, 1920),
-        exposure: float = 0.05,
-        timeout: float = 2.0,
-        seed: int | None = 19,
-        coil_ports: Mapping[str, str] | None = None,
-        optimum_levels: Mapping[str, float] | None = None,
-        level_sigmas: Mapping[str, float] | None = None,
-        peak_counts: float = 93.0,
-        offset_counts: float = 7.0,
-        read_noise: float = 1.5,
-        spot_size_px: tuple[float, float] = (40.0, 20.0),
-    ) -> None:
-        if not isinstance(sequencer, VirtualSequencer):
-            raise TypeError("virtual monitor camera requires VirtualSequencer")
-        self.exposure = _positive(exposure, "monitor exposure")
-        self.timeout = _positive(timeout, "monitor timeout")
-        self.sequencer = sequencer
-        self._frame_source = VirtualMotFrameSource(
-            sequencer,
-            frame_shape=frame_shape,
-            seed=seed,
-            coil_ports=coil_ports,
-            optimum_levels=optimum_levels,
-            level_sigmas=level_sigmas,
-            peak_counts=peak_counts,
-            offset_counts=offset_counts,
-            read_noise=read_noise,
-            spot_size_px=spot_size_px,
-        )
-        self.coil_ports = self._frame_source.coil_ports
-        self.optimum_levels = self._frame_source.optimum_levels
-        self.level_sigmas = self._frame_source.level_sigmas
-        self.peak_counts = self._frame_source.peak_counts
-        self.offset_counts = self._frame_source.offset_counts
-        self.read_noise = self._frame_source.read_noise
-        self.spot_size_px = self._frame_source.spot_size_px
-        self._condition = threading.Condition(threading.RLock())
-        self._pending: deque[CameraFrameRecord] = deque()
-        self._armed = False
-        self._accepting = False
-        self._capacity = self.max_pending_records
-        self._produced = 0
-        self._producer: threading.Thread | None = None
-        self._producer_stop: threading.Event | None = None
-        self._worker_error: BaseException | None = None
-        self._terminal: CameraCaptureTerminalRecord | None = None
-        self._open = True
-
-    @property
-    def frame_shape(self) -> tuple[int, int]:
-        return self._frame_source.image_shape
-
-    @property
-    def sensor_shape(self) -> tuple[int, int]:
-        return self._frame_source.image_shape
-
-    def ensure_open(self) -> "VirtualMonitorCamera":
-        if not self._open:
-            raise RuntimeError("virtual monitor camera is closed")
-        return self
-
-    def snapshot(self) -> dict[str, object]:
-        return {
-            "type": type(self).__name__,
-            "exposure": self.exposure,
-            "frame_shape": self.frame_shape,
-            "acquisition_mode": "FREE_RUNNING",
-            "coil_ports": dict(self.coil_ports),
-            "optimum_levels": dict(self.optimum_levels),
-            "level_sigmas": dict(self.level_sigmas),
-            "peak_counts": self.peak_counts,
-            "offset_counts": self.offset_counts,
-            "read_noise": self.read_noise,
-            "spot_size_px": self.spot_size_px,
-        }
-
-    def capture_working_point(self) -> CameraWorkingPoint:
-        self.ensure_open()
-        settings = canonical_digest(self.snapshot())
-        return CameraWorkingPoint(
-            settings_fingerprint=settings,
-            acquisition_mode="FREE_RUNNING",
-            frame_shape_yx=self.frame_shape,
-            sensor_shape_yx=self.sensor_shape,
-            roi_origin_yx=(0, 0),
-            roi_shape_yx=self.frame_shape,
-            binning_yx=(1, 1),
-            dtype=np.dtype("<u1"),
-            count_unit="count",
-            capture_trigger_channels=(),
-            exposure_seconds=self.exposure,
-            required_external_trigger_interval_seconds=None,
-            external_trigger_integration_start_offset_seconds=None,
-            gain=1.0,
-            readout_mode="target-virtual-mot:mode=FREE_RUNNING;pixel=Mono8",
-        )
-
-    def arm(
-        self,
-        frames: int | None,
-        *,
-        max_inflight_frames: int,
-        timeout: float,
-    ) -> None:
-        del timeout
-        self.ensure_open()
-        if frames is not None:
-            raise ValueError("virtual monitor camera only accepts a continuous arm")
-        capacity = _positive_int(max_inflight_frames, "max_inflight_frames")
-        if capacity > self.max_pending_records:
-            raise ValueError("monitor max_inflight_frames exceeds camera capacity")
-        with self._condition:
-            if self._armed:
-                raise RuntimeError("virtual monitor camera is already armed")
-            if self._producer is not None and self._producer.is_alive():
-                raise RuntimeError("previous monitor producer is still running")
-            self._pending.clear()
-            self._armed = True
-            self._accepting = True
-            self._capacity = capacity
-            self._produced = 0
-            self._worker_error = None
-            self._terminal = None
-            stop = threading.Event()
-            self._producer_stop = stop
-
-            def produce() -> None:
-                next_frame = time.monotonic() + self.exposure
-                try:
-                    while not stop.is_set():
-                        if stop.wait(max(0.0, next_frame - time.monotonic())):
-                            break
-                        with self._condition:
-                            if not self._armed or not self._accepting:
-                                break
-                            if len(self._pending) >= self._capacity:
-                                raise RuntimeError(
-                                    "virtual monitor camera record queue overflowed"
-                                )
-                            ordinal = self._produced
-                        image = self._render(ordinal)
-                        record = CameraFrameRecord(
-                            image=image,
-                            source_ordinal=ordinal,
-                            produced_count=ordinal + 1,
-                            frame_stamp=ordinal + 1,
-                            camera_stamp=ordinal + 1,
-                            timestamp_seconds=None,
-                            timestamp_microseconds=None,
-                            host_received_at_ns=time.time_ns(),
-                        )
-                        with self._condition:
-                            if not self._armed or not self._accepting or stop.is_set():
-                                break
-                            self._pending.append(record)
-                            self._produced = ordinal + 1
-                            self._condition.notify_all()
-                        next_frame += self.exposure
-                except BaseException as error:
-                    with self._condition:
-                        self._worker_error = error
-                        self._accepting = False
-                        self._condition.notify_all()
-                finally:
-                    with self._condition:
-                        # Keep the Thread object until the arm owner explicitly
-                        # joins it in finish_record_capture().  Clearing it from
-                        # inside the producer would let cleanup claim "joined"
-                        # during the tiny interval between this finally block
-                        # and the OS thread's actual exit.
-                        self._condition.notify_all()
-
-            producer = threading.Thread(
-                target=produce,
-                name="zlc-target-virtual-monitor-camera",
-                daemon=False,
-            )
-            self._producer = producer
-            try:
-                producer.start()
-            except BaseException:
-                self._producer = None
-                self._producer_stop = None
-                self._armed = False
-                self._accepting = False
-                raise
-
-    def mot_efficiency(self, levels: Mapping[str, float]) -> float:
-        return self._frame_source.mot_efficiency(levels)
-
-    def _sense_levels(self, _ordinal: int) -> dict[str, float]:
-        artifact = self.sequencer.output_artifact
-        if artifact is None:
-            return {name: 0.0 for name in self.coil_ports}
-        points = artifact.target_ir.scan_points or ((),)
-        if len(points) != 1:
-            raise RuntimeError(
-                "free-running monitor frames have no declared association with "
-                "multi-point sequencer output"
-            )
-        return self._frame_source.levels_for_point(artifact, 0)
-
-    def _render(self, ordinal: int) -> np.ndarray:
-        del ordinal
-        return self._frame_source.render_current_output()
-
-    def read_frame_records(
-        self,
-        n: int,
-        *,
-        timeout: float,
-        exact: bool,
-    ) -> list[CameraFrameRecord]:
-        if exact:
-            raise ValueError("free-running monitor records are not exact capture data")
-        wanted = _positive_int(n, "n")
-        deadline = time.monotonic() + _positive(timeout, "timeout")
-        result: list[CameraFrameRecord] = []
-        with self._condition:
-            if not self._armed:
-                raise RuntimeError("monitor read requires an armed camera")
-            while len(result) < wanted:
-                while self._pending and len(result) < wanted:
-                    result.append(self._pending.popleft())
-                    self._condition.notify_all()
-                if len(result) == wanted:
-                    break
-                if self._worker_error is not None:
-                    raise RuntimeError("virtual monitor source failed") from self._worker_error
-                if not self._accepting:
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.0:
-                    raise TimeoutError("virtual monitor camera read timed out")
-                self._condition.wait(min(0.05, remaining))
-        return result
-
-    def finish_record_capture(self) -> CameraCaptureTerminalRecord:
-        with self._condition:
-            if self._terminal is not None:
-                return self._terminal
-            producer = self._producer
-            stop = self._producer_stop
-            self._accepting = False
-            if stop is not None:
-                stop.set()
-            self._condition.notify_all()
-        if producer is not None and producer is not threading.current_thread():
-            producer.join(self.timeout)
-            if producer.is_alive():
-                raise TimeoutError("virtual monitor producer did not join")
-        with self._condition:
-            terminal = CameraCaptureTerminalRecord(
-                self._produced,
-                True,
-                True,
-                producer is None or not producer.is_alive(),
-            )
-            self._armed = False
-            self._pending.clear()
-            self._producer = None
-            self._producer_stop = None
-            self._terminal = terminal
-            self._condition.notify_all()
-            return terminal
-
-    def capture_state(self) -> tuple[bool, int]:
-        with self._condition:
-            return self._armed, len(self._pending)
-
-    def close(self) -> None:
-        try:
-            with self._condition:
-                armed = self._armed
-            if armed:
-                self.finish_record_capture()
-        finally:
             self._open = False
 
 

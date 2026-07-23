@@ -46,6 +46,7 @@ from .calibration import (
     ReadoutFeature,
     ReadoutModel,
     ReadoutModelKind,
+    ThresholdMethod,
     SiteMap,
     UniformPsfFeature,
     site_grid_positions_yx,
@@ -1612,6 +1613,7 @@ def characterize_readout(
     *,
     bins: int,
     max_drop: int,
+    threshold_method: ThresholdMethod,
 ) -> ModelCalibrationReport:
     short = np.asarray(short_signals, dtype=float)
     short_validity = np.asarray(short_validity, dtype=bool) & np.isfinite(short)
@@ -1619,13 +1621,18 @@ def characterize_readout(
         raise ValueError("short signals/validity must match reference label shape")
     combined_validity = labels.valid & short_validity
     edges = _common_bin_edges(short, combined_validity, bins=bins)
-    quick = np.asarray(
-        [
-            otsu_threshold(short[:, site][short_validity[:, site]])
-            for site in range(labels.n_sites)
-        ],
-        dtype=float,
-    )
+    if not isinstance(threshold_method, ThresholdMethod):
+        raise TypeError("threshold_method must be ThresholdMethod")
+    quick_values: list[float] = []
+    for site in range(labels.n_sites):
+        samples = short[:, site][short_validity[:, site]]
+        fallback = otsu_threshold(samples)
+        if threshold_method is ThresholdMethod.BIMODAL:
+            fitted = fit_bimodal(samples)
+            if fitted.ok and fitted.bright_above and math.isfinite(fitted.threshold):
+                fallback = fitted.threshold
+        quick_values.append(float(fallback))
+    quick = np.asarray(quick_values, dtype=float)
     metrics = []
     prediction = np.zeros_like(labels.occupied, dtype=bool)
     for site in range(labels.n_sites):
@@ -2012,6 +2019,7 @@ def _calibrate_readout_source(
             split,
             bins=request.histogram_bins,
             max_drop=request.max_drop,
+            threshold_method=request.threshold_method,
         )
         reports.append(report)
 

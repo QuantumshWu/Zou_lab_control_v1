@@ -14,7 +14,11 @@ from tests.gui_user_flow import (
     configure_offscreen_fast_path,
     until,
 )
-from zlc_frontend.qt_widgets import ensure_qt_app
+from zlc_frontend.qt_widgets import (
+    ensure_qt_app,
+    fluent_scale,
+    set_fluent_scale,
+)
 
 
 def _replace_text(widget, text: str) -> None:
@@ -70,7 +74,6 @@ def test_formal_device_manager_edits_locally_then_initializes_and_closes(
             lambda: set(body._loaded_cards)
             == {
                 "camera",
-                "monitor_camera",
                 "mot_camera",
                 "sequencer",
             },
@@ -97,3 +100,69 @@ def test_formal_device_manager_edits_locally_then_initializes_and_closes(
         if wrapper.isVisible():
             wrapper.close()
             until(application, lambda: not wrapper.isVisible(), timeout=15.0)
+
+
+def test_task_console_launcher_initializes_through_device_manager_then_reuses_owner(
+    tmp_path,
+):
+    """The standalone GUI enters through formal DeviceManager, not ``connect``."""
+
+    configure_offscreen_fast_path()
+    application = ensure_qt_app()
+
+    from task_console import _StandaloneTaskConsoleFlow, _build_parser
+
+    args = _build_parser().parse_args(
+        [
+            "--repository",
+            str(tmp_path / "workspace"),
+            "--name",
+            "launcher-current",
+            "--seed",
+            "19",
+        ]
+    )
+    flow = _StandaloneTaskConsoleFlow(args)
+    devices = flow.open()
+    device_wrapper = devices.window()
+    console_wrapper = None
+    try:
+        assert fluent_scale() == set_fluent_scale(None)
+        device_capture = capture_offscreen_window(
+            application,
+            devices,
+            tmp_path / "task-console-device-init.png",
+            settle_ms=100,
+        )
+        assert device_capture["image_pixels"]["width"] > 0
+
+        QtTest.QTest.mouseClick(devices.lifecycle_button, QtCore.Qt.LeftButton)
+        until(
+            application,
+            lambda: flow.console is not None or flow.failure is not None,
+            timeout=15.0,
+        )
+        assert flow.failure is None
+        assert devices.experiment is not None
+        assert not device_wrapper.isVisible()
+
+        console_wrapper = flow.console.window()
+        assert console_wrapper.isVisible()
+        console_capture = capture_offscreen_window(
+            application,
+            flow.console,
+            tmp_path / "task-console-after-init.png",
+            settle_ms=100,
+        )
+        assert console_capture["image_pixels"]["width"] > 0
+
+        console_wrapper.close()
+        until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+        until(application, lambda: devices.permanently_closed, timeout=15.0)
+        assert devices.experiment is None
+    finally:
+        if console_wrapper is not None and console_wrapper.isVisible():
+            console_wrapper.close()
+            until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+        flow.close()
+        application.processEvents()

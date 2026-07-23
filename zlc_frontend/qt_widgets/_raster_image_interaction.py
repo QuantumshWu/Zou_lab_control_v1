@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import math
 from typing import Callable
 
-import numpy as np
 from PyQt5 import QtCore, QtGui
 
 from ..image_view import validate_normalized_rectangle
@@ -40,11 +39,12 @@ from ._raster_front import (
 )
 from ._rectangle_selector import (
     RectangleDrag,
+    paint_cross_selector,
     paint_rectangle_selector,
     paint_selector_text,
     selector_pen_color,
 )
-from .style import GREEN, ORANGE
+from .style import ORANGE
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,8 +87,6 @@ class _ImagePanelBinding:
     clim_candidate: tuple[float, float] | None = None
     clim_domain: tuple[float, float] | None = None
     cross: _ImageSample | None = None
-    hover: _ImageSample | None = None
-    hover_position: QtCore.QPointF | None = None
     fault: RuntimeError | None = None
 
 
@@ -357,6 +355,13 @@ def _viewport_for_target(
     target,
     hold: _HeldPanelFront | None,
 ) -> ImageViewportTransform:
+    # Wheel commits are latest-intent, not render-paced.  While Agg is still
+    # answering an earlier wheel step, the next step must be composed from the
+    # already-authored viewport rather than replaying the still-painted one.
+    # The exact painted front remains the CAS origin; only the display intent
+    # accumulates here.
+    if binding.pending_viewport is not None:
+        return binding.pending_viewport
     if hold is not None and hold.panel_id == target[2].panel_id:
         payload = _image_payload(hold)
         if payload is not None:
@@ -397,11 +402,12 @@ def _sample_for_target(
         finite_value = math.isfinite(value)
     except TypeError:
         finite_value = False
+    x_coordinate, y_coordinate = viewport.coordinate_for_visible_point(normalized)
     return _ImageSample(
         x_index=x_index,
         y_index=y_index,
-        x_coordinate=viewport.x_axis.coordinate_at(x_index),
-        y_coordinate=viewport.y_axis.coordinate_at(y_index),
+        x_coordinate=x_coordinate,
+        y_coordinate=y_coordinate,
         value=value,
         valid=bool(valid) and finite_value,
     )
@@ -487,7 +493,6 @@ def _commit_viewport(
         if binding.fault is None:
             binding.fault = detached_render_fault(error)
         binding.binding_enabled = False
-        _set_hover_sample(binding, None)
         return False
     return True
 
@@ -533,7 +538,6 @@ def _commit_color_limits(
         if binding.fault is None:
             binding.fault = detached_render_fault(error)
         binding.binding_enabled = False
-        _set_hover_sample(binding, None)
         return False
     return True
 
@@ -545,17 +549,6 @@ def _set_cross_sample(
     if sample is binding.cross:
         return
     binding.cross = sample
-
-
-def _set_hover_sample(
-    binding: _ImagePanelBinding,
-    sample: _ImageSample | None,
-) -> None:
-    if sample is binding.hover:
-        return
-    binding.hover = sample
-    if sample is None:
-        binding.hover_position = None
 
 
 def _active_image_binding(
@@ -633,33 +626,14 @@ def _image_bounds_for_rectangle_drag(
     visible_bounds: NormalizedRectangle,
 ) -> NormalizedRectangle:
     viewport = binding.viewport
-    drag = binding.rectangle_drag
-    start = binding.drag_start_bounds
-    if drag is None or drag.handle != "C" or start is None:
-        return viewport.snapped_bounds_for_visible_rectangle(visible_bounds)
-
     full_left, full_top = viewport.full_point_for_visible_point(
         (visible_bounds[0], visible_bounds[1])
     )
-    x_size = viewport.x_axis.size
-    y_size = viewport.y_axis.size
-    width_cells = max(1, round((start[2] - start[0]) * x_size))
-    height_cells = max(1, round((start[3] - start[1]) * y_size))
-    x_start = min(
-        x_size - width_cells,
-        max(0, round(full_left * x_size)),
-    )
-    y_start = min(
-        y_size - height_cells,
-        max(0, round(full_top * y_size)),
+    full_right, full_bottom = viewport.full_point_for_visible_point(
+        (visible_bounds[2], visible_bounds[3])
     )
     return validate_normalized_rectangle(
-        (
-            x_start / x_size,
-            y_start / y_size,
-            (x_start + width_cells) / x_size,
-            (y_start + height_cells) / y_size,
-        )
+        (full_left, full_top, full_right, full_bottom)
     )
 
 
@@ -692,19 +666,11 @@ def _visible_point_for_sample(
     sample: _ImageSample,
 ) -> tuple[float, float] | None:
     viewport = binding.viewport
-    if (
-        sample.x_index >= viewport.x_axis.size
-        or sample.y_index >= viewport.y_axis.size
-    ):
-        return None
-    full = (
-        (sample.x_index + 0.5) / viewport.x_axis.size,
-        (sample.y_index + 0.5) / viewport.y_axis.size,
+    point = viewport.unbounded_visible_point_for_coordinate(
+        (sample.x_coordinate, sample.y_coordinate),
+        coordinate_frame=viewport.coordinate_frame,
     )
-    try:
-        return viewport.visible_point_for_full_point(full)
-    except ValueError:
-        return None
+    return point if 0.0 <= point[0] <= 1.0 and 0.0 <= point[1] <= 1.0 else None
 
 
 def _clim_candidate_label(
@@ -829,83 +795,26 @@ def _paint_cross_sample(
     target: QtCore.QRect,
     *,
     site_map: SiteMapPanelPayload | None,
+    color: QtGui.QColor | str | None = None,
 ) -> None:
-    point = _visible_point_for_sample(binding, sample)
-    color = QtGui.QColor(GREEN)
-    if point is not None:
-        x = target.x() + point[0] * target.width()
-        y = target.y() + point[1] * target.height()
-        painter.setPen(QtGui.QPen(color, 1.5))
-        painter.drawLine(
-            QtCore.QPointF(x, target.top()),
-            QtCore.QPointF(x, target.bottom()),
-        )
-        painter.drawLine(
-            QtCore.QPointF(target.left(), y),
-            QtCore.QPointF(target.right(), y),
-        )
-        painter.setBrush(QtGui.QBrush(color))
-        painter.drawEllipse(QtCore.QPointF(x, y), 3.5, 3.5)
+    visible = _visible_point_for_sample(binding, sample)
+    point = None if visible is None else QtCore.QPointF(
+        target.x() + visible[0] * target.width(),
+        target.y() + visible[1] * target.height(),
+    )
     value = _formatted_sample_value(sample)
-    suffix = " · off-view" if point is None else ""
     label = (
-        f"({sample.x_coordinate}, {sample.y_coordinate}){suffix}"
+        f"({sample.x_coordinate:g}, {sample.y_coordinate:g})"
         if site_map is not None
-        else f"({sample.x_coordinate}, {sample.y_coordinate}, {value}){suffix}"
+        else f"({sample.x_coordinate:g}, {sample.y_coordinate:g}, {value})"
     )
-    metrics = painter.fontMetrics()
-    bounds = metrics.boundingRect(label).adjusted(-5, -2, 5, 2)
-    bounds.moveTopRight(target.topRight() + QtCore.QPoint(-5, 5))
-    painter.fillRect(bounds, QtGui.QColor(0, 0, 0, 190))
-    painter.setPen(color)
-    painter.drawText(bounds, QtCore.Qt.AlignCenter, label)
-
-
-def _paint_hover_sample(
-    painter: QtGui.QPainter,
-    sample: _ImageSample,
-    position: QtCore.QPointF,
-    target: QtCore.QRect,
-    *,
-    site_map: SiteMapPanelPayload | None,
-) -> None:
-    if site_map is None:
-        label = (
-            f"x={sample.x_coordinate}  y={sample.y_coordinate}  "
-            f"z={_formatted_sample_value(sample)}"
-        )
-    else:
-        point = np.asarray(
-            (float(sample.x_coordinate), float(sample.y_coordinate)),
-            dtype=np.float64,
-        )
-        distances = np.sum(np.square(site_map.centers_xy - point), axis=1)
-        site_index = int(np.argmin(distances))
-        state = (
-            "invalid"
-            if not site_map.site_validity[site_index]
-            else "calibrated"
-            if site_map.occupied is None
-            else "occupied"
-            if site_map.occupied[site_index]
-            else "empty"
-        )
-        site_label = site_map.site_axis.coordinate_at(site_index)
-        label = (
-            f"x={sample.x_coordinate}  y={sample.y_coordinate}  "
-            f"z={_formatted_sample_value(sample)}  "
-            f"nearest={site_label} ({state})"
-        )
-    metrics = painter.fontMetrics()
-    bounds = metrics.boundingRect(label).adjusted(-5, -2, 5, 2)
-    x = min(target.right() - bounds.width(), int(position.x()) + 12)
-    y = min(target.bottom() - bounds.height(), int(position.y()) + 12)
-    bounds.moveTopLeft(
-        QtCore.QPoint(max(target.left(), x), max(target.top(), y))
+    paint_cross_selector(
+        painter,
+        QtCore.QRectF(target),
+        point,
+        label,
+        color=color,
     )
-    painter.fillRect(bounds, QtGui.QColor(0, 0, 0, 190))
-    painter.setPen(QtGui.QColor(ORANGE))
-    painter.drawText(bounds, QtCore.Qt.AlignCenter, label)
 
 
 def _paint_clim_candidate_label(
@@ -915,12 +824,13 @@ def _paint_clim_candidate_label(
     target: QtCore.QRect,
 ) -> None:
     label = _clim_candidate_label(binding, payload)
-    metrics = painter.fontMetrics()
-    bounds = metrics.boundingRect(label).adjusted(-6, -3, 6, 3)
-    bounds.moveBottomLeft(target.bottomLeft() + QtCore.QPoint(7, -7))
-    painter.fillRect(bounds, QtGui.QColor(0, 0, 0, 190))
-    painter.setPen(QtGui.QColor(ORANGE))
-    painter.drawText(bounds, QtCore.Qt.AlignCenter, label)
+    paint_selector_text(
+        painter,
+        label,
+        QtCore.QRectF(target),
+        QtGui.QColor(ORANGE),
+        corner="top_left",
+    )
 
 
 def _paint_image_overlays(
@@ -1010,14 +920,7 @@ def _paint_image_overlays(
                 binding.cross,
                 image_target,
                 site_map=site_map,
-            )
-        if binding.hover is not None and binding.hover_position is not None:
-            _paint_hover_sample(
-                painter,
-                binding.hover,
-                binding.hover_position,
-                image_target,
-                site_map=site_map,
+                color=selector_color,
             )
         painter.restore()
 
@@ -1056,4 +959,3 @@ def _clear_image_transient(
         binding.pending_color_limits = None
         binding.pending_origin = None
     binding.cross = None
-    _set_hover_sample(binding, None)

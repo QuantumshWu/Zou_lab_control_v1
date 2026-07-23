@@ -32,7 +32,7 @@ from zlc_neutral_atom.runtime.pipeline import (
     ExactDatasetPreviewSpec,
     PipelineResult,
     _notify_preview_failure,
-    _require_direct_capture,
+    _require_passive_external_capture,
     finalize_pipeline_result,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
@@ -522,12 +522,17 @@ def finalize_occupancy_result(context: PostSafetyContext,
     )
 
 
-def compile_occupancy_pipeline(spec: OccupancyPipelineSpec) -> RunPlan:
-    """Compile the finite exact occupancy path into one flat RunPlan."""
+def compile_occupancy_pipeline(
+    spec: OccupancyPipelineSpec,
+    *,
+    preview: ExactDatasetPreviewPort | None = None,
+) -> RunPlan:
+    """Compile passive finite Camera -> occupancy into one flat RunPlan."""
 
     if not isinstance(spec, OccupancyPipelineSpec):
         raise TypeError("spec must be OccupancyPipelineSpec")
-    _require_direct_capture(spec.measurement)
+    _require_passive_external_capture(spec.measurement)
+    preview_spec = _occupancy_preview_spec(spec, preview)
     port = spec.measurement.capture_port
 
     def execute(context: RunContext, prepared: ExactOccupancyTransaction) -> ExecutedOccupancy:
@@ -540,8 +545,16 @@ def compile_occupancy_pipeline(spec: OccupancyPipelineSpec) -> RunPlan:
             raise
 
     def cleanup(context: RunContext, prepared: ExactOccupancyTransaction | None,
-                _primary: BaseException | None) -> CleanupReport:
-        return port.verify_idle(context) if prepared is None else prepared.cleanup(context)
+                primary: BaseException | None) -> CleanupReport:
+        if prepared is None:
+            return _settle_unbound_preview(
+                preview,
+                port.verify_idle(context),
+                primary,
+            )
+        report = prepared.cleanup(context)
+        prepared.settle_preview_after_cleanup(report, primary)
+        return report
 
     def finalize(
         context: PostSafetyContext,
@@ -551,16 +564,37 @@ def compile_occupancy_pipeline(spec: OccupancyPipelineSpec) -> RunPlan:
             raise TypeError("occupancy finalize requires executed occupancy facts")
         if executed.pipeline.run_id != context.run_id.value:
             raise ValueError("executed occupancy result belongs to another Run")
-        context.checkpoint()
-        return finalize_occupancy_result(context, executed)
+        try:
+            context.checkpoint()
+            result = finalize_occupancy_result(context, executed)
+        except BaseException as error:
+            _notify_preview_failure(preview, error)
+            raise
+        _finish_preview_after_post_safety(preview)
+        return result
+
+    def dispose_unfinalized(_executed: ExecutedOccupancy) -> None:
+        _notify_preview_failure(
+            preview,
+            RuntimeError(
+                "passive Camera occupancy preview rejected before post-safety "
+                "finalization"
+            ),
+        )
 
     return RunPlan(
         name=spec.name,
         resource_claims=(port.resource_claim,),
-        bound_devices=(port.device,), preflight=lambda context: _open_exact_occupancy(spec, context),
+        bound_devices=(port.device,), preflight=lambda context: _open_exact_occupancy(
+            spec,
+            context,
+            preview=preview,
+            preview_spec=preview_spec,
+        ),
         execute=execute, cleanup=cleanup, finalize=finalize,
         interrupt_operations=port.interrupt_operations,
         requires_final_commit=False,
+        dispose_unfinalized=dispose_unfinalized,
     )
 
 

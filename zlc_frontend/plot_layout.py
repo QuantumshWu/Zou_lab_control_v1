@@ -90,6 +90,39 @@ class RollingPanelLayout:
     distribution: NormalizedBox
 
 
+def square_image_extent(
+    extent: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Pad the shorter coordinate span while preserving axis directions.
+
+    The returned ``left, right, bottom, upper`` limits keep the image data
+    undistorted inside the established square image box.  Padding is display
+    space only: the original data extent remains the sampling boundary.
+    """
+
+    if not isinstance(extent, tuple) or len(extent) != 4:
+        raise TypeError("extent must be a four-item tuple")
+    left, right, bottom, upper = (float(value) for value in extent)
+    if any(not math.isfinite(value) for value in (left, right, bottom, upper)):
+        raise ValueError("image extent values must be finite")
+    x_span = abs(right - left)
+    y_span = abs(bottom - upper)
+    if x_span <= 0.0 or y_span <= 0.0:
+        raise ValueError("image extent spans must be positive")
+
+    if x_span >= y_span:
+        padding = (x_span - y_span) / 2.0
+        y_direction = 1.0 if bottom > upper else -1.0
+        bottom += y_direction * padding
+        upper -= y_direction * padding
+    else:
+        padding = (y_span - x_span) / 2.0
+        x_direction = 1.0 if right > left else -1.0
+        left -= x_direction * padding
+        right += x_direction * padding
+    return (left, right, bottom, upper)
+
+
 def panel_margins_px(kind: str = "default") -> tuple[int, int, int, int]:
     """Return the only fixed ``left,right,bottom,top`` margin tuple."""
 
@@ -480,5 +513,6 @@ __all__ = [
     "rolling_panel_layout",
     "rolling_panel_layout_for_raster",
     "site_grid_geometry",
+    "square_image_extent",
     "SITE_GRID_MAX_COLUMNS",
 ]

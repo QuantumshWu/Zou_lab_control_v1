@@ -31,6 +31,7 @@ class FacetedPanelHost(QtWidgets.QWidget):
     rangeSelected = QtCore.pyqtSignal(object)
     viewCommitted = QtCore.pyqtSignal(object)
     thresholdsCommitted = QtCore.pyqtSignal(object)
+    crossSelected = QtCore.pyqtSignal(object)
     rectangleSelected = QtCore.pyqtSignal(object)
     colorLimitsCommitted = QtCore.pyqtSignal(object)
 
@@ -77,6 +78,7 @@ class FacetedPanelHost(QtWidgets.QWidget):
         self._focus.thresholdsCommitted.connect(
             self.thresholdsCommitted.emit
         )
+        self._focus.crossSelected.connect(self.crossSelected.emit)
         self._focus.rectangleSelected.connect(self.rectangleSelected.emit)
         self._focus.colorLimitsCommitted.connect(
             self.colorLimitsCommitted.emit
@@ -103,6 +105,12 @@ class FacetedPanelHost(QtWidgets.QWidget):
         return self._overview_png
 
     @property
+    def overview_regions(self) -> tuple[FigurePanelRegion, ...]:
+        """Immutable hit map belonging to the currently presented overview."""
+
+        return self._regions
+
+    @property
     def showing_overview(self) -> bool:
         return self._stack.currentWidget() is self._overview
 
@@ -110,6 +118,8 @@ class FacetedPanelHost(QtWidgets.QWidget):
         self,
         png_bytes: bytes,
         regions: tuple[FigurePanelRegion, ...],
+        *,
+        logical_size: tuple[int, int] | None = None,
     ) -> None:
         """Atomically replace the complete overview and its exact hit map."""
 
@@ -126,16 +136,35 @@ class FacetedPanelHost(QtWidgets.QWidget):
             raise ValueError("faceted overview region keys must be unique")
         if any(region.focus_selection is None for region in resolved):
             raise ValueError("faceted overview regions require exact selections")
-        self._overview.present_encoded(png_bytes, image_format="PNG")
-        self._overview_png = png_bytes
-        self._regions = resolved
-        self._stack.setCurrentWidget(self._overview)
-        self._overview_button.hide()
+        geometry_changes = logical_size is not None and (
+            self.width(), self.height()
+        ) != logical_size
+        if geometry_changes:
+            self.setUpdatesEnabled(False)
+        try:
+            self._overview.present_encoded(png_bytes, image_format="PNG")
+            self._overview_png = png_bytes
+            self._regions = resolved
+            if logical_size is not None:
+                self.set_logical_size(logical_size)
+            self._stack.setCurrentWidget(self._overview)
+            self._overview_button.hide()
+        finally:
+            if geometry_changes:
+                self.setUpdatesEnabled(True)
+                self.update()
 
-    def present_frame(self, frame: BoardFrame) -> None:
+    def present_frame(
+        self,
+        frame: BoardFrame,
+        *,
+        logical_size: tuple[int, int] | None = None,
+    ) -> None:
         """Present one exact focused cell through the shared panel host."""
 
-        self._focus.present_frame(frame)
+        self._focus.present_frame(frame, logical_size=logical_size)
+        if logical_size is not None:
+            self.setFixedSize(*logical_size)
         self._focus.set_selectors_enabled(self._selectors_on)
         self._stack.setCurrentWidget(self._focus)
         self._place_overview_button()

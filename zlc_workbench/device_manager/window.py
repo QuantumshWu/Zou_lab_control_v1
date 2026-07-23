@@ -11,8 +11,6 @@ lifecycle boundaries only (initialize and shutdown-for-restart).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
-
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_frontend.qt_widgets import (
@@ -61,29 +59,27 @@ class _DeviceSummaryCard(FluentFrame):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent, bordered=True)
-        layout = QtWidgets.QVBoxLayout(self)
+        layout = QtWidgets.QHBoxLayout(self)
         pad = window_pad(0.55)
         layout.setContentsMargins(pad, pad, pad, pad)
-        layout.setSpacing(scaled_px(3, minimum=2))
-
-        heading = QtWidgets.QHBoxLayout()
-        heading.setContentsMargins(0, 0, 0, 0)
-        heading.setSpacing(scaled_px(8, minimum=5))
+        layout.setSpacing(scaled_px(8, minimum=5))
         self.role_label = ElidedLabel("")
         role_font = self.role_label.font()
         role_font.setBold(True)
         self.role_label.setFont(role_font)
-        self.domain_label = muted_note_label("")
-        self.domain_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        heading.addWidget(self.role_label, 1)
-        heading.addWidget(self.domain_label)
-        layout.addLayout(heading)
-
+        self.role_label.setMinimumWidth(scaled_px(86, minimum=68))
         self.adapter_label = ElidedLabel("")
         self.detail_label = muted_note_label("")
-        self.detail_label.setWordWrap(True)
-        layout.addWidget(self.adapter_label)
-        layout.addWidget(self.detail_label)
+        self.detail_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
+        self.domain_label = muted_note_label("")
+        self.domain_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        layout.addWidget(self.role_label)
+        layout.addWidget(self.adapter_label, 1)
+        layout.addWidget(self.detail_label, 2)
+        layout.addWidget(self.domain_label)
 
     def update_content(
         self,
@@ -110,16 +106,12 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self,
         controller: DeviceManagerController,
         *,
-        experiment_provider: Callable[[], object | None],
         parent=None,
     ) -> None:
         if not isinstance(controller, DeviceManagerController):
             raise TypeError("controller must be DeviceManagerController")
-        if not callable(experiment_provider):
-            raise TypeError("experiment_provider must be callable")
         super().__init__(parent)
         self._controller = controller
-        self._experiment_provider = experiment_provider
         self._window = None
         self._permanently_closed = False
         self._close_after_shutdown = False
@@ -594,10 +586,6 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
     # ------------------------------------------------------------------
 
     @property
-    def experiment(self):
-        return self._experiment_provider()
-
-    @property
     def permanently_closed(self) -> bool:
         return self._permanently_closed
 
@@ -663,16 +651,12 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
 def launch_device_manager_window(
     controller: DeviceManagerController,
     *,
-    experiment_provider: Callable[[], object | None],
     hide_on_close: bool = False,
 ) -> DeviceManagerWindowBody:
     """Launch the DeviceManager through the one shared Fluent sequence."""
 
     ensure_qt_app()
-    body = DeviceManagerWindowBody(
-        controller,
-        experiment_provider=experiment_provider,
-    )
+    body = DeviceManagerWindowBody(controller)
     initial = screen_fit_window_size(WINDOW_SCREEN_FRACTION)
 
     def wire(window) -> None:

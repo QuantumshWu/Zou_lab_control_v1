@@ -6,7 +6,6 @@ import math
 import threading
 import time
 import uuid
-from dataclasses import dataclass
 from typing import Mapping
 
 from fpga.pulse_streamer.host.image import (
@@ -60,6 +59,7 @@ from zlc_pulse import (
     RemotePulseExecutionClient,
     bind_pulse_document_target,
     load_deployed_pulse_target,
+    load_pulse_document,
     pulse_target_manifest,
     validate_pulse_document_clock_grid,
 )
@@ -75,7 +75,6 @@ from ._virtual_hardware import (
     VirtualAtomArray,
     VirtualCamera,
     VirtualMotFrameSource,
-    VirtualMonitorCamera,
     VirtualSequencer,
 )
 
@@ -85,7 +84,8 @@ from ._virtual_hardware import (
 _COOLING_CHANNELS = ("ch00", "ch01")
 _PROBE_CHANNELS = ("ch03",)
 _TRAP_CHANNELS = ("ch09",)
-_CAMERA_TRIGGER_CHANNELS = ("ch11",)
+_READOUT_CAMERA_TRIGGER_CHANNELS = ("ch11",)
+_MOT_CAMERA_TRIGGER_CHANNELS = ("ch06",)
 _VIRTUAL_MOT_COIL_PORTS = {
     "da_x": "da_bias_x",
     "da_y": "da_bias_y",
@@ -129,7 +129,8 @@ def _deployed_target() -> PulseTarget:
         *_COOLING_CHANNELS,
         *_PROBE_CHANNELS,
         *_TRAP_CHANNELS,
-        *_CAMERA_TRIGGER_CHANNELS,
+        *_READOUT_CAMERA_TRIGGER_CHANNELS,
+        *_MOT_CAMERA_TRIGGER_CHANNELS,
         *_VIRTUAL_MOT_COIL_PORTS.values(),
     }
     missing = tuple(sorted(required.difference(target.by_key)))
@@ -159,8 +160,9 @@ def _virtual_target_manifest(target: PulseTarget) -> PulseTargetManifest:
         "ch00": ("SIM:C0",),
         "ch01": ("SIM:C1",),
         "ch03": ("SIM:PROBE",),
+        "ch06": ("SIM:MOT_CAMERA",),
         "ch09": ("SIM:TRAP",),
-        "ch11": ("SIM:CAM",),
+        "ch11": ("SIM:READOUT_CAMERA",),
     }
     for model_axis, port_key in _VIRTUAL_MOT_COIL_PORTS.items():
         port = target.by_key[port_key]
@@ -204,7 +206,11 @@ def _bind_camera(
     asset: InstallationAsset,
     asset_map_revision: str,
     camera: VirtualCamera,
+    *,
+    free_running_monitor: bool = False,
 ) -> tuple[BoundCapturePort, BoundCameraMonitorPort]:
+    if not isinstance(free_running_monitor, bool):
+        raise TypeError("free_running_monitor must be bool")
     endpoint = CameraMonitorEndpoint(
         camera,
         asset.role,
@@ -217,6 +223,11 @@ def _bind_camera(
             }
         ),
         acquisition_mode=CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+        monitor_acquisition_mode=(
+            CameraAcquisitionMode.FREE_RUNNING
+            if free_running_monitor
+            else CameraAcquisitionMode.EXTERNAL_TRIGGERED
+        ),
     )
     attestation = _bind_camera_endpoint(
         broker,
@@ -262,23 +273,6 @@ def _bind_camera_endpoint(
         interrupt_operations={SafetyOperation.DISARM: endpoint.interrupt},
     )
     return broker.verify_capability(binding)
-
-
-def _bind_monitor_camera(
-    broker: DeviceBroker,
-    asset: InstallationAsset,
-    asset_map_revision: str,
-    camera: VirtualMonitorCamera,
-) -> BoundCameraMonitorPort:
-    endpoint = CameraMonitorEndpoint(camera, asset.role)
-    return BoundCameraMonitorPort(
-        _bind_camera_endpoint(
-            broker,
-            asset,
-            asset_map_revision,
-            endpoint,
-        )
-    )
 
 
 def _bind_sequencer(
@@ -572,6 +566,20 @@ class _InstallationRuntime:
                     f"camera role {reference.role!r} has no sitemap profile"
                 ) from exc
 
+    def sitemap_camera_roles(self) -> tuple[str, ...]:
+        """Camera roles for which this installation can acquire a sitemap.
+
+        A camera port alone does not imply the pulse/readout geometry needed by
+        calibration.  This is the read-only capability projection used by
+        composition surfaces; it exposes role names, never adapters or the
+        installation's private profile objects.
+        """
+
+        with self._lock:
+            if self._state != "RUNNING":
+                raise RuntimeError("installation runtime is not accepting operations")
+            return tuple(self._sitemap_profiles)
+
     def start(self, plan: RunPlan) -> RunHandle:
         with self._lock:
             if self._state != "RUNNING":
@@ -715,7 +723,6 @@ def _catalog(
     domains = {
         "camera": "camera",
         "mot_camera": "camera",
-        "monitor_camera": "camera",
         "sequencer": "sequencer",
         "trap": "trap",
     }
@@ -753,7 +760,6 @@ def create_virtual_installation(
     sequencer: VirtualSequencer | None = None
     camera: VirtualCamera | None = None
     mot_camera: VirtualCamera | None = None
-    monitor_camera: VirtualMonitorCamera | None = None
     devices: dict[str, object] = {}
     resources: ResourceArbiter | None = None
     broker: DeviceBroker | None = None
@@ -780,7 +786,7 @@ def create_virtual_installation(
         camera = VirtualCamera(
             trap,
             sequencer=sequencer,
-            capture_trigger_channels=_CAMERA_TRIGGER_CHANNELS,
+            capture_trigger_channels=_READOUT_CAMERA_TRIGGER_CHANNELS,
         )
         devices["camera"] = camera
         mot_camera = VirtualCamera(
@@ -790,15 +796,11 @@ def create_virtual_installation(
                 coil_ports=_VIRTUAL_MOT_COIL_PORTS,
             ),
             sequencer=sequencer,
-            capture_trigger_channels=_CAMERA_TRIGGER_CHANNELS,
+            capture_trigger_channels=_MOT_CAMERA_TRIGGER_CHANNELS,
             exposure=0.05,
+            free_running_live=True,
         )
         devices["mot_camera"] = mot_camera
-        monitor_camera = VirtualMonitorCamera(
-            sequencer,
-            coil_ports=_VIRTUAL_MOT_COIL_PORTS,
-        )
-        devices["monitor_camera"] = monitor_camera
         # The trap is a private simulator model behind the camera, not an unbound
         # public physical-device role.  It remains in the exact reverse-close graph.
         assets = InstallationAssetMap.ephemeral(
@@ -806,12 +808,11 @@ def create_virtual_installation(
                 "sequencer": sequencer,
                 "camera": camera,
                 "mot_camera": mot_camera,
-                "monitor_camera": monitor_camera,
             }
         )
         installation_id = f"installation-{assets.revision[:20]}"
         runtime_instance_id = uuid.uuid4().hex
-        for role in ("sequencer", "camera", "mot_camera", "monitor_camera"):
+        for role in ("sequencer", "camera", "mot_camera"):
             devices[role].ensure_open()
         sequencer.set_safe_state()
         broker = DeviceBroker()
@@ -821,17 +822,12 @@ def create_virtual_installation(
             assets.revision,
             camera,
         )
-        camera_monitor_port = _bind_monitor_camera(
-            broker,
-            assets.require("monitor_camera", monitor_camera),
-            assets.revision,
-            monitor_camera,
-        )
         mot_camera_port, mot_camera_monitor_port = _bind_camera(
             broker,
             assets.require("mot_camera", mot_camera),
             assets.revision,
             mot_camera,
+            free_running_monitor=True,
         )
         pulse_port = _bind_sequencer(
             broker,
@@ -850,7 +846,7 @@ def create_virtual_installation(
                 load_packaged_sitemap_pulse(),
                 pulse_port.capability.target,
             ),
-            trigger_channel=_CAMERA_TRIGGER_CHANNELS[0],
+            trigger_channel=_READOUT_CAMERA_TRIGGER_CHANNELS[0],
         )
         catalog = _catalog(
             installation_id,
@@ -874,13 +870,11 @@ def create_virtual_installation(
             camera_monitor_ports={
                 "camera": readout_camera_monitor_port,
                 "mot_camera": mot_camera_monitor_port,
-                "monitor_camera": camera_monitor_port,
             },
             pulse_ports={"sequencer": pulse_port},
             sitemap_profiles={"camera": sitemap_profile},
             raw_graph=devices,
             close_order=(
-                "monitor_camera",
                 "mot_camera",
                 "camera",
                 "sequencer",
@@ -892,7 +886,6 @@ def create_virtual_installation(
         cleanup_errors: list[BaseException] = []
         authority_actions = (
             None if broker is None else broker.shutdown,
-            None if monitor_camera is None else monitor_camera.close,
             None if mot_camera is None else mot_camera.close,
             None if camera is None else camera.close,
             None if sequencer is None else sequencer.close,

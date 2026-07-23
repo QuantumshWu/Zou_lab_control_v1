@@ -26,6 +26,7 @@ from zlc_pulse import (
     PulseDocument,
     RepeatRegion,
     pulse_document_from_tree,
+    resolve_api_parameters,
 )
 from zlc_storage import (
     canonical_text,
@@ -284,6 +285,46 @@ class SitemapAcquisitionProfile:
         periods = self.pulse_document.periods
         return replace(
             self.pulse_document,
+            repeat=RepeatRegion(periods[0].period_id, periods[-1].period_id, repeats),
+        )
+
+    def configured_document_for_repeats(
+        self,
+        repeat_count: int,
+        *,
+        reference_exposure_s: float,
+        readout_exposure_s: float,
+        pulse_document: PulseDocument | None = None,
+    ) -> PulseDocument:
+        """Freeze Main's long-short-long exposure intent into the fired pulse.
+
+        A caller-selected pulse is admitted through this profile's complete
+        three-event/trigger validation before any API value is resolved.  The
+        three exposure parameters are then consumed, leaving a fully explicit
+        immutable execution document whose repeat encloses the whole bracket.
+        """
+
+        reference = positive_real(reference_exposure_s, "reference_exposure_s")
+        readout = positive_real(readout_exposure_s, "readout_exposure_s")
+        base = self.pulse_document
+        if pulse_document is not None:
+            if not isinstance(pulse_document, PulseDocument):
+                raise TypeError("pulse_document must be PulseDocument or None")
+            base = replace(self, pulse_document=pulse_document).pulse_document
+        resolved = resolve_api_parameters(
+            base,
+            {
+                _REFERENCE_BEFORE: reference,
+                _READOUT: readout,
+                _REFERENCE_AFTER: reference,
+            },
+        )
+        repeats = self._repeat_count(repeat_count)
+        if repeats == 1:
+            return resolved
+        periods = resolved.periods
+        return replace(
+            resolved,
             repeat=RepeatRegion(periods[0].period_id, periods[-1].period_id, repeats),
         )
 

@@ -23,12 +23,14 @@ four contracted seams this root assembles, in rewiring order:
    encoded-raster / render DTOs onto the qt_widgets raster
    boards); no transitional matplotlib live stack.
 
-Until a seam lands the corresponding skeleton members stay disconnected -- the
-window may not fully operate yet, which is the accepted state of the rewiring
-phase (the purge deliberately preceded the reconnect).
+All four seams are required by this composition root.  A missing catalog,
+runtime, live-data, or render binding is a startup/runtime defect; the product
+does not expose a transitional partial TaskConsole.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 __all__ = ["open_task_console"]
 
@@ -42,16 +44,11 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     """
 
     from Zou_lab_control.notebook.facade import (
-        _prepare_camera_monitor_for_workbench,
-        _prepare_capture_for_workbench,
-        _prepare_finite_occupancy_for_workbench,
+        _prepare_camera_measurement_for_workbench,
         _prepare_temperature_release_recapture_for_workbench,
     )
     from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_KEY
-    from zlc_neutral_atom.capture_application import CaptureRequest
-    from zlc_neutral_atom.monitor_application import (
-        CAMERA_MONITOR_MEASUREMENT_KEY,
-    )
+    from zlc_neutral_atom.camera_measurement import CameraMeasurementRequest
     from zlc_neutral_atom.mot_field import MOT_FIELD_TASK_KEY
     from zlc_neutral_atom.readout.calibration_reference import (
         CalibrationArtifactRef,
@@ -59,6 +56,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     from zlc_neutral_atom.readout.occupancy import (
         OCCUPANCY_STREAM_PROCESSOR_KEY,
     )
+    from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
     from zlc_neutral_atom.readout.coupled_measurements import (
         AutonomousMeasurementUnavailable,
         GREY_MOLASSES_CAPABILITY_GAP,
@@ -70,11 +68,18 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     from zlc_neutral_atom.readout.sitemap import SITEMAP_CALIBRATION_TASK_KEY
     from zlc_neutral_atom.scan import PULSE_SCAN_TASK_KEY
 
-    from .calibration_task import CalibrationTaskHandle
+    from .calibration_task import (
+        CalibrationTaskExecution,
+        CalibrationTaskHandle,
+        CalibrationTaskIntent,
+    )
     from .catalog_bridge import ConsoleCatalogView
     from .data_plane import ConsoleDataPlane
-    from .mot_field_task import MotFieldTaskHandle
-    from .occupancy_binding import OccupancyBindingIntent
+    from .mot_field_task import MotFieldTaskIntent, start_mot_field_task
+    from .occupancy_binding import (
+        OccupancyBindingIntent,
+        ReactiveOccupancyNode,
+    )
     from .coupled_measurement_presenter import (
         GreyMolassesDetuningIntent,
         ReadoutDurationFidelityIntent,
@@ -83,7 +88,6 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     )
     from .result_projection import project_final_signals
     from .window import show_task_console
-    from zlc_workbench.data_figure.app import open_local_data_figure_analysis
     from .run_bridge import ConsoleRunNode
 
     catalog_view = ConsoleCatalogView(experiment)
@@ -99,59 +103,23 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         hook it here rather than inside the run bridge.
         """
 
-    def submit_rectangle_selection(node, selection):
-        """Promote a displayed rectangle only for its exact live monitor owner."""
-
-        if getattr(getattr(node, "spec", None), "key", None) != (
-            CAMERA_MONITOR_MEASUREMENT_KEY
-        ):
-            raise ValueError(
-                "this rectangle is display-only; ROI signals are produced only "
-                "by a running Camera monitor"
-            )
-        handle = getattr(node, "handle", None)
-        if handle is None or handle.snapshot().state.terminal:
-            raise RuntimeError("Camera monitor is not running")
-        request = node.request
-        state = data_plane.current_camera_roi_state(node)
-        applied = getattr(state, "binding", None)
-        # Repeating the exact applied rectangle is the one unambiguous delete
-        # gesture.  It mirrors the standalone monitor without adding a second
-        # ROI toggle or another piece of saved GUI state.
-        candidate = (
-            None
-            if applied is not None and applied.selection == selection
-            else selection
-        )
-        return data_plane.submit_camera_roi_control(
-            node,
-            candidate,
-            request.roi_reduction,
-        )
-
     def run_factory(spec, values):
-        if spec.key == CAMERA_MONITOR_MEASUREMENT_KEY:
-            node = ConsoleRunNode(
-                spec,
-                values,
-                prepare=lambda request: _prepare_camera_monitor_for_workbench(
-                    experiment, request
-                ),
-                request_owner_wake=request_owner_wake,
-            )
-            _bind_monitor_view(node, data_plane)
-            return node
         if spec.key == CAMERA_MEASUREMENT_KEY:
+            def prepare_camera(request):
+                if isinstance(request, CameraMeasurementRequest):
+                    return _prepare_camera_measurement_for_workbench(
+                        experiment,
+                        request,
+                    )
+                raise TypeError("Camera form must produce CameraMeasurementRequest")
+
             node = ConsoleRunNode(
                 spec,
                 values,
-                prepare=lambda request: _prepare_capture_for_workbench(
-                    experiment,
-                    request,
-                ),
+                prepare=prepare_camera,
                 request_owner_wake=request_owner_wake,
             )
-            _bind_capture_execution(node, data_plane)
+            _bind_camera_execution(node, data_plane)
             node.bind_final_projector(
                 lambda result, current=node: project_final_signals(
                     experiment,
@@ -292,16 +260,26 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
             if (
                 source.definition_key != CAMERA_MEASUREMENT_KEY
                 or source.output_name != "frame"
-                or not isinstance(source.request, CaptureRequest)
+                or not isinstance(source.request, CameraMeasurementRequest)
+                or source.request.repeat != 0
             ):
                 raise ValueError(
-                    "occupancy Camera capture must select the frame output of "
-                    "a Camera capture Measurement row in this TaskConsole"
+                    "occupancy Camera source must select the frame output of "
+                    "a live Camera Measurement row (repeat = 0) in this "
+                    "TaskConsole"
                 )
-            if source.running:
+            if not source.running:
                 raise RuntimeError(
-                    "the selected Camera capture row is already running; stop "
-                    "it before starting occupancy"
+                    "start the selected Camera Measurement before starting "
+                    "the reactive Occupancy Processor"
+                )
+            source_value = data_plane.freeze().value(
+                intent.camera_frame_signal
+            )
+            if source_value is None:
+                raise RuntimeError(
+                    "the selected running Camera Measurement has not published "
+                    "a frame yet"
                 )
             calibration = console[0].resolve_console_producer(
                 intent.calibration_signal
@@ -330,40 +308,72 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                     "current FINAL CalibrationArtifactRef; run it successfully "
                     "before starting occupancy"
                 )
-            capture_request = source.request
             calibration_ref = calibration.final_result
 
-            def prepare_occupancy(current_intent):
-                if current_intent != intent:
-                    raise RuntimeError(
-                        "occupancy binding changed after producer resolution"
+            def resolve_calibration():
+                resolved = experiment.readout.load_calibration(calibration_ref)
+                expected = ReadoutBindingKey(source.request.camera_ref.role)
+                if resolved.artifact.frame_contract.binding != expected:
+                    raise ValueError(
+                        "selected Camera role differs from the admitted "
+                        "calibration readout binding"
                     )
-                return _prepare_finite_occupancy_for_workbench(
-                    experiment,
-                    capture_request,
-                    calibration_ref,
+                return resolved
+
+            return ReactiveOccupancyNode(
+                spec,
+                values,
+                intent=intent,
+                source_node=source.run_node,
+                initial_source=source_value,
+                resolve_calibration=resolve_calibration,
+                data_plane=data_plane,
+                request_owner_wake=request_owner_wake,
+            )
+        if spec.key == SITEMAP_CALIBRATION_TASK_KEY:
+            frozen_intent = spec.build_request(values)
+            if not isinstance(frozen_intent, CalibrationTaskIntent):
+                raise TypeError("calibration catalog returned invalid intent")
+
+            def prepare_calibration_task(current_intent):
+                if current_intent != frozen_intent:
+                    raise RuntimeError(
+                        "calibration binding changed after request freeze"
+                    )
+                if current_intent.source_mode == "live":
+                    sequence = experiment.readout.sitemap_request(
+                        frames=current_intent.threshold_frames,
+                        camera_role=current_intent.camera_role,
+                        pulse=current_intent.pulse,
+                        reference_exposure_s=current_intent.reference_exposure_s,
+                        readout_exposure_s=current_intent.readout_exposure_s,
+                        threshold_method=current_intent.threshold_method,
+                        roi_radius=current_intent.roi_radius,
+                    )
+                    return CalibrationTaskExecution(
+                        current_intent,
+                        sequence.analysis,
+                        sequence=sequence,
+                    )
+                source = experiment.readout._resolve_saved_calibration_capture(
+                    Path(current_intent.folder) / "frames",
+                    expected_camera_role=current_intent.camera_role,
+                )
+                analysis = experiment.readout.sitemap_analysis_request(
+                    camera_role=current_intent.camera_role,
+                    threshold_method=current_intent.threshold_method,
+                    roi_radius=current_intent.roi_radius,
+                )
+                return CalibrationTaskExecution(
+                    current_intent,
+                    analysis,
+                    source_capture_ref=source,
                 )
 
             node = ConsoleRunNode(
                 spec,
                 values,
-                prepare=prepare_occupancy,
-                request_owner_wake=request_owner_wake,
-            )
-            _bind_occupancy_preview(node, data_plane)
-            node.bind_final_projector(
-                lambda result, current=node: project_final_signals(
-                    experiment,
-                    current,
-                    result,
-                )
-            )
-            return node
-        if spec.key == SITEMAP_CALIBRATION_TASK_KEY:
-            node = ConsoleRunNode(
-                spec,
-                values,
-                prepare=lambda request: request,
+                prepare=prepare_calibration_task,
                 request_owner_wake=request_owner_wake,
             )
 
@@ -372,15 +382,28 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                     request,
                     start_capture=experiment.start,
                     build_calibration_request=(
-                        lambda source, analysis, timeout: (
+                        lambda source, analysis: (
                             experiment.readout.calibration_request(
                                 source,
                                 analysis,
-                                timeout_seconds=timeout,
                             )
                         )
                     ),
                     start_calibration=experiment.readout.start_calibration,
+                    write_outputs=(
+                        lambda source, calibration, intent: (
+                            experiment.readout._write_calibration_task_outputs(
+                                source,
+                                calibration,
+                                folder=intent.folder,
+                                save_frames=(
+                                    intent.save_frames
+                                    if intent.source_mode == "live"
+                                    else False
+                                ),
+                            )
+                        )
+                    ),
                 )
 
             node.bind_starter(start_calibration_sequence)
@@ -393,6 +416,28 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
             )
             return node
         if spec.key == MOT_FIELD_TASK_KEY:
+            intent = spec.build_request(values)
+            if not isinstance(intent, MotFieldTaskIntent):
+                raise TypeError("MOT form did not produce MotFieldTaskIntent")
+
+            def bind_mot_field(current):
+                if current != intent:
+                    raise RuntimeError(
+                        "MOT-field intent changed after construction"
+                    )
+                return experiment.readout.mot_field_request(
+                    current.pulse,
+                    center_x=current.center_x,
+                    center_y=current.center_y,
+                    center_z=current.center_z,
+                    span=current.span,
+                    points=current.points,
+                    roi_cx=None if current.roi_cx == 0.0 else current.roi_cx,
+                    roi_cy=None if current.roi_cy == 0.0 else current.roi_cy,
+                    roi_radius=current.roi_radius,
+                    camera_role=current.camera_role,
+                )
+
             node = ConsoleRunNode(
                 spec,
                 values,
@@ -400,8 +445,9 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 request_owner_wake=request_owner_wake,
             )
             node.bind_starter(
-                lambda request: MotFieldTaskHandle(
-                    request,
+                lambda current: start_mot_field_task(
+                    current,
+                    bind_request=bind_mot_field,
                     start_scan=experiment.readout._start_mot_field_scan,
                     materialize_scan=experiment.readout.materialize_scan,
                 )
@@ -439,63 +485,45 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         catalog_view=catalog_view,
         run_factory=run_factory,
         data_plane=data_plane,
-        fit_window_factory=experiment.fit_gui,
-        local_fit_window_factory=open_local_data_figure_analysis,
-        rectangle_selection_sink=submit_rectangle_selection,
         **kwargs,
     )
     console.append(body)
     return body
 
 
-def _bind_monitor_view(node, data_plane) -> None:
-    """Teach one run node how to start WITH a live view, and register that view.
-
-    A camera monitor starts only through ``start_with_view``: the factory it
-    receives runs on the worker, builds this node's LiveDatasetSlot, and hands it
-    to the data plane, which is what makes the node's frames reach the board.
-    """
-
-    from zlc_frontend.figure import DatasetId
-    from zlc_workbench.live import LiveDatasetSlot
-
-    dataset_id = DatasetId(f"console-{node.spec.key.stable_definition_id}-{id(node):x}")
-
-    def start(command):
-        def factory(view_spec):
-            slot = LiveDatasetSlot(
-                view_spec,
-                dataset_id=dataset_id,
-                retain_on_terminal=True,
-            )
-            data_plane.attach(node, slot)
-
-            def source_changed() -> None:
-                data_plane.mark_changed(node)
-
-            slot.set_change_listener(source_changed)
-            return slot
-
-        return command.start_with_view(factory=factory)
-
-    node.bind_starter(start)
-
-
-def _bind_capture_execution(node, data_plane) -> None:
-    """Start one finite capture, attaching its optional single-event preview.
-
-    The preview is a presentation convenience, not part of the capture
-    contract.  Any layout outside the preview's one-cell contract therefore
-    starts without it and publishes its complete FINAL dataset after success.
-    """
+def _bind_camera_execution(node, data_plane) -> None:
+    """Start the one Camera definition as live or finite from its typed request."""
 
     import uuid
 
     from zlc_data import BlockId
     from zlc_frontend.figure import DatasetId
-    from zlc_workbench.live import LiveDatasetSlot
+    from zlc_neutral_atom.capture_application import PreparedFiniteCameraMeasurement
+    from zlc_neutral_atom.monitor_application import PreparedLiveCameraMeasurement
+    from zlc_workbench.live_slot import LiveDatasetSlot
 
     def start(command):
+        if isinstance(command, PreparedLiveCameraMeasurement):
+            dataset_id = DatasetId(
+                f"console-{node.spec.key.stable_definition_id}-{id(node):x}"
+            )
+
+            def live_factory(view_spec):
+                slot = LiveDatasetSlot(
+                    view_spec,
+                    dataset_id=dataset_id,
+                    retain_on_terminal=True,
+                )
+                data_plane.attach(node, slot)
+                slot.set_change_listener(lambda: data_plane.mark_changed(node))
+                return slot
+
+            return command.start_with_view(factory=live_factory)
+        if not isinstance(command, PreparedFiniteCameraMeasurement):
+            raise TypeError(
+                "Camera execution requires a prepared live or finite Camera "
+                "measurement"
+            )
         try:
             command.preview_schema
         except ValueError:
@@ -519,21 +547,5 @@ def _bind_capture_execution(node, data_plane) -> None:
             block_id=block_id,
             factory=factory,
         )
-
-    node.bind_starter(start)
-
-
-def _bind_occupancy_preview(node, data_plane) -> None:
-    """Attach the exact counts preview of one flat occupancy Run."""
-
-    from zlc_workbench.progressive_scan import ExactDatasetLiveSlot
-
-    def start(command):
-        def factory(preview_spec):
-            slot = ExactDatasetLiveSlot(preview_spec)
-            data_plane.attach_exact(node, slot)
-            return slot
-
-        return command.start_with_preview(factory=factory)
 
     node.bind_starter(start)

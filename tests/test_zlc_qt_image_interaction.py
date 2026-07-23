@@ -605,10 +605,6 @@ def test_two_image_bindings_isolate_front_hold_state_fault_and_left_double_click
         assert board._image_interaction_armed(a)
         assert not board._image_interaction_armed(b)
         board.set_image_interaction_readiness("image-b", True)
-        _drag_move(board, _point(target_b, 0.25, 0.25), QtCore.Qt.NoButton)
-        assert b.hover is not None and a.hover is None
-        _drag_move(board, _point(target_a, 0.25, 0.25), QtCore.Qt.NoButton)
-        assert a.hover is not None and b.hover is None
 
         QtTest.QTest.mousePress(
             board,
@@ -798,52 +794,6 @@ def test_exact_interaction_callback_rejects_current_or_future_payloadless_panel(
     finally:
         current.close()
         future.close()
-        application.processEvents()
-
-
-def test_hover_is_exact_and_ephemeral_on_leave_disable_and_hide() -> None:
-    from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
-
-    application, board = _bound_board(_frame(1))
-    try:
-        def hover_at(point) -> None:
-            board.mouseMoveEvent(
-                QtGui.QMouseEvent(
-                    QtCore.QEvent.MouseMove,
-                    QtCore.QPointF(point),
-                    QtCore.Qt.NoButton,
-                    QtCore.Qt.NoButton,
-                    QtCore.Qt.NoModifier,
-                )
-            )
-
-        position = _point(_target(board), 0.75, 0.75)
-        hover_at(position)
-        sample = _binding(board).hover
-        assert sample is not None and sample.value == 4000.0 and sample.valid
-
-        # A stationary pointer remains useful on a live image: every promoted
-        # front re-evaluates it against the new exact payload/provenance.
-        board.present(_frame(2, values=[[1.0, 2.0], [3.0, 8.0]]))
-        application.processEvents()
-        sample = _binding(board).hover
-        assert sample is not None and sample.value == 8.0 and sample.valid
-
-        QtWidgets.QApplication.sendEvent(board, QtCore.QEvent(QtCore.QEvent.Leave))
-        assert _binding(board).hover is None
-        hover_at(position)
-        assert _binding(board).hover is not None
-        board.set_selectors_enabled(False)
-        assert _binding(board).hover is None
-        assert not _wheel(board, position, -120).isAccepted()
-
-        board.set_selectors_enabled(True)
-        hover_at(position)
-        assert _binding(board).hover is not None
-        QtWidgets.QApplication.sendEvent(board, QtGui.QHideEvent())
-        assert _binding(board).hover is None
-    finally:
-        board.close()
         application.processEvents()
 
 

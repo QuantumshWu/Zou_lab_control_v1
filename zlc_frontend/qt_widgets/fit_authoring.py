@@ -197,6 +197,116 @@ class FitAuthoringPane(QtWidgets.QWidget):
             self.model_combo.blockSignals(False)
             self._installing = False
 
+    def reconcile_options(
+        self,
+        options: tuple[FitAuthoringOption, ...],
+        *,
+        selected_model: str | None = None,
+    ) -> None:
+        """Keyed-diff fit models/forms into this stable pane.
+
+        Live Figure hosts may retain the same widget while a source schema or
+        authoritative Area selection changes.  Rebuilding the whole pane would
+        disturb scroll/focus state and make Setting/Edit drift.  Models are
+        therefore added/removed by id and each surviving constraint form uses
+        :meth:`FluentParameterForm.reconcile` to keep compatible leaf widgets.
+        """
+
+        prepared = tuple(options)
+        if not prepared or any(
+            not isinstance(option, FitAuthoringOption) for option in prepared
+        ):
+            raise ValueError("fit authoring requires FitAuthoringOption values")
+        schema_fingerprints = {
+            option.spec.input_schema_fingerprint for option in prepared
+        }
+        models = tuple(option.spec.model_id for option in prepared)
+        if len(schema_fingerprints) != 1 or len(models) != len(set(models)):
+            raise ValueError(
+                "fit authoring options require one source schema and unique models"
+            )
+        if selected_model is not None and selected_model not in models:
+            raise ValueError("selected_model is not present in fit options")
+        if self._constraint_stack is None:
+            self.install_options(prepared, selected_model=selected_model)
+            return
+
+        current_model = self.model_combo.currentData()
+        retained_values = {}
+        for model_id, form in self._constraint_forms.items():
+            try:
+                retained_values[model_id] = form.read_all()
+            except (TypeError, ValueError):
+                # An incomplete local draft must not poison a source/schema
+                # transition.  Its compatible widgets remain, but the new
+                # owner-authored defaults are authoritative for population.
+                pass
+
+        self._installing = True
+        self.model_combo.blockSignals(True)
+        try:
+            stack = self._constraint_stack
+            wanted = set(models)
+            for model_id in tuple(self._constraint_forms):
+                if model_id in wanted:
+                    continue
+                form = self._constraint_forms.pop(model_id)
+                stack.removeWidget(form)
+                form.deleteLater()
+
+            forms: dict[str, FluentParameterForm] = {}
+            for index, option in enumerate(prepared):
+                model_id = option.spec.model_id
+                defaults = {
+                    field.key: field.default
+                    for field in option.constraint_form.fields
+                }
+                form = self._constraint_forms.get(model_id)
+                if form is None:
+                    form = FluentParameterForm(
+                        option.constraint_form,
+                        values=defaults,
+                        parent=stack,
+                    )
+                    form.setObjectName(
+                        f"fitAuthoringConstraints_{model_id}"
+                    )
+                    form.changed.connect(self._editor_changed)
+                else:
+                    values = retained_values.get(model_id, defaults)
+                    if set(values) != set(option.constraint_form.keys):
+                        values = defaults
+                    form.reconcile(option.constraint_form, values)
+                    stack.removeWidget(form)
+                stack.insertWidget(index, form)
+                forms[model_id] = form
+
+            self._constraint_forms = forms
+            self._fit_options = {
+                option.spec.model_id: option for option in prepared
+            }
+            self.model_combo.clear()
+            for option in prepared:
+                self.model_combo.addItem(
+                    option.display_name,
+                    option.spec.model_id,
+                )
+            wanted_model = (
+                selected_model
+                if selected_model is not None
+                else current_model
+                if current_model in self._fit_options
+                else models[0]
+            )
+            self.model_combo.setCurrentIndex(
+                self.model_combo.findData(wanted_model)
+            )
+            self._rebuild_constraint_form()
+        finally:
+            self.model_combo.blockSignals(False)
+            self._installing = False
+        self.set_busy(None, draft_ready=self._draft_ready)
+
     def clear_options(self) -> bool:
         """Detach all option widgets and report whether DeferredDelete is pending."""
 

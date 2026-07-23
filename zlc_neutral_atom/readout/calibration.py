@@ -121,6 +121,19 @@ class BackgroundMode(str, Enum):
     ANNULUS_MEDIAN = "annulus"
 
 
+class ThresholdMethod(str, Enum):
+    """Fallback threshold estimator when bracket labels cannot train a site.
+
+    Long-short-long reference labels remain the authoritative threshold source
+    whenever they are usable.  This choice controls the same quick fallback
+    that Main exposed as ``otsu`` versus ``bimodal``; it is analysis intent,
+    not a GUI-only preference.
+    """
+
+    OTSU = "otsu"
+    BIMODAL = "bimodal"
+
+
 def _immutable_array(
     value: object,
     *,
@@ -161,6 +174,7 @@ class CalibrationAnalysisRequest:
         ReadoutModelKind.UNIFORM_PSF,
     )
     default_model_kind: ReadoutModelKind = ReadoutModelKind.BOX
+    threshold_method: ThresholdMethod = ThresholdMethod.OTSU
     train_fraction: float = 0.9
     split_seed: int = 0
     histogram_bins: int = 120
@@ -221,6 +235,8 @@ class CalibrationAnalysisRequest:
             raise TypeError("default_model_kind must be ReadoutModelKind")
         if self.default_model_kind not in kinds:
             raise ValueError("default_model_kind must be present in model_kinds")
+        if not isinstance(self.threshold_method, ThresholdMethod):
+            raise TypeError("threshold_method must be ThresholdMethod")
         fraction = _finite_float(self.train_fraction, "train_fraction")
         if not 0.0 < fraction < 1.0:
             raise ValueError("train_fraction must be in (0, 1)")
@@ -1103,6 +1119,7 @@ __all__ = [
     "ReadoutResult",
     "ResolvedCalibration",
     "SiteMap",
+    "ThresholdMethod",
     "UniformPsfFeature",
     "apply_calibration",
     "classify_occupancy",

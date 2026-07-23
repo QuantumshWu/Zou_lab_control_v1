@@ -18,8 +18,12 @@ from zlc_neutral_atom.readout.occupancy import (
     OccupancyStreamProcessorSpec,
     resolve_occupancy_stream_schema,
 )
-from zlc_neutral_atom.readout.occupancy_pipeline import OccupancyPipelineSpec
+from zlc_neutral_atom.readout.occupancy_pipeline import (
+    OccupancyPipelineSpec,
+    compile_occupancy_pipeline,
+)
 from zlc_neutral_atom.runtime.pipeline import (
+    BoundMeasurement,
     ExactDatasetPreviewPort,
     ExactDatasetPreviewSpec,
     _notify_preview_failure,
@@ -32,7 +36,11 @@ from zlc_neutral_atom.timing.occupancy import (
 )
 from zlc_storage import canonical_digest
 
-__all__ = ["PreparedFiniteOccupancy", "prepare_finite_occupancy"]
+__all__ = [
+    "PreparedFiniteOccupancy",
+    "prepare_finite_camera_occupancy",
+    "prepare_finite_occupancy",
+]
 
 
 class PreparedFiniteOccupancy:
@@ -44,26 +52,26 @@ class PreparedFiniteOccupancy:
         "_occupied_schema",
         "_start_run",
         "_started",
-        "_triggered",
+        "_spec",
     )
 
     def __init__(
         self,
-        triggered: TriggeredOccupancySpec,
+        spec: OccupancyPipelineSpec | TriggeredOccupancySpec,
         *,
         counts_schema: DatasetSchema,
         occupied_schema: DatasetSchema,
         start_run: Callable[[RunPlan], RunHandle],
     ) -> None:
-        if not isinstance(triggered, TriggeredOccupancySpec):
-            raise TypeError("triggered must be TriggeredOccupancySpec")
+        if not isinstance(spec, (OccupancyPipelineSpec, TriggeredOccupancySpec)):
+            raise TypeError("spec must be an occupancy pipeline spec")
         if not isinstance(counts_schema, DatasetSchema):
             raise TypeError("counts_schema must be DatasetSchema")
         if not isinstance(occupied_schema, DatasetSchema):
             raise TypeError("occupied_schema must be DatasetSchema")
         if not callable(start_run):
             raise TypeError("start_run must be callable")
-        self._triggered = triggered
+        self._spec = spec
         self._counts_schema = counts_schema
         self._occupied_schema = occupied_schema
         self._start_run = start_run
@@ -84,9 +92,7 @@ class PreparedFiniteOccupancy:
 
     def start(self) -> RunHandle:
         self._claim_start()
-        return self._start_run(
-            compile_triggered_occupancy_pipeline(self._triggered)
-        )
+        return self._start_run(self._compile())
 
     def start_with_preview(
         self,
@@ -98,10 +104,7 @@ class PreparedFiniteOccupancy:
         self._claim_start()
         preview = factory(self.preview_spec)
         try:
-            plan = compile_triggered_occupancy_pipeline(
-                self._triggered,
-                preview=preview,
-            )
+            plan = self._compile(preview=preview)
             return self._start_run(plan)
         except BaseException as error:
             _notify_preview_failure(preview, error)
@@ -113,18 +116,25 @@ class PreparedFiniteOccupancy:
                 raise RuntimeError("PreparedFiniteOccupancy is one-shot")
             self._started = True
 
+    def _compile(self, *, preview=None) -> RunPlan:
+        if isinstance(self._spec, TriggeredOccupancySpec):
+            return compile_triggered_occupancy_pipeline(
+                self._spec,
+                preview=preview,
+            )
+        return compile_occupancy_pipeline(self._spec, preview=preview)
 
-def prepare_finite_occupancy(
-    binding: TriggeredCameraBinding,
+
+def _bind_occupancy_pipeline(
+    measurement: BoundMeasurement,
     calibration: ResolvedCalibration,
     *,
-    model_kind: ReadoutModelKind | None = None,
-    start_run: Callable[[RunPlan], RunHandle],
-) -> PreparedFiniteOccupancy:
-    """Bind one exact source and one admitted calibration into one flat Run."""
-
-    if not isinstance(binding, TriggeredCameraBinding):
-        raise TypeError("binding must be TriggeredCameraBinding")
+    model_kind: ReadoutModelKind | None,
+    timing_identity: object,
+    name: str,
+) -> tuple[OccupancyPipelineSpec, DatasetSchema, DatasetSchema]:
+    if not isinstance(measurement, BoundMeasurement):
+        raise TypeError("measurement must be BoundMeasurement")
     if type(calibration) is not ResolvedCalibration:
         raise TypeError("calibration must be an exact ResolvedCalibration")
     calibration._require_authority()
@@ -132,10 +142,9 @@ def prepare_finite_occupancy(
     identity = canonical_digest(
         {
             "owner": "zlc_neutral_atom.finite-occupancy",
-            "compiled_pulse": binding.compiled_artifact.fingerprint,
-            "camera_schema": (
-                binding.measurement.capture_contract.dataset_schema.fingerprint
-            ),
+            "timing": timing_identity,
+            "camera_schema": measurement.capture_contract.dataset_schema.fingerprint,
+            "camera_arm": measurement.capture_spec.digest,
             "calibration": calibration_artifact_ref_to_tree(
                 calibration.reference
             ),
@@ -150,14 +159,35 @@ def prepare_finite_occupancy(
     )
     resolved = resolve_occupancy_stream_schema(
         processor,
-        binding.measurement.capture_contract.dataset_schema,
+        measurement.capture_contract.dataset_schema,
     )
     pipeline = OccupancyPipelineSpec(
-        f"Occupancy capture {binding.pulse_request.document.name}",
-        binding.measurement,
+        name,
+        measurement,
         processor,
         BlockId(f"occupancy-counts-{identity[:20]}"),
         BlockId(f"occupancy-occupied-{identity[:20]}"),
+    )
+    return pipeline, resolved.counts_schema, resolved.occupied_schema
+
+
+def prepare_finite_occupancy(
+    binding: TriggeredCameraBinding,
+    calibration: ResolvedCalibration,
+    *,
+    model_kind: ReadoutModelKind | None = None,
+    start_run: Callable[[RunPlan], RunHandle],
+) -> PreparedFiniteOccupancy:
+    """Bind one exact source and one admitted calibration into one flat Run."""
+
+    if not isinstance(binding, TriggeredCameraBinding):
+        raise TypeError("binding must be TriggeredCameraBinding")
+    pipeline, counts_schema, occupied_schema = _bind_occupancy_pipeline(
+        binding.measurement,
+        calibration,
+        model_kind=model_kind,
+        timing_identity={"compiled_pulse": binding.compiled_artifact.fingerprint},
+        name=f"Occupancy capture {binding.pulse_request.document.name}",
     )
     triggered = TriggeredOccupancySpec(
         pipeline,
@@ -168,7 +198,31 @@ def prepare_finite_occupancy(
     )
     return PreparedFiniteOccupancy(
         triggered,
-        counts_schema=resolved.counts_schema,
-        occupied_schema=resolved.occupied_schema,
+        counts_schema=counts_schema,
+        occupied_schema=occupied_schema,
+        start_run=start_run,
+    )
+
+
+def prepare_finite_camera_occupancy(
+    measurement: BoundMeasurement,
+    calibration: ResolvedCalibration,
+    *,
+    model_kind: ReadoutModelKind | None = None,
+    start_run: Callable[[RunPlan], RunHandle],
+) -> PreparedFiniteOccupancy:
+    """Bind occupancy to the passive finite branch of Camera Measurement."""
+
+    pipeline, counts_schema, occupied_schema = _bind_occupancy_pipeline(
+        measurement,
+        calibration,
+        model_kind=model_kind,
+        timing_identity={"owner": "independent-hardware-trigger"},
+        name="Camera occupancy",
+    )
+    return PreparedFiniteOccupancy(
+        pipeline,
+        counts_schema=counts_schema,
+        occupied_schema=occupied_schema,
         start_run=start_run,
     )

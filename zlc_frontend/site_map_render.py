@@ -536,6 +536,7 @@ def compose_site_map_front(
             value_label=value_label,
             distribution_guides=False,
             distribution_bins=40,
+            distribution_identity=view.background_input.ref,
             site_centers_xy=view.centers_xy,
             site_radius=view.site_radius,
             site_occupied=view.site_occupancy,

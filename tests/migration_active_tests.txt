@@ -19,12 +19,6 @@ tests/test_device_manager_current.py
 tests/test_installation_config_current.py
 tests/test_dropdown_anchor.py
 tests/test_figure_archive_current.py
-tests/test_m1_camera_monitor.py
-tests/test_m2_camera_monitor_roi_curve.py
-tests/test_m2b_camera_monitor_scalar_history.py
-tests/test_m2c_camera_monitor_histogram_meter.py
-tests/test_m2d_camera_monitor_roi_selector.py
-tests/test_m2e_camera_monitor_first_roi.py
 tests/test_migration_manifest_gate.py
 tests/test_notebook_experiment_facade.py
 tests/test_operator_flows_on_virtual.py

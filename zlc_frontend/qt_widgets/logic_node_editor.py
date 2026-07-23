@@ -29,8 +29,9 @@ class LogicNodeEditor(QtWidgets.QWidget):
     The param form reuses :class:`MeasurementPanel` (single-spec): a camera /
     measurement / processor / task all expose ``.name`` + ``.params`` (ParamDecls),
     so the same form engine + Start / Stop signals drive every logic kind.  The
-    camera live Measurement's spec is ``readout.camera_spec()`` (its ParamDecls are
-    the camera's exposure / frames-per-cycle)."""
+    Camera Measurement uses the same path for camera role, frames-per-cycle and
+    repeat; hardware configuration stays in DeviceManager instead of being
+    duplicated in a Measurement form."""
 
     def __init__(self, row: "LogicNodeRow", console: "TaskConsole", spec, parent=None):
         super().__init__(parent)
@@ -55,8 +56,8 @@ class LogicNodeEditor(QtWidgets.QWidget):
         col.addWidget(FluentSectionLabel(row.node.title))
         # The auto-generated parameter form + Start / Stop (reused MeasurementPanel,
         # which already carries start_requested(self) / stop_requested + the typed,
-        # no-eval form).  A spec drives a real ParamDecl form; the camera (spec is
-        # None) shows nothing here but Start/Stop still build/run the camera node.
+        # no-eval form).  Every node, including Camera, is driven by its real
+        # ParamDecl form; no camera-only controls are injected by this editor.
         # Acquisition knobs are NOT injected here: a definition declares its own
         # physical parameters (for example a monitor's history depth), and the
         # editor renders exactly that form.  Deadlines remain internal Port/Run

@@ -86,6 +86,9 @@ class TaskConsoleState:
             )
             for panel in (panels or [])
         ]
+        panel_ids = tuple(panel.panel_id for panel in self.panels)
+        if len(panel_ids) != len(set(panel_ids)):
+            raise ValueError("TaskConsoleState contains duplicate panel_id values")
         # The Logic-tab nodes (measurement / processor / task), saved alongside the
         # plot panels so a layout restores the whole dashboard -- nodes always come
         # back STOPPED (the layout records what to build, not a running thread).

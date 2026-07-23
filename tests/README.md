@@ -5,15 +5,17 @@ Run the smallest check that proves the changed boundary still works.  Full `pyte
 ## Principles (see the repo-root `AGENTS.md` for the full rules)
 
 - **Contract tests, Python side only.** There is no iverilog/cocotb in the repo: RTL behaviour is checked by a faithful Python mirror plus `xsim` (the real IP netlist — the strongest hardware evidence), and verilog port widths are locked by a Python contract test (`test_..._vio_widths_match_python_generator`).
-- **Every GUI uses the same two visual-debug paths.**  The fast path is
-  `ensure_qt_app()` → the formal composition/open function → real Qt input →
-  outer `FluentWindow.grab()` at this machine's actual display scale.  It must
-  not force DPI, size, style, tabs, or controller state.  The slow final/dispute
-  path starts the formal `.py/.bat` launcher and uses desktop mouse input plus a
-  screen capture.  Both paths share the same application owner, composition,
-  sizing/style, and operator sequence.  `offscreen`/`minimal` is behavior-only
-  evidence and can never be reported as visual acceptance.  This rule applies
-  to PulseGUI, TaskConsole, DeviceManager, FigureViewer, and every future GUI.
+- **Every GUI uses the same two visual-debug paths.**  The fast path selects
+  `QT_QPA_PLATFORM=offscreen` before `ensure_qt_app()`, then enters the formal
+  composition/open function, drives real Qt input, and captures the untouched
+  outer `FluentWindow.grab()`.  It is the normal visual-and-behaviour iteration
+  path and must not force DPI, size, style, tabs, or controller state.  The slow
+  final/dispute path starts the formal `.py/.bat` launcher and uses desktop
+  mouse input plus a screen capture.  Both paths share the same application
+  owner, composition, sizing/style, and operator sequence; only the driver is
+  different.  Ad-hoc widgets or a separately constructed QApplication are not
+  evidence.  This rule applies to PulseGUI, TaskConsole, DeviceManager,
+  FigureViewer, and every future GUI.
 - **Performance optimizations must be logic/appearance-neutral.**  Only make the same output faster (analytic Jacobian, skip-if-unchanged guards, cached invariants); never change cadence/appearance.  Prove equivalence (e.g. fit `popt` agrees numerically).
 - **After delete/refactor:** `git grep` of the dead identifier == 0; `python -m compileall` clean; no stray TODO/FIXME.
 
@@ -92,11 +94,13 @@ python tests\pulse_gui_user_flow.py --out .gui-evidence\pulse
 ```
 
 This fast path must remain offscreen and therefore must not open a desktop
-window.  Final or disputed appearance uses the slow path: launch the corresponding
-root `.py/.bat` entry, drive the visible GUI with desktop mouse/keyboard, and take
-a screen screenshot.  Both paths use the same application owner, composition,
-sizing/style, and product input sequence.  Object-level checks for button text,
-visible channels, labels, and geometry remain complementary behavior oracles.
+window.  It is valid daily visual evidence because it constructs the same formal
+window through the same sole QApplication owner.  Final or disputed appearance
+uses the slow path: launch the corresponding root `.py/.bat` entry, drive the
+visible GUI with desktop mouse/keyboard, and take a screen screenshot.  Both paths
+use the same application owner, composition, sizing/style, and product input
+sequence.  Object-level checks for button text, visible channels, labels, and
+geometry remain complementary behavior oracles.
 
 ## Cleanup
 

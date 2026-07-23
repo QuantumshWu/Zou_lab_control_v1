@@ -18,7 +18,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
-from zlc_data import ReductionMethod
 from zlc_data.param_decl import ParamDecl
 from zlc_frontend.form import FormChoice, FormFieldProps, FormSpec
 from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_KEY
@@ -33,10 +32,6 @@ from zlc_neutral_atom.catalog import (
 from zlc_neutral_atom.mot_field import (
     MOT_FIELD_TASK_DEFINITIONS,
     MOT_FIELD_TASK_KEY,
-)
-from zlc_neutral_atom.monitor_application import (
-    CAMERA_MONITOR_MEASUREMENT_DEFINITIONS,
-    CAMERA_MONITOR_MEASUREMENT_KEY,
 )
 from zlc_neutral_atom.pulse_programs import DEFAULT_PROBE_PULSE_PATH
 from zlc_neutral_atom.readout.occupancy import (
@@ -56,7 +51,11 @@ from zlc_neutral_atom.readout.sitemap import (
 from zlc_neutral_atom.scan import PULSE_SCAN_TASK_KEY, SCAN_TASK_DEFINITIONS
 from zlc_storage import canonical_text
 
-from .mot_field_task import build_mot_field_request, mot_field_params
+from .calibration_task import (
+    build_calibration_task_intent,
+    calibration_task_params,
+)
+from .mot_field_task import build_mot_field_intent, mot_field_params
 from .occupancy_binding import OccupancyBindingIntent
 from .coupled_measurement_presenter import (
     build_grey_molasses_detuning_intent,
@@ -109,6 +108,7 @@ class ConsoleNodeSpec:
     params: tuple[ParamDecl, ...]
     declared_outputs: tuple[ConsoleSignalDecl, ...]
     build_request: Callable[[Mapping[str, object]], object]
+    default_panel: tuple[str, str] | None = None
 
     @property
     def name(self) -> str:
@@ -127,7 +127,6 @@ def _compose_catalog() -> DefinitionCatalog:
         SITEMAP_CALIBRATION_TASK_DEFINITIONS,
         MOT_FIELD_TASK_DEFINITIONS,
         CAMERA_MEASUREMENT_DEFINITIONS,
-        CAMERA_MONITOR_MEASUREMENT_DEFINITIONS,
         COUPLED_MEASUREMENT_DEFINITIONS,
         OCCUPANCY_STREAM_PROCESSOR_DEFINITIONS,
     )
@@ -258,78 +257,26 @@ def _params_from_form(form: FormSpec) -> tuple[ParamDecl, ...]:
     )
 
 
-def _camera_monitor_params(camera_roles: tuple[str, ...]) -> tuple[ParamDecl, ...]:
-    choices = camera_roles or (SCAN_INTENT_DEFAULT_CAMERA_ROLE,)
-    return (
-        *_params_from_form(
-            FormSpec((
-                # No preferred default: a monitor wants the FREE-RUNNING camera, and
-                # which role that is belongs to the installation's own resolution.
-                _role_form_field(
-                    choices, key="camera_role", label="Camera role",
-                    domain="camera", preferred=None,
-                ),
-                FormFieldProps(
-                    "history_capacity", "int", "Frame history", default=8,
-                    required=True, minimum=1,
-                    description="Frames retained in the monitor history axis",
-                ),
-                FormFieldProps(
-                    "scalar_history_capacity", "int", "Scalar history", default=300,
-                    required=True, minimum=1,
-                    description="ROI-scalar samples retained for the rolling trace",
-                ),
-            ))
-        ),
-        ParamDecl(
-            "roi_reduction",
-            "ROI reducer",
-            "choice",
-            default=ReductionMethod.MEAN.value,
-            required=True,
-            choices=(
-                ReductionMethod.MEAN.value,
-                ReductionMethod.SUM.value,
-                ReductionMethod.MAX.value,
-            ),
-            tooltip="Reducer applied to the selector ROI for roi_value",
-        ),
-    )
-
-
-def _camera_capture_params(
+def _camera_params(
     camera_roles: tuple[str, ...],
-    sequencer_roles: tuple[str, ...],
 ) -> tuple[ParamDecl, ...]:
     return (
-        ParamDecl(
-            "pulse",
-            "Pulse",
-            "path",
-            default=DEFAULT_PROBE_PULSE_PATH,
-            required=True,
-            path_mode="file",
-            base_dir="pulses",
-            file_filter="Pulse program (*.json);;All files (*)",
-            tooltip="Finite PulseDocument that emits the camera trigger",
-        ),
         *_params_from_form(
-            _scan_binding_form(camera_roles, sequencer_roles)
+            FormSpec(
+                (
+                    _role_form_field(
+                        camera_roles,
+                        key="camera_role",
+                        label="Camera",
+                        domain="camera",
+                        preferred=SCAN_INTENT_DEFAULT_CAMERA_ROLE,
+                    ),
+                )
+            )
         ),
         ParamDecl(
-            "repeat_count",
-            "Repeats",
-            "int",
-            default=1,
-            lo=1,
-            hi=1_000_000,
-            required=True,
-            optional=False,
-            tooltip="Exact capture repeats",
-        ),
-        ParamDecl(
-            "readout_events_per_repeat",
-            "Readout events / repeat",
+            "frames_per_cycle",
+            "Frames per cycle",
             "int",
             default=1,
             lo=1,
@@ -337,9 +284,21 @@ def _camera_capture_params(
             required=True,
             optional=False,
             tooltip=(
-                "Expected camera-triggered frames in each repeat. A one-cell "
-                "capture also has a live preview; every other valid layout is "
-                "preserved in the complete FINAL capture without reduction"
+                "Ordered camera frames retained on an explicit READOUT_EVENT axis"
+            ),
+        ),
+        ParamDecl(
+            "repeat",
+            "Repeat",
+            "int",
+            default=0,
+            lo=0,
+            hi=1_000_000,
+            required=True,
+            optional=False,
+            tooltip=(
+                "0 keeps this installed camera live; a positive value performs "
+                "that many exact finite capture cycles"
             ),
         ),
     )
@@ -376,46 +335,18 @@ def _pulse_scan_params(camera_roles: tuple[str, ...],
     )
 
 
-def _calibration_params(camera_roles: tuple[str, ...]) -> tuple[ParamDecl, ...]:
-    role = _params_from_form(FormSpec((
-        _role_form_field(
-            camera_roles,
-            key="camera_role",
-            label="Camera role",
-            domain="camera",
-            preferred=SCAN_INTENT_DEFAULT_CAMERA_ROLE,
-        ),
-    )))
-    return (
-        ParamDecl(
-            "frames",
-            "Reference groups",
-            "int",
-            default=20,
-            lo=1,
-            hi=1_000_000,
-            required=True,
-            optional=False,
-            tooltip=(
-                "Complete long/readout/long groups captured before calibration"
-            ),
-        ),
-        *role,
-    )
-
-
 def _occupancy_params() -> tuple[ParamDecl, ...]:
     return (
         ParamDecl(
             "camera_frame",
-            "Capture recipe",
+            "Camera frame",
             "signal",
             required=True,
             tooltip=(
-                "Select the frame output only to identify a Camera capture "
-                "Measurement row. Occupancy reruns that row's frozen capture "
-                "recipe with calibration; it does not consume a previously "
-                "published frame"
+                "Frame output of an already-running live Camera Measurement "
+                "(repeat = 0). "
+                "Occupancy reacts to each newly published immutable revision; "
+                "it never starts or reconfigures the Camera"
             ),
         ),
         ParamDecl(
@@ -425,7 +356,8 @@ def _occupancy_params() -> tuple[ParamDecl, ...]:
             required=True,
             tooltip=(
                 "FINAL calibration output of a successful Calibrate readout "
-                "Task row in this TaskConsole"
+                "Task row in this TaskConsole; it is admitted once when the "
+                "Processor starts"
             ),
         ),
     )
@@ -451,7 +383,11 @@ class ConsoleCatalogView:
     def __init__(self, experiment) -> None:
         self._experiment = experiment
         self._catalog = _compose_catalog()
-        items = _catalog_items(self._catalog)
+        items = tuple(
+            item
+            for item in _catalog_items(self._catalog)
+            if self._supported(item)
+        )
         specs: list[ConsoleNodeSpec] = []
         for item in items:
             specs.append(self._project(item))
@@ -466,91 +402,35 @@ class ConsoleCatalogView:
     # ------------------------------------------------------------ projection
     def _project(self, item) -> ConsoleNodeSpec:
         experiment = self._experiment
-        if item.key == CAMERA_MONITOR_MEASUREMENT_KEY:
-            roles = self.camera_roles()
-
-            def build_camera_monitor(values: Mapping[str, object]):
-                reduction_value = values.get(
-                    "roi_reduction",
-                    ReductionMethod.MEAN.value,
-                )
-                try:
-                    reduction = (
-                        reduction_value
-                        if isinstance(reduction_value, ReductionMethod)
-                        else ReductionMethod(
-                            str(reduction_value).strip().upper()
-                        )
-                    )
-                except ValueError as error:
-                    raise ValueError(
-                        "camera monitor ROI reducer must be MEAN, SUM, or MAX"
-                    ) from error
-                return experiment.readout.camera_monitor_request(
-                    **_form_values(values, "camera_role", "history_capacity",
-                                   "scalar_history_capacity"),
-                    roi_reduction=reduction,
-                )
-
-            return ConsoleNodeSpec(
-                key=item.key, kind="camera", title=_short_title(item.key),
-                description=item.title,
-                params=_camera_monitor_params(roles),
-                declared_outputs=(
-                    ConsoleSignalDecl(
-                        "frame",
-                        "frame",
-                        "Counts",
-                        "counts",
-                        "camera frame",
-                    ),
-                    ConsoleSignalDecl(
-                        "roi_value",
-                        "ROI value",
-                        "ROI value",
-                        "counts",
-                        "ROI scalar history",
-                    ),
-                ),
-                build_request=build_camera_monitor,
-            )
         if item.key == CAMERA_MEASUREMENT_KEY:
 
-            def build_camera_capture(values: Mapping[str, object]):
-                pulse = values.get("pulse")
-                if not pulse:
-                    raise ValueError("camera capture needs a PulseDocument path")
-                return experiment.readout.capture_request(
-                    pulse,
+            def build_camera(values: Mapping[str, object]):
+                return experiment.readout.camera_measurement_request(
                     **_form_values(
                         values,
                         "camera_role",
-                        "sequencer_role",
-                        "trigger_channel",
-                        "repeat_count",
-                        "readout_events_per_repeat",
+                        "frames_per_cycle",
+                        "repeat",
                     ),
                 )
 
             return ConsoleNodeSpec(
                 key=item.key,
                 kind="camera",
-                title=_short_title(item.key),
+                title=item.title,
                 description=item.title,
-                params=_camera_capture_params(
-                    self.camera_roles(),
-                    self.sequencer_roles(),
-                ),
+                params=_camera_params(self.camera_roles()),
                 declared_outputs=(
                     ConsoleSignalDecl(
                         "frame",
                         "frame",
                         "Counts",
                         "counts",
-                        "complete exact capture dataset (R, P, *data_shape)",
+                        "live or finite camera dataset preserving "
+                        "(R, P, *data_shape)",
                     ),
                 ),
-                build_request=build_camera_capture,
+                build_request=build_camera,
             )
         if item.key == TEMPERATURE_RELEASE_RECAPTURE_KEY:
             return ConsoleNodeSpec(
@@ -632,22 +512,12 @@ class ConsoleCatalogView:
         if kind is None:
             raise TypeError(f"console cannot place catalog group {item.group!r}")
         if item.key == SITEMAP_CALIBRATION_TASK_KEY:
-
-            def build_calibration(values: Mapping[str, object]):
-                frames = values.get("frames", 20)
-                if not isinstance(frames, int) or isinstance(frames, bool):
-                    raise TypeError("reference groups must be an integer")
-                return experiment.readout.sitemap_request(
-                    frames=frames,
-                    **_form_values(values, "camera_role"),
-                )
-
             return ConsoleNodeSpec(
                 key=item.key,
                 kind="task",
                 title=_short_title(item.key),
                 description=item.title,
-                params=_calibration_params(self.camera_roles()),
+                params=calibration_task_params(self.sitemap_camera_roles()),
                 declared_outputs=(
                     ConsoleSignalDecl(
                         "calibration",
@@ -657,7 +527,8 @@ class ConsoleCatalogView:
                         "FINAL calibration artifact",
                     ),
                 ),
-                build_request=build_calibration,
+                build_request=build_calibration_task_intent,
+                default_panel=("calibration", "sites"),
             )
         if item.key == MOT_FIELD_TASK_KEY:
             return ConsoleNodeSpec(
@@ -668,10 +539,7 @@ class ConsoleCatalogView:
                     "Sweep da_x/da_y/da_z in one autonomous hardware scan, "
                     "measure MOT fluorescence, and report the refined optimum"
                 ),
-                params=mot_field_params(
-                    self.camera_roles(),
-                    self.sequencer_roles(),
-                ),
+                params=mot_field_params(self.camera_roles()),
                 declared_outputs=(
                     ConsoleSignalDecl(
                         "mot_field",
@@ -688,10 +556,8 @@ class ConsoleCatalogView:
                         "exact source scan artifact",
                     ),
                 ),
-                build_request=lambda values: build_mot_field_request(
-                    experiment,
-                    values,
-                ),
+                build_request=build_mot_field_intent,
+                default_panel=("mot_field", "grid"),
             )
         if item.key == PULSE_SCAN_TASK_KEY:
 
@@ -771,7 +637,7 @@ class ConsoleCatalogView:
                 calibration = values.get("calibration")
                 if not isinstance(camera_frame, str) or not camera_frame.strip():
                     raise ValueError(
-                        "occupancy requires a Camera capture frame output"
+                        "occupancy requires a running Camera frame output"
                     )
                 if not isinstance(calibration, str) or not calibration.strip():
                     raise ValueError(
@@ -816,6 +682,29 @@ class ConsoleCatalogView:
         )
 
     # -------------------------------------------------------------- queries
+    def _supported(self, item: _CatalogItem) -> bool:
+        """Project only capabilities the current installation can actually bind."""
+
+        cameras = self.camera_roles()
+        sequencers = self.sequencer_roles()
+        if item.key == CAMERA_MEASUREMENT_KEY:
+            return bool(cameras)
+        if item.key == SITEMAP_CALIBRATION_TASK_KEY:
+            return bool(self.sitemap_camera_roles() and sequencers)
+        if item.key == MOT_FIELD_TASK_KEY:
+            return "mot_camera" in cameras and bool(sequencers)
+        if item.key in (
+            PULSE_SCAN_TASK_KEY,
+            TEMPERATURE_RELEASE_RECAPTURE_KEY,
+            READOUT_DURATION_FIDELITY_KEY,
+        ):
+            return bool(cameras and sequencers)
+        if item.key == GREY_MOLASSES_DETUNING_KEY:
+            return bool(cameras and sequencers and self.rf_roles())
+        if item.key == OCCUPANCY_STREAM_PROCESSOR_KEY:
+            return bool(cameras and sequencers)
+        return True
+
     def specs(self, kind: str | None = None) -> tuple[ConsoleNodeSpec, ...]:
         if kind is None:
             return self._specs
@@ -826,6 +715,9 @@ class ConsoleCatalogView:
 
     def camera_roles(self) -> tuple[str, ...]:
         return tuple(self._experiment.device_catalog.roles("camera"))
+
+    def sitemap_camera_roles(self) -> tuple[str, ...]:
+        return tuple(self._experiment.readout.sitemap_camera_roles())
 
     def sequencer_roles(self) -> tuple[str, ...]:
         return tuple(self._experiment.device_catalog.roles("sequencer"))

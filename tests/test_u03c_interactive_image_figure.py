@@ -272,19 +272,6 @@ def test_image_front_preserves_exact_axes_validity_and_all_display_interactions(
     assert window._display == ImageDisplayState()
 
     binding, target = _image_target(board)
-    hover = _point(target, 0.5, 0.5)
-    board.mouseMoveEvent(
-        QtGui.QMouseEvent(
-            QtCore.QEvent.MouseMove,
-            QtCore.QPointF(hover),
-            QtCore.Qt.NoButton,
-            QtCore.Qt.NoButton,
-            QtCore.Qt.NoModifier,
-        )
-    )
-    assert binding.hover is not None
-    assert (binding.hover.x_coordinate, binding.hover.y_coordinate) == (14, 22)
-    assert not binding.hover.valid
     QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=target.center())
     assert binding.cross is not None
     assert (binding.cross.x_coordinate, binding.cross.y_coordinate) == (14, 22)

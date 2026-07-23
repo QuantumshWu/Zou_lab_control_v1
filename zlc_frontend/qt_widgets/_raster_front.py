@@ -115,6 +115,7 @@ def _map_panel_box(bounds: QtCore.QRect, box: NormalizedBox) -> QtCore.QRect:
 
 @dataclass(frozen=True, slots=True)
 class _ImagePanelGeometry:
+    axes_target: QtCore.QRect
     target: QtCore.QRect
     source: QtCore.QRectF
     distribution: QtCore.QRect | None
@@ -133,15 +134,26 @@ def _panel_image_geometry(
         None if payload is None else payload.viewport,
     )
     if payload is None:
+        target = _aspect_target_for_source(bounds, source)
         return _ImagePanelGeometry(
-            _aspect_target_for_source(bounds, source),
+            target,
+            target,
             source,
             None,
             None,
         )
     composed = payload.raster_geometry
+    axes_target = _map_panel_box(
+        bounds,
+        NormalizedBox(*composed.image_bounds),
+    )
+    data_target = _map_panel_box(
+        axes_target,
+        NormalizedBox(*payload.viewport.data_bounds_in_display),
+    )
     return _ImagePanelGeometry(
-        _map_panel_box(bounds, NormalizedBox(*composed.image_bounds)),
+        axes_target,
+        data_target,
         QtCore.QRectF(
             0.0,
             0.0,

@@ -77,6 +77,19 @@ def raster_from_agg(
     """
 
     figure.canvas.draw()
+    return _raster_from_drawn_agg(
+        figure,
+        physical_size=physical_size,
+    )
+
+
+def _raster_from_drawn_agg(
+    figure,
+    *,
+    physical_size: tuple[int, int] | None = None,
+) -> RasterBuffer:
+    """Copy the already-drawn Agg renderer into an immutable front."""
+
     actual_width, actual_height = figure.canvas.get_width_height()
     if physical_size is None:
         return RasterBuffer.from_agg_rgba(
@@ -106,6 +119,177 @@ def raster_from_agg(
         :copy_width,
     ]
     return RasterBuffer(width, height, pixels.tobytes(order="C"))
+
+
+class _AggBlitCache:
+    """Renderer-owned Agg blit cache for progressive live fronts.
+
+    This is the same visual algorithm as Main: a chrome change gets one normal
+    full draw; only a second frame with identical chrome captures a data-free
+    background and enters the steady blit path.  A plot whose ticks/limits keep
+    changing therefore pays no extra recapture work, while a stable camera or
+    curve redraws only its data artists.  The cache never crosses the worker
+    boundary and every result is copied into one immutable full front.
+    """
+
+    __slots__ = (
+        "_artist_ids",
+        "_background",
+        "_primed",
+        "_signature",
+    )
+
+    def __init__(self) -> None:
+        self._artist_ids: tuple[int, ...] = ()
+        self._background = None
+        self._primed = False
+        self._signature = None
+
+    def clear(self) -> None:
+        self._artist_ids = ()
+        self._background = None
+        self._primed = False
+        self._signature = None
+
+    def raster(
+        self,
+        figure,
+        dynamic_artists,
+        *,
+        layout_key,
+        chrome_key,
+        physical_size: tuple[int, int],
+    ) -> RasterBuffer:
+        supplied = tuple(artist for artist in dynamic_artists if artist is not None)
+        # Main's generic rule is intentionally broader than each plotter's
+        # hand-written update list: every Axes data/annotation artist is absent
+        # from the chrome background.  This prevents a colorbar collection,
+        # threshold line, or newly added fit text from becoming a ghost merely
+        # because one caller forgot to extend a tuple.
+        generic = []
+        for axis in figure.axes:
+            generic.extend(axis.lines)
+            generic.extend(axis.images)
+            generic.extend(axis.collections)
+            generic.extend(axis.patches)
+            generic.extend(axis.texts)
+        unique = []
+        seen = set()
+        for artist in (*generic, *supplied):
+            if id(artist) in seen:
+                continue
+            seen.add(id(artist))
+            unique.append(artist)
+        artists = tuple(
+            artist
+            for _index, artist in sorted(
+                enumerate(unique),
+                key=lambda pair: (float(pair[1].get_zorder()), pair[0]),
+            )
+        )
+        artist_ids = tuple(id(artist) for artist in artists)
+        signature = (layout_key, chrome_key, artist_ids)
+        try:
+            if not self._primed or self._signature != signature:
+                self._primed = True
+                self._signature = signature
+                self._artist_ids = artist_ids
+                self._background = None
+                return raster_from_agg(figure, physical_size=physical_size)
+
+            if self._background is None:
+                artist_visibility = tuple(
+                    bool(artist.get_visible()) for artist in artists
+                )
+                try:
+                    for artist in artists:
+                        artist.set_visible(False)
+                    figure.canvas.draw()
+                    self._background = figure.canvas.copy_from_bbox(figure.bbox)
+                finally:
+                    for artist, was_visible in zip(
+                        artists,
+                        artist_visibility,
+                        strict=True,
+                    ):
+                        artist.set_visible(was_visible)
+            assert self._background is not None
+            figure.canvas.restore_region(self._background)
+            for artist in artists:
+                if not artist.get_visible():
+                    continue
+                axes = getattr(artist, "axes", None)
+                if axes is None:
+                    figure.draw_artist(artist)
+                else:
+                    axes.draw_artist(artist)
+            return _raster_from_drawn_agg(
+                figure,
+                physical_size=physical_size,
+            )
+        except BaseException:
+            # Region operations are an optimisation boundary, not a product
+            # failure.  Clear the possibly partial cache and return the exact
+            # ordinary full render; the next stable revision may try again.
+            self.clear()
+            raster = raster_from_agg(figure, physical_size=physical_size)
+            self._primed = True
+            self._signature = signature
+            self._artist_ids = artist_ids
+            return raster
+
+
+def _agg_layout_key(figure, *, extra=()) -> tuple:
+    """Freeze facts that require rebuilding the outer Figure background."""
+
+    return (
+        tuple(float(value) for value in figure.get_size_inches()),
+        float(figure.dpi),
+        tuple(float(value) for value in figure.get_facecolor()),
+        tuple(
+            (
+                id(axis),
+                tuple(float(value) for value in axis.get_position().bounds),
+                bool(axis.get_visible()),
+            )
+            for axis in figure.axes
+        ),
+        tuple(extra),
+    )
+
+
+def _agg_chrome_key(figure, *, extra=()) -> tuple:
+    """Freeze the visible non-data facts that invalidate an Agg background."""
+
+    axes = []
+    for axis in figure.axes:
+        axes.append(
+            (
+                tuple(float(value) for value in axis.get_position().bounds),
+                tuple(float(value) for value in axis.get_xlim()),
+                tuple(float(value) for value in axis.get_ylim()),
+                str(axis.get_xscale()),
+                str(axis.get_yscale()),
+                str(axis.get_xlabel()),
+                str(axis.get_ylabel()),
+                str(axis.get_title()),
+                tuple(float(value) for value in axis.get_xticks()),
+                tuple(float(value) for value in axis.get_yticks()),
+                tuple(label.get_text() for label in axis.get_xticklabels()),
+                tuple(label.get_text() for label in axis.get_yticklabels()),
+                bool(axis.get_visible()),
+                bool(axis.axison),
+                str(axis.get_aspect()),
+                str(axis.get_anchor()),
+            )
+        )
+    return (
+        tuple(float(value) for value in figure.get_size_inches()),
+        float(figure.dpi),
+        tuple(float(value) for value in figure.get_facecolor()),
+        tuple(axes),
+        tuple(extra),
+    )
 
 def _series_label(series, *, include_reductions: bool) -> str | None:
     parts = [_address_label(series.batch_address)]

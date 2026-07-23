@@ -11,6 +11,7 @@ from PyQt5 import QtCore, QtGui
 from .style import (
     SELECTOR_ALPHA,
     SELECTOR_COLOR,
+    SELECTOR_DOT_PX,
     SELECTOR_FONT_FAMILY,
     SELECTOR_FONT_PX,
     SELECTOR_HANDLE_PX,
@@ -258,6 +259,49 @@ def paint_rectangle_selector(
         painter.restore()
 
 
+def paint_cross_selector(
+    painter: QtGui.QPainter,
+    plot: QtCore.QRectF,
+    point: QtCore.QPointF | None,
+    label: str,
+    *,
+    color: QtGui.QColor | str | None = None,
+) -> None:
+    """Paint the one shared Cross appearance used by every plot family."""
+
+    pen_color = selector_pen_color(color)
+    painter.save()
+    try:
+        painter.setClipRect(plot)
+        if point is not None and plot.contains(point):
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.setPen(QtGui.QPen(pen_color, SELECTOR_LINE_PX))
+            painter.drawLine(
+                QtCore.QPointF(point.x(), plot.top()),
+                QtCore.QPointF(point.x(), plot.bottom()),
+            )
+            painter.drawLine(
+                QtCore.QPointF(plot.left(), point.y()),
+                QtCore.QPointF(plot.right(), point.y()),
+            )
+            painter.setBrush(QtGui.QBrush(pen_color))
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.drawEllipse(
+                point,
+                SELECTOR_DOT_PX / 2.0,
+                SELECTOR_DOT_PX / 2.0,
+            )
+        paint_selector_text(
+            painter,
+            label,
+            plot,
+            pen_color,
+            corner="top_right",
+        )
+    finally:
+        painter.restore()
+
+
 def paint_selector_text(
     painter: QtGui.QPainter,
     label: str,
@@ -298,41 +342,13 @@ def paint_selector_text(
         painter.restore()
 
 
-def paint_selector_hover_label(
-    painter: QtGui.QPainter,
-    label: str,
-    plot: QtCore.QRectF,
-    color: QtGui.QColor,
-    *,
-    anchor: QtCore.QPointF | None = None,
-    top_right: bool = False,
-) -> None:
-    metrics = painter.fontMetrics()
-    label_bounds = metrics.boundingRect(label).adjusted(-5, -2, 5, 2)
-    if top_right:
-        label_bounds.moveTopRight(
-            plot.topRight().toPoint() + QtCore.QPoint(-5, 5)
-        )
-    else:
-        if anchor is None:
-            anchor = plot.topLeft()
-        x = min(int(plot.right()) - label_bounds.width(), int(anchor.x()) + 12)
-        y = min(int(plot.bottom()) - label_bounds.height(), int(anchor.y()) + 12)
-        label_bounds.moveTopLeft(
-            QtCore.QPoint(max(int(plot.left()), x), max(int(plot.top()), y))
-        )
-    painter.fillRect(label_bounds, QtGui.QColor(0, 0, 0, 190))
-    painter.setPen(color)
-    painter.drawText(label_bounds, QtCore.Qt.AlignCenter, label)
-
-
 __all__ = [
     "RectangleDrag",
     "RectangleHandle",
     "hit_rectangle_handle",
     "normalized_rectangle",
+    "paint_cross_selector",
     "paint_rectangle_selector",
-    "paint_selector_hover_label",
     "paint_selector_text",
     "rectangle_handle_points",
     "selector_precision",

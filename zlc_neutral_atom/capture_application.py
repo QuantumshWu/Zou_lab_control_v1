@@ -6,15 +6,36 @@ from dataclasses import dataclass
 import threading
 from typing import Callable
 
-from zlc_data import AxisId, AxisSpec, BlockId, DatasetSchema, READOUT_EVENT, REPEAT
-from zlc_neutral_atom.artifacts import CaptureRepository, compile_capture_artifact_pipeline
+from zlc_data import (
+    AxisId,
+    AxisSpec,
+    BlockId,
+    DatasetSchema,
+    PointLayout,
+    READOUT_EVENT,
+    REPEAT,
+)
+from zlc_neutral_atom.acquisition import CameraAcquisitionMode
+from zlc_neutral_atom.artifacts import (
+    CaptureRepository,
+    compile_capture_artifact_pipeline,
+)
+from zlc_neutral_atom.bootstrap._camera_endpoint import (
+    CameraCaptureBindingRequest,
+    bind_camera_measurement,
+)
 from zlc_neutral_atom.bootstrap._triggered_capture import (
     TriggeredCameraBinding,
     TriggeredCameraLayout,
     bind_triggered_camera_acquisition,
 )
 from zlc_neutral_atom.installation import DeviceRef
+from zlc_neutral_atom.camera_measurement import (
+    CameraMeasurementDescriptor,
+    CameraMeasurementRequest,
+)
 from zlc_neutral_atom.runtime.capture import BoundCapturePort
+from zlc_neutral_atom.runtime.dataset import DatasetCellAddress, DatasetCellSchedule
 from zlc_neutral_atom.runtime.pipeline import (
     CapturePreviewPort,
     CapturePreviewSpec,
@@ -31,6 +52,8 @@ from zlc_storage import canonical_text, positive_integer
 _CAPTURE_REPEAT_AXIS_ID = AxisId("capture.repeat")
 _CAPTURE_SCAN_AXIS_ID = AxisId("capture.scan_row_ordinal")
 CAPTURE_READOUT_EVENT_AXIS_ID = AxisId("capture.readout_event")
+_CAMERA_REPEAT_AXIS_ID = AxisId("camera.repeat")
+_CAMERA_READOUT_EVENT_AXIS_ID = AxisId("camera.readout_event")
 
 
 @dataclass(frozen=True)
@@ -95,41 +118,47 @@ class PlanDescriptor:
     resource_claims: tuple[str, ...]
 
 
-class PreparedFiniteCapture:
-    """One-shot app command that exposes no raw drive-capable Port."""
+class _PreparedExactCapture:
+    """Shared one-shot UI command for the two exact camera ownership modes."""
 
     __slots__ = (
+        "_capture",
         "_descriptor",
         "_lock",
+        "_one_shot_name",
+        "_pipeline",
         "_preview_edge",
         "_preview_schema",
         "_repository",
         "_start_run",
         "_started",
-        "_triggered",
     )
 
     def __init__(
         self,
-        triggered: TriggeredCaptureSpec,
+        capture: MinimalPipelineSpec | TriggeredCaptureSpec,
         repository: CaptureRepository,
         start_run: Callable[[RunPlan], RunHandle],
-        descriptor: PlanDescriptor,
+        descriptor,
+        *,
+        one_shot_name: str,
     ) -> None:
-        if not isinstance(triggered, TriggeredCaptureSpec):
-            raise TypeError("triggered must be TriggeredCaptureSpec")
+        if not isinstance(capture, (MinimalPipelineSpec, TriggeredCaptureSpec)):
+            raise TypeError("capture must be an exact camera pipeline spec")
         if type(repository) is not CaptureRepository:
             raise TypeError("repository must be CaptureRepository")
         if not callable(start_run):
             raise TypeError("start_run must be callable")
-        if not isinstance(descriptor, PlanDescriptor):
-            raise TypeError("descriptor must be PlanDescriptor")
-        self._triggered = triggered
+        self._capture = capture
+        self._pipeline = (
+            capture.capture if isinstance(capture, TriggeredCaptureSpec) else capture
+        )
         self._repository = repository
         self._start_run = start_run
         self._descriptor = descriptor
+        self._one_shot_name = canonical_text(one_shot_name, "one_shot_name")
         self._preview_edge = CapturePreviewSpec.dataset_edge_for_capture(
-            triggered.capture
+            self._pipeline
         )
         self._lock = threading.Lock()
         self._preview_schema: DatasetSchema | None = None
@@ -144,18 +173,18 @@ class PreparedFiniteCapture:
         with self._lock:
             if self._preview_schema is not None:
                 return self._preview_schema
-            schema = self._triggered.capture.measurement.capture_contract.dataset_schema
+            schema = self._pipeline.measurement.capture_contract.dataset_schema
             readout_axes = tuple(
                 axis for axis in schema.point_axes if axis.role == READOUT_EVENT
             )
             if (
                 len(readout_axes) != 1
-                or readout_axes[0].size != 1
-                or schema.point_layout.storage_size != 1
+                or len(schema.point_axes) != 1
+                or schema.point_layout.storage_size != readout_axes[0].size
             ):
                 raise ValueError(
-                    "finite capture Workbench preview requires exactly one readout "
-                    "event per repeat and no scan-point multiplexing"
+                    "finite Camera preview requires one explicit READOUT_EVENT "
+                    "axis and no scan-point multiplexing"
                 )
             self._preview_schema = self._preview_edge.schema
             return self._preview_schema
@@ -163,7 +192,7 @@ class PreparedFiniteCapture:
     def start(self) -> RunHandle:
         self._claim_start()
         plan = compile_capture_artifact_pipeline(
-            self._triggered,
+            self._capture,
             self._repository,
         )
         return self._start_run(plan)
@@ -186,7 +215,7 @@ class PreparedFiniteCapture:
         )
         preview = factory(preview_spec)
         plan = compile_capture_artifact_pipeline(
-            self._triggered,
+            self._capture,
             self._repository,
             preview=preview,
         )
@@ -199,8 +228,54 @@ class PreparedFiniteCapture:
     def _claim_start(self) -> None:
         with self._lock:
             if self._started:
-                raise RuntimeError("PreparedFiniteCapture is one-shot")
+                raise RuntimeError(f"{self._one_shot_name} is one-shot")
             self._started = True
+
+
+class PreparedFiniteCapture(_PreparedExactCapture):
+    """Explicit pulse-owned finite Capture command."""
+
+    def __init__(
+        self,
+        triggered: TriggeredCaptureSpec,
+        repository: CaptureRepository,
+        start_run: Callable[[RunPlan], RunHandle],
+        descriptor: PlanDescriptor,
+    ) -> None:
+        if not isinstance(triggered, TriggeredCaptureSpec):
+            raise TypeError("triggered must be TriggeredCaptureSpec")
+        if not isinstance(descriptor, PlanDescriptor):
+            raise TypeError("descriptor must be PlanDescriptor")
+        super().__init__(
+            triggered,
+            repository,
+            start_run,
+            descriptor,
+            one_shot_name="PreparedFiniteCapture",
+        )
+
+
+class PreparedFiniteCameraMeasurement(_PreparedExactCapture):
+    """Passive finite form of the one public Camera Measurement."""
+
+    def __init__(
+        self,
+        pipeline: MinimalPipelineSpec,
+        repository: CaptureRepository,
+        start_run: Callable[[RunPlan], RunHandle],
+        descriptor: CameraMeasurementDescriptor,
+    ) -> None:
+        if not isinstance(pipeline, MinimalPipelineSpec):
+            raise TypeError("pipeline must be MinimalPipelineSpec")
+        if not isinstance(descriptor, CameraMeasurementDescriptor):
+            raise TypeError("descriptor must be CameraMeasurementDescriptor")
+        super().__init__(
+            pipeline,
+            repository,
+            start_run,
+            descriptor,
+            one_shot_name="PreparedFiniteCameraMeasurement",
+        )
 
 
 def bind_finite_capture_spec(
@@ -270,6 +345,96 @@ def prepare_finite_capture(
     return PreparedFiniteCapture(triggered, repository, start_run, descriptor)
 
 
+def bind_finite_camera_measurement(
+    request: CameraMeasurementRequest,
+    *,
+    camera_port: BoundCapturePort,
+) -> tuple[MinimalPipelineSpec, CameraMeasurementDescriptor]:
+    """Bind ``repeat=K`` Camera to K×E passive hardware-triggered frames."""
+
+    if not isinstance(request, CameraMeasurementRequest):
+        raise TypeError("request must be CameraMeasurementRequest")
+    repeats = positive_integer(request.repeat, "repeat")
+    events = positive_integer(request.frames_per_cycle, "frames_per_cycle")
+    capability = camera_port.capability
+    facts = capability.camera_capability_evidence.physical_facts
+    repeat_axis = AxisSpec(
+        _CAMERA_REPEAT_AXIS_ID,
+        "repeat",
+        REPEAT,
+        repeats,
+        tuple(range(repeats)),
+    )
+    event_axis = AxisSpec(
+        _CAMERA_READOUT_EVENT_AXIS_ID,
+        "readout event",
+        READOUT_EVENT,
+        events,
+        tuple(range(events)),
+    )
+    point_layout = PointLayout.rect_c((events,))
+    schema = DatasetSchema(
+        repeat_axis,
+        (event_axis,),
+        point_layout,
+        capability.payload_contract.value_schema,
+    )
+    schedule = DatasetCellSchedule.from_cells(
+        schema,
+        (
+            DatasetCellAddress(repeat_index, event_index)
+            for repeat_index in range(repeats)
+            for event_index in range(events)
+        ),
+    )
+    measurement = bind_camera_measurement(
+        camera_port,
+        CameraCaptureBindingRequest(
+            request.camera_ref.role,
+            repeat_axis,
+            (event_axis,),
+            point_layout,
+            schedule,
+            CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+            0,
+            tuple(facts.event_setting(index) for index in range(events)),
+        ),
+    )
+    pipeline = MinimalPipelineSpec(
+        f"Camera {request.camera_ref.role}",
+        measurement,
+        BlockId(f"camera-{schema.fingerprint[:20]}"),
+    )
+    descriptor = CameraMeasurementDescriptor(
+        "Camera",
+        request.camera_ref.role,
+        schema,
+        str(camera_port.resource_claim.key),
+    )
+    return pipeline, descriptor
+
+
+def prepare_finite_camera_measurement(
+    request: CameraMeasurementRequest,
+    *,
+    camera_port: BoundCapturePort,
+    repository: CaptureRepository,
+    start_run: Callable[[RunPlan], RunHandle],
+) -> PreparedFiniteCameraMeasurement:
+    """Prepare the finite branch of the one public Camera Measurement."""
+
+    pipeline, descriptor = bind_finite_camera_measurement(
+        request,
+        camera_port=camera_port,
+    )
+    return PreparedFiniteCameraMeasurement(
+        pipeline,
+        repository,
+        start_run,
+        descriptor,
+    )
+
+
 def bind_finite_capture_request(
     request: CaptureRequest,
     *,
@@ -307,6 +472,9 @@ __all__ = [
     "CaptureRequest",
     "PlanDescriptor",
     "PreparedFiniteCapture",
+    "PreparedFiniteCameraMeasurement",
+    "bind_finite_camera_measurement",
     "bind_finite_capture_request",
     "bind_finite_capture_spec",
+    "prepare_finite_camera_measurement",
 ]

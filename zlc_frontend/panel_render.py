@@ -258,7 +258,12 @@ class PanelComposer:
         self._dataset_id = DatasetId(self._panel_id)
         self._document: FigureDocument | None = None
         self._document_fingerprint = None
+        self._source_figure_ref = None
+        self._source_figure: DataFigure | None = None
         self._renderer = None
+        self._image_home_viewport = None
+        self._image_color_cache_key = None
+        self._image_color_cache_value = None
         # Display continuity, carried between ticks (see the class docstring).
         self._color_limits: tuple[float, float] | None = None
         self._image_relim_mode = None
@@ -300,6 +305,11 @@ class PanelComposer:
         )
         self._document = document
         self._document_fingerprint = fingerprint
+        self._source_figure_ref = None
+        self._source_figure = None
+        self._image_home_viewport = None
+        self._image_color_cache_key = None
+        self._image_color_cache_value = None
         # The Agg surface is thread-affine to this composer's worker.  A schema
         # change replaces the view, so retire the old surface on that same
         # worker before forgetting it; merely dropping the Python reference
@@ -317,6 +327,11 @@ class PanelComposer:
             renderer.close()
         self._document = None
         self._document_fingerprint = None
+        self._source_figure_ref = None
+        self._source_figure = None
+        self._image_home_viewport = None
+        self._image_color_cache_key = None
+        self._image_color_cache_value = None
 
     # -------------------------------------------------------------- compose
     def compose(self, snapshot, *, display, provenance: PanelProvenance):
@@ -342,6 +357,8 @@ class PanelComposer:
         *,
         display,
         provenance: PanelProvenance,
+        fit_result=None,
+        fit_result_identity: str | None = None,
     ) -> tuple[object, DataFigure]:
         """Rasterize once and return the exact already-evaluated figure too."""
 
@@ -350,9 +367,26 @@ class PanelComposer:
         if block is None or ref is None:
             raise PanelRenderError("a panel front needs an owned (ref, block) snapshot")
         document = self.document_for(block.schema)
-        figure = DataFigure(
-            document,
-            ResolvedDatasetMap((ResolvedDataset(self._dataset_id, snapshot),)),
+        # A display gesture changes only authored presentation state.  The
+        # source revision is immutable, so evaluating its full image again for
+        # every wheel/pan event is both redundant and observably expensive for
+        # camera frames.  Retain exactly the last resolved revision; a new ref
+        # replaces it, while this composer never accumulates historical data.
+        if self._source_figure_ref == ref and self._source_figure is not None:
+            figure = self._source_figure
+        else:
+            figure = DataFigure(
+                document,
+                ResolvedDatasetMap((ResolvedDataset(self._dataset_id, snapshot),)),
+            )
+            self._source_figure_ref = ref
+            self._source_figure = figure
+            self._image_color_cache_key = None
+            self._image_color_cache_value = None
+        fit_result = self._validated_transient_fit(
+            figure,
+            fit_result,
+            fit_result_identity,
         )
         evaluated = figure.evaluated
         layers = evaluated.layers
@@ -362,7 +396,13 @@ class PanelComposer:
         if not series:
             raise PanelRenderError("a panel document evaluated no series")
         raster, payload = self._rasterize(
-            evaluated, series, display, ref, block.schema,
+            figure,
+            series,
+            display,
+            ref,
+            block.schema,
+            fit_result=fit_result,
+            fit_result_identity=fit_result_identity,
         )
         return (
             self._frame_for(
@@ -383,6 +423,8 @@ class PanelComposer:
         display,
         provenance: PanelProvenance,
         focus: FacetedPanelFocus | None = None,
+        fit_result=None,
+        fit_result_identity: str | None = None,
     ) -> FacetedPanelResult:
         """Compose one complete typed grid or one exact focused cell.
 
@@ -404,8 +446,13 @@ class PanelComposer:
         datasets = ResolvedDatasetMap(
             (ResolvedDataset(self._dataset_id, snapshot),)
         )
-        figure = DataFigure(document, datasets)
-        layers = figure.evaluated.layers
+        source_figure = DataFigure(document, datasets)
+        fit_result = self._validated_transient_fit(
+            source_figure,
+            fit_result,
+            fit_result_identity,
+        )
+        layers = source_figure.evaluated.layers
         if (
             len(layers) != 1
             or len(layers[0].cells) <= 1
@@ -422,27 +469,40 @@ class PanelComposer:
         if focus is None:
             from .plot_layout import LIVE_PANEL_DPI
 
-            payload, regions = figure.to_panel_png_bytes_with_panel_regions(
-                size=self._size_name,
-                width=self._size[0],
-                height=self._size[1],
-                dpi=LIVE_PANEL_DPI * self._pixel_ratio,
-                display_state=display,
-                title=self._label,
-                value_label=self._value_label,
-            )
+            options = {
+                "size": self._size_name,
+                "width": self._size[0],
+                "height": self._size[1],
+                "dpi": LIVE_PANEL_DPI * self._pixel_ratio,
+                "display_state": display,
+                "title": self._label,
+                "value_label": self._value_label,
+            }
+            if fit_result is None:
+                payload, regions = (
+                    source_figure.to_panel_png_bytes_with_panel_regions(
+                        **options
+                    )
+                )
+            else:
+                payload, regions = (
+                    source_figure.transient_fit_to_panel_png_bytes_with_panel_regions(
+                        fit_result,
+                        **options,
+                    )
+                )
             if len(regions) != len(layers[0].cells):
                 raise PanelRenderError(
                     "grid hit regions do not cover every evaluated cell"
                 )
             return FacetedPanelResult(
-                figure,
+                source_figure,
                 overview_png=payload,
                 regions=regions,
             )
 
         try:
-            focused = figure.focused_typed_panel(
+            focused = source_figure.focused_typed_panel(
                 focus.panel_index,
                 expected_selection=focus.selection,
                 expected_intent=self._intent,
@@ -459,6 +519,8 @@ class PanelComposer:
         raster, payload = self._rasterize_focused(
             focused,
             focused_display,
+            fit_result=fit_result,
+            fit_result_identity=fit_result_identity,
         )
         frame = self._frame_for(
             focused.document,
@@ -526,16 +588,73 @@ class PanelComposer:
         )
 
     # ------------------------------------------------------------ per intent
-    def _rasterize(self, evaluated, series, display, ref, schema):
+    @staticmethod
+    def _validated_transient_fit(figure, fit_result, fit_result_identity):
+        """Validate one exact draft pair without attaching saved Figure state."""
+
+        if (fit_result is None) != (fit_result_identity is None):
+            raise PanelRenderError(
+                "fit result and fit result identity must be supplied together"
+            )
+        if fit_result is None:
+            return None
+        from zlc_data import FitResultBatch
+
+        if not isinstance(fit_result, FitResultBatch):
+            raise PanelRenderError("panel fit result has another type")
+        if not isinstance(fit_result_identity, str) or not fit_result_identity:
+            raise PanelRenderError("panel fit result identity must be non-empty")
+        if fit_result.source_ref != figure.evaluated.inputs[0].ref:
+            raise PanelRenderError("fit result belongs to another Figure source")
+        return fit_result
+
+    def _rasterize(
+        self,
+        figure,
+        series,
+        display,
+        ref,
+        schema,
+        *,
+        fit_result=None,
+        fit_result_identity: str | None,
+    ):
+        evaluated = figure.evaluated
         data = series[0].data
         if self._intent is ViewIntent.IMAGE:
             if not isinstance(data, EvaluatedImage):
                 raise PanelRenderError("this signal does not evaluate to an image")
-            return self._image_front(data, display, ref, schema)
+            fit_overlay = (
+                None
+                if fit_result is None
+                else figure.transient_single_panel_radial_fit_overlay(
+                    fit_result,
+                    result_identity=fit_result_identity,
+                )
+            )
+            return self._image_front(
+                data,
+                display,
+                ref,
+                schema,
+                fit_overlay=fit_overlay,
+            )
         if self._intent is ViewIntent.CURVE:
             if any(not isinstance(item.data, EvaluatedCurve) for item in series):
                 raise PanelRenderError("this signal does not evaluate to a curve")
-            return self._curve_front(evaluated, display)
+            overlays = ()
+            if fit_result is not None:
+                from .fit_curve_projection import (
+                    materialize_curve_fit_overlay_plan,
+                )
+
+                overlays = materialize_curve_fit_overlay_plan(
+                    figure.transient_single_panel_curve_fit_overlay_plan(
+                        fit_result,
+                        result_identity=fit_result_identity,
+                    )
+                )
+            return self._curve_front(evaluated, display, fit_overlays=overlays)
         if self._intent is ViewIntent.HISTOGRAM:
             if not isinstance(data, EvaluatedHistogram):
                 raise PanelRenderError("this signal does not evaluate to a histogram")
@@ -549,7 +668,14 @@ class PanelComposer:
             )
         raise PanelRenderError(f"no panel renderer for view intent {self._intent!r}")
 
-    def _rasterize_focused(self, figure: DataFigure, display):
+    def _rasterize_focused(
+        self,
+        figure: DataFigure,
+        display,
+        *,
+        fit_result=None,
+        fit_result_identity: str | None = None,
+    ):
         """Use the existing single-panel renderer for one typed grid cell."""
 
         if self._intent is ViewIntent.IMAGE:
@@ -564,11 +690,18 @@ class PanelComposer:
                 )
             descriptor = figure.document.datasets[0]
             resolved = figure.datasets.resolve(descriptor.dataset_id)
+            fit_overlay = None
+            if fit_result is not None:
+                fit_overlay = figure.transient_single_panel_radial_fit_overlay(
+                    fit_result,
+                    result_identity=fit_result_identity,
+                )
             return self._image_front(
                 series[0].data,
                 display,
                 resolved.ref,
                 resolved.block.schema,
+                fit_overlay=fit_overlay,
             )
 
         from .matplotlib_render import SinglePanelAggRenderer
@@ -584,6 +717,18 @@ class PanelComposer:
         )
         try:
             if self._intent is ViewIntent.CURVE:
+                overlays = ()
+                if fit_result is not None:
+                    from .fit_curve_projection import (
+                        materialize_curve_fit_overlay_plan,
+                    )
+
+                    overlays = materialize_curve_fit_overlay_plan(
+                        figure.transient_single_panel_curve_fit_overlay_plan(
+                            fit_result,
+                            result_identity=fit_result_identity,
+                        )
+                    )
                 raster, payload = renderer.render_interactive_curve(
                     figure.evaluated,
                     display,
@@ -593,6 +738,7 @@ class PanelComposer:
                         if self._curve_relim_mode is None
                         else self._curve_relim_mode
                     ),
+                    fit_overlays=overlays,
                 )
                 self._curve_y_limits = payload.viewport.y_limits
                 self._curve_relim_mode = display.relim_mode
@@ -652,21 +798,52 @@ class PanelComposer:
 
         return LIVE_PANEL_DPI * self._pixel_ratio
 
-    def _image_front(self, data: EvaluatedImage, display: ImageDisplayState, ref, schema):
+    def _image_front(
+        self,
+        data: EvaluatedImage,
+        display: ImageDisplayState,
+        ref,
+        schema,
+        *,
+        fit_overlay=None,
+    ):
         from .image_view import ImageViewportTransform
         from .render import ImagePanelPayload
 
-        data_range, color_limits = resolve_image_color_limits(
+        color_cache_key = (
             data,
-            display,
-            current_color_limits=self._color_limits,
-            previous_relim_mode=self._image_relim_mode,
+            display.relim_mode,
+            display.fixed_color_limits,
+            self._color_limits,
+            self._image_relim_mode,
         )
+        if color_cache_key == self._image_color_cache_key:
+            data_range, color_limits = self._image_color_cache_value
+        else:
+            data_range, color_limits = resolve_image_color_limits(
+                data,
+                display,
+                current_color_limits=self._color_limits,
+                previous_relim_mode=self._image_relim_mode,
+            )
         self._color_limits = color_limits
         self._image_relim_mode = display.relim_mode
-        home_viewport = ImageViewportTransform(
-            self._image_axis_specs(data, schema),
+        # Cache the post-resolution continuity state, which is the state the
+        # next display-only gesture will actually observe.
+        self._image_color_cache_key = (
+            data,
+            display.relim_mode,
+            display.fixed_color_limits,
+            self._color_limits,
+            self._image_relim_mode,
         )
+        self._image_color_cache_value = (data_range, color_limits)
+        home_viewport = self._image_home_viewport
+        if home_viewport is None:
+            home_viewport = ImageViewportTransform(
+                self._image_axis_specs(data, schema),
+            )
+            self._image_home_viewport = home_viewport
         viewport = image_viewport_for_display_state(display, home_viewport)
         raster, raster_geometry = self._image_agg().render(
             data,
@@ -676,6 +853,8 @@ class PanelComposer:
             data_range=data_range,
             title=self._label,
             value_label=self._value_label,
+            distribution_identity=ref,
+            fit_overlay=fit_overlay,
         )
         payload = ImagePanelPayload(
             image=data,
@@ -709,7 +888,13 @@ class PanelComposer:
                 "the evaluated image names an axis its schema does not declare"
             ) from error
 
-    def _curve_front(self, evaluated, display: CurveDisplayState):
+    def _curve_front(
+        self,
+        evaluated,
+        display: CurveDisplayState,
+        *,
+        fit_overlays=(),
+    ):
         raster, payload = self._agg().render_interactive_curve(
             evaluated,
             display,
@@ -719,6 +904,7 @@ class PanelComposer:
                 if self._curve_relim_mode is None
                 else self._curve_relim_mode
             ),
+            fit_overlays=fit_overlays,
         )
         self._curve_y_limits = payload.viewport.y_limits
         self._curve_relim_mode = display.relim_mode

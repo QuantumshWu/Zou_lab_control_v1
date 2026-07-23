@@ -241,8 +241,6 @@ def test_final_preview_exposes_exact_image_handles_without_changing_authority(
         center = target.center()
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=center)
         assert _capture_image_binding(board).cross is not None
-        _drag_move(board, center, QtCore.Qt.NoButton)
-        assert _capture_image_binding(board).hover is not None
         QtTest.QTest.mouseDClick(board, QtCore.Qt.RightButton, pos=center)
         assert _capture_image_binding(board).cross is None
 

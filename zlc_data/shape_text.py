@@ -30,7 +30,6 @@ import re
 import numpy as np
 
 __all__ = [
-    "camera_frame_keys",
     "indexed_unique_name",
     "strip_node_prefix",
     "contract_shape_label",
@@ -107,15 +106,6 @@ def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None
     # Raw shape (schema unknown): the SAME ``×`` spelling as the contract form and the flow-graph
     # labels -- never the numpy-tuple ``(96, 128)`` that made the same signal read two different ways.
     return f"({format_dims(shape)})"
-
-
-def camera_frame_keys(frames_per_cycle, prefix=""):
-    """The SINGLE source of a camera's published signal names: ONE ``frame_i`` per emCCD event,
-    ``frame_0 .. frame_{N-1}`` (NO lumped ``frame``).  Used by BOTH ``CameraMeasurement.published_signals``
-    (live, with the node prefix) and the console's declared-signal picker (bare, before the node starts) so
-    the two can never drift -- a declared 'waiting' name always equals what the running camera will emit."""
-    n = max(1, int(frames_per_cycle or 1))
-    return [f"{prefix}frame_{i}" for i in range(n)]
 
 
 def measurement_slug(name: str) -> str:

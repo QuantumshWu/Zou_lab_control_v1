@@ -181,6 +181,7 @@ def _update_histogram_presentation(
     threshold_artists=(),
     stats_text=None,
     show_stats: bool,
+    infer_fit_threshold: bool = True,
     threshold_linewidth: float,
 ):
     """Draw/update the one established histogram fit/cut presentation.
@@ -195,6 +196,8 @@ def _update_histogram_presentation(
         raise TypeError("state must be HistogramDisplayState")
     if not isinstance(show_stats, bool):
         raise TypeError("show_stats must be bool")
+    if not isinstance(infer_fit_threshold, bool):
+        raise TypeError("infer_fit_threshold must be bool")
 
     from zlc_data.readout_math import confidence_weighted_fidelity
 
@@ -252,7 +255,12 @@ def _update_histogram_presentation(
         total_artist.set_data(coordinates, total * presentation_scale)
 
     thresholds = tuple(float(value) for value in state.thresholds)
-    if not thresholds and fit.separated and fit.threshold is not None:
+    if (
+        infer_fit_threshold
+        and not thresholds
+        and fit.separated
+        and fit.threshold is not None
+    ):
         thresholds = (float(fit.threshold),)
     threshold_artists = list(threshold_artists)
     while len(threshold_artists) < len(thresholds):

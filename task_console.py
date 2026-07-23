@@ -25,21 +25,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Open with a saved console layout BY NAME from the workspace's tasks/.",
     )
     parser.add_argument(
+        "--config",
+        default="virtual",
+        help=(
+            "Installation config shown by DeviceManager before TaskConsole "
+            "starts: 'virtual' or a saved config JSON path."
+        ),
+    )
+    parser.add_argument(
         "--repository",
         type=Path,
         default=Path.home() / ".zlc" / "task_console",
-        help="Virtual Experiment workspace.",
+        help="Experiment workspace used after DeviceManager initializes devices.",
     )
     parser.add_argument(
         "--name",
         default="task_console",
-        help="Virtual Experiment name.",
+        help="Experiment name.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=7,
-        help="Virtual installation seed.",
+        help="Virtual installation seed (used only when --config=virtual).",
     )
     return parser
 
@@ -67,45 +75,98 @@ def _close_window(application, window, *, timeout_seconds: float = 10.0) -> None
         raise RuntimeError("TaskConsole did not finish its bounded shutdown")
 
 
+class _StandaloneTaskConsoleFlow:
+    """Own exactly one DeviceManager-created Experiment and its TaskConsole.
+
+    The standalone GUI has no hidden process registry and does not manufacture
+    a second Experiment.  DeviceManager owns installation composition; after
+    its successful Init transition the exact same Experiment is borrowed by
+    TaskConsole.  Closing TaskConsole retires the DeviceManager authority,
+    which in turn closes that one Experiment.
+    """
+
+    def __init__(self, args) -> None:
+        self.args = args
+        self.devices = None
+        self.console = None
+        self.experiment = None
+        self.failure: BaseException | None = None
+
+    def open(self):
+        from Zou_lab_control.notebook import device_manager
+
+        kwargs = {
+            "repository": self.args.repository,
+            "name": self.args.name,
+        }
+        if self.args.config == "virtual":
+            kwargs["seed"] = self.args.seed
+        self.devices = device_manager(
+            self.args.config,
+            on_initialized=self._open_console,
+            **kwargs,
+        )
+        return self.devices
+
+    def _open_console(self, experiment) -> None:
+        if self.console is not None:
+            return
+        if self.devices is None:
+            return
+        try:
+            from zlc_workbench.task_console.app import open_task_console
+
+            console = open_task_console(
+                experiment,
+                state=self.args.state,
+                task=self.args.task,
+            )
+        except BaseException as error:
+            self.failure = error
+            self.devices.status_strip.show_message(
+                f"{type(error).__name__}: {error}",
+                severity="error",
+            )
+            return
+        self.experiment = experiment
+        self.console = console
+        console.window().closed.connect(self.close)
+        self.devices.window().hide()
+
+    def close(self) -> None:
+        self.experiment = None
+        devices, self.devices = self.devices, None
+        if devices is not None:
+            devices.request_owner_close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(sys.argv[1:] if argv is None else list(argv))
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
 
     from PyQt5 import QtCore
 
-    from Zou_lab_control.notebook import connect
     from zlc_frontend.qt_widgets import ensure_qt_app
-    from zlc_storage import durable_makedirs
-    from zlc_workbench.task_console.app import open_task_console
 
     application = ensure_qt_app()
-    experiment = None
-    window = None
+    flow = _StandaloneTaskConsoleFlow(args)
     try:
-        # The composition root owns one repository below an existing
-        # parent, so this launcher owns the workspace levels above it:
-        # a first run on a machine with no ~/.zlc must not die.
-        durable_makedirs(args.repository.expanduser().parent)
-        experiment = connect(
-            "virtual",
-            repository=args.repository,
-            name=args.name,
-            seed=args.seed,
-        )
-        window = open_task_console(experiment, state=args.state, task=args.task)
+        flow.open()
         auto_close_ms = os.environ.get("ZLC_TASK_CONSOLE_AUTO_CLOSE_MS")
         if auto_close_ms:
             QtCore.QTimer.singleShot(
                 max(0, int(auto_close_ms)),
-                window.window().close,
+                application.quit,
             )
-        return int(application.exec_())
+        status = int(application.exec_())
+        if flow.failure is not None:
+            raise flow.failure
+        return status
     finally:
         try:
-            _close_window(application, window)
+            _close_window(application, flow.console)
         finally:
-            if experiment is not None:
-                experiment.close()
+            flow.close()
 
 
 if __name__ == "__main__":

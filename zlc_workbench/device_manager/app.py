@@ -177,11 +177,24 @@ def open_device_manager(
     document: InstallationConfigDocument | None = None,
     repository: str | Path | None = None,
     name: str = "neutral_atom",
+    on_initialized=None,
 ):
     """Open the formal config/admin window on one narrow authority."""
 
+    # DeviceManager may be the first formal window in a process (in
+    # particular, the standalone TaskConsole now enters through it).  Resolve
+    # the same process-global Fluent scale used by TaskConsole/PulseGUI before
+    # constructing any QWidget; doing this after the body exists leaves every
+    # fixed metric in that body at an incorrect 1.0 scale on high-DPI screens.
+    from zlc_frontend.qt_widgets import ensure_qt_app, set_fluent_scale
+
+    ensure_qt_app()
+    set_fluent_scale(None)
+
     if experiment is not None and document is not None:
         raise ValueError("a bound Experiment already supplies its installation config")
+    if on_initialized is not None and not callable(on_initialized):
+        raise TypeError("on_initialized must be callable or None")
     if experiment is not None:
         document = experiment.installation_config
     elif document is None:
@@ -197,11 +210,27 @@ def open_device_manager(
     active = authority.state().active_config
     editor = DeviceConfigEditorSession(document, active_document=active)
     controller = DeviceManagerController(editor, authority)
+    if on_initialized is not None:
+        def publish_initialized(state: DeviceAdminState) -> None:
+            if state.active_config is None:
+                return
+            initialized = authority.experiment
+            if initialized is None:
+                raise RuntimeError(
+                    "initialized DeviceManager state has no owning Experiment"
+                )
+            on_initialized(initialized)
+
+        controller.runtime_changed.connect(publish_initialized)
 
     from .window import launch_device_manager_window
 
-    return launch_device_manager_window(
+    body = launch_device_manager_window(
         controller,
-        experiment_provider=lambda: authority.experiment,
         hide_on_close=experiment is not None,
     )
+    if experiment is not None and on_initialized is not None:
+        from PyQt5 import QtCore
+
+        QtCore.QTimer.singleShot(0, lambda: on_initialized(experiment))
+    return body

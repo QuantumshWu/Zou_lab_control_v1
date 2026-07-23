@@ -21,6 +21,7 @@ Matplotlib stack.
 from __future__ import annotations
 
 from typing import Mapping
+from uuid import uuid4
 
 from zlc_data.panel_size import panel_size_cells
 from zlc_data.plot_kind import PLOT_KIND_SPECS
@@ -29,7 +30,8 @@ from zlc_storage.canonical import exact_mapping
 __all__ = ["DEFAULT_UPDATE_MS", "LOGIC_KINDS", "LOGIC_NODE_CONFIG_FIELDS",
            "LogicNodeConfig", "PANEL_CONFIG_FIELDS", "PANEL_KINDS",
            "CONSOLE_STATE_SCHEMA", "PanelConfig", "TASK_CONSOLE_STATE_FIELDS",
-           "UPDATE_INTERVALS", "console_signal_key", "layout_record"]
+           "UPDATE_INTERVALS", "console_signal_key", "layout_record",
+           "panel_signal_key"]
 
 
 #: The four node families the Logic tab can add.
@@ -56,6 +58,23 @@ def console_signal_key(producer_label: str, output_name: str) -> str:
     if not output:
         raise ValueError("console signal output name must not be empty")
     return f"{producer} / {output}"
+
+
+def panel_signal_key(panel_id: str, output_name: str) -> str:
+    """Return one panel-derived signal's stable, deliberately invisible key.
+
+    A panel title is editable presentation text and therefore cannot identify
+    downstream bindings.  ``panel_id`` is persisted with the current layout;
+    the picker projects the human title and short output name separately.
+    """
+
+    identity = str(panel_id).strip()
+    output = str(output_name).strip()
+    if not identity:
+        raise ValueError("panel signal identity must not be empty")
+    if not output:
+        raise ValueError("panel signal output name must not be empty")
+    return f"@panel/{identity}/{output}"
 
 
 def layout_record(
@@ -132,6 +151,7 @@ UPDATE_INTERVALS = (100, 200, 400, 800)
 DEFAULT_UPDATE_MS = 400
 
 PANEL_CONFIG_FIELDS = {
+    "panel_id": str,
     "kind": str,
     "title": str,
     "row": int,
@@ -149,6 +169,7 @@ class PanelConfig:
     def __init__(
         self,
         *,
+        panel_id: str | None = None,
         kind: str,
         title: str = "",
         row: int = 0,
@@ -160,6 +181,14 @@ class PanelConfig:
         if kind not in PANEL_KINDS:
             raise ValueError(f"unknown panel kind {kind!r}; choose from {sorted(PANEL_KINDS)}.")
         panel_size_cells(size)              # validate against the limited preset list
+        identity = (
+            f"panel_{uuid4().hex}"
+            if panel_id is None
+            else str(panel_id).strip()
+        )
+        if not identity:
+            raise ValueError("panel_id must not be empty")
+        self.panel_id = identity
         self.kind = str(kind)
         self.title = str(title)
         self.row = max(0, int(row))    # pixel y of the card top-left (no column grid)
@@ -184,6 +213,7 @@ class PanelConfig:
         # the gravity packer, which re-packs the whole board on load, so a layout's reading order
         # (top-to-bottom, left-to-right) is what round-trips -- exact pixels are recomputed.
         return {
+            "panel_id": self.panel_id,
             "kind": self.kind,
             "title": self.title,
             "row": self.row,

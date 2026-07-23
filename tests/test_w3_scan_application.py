@@ -1493,9 +1493,7 @@ def _assert_occupancy_scan_window(exp, request, monkeypatch):
                 int(round(plot.center().y())),
             )
 
-            # H/C/A are exercised on the exact painted real-product payload.
-            QtTest.QTest.mouseMove(board, center)
-            assert numeric_binding.hover is not None
+            # C/A are exercised on the exact painted real-product payload.
             QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=center)
             assert numeric_binding.cross is not None
             left = QtCore.QPoint(

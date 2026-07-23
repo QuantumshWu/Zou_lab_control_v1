@@ -3,16 +3,6 @@
 from __future__ import annotations
 
 
-def open_camera_monitor_workbench(prepare, request):
-    """Open one free-running camera monitor without eager Qt imports."""
-
-    from zlc_workbench.camera_monitor.app import (
-        open_camera_monitor_workbench as _open,
-    )
-
-    return _open(prepare, request)
-
-
 def open_capture_workbench(experiment, request):
     """Open the finite exact-capture Workbench without owning the Experiment."""
 
@@ -186,7 +176,6 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
 __all__ = [
     "open_calibration_workbench",
     "open_calibration_report_workbench",
-    "open_camera_monitor_workbench",
     "open_capture_workbench",
     "create_data_figure_pane",
     "open_data_figure_workbench",

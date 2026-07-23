@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import threading
 import time
 import uuid
-from typing import Callable
+from typing import Callable, Mapping
 
+from zlc_data.param_decl import ParamDecl
 from zlc_neutral_atom.capture_reference import CaptureArtifactRef
+from zlc_neutral_atom.readout.calibration import (
+    CalibrationAnalysisRequest,
+    ThresholdMethod,
+)
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
 from zlc_neutral_atom.readout.sitemap import SitemapCalibrationRequest
 from zlc_neutral_atom.runtime.run import (
@@ -20,7 +26,254 @@ from zlc_neutral_atom.runtime.run import (
     RunState,
 )
 
-__all__ = ["CalibrationTaskHandle"]
+CALIBRATION_SOURCE_MODES = ("live", "saved frames")
+CALIBRATION_THRESHOLD_METHODS = tuple(item.value for item in ThresholdMethod)
+DEFAULT_CALIBRATION_FOLDER = "calibrations"
+DEFAULT_CALIBRATION_PULSE_PATH = (
+    "zlc_neutral_atom/assets/imaging_template.json"
+)
+
+
+def _nonempty_text(value: object, field: str) -> str:
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{field} must not be blank")
+    return text
+
+
+def _finite_nonnegative(value: object, field: str) -> float:
+    number = float(value)
+    if number < 0.0 or number == float("inf") or number != number:
+        raise ValueError(f"{field} must be finite and non-negative")
+    return number
+
+
+def _finite_positive(value: object, field: str) -> float:
+    number = _finite_nonnegative(value, field)
+    if number <= 0.0:
+        raise ValueError(f"{field} must be positive")
+    return number
+
+
+@dataclass(frozen=True)
+class CalibrationTaskIntent:
+    """TaskConsole-owned user intent before installation services bind a run.
+
+    This record deliberately retains the complete Main calibration surface.
+    It is not a partial ``SitemapCalibrationRequest``: live acquisition and
+    saved-frame calibration are two branches of the same task, while filesystem
+    output and raw-frame retention are task orchestration concerns rather than
+    fields on the numeric calibration request.
+    """
+
+    source_mode: str
+    folder: str
+    save_frames: bool
+    pulse: str
+    threshold_method: str
+    reference_exposure_s: float
+    readout_exposure_s: float
+    threshold_frames: int
+    roi_radius: int
+    camera_role: str
+
+    def __post_init__(self) -> None:
+        source_mode = str(self.source_mode).strip().lower()
+        if source_mode not in CALIBRATION_SOURCE_MODES:
+            raise ValueError(
+                f"source_mode must be one of {CALIBRATION_SOURCE_MODES}"
+            )
+        folder = _nonempty_text(self.folder, "folder")
+        if type(self.save_frames) is not bool:
+            raise TypeError("save_frames must be bool")
+        pulse = _nonempty_text(self.pulse, "pulse")
+        threshold_method = str(self.threshold_method).strip().lower()
+        if threshold_method not in CALIBRATION_THRESHOLD_METHODS:
+            raise ValueError(
+                "threshold_method must be one of "
+                f"{CALIBRATION_THRESHOLD_METHODS}"
+            )
+        reference_exposure_s = _finite_positive(
+            self.reference_exposure_s,
+            "reference_exposure_s",
+        )
+        readout_exposure_s = _finite_positive(
+            self.readout_exposure_s,
+            "readout_exposure_s",
+        )
+        if not isinstance(self.threshold_frames, int) or isinstance(
+            self.threshold_frames,
+            bool,
+        ):
+            raise TypeError("threshold_frames must be an integer")
+        if self.threshold_frames < 2:
+            raise ValueError("threshold_frames must be at least 2")
+        if not isinstance(self.roi_radius, int) or isinstance(self.roi_radius, bool):
+            raise TypeError("roi_radius must be an integer")
+        roi_radius = self.roi_radius
+        if roi_radius < 1:
+            raise ValueError("roi_radius must be positive")
+        camera_role = _nonempty_text(self.camera_role, "camera_role")
+        object.__setattr__(self, "source_mode", source_mode)
+        object.__setattr__(self, "folder", folder)
+        object.__setattr__(self, "pulse", pulse)
+        object.__setattr__(self, "threshold_method", threshold_method)
+        object.__setattr__(
+            self,
+            "reference_exposure_s",
+            reference_exposure_s,
+        )
+        object.__setattr__(self, "readout_exposure_s", readout_exposure_s)
+        object.__setattr__(self, "roi_radius", roi_radius)
+        object.__setattr__(self, "camera_role", camera_role)
+
+
+def calibration_task_params(
+    camera_roles: tuple[str, ...],
+) -> tuple[ParamDecl, ...]:
+    """Main calibration controls, declared once for the TaskConsole form."""
+
+    choices = tuple(str(role) for role in camera_roles)
+    if not choices:
+        raise ValueError("calibration task requires a configured camera role")
+    camera_default = "camera" if "camera" in choices else choices[0]
+    return (
+        ParamDecl(
+            "source_mode",
+            "Source",
+            "choice",
+            default="live",
+            required=True,
+            choices=CALIBRATION_SOURCE_MODES,
+            tooltip="Acquire live frames now or calibrate from saved raw frames.",
+        ),
+        ParamDecl(
+            "folder",
+            "Output folder",
+            "path",
+            default=DEFAULT_CALIBRATION_FOLDER,
+            required=True,
+            path_mode="dir",
+            base_dir=DEFAULT_CALIBRATION_FOLDER,
+            tooltip=(
+                "The one calibration directory: live writes the result and optional "
+                "raw frames here; saved frames reads this directory's frames/ export."
+            ),
+        ),
+        ParamDecl(
+            "save_frames",
+            "Save live frames",
+            "bool",
+            default=True,
+            tooltip="Keep raw live frames so the same acquisition can be recalibrated.",
+        ),
+        ParamDecl(
+            "pulse",
+            "Pulse template",
+            "path",
+            default=DEFAULT_CALIBRATION_PULSE_PATH,
+            required=True,
+            path_mode="file",
+            base_dir="zlc_neutral_atom/assets",
+            file_filter="Pulse program (*.json);;All files (*)",
+            tooltip="Live only: imaging pulse used for each long-short-long bracket.",
+        ),
+        ParamDecl(
+            "threshold_method",
+            "Threshold",
+            "choice",
+            default="otsu",
+            required=True,
+            choices=CALIBRATION_THRESHOLD_METHODS,
+            tooltip="Per-site threshold estimator.",
+        ),
+        ParamDecl(
+            "reference_exposure_s",
+            "Reference exposure",
+            "float",
+            default=0.020,
+            unit="s",
+            lo=0.0,
+            hi=10.0,
+            required=True,
+            optional=False,
+            tooltip="Live only: long exposure for the two outer reference frames.",
+        ),
+        ParamDecl(
+            "readout_exposure_s",
+            "Readout exposure",
+            "float",
+            default=0.005,
+            unit="s",
+            lo=0.0,
+            hi=10.0,
+            required=True,
+            optional=False,
+            tooltip="Live only: short exposure for the middle readout frame.",
+        ),
+        ParamDecl(
+            "threshold_frames",
+            "Reference brackets",
+            "int",
+            default=100,
+            lo=2,
+            hi=20_000,
+            required=True,
+            optional=False,
+            tooltip="Number of long-short-long calibration shots.",
+        ),
+        ParamDecl(
+            "roi_radius",
+            "ROI radius",
+            "int",
+            default=1,
+            unit="px",
+            lo=1.0,
+            hi=64.0,
+            required=True,
+            optional=False,
+            tooltip="Per-site square ROI half-width in pixels.",
+        ),
+        ParamDecl(
+            "camera_role",
+            "Camera",
+            "choice",
+            default=camera_default,
+            required=True,
+            choices=choices,
+            tooltip="Camera used for live calibration acquisition.",
+        ),
+    )
+
+
+def build_calibration_task_intent(
+    values: Mapping[str, object],
+) -> CalibrationTaskIntent:
+    """Freeze all form values without pretending they already form a Run."""
+
+    return CalibrationTaskIntent(
+        source_mode=str(values.get("source_mode", "live")),
+        folder=str(values.get("folder", DEFAULT_CALIBRATION_FOLDER)),
+        save_frames=values.get("save_frames", True),
+        pulse=str(values.get("pulse", DEFAULT_CALIBRATION_PULSE_PATH)),
+        threshold_method=str(values.get("threshold_method", "otsu")),
+        reference_exposure_s=float(values.get("reference_exposure_s", 0.020)),
+        readout_exposure_s=float(values.get("readout_exposure_s", 0.005)),
+        threshold_frames=values.get("threshold_frames", 100),
+        roi_radius=values.get("roi_radius", 1),
+        camera_role=str(values.get("camera_role", "")),
+    )
+
+
+__all__ = [
+    "CALIBRATION_SOURCE_MODES",
+    "CALIBRATION_THRESHOLD_METHODS",
+    "CalibrationTaskHandle",
+    "CalibrationTaskExecution",
+    "CalibrationTaskIntent",
+    "build_calibration_task_intent",
+    "calibration_task_params",
+]
 
 
 class _CancelledBetweenStages(Exception):
@@ -38,29 +291,62 @@ def _summary(error: BaseException) -> str:
     return type(error).__name__ if not text else f"{type(error).__name__}: {text}"
 
 
-class CalibrationTaskHandle:
-    """Run-like owner of exactly two ordinary, sequential Runs.
+@dataclass(frozen=True)
+class CalibrationTaskExecution:
+    """Fully prepared live or saved-source calibration task."""
 
-    Capture commits independently.  Only the second child can produce this
-    handle's successful ``CalibrationArtifactRef``.
+    intent: CalibrationTaskIntent
+    analysis: CalibrationAnalysisRequest
+    sequence: SitemapCalibrationRequest | None = None
+    source_capture_ref: CaptureArtifactRef | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, CalibrationTaskIntent):
+            raise TypeError("intent must be CalibrationTaskIntent")
+        if not isinstance(self.analysis, CalibrationAnalysisRequest):
+            raise TypeError("analysis must be CalibrationAnalysisRequest")
+        if self.intent.source_mode == "live":
+            if not isinstance(self.sequence, SitemapCalibrationRequest):
+                raise TypeError("live calibration requires SitemapCalibrationRequest")
+            if self.sequence.analysis != self.analysis:
+                raise ValueError("live calibration sequence differs from frozen analysis")
+            if self.source_capture_ref is not None:
+                raise ValueError("live calibration cannot preselect a source capture")
+        else:
+            if not isinstance(self.source_capture_ref, CaptureArtifactRef):
+                raise TypeError("saved calibration requires CaptureArtifactRef")
+            if self.sequence is not None:
+                raise ValueError("saved calibration cannot contain a capture request")
+
+
+class CalibrationTaskHandle:
+    """Run-like owner of one analysis Run after an optional live Capture Run.
+
+    Live input commits its Capture independently; saved input is an already
+    admitted exact CaptureArtifactRef.  Both branches enter the same analysis
+    Run and only that Run can produce ``CalibrationArtifactRef``.
     """
 
     def __init__(
         self,
-        request: SitemapCalibrationRequest,
+        request: CalibrationTaskExecution,
         *,
         start_capture: Callable[[object], RunHandle],
         build_calibration_request: Callable[
-            [CaptureArtifactRef, object, float], object
+            [CaptureArtifactRef, object], object
         ],
         start_calibration: Callable[[object], RunHandle],
+        write_outputs: Callable[
+            [CaptureArtifactRef, CalibrationArtifactRef, CalibrationTaskIntent], None
+        ],
     ) -> None:
-        if not isinstance(request, SitemapCalibrationRequest):
-            raise TypeError("request must be SitemapCalibrationRequest")
+        if not isinstance(request, CalibrationTaskExecution):
+            raise TypeError("request must be CalibrationTaskExecution")
         for name, callback in (
             ("start_capture", start_capture),
             ("build_calibration_request", build_calibration_request),
             ("start_calibration", start_calibration),
+            ("write_outputs", write_outputs),
         ):
             if not callable(callback):
                 raise TypeError(f"{name} must be callable")
@@ -69,6 +355,7 @@ class CalibrationTaskHandle:
         self._start_capture = start_capture
         self._build_calibration_request = build_calibration_request
         self._start_calibration = start_calibration
+        self._write_outputs = write_outputs
         self._condition = threading.Condition(threading.RLock())
         self._phase = "capture-starting"
         self._active: RunHandle | None = None
@@ -146,12 +433,17 @@ class CalibrationTaskHandle:
 
     def _coordinate(self) -> None:
         try:
-            source = self._run_child(
-                "capture",
-                self._start_capture(self._request.capture_request),
-            )
-            if not isinstance(source, CaptureArtifactRef):
-                raise TypeError("capture Run returned a non-CaptureArtifactRef")
+            sequence = self._request.sequence
+            if sequence is None:
+                source = self._request.source_capture_ref
+                assert isinstance(source, CaptureArtifactRef)
+            else:
+                source = self._run_child(
+                    "capture",
+                    self._start_capture(sequence.capture_request),
+                )
+                if not isinstance(source, CaptureArtifactRef):
+                    raise TypeError("capture Run returned a non-CaptureArtifactRef")
             with self._condition:
                 self._source = source
                 self._phase = "calibration-preparing"
@@ -159,7 +451,6 @@ class CalibrationTaskHandle:
             request = self._build_calibration_request(
                 source,
                 self._request.analysis,
-                self._request.calibration_timeout_seconds,
             )
             self._checkpoint()
             handle = self._start_calibration(request)
@@ -169,6 +460,9 @@ class CalibrationTaskHandle:
                     "calibration Run returned a non-CalibrationArtifactRef"
                 )
             self._result = result
+            with self._condition:
+                self._phase = "writing-task-outputs"
+            self._write_outputs(source, result, self._request.intent)
             self._finish(
                 RunState.SUCCEEDED,
                 "calibration-committed",
@@ -204,6 +498,8 @@ class CalibrationTaskHandle:
             failure = _summary(error)
             if source is not None:
                 failure += f"; source capture remains {source!r}"
+            if self._result is not None:
+                failure += f"; calibration remains {self._result!r}"
             self._finish(
                 RunState.CANCELLED if cancelled else RunState.FAILED,
                 "cancelled" if cancelled else "failed",

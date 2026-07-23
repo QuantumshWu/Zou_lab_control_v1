@@ -542,10 +542,14 @@ class ImagePanelPayload:
                 raise ValueError(
                     f"image payload {name} axis does not cover the projected raster"
                 )
-            if len(evaluated.coordinates) != axis.size or any(
-                actual != axis.coordinate_at(index)
-                for index, actual in enumerate(evaluated.coordinates)
-            ):
+            expected_coordinates = (
+                axis.coordinates
+                if axis.coordinates is not None
+                else tuple(
+                    axis.index_origin + index for index in range(axis.size)
+                )
+            )
+            if evaluated.coordinates != expected_coordinates:
                 raise ValueError(f"image payload {name} coordinates changed")
 
         data_range = self.data_range
@@ -706,7 +710,7 @@ class PulsePanelPayload:
     along TIME while the row axis stays pinned, so the payload reuses the curve
     family's viewport transform for its widget<->data mapping and adds only the
     drawn row identities (digital channels then analog bus keys, top to bottom)
-    with their display labels for hover text.
+    with their display labels for the authored row chrome.
     """
 
     document_input: DocumentInputIdentity
