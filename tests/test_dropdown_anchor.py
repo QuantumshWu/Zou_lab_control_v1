@@ -51,8 +51,8 @@ def editor(application):
     application.processEvents()
 
 
-def _anchor_report(combo: QtWidgets.QComboBox, application) -> tuple[int, int, int]:
-    """Return ``(dx, dy, width)`` from the field's bottom-left."""
+def _anchor_report(combo: QtWidgets.QComboBox, application) -> tuple[int, int, int, int]:
+    """Return ``(dx, dy, width, height)`` from the field's bottom-left."""
 
     box_bottom_left = combo.mapToGlobal(QtCore.QPoint(0, combo.height()))
     combo.showPopup()
@@ -67,6 +67,7 @@ def _anchor_report(combo: QtWidgets.QComboBox, application) -> tuple[int, int, i
             geometry.left() - box_bottom_left.x(),
             geometry.top() - box_bottom_left.y(),
             geometry.width(),
+            geometry.height(),
         )
     finally:
         combo.hidePopup()
@@ -83,6 +84,44 @@ def _expected_dx(combo, popup_width: int) -> int:
     return left - anchor.x()
 
 
+def test_long_flat_dropdown_stays_below_and_keeps_native_scroll(application):
+    from zlc_frontend.qt_widgets import FluentComboBox, launch_fluent_window, popup_gap
+
+    body = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(body)
+    combo = FluentComboBox(body)
+    combo.addItems([f"signal {index}" for index in range(40)])
+    layout.addWidget(combo)
+    window = launch_fluent_window(body, title="Combo height")
+    try:
+        for _ in range(4):
+            application.processEvents()
+        screen = combo.screen()
+        available = screen.availableGeometry()
+        target_bottom = available.bottom() - 140
+        current_bottom = combo.mapToGlobal(QtCore.QPoint(0, combo.height())).y()
+        window.move(window.x(), window.y() + target_bottom - current_bottom)
+        for _ in range(4):
+            application.processEvents()
+
+        combo.showPopup()
+        for _ in range(4):
+            application.processEvents()
+        view = combo.view()
+        popup = view.window()
+        box_bottom = combo.mapToGlobal(QtCore.QPoint(0, combo.height())).y()
+        assert popup.geometry().top() == box_bottom + popup_gap()
+        assert popup.geometry().bottom() <= available.bottom()
+        scroll = view.verticalScrollBar()
+        assert scroll.maximum() > 0
+        scroll.setValue(scroll.maximum())
+        assert scroll.value() == scroll.maximum()
+    finally:
+        combo.hidePopup()
+        window.close()
+        application.processEvents()
+
+
 def test_every_dropdown_in_the_pulse_editor_opens_under_its_box(editor, application):
     window = editor.window()
     combos = [combo for combo in window.findChildren(QtWidgets.QComboBox) if combo.count()]
@@ -90,7 +129,7 @@ def test_every_dropdown_in_the_pulse_editor_opens_under_its_box(editor, applicat
 
     misplaced = []
     for index, combo in enumerate(combos):
-        dx, dy, width = _anchor_report(combo, application)
+        dx, dy, width, _height = _anchor_report(combo, application)
         if dx != _expected_dx(combo, width) or not 0 <= dy <= MAX_GAP_PX:
             misplaced.append(f"{combo.objectName() or f'combo#{index}'}: dx={dx:+d} dy={dy:+d}")
     assert not misplaced, (
@@ -119,11 +158,15 @@ def test_a_dropdown_near_the_screen_bottom_still_opens_downward(editor, applicat
 
     box_bottom = combo.mapToGlobal(QtCore.QPoint(0, combo.height())).y()
     room_below = available.bottom() - box_bottom
-    dx, dy, width = _anchor_report(combo, application)
+    dx, dy, width, height = _anchor_report(combo, application)
+    popup_bottom = box_bottom + dy + height - 1
 
     assert dx == _expected_dx(combo, width) and dy >= 0, (
         f"with only {room_below}px below the box the dropdown moved (dx={dx:+d}, dy={dy:+d}); "
         "it must stay anchored and scroll instead")
+    assert popup_bottom <= available.bottom(), (
+        f"dropdown bottom {popup_bottom} exceeded available bottom {available.bottom()}; "
+        "it must surrender height and keep overflow in its native view")
 
 
 def test_long_tree_signal_popup_grows_left_from_the_field(application):
@@ -153,7 +196,7 @@ def test_long_tree_signal_popup_grows_left_from_the_field(application):
     try:
         for _ in range(4):
             application.processEvents()
-        dx, dy, popup_width = _anchor_report(combo, application)
+        dx, dy, popup_width, _height = _anchor_report(combo, application)
         assert popup_width > combo.width()
         assert dx == _expected_dx(combo, popup_width) < 0
         assert 0 <= dy <= MAX_GAP_PX

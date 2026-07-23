@@ -32,21 +32,24 @@ from zlc_pulse import (
     resolve_api_segment_document,
 )
 from zlc_storage import canonical_digest, canonical_text, exact_mapping
-from zlc_neutral_atom.catalog import DefinitionKey, TaskDefinition
+from zlc_neutral_atom.acquisition import CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
+from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
 
 
 SCAN_OUTPUT_CONTRACT_SCHEMA = "zlc_neutral_atom.ScanOutputContract"
 PULSE_SCAN_PROGRAM_SCHEMA = "zlc_neutral_atom.PulseScanProgram"
-PULSE_SCAN_TASK_KEY = DefinitionKey(
+PULSE_SCAN_MEASUREMENT_KEY = DefinitionKey(
     "zlc_neutral_atom.scan",
     "pulse-scan",
 )
-PULSE_SCAN_DEFINITION = TaskDefinition(
-    PULSE_SCAN_TASK_KEY,
+PULSE_SCAN_MEASUREMENT_DEFINITION = MeasurementDefinition(
+    PULSE_SCAN_MEASUREMENT_KEY,
     "Pulse scan",
     PULSE_SCAN_PROGRAM_SCHEMA,
+    "zlc.pulse-scan-binding",
+    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
 )
-SCAN_TASK_DEFINITIONS = (PULSE_SCAN_DEFINITION,)
+SCAN_MEASUREMENT_DEFINITIONS = (PULSE_SCAN_MEASUREMENT_DEFINITION,)
 
 _AUTONOMOUS_SCAN_SLOT_KIND = "AUTONOMOUS_SCAN_SLOT"
 _API_SLOT_SEGMENTED_KIND = "API_SLOT_SEGMENTED_EXISTING"
@@ -656,11 +659,11 @@ __all__ = [
     "ApiSegmentTable",
     "ApiSlotSegmentedProgram",
     "AutonomousScanSlotProgram",
-    "PULSE_SCAN_DEFINITION",
+    "PULSE_SCAN_MEASUREMENT_DEFINITION",
     "PULSE_SCAN_PROGRAM_SCHEMA",
-    "PULSE_SCAN_TASK_KEY",
+    "PULSE_SCAN_MEASUREMENT_KEY",
     "PulseScanProgram",
-    "SCAN_TASK_DEFINITIONS",
+    "SCAN_MEASUREMENT_DEFINITIONS",
     "ScanOutputContract",
     "ScanPointTable",
     "bind_scan_output_contract",

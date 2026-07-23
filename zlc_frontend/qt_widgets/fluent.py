@@ -1880,6 +1880,16 @@ def fluent_confirm(
 _COMBO_MAX_VISIBLE_ITEMS = 12
 
 
+def _available_height_below_anchor(anchor: QtWidgets.QWidget, gap: int) -> int | None:
+    """Return the popup height that fits below ``anchor`` on its current screen."""
+
+    screen = anchor.screen() if hasattr(anchor, "screen") else QtWidgets.QApplication.primaryScreen()
+    if screen is None:
+        return None
+    top = anchor.mapToGlobal(QtCore.QPoint(0, anchor.height())).y() + int(gap)
+    return max(0, screen.availableGeometry().bottom() - top + 1)
+
+
 class FluentComboBox(QtWidgets.QComboBox):
     """A non-editable Fluent combo that paints its own current text.
 
@@ -2030,10 +2040,17 @@ class FluentComboBox(QtWidgets.QComboBox):
         width = self._desired_popup_width()
         if view is not None:
             view.setFixedWidth(width)
+            view.setMinimumHeight(0)
+            view.setMaximumHeight(QtWidgets.QWIDGETSIZE_MAX)
+        container = view.window() if view is not None else None
+        if container is not None and container is not self:
+            container.setMinimumHeight(0)
+            container.setMaximumHeight(QtWidgets.QWIDGETSIZE_MAX)
         super().showPopup()
         container = view.window() if view is not None else None
         if container is not None and container is not self:
             container.setFixedWidth(width)
+        self._resize_popup_to_contents()
         self._place_popup_below()
 
     def _popup_text_width(self) -> int:
@@ -2071,6 +2088,37 @@ class FluentComboBox(QtWidgets.QComboBox):
         if container is None or container is self:
             return
         container.move(self._popup_origin(container.width()))
+
+    def _popup_pad(self) -> int:
+        return 2 * self._gap
+
+    def _visible_popup_row_count(self) -> int:
+        return min(self.count(), self.maxVisibleItems())
+
+    def _desired_popup_height(self) -> int:
+        """Fit the visible rows below the field; overflow remains in the native view."""
+
+        view = self.view()
+        rows = self._visible_popup_row_count()
+        if view is None or rows <= 0:
+            return 0
+        row_h = view.sizeHintForRow(0)
+        if row_h <= 0:
+            row_h = view.fontMetrics().height() + scaled_px(8)
+        desired = rows * row_h + 2 * view.frameWidth() + self._popup_pad()
+        available = _available_height_below_anchor(self, self._gap)
+        return int(desired if available is None else min(desired, available))
+
+    def _resize_popup_to_contents(self, *_) -> None:
+        """Apply one content/available-space height contract to list and tree popups."""
+
+        view = self.view()
+        container = view.window() if view is not None else None
+        if view is None or container is None or container is self:
+            return
+        desired = self._desired_popup_height()
+        view.setFixedHeight(max(0, desired - self._popup_pad()))
+        container.setFixedHeight(desired)
 
     def _display_text(self) -> str:
         """The text painted in the COLLAPSED combo (the seam a tree combo overrides to show a
@@ -2147,13 +2195,6 @@ class FluentTreeComboBox(FluentComboBox):
         tree.expanded.connect(self._resize_popup_to_contents)
         tree.collapsed.connect(self._resize_popup_to_contents)
 
-    def showPopup(self):  # noqa: N802 - Qt naming
-        super().showPopup()
-        self._resize_popup_to_contents()         # fit the initial (collapsed) height on open
-
-    def _popup_pad(self) -> int:
-        return 2 * self._gap                                     # the translucent card's top/bottom gap
-
     def _popup_text_width(self) -> int:
         view = self.view()
         if not isinstance(view, QtWidgets.QTreeView):
@@ -2178,12 +2219,9 @@ class FluentTreeComboBox(FluentComboBox):
         visit(QtCore.QModelIndex(), 0)
         return int(widest)
 
-    def _desired_popup_height(self) -> int:
-        """Pixel height the popup should be to show every CURRENTLY-VISIBLE row (expanded subtrees
-        included), clamped to the screen.  Pure computation (no widget mutation) so it is unit-
-        testable: counts visible rows structurally x ``sizeHintForRow`` (the delegate's height,
-        valid the instant the expand signal fires -- ``rowHeight`` under-reports freshly-shown
-        children before they lay out)."""
+    def _visible_popup_row_count(self) -> int:
+        """Count the rows revealed by the current tree expansion state."""
+
         view = self.view()
         if not isinstance(view, QtWidgets.QTreeView):
             return 0
@@ -2199,59 +2237,7 @@ class FluentTreeComboBox(FluentComboBox):
                     _visit(idx)
 
         _visit(QtCore.QModelIndex())
-        if rows <= 0:
-            return 0
-        row_h = view.sizeHintForRow(0)                          # uniform-row height from the delegate
-        if row_h <= 0:
-            row_h = view.fontMetrics().height() + scaled_px(8)
-        desired = rows * row_h + 2 * view.frameWidth() + self._popup_pad()
-        # Clamp to the space ACTUALLY available at the anchor (the larger of below-the-box / above-the-box,
-        # whichever side the popup opens), NOT the whole screen -- otherwise a popup anchored low overruns
-        # the screen bottom.  When the content exceeds that space the popup stays at the boundary and the
-        # tree SCROLLS (the shared fluent scrollbar), exactly like the Setting popup (#issue-4).
-        avail = self._anchor_available_height()
-        if avail > 0:
-            desired = min(desired, avail)
-        return int(desired)
-
-    def _anchor_available_height(self) -> int:
-        """Pixels available for the popup BELOW the combo box, down to the screen bottom.
-
-        The popup ALWAYS opens downward (``_place_popup_below`` forces it; the dropdown never flips above
-        the box).  So the grow-vs-scroll cap is always the space from the box's bottom edge (+ the outer
-        gap) to the screen bottom: the popup grows to fit its visible rows up to THIS height, then SCROLLS
-        the overflow (the shared fluent scrollbar) -- it never overruns the screen and never flips up."""
-        screen = self.screen() if hasattr(self, "screen") else QtWidgets.QApplication.primaryScreen()
-        if screen is None:
-            return 0
-        avail = screen.availableGeometry()
-        bottom_g = self.mapToGlobal(QtCore.QPoint(0, self.height())).y()   # the box's bottom edge, global
-        return int(max(0, avail.bottom() - (bottom_g + self._gap)))
-
-    def _resize_popup_to_contents(self, *_) -> None:
-        """Re-grow/shrink the OPEN popup so a freshly-expanded parent's children are fully visible
-        instead of scrolled.  Forces BOTH the view and its container height (``setFixedHeight``) so
-        the container's own layout can't keep the view short."""
-        view = self.view()
-        if not isinstance(view, QtWidgets.QTreeView):
-            return
-        container = view.window()
-        # NOT gated on ``view.isVisible()``: during the FIRST showPopup (and its first parent-expand)
-        # the popup's visibility has not propagated yet -- ``view.isVisible()`` is transiently False
-        # even though super().showPopup() already POSITIONED the container and ``_desired_popup_height``
-        # computes the right (full) height.  Gating on it dropped the very first open's/expand's grow,
-        # so the picker opened CLIPPED until the SECOND open.  The container guard (a real top-level
-        # popup window the combo owns, never ``self``) is the correct gate -- it holds whether or not
-        # the transient visible flag has caught up.  ``_resize_popup_to_contents`` is only ever reached
-        # during the open lifecycle (showPopup + the tree expand/collapse signals), so resizing a
-        # not-yet-flagged-visible-but-positioned container is safe.
-        if container is None or container is self:
-            return
-        desired = self._desired_popup_height()
-        if desired <= 0:
-            return
-        view.setFixedHeight(max(0, desired - self._popup_pad()))   # force the view tall enough...
-        container.setFixedHeight(max(scaled_px(40), desired))      # ...and the container to match
+        return rows
 
     def _display_text(self) -> str:
         """The collapsed text = the producer-qualified label of the CURRENT pick, derived LIVE from the

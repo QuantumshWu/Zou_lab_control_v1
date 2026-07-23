@@ -19,6 +19,8 @@ windows take), so the console package stays free of domain authority.
 
 from __future__ import annotations
 
+from concurrent.futures import Future
+import threading
 from typing import Callable
 
 from zlc_data.console_records import console_signal_key
@@ -28,6 +30,11 @@ __all__ = ["ConsoleRunNode"]
 
 
 _UNRESOLVED_FINAL = object()
+_BUILD_REQUEST = object()
+
+
+class _StartSuppressed(Exception):
+    """The user stopped this node before its starter received hardware authority."""
 
 
 class ConsoleRunNode:
@@ -39,8 +46,15 @@ class ConsoleRunNode:
     owns what that factory builds, this seam only sequences the call.
     """
 
-    def __init__(self, spec, values, *, prepare: Callable[[object], object],
-                 request_owner_wake: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        spec,
+        values,
+        *,
+        prepare: Callable[[object], object],
+        request_owner_wake: Callable[[], None],
+        frozen_request: object = _BUILD_REQUEST,
+    ) -> None:
         if not callable(prepare):
             raise TypeError("prepare must be callable")
         self._spec = spec
@@ -55,8 +69,16 @@ class ConsoleRunNode:
             thread_name_prefix=f"console-{spec.key.stable_definition_id}",
             max_workers=1,
         )
-        self._request = spec.build_request(self._values)
+        self._request = (
+            spec.build_request(self._values)
+            if frozen_request is _BUILD_REQUEST
+            else frozen_request
+        )
         self._handle = None
+        self._start_future: Future | None = None
+        self._start_pending = False
+        self._cancelled_before_start = False
+        self._stop_event = threading.Event()
         self._snapshot = None
         # A FINAL value belongs to exactly one started generation.  It is
         # deliberately not inferred from the terminal snapshot: only
@@ -186,6 +208,18 @@ class ConsoleRunNode:
             return False
         return snapshot is None or not snapshot.state.terminal
 
+    @property
+    def worker_idle(self) -> bool:
+        """Whether this node has no pending prepare/start/projection callback."""
+
+        return self._owner.worker_idle
+
+    @property
+    def cancelled_before_start(self) -> bool:
+        """Whether Stop won before a domain RunHandle was created."""
+
+        return self._cancelled_before_start
+
     # ------------------------------------------------------------ lifecycle
     def bind_starter(self, start: Callable[[object], object]) -> None:
         """Fix how THIS node starts, so a caller with no such knowledge can start it.
@@ -236,10 +270,12 @@ class ConsoleRunNode:
             raise TypeError(
                 "this node has no starter: bind one (bind_starter) or pass it here"
             )
-        if self.running:
+        if self.running or self._start_pending:
             return
         self._error = None
         self._stop_requested = False
+        self._cancelled_before_start = False
+        self._stop_event.clear()
         self._stop_reason = "Console user requested stop"
         generation = self._owner.begin_generation()
         self._handle = None
@@ -250,14 +286,27 @@ class ConsoleRunNode:
         self._final_projection_error = None
         request = self._request
         prepare = self._prepare
-        self._owner.submit("start", lambda: start(prepare(request)),
-                           generation=generation)
+
+        def start_owned():
+            prepared = prepare(request)
+            if self._stop_event.is_set():
+                raise _StartSuppressed()
+            return start(prepared)
+
+        future = self._owner.submit(
+            "start",
+            start_owned,
+            generation=generation,
+        )
+        self._start_future = future
+        self._start_pending = True
 
     def cancel(self, reason: str = "Console user requested stop") -> None:
         """Ask the Run to stop.  Never waits for the worker to reap it."""
 
         handle = self._handle
         self._stop_requested = True
+        self._stop_event.set()
         self._stop_reason = str(reason)
         if handle is None or handle.snapshot().state.terminal:
             return
@@ -294,6 +343,14 @@ class ConsoleRunNode:
                 continue
             error = completion.future.exception()
             if error is not None:
+                self._start_pending = False
+                if isinstance(error, _StartSuppressed):
+                    self._cancelled_before_start = True
+                    self._handle = None
+                    self._snapshot = None
+                    self._final_result = _UNRESOLVED_FINAL
+                    self._owner.mark_owner_reaped()
+                    continue
                 self._error = f"{type(error).__name__}: {error}"
                 self._handle = None
                 self._snapshot = None
@@ -301,6 +358,7 @@ class ConsoleRunNode:
                 self._owner.mark_owner_reaped()
                 continue
             if completion.kind == "start":
+                self._start_pending = False
                 self._handle = completion.future.result()
                 self._owner.set_handle(self._handle)
                 if self._stop_requested:
@@ -338,6 +396,25 @@ class ConsoleRunNode:
                     self._final_result = _UNRESOLVED_FINAL
                     self._owner.mark_owner_reaped()
         return self._snapshot
+
+    def wait_until_terminal(self, *, reason: str) -> None:
+        """Join this node's already-submitted Run without draining Qt completions.
+
+        ``Future`` and ``RunHandle`` are the two thread-safe ownership edges.
+        GUI-owned snapshots and final projection remain exclusively in
+        :meth:`poll`.  The bound Port/Run owns its finite I/O deadlines; this
+        join does not invent a second user-tunable timeout.
+        """
+
+        future = self._start_future
+        if future is None:
+            return
+        try:
+            handle = future.result()
+        except _StartSuppressed:
+            return
+        handle.cancel(str(reason))
+        handle.wait()
 
     def shutdown(self) -> None:
         self.cancel("Console is closing")

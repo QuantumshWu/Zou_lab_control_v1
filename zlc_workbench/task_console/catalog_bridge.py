@@ -48,7 +48,10 @@ from zlc_neutral_atom.readout.sitemap import (
     SITEMAP_CALIBRATION_TASK_DEFINITIONS,
     SITEMAP_CALIBRATION_TASK_KEY,
 )
-from zlc_neutral_atom.scan import PULSE_SCAN_TASK_KEY, SCAN_TASK_DEFINITIONS
+from zlc_neutral_atom.scan import (
+    PULSE_SCAN_MEASUREMENT_KEY,
+    SCAN_MEASUREMENT_DEFINITIONS,
+)
 from zlc_storage import canonical_text
 
 from .calibration_task import (
@@ -57,6 +60,7 @@ from .calibration_task import (
 )
 from .mot_field_task import build_mot_field_intent, mot_field_params
 from .occupancy_binding import OccupancyBindingIntent
+from .pulse_scan_binding import PulseScanBindingIntent
 from .coupled_measurement_presenter import (
     build_grey_molasses_detuning_intent,
     build_readout_duration_fidelity_intent,
@@ -123,7 +127,7 @@ def _compose_catalog() -> DefinitionCatalog:
     """Compose the exact capabilities this TaskConsole currently implements."""
 
     return DefinitionCatalog.compose(
-        SCAN_TASK_DEFINITIONS,
+        SCAN_MEASUREMENT_DEFINITIONS,
         SITEMAP_CALIBRATION_TASK_DEFINITIONS,
         MOT_FIELD_TASK_DEFINITIONS,
         CAMERA_MEASUREMENT_DEFINITIONS,
@@ -304,9 +308,7 @@ def _camera_params(
     )
 
 
-def _pulse_scan_params(camera_roles: tuple[str, ...],
-                       sequencer_roles: tuple[str, ...]) -> tuple[ParamDecl, ...]:
-    binding = _scan_binding_form(camera_roles, sequencer_roles)
+def _pulse_scan_params() -> tuple[ParamDecl, ...]:
     return (
         ParamDecl(
             "pulse",
@@ -331,7 +333,19 @@ def _pulse_scan_params(camera_roles: tuple[str, ...],
                 "scan_table program"
             ),
         ),
-        *_params_from_form(binding),
+        ParamDecl(
+            "y_signal",
+            "Exact signal (y)",
+            "signal",
+            required=True,
+            tooltip=(
+                "Current scan-clocked sources are Camera frame, Occupancy "
+                "counts/occupied, or Figure Area data derived from one of "
+                "them. Static/display-only signals are rejected at Start. "
+                "The scan binds a dedicated exact source pipeline and never "
+                "samples a displayed/latest raster."
+            ),
+        ),
     )
 
 
@@ -561,11 +575,15 @@ class ConsoleCatalogView:
                 build_request=build_mot_field_intent,
                 default_panel=("mot_field", "grid"),
             )
-        if item.key == PULSE_SCAN_TASK_KEY:
+        if item.key == PULSE_SCAN_MEASUREMENT_KEY:
 
             def build_scan(values: Mapping[str, object]):
                 from zlc_data.vocabulary import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
-                from zlc_neutral_atom.scan import ApiSegmentTable
+                from zlc_neutral_atom.scan import (
+                    ApiSegmentTable,
+                    ApiSlotSegmentedProgram,
+                    AutonomousScanSlotProgram,
+                )
                 from zlc_pulse import load_pulse_document
                 from zlc_workbench.pulse_editor.scan_workspace import (
                     commit_scan_candidate,
@@ -580,12 +598,12 @@ class ConsoleCatalogView:
                 slots = dict(values.get("pulse_slots") or {})
                 sweep_kind = str(slots.get("sweep_kind") or "")
                 source = str(slots.get("program") or "")
-                binding = _form_values(
-                    values,
-                    "camera_role",
-                    "sequencer_role",
-                    "trigger_channel",
-                )
+                y_signal = values.get("y_signal")
+                if not isinstance(y_signal, str) or not y_signal.strip():
+                    raise ValueError(
+                        "Pulse scan requires an exact Camera frame, Occupancy "
+                        "counts/occupied, or Figure Area signal"
+                    )
                 if sweep_kind == SWEEP_SCAN_SLOT:
                     candidate = execute_scan_program(document, source)
                     committed = commit_scan_candidate(
@@ -593,11 +611,34 @@ class ConsoleCatalogView:
                         candidate.candidate,
                         "generated",
                     )
-                    return experiment.readout.scan_request(
-                        committed,
-                        api_values=dict(slots.get("api") or {}),
-                        **binding,
+                    api_values = dict(slots.get("api") or {})
+                    api_order = tuple(
+                        parameter.parameter_id
+                        for parameter in committed.api_parameters
                     )
+                    missing = tuple(
+                        parameter_id
+                        for parameter_id in api_order
+                        if parameter_id not in api_values
+                    )
+                    extra = tuple(
+                        parameter_id
+                        for parameter_id in api_values
+                        if parameter_id not in set(api_order)
+                    )
+                    if missing or extra:
+                        raise ValueError(
+                            "SCAN_SLOT requires one fixed value for every API "
+                            f"parameter; missing={missing}, extra={extra}"
+                        )
+                    program = AutonomousScanSlotProgram(
+                        committed,
+                        tuple(
+                            (parameter_id, api_values[parameter_id])
+                            for parameter_id in api_order
+                        ),
+                    )
+                    return PulseScanBindingIntent(program, y_signal.strip())
                 if sweep_kind == SWEEP_API_SLOT:
                     columns = tuple(
                         parameter.parameter_id
@@ -607,20 +648,20 @@ class ConsoleCatalogView:
                         source,
                         width=len(columns),
                     )
-                    return experiment.readout.api_scan_request(
+                    program = ApiSlotSegmentedProgram(
                         document,
-                        api_table=ApiSegmentTable(columns, rows),
-                        segmentation_rationale=(
+                        ApiSegmentTable(columns, rows),
+                        (
                             "Explicit API-slot sweep authored in TaskConsole"
                         ),
-                        **binding,
                     )
+                    return PulseScanBindingIntent(program, y_signal.strip())
                 raise ValueError("choose a SCAN_SLOT or API_SLOT sweep")
 
             return ConsoleNodeSpec(
                 key=item.key, kind=kind, title=_short_title(item.key),
                 description=item.title,
-                params=_pulse_scan_params(self.camera_roles(), self.sequencer_roles()),
+                params=_pulse_scan_params(),
                 declared_outputs=(
                     ConsoleSignalDecl(
                         "scan",
@@ -631,6 +672,7 @@ class ConsoleCatalogView:
                     ),
                 ),
                 build_request=build_scan,
+                default_panel=("scan", "1d"),
             )
         if item.key == OCCUPANCY_STREAM_PROCESSOR_KEY:
 
@@ -696,7 +738,7 @@ class ConsoleCatalogView:
         if item.key == MOT_FIELD_TASK_KEY:
             return "mot_camera" in cameras and bool(sequencers)
         if item.key in (
-            PULSE_SCAN_TASK_KEY,
+            PULSE_SCAN_MEASUREMENT_KEY,
             TEMPERATURE_RELEASE_RECAPTURE_KEY,
             READOUT_DURATION_FIDELITY_KEY,
         ):

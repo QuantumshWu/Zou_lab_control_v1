@@ -66,7 +66,11 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         TEMPERATURE_RELEASE_RECAPTURE_KEY,
     )
     from zlc_neutral_atom.readout.sitemap import SITEMAP_CALIBRATION_TASK_KEY
-    from zlc_neutral_atom.scan import PULSE_SCAN_TASK_KEY
+    from zlc_neutral_atom.scan import PULSE_SCAN_MEASUREMENT_KEY
+    from zlc_neutral_atom.scan import (
+        ApiSlotSegmentedProgram,
+        AutonomousScanSlotProgram,
+    )
 
     from .calibration_task import (
         CalibrationTaskExecution,
@@ -80,6 +84,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         OccupancyBindingIntent,
         ReactiveOccupancyNode,
     )
+    from .pulse_scan_binding import PulseScanBindingIntent
     from .coupled_measurement_presenter import (
         GreyMolassesDetuningIntent,
         ReadoutDurationFidelityIntent,
@@ -138,6 +143,115 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 "current FINAL CalibrationArtifactRef"
             )
         return calibration.final_result
+
+    def retire_for_exact_scan(node) -> None:
+        """Join one already-cancelled hardware producer without polling its GUI."""
+
+        if node is None:
+            return
+        wait = getattr(node, "wait_until_terminal", None)
+        if callable(wait):
+            wait(
+                reason="Pulse scan is taking exact source ownership",
+            )
+
+    def freeze_pulse_scan_request(intent: PulseScanBindingIntent):
+        """Resolve Signal(y) into a dedicated current exact source pipeline."""
+
+        if not console:
+            raise RuntimeError(
+                "TaskConsole composition is not ready for Pulse scan binding"
+            )
+        source = console[0].resolve_pulse_scan_source(intent.y_signal)
+        producer = source.producer
+        transform = source.transform_spec
+        program = intent.program
+
+        def direct_request(*, camera_role: str):
+            common = {
+                "camera_role": camera_role,
+                "output_transform_spec": transform,
+            }
+            if isinstance(program, AutonomousScanSlotProgram):
+                return experiment.readout.scan_request(
+                    program.document,
+                    api_values=dict(program.api_values),
+                    **common,
+                )
+            if isinstance(program, ApiSlotSegmentedProgram):
+                return experiment.readout.api_scan_request(
+                    program.document,
+                    api_table=program.table,
+                    segmentation_rationale=program.segmentation_rationale,
+                    **common,
+                )
+            raise TypeError("Pulse scan intent contains an unknown program")
+
+        if (
+            producer.definition_key == CAMERA_MEASUREMENT_KEY
+            and producer.output_name == "frame"
+            and isinstance(producer.request, CameraMeasurementRequest)
+        ):
+            if producer.request.frames_per_cycle != 1:
+                raise ValueError(
+                    "Pulse scan Camera y requires exactly one frame per scan cell"
+                )
+            return direct_request(
+                camera_role=producer.request.camera_ref.role
+            ), (producer.run_node,)
+
+        if (
+            producer.definition_key == OCCUPANCY_STREAM_PROCESSOR_KEY
+            and producer.output_name in ("counts", "occupied")
+            and isinstance(producer.request, OccupancyBindingIntent)
+        ):
+            camera = console[0].resolve_console_producer(
+                producer.request.camera_frame_signal
+            )
+            if (
+                camera.definition_key != CAMERA_MEASUREMENT_KEY
+                or camera.output_name != "frame"
+                or not isinstance(camera.request, CameraMeasurementRequest)
+            ):
+                raise ValueError(
+                    "selected Occupancy y no longer resolves to one Camera frame"
+                )
+            if camera.request.frames_per_cycle != 1:
+                raise ValueError(
+                    "Pulse scan Occupancy y requires one Camera frame per cell"
+                )
+            calibration_ref = resolve_calibration_reference(
+                producer.request.calibration_signal,
+                measurement_name="Pulse scan Occupancy y",
+            )
+            common = {
+                "camera_role": camera.request.camera_ref.role,
+                "calibration_ref": calibration_ref,
+                "output_name": producer.output_name,
+                "output_transform_spec": transform,
+            }
+            if isinstance(program, AutonomousScanSlotProgram):
+                request = experiment.readout.occupancy_scan_request(
+                    program.document,
+                    api_values=dict(program.api_values),
+                    **common,
+                )
+            elif isinstance(program, ApiSlotSegmentedProgram):
+                request = experiment.readout.api_occupancy_scan_request(
+                    program.document,
+                    api_table=program.table,
+                    segmentation_rationale=program.segmentation_rationale,
+                    **common,
+                )
+            else:
+                raise TypeError("Pulse scan intent contains an unknown program")
+            return request, (producer.run_node, camera.run_node)
+
+        raise ValueError(
+            "selected Pulse scan y has no exact source builder; current exact "
+            "sources are Camera frame, Occupancy counts/occupied, and their "
+            "Figure Area data"
+        )
 
     def run_factory(spec, values):
         if spec.key == CAMERA_MEASUREMENT_KEY:
@@ -487,12 +601,32 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 )
             )
             return node
-        if spec.key == PULSE_SCAN_TASK_KEY:
+        if spec.key == PULSE_SCAN_MEASUREMENT_KEY:
+            intent = spec.build_request(values)
+            if not isinstance(intent, PulseScanBindingIntent):
+                raise TypeError("Pulse scan form did not produce its typed intent")
+            request, serving_nodes = freeze_pulse_scan_request(intent)
+            serving_nodes = tuple(
+                {id(node): node for node in serving_nodes if node is not None}.values()
+            )
+            for serving in serving_nodes:
+                serving.cancel("Pulse scan is taking exact source ownership")
+
+            def prepare_scan(current):
+                if current != intent:
+                    raise RuntimeError(
+                        "Pulse scan binding changed after request freeze"
+                    )
+                for serving in serving_nodes:
+                    retire_for_exact_scan(serving)
+                return request
+
             node = ConsoleRunNode(
                 spec,
                 values,
-                prepare=lambda request: request,
+                prepare=prepare_scan,
                 request_owner_wake=request_owner_wake,
+                frozen_request=intent,
             )
             node.bind_starter(experiment.start_scan)
             node.bind_final_projector(

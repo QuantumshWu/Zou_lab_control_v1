@@ -290,9 +290,10 @@ def _compile_scan_artifact_plan(
             finalized = base_finalize(context, base_result)
             adapted = adapt(finalized)
             # Release the opaque joint result before transforming.  In the
-            # occupancy path this drops the occupied sibling and event metadata;
-            # only the authoritative counts source remains.  Calibration arrays
-            # still retained by the frozen plan remain owned by that plan.
+            # occupancy path this drops the unselected sibling and event
+            # metadata; only the selected authoritative output remains.
+            # Calibration arrays retained by the frozen plan remain owned by
+            # that plan.
             base_result = None
             finalized = None
             run_id, source, provenance, execution = adapted
@@ -399,6 +400,7 @@ def compile_occupancy_scan_artifact_plan(
     *,
     program: AutonomousScanSlotProgram,
     output_contract: ScanOutputContract,
+    source_output_name: str = "counts",
     preview: ExactDatasetPreviewPort | None = None,
 ) -> RunPlan:
     """Compile one occupancy scan and terminalize any rejected preview port."""
@@ -409,6 +411,7 @@ def compile_occupancy_scan_artifact_plan(
             repository,
             program=program,
             output_contract=output_contract,
+            source_output_name=source_output_name,
             preview=preview,
         )
     except BaseException as error:
@@ -422,9 +425,10 @@ def _compile_occupancy_scan_artifact_plan(
     *,
     program: AutonomousScanSlotProgram,
     output_contract: ScanOutputContract,
+    source_output_name: str,
     preview: ExactDatasetPreviewPort | None = None,
 ) -> RunPlan:
-    """Compile camera→occupancy counts y into one canonical FINAL scan Run."""
+    """Compile one selected occupancy output into a canonical FINAL scan Run."""
 
     if not isinstance(spec, TriggeredOccupancySpec):
         raise TypeError("spec must be TriggeredOccupancySpec")
@@ -433,10 +437,17 @@ def _compile_occupancy_scan_artifact_plan(
         spec.occupancy.processor,
         camera_schema,
     )
+    if source_output_name not in ("counts", "occupied"):
+        raise ValueError("source_output_name must be 'counts' or 'occupied'")
+    source_schema = (
+        resolved.counts_schema
+        if source_output_name == "counts"
+        else resolved.occupied_schema
+    )
     preview_spec = _occupancy_preview_spec(spec.occupancy, preview)
     _require_output_binding(
         program=program,
-        source_schema=resolved.counts_schema,
+        source_schema=source_schema,
         output_contract=output_contract,
     )
 
@@ -448,7 +459,11 @@ def _compile_occupancy_scan_artifact_plan(
         pipeline = value.occupancy.pipeline
         return (
             pipeline.run_id,
-            value.occupancy.dataset.counts,
+            (
+                value.occupancy.dataset.counts
+                if source_output_name == "counts"
+                else value.occupancy.dataset.occupied
+            ),
             pipeline.dataset.provenance,
             AutonomousScanExecution(
                 program,
@@ -560,8 +575,9 @@ def compile_api_occupancy_scan_artifact_plan(
     *,
     program: ApiSlotSegmentedProgram,
     output_contract: ScanOutputContract,
+    source_output_name: str = "counts",
 ) -> RunPlan:
-    """Commit FINAL-only occupancy counts from finite API segments."""
+    """Commit one FINAL occupancy output from finite API segments."""
 
     if not isinstance(spec, ApiSlotSegmentedSpec) or not isinstance(
         spec.pipeline,
@@ -572,10 +588,17 @@ def compile_api_occupancy_scan_artifact_plan(
         raise ValueError("API segmented spec repeat count differs from its program")
     occupancy_spec = spec.pipeline
     camera_schema = occupancy_spec.measurement.capture_contract.dataset_schema
-    source_schema = resolve_occupancy_stream_schema(
+    resolved_source = resolve_occupancy_stream_schema(
         occupancy_spec.processor,
         camera_schema,
-    ).counts_schema
+    )
+    if source_output_name not in ("counts", "occupied"):
+        raise ValueError("source_output_name must be 'counts' or 'occupied'")
+    source_schema = (
+        resolved_source.counts_schema
+        if source_output_name == "counts"
+        else resolved_source.occupied_schema
+    )
     compiled_pulses = _segmented_compiled_pulses(
         program,
         spec.point_descriptors,
@@ -594,7 +617,11 @@ def compile_api_occupancy_scan_artifact_plan(
         pipeline = occupancy.pipeline
         return (
             pipeline.run_id,
-            occupancy.dataset.counts,
+            (
+                occupancy.dataset.counts
+                if source_output_name == "counts"
+                else occupancy.dataset.occupied
+            ),
             pipeline.dataset.provenance,
             _api_execution(program, value.segments, pipeline),
         )

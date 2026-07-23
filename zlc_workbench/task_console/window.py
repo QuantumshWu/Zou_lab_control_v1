@@ -1129,6 +1129,71 @@ class TaskConsole(QtWidgets.QWidget):
             ),
         )
 
+    def resolve_pulse_scan_source(self, signal_key: str):
+        """Resolve an exact scan source without reading the display data front.
+
+        A logic output resolves to its frozen producer request.  Figure Area
+        data resolves to that same producer plus the Figure-owned named-axis
+        selection.  Cross coordinates, fit parameters, range labels, and other
+        static panel outputs are useful signals, but they are not one fresh
+        event per scan cell and therefore cannot masquerade as Pulse-scan y.
+        """
+
+        from zlc_data import DataTransformSpec
+
+        from .panel_outputs import AREA_DATA_OUTPUT
+        from .pulse_scan_binding import PulseScanSourceBinding
+
+        def resolve(current: str, active: set[str]):
+            if current in active:
+                raise ValueError("Pulse scan source panels form a cycle")
+            try:
+                producer = self.resolve_console_producer(current)
+            except LookupError:
+                producer = None
+            if producer is not None:
+                return PulseScanSourceBinding(producer)
+
+            for card in self.cards:
+                area_key = panel_signal_key(card.panel_id, AREA_DATA_OUTPUT)
+                if current != area_key:
+                    continue
+                source_key = str(card.config.signal).strip()
+                if not source_key:
+                    raise ValueError(
+                        "the selected Figure Area has no bound source dataset"
+                    )
+                _value, selection, _cross, _fit = (
+                    card.frozen_figure_output_state()
+                )
+                if selection is None:
+                    raise ValueError(
+                        "the selected Figure Area has no completed selector gesture"
+                    )
+                upstream = resolve(source_key, {*active, current})
+                prior = (
+                    ()
+                    if upstream.transform_spec is None
+                    else upstream.transform_spec.operations
+                )
+                return PulseScanSourceBinding(
+                    upstream.producer,
+                    DataTransformSpec((*prior, selection)),
+                )
+
+            if current.startswith("@panel/"):
+                raise ValueError(
+                    "Pulse scan y requires event-bearing Figure Area data; "
+                    "Cross/range/Fit outputs are static derived signals"
+                )
+            raise LookupError(
+                f"{current!r} is not an output of a node or Figure in this TaskConsole"
+            )
+
+        if type(signal_key) is not str or not signal_key:
+            raise TypeError("Pulse scan signal key must be a non-empty str")
+        return resolve(signal_key, set())
+
     def _node_for_signal(self, name: str):
         """Return the exact running/retained producer; declarations are not Runs."""
 
@@ -1272,6 +1337,10 @@ class TaskConsole(QtWidgets.QWidget):
         deadline = time.monotonic() + max(0.0, float(timeout))
         while True:
             snapshot = node.poll()
+            if snapshot is None and bool(
+                getattr(node, "cancelled_before_start", False)
+            ):
+                break
             if snapshot is not None and snapshot.state.terminal:
                 if (
                     snapshot.state.name == "SUCCEEDED"
@@ -2038,6 +2107,13 @@ class TaskConsole(QtWidgets.QWidget):
                 self._stop_logic_node(row, _silent=True, timeout=0.0)
                 continue
             if snapshot is None:
+                if bool(getattr(node, "cancelled_before_start", False)):
+                    row.set_state("stopped", status="stopped")
+                    if editor is not None:
+                        editor.set_running(False)
+                        editor.set_status("stopped", error=False)
+                    self._stop_logic_node(row, _silent=True, timeout=0.0)
+                    continue
                 # Submitted, not yet acknowledged: the run exists as a request only.
                 row.set_state("running", status="starting")
                 if editor is not None:

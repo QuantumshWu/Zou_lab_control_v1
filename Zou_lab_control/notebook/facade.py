@@ -320,6 +320,7 @@ class OccupancyScanRequest:
     sequencer_ref: DeviceRef
     calibration_ref: CalibrationArtifactRef
     model_kind: ReadoutModelKind | None = None
+    output_name: str = "counts"
     trigger_channel: str | None = None
     output_transform_spec: DataTransformSpec | None = None
 
@@ -331,6 +332,8 @@ class OccupancyScanRequest:
             ReadoutModelKind,
         ):
             raise TypeError("model_kind must be ReadoutModelKind or None")
+        if self.output_name not in ("counts", "occupied"):
+            raise ValueError("output_name must be 'counts' or 'occupied'")
         _validate_scan_request_fields(
             self.program,
             self.camera_ref,
@@ -1091,6 +1094,7 @@ class ReadoutFacade:
         *,
         calibration_ref: CalibrationArtifactRef,
         model_kind: ReadoutModelKind | None = None,
+        output_name: str = "counts",
         camera_role: str | None = None,
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
@@ -1119,6 +1123,7 @@ class ReadoutFacade:
                 sequencer_ref=services.catalog.require(sequencer_role).ref,
                 calibration_ref=calibration_ref,
                 model_kind=model_kind,
+                output_name=output_name,
                 trigger_channel=trigger_channel,
                 output_transform_spec=output_transform_spec,
             )
@@ -1151,6 +1156,7 @@ class ReadoutFacade:
         segmentation_rationale: str,
         calibration_ref: CalibrationArtifactRef,
         model_kind: ReadoutModelKind | None = None,
+        output_name: str = "counts",
         camera_role: str | None = None,
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
@@ -1180,6 +1186,7 @@ class ReadoutFacade:
                 sequencer_ref=services.catalog.require(sequencer_role).ref,
                 calibration_ref=calibration_ref,
                 model_kind=model_kind,
+                output_name=output_name,
                 trigger_channel=trigger_channel,
                 output_transform_spec=output_transform_spec,
             )
@@ -3761,10 +3768,15 @@ def _bind_occupancy_scan_for_services(
         f"scan-occupancy-{identity}",
         selected_kind,
     )
-    source_schema = resolve_occupancy_stream_schema(
+    resolved_source = resolve_occupancy_stream_schema(
         processor,
         binding.measurement.capture_contract.dataset_schema,
-    ).counts_schema
+    )
+    source_schema = (
+        resolved_source.counts_schema
+        if request.output_name == "counts"
+        else resolved_source.occupied_schema
+    )
     output_contract = _scan_transform(
         source_schema,
         point_table,
@@ -3808,12 +3820,14 @@ def _compile_occupancy_scan_for_services(
             services.scan_repository,
             program=program,
             output_contract=output_contract,
+            source_output_name=request.output_name,
         )
     return compile_api_occupancy_scan_artifact_plan(
         scan_spec,
         services.scan_repository,
         program=program,
         output_contract=output_contract,
+        source_output_name=request.output_name,
     )
 
 
@@ -3833,6 +3847,11 @@ def _prepare_occupancy_scan_for_workbench(
         )
 
     def start(preview):
+        if preview is not None and request.output_name == "occupied":
+            raise ValueError(
+                "occupied Pulse scan output is FINAL-only; the current exact "
+                "progressive publisher owns counts"
+            )
         with _service_guard(experiment._authority_token) as services:
             if isinstance(program, AutonomousScanSlotProgram):
                 plan = compile_occupancy_scan_artifact_plan(
@@ -3840,6 +3859,7 @@ def _prepare_occupancy_scan_for_workbench(
                     services.scan_repository,
                     program=program,
                     output_contract=output_contract,
+                    source_output_name=request.output_name,
                     preview=preview,
                 )
             else:
@@ -3852,6 +3872,7 @@ def _prepare_occupancy_scan_for_workbench(
                     services.scan_repository,
                     program=program,
                     output_contract=output_contract,
+                    source_output_name=request.output_name,
                 )
             return services.runtime.start(plan)
 
