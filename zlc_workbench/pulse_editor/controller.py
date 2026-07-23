@@ -681,8 +681,6 @@ class PulseEditorController:
             )
         document = self._invalidate_changed_scan_schema(previous, document)
         revision = self._editor.replace_document(document)
-        if self._active_manifest_mode == "offline":
-            self._display_ports_by_mode["offline"] = document.visible_ports
         self._observe_document_schema_change(previous, document)
         self._invalidate_document_preview()
         return revision
@@ -1213,6 +1211,9 @@ class PulseEditorController:
             time_step_ns = self._descriptor.time_step_ns
         self._editor = PulseEditorSession.new(
             target, time_step_ns=time_step_ns
+        )
+        self._display_ports_by_mode["offline"] = (
+            self._editor.document.visible_ports
         )
         self._editor_generation += 1
         self._reset_scan_workspace(self._editor.document)

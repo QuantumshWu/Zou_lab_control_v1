@@ -247,11 +247,9 @@ def cycle_field_binding(
     if field.kind == FIELD_DAC:
         period = working.period_by_id[field.period_id]
         if field.port not in {step.port for step in period.analog_steps}:
-            carried = _dac_value_at_period_start(
-                working,
-                field.period_id,
-                field.port,
-            )
+            carried = working.effective_dac_cells()[
+                (field.period_id, field.port)
+            ][1]
             materialized = set_analog_action(
                 working,
                 field.period_id,
@@ -279,24 +277,6 @@ def cycle_field_binding(
         binding,
         cascade=cascade,
     )
-
-
-def _dac_value_at_period_start(
-    document: PulseDocument,
-    period_id: str,
-    port: str,
-) -> int:
-    current = 0
-    for period in document.periods:
-        if period.period_id == period_id:
-            return current
-        action = next(
-            (step for step in period.analog_steps if step.port == port),
-            None,
-        )
-        if action is not None:
-            current = action.value
-    raise KeyError(f"unknown period {period_id!r}")
 
 
 def new_pulse_document(

@@ -652,6 +652,46 @@ class PulseDocument:
     def api_parameter_by_id(self) -> Mapping[str, ApiParameter]:
         return self._api_parameter_by_id
 
+    def effective_dac_cells(
+        self,
+    ) -> dict[tuple[str, str], tuple[str, int]]:
+        """Return each period's authored DAC mode and effective signed value.
+
+        ``Hold`` is represented by the absence of an authored analog step.  Its
+        displayed and bindable value is therefore the preceding user-layer DAC
+        value.  The initial value is the target's encoded safe code converted
+        back to the signed authoring domain (the offset-binary midpoint is
+        signed zero).  Edge/Ramp actions replace the carried value for following
+        periods.  Keeping this rule on ``PulseDocument`` prevents the editor,
+        authoring helpers, and compiler-facing views from inventing different
+        answers for the same cell.
+        """
+
+        dac_ports = tuple(
+            port for port in self.target.ports if port.kind == PORT_DAC
+        )
+        carried = {
+            port.key: int(port.safe_value - (1 << (port.width - 1)))
+            for port in dac_ports
+        }
+        cells: dict[tuple[str, str], tuple[str, int]] = {}
+        for period in self.periods:
+            actions = {step.port: step for step in period.analog_steps}
+            for port in dac_ports:
+                action = actions.get(port.key)
+                if action is None:
+                    cells[(period.period_id, port.key)] = (
+                        "hold",
+                        carried[port.key],
+                    )
+                    continue
+                carried[port.key] = int(action.value)
+                cells[(period.period_id, port.key)] = (
+                    action.mode,
+                    carried[port.key],
+                )
+        return cells
+
     def _scan_definition_contract(self) -> tuple[object, ...]:
         table = self.scan_table
         if table is None:

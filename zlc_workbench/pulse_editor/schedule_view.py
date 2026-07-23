@@ -246,6 +246,21 @@ class _Binding:
     parameter_id: str
 
 
+def _apply_field_state(
+    edit: FluentScanLineEdit,
+    *,
+    editable: bool,
+    binding: _Binding | None,
+) -> None:
+    """Map one complete domain field state onto the shared scan editor."""
+
+    edit.set_field_state(
+        editable=editable,
+        binding=None if binding is None else binding.kind,
+        number=None if binding is None else binding.position + 1,
+    )
+
+
 def _port_rows(
     document: PulseDocument,
     manifest: PulseTargetManifest,
@@ -317,21 +332,17 @@ def _digital_values(document: PulseDocument) -> dict[tuple[str, str], bool]:
 def _analog_values(
     document: PulseDocument,
 ) -> tuple[dict[tuple[str, str], tuple[str, int | None]], dict[str, bool]]:
-    carried = {
-        port.key: 0 for port in document.target.ports if port.kind == PORT_DAC
+    values = document.effective_dac_cells()
+    dac_ports = tuple(
+        port.key for port in document.target.ports if port.kind == PORT_DAC
+    )
+    active = {
+        port: any(
+            values[(period.period_id, port)][0] != "hold"
+            for period in document.periods
+        )
+        for port in dac_ports
     }
-    values: dict[tuple[str, str], tuple[str, int | None]] = {}
-    active = {key: False for key in carried}
-    for period in document.periods:
-        actions = {step.port: step for step in period.analog_steps}
-        for port in carried:
-            action = actions.get(port)
-            if action is None:
-                values[(period.period_id, port)] = ("hold", carried[port])
-            else:
-                carried[port] = action.value
-                active[port] = True
-                values[(period.period_id, port)] = (action.mode, action.value)
     return values, active
 
 
@@ -402,6 +413,7 @@ class PeriodCard(FluentGroupBox):
         *,
         total_periods: int,
         rows: Sequence[_PortRow],
+        visible_ports: frozenset[str],
         digital_values: Mapping[str, bool],
         analog_values: Mapping[str, tuple[str, int | None]],
         bindings: Mapping[PulseFieldRef, _Binding],
@@ -458,11 +470,12 @@ class PeriodCard(FluentGroupBox):
         self.duration_edit.setFixedWidth(control_width)
         self.duration_edit.setToolTip("How long this period lasts, in the unit below")
         self.duration_dot = self.duration_edit.dot
+        _apply_field_state(
+            self.duration_edit,
+            editable=True,
+            binding=duration_binding,
+        )
         if duration_binding is not None:
-            if duration_binding.kind == "scan":
-                self.duration_edit.set_scan_bound(True, duration_binding.position + 1)
-            else:
-                self.duration_edit.set_api_bound(True, duration_binding.position + 1)
             self.duration_edit.setToolTip(
                 f"{self.duration_edit.toolTip()}\nParameter: {duration_binding.parameter_id}"
             )
@@ -500,6 +513,7 @@ class PeriodCard(FluentGroupBox):
             period,
             total_periods=total_periods,
             rows=rows,
+            visible_ports=visible_ports,
             digital_values=digital_values,
             analog_values=analog_values,
             bindings=bindings,
@@ -625,18 +639,15 @@ class PeriodCard(FluentGroupBox):
         )
         edit.set_numeric_validator("int", bottom=lo, top=hi)
         edit.setFixedHeight(row_height)
-        edit.set_editable(mode != "hold")
         field = PulseFieldRef(FIELD_DAC, self.period_id, row_info.key)
         edit.scanClicked.connect(
             lambda key=row_info.key, ref=field: self.bindingCycleRequested.emit(ref)
         )
+        _apply_field_state(edit, editable=mode != "hold", binding=binding)
         if binding is not None:
             if binding.kind == "scan":
-                edit.set_scan_bound(True, binding.position + 1)
                 edit.setValidator(None)
                 combo.setEnabled(False)
-            else:
-                edit.set_api_bound(True, binding.position + 1)
             edit.setToolTip(f"{edit.toolTip()}\nParameter: {binding.parameter_id}")
         self.bus_value_edits[row_info.key] = edit
         layout.addWidget(edit, 1)
@@ -671,7 +682,6 @@ class PeriodCard(FluentGroupBox):
         combo = self.bus_mode_combos[port]
         edit = self.bus_value_edits[port]
         mode = _bus_mode_value(combo.currentText())
-        edit.set_editable(mode != "hold")
         if mode == "hold":
             self.analogEdited.emit(self.period_id, port, mode, None)
             return
@@ -725,18 +735,18 @@ class PeriodCard(FluentGroupBox):
             else str(value)
         )
         with signals_blocked(self.duration_edit, self.unit_combo):
-            self.duration_edit.set_scan_bound(False, None)
-            self.duration_edit.set_api_bound(False, None)
             self.duration_edit.set_numeric_validator("float", bottom=0.0)
             _set_widget_text(self.duration_edit, text)
             tooltip = "How long this period lasts, in the unit below"
             if binding is not None:
                 if binding.kind == "scan":
-                    self.duration_edit.set_scan_bound(True, binding.position + 1)
                     self.duration_edit.setValidator(None)
-                else:
-                    self.duration_edit.set_api_bound(True, binding.position + 1)
                 tooltip += f"\nParameter: {binding.parameter_id}"
+            _apply_field_state(
+                self.duration_edit,
+                editable=True,
+                binding=binding,
+            )
             self.duration_edit.setToolTip(tooltip)
             _set_duration_units(self.unit_combo, binding, str(unit))
         self._committed_duration = value
@@ -774,23 +784,22 @@ class PeriodCard(FluentGroupBox):
             title = _bus_mode_title(mode)
             if combo.currentText() != title:
                 combo.setCurrentText(title)
-            edit.set_scan_bound(False, None)
-            edit.set_api_bound(False, None)
             edit.set_numeric_validator("int", bottom=lo, top=hi)
             _set_widget_text(edit, text)
-            edit.set_editable(mode != "hold")
             tooltip = (
                 f"{row.label}: signed integer {lo}..{hi} (0 = 0 V); "
                 "click the dot to cycle scan (sN) -> API (aN) -> off"
             )
             if binding is not None:
                 if binding.kind == "scan":
-                    edit.set_scan_bound(True, binding.position + 1)
                     edit.setValidator(None)
                     combo.setEnabled(False)
-                else:
-                    edit.set_api_bound(True, binding.position + 1)
                 tooltip += f"\nParameter: {binding.parameter_id}"
+            _apply_field_state(
+                edit,
+                editable=mode != "hold",
+                binding=binding,
+            )
             edit.setToolTip(tooltip)
         self._projection_state = None
 
@@ -801,6 +810,7 @@ class PeriodCard(FluentGroupBox):
         *,
         total_periods: int,
         rows: Sequence[_PortRow],
+        visible_ports: frozenset[str],
         digital_values: Mapping[str, bool],
         analog_values: Mapping[str, tuple[str, int | None]],
         bindings: Mapping[PulseFieldRef, _Binding],
@@ -814,6 +824,7 @@ class PeriodCard(FluentGroupBox):
             int(total_periods),
             period,
             tuple(rows),
+            visible_ports,
             tuple((row.key, bool(digital_values.get(row.key, False))) for row in rows),
             tuple(
                 (row.key, analog_values.get(row.key, ("hold", 0))) for row in rows
@@ -850,6 +861,7 @@ class PeriodCard(FluentGroupBox):
             mode, number = analog_values.get(key, ("hold", 0))
             binding = bindings.get(PulseFieldRef(FIELD_DAC, self.period_id, key))
             self.apply_analog(key, mode, 0 if number is None else number, binding)
+        self.set_visible_ports(visible_ports)
         self._projection_state = projection_state
 
     def set_visible_ports(self, ports: frozenset[str]) -> None:
@@ -1317,12 +1329,9 @@ class ChannelPanel(FluentGroupBox):
         if edit is None or unit is None or row is None:
             raise KeyError(f"unknown delay row {port!r}")
         with signals_blocked(edit, unit):
-            edit.set_scan_bound(False, None)
-            edit.set_api_bound(False, None)
             edit.set_numeric_validator("float")
             _set_widget_text(edit, value)
             if binding is not None:
-                edit.set_api_bound(True, binding.position + 1)
                 edit.setToolTip(f"API parameter: {binding.parameter_id}")
             elif row.kind == PORT_DAC:
                 edit.setToolTip(
@@ -1334,6 +1343,7 @@ class ChannelPanel(FluentGroupBox):
                     "Physical per-channel output delay (may be negative): the "
                     "whole channel waveform shifts by d, out[t] = in[t-d]."
                 )
+            _apply_field_state(edit, editable=True, binding=binding)
             selected_unit = unit_text if unit_text in DELAY_UNITS else "ns"
             if unit.currentText() != selected_unit:
                 unit.setCurrentText(selected_unit)
@@ -2099,6 +2109,7 @@ class PulseScheduleView(QtWidgets.QWidget):
         digital_values: Mapping[tuple[str, str], bool],
         analog_values: Mapping[tuple[str, str], tuple[str, int | None]],
         bindings: Mapping[PulseFieldRef, _Binding],
+        visible_ports: frozenset[str],
         reconcile_existing: bool = True,
     ) -> None:
         """Incrementally add/remove/move cards and repeat markers by stable id."""
@@ -2116,6 +2127,7 @@ class PulseScheduleView(QtWidgets.QWidget):
                     period,
                     total_periods=total,
                     rows=rows,
+                    visible_ports=visible_ports,
                     digital_values={
                         row.key: digital_values.get(
                             (period.period_id, row.key), False
@@ -2139,6 +2151,7 @@ class PulseScheduleView(QtWidgets.QWidget):
                     period,
                     total_periods=total,
                     rows=rows,
+                    visible_ports=visible_ports,
                     digital_values={
                         row.key: digital_values.get(
                             (period.period_id, row.key), False
@@ -2376,6 +2389,7 @@ class PulseScheduleView(QtWidgets.QWidget):
                 digital_values=digital_values,
                 analog_values=analog_values,
                 bindings=bindings,
+                visible_ports=frozenset(visible),
             )
 
             self._period_ids = period_ids
@@ -2532,6 +2546,7 @@ class PulseScheduleView(QtWidgets.QWidget):
             digital_values=digital_values,
             analog_values=analog_values,
             bindings=bindings,
+            visible_ports=frozenset(self._visible_ports),
             reconcile_existing=False,
         )
         self._period_ids = tuple(period.period_id for period in document.periods)

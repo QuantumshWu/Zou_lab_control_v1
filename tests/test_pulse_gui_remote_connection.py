@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -578,6 +579,83 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
             QtCore.Qt.LeftButton,
         )
         _until(application, lambda: len(body.schedule_view._visible_ports) == 4)
+        hidden_ports = body.schedule_view._visible_ports
+
+        # Load a different document generation with the SAME hidden projection.
+        # New period widgets must be born with that complete projection; there
+        # is intentionally no second visibility change for a presenter to use
+        # as a repair event.
+        loaded_periods = tuple(
+            replace(period, period_id=f"loaded_{index}")
+            for index, period in enumerate(body.current_document.periods, start=1)
+        )
+        loaded_document = replace(
+            body.current_document,
+            name="loaded hidden projection",
+            periods=loaded_periods,
+            visible_ports=hidden_ports,
+            repeat=None,
+            scan_parameters=(),
+            api_parameters=(),
+            scan_table=None,
+            scan_recipe=None,
+        )
+        loaded_path = workspace / "loaded_hidden_projection.json"
+        save_pulse_document(loaded_document, loaded_path)
+        with patch.object(
+            QtWidgets.QFileDialog,
+            "getOpenFileName",
+            return_value=(str(loaded_path), "ZLC pulse (*.json)"),
+        ):
+            QtTest.QTest.mouseClick(
+                body.schedule_view.load_button,
+                QtCore.Qt.LeftButton,
+            )
+        _until(
+            application,
+            lambda: body.current_document.name == "loaded hidden projection",
+        )
+        assert body.schedule_view._visible_ports == hidden_ports
+        assert tuple(
+            card.period_id for card in body.schedule_view.period_cards()
+        ) == tuple(period.period_id for period in loaded_periods)
+        for card in body.schedule_view.period_cards():
+            assert all(
+                (not row.isHidden()) == (key in hidden_ports)
+                for key, row in card.port_rows.items()
+            )
+        QtTest.QTest.mouseClick(
+            body.schedule_view.hide_off_button,
+            QtCore.Qt.LeftButton,
+        )
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        assert all(
+            (not row.isHidden()) == (key in hidden_ports)
+            for card in body.schedule_view.period_cards()
+            for key, row in card.port_rows.items()
+        )
+
+        hidden_cards = body.schedule_view.period_cards()
+        QtTest.QTest.mouseClick(
+            body.schedule_view.add_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(
+            application,
+            lambda: len(body.schedule_view.period_cards()) == len(hidden_cards) + 1,
+        )
+        assert body.schedule_view.period_cards()[:-1] == hidden_cards
+        added_hidden_card = body.schedule_view.period_cards()[-1]
+        assert all(
+            (not row.isHidden()) == (key in hidden_ports)
+            for key, row in added_hidden_card.port_rows.items()
+        )
+        QtTest.QTest.mouseClick(
+            body.schedule_view.remove_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(application, lambda: body.schedule_view.period_cards() == hidden_cards)
+
         offline_geometry_before = (
             body.schedule_view.timeline_scroll.geometry().getRect(),
             body.schedule_view.button_frame.geometry().getRect(),
@@ -721,6 +799,66 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
                 ),
                 strict=True,
             )
+        )
+
+        # HOLD is the preceding effective signed value, and editability plus
+        # scan/API decoration is one state.  Exercise the full cycle with real
+        # combo, line-edit, and dot input before returning to HOLD.
+        first_card, second_card = body.schedule_view.period_cards()[:2]
+        dac_port = next(iter(first_card.bus_mode_combos))
+        edge_combo = first_card.bus_mode_combos[dac_port]
+        edge_value = first_card.bus_value_edits[dac_port]
+        assert edge_combo.currentText() == "Hold"
+        assert edge_value.text() == "0" and edge_value.isReadOnly()
+        QtTest.QTest.mouseClick(edge_combo, QtCore.Qt.LeftButton)
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        QtTest.QTest.keyClick(edge_combo.view(), QtCore.Qt.Key_Home)
+        QtTest.QTest.keyClick(edge_combo.view(), QtCore.Qt.Key_Return)
+        _until(application, lambda: not edge_value.isReadOnly())
+        QtTest.QTest.mouseClick(edge_value, QtCore.Qt.LeftButton)
+        QtTest.QTest.keyClick(edge_value, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
+        QtTest.QTest.keyClicks(edge_value, "37")
+        QtTest.QTest.keyClick(edge_value, QtCore.Qt.Key_Return)
+
+        held_combo = second_card.bus_mode_combos[dac_port]
+        held_value = second_card.bus_value_edits[dac_port]
+        _until(
+            application,
+            lambda: held_value.text() == "37" and held_value.isReadOnly(),
+        )
+        assert held_combo.currentText() == "Hold"
+
+        def held_binding_kind() -> str | None:
+            field = (second_card.period_id, dac_port)
+            if any(
+                (item.field.period_id, item.field.port) == field
+                for item in body.current_document.scan_parameters
+            ):
+                return "scan"
+            if any(
+                (item.field.period_id, item.field.port) == field
+                for item in body.current_document.api_parameters
+            ):
+                return "api"
+            return None
+
+        for _expected_kind in ("scan", "api", None):
+            QtTest.QTest.mouseClick(held_value.dot, QtCore.Qt.LeftButton)
+            _until(
+                application,
+                lambda expected=_expected_kind: held_binding_kind() == expected,
+            )
+        QtTest.QTest.mouseClick(held_combo, QtCore.Qt.LeftButton)
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        QtTest.QTest.keyClick(held_combo.view(), QtCore.Qt.Key_End)
+        QtTest.QTest.keyClick(held_combo.view(), QtCore.Qt.Key_Return)
+        _until(
+            application,
+            lambda: (
+                held_combo.currentText() == "Hold"
+                and held_value.text() == "37"
+                and held_value.isReadOnly()
+            ),
         )
 
         _click_tab(body, body.target_view)

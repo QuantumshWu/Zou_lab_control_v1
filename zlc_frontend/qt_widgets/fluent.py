@@ -3563,7 +3563,7 @@ class FluentScanDot(QtWidgets.QAbstractButton):
         self.update()
 
     def nextCheckState(self) -> None:  # noqa: N802 - Qt API name
-        # The dot's checked (scan) state is DRIVEN BY THE MODEL via set_scan_bound, not by the
+        # The dot's binding state is driven by the model via set_field_state, not by the
         # click toggle: a click only emits ``clicked`` to drive the none->scan->api->off cycle,
         # which then re-applies the correct visual.  Without this, the auto-toggle would leave a
         # just-cleared dot stuck "checked" (orange) when the cycle landed on API or off.
@@ -3653,7 +3653,7 @@ class FluentScanLineEdit(FluentLineEdit):
         self._base_style = self.styleSheet()
         self._dot = FluentScanDot(self, tooltip=tooltip)
         self._dot.clicked.connect(self.scanClicked)
-        self._bound = False
+        self._field_state: tuple[bool, str | None, int | None] | None = None
         self._reserve_right()
 
     @property
@@ -3691,73 +3691,57 @@ class FluentScanLineEdit(FluentLineEdit):
         super().showEvent(event)
         self._place_dot()
 
-    def set_scan_bound(self, bound: bool, number: int | None = None) -> None:
-        bound = bool(bound)
-        # no-op guard: re-applying the (expensive) stylesheet/dot/readonly when neither the
-        # bound flag nor the badge number changed is wasted work (Qt re-polishes the style).
-        if self._bound == bound and getattr(self, "_scan_number", "\x00unset") == number:
-            return
-        self._bound = bound
-        self._scan_number = number
-        if bound:                      # scan and api are mutually exclusive on a field
-            self._api_bound = False
-        self._dot.set_api(False)
-        self._dot.setChecked(self._bound)
-        self._dot.set_number(number if self._bound else None)
-        self.setReadOnly(self._bound)
-        if self._bound:
-            self.setStyleSheet(_bound_field_style(
-                selector="QLineEdit", text=ORANGE_DARK, border=ORANGE, fill=ORANGE_TINT))
-        else:
-            self.setStyleSheet(self._base_style)
-        self._reserve_right()
-        self.update()
+    def set_field_state(
+        self,
+        *,
+        editable: bool,
+        binding: str | None = None,
+        number: int | None = None,
+    ) -> None:
+        """Project the complete edit/binding state in one operation.
 
-    def set_api_bound(self, bound: bool, number: int | None = None) -> None:
-        """Mark (or clear) this field as an API slot ``a{number}``.
-
-        UNLIKE :meth:`set_scan_bound`, an API slot KEEPS the field's value visible and
-        EDITABLE -- only a thin violet border + the violet dot mark it (the value is a real
-        number the API can also set by name).  Scan and API are mutually exclusive."""
-        bound = bool(bound)
-        if getattr(self, "_api_bound", False) == bound and getattr(self, "_api_number", "\x00unset") == number:
-            return
-        self._api_bound = bound
-        self._api_number = number
-        if bound:                      # leaving any scan state
-            self._bound = False
-            self._scan_number = None
-            self._dot.setChecked(False)
-            self.setReadOnly(False)
-        self._dot.set_api(bound)
-        self._dot.set_number(number if bound else None)
-        if bound:
-            self.setStyleSheet(_bound_field_style(
-                selector="QLineEdit", text=API_VIOLET_DARK, border=API_VIOLET, fill=None))
-        elif not getattr(self, "_bound", False):
-            self.setStyleSheet(self._base_style)
-        self._reserve_right()
-        self.update()
-
-    def set_editable(self, editable: bool) -> None:
-        """Toggle text editability *without disabling the widget*.
-
-        Disabling a ``QLineEdit`` also disables its child scan dot, which would
-        make the dot un-clickable -- you could no longer bind/unbind a scan
-        slot.  So an inactive field (e.g. a ``hold`` bus segment) instead goes
-        read-only with a muted style while staying enabled, keeping the dot
-        live.  The bound (orange) state owns its own appearance, so this is a
-        no-op while bound.
+        ``editable`` describes the underlying field (for example a DAC Hold is
+        not editable).  ``binding`` is either ``"scan"``, ``"api"``, or
+        ``None``.  These facts cannot be applied independently: scan binding is
+        always read-only, while an API-bound Hold must remain read-only even
+        though ordinary API values are editable.  One reducer owns the dot,
+        badge, read-only flag, and stylesheet so setter order cannot leave a
+        mixed visual state.
         """
 
-        editable = bool(editable)
-        if self._bound:
+        normalized = None if binding is None else str(binding).strip().lower()
+        if normalized not in (None, "scan", "api"):
+            raise ValueError("binding must be 'scan', 'api', or None")
+        if normalized is None and number is not None:
+            raise ValueError("an unbound field cannot have a binding number")
+        state = (bool(editable), normalized, number)
+        if state == self._field_state:
             return
-        if getattr(self, "_editable", None) == editable:
-            return   # no-op guard: skip the readonly/stylesheet re-apply when unchanged
-        self._editable = editable
-        self.setReadOnly(not editable)
-        self.setStyleSheet(self._base_style if editable else _muted_line_style())
+        self._field_state = state
+
+        is_scan = normalized == "scan"
+        is_api = normalized == "api"
+        self._dot.set_api(is_api)
+        self._dot.setChecked(is_scan)
+        self._dot.set_number(number if normalized is not None else None)
+        self.setReadOnly(is_scan or not state[0])
+        if is_scan:
+            style = _bound_field_style(
+                selector="QLineEdit",
+                text=ORANGE_DARK,
+                border=ORANGE,
+                fill=ORANGE_TINT,
+            )
+        elif is_api:
+            style = _bound_field_style(
+                selector="QLineEdit",
+                text=API_VIOLET_DARK,
+                border=API_VIOLET,
+                fill=None,
+            )
+        else:
+            style = self._base_style if state[0] else _muted_line_style()
+        self.setStyleSheet(style)
         self._reserve_right()
         self.update()
 
