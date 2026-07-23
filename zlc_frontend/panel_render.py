@@ -35,7 +35,6 @@ from .figure import (
     EvaluatedInput,
     EvaluatedMeter,
     FigureDocument,
-    FigureEvaluator,
     FigureLayer,
     ResolvedDataset,
     ResolvedDatasetMap,
@@ -257,7 +256,6 @@ class PanelComposer:
         self._value_label = str(value_label or "Signal")
         self._rolling_distribution = bool(rolling_distribution)
         self._dataset_id = DatasetId(self._panel_id)
-        self._evaluator = FigureEvaluator()
         self._document: FigureDocument | None = None
         self._document_fingerprint = None
         self._renderer = None
@@ -331,15 +329,32 @@ class PanelComposer:
         re-deriving them from a newer frame.
         """
 
+        frame, _figure = self.compose_with_figure(
+            snapshot,
+            display=display,
+            provenance=provenance,
+        )
+        return frame
+
+    def compose_with_figure(
+        self,
+        snapshot,
+        *,
+        display,
+        provenance: PanelProvenance,
+    ) -> tuple[object, DataFigure]:
+        """Rasterize once and return the exact already-evaluated figure too."""
+
         block = getattr(snapshot, "block", None)
         ref = getattr(snapshot, "ref", None)
         if block is None or ref is None:
             raise PanelRenderError("a panel front needs an owned (ref, block) snapshot")
         document = self.document_for(block.schema)
-        evaluated = self._evaluator.evaluate(
+        figure = DataFigure(
             document,
             ResolvedDatasetMap((ResolvedDataset(self._dataset_id, snapshot),)),
         )
+        evaluated = figure.evaluated
         layers = evaluated.layers
         if len(layers) != 1 or len(layers[0].cells) != 1:
             raise PanelRenderError("a panel document must evaluate to one cell")
@@ -349,13 +364,16 @@ class PanelComposer:
         raster, payload = self._rasterize(
             evaluated, series, display, ref, block.schema,
         )
-        return self._frame_for(
-            document,
-            ref,
-            raster,
-            payload,
-            display,
-            provenance,
+        return (
+            self._frame_for(
+                document,
+                ref,
+                raster,
+                payload,
+                display,
+                provenance,
+            ),
+            figure,
         )
 
     def compose_faceted(

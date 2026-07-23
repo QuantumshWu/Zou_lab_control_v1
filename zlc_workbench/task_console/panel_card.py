@@ -112,6 +112,7 @@ class PanelCard(FluentGroupBox):
     fit_analysis_available_changed = QtCore.pyqtSignal(bool)
     front_presented = QtCore.pyqtSignal()
     rectangle_selected = QtCore.pyqtSignal(object)
+    selectors_enabled_changed = QtCore.pyqtSignal(bool)
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
                  sources_provider=None, formats_provider=None,
@@ -164,8 +165,24 @@ class PanelCard(FluentGroupBox):
         # snapshot, mutable cache, or accepted-front claim.
         self._candidate_value = None
         self._last_document = None
-        self._last_figure = None
         self._last_display = None
+        # Worker completion and visible presentation are different facts.
+        # Promote this group only after the Qt board accepts its matching
+        # immutable frame in ``present()``.
+        self._pending_figure = None
+        self._pending_display = None
+        self._pending_size_name = None
+        self._pending_pixel_ratio = None
+        self._pending_run_id = None
+        self._pending_title = None
+        self._pending_value_label = None
+        self._presented_figure = None
+        self._presented_display = None
+        self._presented_size_name = None
+        self._presented_pixel_ratio = None
+        self._presented_run_id = None
+        self._presented_title = None
+        self._presented_value_label = None
         self._candidate_schema = None
         self._grid_focus = None
         self._render_request_revision = 0
@@ -597,23 +614,27 @@ class PanelCard(FluentGroupBox):
     def has_local_fit_source(self) -> bool:
         """Whether the accepted front is one exact local CURVE/IMAGE panel."""
 
-        if self.config.kind in ("sites", "grid") or self._last_document is None:
+        if self.config.kind in ("sites", "grid"):
             return False
         board = self.board
         if board is None or board.front_frame is None:
             return False
-        snapshot = getattr(self._last_value, "snapshot", None)
+        figure = self._presented_figure
+        if figure is None:
+            return False
         try:
             visible_input = self._visible_evaluated_input()
         except RuntimeError:
             return False
-        if snapshot is None or snapshot.ref != visible_input.ref:
-            return False
-        datasets = tuple(self._last_document.datasets)
-        layers = tuple(self._last_document.layers)
+        entries = tuple(figure.datasets.entries)
+        datasets = tuple(figure.document.datasets)
+        layers = tuple(figure.document.layers)
         if (
-            len(datasets) != 1
+            len(entries) != 1
+            or len(datasets) != 1
             or len(layers) != 1
+            or entries[0].snapshot.ref != visible_input.ref
+            or entries[0].dataset_id != visible_input.dataset_id
             or datasets[0].dataset_id != visible_input.dataset_id
             or layers[0].dataset_id != visible_input.dataset_id
         ):
@@ -749,8 +770,14 @@ class PanelCard(FluentGroupBox):
         if schema != self._candidate_schema:
             self._candidate_schema = schema
             self._grid_focus = None
-            self._last_figure = None
             self._pending_faceted_result = None
+            self._pending_figure = None
+            self._pending_display = None
+            self._pending_size_name = None
+            self._pending_pixel_ratio = None
+            self._pending_run_id = None
+            self._pending_title = None
+            self._pending_value_label = None
             self._refresh_grid_view_controls()
             self._refresh_repeat_mode_control()
         self._candidate_value = value
@@ -843,7 +870,7 @@ class PanelCard(FluentGroupBox):
         *,
         frame=None,
         faceted_result=None,
-        document=None,
+        figure=None,
         error: str | None = None,
     ) -> bool:
         """Accept one worker result on the Qt owner and nothing else."""
@@ -871,21 +898,56 @@ class PanelCard(FluentGroupBox):
                 return True
             self._pending_faceted_result = faceted_result
             self._pending_frame = None
-            self._last_figure = faceted_result.figure
-            document = faceted_result.figure.document
+            pending_figure = faceted_result.figure
+            if figure is not pending_figure:
+                self.set_status(
+                    "faceted worker result lost its exact DataFigure",
+                    error=True,
+                )
+                return True
+            pending_display = request.display
+            if faceted_result.focus is not None:
+                from zlc_frontend.histogram_display import (
+                    FacetedHistogramDisplayState,
+                )
+
+                if isinstance(pending_display, FacetedHistogramDisplayState):
+                    pending_display = pending_display.display_for(
+                        faceted_result.focus.selection
+                    )
         elif frame is None or (
-            self.config.kind != "sites" and document is None
+            self.config.kind != "sites" and figure is None
         ):
             self.set_status("render worker returned no complete front", error=True)
             return True
         else:
             self._pending_frame = frame
             self._pending_faceted_result = None
-            self._last_figure = None
+            pending_figure = None
+            if self.config.kind != "sites":
+                from zlc_frontend import DataFigure
+
+                if not isinstance(figure, DataFigure):
+                    self.set_status(
+                        "render worker returned no exact DataFigure",
+                        error=True,
+                    )
+                    return True
+                pending_figure = figure
+            pending_display = request.display
         self._last_value = request.value
         self._candidate_value = request.value
-        self._last_document = document
+        self._last_document = (
+            None if pending_figure is None else pending_figure.document
+        )
         self._last_display = request.display
+        self._pending_figure = pending_figure
+        self._pending_display = pending_display
+        self._pending_size_name = str(request.size_name)
+        self._pending_pixel_ratio = float(request.pixel_ratio)
+        self._pending_run_id = getattr(request.value, "run_id", None)
+        self._pending_title = str(request.label)
+        self._pending_value_label = str(request.value_label)
         self._candidate_schema = request.value.snapshot.block.schema
         self._refresh_grid_view_controls()
         self._refresh_repeat_mode_control()
@@ -1044,28 +1106,19 @@ class PanelCard(FluentGroupBox):
             raise RuntimeError(
                 "Site map is an exact composite front, not a single-dataset DataFigure"
             )
-        from zlc_frontend import DataFigure
-        from zlc_frontend.figure import ResolvedDataset, ResolvedDatasetMap
+        figure = self._presented_figure
+        if figure is None:
+            raise RuntimeError("the panel has no presented typed figure to save")
 
-        if self._last_figure is not None:
-            figure = self._last_figure
-        else:
-            value = self._last_value
-            snapshot = None if value is None else getattr(value, "snapshot", None)
-            block = None if snapshot is None else getattr(snapshot, "block", None)
-            if block is None:
-                raise RuntimeError("the panel has no immutable data revision to save")
-            document = self._last_document
-            if document is None:
-                raise RuntimeError("the panel has no accepted render document to save")
-            if len(document.datasets) != 1:
-                raise RuntimeError("a saved panel must bind exactly one typed dataset")
-            dataset_id = document.datasets[0].dataset_id
-            figure = DataFigure(
-                document,
-                ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
-            )
-
+        # Grid overview is an encoded image whose exact DataFigure is promoted
+        # in the same Qt present transaction.  Focused and ordinary panels also
+        # carry an EvaluatedInput, so verify that visible provenance before
+        # exposing their figure to Fit or Save.
+        board = self.board
+        if board is not None and getattr(board, "front_frame", None) is None:
+            if not bool(getattr(board, "showing_overview", False)):
+                raise RuntimeError("front replacement in progress")
+            return figure
         visible_input = self._visible_evaluated_input()
         entries = tuple(figure.datasets.entries)
         if (
@@ -1076,27 +1129,54 @@ class PanelCard(FluentGroupBox):
             raise RuntimeError("front replacement in progress")
         return figure
 
+    def frozen_display_state(self):
+        """Return the display state promoted with the visible immutable front."""
+
+        if self._presented_display is None:
+            raise RuntimeError("the panel has no presented display state")
+        return self._presented_display
+
+    def frozen_panel_geometry(self) -> tuple[str, float]:
+        """Return the size preset and DPR promoted with the visible front."""
+
+        size_name = self._presented_size_name
+        pixel_ratio = self._presented_pixel_ratio
+        if size_name is None or pixel_ratio is None:
+            raise RuntimeError("the panel has no presented plot geometry")
+        return str(size_name), float(pixel_ratio)
+
+    def frozen_panel_labels(self) -> tuple[str, str]:
+        """Return the exact title and value label painted on the visible front."""
+
+        title = self._presented_title
+        value_label = self._presented_value_label
+        if title is None or value_label is None:
+            raise RuntimeError("the panel has no presented plot labels")
+        return str(title), str(value_label)
+
+    def frozen_render_payload(self):
+        """Return the exact typed payload painted by the current focused front."""
+
+        board = self.board
+        front = None if board is None else board.front_frame
+        if front is None:
+            return None
+        if len(front.panels) != 1:
+            raise RuntimeError("front replacement in progress")
+        return front.panels[0].display_payload
+
     def visible_run_id(self):
-        """Return the producer RunId only when ``_last_value`` is visibly painted.
+        """Return the producer RunId promoted with the visible immutable front.
 
         A FINAL result and its projected dataset become available before the
         worker necessarily presents that revision.  Analysis must not fit the
         new artifact while the operator is still looking at the previous
-        front.  This is a comparison against the board's existing typed input,
-        not another snapshot or presentation cache.
+        front.  The value therefore crosses the same Qt present boundary as
+        its figure/display/geometry rather than being read from the latest
+        worker completion.
         """
 
-        value = self._last_value
-        snapshot = None if value is None else getattr(value, "snapshot", None)
-        if snapshot is None:
-            return None
-        try:
-            visible_input = self._visible_evaluated_input()
-        except RuntimeError:
-            return None
-        if snapshot.ref != visible_input.ref:
-            return None
-        return getattr(value, "run_id", None)
+        return self._presented_run_id
 
     def _visible_evaluated_input(self):
         """Read the exact typed input painted by the one current board front."""
@@ -1128,6 +1208,20 @@ class PanelCard(FluentGroupBox):
             return
         self._pending_frame = None
         self._pending_faceted_result = None
+        pending_figure = self._pending_figure
+        pending_display = self._pending_display
+        pending_size_name = self._pending_size_name
+        pending_pixel_ratio = self._pending_pixel_ratio
+        pending_run_id = self._pending_run_id
+        pending_title = self._pending_title
+        pending_value_label = self._pending_value_label
+        self._pending_figure = None
+        self._pending_display = None
+        self._pending_size_name = None
+        self._pending_pixel_ratio = None
+        self._pending_run_id = None
+        self._pending_title = None
+        self._pending_value_label = None
         self._build_plot()
         if faceted is not None:
             if faceted.overview_png is not None:
@@ -1139,6 +1233,13 @@ class PanelCard(FluentGroupBox):
                 self.board.present_frame(faceted.frame)
         else:
             self.board.present_frame(frame)
+        self._presented_figure = pending_figure
+        self._presented_display = pending_display
+        self._presented_size_name = pending_size_name
+        self._presented_pixel_ratio = pending_pixel_ratio
+        self._presented_run_id = pending_run_id
+        self._presented_title = pending_title
+        self._presented_value_label = pending_value_label
         self._pending_interaction_origin = None
         self.front_presented.emit()
 
@@ -2189,7 +2290,6 @@ class PanelCard(FluentGroupBox):
         self._last_value = None
         self._candidate_value = None
         self._last_document = None
-        self._last_figure = None
         self._fit_selection_candidate = None
         self._fit_selection_origin = None
         self._candidate_schema = None
@@ -2623,8 +2723,18 @@ class PanelCard(FluentGroupBox):
         gate the CURRENT plotter now (in place -- no rebuild, no flash).  Every later rebind /
         focus swap re-applies it through ``_apply_selectors_state``, so a fresh figure always
         inherits the switch."""
-        self._selectors_on = bool(on)
+        enabled = bool(on)
+        changed = enabled != self._selectors_on
+        self._selectors_on = enabled
         self._apply_selectors_state()
+        if changed:
+            self.selectors_enabled_changed.emit(enabled)
+
+    @property
+    def selectors_enabled(self) -> bool:
+        """The one console-authored selector switch state for this panel."""
+
+        return bool(self._selectors_on)
 
     def _apply_selectors_state(self) -> None:
         """Carry the board header's Selectors switch onto this card's surface.
@@ -2650,6 +2760,13 @@ class PanelCard(FluentGroupBox):
 
         self._pending_frame = None
         self._pending_faceted_result = None
+        self._pending_figure = None
+        self._pending_display = None
+        self._pending_size_name = None
+        self._pending_pixel_ratio = None
+        self._pending_run_id = None
+        self._pending_title = None
+        self._pending_value_label = None
         self._render_request_revision += 1
         self._requested_signature = None
 
@@ -2666,12 +2783,25 @@ class PanelCard(FluentGroupBox):
         self.board = None
         self._pending_frame = None
         self._pending_faceted_result = None
+        self._pending_figure = None
+        self._pending_display = None
+        self._pending_size_name = None
+        self._pending_pixel_ratio = None
+        self._pending_run_id = None
+        self._pending_title = None
+        self._pending_value_label = None
         self._candidate_value = None
         self._candidate_schema = None
         self._grid_focus = None
-        self._last_figure = None
         self._last_document = None
         self._last_display = None
+        self._presented_figure = None
+        self._presented_display = None
+        self._presented_size_name = None
+        self._presented_pixel_ratio = None
+        self._presented_run_id = None
+        self._presented_title = None
+        self._presented_value_label = None
         self._fit_selection_candidate = None
         self._fit_selection_origin = None
         self._requested_signature = None

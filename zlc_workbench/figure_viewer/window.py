@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from concurrent.futures import CancelledError, Future
+import math
+from numbers import Real
 from pathlib import Path
 
 from PyQt5 import QtCore, QtWidgets
@@ -249,16 +251,68 @@ class FigureViewer(QtWidgets.QWidget):
         """Build a hidden candidate; its admitted first front commits the generation."""
 
         from zlc_workbench.data_figure.app import create_data_figure_pane
+        from zlc_workbench.data_figure.projection import (
+            _classify_single_typed,
+            _classify_typed_grid,
+            _default_typed_state,
+        )
         from zlc_frontend.figure import ViewIntent
 
         metadata = archive.metadata
         if not isinstance(metadata, Mapping):
             raise TypeError("FigureArchive metadata must be a mapping")
         info = project_figure_info(archive)
-        layers = tuple(archive.figure.document.layers)
+        single_intent, _single_reason = _classify_single_typed(archive.figure)
+        grid_intent, grid_panel_count, _grid_reason = _classify_typed_grid(
+            archive.figure
+        )
+        size_name = metadata.get("size_name")
+        if size_name is not None:
+            if not isinstance(size_name, str):
+                raise TypeError("FigureArchive size_name must be text or null")
+            from zlc_data.panel_size import panel_size_cells
+
+            panel_size_cells(size_name)
+        raw_pixel_ratio = metadata.get("pixel_ratio", 1.0)
+        if isinstance(raw_pixel_ratio, bool) or not isinstance(
+            raw_pixel_ratio,
+            Real,
+        ):
+            raise TypeError("FigureArchive pixel_ratio must be a real number")
+        pixel_ratio = float(raw_pixel_ratio)
+        if not math.isfinite(pixel_ratio) or pixel_ratio <= 0.0:
+            raise ValueError(
+                "FigureArchive pixel_ratio must be positive and finite"
+            )
+        presentation_title = metadata.get("presentation_title")
+        presentation_value_label = metadata.get(
+            "presentation_value_label"
+        )
+        for name, value in (
+            ("presentation_title", presentation_title),
+            ("presentation_value_label", presentation_value_label),
+        ):
+            if value is not None and not isinstance(value, str):
+                raise TypeError(
+                    f"FigureArchive {name} must be text or null"
+                )
+        is_grid = grid_intent is not None and grid_panel_count is not None
+        if is_grid and size_name is None:
+            authored_display = (
+                archive.display is not None
+                and archive.display != _default_typed_state(grid_intent)
+            )
+            if (
+                authored_display
+                or pixel_ratio != 1.0
+                or presentation_title is not None
+                or presentation_value_label is not None
+            ):
+                raise ValueError(
+                    "authored Grid archive presentation requires size_name"
+                )
         local_fit = bool(
-            len(layers) == 1
-            and layers[0].view.intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
+            single_intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
         )
         local_fit_options = (
             {
@@ -269,15 +323,24 @@ class FigureViewer(QtWidgets.QWidget):
             if local_fit
             else {}
         )
+        display_options = (
+            {"initial_grid_display": archive.display}
+            if is_grid
+            else {"initial_display": archive.display}
+        )
         candidate = create_data_figure_pane(
             archive.figure,
-            initial_display=archive.display,
             initial_fit_result_identity=(
                 archive.payload_digest
                 if archive.figure.has_fit_overlays
                 else None
             ),
             embedded=True,
+            size_name=size_name,
+            pixel_ratio=pixel_ratio,
+            presentation_title=presentation_title,
+            presentation_value_label=presentation_value_label,
+            **display_options,
             **local_fit_options,
         )
         if not isinstance(candidate, QtWidgets.QWidget):

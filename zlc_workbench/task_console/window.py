@@ -1979,13 +1979,13 @@ class TaskConsole(QtWidgets.QWidget):
             )
         else:
             by_id = {card.panel_id: card for card in self.cards}
-            for request, frame, faceted_result, document, error in completion:
+            for request, frame, faceted_result, figure, error in completion:
                 card = by_id.get(request.panel_id)
                 if card is None or not card.accept_render_result(
                     request,
                     frame=frame,
                     faceted_result=faceted_result,
-                    document=document,
+                    figure=figure,
                     error=error,
                 ):
                     reset.add(request.panel_id)

@@ -39,6 +39,7 @@ from zlc_frontend.figure import (
     ViewIntent,
 )
 from zlc_frontend.histogram_display import (
+    FacetedHistogramDisplayState,
     HistogramDisplayState,
     histogram_display_form_spec,
     histogram_display_form_values,
@@ -161,6 +162,7 @@ def _classify_typed_grid(
         return None, None, "typed grid requires exactly one layer and input"
     intent = figure.document.layers[0].view.intent
     data_type = {
+        ViewIntent.IMAGE: EvaluatedImage,
         ViewIntent.CURVE: EvaluatedCurve,
         ViewIntent.METER: EvaluatedMeter,
         ViewIntent.HISTOGRAM: EvaluatedHistogram,
@@ -172,6 +174,7 @@ def _classify_typed_grid(
         return None, None, "typed grid requires more than one logical panel"
     grid_curve_axis = None
     grid_value_unit = None
+    grid_image_axes = None
     for cell in cells:
         series_group = cell.series
         if not series_group or any(
@@ -181,6 +184,24 @@ def _classify_typed_grid(
             return None, None, "typed grid contains another evaluated data kind"
         if len({series.data.value_unit for series in series_group}) != 1:
             return None, None, "typed grid panel mixes value units"
+        if intent is ViewIntent.IMAGE:
+            if len(series_group) != 1:
+                return None, None, "typed IMAGE grid panel must contain one image"
+            image = series_group[0].data
+            assert isinstance(image, EvaluatedImage)
+            if image.values.dtype.kind not in "biuf":
+                return None, None, "typed IMAGE grid requires real numeric values"
+            try:
+                image_viewport_for_evaluated_image(image)
+            except (TypeError, ValueError) as error:
+                return None, None, str(error)
+            axes = (image.x_axis, image.y_axis, image.value_unit)
+            if grid_image_axes is None:
+                grid_image_axes = axes
+            elif axes != grid_image_axes:
+                return None, None, (
+                    "typed IMAGE grid cells do not share axes and value unit"
+                )
         if intent is ViewIntent.CURVE:
             first_curve = series_group[0].data
             assert isinstance(first_curve, EvaluatedCurve)
@@ -206,17 +227,30 @@ def _classify_typed_grid(
 @dataclass(frozen=True, slots=True)
 class _TypedGridOverview:
     intent: ViewIntent
+    figure: DataFigure
     bundle: EncodedRasterDocument
     regions: tuple[FigurePanelRegion, ...]
     histogram_home_x_limits: tuple[float, float] | None
+    display_state: _GridDisplayState | None
 
     def __post_init__(self) -> None:
         if self.intent not in (
+            ViewIntent.IMAGE,
             ViewIntent.CURVE,
             ViewIntent.METER,
             ViewIntent.HISTOGRAM,
         ):
-            raise ValueError("typed grid overview requires CURVE, METER, or HISTOGRAM")
+            raise ValueError(
+                "typed grid overview requires IMAGE, CURVE, METER, or HISTOGRAM"
+            )
+        if not isinstance(self.figure, DataFigure):
+            raise TypeError("typed grid overview requires one exact DataFigure")
+        figure_intent, panel_count, reason = _classify_typed_grid(self.figure)
+        if figure_intent is not self.intent or panel_count is None:
+            raise ValueError(
+                "typed grid overview figure does not match its intent"
+                + ("" if reason is None else f": {reason}")
+            )
         if not isinstance(self.bundle, EncodedRasterDocument):
             raise TypeError("typed grid overview requires EncodedRasterDocument")
         if len(self.bundle.pages) != 1:
@@ -230,11 +264,16 @@ class _TypedGridOverview:
             )
         if len({region.key for region in regions}) != len(regions):
             raise ValueError("typed grid overview region keys must be unique")
+        if len(regions) != panel_count:
+            raise ValueError("typed grid overview regions do not cover its figure")
         selections = tuple(region.focus_selection for region in regions)
         if any(selection is None for selection in selections):
             raise ValueError("typed grid regions require exact selections")
         if len(set(selections)) != len(selections):
             raise ValueError("typed grid selections must identify unique panels")
+        display = self.display_state
+        if display is not None and _grid_state_intent(display) is not self.intent:
+            raise ValueError("typed grid display state does not match its intent")
         object.__setattr__(self, "regions", regions)
         home = self.histogram_home_x_limits
         if self.intent is ViewIntent.HISTOGRAM:
@@ -246,7 +285,7 @@ class _TypedGridOverview:
                 validated_display_range(home, "histogram grid home x limits"),
             )
         elif home is not None:
-            raise ValueError("METER grid cannot carry a histogram home x range")
+            raise ValueError("non-HISTOGRAM grid cannot carry a histogram home x range")
 
 _TypedDisplayState = (
     ImageDisplayState
@@ -254,6 +293,8 @@ _TypedDisplayState = (
     | HistogramDisplayState
     | MeterDisplayState
 )
+
+_GridDisplayState = _TypedDisplayState | FacetedHistogramDisplayState
 
 _TypedPanelPayload = (
     ImagePanelPayload
@@ -277,11 +318,14 @@ class _GridFocusRequest:
         if not isinstance(self.expected_selection, Selection):
             raise TypeError("grid focus requires one exact Selection")
         if _state_intent(self.display) not in (
+            ViewIntent.IMAGE,
             ViewIntent.CURVE,
             ViewIntent.METER,
             ViewIntent.HISTOGRAM,
         ):
-            raise ValueError("grid focus supports CURVE, METER, or HISTOGRAM display state")
+            raise ValueError(
+                "grid focus supports IMAGE, CURVE, METER, or HISTOGRAM display state"
+            )
         home = self.histogram_home_x_limits
         if isinstance(self.display, HistogramDisplayState):
             if home is None:
@@ -434,6 +478,11 @@ def _state_intent(state: _TypedDisplayState) -> ViewIntent:
     if isinstance(state, MeterDisplayState):
         return ViewIntent.METER
     raise TypeError("typed display state must be IMAGE, CURVE, HISTOGRAM, or METER")
+
+def _grid_state_intent(state: _GridDisplayState) -> ViewIntent:
+    if isinstance(state, FacetedHistogramDisplayState):
+        return ViewIntent.HISTOGRAM
+    return _state_intent(state)
 
 def _default_typed_state(intent: ViewIntent) -> _TypedDisplayState:
     if intent is ViewIntent.IMAGE:
@@ -603,6 +652,7 @@ def _validate_fit_replay_options(
 @dataclass(frozen=True, slots=True)
 class _TypedFigureFront:
     intent: ViewIntent
+    figure: DataFigure
     state: _TypedDisplayState
     summary: str
     frame: BoardFrame
@@ -612,6 +662,7 @@ class _TypedFigureFront:
     fit_result_identity: str | None
     transient_fit_result_owner: FitResultBatch | None
     release_initial_canonical_on_commit: bool
+    raster_size: tuple[int, int]
 
     def __post_init__(self) -> None:
         if self.intent not in (
@@ -621,6 +672,22 @@ class _TypedFigureFront:
             ViewIntent.METER,
         ):
             raise ValueError("typed figure front has another intent")
+        if not isinstance(self.figure, DataFigure):
+            raise TypeError("typed figure front requires one exact DataFigure")
+        figure_intent, unavailable_reason = _classify_single_typed(self.figure)
+        if figure_intent is not self.intent:
+            raise ValueError(
+                "typed figure front DataFigure does not match its intent"
+                + (
+                    ""
+                    if unavailable_reason is None
+                    else f": {unavailable_reason}"
+                )
+            )
+        if self.figure.has_fit_overlays != (self.fit_result_identity is not None):
+            raise ValueError(
+                "typed figure front Fit overlay and result identity disagree"
+            )
         if _state_intent(self.state) is not self.intent:
             raise ValueError("typed figure front state belongs to another intent")
         if not isinstance(self.summary, str) or not self.summary:
@@ -661,8 +728,20 @@ class _TypedFigureFront:
             raise TypeError("transient_fit_result_owner must be FitResultBatch or None")
         if not isinstance(self.release_initial_canonical_on_commit, bool):
             raise TypeError("release_initial_canonical_on_commit must be bool")
+        raster_size = tuple(self.raster_size)
+        if (
+            len(raster_size) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in raster_size
+            )
+        ):
+            raise ValueError("typed figure raster_size must contain two positive integers")
         object.__setattr__(self, "fit_axis_ids", fit_axis_ids)
         object.__setattr__(self, "axis_roles", roles)
+        object.__setattr__(self, "raster_size", raster_size)
         panel = self.frame.panels[0]
         payload = panel.display_payload
         if (
@@ -679,13 +758,13 @@ class _TypedFigureFront:
             or _payload_intent(payload) is not self.intent
         ):
             raise ValueError("typed figure front has another payload")
+        if payload.evaluated_input is not self.figure.evaluated.inputs[0]:
+            raise ValueError(
+                "typed figure front DataFigure has another evaluated input"
+            )
         raster = panel.raster
-        if isinstance(payload, ImagePanelPayload):
-            if (raster.width, raster.height) != _NUMERIC_RASTER_SIZE:
-                raise ValueError("IMAGE front has another panel-raster geometry")
-        else:
-            if (raster.width, raster.height) != _NUMERIC_RASTER_SIZE:
-                raise ValueError("numeric front has another raster geometry")
+        if (raster.width, raster.height) != raster_size:
+            raise ValueError("typed front has another panel-raster geometry")
 
 def _typed_join_digest(
     figure: DataFigure,

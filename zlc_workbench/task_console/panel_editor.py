@@ -1,7 +1,10 @@
 """The panel Edit tab: a snapshot of the card plus its full parameter surface.
 
-The editor owns only a frozen raster view and copies the card's accepted
-immutable front.  It never evaluates data or owns a Matplotlib composer.
+The editor freezes the card's accepted immutable ``DataFigure`` into the one
+shared interactive DataFigure surface.  A calibrated SiteMap, which is a
+two-input physical join rather than a DataFigure, copies its exact BoardFrame
+into the shared ``SinglePanelHost``.  The editor never evaluates data or owns a
+Matplotlib composer.
 
 Every import names a TRUE owner -- nothing here touches the legacy tree.
 """
@@ -45,6 +48,7 @@ from zlc_frontend.form import (
     text_to_python as _text_to_py,
 )
 from zlc_frontend.panel_params import panel_param_decls as _panel_param_decls
+from zlc_frontend.render_style import panel_display_size
 from .panel_types import RELIM_PARAM as _RELIM_PARAM
 from zlc_storage.paths import display_path
 
@@ -109,11 +113,12 @@ class PanelEditor(QtWidgets.QWidget):
         self.console = console
         self.setStyleSheet("background: transparent;")
         self._board = None
-        self._displayed_figure = None
-        self._displayed_display = None
-        self._displayed_png: bytes | None = None
+        self._candidate_board = None
         self._follow_next_front = False
         card.front_presented.connect(self._on_card_front_presented)
+        card.selectors_enabled_changed.connect(
+            self._sync_snapshot_selectors
+        )
         # A plot panel's Edit never carries a measurement form or Start/Stop: a plot is a
         # pure VIEW, and the node that produces its data lives on the Logic tab.
         self.meas_panel = None
@@ -313,13 +318,24 @@ class PanelEditor(QtWidgets.QWidget):
         self.canvas_holder.setContentsMargins(0, 0, 0, 0)
         col.addLayout(self.canvas_holder)
 
-        # ---- Analysis: another view of the card's one FINAL-artifact command.
-        # Model/axis/constraint authoring and the result overlay live in the
-        # shared DataFigure host; this Edit tab does not create a parallel
-        # parallel fit draft or worker.
+        # ---- Analysis: open the Fit pane belonging to this exact frozen
+        # DataFigure.  It must not delegate to the live card, which may already
+        # have presented another immutable revision.
+        self.analysis_button = None
         if self.card is not None and self.card.fit_analysis_sink is not None:
             section("Analysis")
-            col.addWidget(self.card.make_fit_analysis_button())
+            self.analysis_button = FluentButton(
+                "Analyze → Fit",
+                color=ORANGE,
+            )
+            self.analysis_button.setEnabled(False)
+            self.analysis_button.setToolTip(
+                "Fit the exact immutable snapshot shown in this Edit tab"
+            )
+            self.analysis_button.clicked.connect(
+                self._open_snapshot_analysis
+            )
+            col.addWidget(self.analysis_button)
 
         # ---- Limits: the view-window pins.  A box holds the STORED pin (empty =
         # autoscale) and is re-seeded only on build / show / Clear, so the refresh tick
@@ -409,15 +425,15 @@ class PanelEditor(QtWidgets.QWidget):
         self.rebuild()
 
     def rebuild(self) -> None:
-        """Copy the card's accepted immutable front into the frozen view.
+        """Freeze the card's actually-presented source into its shared viewer.
 
-        Refresh is a presentation copy, not a second render.  The live card's
-        worker compose is the only evaluation/rasterization for a semantic
-        commit, so the Edit snapshot cannot disagree with it or double the
-        cost of every parameter change.
+        The live card is the source of exact data/display/geometry facts.  A
+        normal DataFigure then gets an independent immutable interaction
+        session; a calibrated SiteMap copies the already-rendered physical
+        join because it cannot truthfully be retyped as a one-input Figure.
         """
 
-        from zlc_frontend.qt_widgets import FrozenRasterView, SinglePanelHost
+        from zlc_frontend.qt_widgets import SinglePanelHost
 
         card = self.card
         front = (
@@ -433,36 +449,187 @@ class PanelEditor(QtWidgets.QWidget):
         if front is None and overview_png is None:
             self.status.setText("open the panel with data first")
             return
-        if self._board is None:
-            self._board = (
-                SinglePanelHost(card.panel_id, empty_text="no snapshot yet")
-                if card.config.kind == "sites"
-                else FrozenRasterView(
+        if card.config.kind == "sites" and front is not None:
+            candidate = self._candidate_board
+            self._candidate_board = None
+            if candidate is not None:
+                self._retire_snapshot_surface(candidate)
+            board = self._board
+            if not isinstance(board, SinglePanelHost):
+                self._retire_snapshot_surface(board)
+                board = SinglePanelHost(
                     card.panel_id,
                     empty_text="no snapshot yet",
-                    zoomable=True,
                 )
+                board.rectangleSelected.connect(
+                    self._accept_site_rectangle
+                )
+                board.viewCommitted.connect(
+                    self._discard_site_display_commit
+                )
+                board.colorLimitsCommitted.connect(
+                    self._discard_site_display_commit
+                )
+                self._board = board
+                self.canvas_holder.addWidget(board)
+            size_name, _pixel_ratio = card.frozen_panel_geometry()
+            board.set_logical_size(
+                tuple(int(value) for value in panel_display_size(size_name))
             )
-            self.canvas_holder.addWidget(self._board)
-        if card.config.kind == "sites" and front is not None:
-            figure = None
+            board.present_frame(front)
+            board.set_selectors_enabled(card.selectors_enabled)
+            if self.analysis_button is not None:
+                self.analysis_button.setEnabled(False)
+            self.status.setText("")
+            return
+
+        try:
+            figure = card.frozen_data_figure()
+            display = card.frozen_display_state()
+            size_name, pixel_ratio = card.frozen_panel_geometry()
+            title, value_label = card.frozen_panel_labels()
+            initial_payload = card.frozen_render_payload()
+        except Exception as error:
+            self.status.setText("%s: %s" % (type(error).__name__, error))
+            return
+
+        from zlc_workbench.data_figure.app import create_data_figure_pane
+        from zlc_workbench.data_figure.projection import (
+            _classify_typed_grid,
+        )
+
+        local_fit = card.has_local_fit_source()
+        grid_intent, grid_panel_count, _grid_reason = (
+            _classify_typed_grid(figure)
+        )
+        is_grid_overview = (
+            grid_intent is not None and grid_panel_count is not None
+        )
+        grid_display = (
+            display if is_grid_overview else None
+        )
+        initial_display = None if grid_display is not None else display
+        candidate = create_data_figure_pane(
+            figure,
+            initial_display=initial_display,
+            initial_grid_display=grid_display,
+            local_fit=local_fit,
+            local_fit_initial_selection=(
+                card.fit_selection_candidate() if local_fit else None
+            ),
+            embedded=True,
+            surface_only=True,
+            size_name=size_name,
+            pixel_ratio=pixel_ratio,
+            presentation_title=title,
+            presentation_value_label=value_label,
+            initial_payload=(
+                None if is_grid_overview else initial_payload
+            ),
+        )
+        candidate.set_interaction_enabled(card.selectors_enabled)
+        old_candidate = self._candidate_board
+        self._candidate_board = candidate
+        if old_candidate is not None:
+            self._retire_snapshot_surface(old_candidate)
+        candidate.hide()
+        self.canvas_holder.addWidget(candidate)
+        candidate.initialReady.connect(
+            lambda pane=candidate, fit=local_fit:
+            self._accept_snapshot_surface(pane, fit)
+        )
+        candidate.initialFailed.connect(
+            lambda detail, pane=candidate:
+            self._reject_snapshot_surface(pane, detail)
+        )
+        self.status.setText("building frozen interactive snapshot…")
+
+    def _retire_snapshot_surface(self, board) -> None:
+        if board is None:
+            return
+        self.canvas_holder.removeWidget(board)
+        board.hide()
+        shutdown = getattr(board, "shutdown", None)
+        if callable(shutdown):
+            board.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+            shutdown()
         else:
-            try:
-                figure = card.frozen_data_figure()
-            except Exception as error:
-                self.status.setText("%s: %s" % (type(error).__name__, error))
-                return
-        if front is not None:
-            if isinstance(self._board, SinglePanelHost):
-                self._board.present_frame(front)
-            else:
-                self._board.present(front)
-            self._displayed_png = None
-        else:
-            self._board.present_encoded(overview_png, image_format="PNG")
-            self._displayed_png = bytes(overview_png)
-        self._displayed_figure = figure
-        self._displayed_display = card._last_display
+            board.setParent(None)
+            board.deleteLater()
+
+    def _accept_snapshot_surface(
+        self,
+        pane,
+        local_fit: bool,
+    ) -> None:
+        if pane is not self._candidate_board:
+            self._retire_snapshot_surface(pane)
+            return
+        presentation = pane.visible_presentation
+        if presentation is None:
+            self._reject_snapshot_surface(
+                pane,
+                "the interactive snapshot admitted no stable front",
+            )
+            return
+        old = self._board
+        self._candidate_board = None
+        self._board = pane
+        if old is not None and old is not pane:
+            self._retire_snapshot_surface(old)
+        pane.show()
+        if self.analysis_button is not None:
+            self.analysis_button.setEnabled(bool(local_fit))
+        self.refresh_limit_hints()
+        self.status.setText("")
+
+    def _reject_snapshot_surface(self, pane, detail: str) -> None:
+        if pane is not self._candidate_board:
+            return
+        self._candidate_board = None
+        self._retire_snapshot_surface(pane)
+        self.status.setText(f"snapshot failed: {detail}")
+
+    def _sync_snapshot_selectors(self, enabled: bool) -> None:
+        for board in (self._board, self._candidate_board):
+            if board is None:
+                continue
+            setter = getattr(board, "set_interaction_enabled", None)
+            if setter is None:
+                setter = getattr(board, "set_selectors_enabled", None)
+            if callable(setter):
+                setter(bool(enabled))
+
+    def _accept_site_rectangle(self, gesture) -> None:
+        from zlc_frontend.selector import RectangleGesture
+        from zlc_frontend.qt_widgets import SinglePanelHost
+
+        board = self._board
+        if not isinstance(board, SinglePanelHost) or not isinstance(
+            gesture,
+            RectangleGesture,
+        ):
+            return
+        if gesture.origin != board.visible_interaction_origin():
+            return
+        board.board.set_image_rectangle_candidate(
+            gesture.normalized_bounds
+        )
+
+    def _discard_site_display_commit(self, command) -> None:
+        origin = getattr(command, "origin", None)
+        board = self._board
+        if origin is not None and board is not None:
+            board.discard_pending_interaction(origin)
+
+    def _open_snapshot_analysis(self) -> None:
+        pane = self._board
+        opener = getattr(pane, "open_analysis", None)
+        if not callable(opener) or not opener():
+            self.status.setText(
+                "Fit is unavailable for this frozen panel projection"
+            )
+            return
         self.status.setText("")
 
     def _on_card_front_presented(self) -> None:
@@ -474,14 +641,19 @@ class PanelEditor(QtWidgets.QWidget):
     def teardown(self) -> None:
         """Release this tab's frozen Qt presentation surface."""
 
-        if self._board is not None:
-            self.canvas_holder.removeWidget(self._board)
-            self._board.setParent(None)
-            self._board.deleteLater()
+        self._retire_snapshot_surface(self._candidate_board)
+        self._candidate_board = None
+        self._retire_snapshot_surface(self._board)
         self._board = None
         if self.card is not None:
             try:
                 self.card.front_presented.disconnect(self._on_card_front_presented)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.card.selectors_enabled_changed.disconnect(
+                    self._sync_snapshot_selectors
+                )
             except (TypeError, RuntimeError):
                 pass
 
@@ -714,6 +886,28 @@ class PanelEditor(QtWidgets.QWidget):
             rows.append(("view_ylim", self.ymin, self.ymax))
         return tuple(rows)
 
+    def _data_figure_presentation(self):
+        """Return the shared pane's exact public presentation, if applicable."""
+
+        board = self._board
+        if board is None:
+            return None
+        if not hasattr(type(board), "visible_presentation"):
+            return None
+        return board.visible_presentation
+
+    def _visible_snapshot_pixels(self):
+        """Return the immutable front or overview that is actually on screen."""
+
+        presentation = self._data_figure_presentation()
+        if presentation is not None:
+            return presentation.frame, presentation.overview_png
+        board = self._board
+        return (
+            None if board is None else getattr(board, "front_frame", None),
+            None,
+        )
+
     def _front_view_bounds(self):
         """The window the composed front is showing, as (xlo, xhi, ylo, yhi).
 
@@ -722,7 +916,7 @@ class PanelEditor(QtWidgets.QWidget):
         picture rather than a range derived beside it.
         """
 
-        front = None if self._board is None else self._board.front_frame
+        front, _overview_png = self._visible_snapshot_pixels()
         panels = tuple(getattr(front, "panels", ()) or ())
         if not panels:
             return None
@@ -938,8 +1132,9 @@ class PanelEditor(QtWidgets.QWidget):
     def save(self) -> None:
         """Write the exact visible pixels and their exact typed data revision."""
 
-        front = None if self._board is None else self._board.front_frame
-        if front is None and self._displayed_png is None:
+        presentation = self._data_figure_presentation()
+        front, overview_png = self._visible_snapshot_pixels()
+        if front is None and overview_png is None:
             self.status.setText("no snapshot to save")
             return
         try:
@@ -949,7 +1144,7 @@ class PanelEditor(QtWidgets.QWidget):
             image = (
                 _front_qimage(front)
                 if front is not None
-                else QtGui.QImage.fromData(self._displayed_png, "PNG")
+                else QtGui.QImage.fromData(overview_png, "PNG")
             )
             if image is None or not image.save(str(target)):
                 raise RuntimeError("Qt refused to write %s" % target.name)
@@ -959,8 +1154,12 @@ class PanelEditor(QtWidgets.QWidget):
                 self.status.setText("saved %s" % target.name)
                 self.status.setToolTip(str(stem.parent))
                 return
-            figure = self._displayed_figure
-            display = self._displayed_display
+            if presentation is None:
+                raise RuntimeError(
+                    "the editor has no exact typed presentation to save"
+                )
+            figure = presentation.figure
+            display = presentation.display_state
             if figure is None or display is None:
                 raise RuntimeError("the editor has no exact typed figure to save")
             figure.save_archive(
@@ -968,7 +1167,17 @@ class PanelEditor(QtWidgets.QWidget):
                 display=display,
                 metadata={
                     "panel_kind": str(self.card.config.kind),
-                    "title": str(self.card.config.title or ""),
+                    "title": str(
+                        presentation.presentation_title or ""
+                    ),
+                    "size_name": presentation.size_name,
+                    "pixel_ratio": presentation.pixel_ratio,
+                    "presentation_title": (
+                        presentation.presentation_title
+                    ),
+                    "presentation_value_label": (
+                        presentation.presentation_value_label
+                    ),
                 },
             )
             self.console._last_save_dir = str(stem.parent)

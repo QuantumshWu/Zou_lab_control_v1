@@ -181,7 +181,7 @@ class ConsoleRenderLane:
                         display=request.display,
                     )
                     faceted_result = None
-                    document = None
+                    figure = None
                 elif request.faceted:
                     faceted_result = composer.compose_faceted(
                         request.value.snapshot,
@@ -190,15 +190,14 @@ class ConsoleRenderLane:
                         focus=request.focus,
                     )
                     frame = None
-                    document = faceted_result.figure.document
+                    figure = faceted_result.figure
                 else:
-                    frame = composer.compose(
+                    frame, figure = composer.compose_with_figure(
                         request.value.snapshot,
                         display=request.display,
                         provenance=request.provenance,
                     )
                     faceted_result = None
-                    document = composer.document_for(request.value.snapshot.block.schema)
             except PanelRenderError as error:
                 results.append((request, None, None, None, str(error)))
             except BaseException as error:
@@ -213,7 +212,7 @@ class ConsoleRenderLane:
                     )
                 )
             else:
-                results.append((request, frame, faceted_result, document, None))
+                results.append((request, frame, faceted_result, figure, None))
         return tuple(results)
 
     def _finished(self, future: Future) -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, Future
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 import threading
@@ -22,6 +22,7 @@ from zlc_data import (
     Selection,
 )
 from zlc_frontend import (
+    BoardFrame,
     CurvePanelPayload,
     DataFigure,
     FitAuthoringOption,
@@ -35,6 +36,7 @@ from zlc_frontend.display_range import RelimMode
 from zlc_frontend.encoded_raster import EncodedRasterDocument
 from zlc_frontend.figure import AxisViewRole, ViewIntent
 from zlc_frontend.histogram_display import (
+    FacetedHistogramDisplayState,
     HistogramCountScale,
     HistogramDisplayState,
     histogram_display_with_thresholds,
@@ -81,10 +83,13 @@ from .projection import (
     _FitOverlayRequest,
     _FitSelectionCandidate,
     _FitWorkbenchBindings,
+    _GridDisplayState,
     _GridFocusRequest,
     _TypedDisplayState,
     _TypedFigureFront,
     _TypedGridOverview,
+    _classify_single_typed,
+    _classify_typed_grid,
     _default_typed_state,
     _payload_intent,
     _same_exact_data_owners,
@@ -106,6 +111,90 @@ from .render_lane import (
     _reload_fit_result,
 )
 
+
+@dataclass(frozen=True, slots=True)
+class VisibleDataFigurePresentation:
+    """One immutable presentation that is exactly stable on the Qt surface."""
+
+    view_family: str
+    figure: DataFigure
+    frame: BoardFrame | None
+    overview_png: bytes | None
+    display_state: _GridDisplayState | None
+    size_name: str | None
+    pixel_ratio: float
+    presentation_title: str | None
+    presentation_value_label: str | None
+
+    def __post_init__(self) -> None:
+        family = str(self.view_family).strip()
+        if not family:
+            raise ValueError("visible presentation view_family must be non-empty")
+        if not isinstance(self.figure, DataFigure):
+            raise TypeError(
+                "visible presentation requires one exact DataFigure"
+            )
+        if self.size_name is not None:
+            if not isinstance(self.size_name, str):
+                raise TypeError(
+                    "visible presentation size_name must be text or None"
+                )
+            from zlc_data.panel_size import panel_size_cells
+
+            panel_size_cells(self.size_name)
+        ratio = float(self.pixel_ratio)
+        if not math.isfinite(ratio) or ratio <= 0.0:
+            raise ValueError(
+                "visible presentation pixel_ratio must be positive and finite"
+            )
+        object.__setattr__(self, "pixel_ratio", ratio)
+        for name in (
+            "presentation_title",
+            "presentation_value_label",
+        ):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{name} must be text or None")
+        has_frame = self.frame is not None
+        has_overview = self.overview_png is not None
+        if has_frame == has_overview:
+            raise ValueError(
+                "visible presentation requires exactly one frame or overview PNG"
+            )
+        if has_frame:
+            if not isinstance(self.frame, BoardFrame) or len(self.frame.panels) != 1:
+                raise TypeError("visible typed presentation requires one BoardFrame panel")
+            if self.display_state is None:
+                raise ValueError("visible typed presentation requires display_state")
+            if isinstance(self.display_state, FacetedHistogramDisplayState):
+                raise TypeError(
+                    "a focused typed presentation requires one cell display state"
+                )
+            intent, reason = _classify_single_typed(self.figure)
+            if intent is None or family != intent.value.lower():
+                raise ValueError(
+                    "visible typed presentation Figure does not match its family"
+                    + ("" if reason is None else f": {reason}")
+                )
+        elif (
+            not isinstance(self.overview_png, bytes)
+            or not self.overview_png
+        ):
+            raise ValueError("visible overview presentation requires owned PNG bytes")
+        else:
+            intent, panel_count, reason = _classify_typed_grid(self.figure)
+            if (
+                intent is None
+                or panel_count is None
+                or family != f"{intent.value.lower()}-overview"
+            ):
+                raise ValueError(
+                    "visible overview presentation Figure does not match its family"
+                    + ("" if reason is None else f": {reason}")
+                )
+        object.__setattr__(self, "view_family", family)
+
+
 class DataFigureWindow(FrozenRasterWindow):
     """Frozen generic viewer with one closed IMAGE/CURVE/HISTOGRAM/METER front."""
 
@@ -123,6 +212,12 @@ class DataFigureWindow(FrozenRasterWindow):
         typed_front_committed=None,
         initial_display: _TypedDisplayState | None = None,
         embedded: bool = False,
+        surface_only: bool = False,
+        logical_panel_size: tuple[int, int] | None = None,
+        size_name: str | None = None,
+        pixel_ratio: float = 1.0,
+        presentation_title: str | None = None,
+        presentation_value_label: str | None = None,
     ) -> None:
         if not callable(initial_loader) or not callable(typed_renderer):
             raise TypeError("figure worker callables must be callable")
@@ -141,12 +236,51 @@ class DataFigureWindow(FrozenRasterWindow):
             _state_intent(initial_display)
         if not isinstance(embedded, bool):
             raise TypeError("embedded must be bool")
+        if not isinstance(surface_only, bool):
+            raise TypeError("surface_only must be bool")
+        if surface_only and not embedded:
+            raise ValueError("surface_only requires embedded=True")
+        if logical_panel_size is not None:
+            logical_panel_size = tuple(logical_panel_size)
+            if (
+                len(logical_panel_size) != 2
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value <= 0
+                    for value in logical_panel_size
+                )
+            ):
+                raise ValueError(
+                    "logical_panel_size must contain two positive integers"
+                )
+        if size_name is not None:
+            if not isinstance(size_name, str):
+                raise TypeError("size_name must be text or None")
+            from zlc_data.panel_size import panel_size_cells
+
+            panel_size_cells(size_name)
+        pixel_ratio = float(pixel_ratio)
+        if not math.isfinite(pixel_ratio) or pixel_ratio <= 0.0:
+            raise ValueError("pixel_ratio must be positive and finite")
+        for name, value in (
+            ("presentation_title", presentation_title),
+            ("presentation_value_label", presentation_value_label),
+        ):
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{name} must be text or None")
         self._typed_renderer = typed_renderer
         self._fit_overlay_renderer = fit_overlay_renderer
         self._fit_bindings = fit_bindings
         self._typed_front_committed = typed_front_committed
         self._initial_display = initial_display
         self._embedded = embedded
+        self._surface_only = surface_only
+        self._logical_panel_size = logical_panel_size
+        self._size_name = size_name
+        self._pixel_ratio = pixel_ratio
+        self._presentation_title = presentation_title
+        self._presentation_value_label = presentation_value_label
         self._view_family: str | None = None
         self._display: _TypedDisplayState | None = None
         self._typed_contract: (
@@ -171,6 +305,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._fit_axis_roles: tuple[tuple[AxisId, AxisViewRole], ...] = ()
         self._visible_fit_result_identity: str | None = None
         self._grid_overview: _TypedGridOverview | None = None
+        self._visible_figure: DataFigure | None = None
         self._grid_focus_pending: _GridFocusRequest | None = None
         self._discard_grid_focus_sequence: int | None = None
 
@@ -248,7 +383,10 @@ class DataFigureWindow(FrozenRasterWindow):
             empty_text="Resolving exact typed figure…",
         )
         self._board_widget.setObjectName("figureViewerTypedBoard")
-        self._board_widget.setMinimumSize(480, 320)
+        if logical_panel_size is None:
+            self._board_widget.setMinimumSize(480, 320)
+        else:
+            self._board_widget.setFixedSize(*logical_panel_size)
         page_layout.addWidget(self._board_widget, 1)
 
         self._settings_popup = FluentPopup(self)
@@ -301,6 +439,7 @@ class DataFigureWindow(FrozenRasterWindow):
             pane.optionsReleased.connect(self._fit_option_widgets_released)
             pane.hide()
             self._fit_pane = pane
+        self._sync_surface_only_chrome()
         self._set_typed_controls_enabled(False)
         if not self._submit_future(
             initial_loader,
@@ -313,6 +452,25 @@ class DataFigureWindow(FrozenRasterWindow):
                 0,
                 lambda detail=failure: self._emit_initial_failed(detail),
             )
+
+    def _sync_surface_only_chrome(self) -> None:
+        if not self._surface_only:
+            return
+        for widget in (
+            self._mode,
+            self._status,
+            self._summary,
+            self._diagnostic,
+            self._close_button,
+            self._interaction_switch,
+            self._settings_button,
+            self._analyze_button,
+            self._overview_button,
+            self._export_button,
+        ):
+            widget.hide()
+        self._layout.setSpacing(0)
+        self._tabs.tabBar().setVisible(self._fit_analysis_is_open())
 
     def _emit_initial_ready(self) -> None:
         """Publish the one-time boundary after an actual front is admitted."""
@@ -338,8 +496,11 @@ class DataFigureWindow(FrozenRasterWindow):
         if len(self._boards) != 1 or not isinstance(self._boards[0], FrozenRasterView):
             raise RuntimeError("typed grid overview did not admit one encoded board")
         board = self._boards[0]
+        if self._logical_panel_size is not None:
+            board.setFixedSize(*self._logical_panel_size)
         board.normalizedDoubleClicked.connect(self._focus_grid_region)
         self._grid_overview = overview
+        self._visible_figure = overview.figure
         self._view_family = f"{overview.intent.value.lower()}-overview"
         self._display = None
         self._typed_contract = None
@@ -358,6 +519,7 @@ class DataFigureWindow(FrozenRasterWindow):
             widget.hide()
         self._export_button.show()
         self._set_typed_controls_enabled(True)
+        self._sync_surface_only_chrome()
 
     @QtCore.pyqtSlot(float, float)
     def _focus_grid_region(self, x: float, y: float) -> None:
@@ -384,11 +546,23 @@ class DataFigureWindow(FrozenRasterWindow):
         panel_index, region = hits[0]
         if region.focus_selection is None:
             raise RuntimeError("typed grid region lost its exact selection")
-        display: _TypedDisplayState = (
-            MeterDisplayState(panel_index, region.focus_selection)
-            if overview.intent is ViewIntent.METER
-            else _default_typed_state(overview.intent)
-        )
+        grid_display = overview.display_state
+        if isinstance(grid_display, FacetedHistogramDisplayState):
+            display = grid_display.display_for(region.focus_selection)
+        elif isinstance(grid_display, MeterDisplayState):
+            display = MeterDisplayState(
+                panel_index,
+                region.focus_selection,
+                grid_display.revision,
+            )
+        elif grid_display is None:
+            display = (
+                MeterDisplayState(panel_index, region.focus_selection)
+                if overview.intent is ViewIntent.METER
+                else _default_typed_state(overview.intent)
+            )
+        else:
+            display = grid_display
         request = _GridFocusRequest(
             panel_index,
             region.focus_selection,
@@ -439,6 +613,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._fit_axis_ids = ()
         self._fit_axis_roles = ()
         self._fit_overlay_desired = None
+        self._visible_figure = overview.figure
         self._view_family = f"{overview.intent.value.lower()}-overview"
         overview_board = self._boards[0]
         if self._tabs.indexOf(overview_board) < 0:
@@ -452,6 +627,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._overview_button.hide()
         self._export_button.show()
         self._set_typed_controls_enabled(True)
+        self._sync_surface_only_chrome()
 
     def keyPressEvent(self, event) -> None:
         if event.key() == QtCore.Qt.Key_Escape and self._grid_overview is not None:
@@ -505,6 +681,67 @@ class DataFigureWindow(FrozenRasterWindow):
     @property
     def saved_reference(self) -> FitResultArtifactRef | None:
         return self._saved_fit_reference
+
+    @property
+    def visible_presentation(self) -> VisibleDataFigurePresentation | None:
+        """Return only an exact, stable presentation currently painted by Qt."""
+
+        if self._closing:
+            return None
+        display = self._display
+        frame = self._board_widget.front_frame
+        if (
+            self._view_family in ("image", "curve", "histogram", "meter")
+            and display is not None
+            and frame is not None
+            and self.raster_ready
+            and self._future is None
+        ):
+            payload = self._visible_typed_payload()
+            if (
+                payload is not None
+                and len(frame.panels) == 1
+                and frame.panels[0].display_payload is payload
+            ):
+                return VisibleDataFigurePresentation(
+                    view_family=self._view_family,
+                    figure=self._visible_figure,
+                    frame=frame,
+                    overview_png=None,
+                    display_state=display,
+                    size_name=self._size_name,
+                    pixel_ratio=self._pixel_ratio,
+                    presentation_title=self._presentation_title,
+                    presentation_value_label=self._presentation_value_label,
+                )
+            return None
+        overview = self._grid_overview
+        overview_family = (
+            None
+            if overview is None
+            else f"{overview.intent.value.lower()}-overview"
+        )
+        if (
+            overview is not None
+            and self._view_family == overview_family
+            and self._future is None
+            and self._bundle is not None
+            and len(self._bundle.pages) == 1
+            and len(self._boards) == 1
+            and self._boards[0].has_front
+        ):
+            return VisibleDataFigurePresentation(
+                view_family=overview_family,
+                figure=self._visible_figure,
+                frame=None,
+                overview_png=bytes(self._bundle.pages[0].png_bytes),
+                display_state=overview.display_state,
+                size_name=self._size_name,
+                pixel_ratio=self._pixel_ratio,
+                presentation_title=self._presentation_title,
+                presentation_value_label=self._presentation_value_label,
+            )
+        return None
 
     @property
     def fit_models(self) -> tuple[str, ...]:
@@ -660,12 +897,16 @@ class DataFigureWindow(FrozenRasterWindow):
                     _TYPED_PANEL_ID,
                     payload.viewport,
                     self._accept_image_rectangle,
-                    enabled=True,
+                    enabled=self._interaction_switch.isChecked(),
                     interaction_callback=self._accept_image_interaction,
                 )
             else:
                 assert bind is not None
-                bind(_TYPED_PANEL_ID, self._accept_numeric_interaction, enabled=True)
+                bind(
+                    _TYPED_PANEL_ID,
+                    self._accept_numeric_interaction,
+                    enabled=self._interaction_switch.isChecked(),
+                )
         except BaseException:
             if setting is not None:
                 self._settings_popup_layout.removeWidget(setting)
@@ -828,6 +1069,16 @@ class DataFigureWindow(FrozenRasterWindow):
         except BaseException as error:
             self._diagnostic.setText(error_summary(error))
 
+    def set_interaction_enabled(self, enabled: bool) -> None:
+        """Gate the sole board selector through the existing Interact owner."""
+
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be bool")
+        changed = self._interaction_switch.isChecked() != enabled
+        self._interaction_switch.setChecked(enabled)
+        if not changed:
+            self._toggle_interaction(enabled)
+
     def _fit_analysis_is_open(self) -> bool:
         pane = self._fit_pane
         return pane is not None and self._tabs.indexOf(pane) >= 0
@@ -887,6 +1138,13 @@ class DataFigureWindow(FrozenRasterWindow):
             pane.show()
         self._tabs.setCurrentWidget(pane)
         self._start_fit_prepare()
+
+    def open_analysis(self) -> bool:
+        """Open the existing Fit pane without exposing its private lifecycle."""
+
+        self._open_fit_analysis()
+        self._sync_surface_only_chrome()
+        return self._fit_analysis_is_open()
 
     def _submit_fit_future(self, kind: str, function, *args) -> bool:
         if self._fit_future is not None:
@@ -1626,15 +1884,13 @@ class DataFigureWindow(FrozenRasterWindow):
                 raise ValueError("typed worker changed frozen evaluated data")
 
         self._board_widget.present(front.frame)
-        if self._typed_front_committed is not None:
-            self._typed_front_committed(
-                front.release_initial_canonical_on_commit
-            )
         # The admitted board front is the transaction boundary.  Commit the
-        # exact authored state/contract before any optional Qt chrome work.
+        # exact Figure/authored state/contract before cache release or any
+        # optional Qt chrome work.
         if expected_contract is None:
             self._typed_contract = contract
         self._display = expected_state
+        self._visible_figure = front.figure
         self._view_family = front.intent.value.lower()
         self._fit_axis_ids = front.fit_axis_ids
         self._fit_axis_roles = front.axis_roles
@@ -1642,6 +1898,10 @@ class DataFigureWindow(FrozenRasterWindow):
         self._visible_transient_fit_result_owner = (
             front.transient_fit_result_owner
         )
+        if self._typed_front_committed is not None:
+            self._typed_front_committed(
+                front.release_initial_canonical_on_commit
+            )
         if front.intent is not ViewIntent.METER and self._fit_overlay_desired is None:
             self._fit_overlay_desired = _FitOverlayRequest(
                 self._fit_analysis_revision,
@@ -1690,13 +1950,14 @@ class DataFigureWindow(FrozenRasterWindow):
             self._overview_button.setVisible(self._grid_overview is not None)
             self._tabs.tabBar().setVisible(False)
             self._set_typed_controls_enabled(True)
+            self._sync_surface_only_chrome()
             return
         try:
             self._ensure_typed_controls(expected_state)
             edit, _setting = self._editors()
-            if self._tabs.indexOf(edit) < 0:
+            if not self._surface_only and self._tabs.indexOf(edit) < 0:
                 self._tabs.addTab(edit, "Edit")
-            self._tabs.tabBar().setVisible(True)
+            self._tabs.tabBar().setVisible(not self._surface_only)
             edit.show()
             for widget in (
                 self._interaction_switch,
@@ -1731,6 +1992,7 @@ class DataFigureWindow(FrozenRasterWindow):
                         "Analyze unavailable: grid focus is a display projection; "
                         "Fit authority requires an axis-complete source view."
                     )
+            self._sync_surface_only_chrome()
         except BaseException as error:
             self._typed_ui_faulted = True
             self._set_typed_controls_enabled(False)
@@ -2297,6 +2559,7 @@ class DataFigureWindow(FrozenRasterWindow):
         super()._clear_bundle()
         self._board_widget.clear()
         self._grid_overview = None
+        self._visible_figure = None
         self._grid_focus_pending = None
         self._discard_grid_focus_sequence = None
 
@@ -2416,4 +2679,4 @@ class DataFigureWindow(FrozenRasterWindow):
             fit_future.cancel()
 
 
-__all__ = ["DataFigureWindow"]
+__all__ = ["DataFigureWindow", "VisibleDataFigurePresentation"]

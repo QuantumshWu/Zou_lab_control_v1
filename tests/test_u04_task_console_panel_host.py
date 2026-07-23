@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 import os
+import time
 
+import numpy as np
 import pytest
 
 import Zou_lab_control.notebook as zlc
@@ -63,6 +65,108 @@ def _drag_move(board, position, button) -> None:
         QtCore.Qt.NoModifier,
     )
     QtWidgets.QApplication.sendEvent(board, event)
+
+
+def _wait_until(application, predicate, timeout: float = 20.0) -> None:
+    from PyQt5 import QtCore
+
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        time.sleep(0.005)
+    assert predicate()
+
+
+def _camera_value():
+    from zlc_data import (
+        REPEAT,
+        SCAN_POINT,
+        SPATIAL_X,
+        SPATIAL_Y,
+        AxisId,
+        AxisSpec,
+        BlockId,
+        ComponentValidity,
+        CoordinateFrameId,
+        DataBlock,
+        DatasetRevision,
+        DatasetSchema,
+        OwnedSnapshot,
+        PointLayout,
+        StreamGenerationId,
+        ValidityContract,
+        ValueSchema,
+    )
+    from zlc_workbench.task_console.data_plane import ConsoleSignalValue
+
+    repeat = AxisSpec(
+        AxisId("task-console-edit.repeat"),
+        "Repeat",
+        REPEAT,
+        1,
+        (0,),
+    )
+    point = AxisSpec(
+        AxisId("task-console-edit.point"),
+        "Point",
+        SCAN_POINT,
+        1,
+        (0,),
+    )
+    frame = CoordinateFrameId("task-console-edit-camera")
+    y_axis = AxisSpec(
+        AxisId("task-console-edit.y"),
+        "Sensor row",
+        SPATIAL_Y,
+        4,
+        (20.0, 22.0, 24.0, 26.0),
+        "pixel",
+        frame,
+    )
+    x_axis = AxisSpec(
+        AxisId("task-console-edit.x"),
+        "Sensor column",
+        SPATIAL_X,
+        5,
+        (10.0, 12.0, 14.0, 16.0, 18.0),
+        "pixel",
+        frame,
+    )
+    values = np.arange(20, dtype=np.float64).reshape(1, 1, 4, 5)
+    schema = DatasetSchema(
+        repeat,
+        (point,),
+        PointLayout.rect_c((1,)),
+        ValueSchema(
+            (y_axis, x_axis),
+            ValidityContract.components(y_axis.axis_id, x_axis.axis_id),
+            values.dtype,
+            value_unit="photoelectron",
+        ),
+    )
+    block = DataBlock(
+        BlockId("task-console-edit-image"),
+        DatasetRevision(7),
+        values,
+        ComponentValidity(
+            (y_axis.axis_id, x_axis.axis_id),
+            np.ones(values.shape, dtype=np.bool_),
+        ),
+        schema,
+    )
+    snapshot = OwnedSnapshot(
+        block.ref(StreamGenerationId("task-console-edit-generation")),
+        block,
+    )
+    return ConsoleSignalValue(
+        name="Camera / frame",
+        source="Camera",
+        snapshot=snapshot,
+        coverage=None,
+        run_id="task-console-edit-run",
+        epoch_id="task-console-edit-epoch",
+        join_digest="0" * 64,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -189,6 +293,117 @@ def test_console_cards_answer_zoom_home_and_clim_from_human_controls(experiment)
         assert image_card.config.params["fixed_lo"] == pytest.approx(
             target_low, abs=35.0)
         assert image_card.config.params["fixed_hi"] == high
+    finally:
+        assert console.shutdown()
+        console.window().close()
+        application.processEvents()
+
+
+def test_edit_snapshot_reuses_presented_size_revision_and_selector_gate(
+    experiment,
+) -> None:
+    from PyQt5 import QtCore, QtTest, QtWidgets
+
+    from zlc_data.console_records import PanelConfig
+    from zlc_frontend.console_state import TaskConsoleState
+    from zlc_frontend.plot_layout import panel_display_size
+    from zlc_frontend.qt_widgets import QtRasterBoard
+
+    application = QtWidgets.QApplication.instance()
+    console = experiment.task_console(
+        state=TaskConsoleState(
+            panels=(
+                PanelConfig(
+                    kind="2d",
+                    title="Camera",
+                    size="1x2",
+                    signal="Camera / frame",
+                ),
+            ),
+        ),
+    )
+    try:
+        application.processEvents()
+        console._timer.stop()
+        card = console.cards[0]
+
+        # Model a non-integer screen DPR at the sole platform-input seam.  The
+        # immutable render request then carries this fact through the worker and
+        # into the Edit snapshot; no alternate high-DPI window is constructed.
+        assert card.set_raster_pixel_ratio(1.25)
+        value = _camera_value()
+        request = card._freeze_value_render_request(
+            value,
+            ("Camera / frame", value.snapshot.ref),
+            force=True,
+        )
+        assert request is not None
+        console._render_lane.enqueue((request,))
+        _wait_until(
+            application,
+            lambda: card.board is not None
+            and card.board.front_frame is not None
+            and card.frozen_data_figure() is not None,
+        )
+
+        live_frame = card.board.front_frame
+        live_payload = live_frame.panels[0].display_payload
+        live_raster = live_frame.panels[0].raster
+        assert live_payload.evaluated_input.ref == value.snapshot.ref
+
+        # Open the actual Setting popup and its Edit action as the operator does.
+        QtTest.QTest.mouseClick(
+            card.setting_button,
+            QtCore.Qt.LeftButton,
+        )
+        _wait_until(application, lambda: card.edit_button.isVisible())
+        QtTest.QTest.mouseClick(
+            card.edit_button,
+            QtCore.Qt.LeftButton,
+        )
+        _wait_until(
+            application,
+            lambda: id(card) in console._panel_editors
+            and console._panel_editors[id(card)]._board is not None
+            and console._panel_editors[id(card)]._candidate_board is None
+            and console._panel_editors[id(card)]._board.visible_presentation
+            is not None,
+        )
+
+        editor = console._panel_editors[id(card)]
+        pane = editor._board
+        presentation = pane.visible_presentation
+        assert presentation is not None and presentation.frame is not None
+        edit_payload = presentation.frame.panels[0].display_payload
+        assert edit_payload.evaluated_input.ref == live_payload.evaluated_input.ref
+
+        logical_size = tuple(
+            int(value) for value in panel_display_size(card.config.size)
+        )
+        typed_board = pane.findChild(
+            QtRasterBoard,
+            "figureViewerTypedBoard",
+        )
+        assert typed_board is not None
+        assert (typed_board.width(), typed_board.height()) == logical_size
+        raster = presentation.frame.panels[0].raster
+        assert (raster.width, raster.height) == tuple(
+            QtCore.qRound(value * 1.25) for value in logical_size
+        )
+        assert bytes(raster.pixels) == bytes(live_raster.pixels)
+
+        # The console switch is the one selector owner.  The frozen Edit pane
+        # receives that state in place through the shared QtRasterBoard.
+        assert not console.selectors_switch.isChecked()
+        assert not typed_board.selectors_enabled
+        QtTest.QTest.mouseClick(
+            console.selectors_switch,
+            QtCore.Qt.LeftButton,
+        )
+        application.processEvents()
+        assert console.selectors_switch.isChecked()
+        assert card.selectors_enabled
+        assert typed_board.selectors_enabled
     finally:
         assert console.shutdown()
         console.window().close()

@@ -200,6 +200,31 @@ def test_archive_roundtrip_preserves_multidimensional_source_and_validity(tmp_pa
         load_figure_archive(old)
 
 
+def test_archive_codec_preserves_faceted_histogram_display():
+    from zlc_data import AxisId, Selection
+    from zlc_frontend import (
+        FacetedHistogramDisplayState,
+        HistogramCellThresholds,
+        HistogramDisplayState,
+    )
+    from zlc_frontend.figure_archive import (
+        _display_state_from_tree,
+        _display_state_to_tree,
+    )
+
+    display = FacetedHistogramDisplayState(
+        HistogramDisplayState(revision=9),
+        (
+            HistogramCellThresholds(
+                Selection.index(AxisId("archive.site"), 1),
+                (12.0, 24.0),
+            ),
+        ),
+    )
+
+    assert _display_state_from_tree(_display_state_to_tree(display)) == display
+
+
 def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
     application,
     tmp_path,

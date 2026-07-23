@@ -52,9 +52,12 @@ from .display_range import RelimMode, validated_display_range
 from .figure import DatasetId, ResolvedDataset, ResolvedDatasetMap, ViewIntent
 from .figure.codec import decode_figure_document, encode_figure_document
 from .histogram_display import (
+    FacetedHistogramDisplayState,
     HistogramCountScale,
     HistogramDisplayState,
     HistogramFitMode,
+    histogram_cell_thresholds_from_tree,
+    histogram_cell_thresholds_to_tree,
 )
 from .image_display import ImageColormap, ImageDisplayState
 from .meter_display import MeterDisplayState
@@ -69,8 +72,11 @@ FigureDisplayState: TypeAlias = (
     CurveDisplayState
     | ImageDisplayState
     | HistogramDisplayState
+    | FacetedHistogramDisplayState
     | MeterDisplayState
 )
+
+_FACETED_HISTOGRAM_DISPLAY_KIND = "FACETED_HISTOGRAM"
 
 
 def _optional_range_to_tree(value) -> list[float] | None:
@@ -110,6 +116,14 @@ def _display_state_to_tree(
                 state.fixed_color_limits
             ),
         }
+    if isinstance(state, FacetedHistogramDisplayState):
+        return {
+            "kind": _FACETED_HISTOGRAM_DISPLAY_KIND,
+            "display": _display_state_to_tree(state.display),
+            "cell_thresholds": histogram_cell_thresholds_to_tree(
+                state.cell_thresholds
+            ),
+        }
     if isinstance(state, HistogramDisplayState):
         return {
             "kind": ViewIntent.HISTOGRAM.value,
@@ -135,7 +149,8 @@ def _display_state_to_tree(
         }
     raise TypeError(
         "display must be CurveDisplayState, ImageDisplayState, "
-        "HistogramDisplayState, MeterDisplayState, or None"
+        "HistogramDisplayState, FacetedHistogramDisplayState, "
+        "MeterDisplayState, or None"
     )
 
 
@@ -192,6 +207,22 @@ def _display_state_from_tree(tree: Any) -> FigureDisplayState | None:
                 data["fixed_color_limits"],
                 "image fixed_color_limits",
             ),
+        )
+    if kind == _FACETED_HISTOGRAM_DISPLAY_KIND:
+        data = exact_mapping(
+            tree,
+            {"kind", "display", "cell_thresholds"},
+            _FACETED_HISTOGRAM_DISPLAY_KIND,
+            discriminator="kind",
+        )
+        display = _display_state_from_tree(data["display"])
+        if not isinstance(display, HistogramDisplayState):
+            raise ValueError(
+                "faceted histogram archive requires a histogram display"
+            )
+        return FacetedHistogramDisplayState(
+            display,
+            histogram_cell_thresholds_from_tree(data["cell_thresholds"]),
         )
     if kind == ViewIntent.HISTOGRAM.value:
         data = exact_mapping(

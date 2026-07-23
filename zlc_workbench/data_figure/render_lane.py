@@ -39,6 +39,7 @@ from zlc_frontend.histogram_display import (
 from zlc_frontend.image_display import ImageDisplayState, image_viewport_for_display_state
 from zlc_frontend.image_display import resolve_image_color_limits
 from zlc_frontend.image_view import image_viewport_for_evaluated_image
+from zlc_frontend.plot_layout import LIVE_PANEL_DPI
 from zlc_workbench.fit import FitDraftAuthority, FitDraftResult
 from zlc_workbench.window_runtime import stage_and_replace_export
 
@@ -47,6 +48,7 @@ from .projection import (
     _TYPED_BOARD_ID,
     _TYPED_JOIN_SCHEMA_DIGEST,
     _TYPED_PANEL_ID,
+    _GridDisplayState,
     _TypedDisplayState,
     _TypedFigureFront,
     _TypedGridOverview,
@@ -56,6 +58,7 @@ from .projection import (
     _figure_summary,
     _fit_projection_metadata,
     _payload_intent,
+    _grid_state_intent,
     _state_intent,
     _require_not_cancelled,
     _validate_fit_replay_options,
@@ -87,9 +90,27 @@ def _encoded_figure(
         (EncodedRasterPage("figure", "Figure", payload),),
     )
 
+def _presentation_label(
+    value: str | None,
+    fallback: str,
+    name: str,
+) -> str:
+    if value is None:
+        return fallback
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be text or None")
+    return value
+
 def _render_typed_grid_overview(
     figure: DataFigure,
     cancelled: threading.Event,
+    *,
+    raster_size: tuple[int, int] = _NUMERIC_RASTER_SIZE,
+    size_name: str | None = None,
+    pixel_ratio: float = 1.0,
+    display_state: _GridDisplayState | None = None,
+    presentation_title: str | None = None,
+    presentation_value_label: str | None = None,
 ) -> _TypedGridOverview:
     intent, panel_count, reason = _classify_typed_grid(figure)
     if intent is None or panel_count is None:
@@ -108,7 +129,45 @@ def _render_typed_grid_overview(
             )
         )
     _require_not_cancelled(cancelled)
-    payload, regions = figure.to_png_bytes_with_panel_regions()
+    if display_state is None:
+        display_state = _default_typed_state(intent)
+    elif _grid_state_intent(display_state) is not intent:
+        raise ValueError("typed grid display state does not match the figure intent")
+    if size_name is None:
+        if (
+            presentation_title is not None
+            or presentation_value_label is not None
+        ):
+            raise ValueError(
+                "authored grid labels require named panel geometry"
+            )
+        if display_state != _default_typed_state(intent):
+            raise ValueError(
+                "an authored grid display requires named panel geometry"
+            )
+        payload, regions = figure.to_png_bytes_with_panel_regions()
+        visible_display_state = None
+    else:
+        title = _presentation_label(
+            presentation_title,
+            figure.document.layers[0].layer_id,
+            "presentation_title",
+        )
+        value_label = _presentation_label(
+            presentation_value_label,
+            figure.document.datasets[0].label,
+            "presentation_value_label",
+        )
+        payload, regions = figure.to_panel_png_bytes_with_panel_regions(
+            size=size_name,
+            width=raster_size[0],
+            height=raster_size[1],
+            dpi=LIVE_PANEL_DPI * pixel_ratio,
+            display_state=display_state,
+            title=title,
+            value_label=value_label,
+        )
+        visible_display_state = display_state
     _require_not_cancelled(cancelled)
     if len(regions) != panel_count:
         raise RuntimeError("typed grid regions do not cover every canonical panel")
@@ -123,10 +182,12 @@ def _render_typed_grid_overview(
         ),
     )
     return _TypedGridOverview(
-        intent,
-        bundle,
-        regions,
-        histogram_home,
+        intent=intent,
+        figure=figure,
+        bundle=bundle,
+        regions=regions,
+        histogram_home_x_limits=histogram_home,
+        display_state=visible_display_state,
     )
 
 def _fit_summary(
@@ -247,6 +308,11 @@ def _render_typed_front(
     fit_result_identity: str | None = None,
     histogram_projection_value_range: tuple[float, float] | None = None,
     release_initial_canonical_on_commit: bool = False,
+    raster_size: tuple[int, int] = _NUMERIC_RASTER_SIZE,
+    size_name: str | None = None,
+    pixel_ratio: float = 1.0,
+    presentation_title: str | None = None,
+    presentation_value_label: str | None = None,
 ) -> _TypedFigureFront:
     intent, unavailable_reason = _classify_single_typed(figure)
     if intent is None or intent is not _state_intent(state):
@@ -279,6 +345,16 @@ def _render_typed_front(
     ):
         raise ValueError("METER display cannot carry a Fit overlay")
     _require_not_cancelled(cancelled)
+    title = _presentation_label(
+        presentation_title,
+        figure.document.layers[0].layer_id,
+        "presentation_title",
+    )
+    value_label = _presentation_label(
+        presentation_value_label,
+        figure.document.datasets[0].label,
+        "presentation_value_label",
+    )
     curve_fit_overlay_plan: CurveFitOverlayPlan | None = None
     image_fit_overlay: RadialGaussianImageFitOverlay | None = None
     if figure.has_fit_overlays:
@@ -328,8 +404,13 @@ def _render_typed_front(
         )
         from zlc_frontend.matplotlib_render import ImagePanelAggRenderer
 
-        width, height = _NUMERIC_RASTER_SIZE
-        renderer = ImagePanelAggRenderer(width=width, height=height)
+        width, height = raster_size
+        renderer = ImagePanelAggRenderer(
+            width=width,
+            height=height,
+            dpi=LIVE_PANEL_DPI * pixel_ratio,
+            size_name=size_name,
+        )
         try:
             raster, raster_geometry = renderer.render(
                 image,
@@ -337,8 +418,8 @@ def _render_typed_front(
                 state,
                 color_limits=color_limits,
                 data_range=data_range,
-                title=figure.document.layers[0].layer_id,
-                value_label=figure.document.datasets[0].label,
+                title=title,
+                value_label=value_label,
                 fit_overlay=image_fit_overlay,
             )
         finally:
@@ -356,11 +437,15 @@ def _render_typed_front(
     else:
         from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
 
-        width, height = _NUMERIC_RASTER_SIZE
+        width, height = raster_size
         renderer = SinglePanelAggRenderer(
             figure.document,
             width=width,
             height=height,
+            dpi=LIVE_PANEL_DPI * pixel_ratio,
+            size_name=size_name,
+            title=title,
+            value_label=value_label,
         )
         try:
             if isinstance(state, CurveDisplayState):
@@ -440,8 +525,16 @@ def _render_typed_front(
         intent,
         frame,
     )
+    visible_figure = (
+        figure
+        if fit_result is None
+        else figure.with_fit_results(
+            {figure.document.layers[0].layer_id: fit_result}
+        )
+    )
     return _TypedFigureFront(
         intent=intent,
+        figure=visible_figure,
         state=state,
         summary=_figure_summary(figure),
         frame=frame,
@@ -453,6 +546,7 @@ def _render_typed_front(
         release_initial_canonical_on_commit=(
             release_initial_canonical_on_commit
         ),
+        raster_size=raster_size,
     )
 
 def _export_typed_png(
