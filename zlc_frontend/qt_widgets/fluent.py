@@ -2066,20 +2066,14 @@ class FluentComboBox(QtWidgets.QComboBox):
         Qt positions the popup container in a deferred flush AFTER ``super().showPopup()`` and, near the
         screen bottom, would flip it UPWARD.  We move the container to the combo's bottom-left + the outer
         gap right away (and ``_RoundedPopupCard``'s Move filter re-applies the same downward target on
-        Qt's later flush, so the box can never end up above).  The x is clamped into the screen so a combo
-        at the right edge does not push the popup off-screen horizontally; the height is clamped to the
-        below-the-box space elsewhere so an overrun SCROLLS rather than flipping up."""
+        Qt's later flush, so the box can never end up above).  Position is never changed to keep the popup
+        on-screen; vertical overrun is absorbed by a shorter, scrolling popup instead."""
         view = self.view()
         container = view.window() if view is not None else None
         if container is None or container is self:
             return
         below = self.mapToGlobal(QtCore.QPoint(0, self.height() + self._gap))
-        x = below.x()
-        screen = self.screen() if hasattr(self, "screen") else QtWidgets.QApplication.primaryScreen()
-        if screen is not None:
-            avail = screen.availableGeometry()
-            x = max(avail.left(), min(x, avail.right() - container.width()))
-        container.move(x, below.y())
+        container.move(below)
 
     def _display_text(self) -> str:
         """The text painted in the COLLAPSED combo (the seam a tree combo overrides to show a
