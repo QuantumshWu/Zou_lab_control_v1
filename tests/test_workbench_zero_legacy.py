@@ -20,11 +20,10 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 #: Every window UI BODY that has been rewired (the kept ORIGINAL UI skeletons on the
-#: current data plane), plus the retained entry facades.  figure_viewer's body joins
-#: this roster the commit its domain imports are replaced -- it may not ship before.
+#: current data plane), plus the application windows that compose those ports.
 ROOTS = (
-    "zlc_workbench.task_console.plot_bridge_console",
-    "zlc_workbench.figure_viewer.plot_bridge_figure_viewer",
+    "zlc_workbench.task_console.window",
+    "zlc_workbench.figure_viewer.window",
     "zlc_workbench.pulse_editor.window",
     "zlc_workbench.task_console.app",
     "zlc_workbench.pulse_editor.app",

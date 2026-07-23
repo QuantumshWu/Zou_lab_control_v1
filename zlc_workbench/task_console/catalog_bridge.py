@@ -260,17 +260,6 @@ class ConsoleCatalogView:
         )
 
     # -------------------------------------------------------------- queries
-    @property
-    def experiment(self):
-        """The one session this view projects.
-
-        The skeleton reaches the domain ONLY through this view, so the window
-        never imports ``Zou_lab_control.notebook`` itself; the RUN seam derives
-        its prepare/start closures from the same object.
-        """
-
-        return self._experiment
-
     def specs(self, kind: str | None = None) -> tuple[ConsoleNodeSpec, ...]:
         if kind is None:
             return self._specs

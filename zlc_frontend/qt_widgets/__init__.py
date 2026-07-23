@@ -26,6 +26,7 @@ from .owner_wake import QtOwnerWake
 from .panel_host import SinglePanelHost
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
 from .fit_authoring import FitAuthoringPane
+from .figure_info_pane import FigureInfoPane
 from .pulse_slots_widget import PulseSlotsWidget
 from .logic_node_row import LogicNodeRow
 from .flow_graph_view import FlowGraphView
@@ -192,6 +193,7 @@ __all__ = [
     "FluentDoubleSpinBox",
     "FluentFloatingEditor",
     "FitAuthoringPane",
+    "FigureInfoPane",
     "FacetedPanelHost",
     "FluentFormGrid",
     "FluentFrame",

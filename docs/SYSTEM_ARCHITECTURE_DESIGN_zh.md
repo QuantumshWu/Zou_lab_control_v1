@@ -3562,6 +3562,25 @@ F0 只有 contract/unit tests，不作为长期“基础设施里程碑”单独
 
 S0.5 解决的是“新切片住在哪里”，不是预先重写 9000 行 UI；Setting/Edit/catalog 的完整迁移仍随实际 panel/use case 发生。
 
+**S0.5 终态 GUI 拆分合同（2026-07-22）：** 拆分按对象所有权而非行数。`app.py`
+只做 composition/正式窗口包装；`window.py` 只保留跨组件 generation、窗口生命周期与用户动作编排；
+能独立组合且有自身 QWidget/worker 生命周期的 card、editor、board、info pane、render lane 各自成档；
+纯 archive→Info 或 schema→presentation 推导必须在无 Qt 的纯函数叶。不得用 mixin、manager、callback
+facade 把同一个类机械切碎，也不得保留 `plot_bridge`、旧模块转发壳或私有属性 alias。
+
+TaskConsole 的 current 落点为 `panel_card/panel_editor/panel_board/panel_types/render_lane/window`：
+`PanelComposer/Agg` 只由单 worker lane 拥有，Qt card 只接受 immutable front；Setting 恢复 main 的
+扁平 `Source/Display/Analysis/Panel` 结构并复用 `FluentSectionLabel/FluentSettingRow/FluentScrollArea`
+与统一 `FluentSettingsPopupAnchor`，Setting/Edit 继续提交同一 typed `PanelConfig/ViewSpec`，不另造表单框架。
+FigureViewer 的 current 落点为 `window + info_projection + FigureInfoPane`：路径键入只留本地 draft，
+Browse/`editingFinished` 才加载；候选首帧成功后才原子替换 pane 与五个 Info tab。以上模式是后续
+GUI 拆分的复用样板，但只复用已闭合的 owner，不复制仍在 C47 账本中 OPEN 的机制。
+
+所有 Fluent combo 的弹层宽度由完整可见选项决定，collapsed field 只负责当前摘要；普通列表量全部
+item，树形 signal picker 递归量 producer 与 leaf（含缩进、shape/state）。弹层不够宽时保持 field
+右边缘并向左扩展，只有物理屏幕边界可以钳制；纵向仍固定在 field 下方并以滚动吸收溢出。该合同
+由 `FluentComboBox/FluentTreeComboBox` 单一拥有，TaskConsole 不得按某个 signal 名单局部改 popup geometry。
+
 当前W1以最窄纵向产品面兑现了这个宿主原则，而没有提前造通用workflow：public lazy `Zou_lab_control.workbench.open_capture_workbench(experiment, request)`只在调用时加载Qt；`PreparedFiniteCapture`是notebook与Workbench共用的one-shot应用边界，公开面只有descriptor、capacity-one preview schema与start，不暴露`MinimalPipelineSpec/RunPlan/Port/runtime/authority token`。每次Run使用重新prepare的command并获得新的slot、board、generation和Run；上一Run必须terminal且owner thread已reap后Start才重新开放。这个window不拥有Experiment，关闭时只撤销/清理自己的preview、Run和worker。
 
 当前W2a+W2b已完成 current PulseGUI 产品纵切：current-only authoring helper不暴露raw lane，并把digital/DAC visible-port约束收敛在`PulseDocument`唯一owner；descriptor-free `PulseEditorSession`拥有immutable document、revision、真实disk baseline/path与save-conflict语义；preview从带source-document provenance的`CompiledPulseArtifact`产生精确的digital delay/repeat/DAC edge-ramp timeline；API nominal literal只服务预览，hardware Run对任何未显式解析的API parameter fail closed；pulse-only `RunPlan`复用现有RunController，finite有真实terminal result，continuous HOLD无轮询等待cancel并复用同一interrupt/SAFE清理。唯一正式Qt窗口保留Edit/Preview/Scan、New/Open/Save、static/scan/HOLD/API、remote与Stop可见合同，并增加同产品的Target manifest tab：online只读、Offline显式Apply，增删DAC时数据bus与latch clock不可分割。普通name/unit/value/delay/binding/visible、Add/Remove/Reorder/Repeat与Clear编辑由Qt handler直接调用领域命令并按stable id原位增删、移动或更新现有widget；不构造local delta或application snapshot，不调用全量`editor_projection/set_document`，也不把编辑送进worker。完整Edit树projection/reconcile只存在于Target topology、Open/New/Reconnect真正替换document或target generation的边界；初始composition分别读取窄editor/runtime/preview front。Run观察/reap/close只发`PulseRuntimeUpdate`，scan cursor只发`PulseScanProgressUpdate`，无可见变化返回`None`。Preview、Save、Connect及scan generate/load是低频、显式跨线程提交边界，可以各发布一次借用同一immutable document的controller DTO；presenter必须按component key更新，editor revision未变时严禁`set_document`或重放Scan draft。领域侧为compile、Run或跨线程交接冻结一个immutable `PulseDocument`/request是权威数据边界，不等于复制GUI树。Scan tab保留一个只在其source/schema/candidate依赖真实变化时重算的component front，不把每次敲键、scan cursor tick或空owner wake升级成全局状态快照。offline只author/preview，standalone virtual/remote拥有并关闭自己的Experiment，`exp.pulse_gui()`复用同一dirty窗口并由Experiment统一退休。旧`plot_bridge_pulse_gui.py`及其`PulseTableState`编辑器已在最后产品consumer切走后物理删除，不存在迁移编辑器、转换器、隐藏第二窗口或兼容入口；TaskConsole/Camera/PulseScan仍消费的legacy timing链是独立consumer闭包，不能反向成为恢复旧PulseGUI的理由。整个S0.5/H1仍以其它未迁闭包为OPEN，不能因PulseGUI闭合而冒充完成。

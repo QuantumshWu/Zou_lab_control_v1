@@ -1,0 +1,168 @@
+"""Headless projection of a current Figure archive into operator-facing facts.
+
+This module performs no I/O and owns no Qt objects.  It translates the typed
+archive already accepted by the FigureViewer into the five stable Info surfaces;
+the Qt pane only lays those values out.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from pprint import pformat
+from typing import TypeAlias
+
+from zlc_storage.paths import display_path
+
+
+InfoRows: TypeAlias = tuple[tuple[str, object], ...]
+FigureInfoProjection: TypeAlias = tuple[
+    InfoRows,
+    InfoRows,
+    InfoRows,
+    object,
+    str,
+]
+
+
+def _axis_text(axis) -> str:
+    """Describe one declared axis without inferring anything from array rank."""
+
+    unit = "" if axis.unit is None else f" [{axis.unit}]"
+    return (
+        f"{axis.name} ({axis.axis_id}; role={axis.role}; "
+        f"size={axis.size}{unit})"
+    )
+
+
+def _view_text(view) -> str:
+    bindings = ", ".join(
+        f"{binding.axis_id}={binding.role.value}"
+        for binding in view.axis_bindings
+    )
+    selections = len(view.display_selections)
+    suffix = "" if selections == 0 else f"; selections={selections}"
+    return f"intent={view.intent.value}; {bindings or 'no axis bindings'}{suffix}"
+
+
+def _dataset_projection(figure) -> InfoRows:
+    """Project typed source schemas into human-readable, array-free rows."""
+
+    rows: list[tuple[str, object]] = []
+    document = figure.document
+    datasets = figure.datasets
+    for descriptor in document.datasets:
+        snapshot = datasets.resolve(descriptor.dataset_id)
+        schema = snapshot.block.schema
+        cell = schema.cell_schema
+        prefix = descriptor.label
+        rows.extend(
+            (
+                (f"{prefix} id", descriptor.dataset_id),
+                (f"{prefix} revision", snapshot.ref),
+                (f"{prefix} shape", schema.physical_shape),
+                (f"{prefix} repeat", _axis_text(schema.repeat_axis)),
+                (
+                    f"{prefix} points",
+                    ", ".join(_axis_text(axis) for axis in schema.point_axes)
+                    or "(none)",
+                ),
+                (
+                    f"{prefix} data",
+                    ", ".join(_axis_text(axis) for axis in cell.data_axes)
+                    or "scalar",
+                ),
+                (f"{prefix} dtype", cell.dtype),
+                (f"{prefix} unit", cell.value_unit or "(none)"),
+                (
+                    f"{prefix} validity",
+                    cell.validity_contract.mode.value,
+                ),
+            )
+        )
+    return tuple(rows)
+
+
+def _flow_graph(metadata: Mapping[str, object]) -> object:
+    direct = metadata.get("flow_graph")
+    if direct is not None:
+        return direct
+    provenance = metadata.get("provenance")
+    if isinstance(provenance, Mapping):
+        return provenance.get("flow_graph")
+    return None
+
+
+def _raw_projection(archive) -> str:
+    """Show the complete typed descriptive record, excluding source array bytes."""
+
+    figure = archive.figure
+    datasets = []
+    for descriptor in figure.document.datasets:
+        snapshot = figure.datasets.resolve(descriptor.dataset_id)
+        datasets.append(
+            {
+                "descriptor": descriptor,
+                "reference": snapshot.ref,
+                "schema": snapshot.block.schema,
+                "validity": snapshot.block.validity,
+            }
+        )
+    return pformat(
+        {
+            "path": str(archive.path),
+            "payload_digest": archive.payload_digest,
+            "document": figure.document,
+            "datasets": tuple(datasets),
+            "fit_results": dict(figure.fit_results),
+            "display": archive.display,
+            "metadata": dict(archive.metadata),
+        },
+        sort_dicts=False,
+        width=100,
+    )
+
+
+def project_figure_info(archive) -> FigureInfoProjection:
+    """Project one fully decoded current archive without touching its array bytes."""
+
+    figure = archive.figure
+    document = figure.document
+    plot_rows: list[tuple[str, object]] = [
+        ("document", document.document_id),
+        ("revision", document.revision),
+        ("payload_digest", archive.payload_digest),
+    ]
+    for layer in document.layers:
+        descriptor = document.descriptor(layer.dataset_id)
+        plot_rows.append(
+            (
+                f"layer {layer.layer_id}",
+                f"{descriptor.label} ({descriptor.dataset_id}); "
+                f"{_view_text(layer.view)}",
+            )
+        )
+    if document.selections:
+        plot_rows.append(("selections", len(document.selections)))
+    if archive.display is not None:
+        plot_rows.append(("display", archive.display))
+
+    measurement_rows = list(_dataset_projection(figure))
+    measurement_rows.append(("path", display_path(str(archive.path))))
+
+    device_rows: list[tuple[str, object]] = []
+    for key, value in archive.metadata.items():
+        if key != "flow_graph":
+            device_rows.append((str(key), value))
+    if not device_rows:
+        device_rows.append(("metadata", "(none recorded)"))
+
+    return (
+        tuple(plot_rows),
+        tuple(measurement_rows),
+        tuple(device_rows),
+        _flow_graph(archive.metadata),
+        _raw_projection(archive),
+    )
+
+
+__all__ = ["FigureInfoProjection", "InfoRows", "project_figure_info"]

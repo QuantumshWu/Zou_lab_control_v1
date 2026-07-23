@@ -18,38 +18,26 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from concurrent.futures import CancelledError, Future
-from enum import Enum
 from pathlib import Path
-from pprint import pformat
 
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_storage.paths import display_path
 
 from zlc_frontend.qt_widgets import (
-    CARD_PAD,
-    FlowGraphView,
-    FluentCodeEdit,
+    FigureInfoPane,
     FluentFrame,
     FluentLabel,
-    FluentPathEdit,
-    FluentReadoutMultiline,
-    FluentScrollArea,
-    FluentSectionLabel,
-    FluentSettingRow,
-    FluentStatusStrip,
-    FluentTabWidget,
     QtOwnerWake,
     WINDOW_SCREEN_FRACTION,
     ensure_qt_app,
-    launch_fluent_window,
-    scaled_px,
     screen_fit_window_size,
     set_fluent_scale,
-    setting_label_width,
     window_pad,
 )
 from Zou_lab_control.workbench._window_runtime import RASTER_WORK_EXECUTOR
+
+from .info_projection import project_figure_info
 
 
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
@@ -75,108 +63,6 @@ def _load_archive(path: Path):
     from zlc_frontend.figure_archive import load_figure_archive
 
     return load_figure_archive(path)
-
-
-def _enum_text(value: object) -> object:
-    return value.value if isinstance(value, Enum) else value
-
-
-def _axis_text(axis) -> str:
-    """Describe one declared axis without inferring anything from array rank."""
-
-    unit = "" if axis.unit is None else f" [{axis.unit}]"
-    return (
-        f"{axis.name} ({axis.axis_id}; role={axis.role}; "
-        f"size={axis.size}{unit})"
-    )
-
-
-def _view_text(view) -> str:
-    bindings = ", ".join(
-        f"{binding.axis_id}={binding.role.value}"
-        for binding in view.axis_bindings
-    )
-    selections = len(view.display_selections)
-    suffix = "" if selections == 0 else f"; selections={selections}"
-    return f"intent={view.intent.value}; {bindings or 'no axis bindings'}{suffix}"
-
-
-def _dataset_projection(figure) -> tuple[tuple[str, object], ...]:
-    """Project typed source schemas into human-readable, array-free rows."""
-
-    rows: list[tuple[str, object]] = []
-    document = figure.document
-    datasets = figure.datasets
-    for descriptor in document.datasets:
-        snapshot = datasets.resolve(descriptor.dataset_id)
-        schema = snapshot.block.schema
-        cell = schema.cell_schema
-        prefix = descriptor.label
-        rows.extend(
-            (
-                (f"{prefix} id", descriptor.dataset_id),
-                (f"{prefix} revision", snapshot.ref),
-                (f"{prefix} shape", schema.physical_shape),
-                (f"{prefix} repeat", _axis_text(schema.repeat_axis)),
-                (
-                    f"{prefix} points",
-                    ", ".join(_axis_text(axis) for axis in schema.point_axes)
-                    or "(none)",
-                ),
-                (
-                    f"{prefix} data",
-                    ", ".join(_axis_text(axis) for axis in cell.data_axes)
-                    or "scalar",
-                ),
-                (f"{prefix} dtype", cell.dtype),
-                (f"{prefix} unit", cell.value_unit or "(none)"),
-                (
-                    f"{prefix} validity",
-                    cell.validity_contract.mode.value,
-                ),
-            )
-        )
-    return tuple(rows)
-
-
-def _flow_graph(metadata: Mapping[str, object]) -> object:
-    direct = metadata.get("flow_graph")
-    if direct is not None:
-        return direct
-    provenance = metadata.get("provenance")
-    if isinstance(provenance, Mapping):
-        return provenance.get("flow_graph")
-    return None
-
-
-def _raw_projection(archive) -> str:
-    """Show the complete typed descriptive record, excluding source array bytes."""
-
-    figure = archive.figure
-    datasets = []
-    for descriptor in figure.document.datasets:
-        snapshot = figure.datasets.resolve(descriptor.dataset_id)
-        datasets.append(
-            {
-                "descriptor": descriptor,
-                "reference": snapshot.ref,
-                "schema": snapshot.block.schema,
-                "validity": snapshot.block.validity,
-            }
-        )
-    return pformat(
-        {
-            "path": str(archive.path),
-            "payload_digest": archive.payload_digest,
-            "document": figure.document,
-            "datasets": tuple(datasets),
-            "fit_results": dict(figure.fit_results),
-            "display": archive.display,
-            "metadata": dict(archive.metadata),
-        },
-        sort_dicts=False,
-        width=100,
-    )
 
 
 class FigureViewer(QtWidgets.QWidget):
@@ -205,16 +91,22 @@ class FigureViewer(QtWidgets.QWidget):
         self._closing = False
         self._closed = False
 
-        self._label_w = setting_label_width(
-            ("payload_digest", "schema_fingerprint", "coordinate_frame")
-        )
-        self._info_col_w = self._label_w + scaled_px(320, minimum=240)
+        self.setStyleSheet("background: transparent;")
         self.setFixedSize(screen_fit_window_size(self.window_ratio))
 
         root = QtWidgets.QHBoxLayout(self)
         root.setContentsMargins(0, window_pad(1), 0, window_pad(1))
         root.setSpacing(window_pad(0.5))
-        root.addWidget(self._build_info_column(), 0)
+        self.info_pane = FigureInfoPane(
+            label_names=(
+                "payload_digest",
+                "schema_fingerprint",
+                "coordinate_frame",
+            ),
+            parent=self,
+        )
+        self.info_pane.pathCommitted.connect(self._commit_path)
+        root.addWidget(self.info_pane, 0)
 
         holder = QtWidgets.QWidget(self)
         holder.setStyleSheet("background: transparent;")
@@ -249,93 +141,6 @@ class FigureViewer(QtWidgets.QWidget):
         layout.addStretch(1)
         return frame
 
-    def _build_info_column(self) -> QtWidgets.QWidget:
-        col = QtWidgets.QWidget(self)
-        col.setStyleSheet("background: transparent;")
-        col.setFixedWidth(self._info_col_w)
-        layout = QtWidgets.QVBoxLayout(col)
-        layout.setContentsMargins(window_pad(1), 0, 0, 0)
-        layout.setSpacing(window_pad(0.5))
-
-        header_frame = FluentFrame(bordered=False)
-        header_frame.setFixedHeight(scaled_px(48, minimum=38))
-        header = QtWidgets.QHBoxLayout(header_frame)
-        header.setContentsMargins(
-            scaled_px(12), scaled_px(6), scaled_px(12), scaled_px(6)
-        )
-        header.setSpacing(scaled_px(8, minimum=5))
-        header.addWidget(FluentSectionLabel("File"))
-        self.path_edit = FluentPathEdit(
-            "",
-            mode="file",
-            caption="Open a saved figure (image or .npz)",
-            file_filter="Saved figures (*.png *.jpg *.jpeg *.npz);;All files (*)",
-        )
-        self.path_edit.setToolTip(
-            "Choose a current saved Figure .npz, or its same-stem PNG/JPEG image."
-        )
-        # File I/O is a committed action, never a textChanged side effect.
-        self.path_edit.selected.connect(self._commit_path)
-        self.path_edit.edit.editingFinished.connect(
-            lambda: self._commit_path(self.path_edit.text())
-        )
-        header.addWidget(self.path_edit, 1)
-        layout.addWidget(header_frame)
-
-        self.info_tabs = FluentTabWidget()
-        self.info_tabs.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding,
-            QtWidgets.QSizePolicy.Expanding,
-        )
-        self.plot_layout = self._add_rows_tab("Plot")
-        self.meas_layout = self._add_rows_tab("Measurement")
-        self.info_layout = self._add_rows_tab("Device")
-        self.flow_view = self._add_flow_tab("Flow")
-        self.raw_info = self._add_raw_tab("Raw")
-        layout.addWidget(self.info_tabs, 1)
-
-        self.status = FluentStatusStrip()
-        self.status.show_message("Open a current saved Figure (.npz).")
-        layout.addWidget(self.status)
-        return col
-
-    def _add_rows_tab(self, title: str) -> QtWidgets.QVBoxLayout:
-        scroll = FluentScrollArea()
-        scroll.setWidgetResizable(True)
-        body = QtWidgets.QWidget()
-        body.setStyleSheet("background: transparent;")
-        layout = QtWidgets.QVBoxLayout(body)
-        margin = scaled_px(CARD_PAD, minimum=6)
-        layout.setContentsMargins(margin, margin, margin, margin)
-        layout.setSpacing(scaled_px(3, minimum=2))
-        layout.setAlignment(QtCore.Qt.AlignTop)
-        scroll.setWidget(body)
-        self.info_tabs.add_permanent_tab(scroll, title)
-        return layout
-
-    def _add_flow_tab(self, title: str) -> FlowGraphView:
-        scroll = FluentScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        view = FlowGraphView()
-        scroll.setWidget(view)
-        self.info_tabs.add_permanent_tab(scroll, title)
-        return view
-
-    def _add_raw_tab(self, title: str) -> FluentCodeEdit:
-        body = QtWidgets.QWidget()
-        body.setStyleSheet("background: transparent;")
-        layout = QtWidgets.QVBoxLayout(body)
-        margin = scaled_px(CARD_PAD, minimum=6)
-        layout.setContentsMargins(margin, margin, margin, margin)
-        raw = FluentCodeEdit("", read_only=True)
-        raw.setToolTip(
-            "The complete typed archive description; source array bytes are represented by schema."
-        )
-        layout.addWidget(raw)
-        self.info_tabs.add_permanent_tab(body, title)
-        return raw
-
     # -------------------------------------------------------------- public API
     def window(self):
         return getattr(self, "_zlc_window", None)
@@ -354,7 +159,7 @@ class FigureViewer(QtWidgets.QWidget):
         text = str(path).strip()
         if not text:
             return
-        self.path_edit.setText(text)
+        self.info_pane.path_edit.setText(text)
         self._commit_path(text)
 
     @QtCore.pyqtSlot(str)
@@ -367,7 +172,7 @@ class FigureViewer(QtWidgets.QWidget):
         try:
             path = _archive_path(Path(raw))
         except BaseException as error:
-            self.status.show_message(
+            self.info_pane.status.show_message(
                 f"{type(error).__name__}: {error}", severity="error"
             )
             return
@@ -391,7 +196,7 @@ class FigureViewer(QtWidgets.QWidget):
             return
         self._load_revision += 1
         self._pending_load = (self._load_revision, path)
-        self.status.show_message(
+        self.info_pane.status.show_message(
             f"Loading {display_path(str(path))}", severity="task"
         )
         self._start_pending_load()
@@ -404,7 +209,7 @@ class FigureViewer(QtWidgets.QWidget):
         try:
             future = RASTER_WORK_EXECUTOR.submit(_load_archive, path)
         except BaseException as error:
-            self.status.show_message(
+            self.info_pane.status.show_message(
                 f"{type(error).__name__}: {error}", severity="error"
             )
             return
@@ -422,13 +227,13 @@ class FigureViewer(QtWidgets.QWidget):
                     archive = future.result()
                     self._accept_archive(revision, archive)
                 except CancelledError:
-                    self.status.show_message(
+                    self.info_pane.status.show_message(
                         f"Load cancelled: {display_path(str(path))}",
                         severity="warning",
                     )
                 except BaseException as error:
                     # Full error text is retained by FluentStatusStrip's tooltip.
-                    self.status.show_message(
+                    self.info_pane.status.show_message(
                         f"{type(error).__name__}: {error}", severity="error"
                     )
             else:
@@ -448,7 +253,7 @@ class FigureViewer(QtWidgets.QWidget):
         metadata = archive.metadata
         if not isinstance(metadata, Mapping):
             raise TypeError("FigureArchive metadata must be a mapping")
-        info = self._info_projection(archive)
+        info = project_figure_info(archive)
         candidate = create_data_figure_pane(
             archive.figure,
             initial_display=archive.display,
@@ -478,7 +283,7 @@ class FigureViewer(QtWidgets.QWidget):
             lambda detail, pane=candidate: self._reject_candidate(pane, detail),
             QtCore.Qt.QueuedConnection,
         )
-        self.status.show_message(
+        self.info_pane.status.show_message(
             f"Rendering {display_path(str(archive.path))}",
             severity="task",
         )
@@ -505,9 +310,22 @@ class FigureViewer(QtWidgets.QWidget):
 
         self.archive = archive
         self._current_path = Path(archive.path)
-        self.path_edit.setText(str(self._current_path))
-        self._apply_info_projection(*info)
-        self.status.show_message(
+        self.info_pane.path_edit.setText(str(self._current_path))
+        (
+            plot_rows,
+            measurement_rows,
+            device_rows,
+            flow_graph,
+            raw_text,
+        ) = info
+        self.info_pane.replace_info(
+            plot_rows=plot_rows,
+            measurement_rows=measurement_rows,
+            device_rows=device_rows,
+            flow_graph=flow_graph,
+            raw_text=raw_text,
+        )
+        self.info_pane.status.show_message(
             f"Loaded {display_path(str(self._current_path))}"
         )
 
@@ -523,93 +341,10 @@ class FigureViewer(QtWidgets.QWidget):
         self._candidate_load = None
         self._retire_pane(candidate)
         if not self._closing and revision == self._load_revision:
-            self.status.show_message(
+            self.info_pane.status.show_message(
                 f"Figure render failed: {detail}",
                 severity="error",
             )
-
-    # --------------------------------------------------------------- Info data
-    def _info_projection(self, archive):
-        figure = archive.figure
-        document = figure.document
-        plot_rows: list[tuple[str, object]] = [
-            ("document", document.document_id),
-            ("revision", document.revision),
-            ("payload_digest", archive.payload_digest),
-        ]
-        for layer in document.layers:
-            descriptor = document.descriptor(layer.dataset_id)
-            plot_rows.append(
-                (
-                    f"layer {layer.layer_id}",
-                    f"{descriptor.label} ({descriptor.dataset_id}); {_view_text(layer.view)}",
-                )
-            )
-        if document.selections:
-            plot_rows.append(("selections", len(document.selections)))
-        if archive.display is not None:
-            plot_rows.append(("display", archive.display))
-
-        measurement_rows = list(_dataset_projection(figure))
-        measurement_rows.append(("path", display_path(str(archive.path))))
-
-        device_rows: list[tuple[str, object]] = []
-        for key, value in archive.metadata.items():
-            if key not in {"flow_graph"}:
-                device_rows.append((str(key), value))
-        if not device_rows:
-            device_rows.append(("metadata", "(none recorded)"))
-        return (
-            tuple(plot_rows),
-            tuple(measurement_rows),
-            tuple(device_rows),
-            _flow_graph(archive.metadata),
-            _raw_projection(archive),
-        )
-
-    def _apply_info_projection(
-        self,
-        plot_rows,
-        measurement_rows,
-        device_rows,
-        flow_graph,
-        raw_text,
-    ) -> None:
-        for layout in (self.plot_layout, self.meas_layout, self.info_layout):
-            self._clear_layout(layout)
-        self._fill_rows(self.plot_layout, plot_rows)
-        self._fill_rows(self.meas_layout, measurement_rows)
-        self._fill_rows(self.info_layout, device_rows)
-        self.flow_view.set_graph(flow_graph)
-        self.raw_info.setPlainText(raw_text)
-
-    @staticmethod
-    def _clear_layout(layout: QtWidgets.QVBoxLayout) -> None:
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-
-    def _fill_rows(self, layout, rows) -> None:
-        for key, value in rows:
-            field = FluentReadoutMultiline(self._readout_text(value))
-            field.setSizePolicy(
-                QtWidgets.QSizePolicy.Ignored,
-                QtWidgets.QSizePolicy.Fixed,
-            )
-            layout.addWidget(
-                FluentSettingRow(str(key), field, label_width=self._label_w)
-            )
-
-    @staticmethod
-    def _readout_text(value: object) -> str:
-        value = _enum_text(value)
-        if isinstance(value, Mapping):
-            return pformat(dict(value), sort_dicts=False, width=80)
-        if isinstance(value, (tuple, list)):
-            return ", ".join(str(_enum_text(item)) for item in value)
-        return str(value)
 
     # ------------------------------------------------------------ pane lifetime
     def _retire_pane(self, pane: QtWidgets.QWidget) -> None:
@@ -676,32 +411,4 @@ class FigureViewer(QtWidgets.QWidget):
             return screen_fit_window_size(self.window_ratio)
         except Exception:
             return super().sizeHint()
-
-
-def show_figure_viewer(
-    path: str | Path | None = None,
-    *,
-    scale: float | None = None,
-    window_ratio: float = WINDOW_SCREEN_FRACTION,
-    hide_on_close: bool = False,
-) -> FigureViewer:
-    """Open the session-independent saved-figure viewer."""
-
-    ensure_qt_app()
-    viewer = FigureViewer(path, scale=scale, window_ratio=window_ratio)
-
-    def _wire(window):
-        if not hide_on_close:
-            window.set_close_guard(viewer.teardown)
-
-    window = launch_fluent_window(
-        viewer,
-        title="FigureViewer@Zou lab",
-        hide_on_close=hide_on_close,
-        wire=_wire,
-    )
-    viewer._zlc_window = window
-    return viewer
-
-
-__all__ = ["FigureViewer", "show_figure_viewer"]
+__all__ = ["FigureViewer"]

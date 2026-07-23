@@ -820,16 +820,10 @@ def show_fluent_popup_for_anchor(
 class FluentSettingsPopupAnchor:
     """Own the true-toggle contract between one Setting button and its popup.
 
-    A ``Qt.Popup`` auto-closes on any outside mouse press, including the press
-    on the very button that opened it.  Without a dismissal record the release
-    of that same click reopens the popup, so the button stops behaving like a
-    toggle.  This owner records every hide through :attr:`FluentPopup._on_hidden`
-    and refuses to reopen inside ``reopen_debounce_s`` of it, which is the
-    single source of that debounce for every Workbench Setting surface.
-
-    ``prepare`` runs only on the branch that actually shows the popup, so the
-    editors a window reseeds before display are never reseeded on the hide or
-    debounce branches.
+    ``Qt.Popup`` auto-dismiss plus button release otherwise reopens the popup.
+    This owner records that hide and centralises the debounce. ``prepare`` runs
+    only before showing; an optional ``present`` preserves a component-specific
+    placement contract while leaving toggle ownership here.
     """
 
     def __init__(
@@ -863,6 +857,7 @@ class FluentSettingsPopupAnchor:
         content: QtWidgets.QWidget,
         *,
         prepare=None,
+        present=None,
         minimum_width: int = 360,
         minimum_height: int = 300,
     ) -> None:
@@ -870,6 +865,8 @@ class FluentSettingsPopupAnchor:
 
         if prepare is not None and not callable(prepare):
             raise TypeError("prepare must be callable or None")
+        if present is not None and not callable(present):
+            raise TypeError("present must be callable or None")
         if not self._anchor.isEnabled():
             return
         popup = self._popup
@@ -880,13 +877,16 @@ class FluentSettingsPopupAnchor:
             return
         if prepare is not None:
             prepare()
-        show_fluent_popup_for_anchor(
-            popup,
-            self._anchor,
-            content,
-            minimum_width=minimum_width,
-            minimum_height=minimum_height,
-        )
+        if present is None:
+            show_fluent_popup_for_anchor(
+                popup,
+                self._anchor,
+                content,
+                minimum_width=minimum_width,
+                minimum_height=minimum_height,
+            )
+        else:
+            present()
 
 
 class FluentGroupBox(QtWidgets.QGroupBox):
@@ -1675,23 +1675,10 @@ class _RoundedPopupCard(QtCore.QObject):
             painter.end()
             return True
         if et == QtCore.QEvent.Move and self._combo is not None and isinstance(obj, QtWidgets.QWidget):
-            # DIRECTLY UNDER THE BOX -- both axes, unconditionally.  "Under" is two facts: the
-            # dropdown's TOP sits just below the box's bottom, and its LEFT edge lines up with the
-            # box's left edge.  Qt violates each one for its own reason and in a deferred step a
-            # showPopup-time move() cannot beat, so both are re-applied on every reposition:
-            #   * vertically it flips the list ABOVE the box when the space below runs out;
-            #   * horizontally it SLIDES a popup that is wider than its box leftwards to keep it
-            #     inside the screen -- so the list detaches from the box exactly at the right-hand
-            #     edge of a window, which reads as the list jumping somewhere else.
-            # Neither is wanted: a list that moves no longer points at the box that was clicked.
-            # Overrun is absorbed instead -- vertically by clamping the popup HEIGHT so it scrolls
-            # (FluentComboBox.showPopup / _anchor_available_height), horizontally by letting the
-            # wider card extend past the box.  Self-converging: at target the guard no-ops.
-            anchor = self._combo.mapToGlobal(QtCore.QPoint(0, self._combo.height()))
             geo = obj.geometry()
-            target_top = anchor.y() + self._gap
-            if abs(geo.top() - target_top) > 1 or geo.left() != anchor.x():
-                obj.move(anchor.x(), target_top)
+            target = self._combo._popup_origin(geo.width())
+            if abs(geo.top() - target.y()) > 1 or geo.left() != target.x():
+                obj.move(target)
             return False
         return False
 
@@ -1882,26 +1869,11 @@ class FluentComboBox(QtWidgets.QComboBox):
         super().__init__(parent)
         self.setMinimumHeight(scaled_px(30, minimum=22))
         self.setEditable(False)
-        # Cap the drop-down at a sensible number of visible rows so a long signal list SCROLLS (via the
-        # shared fluent scrollbar already styled below) instead of growing unbounded / overflowing the
-        # screen.  Qt shows its vertical scrollbar once the item count exceeds this (#H3w-4).
+        # Long lists scroll rather than overflowing the screen.
         self.setMaxVisibleItems(_COMBO_MAX_VISIBLE_ITEMS)
         self._popup_styled = False
-        # The drop-down list is a top-level popup.  It must look EXACTLY like the
-        # FluentPopup card (the Setting popup): one antialiased rounded rect with a
-        # 1 px border, a few-px gap before the items, and the SHARED fluent
-        # scrollbar.  A stylesheet ``border-radius`` on the popup is NOT enough --
-        # the popup's window stays opaque + square behind the arc, so the corner
-        # triangles outside the radius show a white/grey nub (the "stray line at the
-        # bottom-right" the user hit) and Windows adds a native popup shadow.  So
-        # the popup CONTAINER is made translucent + frameless and PAINTS the card
-        # itself (see showPopup), and the item view below is transparent so that
-        # painted card shows through.
+        # The top-level popup is a translucent, rounded Fluent card.
         view = QtWidgets.QListView(self)
-        # The item view must be GENUINELY transparent so the container's painted
-        # rounded card shows through (a stylesheet ``background: transparent`` alone
-        # does not stop QAbstractScrollArea's viewport from filling its Base colour,
-        # which would paint an opaque SQUARE over the rounded card).
         view.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
         view.viewport().setAutoFillBackground(False)
         view.viewport().setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
@@ -1910,10 +1882,8 @@ class FluentComboBox(QtWidgets.QComboBox):
         view_palette.setColor(QtGui.QPalette.Window, QtCore.Qt.transparent)
         view.setPalette(view_palette)
         self.setView(view)
-        self._gap = popup_gap()   # the ONE Fluent popup outer-gap (shared with the overflow menu, etc.)
-        # Configure the drop-down's top-level container NOW (setView created it but it
-        # is not shown yet) -- WA_TranslucentBackground only takes effect if it is set
-        # BEFORE the native window is created, so this cannot wait until showPopup.
+        self._gap = popup_gap()
+        # Translucency must be installed before the native popup window is created.
         self._configure_popup_container()
         self.setStyleSheet(
             f"""
@@ -1971,18 +1941,7 @@ class FluentComboBox(QtWidgets.QComboBox):
         )
 
     def _configure_popup_container(self) -> None:
-        """Make the drop-down's top-level container a translucent, frameless card
-        that PAINTS one rounded rect (border + fill) -- the SAME chrome FluentPopup
-        uses for the Setting popup.
-
-        The rounded card is painted by an EVENT FILTER on the container, not by
-        assigning ``container.paintEvent`` (Qt's C++ event dispatch never calls a
-        Python instance attribute, so a monkey-patched paintEvent silently does
-        nothing and the container keeps its default opaque SQUARE).  The filter
-        intercepts the Paint event, strokes the rounded card and returns True so the
-        default square paint is suppressed; the transparent item view paints its
-        rows on top.  The few-px gap before the items is the view's stylesheet
-        ``padding`` (the translucent card shows through it)."""
+        """Install the rounded translucent card on Qt's private popup container."""
         container = self.view().window()
         if container is None or container is self or self._popup_styled:
             return
@@ -2043,37 +2002,51 @@ class FluentComboBox(QtWidgets.QComboBox):
         # container's Move event filter (_RoundedPopupCard), which beats Qt's
         # deferred flush-positioning that a showPopup-time move() cannot.
         self._configure_popup_container()
-        # Size the dropdown to its widest item so options like "Edge"/"Ramp"/
-        # "Hold" or "ns"/"us"/"ms" are never clipped when the combo itself is
-        # narrow (the popup defaults to the combo width otherwise).
         view = self.view()
-        if view is not None and self.count():
-            metrics = view.fontMetrics()
-            widest = 0
-            for index in range(self.count()):
-                try:
-                    advance = metrics.horizontalAdvance(self.itemText(index))
-                except AttributeError:  # pragma: no cover - very old Qt
-                    advance = metrics.width(self.itemText(index))
-                widest = max(widest, advance)
-            view.setMinimumWidth(widest + scaled_px(COMBO_WIDTH) + scaled_px(EDIT_PADDING_H) * 2)
+        width = self._desired_popup_width()
+        if view is not None:
+            view.setFixedWidth(width)
         super().showPopup()
+        container = view.window() if view is not None else None
+        if container is not None and container is not self:
+            container.setFixedWidth(width)
         self._place_popup_below()
+
+    def _popup_text_width(self) -> int:
+        view = self.view()
+        if view is None:
+            return 0
+        metrics = view.fontMetrics()
+        measure = getattr(metrics, "horizontalAdvance", metrics.width)
+        return max((measure(self.itemText(i)) for i in range(self.count())), default=0)
+
+    def _desired_popup_width(self) -> int:
+        chrome = 2 * (self._gap + scaled_px(6, minimum=4))
+        chrome += self.style().pixelMetric(QtWidgets.QStyle.PM_ScrollBarExtent)
+        width = max(self.width(), self._popup_text_width() + chrome)
+        screen = self.screen() if hasattr(self, "screen") else None
+        available = screen.availableGeometry() if screen is not None else None
+        return int(min(width, available.width()) if available is not None else width)
+
+    def _popup_origin(self, popup_width: int) -> QtCore.QPoint:
+        anchor = self.mapToGlobal(QtCore.QPoint(0, self.height()))
+        left = anchor.x() if popup_width <= self.width() else anchor.x() + self.width() - popup_width
+        screen = self.screen() if hasattr(self, "screen") else None
+        available = screen.availableGeometry() if screen is not None else None
+        if available is not None:
+            left = max(available.left(), min(left, available.right() - popup_width + 1))
+        return QtCore.QPoint(int(left), anchor.y() + self._gap)
 
     def _place_popup_below(self) -> None:
         """Force the open drop-down to sit BELOW the box (never flipped above it).
 
-        Qt positions the popup container in a deferred flush AFTER ``super().showPopup()`` and, near the
-        screen bottom, would flip it UPWARD.  We move the container to the combo's bottom-left + the outer
-        gap right away (and ``_RoundedPopupCard``'s Move filter re-applies the same downward target on
-        Qt's later flush, so the box can never end up above).  Position is never changed to keep the popup
-        on-screen; vertical overrun is absorbed by a shorter, scrolling popup instead."""
+        The Move filter reapplies the same target after Qt's deferred placement.
+        Wide content grows left from the field's right edge; vertical overflow scrolls."""
         view = self.view()
         container = view.window() if view is not None else None
         if container is None or container is self:
             return
-        below = self.mapToGlobal(QtCore.QPoint(0, self.height() + self._gap))
-        container.move(below)
+        container.move(self._popup_origin(container.width()))
 
     def _display_text(self) -> str:
         """The text painted in the COLLAPSED combo (the seam a tree combo overrides to show a
@@ -2156,6 +2129,30 @@ class FluentTreeComboBox(FluentComboBox):
 
     def _popup_pad(self) -> int:
         return 2 * self._gap                                     # the translucent card's top/bottom gap
+
+    def _popup_text_width(self) -> int:
+        view = self.view()
+        if not isinstance(view, QtWidgets.QTreeView):
+            return super()._popup_text_width()
+        metrics = view.fontMetrics()
+        measure = getattr(metrics, "horizontalAdvance", metrics.width)
+        widest = 0
+
+        def visit(parent, depth: int) -> None:
+            nonlocal widest
+            for row in range(self._model.rowCount(parent)):
+                index = self._model.index(row, 0, parent)
+                item = self._model.itemFromIndex(index)
+                if item is None:
+                    continue
+                widest = max(
+                    widest,
+                    measure(item.text()) + (depth + 1) * view.indentation(),
+                )
+                visit(index, depth + 1)
+
+        visit(QtCore.QModelIndex(), 0)
+        return int(widest)
 
     def _desired_popup_height(self) -> int:
         """Pixel height the popup should be to show every CURRENTLY-VISIBLE row (expanded subtrees

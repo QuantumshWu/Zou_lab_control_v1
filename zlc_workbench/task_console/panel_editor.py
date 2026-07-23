@@ -1,8 +1,7 @@
 """The panel Edit tab: a snapshot of the card plus its full parameter surface.
 
-Qt presentation belongs in the task console's plot_bridge zone: the editor owns
-only a frozen raster view and copies the card's accepted immutable front.  It
-never evaluates data or owns a Matplotlib composer.
+The editor owns only a frozen raster view and copies the card's accepted
+immutable front.  It never evaluates data or owns a Matplotlib composer.
 
 Every import names a TRUE owner -- nothing here touches the legacy tree.
 """
@@ -46,7 +45,7 @@ from zlc_frontend.form import (
     text_to_python as _text_to_py,
 )
 from zlc_frontend.panel_params import panel_param_decls as _panel_param_decls
-from .plot_bridge import _RELIM_PARAM
+from .panel_types import RELIM_PARAM as _RELIM_PARAM
 from zlc_storage.paths import display_path
 
 

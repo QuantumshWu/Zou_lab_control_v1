@@ -14,16 +14,13 @@ tree, so deleting ``Zou_lab_control`` cannot orphan it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import time
-from typing import Mapping, Sequence
-from PyQt5 import QtCore, QtGui, QtWidgets
+from typing import Mapping
+from PyQt5 import QtCore, QtWidgets
 
 import zlc_frontend.qt_widgets as _qt_widgets
 from zlc_frontend.qt_widgets import (
     ACCENT,
     CARD_PAD,
-    CARD_TITLE_PX,
     FluentButton,
     FluentComboBox,
     FluentGroupBox,
@@ -32,6 +29,7 @@ from zlc_frontend.qt_widgets import (
     FluentPopup,
     FluentScrollArea,
     FluentSectionLabel,
+    FluentSettingsPopupAnchor,
     FluentSettingRow,
     FluentTreeComboBox,
     GREEN,
@@ -44,7 +42,6 @@ from zlc_frontend.qt_widgets import (
     scaled_px,
     signals_blocked as _signals_blocked,
 )
-from zlc_frontend import board_layout as _layout
 from zlc_frontend.form import lenient_float as _safe_float
 from zlc_frontend.render_style import panel_display_size
 from zlc_frontend.panel_params import (
@@ -57,8 +54,19 @@ from zlc_data.console_records import (
     PanelConfig,
     UPDATE_INTERVALS,
 )
-from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
+from zlc_data.panel_size import PANEL_SIZES
 from zlc_data.param_decl import ParamDecl
+from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY
+
+from .panel_board import card_size as _card_size
+from .panel_types import (
+    RELIM_PARAM as _RELIM_PARAM,
+    VIEW_SPEC_PARAM as _VIEW_SPEC_PARAM,
+    grid_view_intents as _grid_view_intents,
+    panel_view_intents as _panel_view_intents,
+    repeat_mode_label as _repeat_mode_label,
+)
+from .render_lane import PanelRenderRequest as _PanelRenderRequest
 
 # qt_widgets submodules are reached as ATTRIBUTES of the one facade binding: their names are
 # deliberately absent from the facade __all__, and the package forbids outside deep imports.
@@ -84,186 +92,6 @@ fill_grouped_signal_combo = _qt_widgets.param_widgets.fill_grouped_signal_combo
 # every card at the first free NW slot in list order.  The CARD'S FORMAT (rounded corners, shadow, grey title strip,
 # content padding) belongs to the FluentGroupBox COMPONENT (qt_widgets.CARD_PAD / CARD_TITLE_PX,
 # the single source); this module only lays cards out.
-#: Which view a panel kind asks its data for.  A kind is the operator's word
-#: for what they want to see; a ViewIntent is what the figure layer understands.
-def _panel_view_intents():
-    from zlc_frontend.figure import ViewIntent
-
-    return {
-        "2d": ViewIntent.IMAGE,
-        "1d": ViewIntent.CURVE,
-        "monitor": ViewIntent.CURVE,
-        "hist": ViewIntent.HISTOGRAM,
-    }
-
-
-def _grid_view_intents():
-    """The typed cell families the current coherent grid host can focus."""
-
-    from zlc_frontend.figure import ViewIntent
-
-    return (
-        ("Curves", ViewIntent.CURVE),
-        ("Distribution", ViewIntent.HISTOGRAM),
-        ("Meter", ViewIntent.METER),
-    )
-
-
-# ``ViewSpec`` is the figure owner's sole persistent presentation value.  The
-# TaskConsole stores its owner-coded tree inside the application-local panel
-# params; it never persists a second string vocabulary such as
-# ``average/add/replace/create``.
-_VIEW_SPEC_PARAM = "view_spec"
-
-
-def _repeat_mode_label(mode) -> str:
-    """Operator label for one existing typed repeat policy."""
-
-    from zlc_frontend.figure import RepeatViewMode
-
-    return {
-        RepeatViewMode.MEAN: "Mean",
-        RepeatViewMode.SUM: "Sum",
-        RepeatViewMode.LATEST: "Latest repeat",
-        RepeatViewMode.BATCH: "Overlay repeats",
-        RepeatViewMode.SAMPLE: "Pool as samples",
-        RepeatViewMode.FACET: "Facet repeats",
-    }[mode]
-
-GRID_UNIT = 8
-
-# The ONE spacing setting (#H3s-F8).  GAP is the UNIFORM clear distance between any two cards on
-# every side -- top, bottom, left, right -- AND the board margin from the (0, 0) origin.  It equals
-# the HORIZONTAL inter-card gap the user likes: two cards on adjacent base-columns pitched by
-# ``_cell_size()[0] + GAP`` sit exactly GAP px apart (and a multi-column card's internal columns are
-# joined by the SAME GAP, see ``_card_size``).  Reusing this one existing spacing constant (no new
-# public art/geom knob); change this one number to retune all board
-# spacing.
-GAP = GRID_UNIT
-
-
-def _cell_size() -> tuple[int, int]:
-    """The board's base CELL in pixels: the footprint of the narrowest card ("1x2").
-
-    The packer works in cells; this is the one place a cell is converted to pixels.
-    Width and height both come from the panel's displayed raster box
-    (:func:`~zlc_frontend.render_style.panel_display_size`) plus the card chrome the
-    FluentGroupBox component owns, so a card is exactly as tall as its content.
-    """
-
-    width = panel_display_size("1x2")[0] + 2 * CARD_PAD
-    height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + panel_display_size("1x2")[1] + CARD_PAD
-    return (width, height)
-
-
-def _card_size(size: str) -> tuple[int, int]:
-    """Pixel footprint of a card at a panel-size preset.
-
-    Width snaps to a whole number of base cells (so cards align to the board grid and
-    the inter-column joins are the same GAP as between cards); height hugs the panel's
-    own displayed height, so no size leaves blank padding under the plot.
-    """
-
-    rows, cols = panel_size_cells(size)
-    w_units = max(1, cols // 2)
-    cw, _ch = _cell_size()
-    width = w_units * cw + (w_units - 1) * GAP
-    height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + panel_display_size(size)[1] + CARD_PAD
-    return (width, height)
-
-
-def _board_metrics() -> "_layout.BoardMetrics":
-    """The two facts the moved packer cannot derive, read LIVE on every call.
-
-    ``_card_size`` stays here because it is the bridge between the FIGURE size (render
-    layer) and the card CHROME (Qt tokens) -- neither of which the packer may import.
-    Built fresh rather than cached: card pixels follow the current Qt scale, and a value
-    captured once would go stale exactly the way a snapshot shim does.
-    """
-
-    return _layout.BoardMetrics(gap=GAP, card_size=_card_size)
-
-
-
-def _opaque_white_composite(pm):
-    """Composite a (possibly transparent, possibly HiDPI) grabbed pixmap onto an opaque WHITE canvas of
-    the SAME size AND devicePixelRatio, so the saved PNG is not see-through AND has no blank margin.
-
-    The dpr match is the crux: on a HiDPI screen ``QWidget.grab`` returns a pixmap whose PHYSICAL size is
-    ``logical × dpr`` but whose LOGICAL size is ``logical``.  A plain ``QPixmap(pm.size())`` is dpr=1, so
-    ``drawPixmap`` paints the pixmap at its smaller LOGICAL size into the top-left and leaves the rest
-    blank -- the giant white margin around the panels the user saw on a scaled display.  Carrying the
-    pixmap's dpr makes the canvas's logical size equal the pixmap's, so the composite fills it exactly."""
-    canvas = QtGui.QPixmap(pm.size())
-    canvas.setDevicePixelRatio(pm.devicePixelRatio())
-    canvas.fill(QtGui.QColor("#FFFFFF"))
-    painter = QtGui.QPainter(canvas)
-    painter.drawPixmap(0, 0, pm)
-    painter.end()
-    return canvas
-
-def _aabb(cfg) -> tuple[int, int, int, int]:
-    """The card's pixel AABB -- see :func:`zlc_frontend.board_layout._aabb`."""
-    return _layout._aabb(cfg, _board_metrics())
-
-def _overlaps_with_gap(box: tuple[int, int, int, int], placed) -> bool:
-    """See :func:`zlc_frontend.board_layout._overlaps_with_gap`."""
-    return _layout._overlaps_with_gap(box, placed, _board_metrics())
-
-def _board_width(configs: Sequence["PanelConfig"]) -> int:
-    """See :func:`zlc_frontend.board_layout.board_width`."""
-    return _layout.board_width(configs, _board_metrics())
-
-def pack(order: Sequence["PanelConfig"], board_w: int | None = None) -> bool:
-    """See :func:`zlc_frontend.board_layout.pack` -- the ONE board packer, now in the target package."""
-    return _layout.pack(order, _board_metrics(), board_w)
-
-def drop_index(cfg, others: Sequence["PanelConfig"], board_w: int | None = None) -> int:
-    """See :func:`zlc_frontend.board_layout.drop_index`."""
-    return _layout.drop_index(cfg, others, _board_metrics(), board_w)
-
-#: relim modes (confocal_gui combo_relim naming) -- the SINGLE source for both the Setting
-#: popup combo and the Edit-tab combo, so the two never list different options.
-#: "fixed" (#8) pins the y-axis / colour-limit to operator-set ``fixed_lo``/``fixed_hi`` bounds
-#: (the lo/hi inputs reveal only in that mode); tight/normal autoscale as before.
-_RELIM_MODES = ("tight", "normal", "fixed")
-
-#: The relim mode as a declarative ``ParamDecl`` -- so every panel's relim chooser renders
-#: through the SAME _make_param_widget / PARAM_WIDGETS path every other plot param uses (one source,
-#: auto-injected into BOTH the Setting popup and the Edit tab, #H3v-4b).  Edits route through
-#: ``_set_param`` (which stores the mode and reveals the fixed lo/hi row).
-_RELIM_PARAM = ParamDecl(
-    key="relim", label="relim", kind="choice", default="tight", choices=_RELIM_MODES, display=True,
-    tooltip="Relim mode (confocal_gui combo_relim naming):\n"
-            "  tight  = autoscale hugs the data\n"
-            "  normal = autoscale, holding the window until the data leaves it\n"
-            "  fixed  = pin the y-axis / colour-limit to the lo/hi below")
-
-# ====================================================================== panels
-@dataclass(frozen=True, slots=True)
-class _PanelRenderRequest:
-    """One fully frozen worker request for a panel raster.
-
-    The worker never reads ``PanelCard`` or its mutable ``PanelConfig``.  Every
-    display fact used by the compose is captured on the Qt owner before the
-    request crosses the thread boundary.
-    """
-
-    panel_id: str
-    request_revision: int
-    signature: object
-    source_key: object
-    frame_key: object
-    value: object
-    display: object
-    intent: object
-    label: str
-    size: tuple[int, int]
-    provenance: object
-    view: object
-    faceted: bool
-    focus: object
-
 class PanelCard(FluentGroupBox):
     """One dashboard panel: a TITLED frame (title strip = the panel KIND + the signal-source
     legend, top-left) holding the frontend canvas, and a text
@@ -346,25 +174,14 @@ class PanelCard(FluentGroupBox):
         # Every plotter (re)build parks its selector layer to this flag (``_apply_selectors_state``),
         # so a fresh figure always inherits the switch instead of coming up live.
         self._selectors_on = False
-        # When the Setting popup last dismissed itself.  The button re-opens it, and a
-        # click that DISMISSED the popup would otherwise arrive here as "open" a moment
-        # later -- the popup would flicker shut and straight back open.  Zero means it
-        # has never been dismissed, which is safely outside any debounce window.
-        self._settings_dismissed_at = 0.0
         # {param key: declared kind} for each rendered row, so reopening the Setting
         # re-seeds a control through its OWN kind's writer instead of guessing from
         # the stored value's Python type.
         self._param_kinds: dict[str, str] = {}
-        self._value_shape: tuple[int, ...] | None = None
         # The hub version at this panel's LAST render -- the per-panel multi-rate refresh
         # (see TaskConsole._tick) skips a panel on its beat when nothing new was published
         # since, so a slow panel does not redraw stale data and a fast one only when needed.
         self._render_version = -1
-        # Fairness under overload: True when this panel's beat fell on a tick the render
-        # worker was busy (or the panel was mid-drag) -- the next idle tick serves it
-        # regardless of the beat modulo, so a slow-beat panel can never phase-lock onto
-        # busy ticks and starve behind a heavy fast-beat sibling (see TaskConsole._tick).
-        self._beat_owed = False
         self._drag_offset: QtCore.QPoint | None = None
         self.setCursor(QtCore.Qt.OpenHandCursor)   # the frame border drags
 
@@ -387,6 +204,10 @@ class PanelCard(FluentGroupBox):
         self.setting_button.setParent(self)
         self.setting_button.setFixedSize(scaled_px(74, minimum=64), scaled_px(26, minimum=22))
         self.setting_button.setToolTip("Panel settings")
+        self._settings_anchor = FluentSettingsPopupAnchor(
+            self.settings_popup,
+            self.setting_button,
+        )
         self.setting_button.clicked.connect(self._open_settings)
 
         self.fit_analysis_button = None
@@ -471,9 +292,6 @@ class PanelCard(FluentGroupBox):
             self.set_status(f"Fit failed to open: {error}", error=True)
 
     # ------------------------------------------------------------- settings UI
-
-    def _note_settings_dismissed(self) -> None:
-        self._settings_dismissed_at = time.monotonic()
 
     def _make_param_widget(self, spec: ParamDecl, *, apply=None) -> QtWidgets.QWidget:
         """One widget per declarative ParamDecl with a semantic commit edge.
@@ -990,13 +808,7 @@ class PanelCard(FluentGroupBox):
         self.front_presented.emit()
 
     def _build_settings(self) -> None:
-        """The Setting popup: the sections the operator tunes this panel through.
-
-        Everything here is a VIEW of ``config.params`` / ``config.signal``.  No control
-        owns state of its own: each writes through the card's one writer and is re-seeded
-        from the stored value on open, which is what stops this popup and the Edit tab --
-        which renders the same declarations -- from drifting apart.
-        """
+        """Build the main-UI flat Setting surface over current typed state."""
 
         popup = FluentPopup(self)
         outer = QtWidgets.QVBoxLayout(popup)
@@ -1004,35 +816,67 @@ class PanelCard(FluentGroupBox):
         self._settings_scroll = FluentScrollArea()
         self._settings_scroll.setWidgetResizable(True)
         self._settings_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self._settings_scroll.viewport().setAutoFillBackground(False)
+        self._settings_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+        )
+        self._settings_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAlwaysOff
+        )
+        self._settings_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         content = QtWidgets.QWidget()
-        content.setAutoFillBackground(False)
+        content.setStyleSheet("background: transparent;")
         self._settings_col = QtWidgets.QVBoxLayout(content)
-        self._settings_col.setContentsMargins(popup_gap(), popup_gap(), popup_gap(), popup_gap())
-        self._settings_col.setSpacing(popup_gap())
+        pad = scaled_px(10)
+        self._settings_col.setContentsMargins(
+            pad,
+            pad,
+            pad + fluent_scrollbar_thickness() + scaled_px(4),
+            pad,
+        )
+        self._settings_col.setSpacing(scaled_px(10, minimum=6))
         self._settings_scroll.setWidget(content)
         outer.addWidget(self._settings_scroll)
         self.settings_popup = popup
-        # ``Qt.Popup`` closes on the press that lands on its own anchor.  Record
-        # that real hide edge so the matching release cannot immediately reopen
-        # the popup.  FluentPopup owns this lifecycle hook; no event filter or
-        # second visibility state is needed here.
-        popup._on_hidden = self._note_settings_dismissed
         self._settings_h_hwm = 0
 
-        label_w = scaled_px(96, minimum=72)
+        display_specs = [
+            spec for spec in _panel_param_decls(self.config.kind) if spec.display
+        ] + [_RELIM_PARAM]
+        labels = [
+            "signal",
+            "size",
+            "view",
+            "facet",
+            "repeat",
+            "lo / hi",
+            "unit",
+            "update",
+            "title",
+            *(spec.label for spec in display_specs),
+        ]
+        fm = self.fontMetrics()
+        widest = max((fluent_text_width(fm, label) for label in labels), default=0)
+        label_w = max(scaled_px(80, minimum=56), widest + scaled_px(10))
 
-        def section_box(title):
-            box = FluentGroupBox(title, content)
-            layout = QtWidgets.QVBoxLayout(box)
-            layout.setContentsMargins(popup_gap(), popup_gap(), popup_gap(), popup_gap())
-            layout.setSpacing(scaled_px(4, minimum=2))
-            self._settings_col.addWidget(box)
+        def section(title):
+            self._settings_col.addWidget(FluentSectionLabel(title))
+            layout = QtWidgets.QVBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(scaled_px(6, minimum=4))
+            self._settings_col.addLayout(layout)
             return layout
 
         # ---- Source: one typed dataset.  Combining producers belongs to a
         # Processor or explicit join, never an independent-latest GUI expression.
-        source = section_box("Source")
+        source = section("Source")
+        input_format = PLOT_KIND_SPEC_BY_KEY[self.config.kind].input_format
+        if input_format:
+            accepts = FluentLabel(f"accepts {input_format}")
+            accepts.setWordWrap(True)
+            accepts.setStyleSheet(
+                f"color: {GREY}; background: transparent; border: none;"
+            )
+            source.addWidget(accepts)
         self.signal_combo = FluentTreeComboBox()
         self.signal_combo.setToolTip(
             "The typed dataset this panel displays, grouped by its producing node."
@@ -1041,13 +885,36 @@ class PanelCard(FluentGroupBox):
         source.addWidget(
             FluentSettingRow("signal", self.signal_combo, label_width=label_w)
         )
+        self.status = FluentLabel(self._status_text)
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet(
+            f"color: {GREY}; background: transparent; border: none;"
+        )
+        self.status.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
+        source.addWidget(self.status)
 
         # ---- Display: the declared view knobs for this kind, emitted through the SHARED
         # row builder, so a kind that gains a knob shows it in both surfaces with no
         # wiring here.
-        display = section_box("Display")
-        display_specs = ([spec for spec in _panel_param_decls(self.config.kind)
-                          if spec.display] + [_RELIM_PARAM])
+        display = section("Display")
+        self.size_combo = FluentComboBox()
+        for preset in PANEL_SIZES:
+            self.size_combo.addItem(preset, preset)
+        index = self.size_combo.findData(self.config.size)
+        if index >= 0:
+            self.size_combo.setCurrentIndex(index)
+        self.size_combo.setToolTip("Panel size preset (height × width half-units)")
+        self.size_combo.currentIndexChanged.connect(
+            lambda _i: self._on_size(
+                str(self.size_combo.currentData() or self.config.size)
+            )
+        )
+        display.addWidget(
+            FluentSettingRow("size", self.size_combo, label_width=label_w)
+        )
         self.param_widgets = self._emit_param_rows(
             display_specs, display.addWidget, self._set_param, label_w)
         self.grid_bins_row, self.grid_bins_widget = self._make_grid_bins_row(
@@ -1077,63 +944,76 @@ class PanelCard(FluentGroupBox):
         unit_row, self.unit_button, self.unit_label = self._make_unit_cycle_row(
             self._on_unit_cycle, label_w, with_label=True)
         display.addWidget(unit_row)
-
-        # ---- Analysis: what a drag on this panel means (the shared composite).
-        self._build_analysis_section(section_box, label_w)
-
-        # ---- Panel: the card itself -- its name, its footprint, and how often it redraws.
-        panel = section_box("Panel")
-        self.title_edit = FluentLineEdit(self.config.title)
-        self.title_edit.setToolTip("Rename this panel (also the default save name)")
-        self.title_edit.editingFinished.connect(self._commit_title)
-        panel.addWidget(FluentSettingRow("title", self.title_edit, label_width=label_w))
-        self.size_combo = FluentComboBox()
-        for preset in PANEL_SIZES:
-            self.size_combo.addItem(preset, preset)
-        index = self.size_combo.findData(self.config.size)
-        if index >= 0:
-            self.size_combo.setCurrentIndex(index)
-        self.size_combo.setToolTip("Card footprint in layout half-units (rows x columns)")
-        self.size_combo.currentIndexChanged.connect(
-            lambda _i: self._on_size(str(self.size_combo.currentData() or self.config.size)))
-        panel.addWidget(FluentSettingRow("size", self.size_combo, label_width=label_w))
         self.update_combo = FluentComboBox()
         for interval in UPDATE_INTERVALS:
-            self.update_combo.addItem("%d ms" % interval, interval)
+            self.update_combo.addItem(f"{interval} ms", interval)
         index = self.update_combo.findData(
-            int(self.config.params.get("update_ms", DEFAULT_UPDATE_MS) or DEFAULT_UPDATE_MS))
+            int(
+                self.config.params.get("update_ms", DEFAULT_UPDATE_MS)
+                or DEFAULT_UPDATE_MS
+            )
+        )
         if index >= 0:
             self.update_combo.setCurrentIndex(index)
         self.update_combo.setToolTip(
-            "How often THIS panel redraws.  Acquisition is unaffected -- this is a display rate.")
+            "How often this panel redraws; acquisition is unaffected."
+        )
         self.update_combo.currentIndexChanged.connect(self._on_update_interval)
-        panel.addWidget(FluentSettingRow("update", self.update_combo, label_width=label_w))
+        display.addWidget(
+            FluentSettingRow("update", self.update_combo, label_width=label_w)
+        )
 
-        # The status line lives at the bottom of the popup, where a message about the panel
-        # belongs; the card's own title strip stays clean.
-        self.status = FluentLabel(self._status_text)
-        self.status.setStyleSheet("color: %s; background: transparent; border: none;" % GREY)
-        self.status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
-        self._settings_col.addWidget(self.status)
+        # ---- Analysis: what a drag on this panel means (the shared composite).
+        self._build_analysis_section(section, label_w)
+
+        # ---- Panel: card identity and the two standard panel actions.
+        panel = section("Panel")
+        self.title_edit = FluentLineEdit(self.config.title)
+        self.title_edit.setPlaceholderText("panel title…")
+        self.title_edit.setToolTip("Rename this panel (also the default save name)")
+        self.title_edit.editingFinished.connect(self._commit_title)
+        panel.addWidget(FluentSettingRow("title", self.title_edit, label_width=label_w))
+        self.remove_button = FluentButton("Remove", color=ORANGE)
+        self.remove_button.setFixedWidth(scaled_px(72, minimum=58))
+        self.remove_button.clicked.connect(self._remove_from_settings)
+        self.edit_button = FluentButton("Edit…", color=ACCENT)
+        self.edit_button.setFixedWidth(scaled_px(64, minimum=52))
+        self.edit_button.setToolTip("Open this panel's full Edit tab")
+        self.edit_button.clicked.connect(self._edit_from_settings)
+        actions = QtWidgets.QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(scaled_px(6, minimum=4))
+        actions.addWidget(self.remove_button)
+        actions.addWidget(self.edit_button)
+        actions.addStretch(1)
+        panel.addLayout(actions)
+
         self._settings_col.addStretch(1)
 
         self._refresh_signal_combo()
 
+    def _remove_from_settings(self) -> None:
+        self.settings_popup.hide()
+        self.remove_requested.emit(self)
+
+    def _edit_from_settings(self) -> None:
+        self.settings_popup.hide()
+        self.edit_requested.emit(self)
+
     def _open_settings(self) -> None:
-        # Click-to-open / click-again-to-close TOGGLE.  A Qt.Popup already auto-closes
-        # on the mouse PRESS that lands on this button, so by the time the button's
-        # release fires the popup is hidden -- naively re-opening it would make the
-        # button never close it.  So: if visible, hide; and if it was auto-dismissed
-        # within the last moment (this very click closed it), do NOT re-open.
-        popup = self.settings_popup
-        if popup.isVisible():
-            popup.hide()
-            return
-        if time.monotonic() - self._settings_dismissed_at < 0.25:
-            return
-        self.refresh_on_show()          # Setting controls are a VIEW of config.params -- refresh on open (#6)
+        self._settings_anchor.toggle(
+            self._settings_scroll.widget(),
+            prepare=self._prepare_settings_popup,
+            present=self._present_settings_popup,
+        )
+
+    def _prepare_settings_popup(self) -> None:
+        self.refresh_on_show()
         self._refresh_signal_combo()
         self._refresh_grid_view_controls()
+
+    def _present_settings_popup(self) -> None:
+        popup = self.settings_popup
         anchor = self.setting_button.mapToGlobal(
             QtCore.QPoint(self.setting_button.width(), self.setting_button.height()))
         self._size_settings_popup()                        # height: show-all, grow-not-shrink (#H3i-2)
@@ -2160,7 +2040,6 @@ class PanelCard(FluentGroupBox):
         self._pending_faceted_result = None
         self._render_request_revision += 1
         self._requested_signature = None
-        self._value_shape = None
 
     def _teardown_plot(self) -> None:
         """Drop this card's surface, leaving nothing painted behind it.
@@ -2195,21 +2074,3 @@ class PanelCard(FluentGroupBox):
         """
 
         self._teardown_plot()
-
-class _PanelBoard(QtWidgets.QWidget):
-    """Absolute-positioned canvas the cards live on (drag + snap layout)."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setStyleSheet("background: transparent;")
-
-    def arrange(self, cards: Sequence[PanelCard]) -> None:
-        # ``col``/``row`` ARE the card's pixel top-left (gravity-packed by :func:`pack`); place verbatim
-        # and reserve a GAP margin past the lowest-right card so the board scrolls cleanly.
-        max_x = max_y = 0
-        for card in cards:
-            x, y = card.config.col, card.config.row
-            card.move(x, y)
-            max_x = max(max_x, x + card.width())
-            max_y = max(max_y, y + card.height())
-        self.setMinimumSize(max_x + GAP, max_y + GAP)

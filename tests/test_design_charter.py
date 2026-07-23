@@ -30,7 +30,7 @@ QT_WIDGETS_LINE_CAP = 600
 #: still obey the cap.
 GRANDFATHERED = {
     "board.py": 4515,
-    "fluent.py": 3798,
+    "fluent.py": 3795,
     "form.py": 735,
     "param_widgets.py": 676,
 }
@@ -178,12 +178,7 @@ def test_the_deletion_ledger_covers_every_legacy_file():
 
 
 def test_no_file_marries_qt_to_matplotlib_outside_the_sanctioned_zones():
-    """C14 -- the render end state, enforced from today.  Qt sees pixels; matplotlib lives in
-    the headless render leaf; the ONLY places allowed to touch both are the legacy frontend
-    tree (which Z0 deletes wholesale) and the workbench plot_bridge transitional zone (which
-    the post-migration worker-raster rework empties).  Measured at adoption: exactly five
-    dual importers, all inside the legacy tree -- so a sixth anywhere else is a new marriage,
-    not an inherited one."""
+    """C14 -- Qt sees pixels while matplotlib stays in headless render leaves."""
 
     import ast as _ast
 
@@ -194,8 +189,6 @@ def test_no_file_marries_qt_to_matplotlib_outside_the_sanctioned_zones():
         # code, and a probe that builds real windows inevitably touches both toolkits.
         if ("__pycache__" in rel or rel.startswith(("tests/", "tools/", "fpga/", "docs/",
                                                     "_output/", "results/", "mot_field/"))):
-            continue
-        if "/plot_bridge" in rel:
             continue
         try:
             tree = _ast.parse(path.read_text(encoding="utf-8"))

@@ -94,11 +94,33 @@ def test_disabled_anchor_never_opens(application):
         host.deleteLater()
 
 
+def test_custom_present_keeps_shared_toggle_ownership(application):
+    host, _button, popup, content, owner = _anchor(
+        application,
+        reopen_debounce_s=0.0,
+    )
+    presented = []
+    try:
+        owner.toggle(
+            content,
+            prepare=lambda: presented.append("prepared"),
+            present=lambda: (presented.append("presented"), popup.show()),
+        )
+        application.processEvents()
+        assert popup.isVisible()
+        assert presented == ["prepared", "presented"]
+    finally:
+        popup.hide()
+        host.deleteLater()
+
+
 def test_rejects_a_non_callable_prepare_and_a_foreign_popup(application):
     host, button, popup, content, owner = _anchor(application, reopen_debounce_s=0.0)
     try:
         with pytest.raises(TypeError):
             owner.toggle(content, prepare=object())
+        with pytest.raises(TypeError):
+            owner.toggle(content, present=object())
         with pytest.raises(TypeError):
             FluentSettingsPopupAnchor(QtWidgets.QWidget(host), button)
         with pytest.raises(ValueError):
@@ -114,9 +136,18 @@ def test_every_workbench_setting_button_opens_through_the_shared_owner():
     import ast
     from pathlib import Path
 
-    workbench = Path(__file__).resolve().parents[1] / "Zou_lab_control" / "workbench"
+    root = Path(__file__).resolve().parents[1]
+    workbenches = (
+        root / "Zou_lab_control" / "workbench",
+        root / "zlc_workbench",
+    )
     offenders = {}
-    for path in sorted(workbench.glob("*.py")):
+    paths = [
+        path
+        for workbench in workbenches
+        for path in workbench.rglob("*.py")
+    ]
+    for path in sorted(paths):
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source)
         names = {
@@ -135,5 +166,5 @@ def test_every_workbench_setting_button_opens_through_the_shared_owner():
         if "_settings_dismissed_at" in attrs:
             found.append("_settings_dismissed_at")
         if found:
-            offenders[path.name] = found
+            offenders[path.relative_to(root).as_posix()] = found
     assert offenders == {}, offenders

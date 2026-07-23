@@ -76,13 +76,15 @@ def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
     _saved_curve(path)
     viewer = open_figure_viewer()
     wrapper = viewer._zlc_window
+    path_edit = viewer.info_pane.path_edit.edit
+    status = viewer.info_pane.status
     try:
         wrapper.show()
         application.processEvents()
-        QtTest.QTest.mouseClick(viewer.path_edit.edit, QtCore.Qt.LeftButton)
-        QtTest.QTest.keyClicks(viewer.path_edit.edit, str(path))
+        QtTest.QTest.mouseClick(path_edit, QtCore.Qt.LeftButton)
+        QtTest.QTest.keyClicks(path_edit, str(path))
         assert viewer.archive is None
-        QtTest.QTest.keyClick(viewer.path_edit.edit, QtCore.Qt.Key_Return)
+        QtTest.QTest.keyClick(path_edit, QtCore.Qt.Key_Return)
         _until(
             application,
             lambda: (
@@ -102,13 +104,17 @@ def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
         assert not wrapper.grab().isNull()
 
         missing = tmp_path / "missing.npz"
-        QtTest.QTest.mouseClick(viewer.path_edit.edit, QtCore.Qt.LeftButton)
-        QtTest.QTest.keyClick(viewer.path_edit.edit, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
-        QtTest.QTest.keyClicks(viewer.path_edit.edit, str(missing))
-        QtTest.QTest.keyClick(viewer.path_edit.edit, QtCore.Qt.Key_Return)
+        QtTest.QTest.mouseClick(path_edit, QtCore.Qt.LeftButton)
+        QtTest.QTest.keyClick(
+            path_edit,
+            QtCore.Qt.Key_A,
+            QtCore.Qt.ControlModifier,
+        )
+        QtTest.QTest.keyClicks(path_edit, str(missing))
+        QtTest.QTest.keyClick(path_edit, QtCore.Qt.Key_Return)
         _until(
             application,
-            lambda: viewer.worker_idle and viewer.status.severity == "error",
+            lambda: viewer.worker_idle and status.severity == "error",
         )
         assert viewer.figure_pane is pane
         assert viewer.archive.payload_digest == digest
@@ -128,19 +134,22 @@ def test_formal_viewer_keeps_old_generation_when_candidate_first_render_fails(
     _saved_curve(second_path)
     viewer = open_figure_viewer()
     wrapper = viewer._zlc_window
+    path_edit = viewer.info_pane.path_edit.edit
+    status = viewer.info_pane.status
+    raw_info = viewer.info_pane.raw_info
     try:
         wrapper.show()
         application.processEvents()
-        QtTest.QTest.mouseClick(viewer.path_edit.edit, QtCore.Qt.LeftButton)
-        QtTest.QTest.keyClicks(viewer.path_edit.edit, str(first_path))
-        QtTest.QTest.keyClick(viewer.path_edit.edit, QtCore.Qt.Key_Return)
+        QtTest.QTest.mouseClick(path_edit, QtCore.Qt.LeftButton)
+        QtTest.QTest.keyClicks(path_edit, str(first_path))
+        QtTest.QTest.keyClick(path_edit, QtCore.Qt.Key_Return)
         _until(
             application,
             lambda: viewer.archive is not None and viewer.worker_idle,
         )
         old_pane = viewer.figure_pane
         old_archive = viewer.archive
-        old_info = viewer.raw_info.toPlainText()
+        old_info = raw_info.toPlainText()
         old_board = old_pane.findChild(
             QtRasterBoard,
             "figureViewerTypedBoard",
@@ -169,30 +178,30 @@ def test_formal_viewer_keeps_old_generation_when_candidate_first_render_fails(
             reject_initial_render,
         )
 
-        QtTest.QTest.mouseClick(viewer.path_edit.edit, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseClick(path_edit, QtCore.Qt.LeftButton)
         QtTest.QTest.keyClick(
-            viewer.path_edit.edit,
+            path_edit,
             QtCore.Qt.Key_A,
             QtCore.Qt.ControlModifier,
         )
-        QtTest.QTest.keyClicks(viewer.path_edit.edit, str(second_path))
-        QtTest.QTest.keyClick(viewer.path_edit.edit, QtCore.Qt.Key_Return)
+        QtTest.QTest.keyClicks(path_edit, str(second_path))
+        QtTest.QTest.keyClick(path_edit, QtCore.Qt.Key_Return)
         _until(
             application,
             lambda: (
                 bool(candidates)
                 and candidates[0].closed
                 and viewer.worker_idle
-                and viewer.status.severity == "error"
+                and status.severity == "error"
             ),
         )
 
         assert viewer.figure_pane is old_pane
         assert viewer.archive is old_archive
         assert viewer._current_path == first_path
-        assert viewer.raw_info.toPlainText() == old_info
+        assert raw_info.toPlainText() == old_info
         assert old_board.front_frame is old_front
-        assert "synthetic initial render failure" in viewer.status.text()
+        assert "synthetic initial render failure" in status.text()
     finally:
         wrapper.close()
         _until(application, lambda: viewer._closed)

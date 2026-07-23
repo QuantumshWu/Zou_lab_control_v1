@@ -657,14 +657,14 @@ def test_readout_artifacts_do_not_restore_edit_counter_metadata():
 
 GUI_TOOLKITS = frozenset({"matplotlib", "PyQt5", "PySide2", "PySide6", "tkinter"})
 
-#: Only ``zlc_frontend`` renders.  Everything else describes, computes or moves
-#: data, and must stay importable in a headless process (a server, a notebook
-#: kernel with no display, a CI worker) without dragging a GUI toolkit in.
-GUI_FREE_PACKAGES = ("zlc_data", "zlc_storage", "zlc_pulse", "zlc_neutral_atom", "zlc_workbench")
+#: Domain packages describe, compute or move data and remain GUI-free.
+#: ``zlc_frontend`` owns reusable presentation; ``zlc_workbench`` is the Qt
+#: composition root, so neither belongs in this domain-only set.
+GUI_FREE_PACKAGES = ("zlc_data", "zlc_storage", "zlc_pulse", "zlc_neutral_atom")
 
 
 @pytest.mark.parametrize("package", GUI_FREE_PACKAGES)
-def test_only_the_frontend_package_may_import_a_gui_toolkit(package):
+def test_domain_packages_may_not_import_a_gui_toolkit(package):
     """The frontend-neutrality promise, mechanised.
 
     ``figure_capture`` - what a saved figure records about where its data came
@@ -681,18 +681,11 @@ def test_only_the_frontend_package_may_import_a_gui_toolkit(package):
     violations = []
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(ROOT).as_posix()
-        # The ONE sanctioned exception (C14/C20): the workbench plot_bridge zone holds the
-        # widgets that marry Qt to matplotlib while the legacy shells are dismantled.  It is
-        # reached only by explicit import (never from a package __init__), so every package
-        # root here still imports headless; the zone itself empties in the render-purification
-        # pass, at which point this exemption is deleted with it.
-        if "/plot_bridge" in f"/{rel}":
-            continue
         for imported in _imports(path):
             if imported.split(".")[0] in GUI_TOOLKITS:
                 violations.append(f"{path.relative_to(ROOT)} imports {imported}")
     assert not violations, (
-        f"{package} must stay headless-importable; only zlc_frontend may render: "
+        f"{package} must stay headless-importable: "
         + "; ".join(violations)
     )
 

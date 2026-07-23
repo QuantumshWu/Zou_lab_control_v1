@@ -11,7 +11,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 class _Catalog:
     def __init__(self, spec) -> None:
         self._spec = spec
-        self.experiment = None
 
     def specs(self, kind=None):
         if kind is None or kind == self._spec.kind:
@@ -44,7 +43,7 @@ def test_panel_analyze_button_opens_and_focuses_the_exact_final_ref() -> None:
         ConsoleNodeSpec,
         ConsoleSignalDecl,
     )
-    from zlc_workbench.task_console.plot_bridge_console import TaskConsole
+    from zlc_workbench.task_console.window import TaskConsole
 
     application = ensure_qt_app()
     spec = ConsoleNodeSpec(

@@ -26,7 +26,7 @@ def test_panel_title_is_a_local_draft_until_one_semantic_commit() -> None:
     from zlc_data.console_records import PanelConfig
     from zlc_frontend.console_state import TaskConsoleState
     from zlc_frontend.qt_widgets import ensure_qt_app
-    from zlc_workbench.task_console.plot_bridge_console import TaskConsole
+    from zlc_workbench.task_console.window import TaskConsole
 
     application = ensure_qt_app()
     console = TaskConsole(
@@ -78,7 +78,7 @@ def test_timer_never_rediscovers_signal_topology_but_binding_commit_does() -> No
     from zlc_data.console_records import PanelConfig
     from zlc_frontend.console_state import TaskConsoleState
     from zlc_frontend.qt_widgets import ensure_qt_app
-    from zlc_workbench.task_console.plot_bridge_console import TaskConsole
+    from zlc_workbench.task_console.window import TaskConsole
 
     application = ensure_qt_app()
     console = TaskConsole(
@@ -189,7 +189,7 @@ def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
     )
     from zlc_frontend.panel_render import PanelComposer
     from zlc_frontend.qt_widgets import ensure_qt_app
-    from zlc_workbench.task_console.plot_bridge_console import TaskConsole
+    from zlc_workbench.task_console.window import TaskConsole
 
     repeat = AxisSpec(
         AxisId("task-console.repeat"),
@@ -288,7 +288,7 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
     from zlc_frontend.figure import AxisViewRole, view_spec_from_tree
     from zlc_frontend.qt_widgets import ensure_qt_app
     from zlc_workbench.task_console.data_plane import ConsoleSignalValue
-    from zlc_workbench.task_console.plot_bridge_console import TaskConsole
+    from zlc_workbench.task_console.window import TaskConsole
 
     repeat = AxisSpec(
         AxisId("task-console.grid.repeat"),
@@ -406,16 +406,30 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
 
 
 def test_only_the_task_console_worker_lane_may_compose() -> None:
-    bridge = ROOT / "zlc_workbench" / "task_console" / "plot_bridge.py"
-    console = ROOT / "zlc_workbench" / "task_console" / "plot_bridge_console.py"
-    editor = ROOT / "zlc_workbench" / "task_console" / "plot_bridge_editor.py"
+    card = ROOT / "zlc_workbench" / "task_console" / "panel_card.py"
+    console = ROOT / "zlc_workbench" / "task_console" / "window.py"
+    editor = ROOT / "zlc_workbench" / "task_console" / "panel_editor.py"
+    render_lane = ROOT / "zlc_workbench" / "task_console" / "render_lane.py"
 
-    bridge_text = bridge.read_text(encoding="utf-8")
+    card_text = card.read_text(encoding="utf-8")
     editor_text = editor.read_text(encoding="utf-8")
-    assert "_rerender_now" not in bridge_text
-    assert "PanelComposer" not in editor_text
-    assert ".compose(" not in editor_text
-    assert "title_edit.textChanged" not in bridge_text
+    for path in (card, editor, console):
+        owner_tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported_names = {
+            alias.name
+            for node in ast.walk(owner_tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
+        compose_calls = {
+            node.func.attr
+            for node in ast.walk(owner_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+        assert "PanelComposer" not in imported_names
+        assert "compose" not in compose_calls
+    assert "title_edit.textChanged" not in card_text
     assert "title_edit.textChanged" not in editor_text
 
     tree = ast.parse(console.read_text(encoding="utf-8"))
@@ -446,14 +460,15 @@ def test_only_the_task_console_worker_lane_may_compose() -> None:
     assert "freeze_render_request" not in view_request_calls
     assert "freeze_current_view_request" in view_request_calls
 
+    render_tree = ast.parse(render_lane.read_text(encoding="utf-8"))
     parents: dict[ast.AST, ast.AST] = {}
-    for parent in ast.walk(tree):
+    for parent in ast.walk(render_tree):
         for child in ast.iter_child_nodes(parent):
             parents[child] = parent
 
     compose_calls = [
         node
-        for node in ast.walk(tree)
+        for node in ast.walk(render_tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "compose"
@@ -466,4 +481,4 @@ def test_only_the_task_console_worker_lane_may_compose() -> None:
         ):
             owner = parents.get(owner)
         assert owner is not None
-        assert owner.name == "_compose_render_requests"
+        assert owner.name == "_compose"

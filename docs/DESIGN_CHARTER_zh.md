@@ -22,11 +22,11 @@
 - **C11** 依赖方向由 `tests/test_architecture_import_dag.py` 的 `FORBIDDEN` 表机械强制;改表=修宪。
 - **C12** 放置公理:`zlc_frontend` 内**只有 `qt_widgets` 可 import PyQt5**,且 `qt_widgets` **不可 import matplotlib**(源:台账 S5-shell(a),守卫:DAG 测试 + `test_zlc_frontend_qt_widgets`)。外部不得深 import `zlc_frontend.qt_widgets.<子模块>`,一律走包门面。
 - **C13** 顶层 import 纯净(L506):`zlc_frontend`、`zlc_frontend.figure`、`zlc_workbench` 及各应用包根的顶层 import 不得加载 matplotlib backend、PyQt/qframelesswindow、repository backend 或真实硬件 adapter;调用者显式进入 `zlc_frontend.matplotlib_render` / `qt_widgets` / notebook leaf。
-- **C14 渲染终态**:Qt 侧只见像素(`RasterBuffer`/QImage)+ `ViewportTransform` 做命中换算;matplotlib 只活在无头渲染叶(§12.5,L2035-2080:GUI 不读 worker 的 Figure/artist,静态 axes/colorbar 由 worker raster 缓存,动态 overlay 由 Qt 画,export 从 document 重画)。**任何文件不得同时 import PyQt5 与 matplotlib**;唯一过渡豁免 = `zlc_workbench/*/plot_bridge*` 与旧树,§12.5 完成后清空。
+- **C14 渲染终态**:Qt 侧只见像素(`RasterBuffer`/QImage)+ `ViewportTransform` 做命中换算;matplotlib 只活在无头渲染叶(§12.5,L2035-2080:GUI 不读 worker 的 Figure/artist,静态 axes/colorbar 由 worker raster 缓存,动态 overlay 由 Qt 画,export 从 document 重画)。**任何文件不得同时 import PyQt5 与 matplotlib**;`plot_bridge`过渡区已清空,不得以新名字、alias或wrapper复活。
 
 ## C. GUI 结构(2026-07-20 定案,经用户批准)
 
-- **C20 巨石死刑**:GUI 按三层落位——纯 Qt 控件一件一档进 `zlc_frontend/qt_widgets`;应用接线进 `zlc_workbench/<app>/app.py`(目标 <1k 行);持 mpl 对象的控件暂进 `zlc_workbench/<app>/plot_bridge`。`Zou_lab_control/frontend/task_console.py` 与 `pulse_gui.py` 的终态是**删除**,不是搬家。
+- **C20 巨石死刑**:GUI 按三层落位——可跨产品复用的纯 Qt 控件一件一档进 `zlc_frontend/qt_widgets`;领域窗口按真实组件/生命周期 owner 分档进 `zlc_workbench/<app>/`,应用接线只进 `app.py`(目标 <1k 行);matplotlib只进无头render叶。禁止`plot_bridge`过渡区、按行数造mixin/manager、或让一个window文件同时拥有可独立组合的card/editor/board/worker。
 - **C21 文件行数棘轮**(等值,守卫机械强制):qt_widgets 新文件 ≤600 行;存量超限件(board.py/fluent.py/param_widgets.py)记录现值**只准降**。放置事实不只看 import——**持有**活 Qt/mpl 对象的记录,其家在对象所在层(血训:`_GridFocus`/`_StopAttempt` 按 import 判是 render-free,实持 canvas/线程)。
 - **C22 行为权威 = main**:UX 逐项继承 `ZLC_main`(独立 clone)的真实窗口行为,验收 = **两棵活树 A/B 真窗口对比**并记录 main 当日 HEAD;偏离只能进 UX 偏离台账待用户批准(L129/§2.2),默认动作是恢复 main 行为。**取到 A 树的方式(C44 修宪后)= 从 `ZLC_main` 目录起进程**(cwd 优先),不是 import——editable 现在指本仓库,任何目录 import 拿到的都是 B 树。
 - **C23** §12.5 worker-raster 是**迁移完成后的独立质量项**,不是迁移前置;其前置 = 先建交互验收矩阵(逐 plot kind × 逐手势的行为表,因交互栈曾零活动覆盖);完成后 plot_bridge 控件提纯毕业进 qt_widgets。

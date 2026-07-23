@@ -1,19 +1,15 @@
-"""The task console window itself: tabs, board, logic rows, render bridge, lifecycle.
+"""The TaskConsole window: tabs, cards, logic rows, and lifecycle wiring.
 
-This is the composition CORE salvaged out of the legacy shell -- it holds the panel cards
-(plot_bridge objects), the background render bridge and the whole window lifecycle, so its
-transitional home is the plot_bridge zone.  The render-purification pass dissolves it: the
-wiring sinks into ``app.py`` and the widgets graduate into ``qt_widgets``.
+Panel widgets, board geometry, editing, and worker raster ownership each live in
+their own module; this file owns only the application window and their wiring.
 
 Every import names a TRUE owner -- nothing here touches the legacy tree.
 """
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
 import inspect
 import os
-import threading
 import time
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -37,7 +33,6 @@ from zlc_frontend.qt_widgets import (
     GREEN,
     GREY,
     LogicNodeEditor,
-    QtOwnerWake,
     LogicNodeRow,
     ORANGE,
     WINDOW_SCREEN_FRACTION,
@@ -66,18 +61,18 @@ from zlc_data.console_records import (
     UPDATE_INTERVALS,
 )
 from zlc_data.shape_text import indexed_unique_name, strip_node_prefix
-from .plot_bridge import (
+from .panel_board import (
     GAP,
-    PanelCard,
-    _PanelRenderRequest,
-    _PanelBoard,
-    _board_width,
-    _opaque_white_composite,
+    PanelBoard,
+    board_width,
     drop_index,
+    opaque_white_composite,
     pack,
 )
 from .data_plane import ConsoleDataPlane
-from .plot_bridge_editor import PanelEditor
+from .panel_card import PanelCard
+from .panel_editor import PanelEditor
+from .render_lane import ConsoleRenderLane
 
 
 # ====================================================================== console
@@ -168,11 +163,6 @@ class TaskConsole(QtWidgets.QWidget):
         # for the life of the process / Jupyter kernel, like the pulse GUI's save dir).
         # None until the first save -> the picker defaults to the tasks/ folder.
         self._last_save_dir: str | None = None
-        # No-measurement / no-processor sentinels kept so older callers / tests that
-        # probe "is there a global measurement launcher" still read None (there is
-        # no global form -- a measurement is a Logic node now).
-        self.measurement_panel = None
-        self.measurement_group = None
         # Per-panel editors: one PanelEditor per opened PLOT panel, hosted as a
         # closable tab (keyed by id(card)).
         self._panel_editors: dict[int, "PanelEditor"] = {}
@@ -193,25 +183,12 @@ class TaskConsole(QtWidgets.QWidget):
         # related view signals publishes them atomically, so companion values remain
         # shot-coherent without console-side joins.
 
-        # One thread-affine worker owns every PanelComposer/Agg object.  Qt only
-        # freezes immutable requests and presents immutable BoardFrames.  While
-        # one batch is running, newer requests replace the not-yet-started
-        # request for that panel; the next batch is not dispatched until the Qt
-        # owner has accepted/rejected the current result, so render continuity
-        # is never determined by executor timing.
-        self._render_pool = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="zlc-task-console-raster",
+        # One explicit owner keeps every PanelComposer/Agg object on its serial
+        # worker.  This window only freezes requests and accepts completed fronts.
+        self._render_lane = ConsoleRenderLane(
+            self,
+            accept_completion=self._accept_render_completion,
         )
-        self._render_lock = threading.Lock()
-        self._render_future: Future | None = None
-        self._render_completion = None
-        self._render_pending: dict[str, _PanelRenderRequest] = {}
-        self._render_reset_pending: set[str] = set()
-        self._render_worker_composers: dict[str, tuple[object, object]] = {}
-        self._render_closing = False
-        self._render_wake = QtOwnerWake(self)
-        self._render_wake.bind(self._render_owner_cycle)
 
         self._build_ui()
         self.load_state(self.state)
@@ -403,7 +380,7 @@ class TaskConsole(QtWidgets.QWidget):
         dash_layout.setContentsMargins(0, 0, 0, 0)
         self.scroll = FluentScrollArea()
         self.scroll.setWidgetResizable(True)
-        self.board = _PanelBoard()
+        self.board = PanelBoard()
         self.scroll.setWidget(self.board)
         dash_layout.addWidget(self.scroll, 1)
         # Re-pack the gravity board when the viewport WIDTH changes (window resized): cards wrap at
@@ -534,16 +511,6 @@ class TaskConsole(QtWidgets.QWidget):
         self._recompute_tick_interval()    # the loaded panels' rates set the timer base
         self._sync_fit_analysis_entries()
         self._update_summary()
-
-    def reseed(self, state: TaskConsoleState, *, running_nodes: Sequence[object] = ()) -> None:
-        """Reload the board to a NEW state IN PLACE: reuse this console's WHOLE widget tree (tabs, board,
-        header, hub, refresh timer) and rebuild only its PANELS (:meth:`load_state`), swapping the
-        producing-node set.  The single reseed entry for a host that shows one console and re-points it
-        at different data -- the figure_viewer's Browse re-load: swapping the seeded panel must NOT tear
-        the console down and construct a fresh one, which re-realizes the entire Qt widget tree (~0.35 s
-        of the perceived load).  The caller owns STOPPING the previous nodes (the console only reads the
-        hub); a reused hub's stale signals are overwritten by same-named republishes or GC'd as orphans."""
-        self.load_state(state, _replacement_running_nodes=running_nodes)
 
     def _new_panel_card(self, config: PanelConfig) -> PanelCard:
         """Build a PanelCard wired to the console's signal providers -- the ONE place the
@@ -1203,7 +1170,7 @@ class TaskConsole(QtWidgets.QWidget):
         demand-grown horizontal extent to track any more (that was the parking the user asked us to
         stop, #2).  No viewport yet (pre-show) -> the headless two-wide fallback."""
         vw = self.scroll.viewport().width() if hasattr(self, "scroll") else 0
-        return vw if vw else _board_width(configs)
+        return vw if vw else board_width(configs)
 
     # ------------------------------------------------------------------ actions
     def _add_panel(self) -> None:
@@ -1278,16 +1245,6 @@ class TaskConsole(QtWidgets.QWidget):
         self._panel_teardown_phases.pop(id(card), None)
         self._sync_fit_analysis_entries()
         return True
-
-    @property
-    def experiment(self):
-        """The session behind the catalog view, or None for a catalog-less window.
-
-        The skeleton reaches the domain ONLY through the catalog seam, so this is
-        the single accessor every panel/editor asks -- no second session field.
-        """
-
-        return self._catalog.experiment if self._catalog is not None else None
 
     # ====================================================================== logic nodes
     def _catalog_specs(self, kind: str) -> tuple:
@@ -1688,15 +1645,6 @@ class TaskConsole(QtWidgets.QWidget):
             )
         return self._run_factory(spec, dict(values))
 
-    @property
-    def render_worker_idle(self) -> bool:
-        with self._render_lock:
-            return (
-                self._render_future is None
-                and self._render_completion is None
-                and not self._render_pending
-            )
-
     def _request_card_render(self, card: PanelCard, *, force: bool = False) -> bool:
         """Re-render one card from its already accepted immutable data front.
 
@@ -1705,12 +1653,12 @@ class TaskConsole(QtWidgets.QWidget):
         mouse/key event cannot materialize producer data as a side effect.
         """
 
-        if self._render_closing or card not in self.cards:
+        if self._render_lane.closing or card not in self.cards:
             return False
         request = card.freeze_current_view_request(force=bool(force))
         if request is None:
             return False
-        self._enqueue_render_requests((request,))
+        self._render_lane.enqueue((request,))
         return True
 
     def _enqueue_render_batch(self, batch, snapshot, *, force: bool = False) -> None:
@@ -1719,134 +1667,12 @@ class TaskConsole(QtWidgets.QWidget):
             request = card.freeze_render_request(snapshot, key, force=force)
             if request is not None:
                 requests.append(request)
-        self._enqueue_render_requests(tuple(requests))
+        self._render_lane.enqueue(tuple(requests))
 
-    def _enqueue_render_requests(
-        self,
-        requests: tuple[_PanelRenderRequest, ...],
-    ) -> None:
-        if not requests or self._render_closing:
-            return
-        with self._render_lock:
-            if self._render_future is not None or self._render_completion is not None:
-                for request in requests:
-                    self._render_pending[request.panel_id] = request
-                return
-        self._start_render_batch(requests, ())
+    def _accept_render_completion(self, completion: object) -> set[str]:
+        """Accept one worker batch on the Qt owner and return stale panel ids."""
 
-    def _start_render_batch(
-        self,
-        requests: tuple[_PanelRenderRequest, ...],
-        reset_panel_ids: tuple[str, ...],
-    ) -> None:
-        if self._render_closing:
-            return
-        future = self._render_pool.submit(
-            self._compose_render_requests,
-            requests,
-            reset_panel_ids,
-        )
-        with self._render_lock:
-            if self._render_future is not None:
-                raise RuntimeError("TaskConsole render lane admitted overlapping batches")
-            self._render_future = future
-        future.add_done_callback(self._render_batch_finished)
-
-    def _compose_render_requests(
-        self,
-        requests: tuple[_PanelRenderRequest, ...],
-        reset_panel_ids: tuple[str, ...],
-    ):
-        """Worker-only PanelComposer/Agg owner."""
-
-        from zlc_frontend.panel_render import PanelComposer, PanelRenderError
-
-        for panel_id in reset_panel_ids:
-            owned = self._render_worker_composers.pop(panel_id, None)
-            if owned is not None:
-                owned[1].close()
-        results = []
-        for request in requests:
-            owned = self._render_worker_composers.get(request.panel_id)
-            if owned is None or owned[0] != request.source_key:
-                if owned is not None:
-                    owned[1].close()
-                composer = PanelComposer(
-                    request.panel_id,
-                    intent=request.intent,
-                    size=request.size,
-                    label=request.label,
-                    view=request.view,
-                )
-                self._render_worker_composers[request.panel_id] = (
-                    request.source_key,
-                    composer,
-                )
-            else:
-                composer = owned[1]
-            try:
-                if request.faceted:
-                    faceted_result = composer.compose_faceted(
-                        request.value.snapshot,
-                        display=request.display,
-                        provenance=request.provenance,
-                        focus=request.focus,
-                    )
-                    frame = None
-                    document = faceted_result.figure.document
-                else:
-                    frame = composer.compose(
-                        request.value.snapshot,
-                        display=request.display,
-                        provenance=request.provenance,
-                    )
-                    faceted_result = None
-                    document = composer.document_for(
-                        request.value.snapshot.block.schema
-                    )
-            except PanelRenderError as error:
-                results.append((request, None, None, None, str(error)))
-            except BaseException as error:
-                # Never retain the raw exception/traceback: it may own the
-                # entire frozen dataset and Agg graph.
-                results.append(
-                    (
-                        request,
-                        None,
-                        None,
-                        None,
-                        f"{type(error).__name__}: {error}",
-                    )
-                )
-            else:
-                results.append(
-                    (request, frame, faceted_result, document, None)
-                )
-        return tuple(results)
-
-    def _render_batch_finished(self, future: Future) -> None:
-        try:
-            completion = future.result()
-        except BaseException as error:
-            completion = f"{type(error).__name__}: {error}"
-        with self._render_lock:
-            if self._render_closing:
-                return
-            self._render_completion = completion
-        self._render_wake.request_owner_wake()
-
-    def _render_owner_cycle(self) -> None:
-        """Qt-only accept/present point, then release the next latest batch."""
-
-        if self._render_closing:
-            return
-        with self._render_lock:
-            completion = self._render_completion
-            if completion is None:
-                return
-            self._render_completion = None
-            self._render_future = None
-        reset = set()
+        reset: set[str] = set()
         to_present = []
         if isinstance(completion, str):
             self.status_strip.show_message(
@@ -1872,50 +1698,17 @@ class TaskConsole(QtWidgets.QWidget):
             # accepted because one sibling raised.
             for card in to_present:
                 card.present()
-        with self._render_lock:
-            reset.update(self._render_reset_pending)
-            self._render_reset_pending.clear()
-            pending = tuple(self._render_pending.values())
-            self._render_pending.clear()
-        if pending or reset:
-            self._start_render_batch(pending, tuple(sorted(reset)))
+        return reset
 
     def _forget_card_render(self, card: PanelCard) -> None:
         """Revoke queued results without waiting for immutable worker work."""
 
         card._render_request_revision += 1
         card._requested_signature = None
-        start_reset = False
-        with self._render_lock:
-            self._render_pending.pop(card.panel_id, None)
-            if self._render_future is None and self._render_completion is None:
-                start_reset = True
-            else:
-                self._render_reset_pending.add(card.panel_id)
-        if start_reset:
-            # No completion will arrive to drain ``_render_reset_pending``.
-            # Queue the disposal directly on the same worker that owns Agg.
-            self._start_render_batch((), (card.panel_id,))
+        self._render_lane.forget(card.panel_id)
 
     def _shutdown_render_lane(self) -> None:
-        if self._render_closing:
-            return
-        self._render_closing = True
-        self._render_wake.detach()
-        with self._render_lock:
-            self._render_pending.clear()
-            self._render_completion = None
-
-        def release_worker_state() -> None:
-            for _key, composer in tuple(self._render_worker_composers.values()):
-                composer.close()
-            self._render_worker_composers.clear()
-
-        # The executor is serial: cleanup runs after an already-started compose
-        # on the same owner thread.  Qt does not block while that finite work
-        # drains, and the closing gate refuses every late completion.
-        self._render_pool.submit(release_worker_state)
-        self._render_pool.shutdown(wait=False)
+        self._render_lane.shutdown()
 
     def _stop_logic_node(
         self,
@@ -2158,8 +1951,8 @@ class TaskConsole(QtWidgets.QWidget):
             pm = self.board.grab(rect)
         else:
             pm = self.board.grab()
-        # _PanelBoard is transparent -> composite onto an opaque white canvas so the PNG isn't see-through.
-        _opaque_white_composite(pm).save(path)
+        # PanelBoard is transparent; flatten the exported board onto white.
+        opaque_white_composite(pm).save(path)
         self._last_save_dir = str(Path(path).parent)
         self._update_summary()
 
@@ -2194,23 +1987,17 @@ class TaskConsole(QtWidgets.QWidget):
         versions = self._tick_data.versions()
         elapsed = self._tick_count * self._base_interval_ms
         # COLLECT every panel whose own source revisions changed and whose beat is
-        # due (or owed).  ``update_ms`` gates when that card recomposes; batching
+        # due.  ``update_ms`` gates when that card recomposes; batching
         # only makes presentation efficient and carries no cross-producer
-        # same-shot assertion.  A mid-drag panel is skipped whole (a live recompose under a drag stomps
-        # the widget blit backgrounds); its beat is owed too, so it catches up right on release.
+        # same-shot assertion.  Raster-board interactions own their accepted front;
+        # unlike the removed live-artist path, they need no GUI-side blit lock.
         batch = []
         for card in self.cards:
             key = self._panel_frame_key(card, versions)
             if key == card._render_version:
                 continue                       # nothing this panel shows changed
-            if elapsed % card.config.update_ms != 0 and not card._beat_owed:
-                continue                       # beat not due (and none owed)
-            # A card mid-gesture is skipped whole: recomposing under a drag would
-            # replace the very front the pointer is measuring against.
-            if bool(getattr(card, "_interacting", False)):
-                card._beat_owed = True         # due but unservable this tick -> next idle tick serves it
-                continue
-            card._beat_owed = False
+            if elapsed % card.config.update_ms != 0:
+                continue                       # beat not due
             batch.append((card, key))
         if batch:
             self._enqueue_render_batch(batch, self._tick_data)
@@ -2351,10 +2138,7 @@ class TaskConsole(QtWidgets.QWidget):
             if node is not None
         }
         for row in list(self.logic_nodes):
-            if (
-                self._logic_nodes.get(id(row)) is not None
-                is not None
-            ):
+            if self._logic_nodes.get(id(row)) is not None:
                 remaining = max(0.0, deadline - time.monotonic())
                 stopped = self._stop_logic_node(row, timeout=remaining) and stopped
         # Row-less injected nodes (show_task_console(running_nodes=[...])) have
@@ -2372,66 +2156,6 @@ class TaskConsole(QtWidgets.QWidget):
                 "Close delayed: a logic-node owner thread is still active",
                 severity="error",
             )
-        return stopped
-
-    def stop_nodes_using(self, affected_ids, timeout: float = 2.0) -> bool:
-        """Stop exactly the running nodes that reference one of the ``affected_ids`` devices --
-        the session's fine-grained device-change hook (``load_config`` swapping specific device
-        INSTANCES).  A node is affected iff its :meth:`~LogicNode.referenced_devices` (EXCLUSIVE
-        drivers AND OBSERVE records, unwrapped to real identity) intersect the swapped set, so
-        reinitialising the camera stops every camera view / occupancy path riding it while a scan
-        on the untouched sequencer keeps running.  Goes through the SAME
-        ``_stop_logic_node`` endpoint as every other stop, so no dead provider is
-        left advertised as live after close/reopen."""
-        if QtCore.QThread.currentThread() is not self.thread():
-            raise RuntimeError("node shutdown must run on the TaskConsole Qt owner thread")
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
-            raise ValueError("node shutdown timeout must be a non-negative number")
-        deadline = time.monotonic() + float(timeout)
-        affected = {int(i) for i in affected_ids}
-        if not affected:
-            return True
-
-        def _touches(node) -> bool:
-            references = tuple(node.referenced_devices()) + tuple(
-                getattr(node, "lifecycle_devices", lambda: ())()
-            )
-            return any(id(d) in affected for d in references)
-
-        stopped = True
-        row_node_ids = {
-            id(node)
-            for row in self.logic_nodes
-            for node in (
-                self._logic_nodes.get(id(row)),
-            )
-            if node is not None
-        }
-        for row in list(self.logic_nodes):
-            node = self._logic_nodes.get(id(row))
-            if node is not None:
-                try:
-                    touches = _touches(node)
-                except BaseException:
-                    stopped = False
-                    continue
-                if touches:
-                    remaining = max(0.0, deadline - time.monotonic())
-                    stopped = self._stop_logic_node(row, timeout=remaining) and stopped
-        for node in list(self.running_nodes):        # row-less injected nodes
-            if id(node) in row_node_ids:
-                continue
-            try:
-                touches = _touches(node)
-            except BaseException:
-                stopped = False
-                continue
-            if touches:
-                remaining = max(0.0, deadline - time.monotonic())
-                confirmed = self._stop_run(node, timeout=remaining)
-                stopped = confirmed and stopped
-                if confirmed and node in self.running_nodes:
-                    self.running_nodes.remove(node)
         return stopped
 
     def shutdown(self, timeout: float = 5.0) -> bool:

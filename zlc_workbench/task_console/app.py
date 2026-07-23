@@ -4,9 +4,8 @@ Every entry goes through :func:`open_task_console`: the double-clickable
 ``task_console.bat``, the root ``task_console.py`` launcher, and
 ``Experiment.task_console()`` from a notebook.
 
-The window is the ORIGINAL console UI -- the Monitor/Logic tabbed board, panel
-cards, Fluent chrome -- hosted in :mod:`.plot_bridge_console` (the UI skeleton is
-kept BY DIRECTIVE 2026-07-21; it is never redesigned).  Its DATA plane is being
+The window preserves the main Monitor/Logic tabbed board, panel cards, and
+Fluent chrome in the named presentation modules under this package.  Its data plane is
 rewired onto the CURRENT architecture per the design document's section 10; the
 four contracted seams this root assembles, in rewiring order:
 
@@ -48,7 +47,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
 
     from .catalog_bridge import ConsoleCatalogView
     from .data_plane import ConsoleDataPlane
-    from .plot_bridge_console import show_task_console
+    from .window import show_task_console
     from .run_bridge import ConsoleRunNode
 
     catalog_view = ConsoleCatalogView(experiment)
@@ -94,7 +93,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         catalog_view=catalog_view,
         run_factory=run_factory,
         data_plane=data_plane,
-        fit_window_factory=experiment.readout.fit_gui,
+        fit_window_factory=experiment.fit_gui,
         **kwargs,
     )
     console.append(body)
