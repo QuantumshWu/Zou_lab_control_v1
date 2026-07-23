@@ -197,6 +197,7 @@ class FigureViewer(QtWidgets.QWidget):
         self._current_path: Path | None = None
         self.archive = None
         self.figure_pane: QtWidgets.QWidget | None = None
+        self._candidate_load: tuple[int, object, tuple, QtWidgets.QWidget] | None = None
         self._retiring_panes: list[QtWidgets.QWidget] = []
         self._load_revision = 0
         self._active_load: tuple[int, Path, Future] | None = None
@@ -341,7 +342,11 @@ class FigureViewer(QtWidgets.QWidget):
 
     @property
     def worker_idle(self) -> bool:
-        return self._active_load is None and self._pending_load is None
+        return (
+            self._active_load is None
+            and self._pending_load is None
+            and self._candidate_load is None
+        )
 
     def open_path(self, path: str | Path) -> None:
         """Commit one programmatic path exactly like Browse/editingFinished."""
@@ -366,6 +371,13 @@ class FigureViewer(QtWidgets.QWidget):
                 f"{type(error).__name__}: {error}", severity="error"
             )
             return
+        candidate = self._candidate_load
+        if candidate is not None:
+            candidate_path = Path(candidate[1].path)
+            if path == candidate_path:
+                return
+            self._candidate_load = None
+            self._retire_pane(candidate[3])
         if (
             path == self._current_path
             and self._active_load is None
@@ -408,7 +420,7 @@ class FigureViewer(QtWidgets.QWidget):
             if not self._closing and revision == self._load_revision:
                 try:
                     archive = future.result()
-                    self._accept_archive(archive)
+                    self._accept_archive(revision, archive)
                 except CancelledError:
                     self.status.show_message(
                         f"Load cancelled: {display_path(str(path))}",
@@ -428,8 +440,8 @@ class FigureViewer(QtWidgets.QWidget):
             self._start_pending_load()
         self._finish_close_if_ready()
 
-    def _accept_archive(self, archive) -> None:
-        """Construct a complete candidate, then atomically replace the visible generation."""
+    def _accept_archive(self, revision: int, archive) -> None:
+        """Build a hidden candidate; its admitted first front commits the generation."""
 
         from Zou_lab_control.workbench import create_data_figure_pane
 
@@ -449,6 +461,37 @@ class FigureViewer(QtWidgets.QWidget):
         )
         if not isinstance(candidate, QtWidgets.QWidget):
             raise TypeError("create_data_figure_pane must return a QWidget")
+        ready = getattr(candidate, "initialReady", None)
+        failed = getattr(candidate, "initialFailed", None)
+        if ready is None or failed is None:
+            candidate.shutdown()
+            raise TypeError(
+                "DataFigure pane must expose initialReady and initialFailed"
+            )
+
+        self._candidate_load = (revision, archive, info, candidate)
+        ready.connect(
+            lambda pane=candidate: self._commit_candidate(pane),
+            QtCore.Qt.QueuedConnection,
+        )
+        failed.connect(
+            lambda detail, pane=candidate: self._reject_candidate(pane, detail),
+            QtCore.Qt.QueuedConnection,
+        )
+        self.status.show_message(
+            f"Rendering {display_path(str(archive.path))}",
+            severity="task",
+        )
+
+    def _commit_candidate(self, candidate: QtWidgets.QWidget) -> None:
+        pending = self._candidate_load
+        if pending is None or pending[3] is not candidate:
+            return
+        revision, archive, info, _pane = pending
+        self._candidate_load = None
+        if self._closing or revision != self._load_revision:
+            self._retire_pane(candidate)
+            return
 
         previous = self.figure_pane
         if self._placeholder is not None:
@@ -467,6 +510,23 @@ class FigureViewer(QtWidgets.QWidget):
         self.status.show_message(
             f"Loaded {display_path(str(self._current_path))}"
         )
+
+    def _reject_candidate(
+        self,
+        candidate: QtWidgets.QWidget,
+        detail: str,
+    ) -> None:
+        pending = self._candidate_load
+        if pending is None or pending[3] is not candidate:
+            return
+        revision, _archive, _info, _pane = pending
+        self._candidate_load = None
+        self._retire_pane(candidate)
+        if not self._closing and revision == self._load_revision:
+            self.status.show_message(
+                f"Figure render failed: {detail}",
+                severity="error",
+            )
 
     # --------------------------------------------------------------- Info data
     def _info_projection(self, archive):
@@ -587,6 +647,10 @@ class FigureViewer(QtWidgets.QWidget):
             self.figure_pane = None
             if pane is not None:
                 self._retire_pane(pane)
+            candidate = self._candidate_load
+            self._candidate_load = None
+            if candidate is not None:
+                self._retire_pane(candidate[3])
         self._finish_close_if_ready()
         return self._closed
 

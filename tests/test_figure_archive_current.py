@@ -117,6 +117,87 @@ def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
         _until(application, lambda: viewer._closed)
 
 
+def test_formal_viewer_keeps_old_generation_when_candidate_first_render_fails(
+    application,
+    monkeypatch,
+    tmp_path,
+):
+    first_path = tmp_path / "first.npz"
+    second_path = tmp_path / "second.npz"
+    _saved_curve(first_path)
+    _saved_curve(second_path)
+    viewer = open_figure_viewer()
+    wrapper = viewer._zlc_window
+    try:
+        wrapper.show()
+        application.processEvents()
+        QtTest.QTest.mouseClick(viewer.path_edit.edit, QtCore.Qt.LeftButton)
+        QtTest.QTest.keyClicks(viewer.path_edit.edit, str(first_path))
+        QtTest.QTest.keyClick(viewer.path_edit.edit, QtCore.Qt.Key_Return)
+        _until(
+            application,
+            lambda: viewer.archive is not None and viewer.worker_idle,
+        )
+        old_pane = viewer.figure_pane
+        old_archive = viewer.archive
+        old_info = viewer.raw_info.toPlainText()
+        old_board = old_pane.findChild(
+            QtRasterBoard,
+            "figureViewerTypedBoard",
+        )
+        assert old_board is not None and old_board.front_frame is not None
+        old_front = old_board.front_frame
+
+        import Zou_lab_control.workbench as workbench
+        import Zou_lab_control.workbench._figure as figure_workbench
+
+        original_create = workbench.create_data_figure_pane
+        candidates = []
+
+        def tracked_create(*args, **kwargs):
+            pane = original_create(*args, **kwargs)
+            candidates.append(pane)
+            return pane
+
+        def reject_initial_render(*_args, **_kwargs):
+            raise RuntimeError("synthetic initial render failure")
+
+        monkeypatch.setattr(workbench, "create_data_figure_pane", tracked_create)
+        monkeypatch.setattr(
+            figure_workbench,
+            "_render_typed_front",
+            reject_initial_render,
+        )
+
+        QtTest.QTest.mouseClick(viewer.path_edit.edit, QtCore.Qt.LeftButton)
+        QtTest.QTest.keyClick(
+            viewer.path_edit.edit,
+            QtCore.Qt.Key_A,
+            QtCore.Qt.ControlModifier,
+        )
+        QtTest.QTest.keyClicks(viewer.path_edit.edit, str(second_path))
+        QtTest.QTest.keyClick(viewer.path_edit.edit, QtCore.Qt.Key_Return)
+        _until(
+            application,
+            lambda: (
+                bool(candidates)
+                and candidates[0].closed
+                and viewer.worker_idle
+                and viewer.status.severity == "error"
+            ),
+        )
+
+        assert viewer.figure_pane is old_pane
+        assert viewer.archive is old_archive
+        assert viewer._current_path == first_path
+        assert viewer.raw_info.toPlainText() == old_info
+        assert old_board.front_frame is old_front
+        assert "synthetic initial render failure" in viewer.status.text()
+    finally:
+        wrapper.close()
+        _until(application, lambda: viewer._closed)
+
+
 def test_notebook_no_argument_entry_opens_the_same_session_independent_viewer(
     application,
     tmp_path,

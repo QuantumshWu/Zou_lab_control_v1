@@ -1421,6 +1421,9 @@ def _export_encoded_png(
 class DataFigureWindow(FrozenRasterWindow):
     """Frozen generic viewer with one closed IMAGE/CURVE/HISTOGRAM/METER front."""
 
+    initialReady = QtCore.pyqtSignal()
+    initialFailed = QtCore.pyqtSignal(str)
+
     def __init__(
         self,
         initial_loader,
@@ -1462,6 +1465,7 @@ class DataFigureWindow(FrozenRasterWindow):
         ) = None
         self._typed_pages_admitted = False
         self._typed_ui_faulted = False
+        self._initial_outcome: str | None = None
         self._request_revision = 0
         self._active_kind: str | None = "initial"
         self._pending_state: _TypedDisplayState | None = None
@@ -1594,11 +1598,33 @@ class DataFigureWindow(FrozenRasterWindow):
             pane.hide()
             self._fit_pane = pane
         self._set_typed_controls_enabled(False)
-        self._submit_future(
+        if not self._submit_future(
             initial_loader,
             self._request_revision,
             self._cancelled,
-        )
+        ):
+            self._active_kind = None
+            failure = self._diagnostic.text() or "initial figure work was not submitted"
+            QtCore.QTimer.singleShot(
+                0,
+                lambda detail=failure: self._emit_initial_failed(detail),
+            )
+
+    def _emit_initial_ready(self) -> None:
+        """Publish the one-time boundary after an actual front is admitted."""
+
+        if self._initial_outcome is not None:
+            return
+        self._initial_outcome = "ready"
+        self.initialReady.emit()
+
+    def _emit_initial_failed(self, detail: str) -> None:
+        """Publish the one-time boundary when no initial front was admitted."""
+
+        if self._initial_outcome is not None:
+            return
+        self._initial_outcome = "failed"
+        self.initialFailed.emit(str(detail))
 
     def _present_grid_overview(self, overview: _TypedGridOverview) -> None:
         if not isinstance(overview, _TypedGridOverview):
@@ -3007,6 +3033,9 @@ class DataFigureWindow(FrozenRasterWindow):
                     self._status.setText("READY")
                     self._diagnostic.setText("")
                     self._set_typed_controls_enabled(True)
+                elif kind == "initial":
+                    self._active_kind = None
+                    self._emit_initial_failed("initial figure render was cancelled")
                 else:
                     self._active_kind = None
         except BaseException as error:
@@ -3199,7 +3228,11 @@ class DataFigureWindow(FrozenRasterWindow):
                 self._view_family = "encoded"
                 self._set_typed_controls_enabled(False)
                 self._mode.setText("FROZEN DATA FIGURE · DISPLAY ONLY")
-                self._present_bundle(result)
+                if not self._present_bundle(result):
+                    raise RuntimeError(
+                        self._diagnostic.text()
+                        or "initial encoded figure could not be presented"
+                    )
             elif isinstance(result, _TypedFigureFront):
                 initial_display = self._initial_display
                 if initial_display is None:
@@ -3219,6 +3252,7 @@ class DataFigureWindow(FrozenRasterWindow):
             else:
                 raise TypeError("initial figure worker returned another result")
             self._active_kind = None
+            self._emit_initial_ready()
             return
         if kind == "grid_focus":
             if not isinstance(result, _TypedFigureFront):
@@ -3406,6 +3440,13 @@ class DataFigureWindow(FrozenRasterWindow):
             self._diagnostic.setText(error_summary(error))
             self._active_kind = None
             self._set_typed_controls_enabled(True)
+        elif kind == "initial":
+            self._status.setText("FIGURE FAILED")
+            self._summary.setText("No raster was admitted")
+            detail = error_summary(error)
+            self._diagnostic.setText(detail)
+            self._active_kind = None
+            self._emit_initial_failed(detail)
         else:
             self._status.setText("FIGURE FAILED")
             self._summary.setText("No raster was admitted")
