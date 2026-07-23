@@ -210,7 +210,7 @@ def capture_offscreen_pulse_gui_user_flow(
         )
         until(
             application,
-            lambda: body._controller.snapshot().connection_state == "ready",
+            lambda: body._controller.runtime_update().connection_state == "ready",
         )
         captures.append(
             capture_offscreen_window(
@@ -240,8 +240,8 @@ def capture_offscreen_pulse_gui_user_flow(
         until(
             application,
             lambda: (
-                body._controller.snapshot().connection_state == "offline"
-                and body._controller.snapshot().connection_mode == "offline"
+                body._controller.runtime_update().connection_state == "offline"
+                and body._controller.runtime_update().connection_mode == "offline"
             ),
         )
         captures.append(
@@ -254,7 +254,7 @@ def capture_offscreen_pulse_gui_user_flow(
         )
     finally:
         body.request_close(discard_unsaved=True)
-        until(application, lambda: body._controller.snapshot().close_complete)
+        until(application, lambda: body._controller.runtime_update().close_complete)
         until(application, lambda: wrapper is None or not wrapper.isVisible())
         if temporary is not None:
             temporary.cleanup()

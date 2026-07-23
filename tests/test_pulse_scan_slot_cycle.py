@@ -30,7 +30,7 @@ def editor():
     _until(application, lambda: bool(body.schedule_view.period_cards()))
     yield application, body
     body.request_close(discard_unsaved=True)
-    _until(application, lambda: body._controller.snapshot().close_complete)
+    _until(application, lambda: body._controller.runtime_update().close_complete)
 
 
 def _first_card(body):

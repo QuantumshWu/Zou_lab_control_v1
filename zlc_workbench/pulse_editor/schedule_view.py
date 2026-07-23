@@ -32,8 +32,6 @@ from zlc_frontend.qt_widgets import (
     FluentScanLineEdit,
     FluentScrollArea,
     FluentSwitch,
-    fluent_scrollbar_stylesheet,
-    fluent_scrollbar_thickness,
     format_compact_number,
     signals_blocked,
 )
@@ -248,23 +246,6 @@ class _Binding:
     parameter_id: str
 
 
-@dataclass(frozen=True)
-class _FocusSnapshot:
-    token: tuple[str, ...]
-    cursor_position: int | None = None
-    selection_start: int = -1
-    selection_length: int = 0
-
-
-@dataclass(frozen=True)
-class _InteractionSnapshot:
-    selected_period_id: str | None
-    selected_gap: int | None
-    horizontal_scroll: int
-    vertical_scroll: int
-    focus: _FocusSnapshot | None
-
-
 def _port_rows(
     document: PulseDocument,
     manifest: PulseTargetManifest,
@@ -305,6 +286,14 @@ def _field_bindings(document: PulseDocument) -> dict[PulseFieldRef, _Binding]:
         }
     )
     return result
+
+
+def _delay_values(
+    document: PulseDocument,
+) -> dict[str, tuple[int | float, str]]:
+    """Display values for optional delays; absence is the canonical 0 ns."""
+
+    return {item.port: (item.value, item.unit) for item in document.delays}
 
 
 def _digital_values(document: PulseDocument) -> dict[tuple[str, str], bool]:
@@ -1436,11 +1425,12 @@ class PulseDragContainer(QtWidgets.QWidget):
         self.drag_start_pos = None
         self.dragging_index = None
         self.layout_main = QtWidgets.QHBoxLayout(self)
+        self.layout_main.setSizeConstraint(QtWidgets.QLayout.SetFixedSize)
         pad = _card_gutter()
         self.layout_main.setContentsMargins(pad, pad, pad, pad)
         self.layout_main.setSpacing(_px(5, minimum=3))
         self.layout_main.setAlignment(QtCore.Qt.AlignLeft)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         self.insert_indicator = QtWidgets.QFrame(self)
         self.insert_indicator.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.insert_indicator.setStyleSheet(f"background: {ACCENT};")
@@ -1847,29 +1837,38 @@ class PulseScheduleView(QtWidgets.QWidget):
         edit_layout.setContentsMargins(tab_margin, tab_margin, tab_margin, tab_margin)
         edit_layout.setSpacing(_px(8, minimum=5))
 
-        self.dataset_scroll = FluentScrollArea()
-        self.dataset_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        # The channel form changes height when ports are shown/hidden.  Reserve
-        # the Fluent scrollbar gutter permanently so the first overflow never
-        # steals width and shifts every aligned column in the Edit surface.
-        self.dataset_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
-        self.dataset_body = QtWidgets.QWidget()
-        dataset = QtWidgets.QHBoxLayout(self.dataset_body)
+        dataset_frame = QtWidgets.QWidget()
+        dataset = QtWidgets.QHBoxLayout(dataset_frame)
         gutter = _card_gutter()
         dataset.setContentsMargins(0, 0, 0, 0)
         dataset.setSpacing(0)
+
+        self.left_scroll = FluentScrollArea()
+        self.left_scroll.setWidgetResizable(True)
+        self.left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.left_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.left_scroll.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustToContents)
+        self.left_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Maximum,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        left_body = QtWidgets.QWidget()
+        left = QtWidgets.QHBoxLayout(left_body)
+        left.setSizeConstraint(QtWidgets.QLayout.SetMinimumSize)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(0)
 
         self.names_panel_holder = QtWidgets.QWidget()
         self.names_panel_layout = QtWidgets.QVBoxLayout(self.names_panel_holder)
         self.names_panel_layout.setContentsMargins(gutter, gutter, gutter, gutter)
         self.names_panel_layout.setSpacing(0)
-        dataset.addWidget(self.names_panel_holder)
+        left.addWidget(self.names_panel_holder)
 
         self.channel_panel_holder = QtWidgets.QWidget()
         self.channel_panel_layout = QtWidgets.QVBoxLayout(self.channel_panel_holder)
         self.channel_panel_layout.setContentsMargins(gutter, gutter, gutter, gutter)
         self.channel_panel_layout.setSpacing(0)
-        dataset.addWidget(self.channel_panel_holder)
+        left.addWidget(self.channel_panel_holder)
 
         self.left_panel_stub_holder = QtWidgets.QWidget()
         stub_holder_layout = QtWidgets.QVBoxLayout(self.left_panel_stub_holder)
@@ -1890,37 +1889,35 @@ class PulseScheduleView(QtWidgets.QWidget):
         stub_layout.addStretch()
         stub_holder_layout.addWidget(self.left_panel_stub)
         self.left_panel_stub_holder.hide()
-        dataset.addWidget(self.left_panel_stub_holder)
+        left.addWidget(self.left_panel_stub_holder)
+        self.left_scroll.setWidget(left_body)
+        dataset.addWidget(self.left_scroll)
 
-        self.scroll = FluentScrollArea()
-        self.scroll.setWidgetResizable(False)
-        self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.timeline_scroll = FluentScrollArea()
+        self.timeline_scroll.setWidgetResizable(False)
+        self.timeline_scroll.setSizeAdjustPolicy(
+            QtWidgets.QAbstractScrollArea.AdjustToContents
+        )
+        self.timeline_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        self.timeline_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        # Reserve the one operator scrollbar gutter permanently, so first
+        # overflow never shifts the aligned columns horizontally.
+        self.timeline_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
         self.drag_container = PulseDragContainer()
         self.drag_container.periodClicked.connect(self._on_period_card_clicked)
         self.drag_container.gapClicked.connect(self._on_period_gap_clicked)
         self.drag_container.moveRequested.connect(self.movePeriodRequested)
         self.drag_container.repeatMoveRequested.connect(self.repeatEdited)
-        self.scroll.setWidget(self.drag_container)
-        dataset.addWidget(self.scroll, 1)
-        self.dataset_scroll.setWidget(self.dataset_body)
-        edit_layout.addWidget(self.dataset_scroll, 1)
-
-        self.timeline_hbar = QtWidgets.QScrollBar(QtCore.Qt.Horizontal)
-        self.timeline_hbar.setStyleSheet(fluent_scrollbar_stylesheet("QScrollBar"))
-        self.timeline_hbar.setFixedHeight(fluent_scrollbar_thickness())
-        self.timeline_hbar.hide()
-        self.timeline_hbar_spacer = QtWidgets.QWidget()
-        hbar_row = QtWidgets.QHBoxLayout()
-        hbar_row.setContentsMargins(0, 0, 0, 0)
-        hbar_row.setSpacing(0)
-        hbar_row.addWidget(self.timeline_hbar_spacer)
-        hbar_row.addWidget(self.timeline_hbar, 1)
-        edit_layout.addLayout(hbar_row)
-        inner_hbar = self.scroll.horizontalScrollBar()
-        inner_hbar.rangeChanged.connect(self._sync_timeline_scrollbar)
-        inner_hbar.valueChanged.connect(self.timeline_hbar.setValue)
-        self.timeline_hbar.valueChanged.connect(inner_hbar.setValue)
+        self.timeline_scroll.setWidget(self.drag_container)
+        dataset.addWidget(self.timeline_scroll, 1)
+        edit_layout.addWidget(dataset_frame, 1)
+        left_vbar = self.left_scroll.verticalScrollBar()
+        timeline_vbar = self.timeline_scroll.verticalScrollBar()
+        left_vbar.valueChanged.connect(timeline_vbar.setValue)
+        timeline_vbar.valueChanged.connect(left_vbar.setValue)
 
         self.button_frame = FluentFrame(bordered=False)
         self.button_frame.setObjectName("zlcPulseButtonBar")
@@ -2086,138 +2083,6 @@ class PulseScheduleView(QtWidgets.QWidget):
         else:
             button.clicked.connect(slot)
         return button
-
-    def _dynamic_focus_targets(self) -> dict[tuple[str, ...], QtWidgets.QWidget]:
-        """Map rebuilt controls to stable semantic identities.
-
-        Only controls owned by the document projection appear here.  Header and
-        footer controls are not rebuilt and therefore keep their native Qt focus.
-        """
-
-        targets: dict[tuple[str, ...], QtWidgets.QWidget] = {}
-
-        def add(token: tuple[str, ...], widget: QtWidgets.QWidget | None) -> None:
-            if widget is not None:
-                targets[token] = widget
-
-        names = getattr(self, "names_panel", None)
-        if names is not None:
-            add(("document-name",), names.name_edit)
-            for port, widget in names.port_labels.items():
-                add(("port-label", port), widget)
-
-        channels = getattr(self, "channel_panel", None)
-        if channels is not None:
-            add(("scan-load",), channels.load_button)
-            add(("scan-source",), channels.scan_source_toggle)
-            for port, widget in channels.delay_edits.items():
-                add(("delay", port), widget)
-                add(("delay-dot", port), getattr(widget, "dot", None))
-            for port, widget in channels.delay_units.items():
-                add(("delay-unit", port), widget)
-            for port, widget in channels.clear_buttons.items():
-                add(("clear-port", port), widget)
-
-        drag_container = getattr(self, "drag_container", None)
-        if drag_container is None:
-            return targets
-        for card in drag_container.pulse_cards():
-            period_id = card.period_id
-            add(("duration", period_id), card.duration_edit)
-            add(("duration-dot", period_id), card.duration_dot)
-            add(("duration-unit", period_id), card.unit_combo)
-            add(("period-name", period_id), card.name_edit)
-            for port, widget in card.checks.items():
-                add(("digital", period_id, port), widget)
-            for port, widget in card.bus_mode_combos.items():
-                add(("dac-mode", period_id, port), widget)
-            for port, widget in card.bus_value_edits.items():
-                add(("dac-value", period_id, port), widget)
-                add(("dac-dot", period_id, port), getattr(widget, "dot", None))
-        for item in drag_container.items:
-            if item.item_type == "bracket_end":
-                add(("repeat-count",), getattr(item.widget, "repeat_spin", None))
-        return targets
-
-    def _capture_interaction(self) -> _InteractionSnapshot:
-        focus_widget = QtWidgets.QApplication.focusWidget()
-        focus_snapshot = None
-        if focus_widget is not None:
-            targets = self._dynamic_focus_targets()
-            target = next(
-                (
-                    (token, widget)
-                    for token, widget in targets.items()
-                    if widget is focus_widget
-                ),
-                None,
-            )
-            if target is None:
-                target = next(
-                    (
-                        (token, widget)
-                        for token, widget in targets.items()
-                        if widget.isAncestorOf(focus_widget)
-                    ),
-                    None,
-                )
-            if target is not None:
-                token, widget = target
-                if isinstance(widget, QtWidgets.QLineEdit):
-                    selection_start = widget.selectionStart()
-                    focus_snapshot = _FocusSnapshot(
-                        token,
-                        widget.cursorPosition(),
-                        selection_start,
-                        (
-                            len(widget.selectedText())
-                            if selection_start >= 0
-                            else 0
-                        ),
-                    )
-                else:
-                    focus_snapshot = _FocusSnapshot(token)
-        return _InteractionSnapshot(
-            self._selected_period_id,
-            self._selected_gap,
-            self.scroll.horizontalScrollBar().value(),
-            self.dataset_scroll.verticalScrollBar().value(),
-            focus_snapshot,
-        )
-
-    def _restore_interaction(
-        self,
-        snapshot: _InteractionSnapshot,
-        *,
-        version: tuple[int, int],
-    ) -> None:
-        if version != (self._document_generation, self._revision):
-            return
-        if snapshot.focus is not None:
-            widget = self._dynamic_focus_targets().get(snapshot.focus.token)
-            if widget is not None and widget.isEnabled():
-                widget.setFocus(QtCore.Qt.OtherFocusReason)
-                if isinstance(widget, QtWidgets.QLineEdit):
-                    cursor = snapshot.focus.cursor_position
-                    if cursor is not None:
-                        widget.setCursorPosition(min(cursor, len(widget.text())))
-                    if snapshot.focus.selection_start >= 0:
-                        start = min(
-                            snapshot.focus.selection_start,
-                            len(widget.text()),
-                        )
-                        widget.setSelection(
-                            start,
-                            min(
-                                snapshot.focus.selection_length,
-                                max(0, len(widget.text()) - start),
-                            ),
-                        )
-        # A structural add/remove/reorder may ask a scroll area to reveal the
-        # focused child.  Restore the saved bars last so the operator keeps the
-        # same viewport; scalar reconciliation normally retains the child too.
-        self.scroll.horizontalScrollBar().setValue(snapshot.horizontal_scroll)
-        self.dataset_scroll.verticalScrollBar().setValue(snapshot.vertical_scroll)
 
     def _connect_period_card(self, card: PeriodCard) -> None:
         card.periodNameEdited.connect(self.periodNameEdited)
@@ -2421,7 +2286,7 @@ class PulseScheduleView(QtWidgets.QWidget):
         bindings = _field_bindings(document)
         digital_values = _digital_values(document)
         analog_values, analog_active = _analog_values(document)
-        delays = {item.port: (item.value, item.unit) for item in document.delays}
+        delays = _delay_values(document)
         period_ids = tuple(period.period_id for period in document.periods)
         programmable = tuple(row.key for row in all_rows)
         visible = tuple(row.key for row in rows)
@@ -2447,7 +2312,6 @@ class PulseScheduleView(QtWidgets.QWidget):
         )
         visible_changed = visible != self._visible_ports
         layout_changed = structure_changed or visible_changed
-        interaction = self._capture_interaction() if layout_changed else None
 
         if layout_changed:
             self.setUpdatesEnabled(False)
@@ -2520,22 +2384,16 @@ class PulseScheduleView(QtWidgets.QWidget):
             self._visible_ports = visible
             self._active_ports = active
             self._repeat = repeat
-            selected_period_id = (
-                self._selected_period_id
-                if interaction is None
-                else interaction.selected_period_id
-            )
-            selected_gap = (
-                self._selected_gap if interaction is None else interaction.selected_gap
-            )
             self._selected_period_id = (
-                selected_period_id if selected_period_id in period_ids else None
+                self._selected_period_id
+                if self._selected_period_id in period_ids
+                else None
             )
             self._selected_gap = (
-                selected_gap
+                self._selected_gap
                 if self._selected_period_id is None
-                and selected_gap is not None
-                and 0 <= selected_gap <= len(period_ids)
+                and self._selected_gap is not None
+                and 0 <= self._selected_gap <= len(period_ids)
                 else None
             )
             if layout_changed:
@@ -2556,180 +2414,174 @@ class PulseScheduleView(QtWidgets.QWidget):
             self._revision = revision
             self._document_identity = document_identity
             self._manifest_fingerprint = manifest_fingerprint
-            if layout_changed:
-                self._sync_dataset_geometry()
-            if interaction is not None:
-                self._restore_interaction(interaction, version=incoming_version)
-                QtCore.QTimer.singleShot(
-                    0,
-                    lambda saved=interaction, version=incoming_version: self._restore_interaction(
-                        saved,
-                        version=version,
-                    ),
-                )
         finally:
             if layout_changed:
                 self.setUpdatesEnabled(True)
                 self.update()
         return True
 
-    def apply_local_delta(self, delta) -> bool:
-        """Read changed stable ids from one committed same-thread document."""
+    def accept_local_commit(self, *, document_generation: int, revision: int) -> None:
+        """Advance the displayed document version after one synchronous Qt command."""
 
-        if delta.document_generation != self._document_generation:
-            return False
-        document_changed = delta.editor_revision != delta.base_revision
-        if document_changed:
-            if delta.base_revision != self._revision:
-                return False
-            if delta.editor_revision <= self._revision:
-                return False
-            self._revision = delta.editor_revision
-            # A later explicit snapshot boundary is allowed to perform one full
-            # verification at this same revision.  Ordinary edits never do it.
-            self._document_identity = None
-        elif delta.editor_revision != self._revision:
-            return False
+        if document_generation != self._document_generation:
+            raise RuntimeError("local Pulse edit crossed a document replacement")
+        if revision < self._revision:
+            raise RuntimeError("local Pulse edit moved the displayed revision backwards")
+        self._revision = revision
+        self._document_identity = None
 
-        document = delta.document
-        if delta.document_name is not None:
-            self.names_panel.apply_document_name(delta.document_name)
+    def apply_document_name(self, document: PulseDocument) -> None:
+        self.names_panel.apply_document_name(document.name)
 
-        if delta.period_structure:
-            existing = {card.period_id for card in self.period_cards()}
-            has_new_card = any(
-                period.period_id not in existing for period in document.periods
-            )
-            digital_values = _digital_values(document) if has_new_card else {}
-            analog_values, _active = (
-                _analog_values(document) if has_new_card else ({}, {})
-            )
-            bindings = _field_bindings(document) if has_new_card else {}
-            self._reconcile_period_items(
-                document,
-                self._all_rows,
-                digital_values=digital_values,
-                analog_values=analog_values,
-                bindings=bindings,
-                reconcile_existing=False,
-            )
-            self._period_ids = tuple(period.period_id for period in document.periods)
-            self._repeat = (
-                None
-                if document.repeat is None
-                else (
-                    document.repeat.start_period_id,
-                    document.repeat.end_period_id,
-                    document.repeat.count,
-                )
-            )
-            if self._selected_period_id not in self._period_ids:
-                self._selected_period_id = None
-            if (
-                self._selected_gap is not None
-                and self._selected_gap > len(self._period_ids)
-            ):
-                self._selected_gap = None
-            self.drag_container.show_selection(
-                period_id=self._selected_period_id,
-                gap=self._selected_gap,
-            )
-            self.remove_button.setEnabled(len(self._period_ids) > 1)
-
-        cards = {card.period_id: card for card in self.period_cards()}
-        for period_id in delta.period_ids:
-            card = cards.get(period_id)
-            if card is None:
-                return False
-            card.apply_period_name(document.period_by_id[period_id].name)
-
-        row_keys = {row.key for row in self._all_rows}
-        for port in delta.port_ids:
-            if port not in row_keys or port not in document.target.by_key:
-                return False
-            label = document.target.by_key[port].label
-            self._all_rows = tuple(
-                dataclass_replace(row, label=label) if row.key == port else row
-                for row in self._all_rows
-            )
-            self.names_panel.apply_port_label(port, label)
-            self.channel_panel.set_port_label(port, label)
-            for card in cards.values():
-                card.set_port_label(port, label)
-
-        digital_values = _digital_values(document) if delta.digital_cells else {}
-        for period_id, port in delta.digital_cells:
-            card = cards.get(period_id)
-            if card is None or port not in card.checks:
-                return False
-            card.apply_digital(port, digital_values[(period_id, port)])
-
-        bindings = (
-            _field_bindings(document)
-            if delta.fields or delta.analog_cells or delta.refresh_bindings
-            else {}
+    def apply_period_name(self, document: PulseDocument, period_id: str) -> None:
+        card = next(
+            (item for item in self.period_cards() if item.period_id == period_id),
+            None,
         )
-        fields = set(delta.fields)
-        if delta.refresh_bindings:
-            fields.update(
-                parameter.field
-                for parameter in (*document.scan_parameters, *document.api_parameters)
-            )
+        if card is None:
+            raise KeyError(f"unknown period card {period_id!r}")
+        card.apply_period_name(document.period_by_id[period_id].name)
 
-        analog_cells = set(delta.analog_cells)
-        for field in fields:
-            binding = bindings.get(field)
-            if field.kind == FIELD_DURATION:
-                card = cards.get(field.period_id)
-                if card is None:
-                    return False
-                value, unit = document.field_value(field)
-                card.apply_duration(value, unit, binding)
-            elif field.kind == FIELD_DAC:
-                analog_cells.add((field.period_id, field.port))
-            else:
-                value, unit = document.field_value(field)
-                self.channel_panel.apply_delay(
-                    field.port,
-                    value,
-                    unit,
-                    binding,
-                )
+    def apply_port_label(self, document: PulseDocument, port: str) -> None:
+        if port not in document.target.by_key:
+            raise KeyError(f"unknown Pulse port {port!r}")
+        label = document.target.by_key[port].label
+        self._all_rows = tuple(
+            dataclass_replace(row, label=label) if row.key == port else row
+            for row in self._all_rows
+        )
+        self.names_panel.apply_port_label(port, label)
+        self.channel_panel.set_port_label(port, label)
+        for card in self.period_cards():
+            card.set_port_label(port, label)
 
-        if analog_cells:
-            analog_values, _active = _analog_values(document)
-            for period_id, port in analog_cells:
-                card = cards.get(period_id)
-                if card is None or port not in card.bus_mode_combos:
-                    return False
-                mode, value = analog_values[(period_id, port)]
+    def apply_duration(self, document: PulseDocument, period_id: str) -> None:
+        card = next(
+            (item for item in self.period_cards() if item.period_id == period_id),
+            None,
+        )
+        if card is None:
+            raise KeyError(f"unknown period card {period_id!r}")
+        field = PulseFieldRef(FIELD_DURATION, period_id)
+        value, unit = document.field_value(field)
+        card.apply_duration(value, unit, _field_bindings(document).get(field))
+
+    def apply_digital(self, document: PulseDocument, period_id: str, port: str) -> None:
+        card = next(
+            (item for item in self.period_cards() if item.period_id == period_id),
+            None,
+        )
+        if card is None or port not in card.checks:
+            raise KeyError(f"unknown digital cell {(period_id, port)!r}")
+        card.apply_digital(port, _digital_values(document)[(period_id, port)])
+
+    def apply_analog_port(self, document: PulseDocument, port: str) -> None:
+        values, _active = _analog_values(document)
+        bindings = _field_bindings(document)
+        for card in self.period_cards():
+            if port not in card.bus_mode_combos:
+                continue
+            mode, value = values[(card.period_id, port)]
+            field = PulseFieldRef(FIELD_DAC, card.period_id, port)
+            card.apply_analog(port, mode, value, bindings.get(field))
+
+    def apply_delay(self, document: PulseDocument, port: str) -> None:
+        field = PulseFieldRef(FIELD_DELAY, None, port)
+        value, unit = _delay_values(document).get(port, (0, "ns"))
+        self.channel_panel.apply_delay(
+            port,
+            value,
+            unit,
+            _field_bindings(document).get(field),
+        )
+
+    def apply_all_bindings(self, document: PulseDocument) -> None:
+        bindings = _field_bindings(document)
+        analog_values, _active = _analog_values(document)
+        delays = _delay_values(document)
+        for card in self.period_cards():
+            duration = PulseFieldRef(FIELD_DURATION, card.period_id)
+            value, unit = document.field_value(duration)
+            card.apply_duration(value, unit, bindings.get(duration))
+            for port in card.bus_mode_combos:
+                mode, analog_value = analog_values[(card.period_id, port)]
+                field = PulseFieldRef(FIELD_DAC, card.period_id, port)
                 card.apply_analog(
                     port,
                     mode,
-                    value,
-                    bindings.get(PulseFieldRef(FIELD_DAC, period_id, port)),
+                    analog_value,
+                    bindings.get(field),
                 )
+        for port in self.channel_panel.delay_edits:
+            field = PulseFieldRef(FIELD_DELAY, None, port)
+            value, unit = delays.get(port, (0, "ns"))
+            self.channel_panel.apply_delay(
+                port,
+                value,
+                unit,
+                bindings.get(field),
+            )
 
-        visible = delta.display_visible_ports
-        if visible is not None:
-            if set(visible) - set(self._programmable_ports):
-                return False
-            self._visible_ports = tuple(visible)
-            self._apply_visible_port_projection(frozenset(visible))
-            self._refresh_hidden_combo(self._all_rows)
+    def apply_period_structure(self, document: PulseDocument) -> None:
+        digital_values = _digital_values(document)
+        analog_values, _active = _analog_values(document)
+        bindings = _field_bindings(document)
+        self._reconcile_period_items(
+            document,
+            self._all_rows,
+            digital_values=digital_values,
+            analog_values=analog_values,
+            bindings=bindings,
+            reconcile_existing=False,
+        )
+        self._period_ids = tuple(period.period_id for period in document.periods)
+        self._repeat = (
+            None
+            if document.repeat is None
+            else (
+                document.repeat.start_period_id,
+                document.repeat.end_period_id,
+                document.repeat.count,
+            )
+        )
+        if self._selected_period_id not in self._period_ids:
+            self._selected_period_id = None
+        if self._selected_gap is not None and self._selected_gap > len(self._period_ids):
+            self._selected_gap = None
+        self.drag_container.show_selection(
+            period_id=self._selected_period_id,
+            gap=self._selected_gap,
+        )
+        self.remove_button.setEnabled(len(self._period_ids) > 1)
+        self.apply_all_bindings(document)
 
-        if (
-            delta.period_structure
-            or delta.port_ids
-            or delta.digital_cells
-            or delta.analog_cells
-            or delta.display_visible_ports is not None
-            or delta.refresh_bindings
-            or any(field.kind == FIELD_DURATION for field in delta.fields)
-            or (delta.scan_workspace is not None and document_changed)
-        ):
-            self._refresh_summary_from_document(document)
-        return True
+    def apply_visible_ports(self, visible: Sequence[str]) -> None:
+        normalized = tuple(str(port) for port in visible)
+        unknown = set(normalized) - set(self._programmable_ports)
+        if unknown:
+            raise KeyError(f"unknown visible Pulse ports: {sorted(unknown)}")
+        self._visible_ports = normalized
+        self._apply_visible_port_projection(frozenset(normalized))
+        self._refresh_hidden_combo(self._all_rows)
+
+    def apply_port_clear(self, document: PulseDocument, port: str) -> None:
+        target = document.target.by_key[port]
+        if target.kind == PORT_DIGITAL:
+            for period in document.periods:
+                self.apply_digital(document, period.period_id, port)
+        else:
+            self.apply_analog_port(document, port)
+        self.apply_all_bindings(document)
+
+    def apply_clear_all(self, document: PulseDocument) -> None:
+        self.apply_period_structure(document)
+        digital_values = _digital_values(document)
+        for card in self.period_cards():
+            for port in card.checks:
+                card.apply_digital(port, digital_values[(card.period_id, port)])
+
+    def refresh_summary(self, document: PulseDocument) -> None:
+        self._refresh_summary_from_document(document)
 
     def _refresh_summary_from_document(self, document: PulseDocument) -> None:
         """Recompute cheap textual facts without touching the widget structure."""
@@ -2762,22 +2614,12 @@ class PulseScheduleView(QtWidgets.QWidget):
         self._summary_text = summary
 
     def _apply_visible_port_projection(self, visible: frozenset[str]) -> None:
-        """Reveal existing aligned rows without rebuilding any editor widget."""
+        """Reveal the existing aligned rows; Qt layouts own the resulting size."""
 
         self.names_panel.set_visible_ports(visible)
         self.channel_panel.set_visible_ports(visible)
         for card in self.drag_container.pulse_cards():
             card.set_visible_ports(visible)
-        for widget in (
-            self.names_panel,
-            self.channel_panel,
-            *self.drag_container.pulse_cards(),
-        ):
-            layout = widget.layout()
-            if layout is not None:
-                layout.invalidate()
-                layout.activate()
-            widget.updateGeometry()
 
     def period_cards(self) -> tuple[PeriodCard, ...]:
         return tuple(self.drag_container.pulse_cards())
@@ -3001,7 +2843,6 @@ class PulseScheduleView(QtWidgets.QWidget):
         self.channel_panel_holder.hide()
         self.left_panel_stub_holder.show()
         self.collapse_button.setText("Show Left")
-        self._sync_dataset_geometry()
         self.leftPanelsCollapsed.emit(True)
 
     def show_left_panels(self) -> None:
@@ -3010,110 +2851,7 @@ class PulseScheduleView(QtWidgets.QWidget):
         self.names_panel_holder.show()
         self.channel_panel_holder.show()
         self.collapse_button.setText("Collapse")
-        self._sync_dataset_geometry()
         self.leftPanelsCollapsed.emit(False)
-
-    def _drag_container_width(self) -> int:
-        widths = []
-        for item in self.drag_container.items:
-            widget = item.widget
-            maximum = widget.maximumWidth()
-            width = (
-                maximum
-                if 0 < maximum < QtWidgets.QWIDGETSIZE_MAX
-                else widget.sizeHint().width()
-            )
-            widths.append(max(width, widget.minimumWidth(), widget.width()))
-        if not widths:
-            return 0
-        spacing = max(0, self.drag_container.layout_main.spacing())
-        margins = self.drag_container.layout_main.contentsMargins()
-        return (
-            sum(widths)
-            + spacing * (len(widths) - 1)
-            + margins.left()
-            + margins.right()
-        )
-
-    def _sync_dataset_geometry(self) -> None:
-        if not hasattr(self, "names_panel"):
-            return
-
-        def vertical_margins(layout: QtWidgets.QLayout | None) -> int:
-            if layout is None:
-                return 0
-            margins = layout.contentsMargins()
-            return margins.top() + margins.bottom()
-
-        card_hints = [
-            item.widget.sizeHint().height() for item in self.drag_container.items
-        ]
-        drag_height = (
-            (max(card_hints) if card_hints else 0)
-            + vertical_margins(self.drag_container.layout_main)
-        )
-        names_height = (
-            0
-            if self.names_panel_holder.isHidden()
-            else self.names_panel.sizeHint().height()
-            + vertical_margins(self.names_panel_layout)
-        )
-        channel_height = (
-            0
-            if self.channel_panel_holder.isHidden()
-            else self.channel_panel.sizeHint().height()
-            + vertical_margins(self.channel_panel_layout)
-        )
-        stub_height = (
-            0
-            if self.left_panel_stub_holder.isHidden()
-            else self.left_panel_stub.sizeHint().height()
-        )
-        content_height = max(
-            names_height, channel_height, stub_height, drag_height
-        ) + _px(2, minimum=1)
-        for widget in (
-            self.names_panel_holder,
-            self.channel_panel_holder,
-            self.left_panel_stub_holder,
-            self.scroll,
-            self.drag_container,
-        ):
-            widget.setMinimumHeight(content_height)
-        self.dataset_body.setMinimumHeight(
-            content_height + vertical_margins(self.dataset_body.layout())
-        )
-        self.drag_container.setFixedSize(
-            self._drag_container_width(), content_height
-        )
-        self._sync_timeline_scrollbar()
-
-    def _sync_timeline_scrollbar(self, *_args) -> None:
-        source = self.scroll.horizontalScrollBar()
-        with signals_blocked(self.timeline_hbar):
-            self.timeline_hbar.setRange(source.minimum(), source.maximum())
-            self.timeline_hbar.setPageStep(source.pageStep())
-            self.timeline_hbar.setSingleStep(max(1, source.singleStep()))
-            self.timeline_hbar.setValue(source.value())
-        self.timeline_hbar.setVisible(source.maximum() > source.minimum())
-        left_width = 0
-        for widget in (
-            self.names_panel_holder,
-            self.channel_panel_holder,
-            self.left_panel_stub_holder,
-        ):
-            if widget.isHidden():
-                continue
-            left_width += widget.width() or widget.sizeHint().width()
-        body_layout = self.dataset_body.layout()
-        if body_layout is not None:
-            left_width += body_layout.contentsMargins().left()
-        self.timeline_hbar_spacer.setFixedWidth(max(0, left_width))
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        QtCore.QTimer.singleShot(0, self._sync_timeline_scrollbar)
-
 
 __all__ = [
     "ChannelNamesPanel",

@@ -36,20 +36,20 @@ def test_notebook_x_hides_and_reopens_same_dirty_editor_then_owner_retires(tmp_p
         _until(
             application,
             lambda: body.current_document.name == "operator unsaved pulse"
-            and body._controller.snapshot().dirty,
+            and body._controller.dirty,
         )
 
         # This is the same close event emitted by the title-bar X.  Notebook
         # windows hide immediately; no controller shutdown or dirty prompt runs.
         wrapper.close()
         _until(application, lambda: not wrapper.isVisible())
-        assert not body._controller.snapshot().close_requested
+        assert not body._controller.runtime_update().close_requested
 
         restored = experiment.pulse_gui()
         assert restored is body
         _until(application, wrapper.isVisible)
         assert restored.current_document.name == "operator unsaved pulse"
-        assert restored._controller.snapshot().dirty
+        assert restored._controller.dirty
 
         replacement = new_pulse_document(
             load_deployed_pulse_target(),

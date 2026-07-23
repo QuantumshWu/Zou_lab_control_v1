@@ -208,40 +208,6 @@ def _applied_authoring_document(snapshot: AppliedPulseSnapshot) -> PulseDocument
     return document
 
 
-def _changed_analog_cells(
-    before: PulseDocument,
-    after: PulseDocument,
-    ports: tuple[str, ...] | None = None,
-) -> tuple[tuple[str, str], ...]:
-    """Identify only Edge/Ramp/Hold presentations changed by one edit."""
-
-    selected = (
-        tuple(port.key for port in after.target.ports if port.kind == PORT_DAC)
-        if ports is None
-        else ports
-    )
-
-    def values(document: PulseDocument) -> dict[tuple[str, str], tuple[str, int]]:
-        carried = {port: 0 for port in selected}
-        result = {}
-        for period in document.periods:
-            actions = {step.port: step for step in period.analog_steps}
-            for port in selected:
-                action = actions.get(port)
-                if action is None:
-                    result[(period.period_id, port)] = ("hold", carried[port])
-                else:
-                    carried[port] = action.value
-                    result[(period.period_id, port)] = (action.mode, action.value)
-        return result
-
-    old = values(before)
-    return tuple(
-        cell for cell, value in values(after).items()
-        if cell in old and old[cell] != value
-    )
-
-
 def parse_remote_endpoint(value: str) -> tuple[str, int]:
     """Parse ``host[:port]`` and bracketed IPv6 without guessing a blank host."""
 
@@ -271,44 +237,6 @@ def parse_remote_endpoint(value: str) -> tuple[str, int]:
     if not 1 <= port <= 65535:
         raise ValueError("remote pulse endpoint port must be between 1 and 65535")
     return host, port
-
-
-@dataclass(frozen=True)
-class PulseEditorControllerSnapshot:
-    document: PulseDocument
-    document_generation: int
-    editor_revision: int
-    path: Path | None
-    file_state: str
-    dirty: bool
-    connection_state: str
-    connection_mode: str
-    connection_endpoint: str
-    target_descriptor: PulseTargetDescriptor | None
-    target_manifest: PulseTargetManifest
-    display_visible_ports: tuple[str, ...]
-    run_snapshot: RunSnapshot | None
-    run_generation: int | None
-    run_revision: int | None
-    preview_revision: int | None
-    preview_generation: int | None
-    preview: PulseTimelineDocument | None
-    rendered_preview: RenderedPulsePreview | None
-    preview_error: str
-    preview_notice: str
-    scan_workspace: ScanWorkspaceSnapshot
-    applied_snapshot: AppliedPulseSnapshot | None
-    scan_progress: PulseScanProgress | None
-    held_scan_point: tuple[
-        int,
-        int,
-        tuple[tuple[str, int | float], ...],
-    ] | None
-    diagnostic: str
-    file_busy: bool
-    run_busy: bool
-    close_requested: bool
-    close_complete: bool
 
 
 @dataclass(frozen=True)
@@ -397,28 +325,28 @@ class PulseOwnerUpdate:
     """Independent visible changes drained in one coalesced owner turn."""
 
     editor: PulseEditorProjection | None = None
-    editor_delta: PulseEditorLocalDelta | None = None
     file: PulseFileUpdate | None = None
     preview: PulsePreviewUpdate | None = None
     runtime: PulseRuntimeUpdate | None = None
+    scan_workspace: ScanWorkspaceSnapshot | None = None
     scan_progress: PulseScanProgressUpdate | None = None
 
 
 @dataclass
 class _OwnerChanges:
     editor: bool = False
-    editor_delta: bool = False
     file: bool = False
     preview: bool = False
     runtime: bool = False
+    scan_workspace: bool = False
     scan_progress: bool = False
 
     def include(self, other: "_OwnerChanges") -> None:
         self.editor |= other.editor
-        self.editor_delta |= other.editor_delta
         self.file |= other.file
         self.preview |= other.preview
         self.runtime |= other.runtime
+        self.scan_workspace |= other.scan_workspace
         self.scan_progress |= other.scan_progress
 
     @property
@@ -426,40 +354,13 @@ class _OwnerChanges:
         return any(
             (
                 self.editor,
-                self.editor_delta,
                 self.file,
                 self.preview,
                 self.runtime,
+                self.scan_workspace,
                 self.scan_progress,
             )
         )
-
-
-@dataclass(frozen=True)
-class PulseEditorLocalDelta:
-    """One same-thread edit result, not a projected application snapshot.
-
-    ``document`` is the already-committed immutable domain object (one borrowed
-    reference, no copy/serialization).  The stable ids say which widgets may
-    read from it; the view never retains it or traverses unrelated controls.
-    """
-
-    document_generation: int
-    base_revision: int
-    editor_revision: int
-    document: PulseDocument
-    document_name: str | None = None
-    period_ids: tuple[str, ...] = ()
-    port_ids: tuple[str, ...] = ()
-    digital_cells: tuple[tuple[str, str], ...] = ()
-    fields: tuple[PulseFieldRef, ...] = ()
-    analog_cells: tuple[tuple[str, str], ...] = ()
-    period_structure: bool = False
-    refresh_bindings: bool = False
-    display_visible_ports: tuple[str, ...] | None = None
-    scan_workspace: ScanWorkspaceSnapshot | None = None
-    scan_slots_text: str | None = None
-    scan_sweep_count: int | None = None
 
 
 class PulseEditorController:
@@ -621,6 +522,14 @@ class PulseEditorController:
         return self._editor.document
 
     @property
+    def current_document_generation(self) -> int:
+        return self._editor_generation
+
+    @property
+    def current_editor_revision(self) -> int:
+        return self._editor.revision
+
+    @property
     def dirty(self) -> bool:
         return self._editor.dirty
 
@@ -631,6 +540,28 @@ class PulseEditorController:
     @property
     def current_scan_workspace(self) -> ScanWorkspaceSnapshot:
         return self._scan_workspace_snapshot(self._editor.document)
+
+    @property
+    def current_display_visible_ports(self) -> tuple[str, ...]:
+        document = self._editor.document
+        manifest = self.current_target_manifest
+        return self._display_ports_for(
+            self._active_manifest_mode,
+            manifest,
+            document=document,
+        )
+
+    @property
+    def current_target_manifest(self) -> PulseTargetManifest:
+        """Return the manifest currently governing the authoring document."""
+
+        document = self._editor.document
+        source = (
+            self._descriptor.manifest
+            if self._descriptor is not None
+            else self._authoring_manifest
+        )
+        return source.with_target(document.target)
 
     def editor_projection(self) -> PulseEditorProjection:
         """Project one real document/target boundary, without runtime state."""
@@ -684,20 +615,6 @@ class PulseEditorController:
             preview_notice=self._preview_notice,
         )
 
-    def scan_workspace_delta(
-        self,
-        *,
-        base_revision: int | None = None,
-    ) -> PulseEditorLocalDelta:
-        """Describe a Scan-workspace transition on stable Edit widgets."""
-
-        if base_revision is None:
-            base_revision = self._editor.revision
-        return self._local_delta(
-            base_revision,
-            include_scan_workspace=True,
-        )
-
     def runtime_update(self) -> PulseRuntimeUpdate:
         """Project current narrow runtime facts without polling or editor work."""
 
@@ -709,45 +626,6 @@ class PulseEditorController:
             run_snapshot=self._run_snapshot,
             run_generation=self._run_generation,
             run_revision=self._run_revision,
-            applied_snapshot=self._applied_snapshot,
-            scan_progress=self._scan_progress,
-            held_scan_point=self._held_scan_snapshot(),
-            diagnostic=self._diagnostic,
-            file_busy=(
-                self._save_inflight
-                or self._load_inflight
-                or self._preview_export_inflight
-            ),
-            run_busy=self._run_busy(),
-            close_requested=self._close_requested,
-            close_complete=self._close_complete,
-        )
-
-    def snapshot(self) -> PulseEditorControllerSnapshot:
-        editor = self.editor_projection()
-        return PulseEditorControllerSnapshot(
-            document=editor.document,
-            document_generation=editor.document_generation,
-            editor_revision=editor.editor_revision,
-            path=editor.path,
-            file_state=editor.file_state,
-            dirty=editor.dirty,
-            connection_state=self._connection_state,
-            connection_mode=self._connection_mode,
-            connection_endpoint=self._connection_endpoint,
-            target_descriptor=self._descriptor,
-            target_manifest=editor.target_manifest,
-            display_visible_ports=editor.display_visible_ports,
-            run_snapshot=self._run_snapshot,
-            run_generation=self._run_generation,
-            run_revision=self._run_revision,
-            preview_revision=self._preview_revision,
-            preview_generation=self._preview_generation,
-            preview=self._preview,
-            rendered_preview=self._rendered_preview,
-            preview_error=self._preview_error,
-            preview_notice=self._preview_notice,
-            scan_workspace=editor.scan_workspace,
             applied_snapshot=self._applied_snapshot,
             scan_progress=self._scan_progress,
             held_scan_point=self._held_scan_snapshot(),
@@ -829,66 +707,6 @@ class PulseEditorController:
         self._scan_workspace_cache_generated = None
         self._scan_workspace_cache_loaded = None
 
-    def _local_delta(
-        self,
-        base_revision: int,
-        *,
-        period_ids: tuple[str, ...] = (),
-        port_ids: tuple[str, ...] = (),
-        digital_cells: tuple[tuple[str, str], ...] = (),
-        fields: tuple[PulseFieldRef, ...] = (),
-        analog_cells: tuple[tuple[str, str], ...] = (),
-        include_document_name: bool = False,
-        period_structure: bool = False,
-        refresh_bindings: bool = False,
-        include_visible_ports: bool = False,
-        include_scan_workspace: bool = False,
-        include_scan_slots: bool = False,
-        include_scan_sweep_count: bool = False,
-    ) -> PulseEditorLocalDelta:
-        """Describe the committed local change without projecting the document."""
-
-        document = self._editor.document
-        revision = self._editor.revision
-        workspace = None
-        if include_scan_workspace:
-            self._invalidate_scan_workspace_projection()
-            workspace = self._scan_workspace_snapshot(document)
-        return PulseEditorLocalDelta(
-            document_generation=self._editor_generation,
-            base_revision=base_revision,
-            editor_revision=revision,
-            document=document,
-            document_name=(document.name if include_document_name else None),
-            period_ids=period_ids,
-            port_ids=port_ids,
-            digital_cells=digital_cells,
-            fields=fields,
-            analog_cells=analog_cells,
-            period_structure=period_structure,
-            refresh_bindings=refresh_bindings,
-            display_visible_ports=(
-                self._display_ports_for(
-                    self._active_manifest_mode,
-                    (
-                        self._descriptor.manifest.with_target(document.target)
-                        if self._descriptor is not None
-                        else self._authoring_manifest.with_target(document.target)
-                    ),
-                    document=document,
-                )
-                if include_visible_ports
-                else None
-            ),
-            scan_workspace=workspace,
-            scan_slots_text=(
-                format_scan_slots(document) if include_scan_slots else None
-            ),
-            scan_sweep_count=(
-                document.scan_sweep_count if include_scan_sweep_count else None
-            ),
-        )
-
     def apply_target_manifest(
         self,
         manifest: PulseTargetManifest,
@@ -914,7 +732,7 @@ class PulseEditorController:
         self._invalidate_document_preview()
         return PulseTargetEditResult(document, self._authoring_manifest, result.impact)
 
-    def rename_document(self, name: str) -> PulseEditorLocalDelta | None:
+    def rename_document(self, name: str) -> int | None:
         """Commit the visible pulse name without making the view an authority."""
 
         document = self._editor.document
@@ -922,10 +740,10 @@ class PulseEditorController:
         if normalized == document.name:
             return None
         base_revision = self._editor.revision
-        self.replace_document(replace(document, name=normalized))
-        return self._local_delta(base_revision, include_document_name=True)
+        revision = self.replace_document(replace(document, name=normalized))
+        return revision if revision != base_revision else None
 
-    def set_scan_sweep_count(self, count: int) -> PulseEditorLocalDelta | None:
+    def set_scan_sweep_count(self, count: int) -> int | None:
         """Commit the saved operator default; runtime remains request-explicit."""
 
         if isinstance(count, bool) or not isinstance(count, int):
@@ -936,19 +754,16 @@ class PulseEditorController:
         if count == document.scan_sweep_count:
             return None
         base_revision = self._editor.revision
-        self.replace_document(
+        revision = self.replace_document(
             replace(document, scan_sweep_count=count)
         )
-        return self._local_delta(
-            base_revision,
-            include_scan_sweep_count=True,
-        )
+        return revision if revision != base_revision else None
 
     def rename_period(
         self,
         period_id: str,
         name: str,
-    ) -> PulseEditorLocalDelta | None:
+    ) -> int | None:
         document = self._editor.document
         if period_id not in document.period_by_id:
             raise KeyError(f"unknown period {period_id!r}")
@@ -960,80 +775,69 @@ class PulseEditorController:
             replace(period, name=normalized) if period.period_id == period_id else period
             for period in document.periods
         )
-        self.replace_document(replace(document, periods=periods))
+        revision = self.replace_document(replace(document, periods=periods))
         has_scan_display = any(
             parameter.field.period_id == period_id
             for parameter in document.scan_parameters
         )
-        return self._local_delta(
-            base_revision,
-            period_ids=(period_id,),
-            include_scan_workspace=has_scan_display,
-        )
+        if has_scan_display:
+            self._invalidate_scan_workspace_projection()
+        return revision if revision != base_revision else None
 
     def rename_port(
         self,
         port: str,
         label: str,
-    ) -> PulseEditorLocalDelta | None:
+    ) -> int | None:
         document = self._editor.document
         normalized = str(label).strip() or str(port)
         if document.target.by_key[str(port)].label == normalized:
             return None
         base_revision = self._editor.revision
-        self.replace_document(rename_port_label(document, port, normalized))
+        revision = self.replace_document(
+            rename_port_label(document, port, normalized)
+        )
         has_scan_display = any(
             parameter.field.port == str(port)
             for parameter in document.scan_parameters
         )
-        return self._local_delta(
-            base_revision,
-            port_ids=(str(port),),
-            include_scan_workspace=has_scan_display,
-        )
+        if has_scan_display:
+            self._invalidate_scan_workspace_projection()
+        return revision if revision != base_revision else None
 
     def set_period_duration(
         self,
         period_id: str,
         value: int | float,
         unit: str,
-    ) -> PulseEditorLocalDelta | None:
+    ) -> int | None:
         document = self._editor.document
         field = PulseFieldRef(FIELD_DURATION, period_id)
         current_value, current_unit = document.field_value(field)
         if current_value == value and current_unit == str(unit):
             return None
         base_revision = self._editor.revision
-        self.replace_document(
+        revision = self.replace_document(
             replace_pulse_field(document, field, value, unit=unit)
         )
-        was_bound = any(
-            parameter.field == field
-            for parameter in (*document.scan_parameters, *document.api_parameters)
-        )
-        return self._local_delta(
-            base_revision,
-            fields=(field,),
-            include_scan_slots=was_bound,
-        )
+        return revision if revision != base_revision else None
 
     def set_digital(
         self,
         period_id: str,
         port: str,
         high: bool,
-    ) -> PulseEditorLocalDelta | None:
+    ) -> int | None:
         document = self._editor.document
         target_port = document.target.by_key[str(port)]
         lane_index = document.target.raw_lanes.index(target_port.lanes[0])
         if bool(document.period_by_id[period_id].states[lane_index]) == bool(high):
             return None
         base_revision = self._editor.revision
-        self.replace_document(set_digital_output(document, period_id, port, high))
-        return self._local_delta(
-            base_revision,
-            digital_cells=((period_id, str(port)),),
+        revision = self.replace_document(
+            set_digital_output(document, period_id, port, high)
         )
+        return revision if revision != base_revision else None
 
     def set_analog(
         self,
@@ -1043,7 +847,7 @@ class PulseEditorController:
         value: int | float | None,
         *,
         cascade: bool = False,
-    ) -> PulseEditorLocalDelta | None:
+    ) -> int | None:
         document = self._editor.document
         base_revision = self._editor.revision
         normalized = str(mode).strip().lower()
@@ -1064,28 +868,7 @@ class PulseEditorController:
         self.replace_document(result.document)
         if self._editor.revision == base_revision:
             return None
-        after = self._editor.document
-        edited_field = PulseFieldRef(FIELD_DAC, period_id, str(port))
-        binding_changed = (
-            document.scan_parameters,
-            document.api_parameters,
-        ) != (after.scan_parameters, after.api_parameters)
-        was_bound = any(
-            parameter.field == edited_field
-            for parameter in (*document.scan_parameters, *document.api_parameters)
-        )
-        return self._local_delta(
-            base_revision,
-            fields=(edited_field,),
-            analog_cells=_changed_analog_cells(
-                document,
-                after,
-                (str(port),),
-            ),
-            refresh_bindings=binding_changed,
-            include_scan_workspace=binding_changed,
-            include_scan_slots=was_bound and not binding_changed,
-        )
+        return self._editor.revision
 
     def set_delay(
         self,
@@ -1094,7 +877,7 @@ class PulseEditorController:
         unit: str = "ns",
         *,
         cascade: bool = False,
-    ) -> PulseEditorLocalDelta | None:
+    ) -> int | None:
         document = self._editor.document
         base_revision = self._editor.revision
         delay = None if value is None else OutputDelay(port, value, unit)
@@ -1107,22 +890,12 @@ class PulseEditorController:
         self.replace_document(result.document)
         if self._editor.revision == base_revision:
             return None
-        after = self._editor.document
-        binding_changed = (
-            document.scan_parameters,
-            document.api_parameters,
-        ) != (after.scan_parameters, after.api_parameters)
-        return self._local_delta(
-            base_revision,
-            fields=(PulseFieldRef(FIELD_DELAY, None, str(port)),),
-            refresh_bindings=binding_changed,
-            include_scan_workspace=binding_changed,
-        )
+        return self._editor.revision
 
     def set_visible_ports(
         self,
         ports: tuple[str, ...] | list[str],
-    ) -> PulseEditorLocalDelta | None:
+    ) -> tuple[str, ...] | None:
         document = self._editor.document
         requested = tuple(str(port) for port in ports)
         manifest = (
@@ -1146,16 +919,12 @@ class PulseEditorController:
             document=document,
         ):
             return None
-        base_revision = self._editor.revision
         self._display_ports_by_mode[self._active_manifest_mode] = ordered
         if self._active_manifest_mode == "offline":
             self.replace_document(replace(document, visible_ports=ordered))
-        return self._local_delta(
-            base_revision,
-            include_visible_ports=True,
-        )
+        return ordered
 
-    def clear_port(self, port: str) -> PulseEditorLocalDelta | None:
+    def clear_port(self, port: str) -> int | None:
         """Apply the formal row-clear action through the domain owner."""
 
         document = self._editor.document
@@ -1168,29 +937,9 @@ class PulseEditorController:
         self.replace_document(result.document)
         if self._editor.revision == base_revision:
             return None
-        after = self._editor.document
-        target_port = after.target.by_key[str(port)]
-        binding_changed = (
-            document.scan_parameters,
-            document.api_parameters,
-        ) != (after.scan_parameters, after.api_parameters)
-        return self._local_delta(
-            base_revision,
-            digital_cells=(
-                tuple((period.period_id, str(port)) for period in after.periods)
-                if target_port.kind == PORT_DIGITAL
-                else ()
-            ),
-            analog_cells=(
-                _changed_analog_cells(document, after, (str(port),))
-                if target_port.kind == PORT_DAC
-                else ()
-            ),
-            refresh_bindings=binding_changed,
-            include_scan_workspace=binding_changed,
-        )
+        return self._editor.revision
 
-    def clear_all(self) -> PulseEditorLocalDelta | None:
+    def clear_all(self) -> int | None:
         """Apply the formal destructive schedule reset as one document revision."""
 
         base_revision = self._editor.revision
@@ -1198,12 +947,7 @@ class PulseEditorController:
         self.replace_document(result.document)
         if self._editor.revision == base_revision:
             return None
-        return self._local_delta(
-            base_revision,
-            period_structure=True,
-            refresh_bindings=True,
-            include_scan_workspace=True,
-        )
+        return self._editor.revision
 
     def add_period(
         self,
@@ -1213,7 +957,7 @@ class PulseEditorController:
         unit: str = "ns",
         name: str = "",
         cascade: bool = False,
-    ) -> PulseEditorLocalDelta:
+    ) -> int:
         document = self._editor.document
         base_revision = self._editor.revision
         period = new_period(document, duration=duration, unit=unit, name=name)
@@ -1223,15 +967,7 @@ class PulseEditorController:
             before=before_period_id,
             cascade=cascade,
         )
-        self.replace_document(result.document)
-        return self._local_delta(
-            base_revision,
-            period_ids=(period.period_id,),
-            period_structure=True,
-            include_scan_workspace=bool(
-                document.scan_parameters or document.api_parameters
-            ),
-        )
+        return self.replace_document(result.document)
 
     def move_period(
         self,
@@ -1239,7 +975,7 @@ class PulseEditorController:
         before_period_id: str | None,
         *,
         cascade: bool = False,
-    ) -> PulseEditorLocalDelta | None:
+    ) -> int | None:
         document = self._editor.document
         base_revision = self._editor.revision
         result = move_period(
@@ -1251,21 +987,14 @@ class PulseEditorController:
         self.replace_document(result.document)
         if self._editor.revision == base_revision:
             return None
-        return self._local_delta(
-            base_revision,
-            analog_cells=_changed_analog_cells(document, self._editor.document),
-            period_structure=True,
-            include_scan_workspace=bool(
-                document.scan_parameters or document.api_parameters
-            ),
-        )
+        return self._editor.revision
 
     def remove_period(
         self,
         period_id: str,
         *,
         cascade: bool = False,
-    ) -> PulseEditorLocalDelta | None:
+    ) -> int | None:
         document = self._editor.document
         base_revision = self._editor.revision
         result = remove_period(
@@ -1276,22 +1005,14 @@ class PulseEditorController:
         self.replace_document(result.document)
         if self._editor.revision == base_revision:
             return None
-        return self._local_delta(
-            base_revision,
-            analog_cells=_changed_analog_cells(document, self._editor.document),
-            period_structure=True,
-            refresh_bindings=True,
-            include_scan_workspace=bool(
-                document.scan_parameters or document.api_parameters
-            ),
-        )
+        return self._editor.revision
 
     def set_repeat(
         self,
         start_period_id: str | None,
         end_period_id: str | None = None,
         count: int = 2,
-    ) -> PulseEditorLocalDelta | None:
+    ) -> int | None:
         document = self._editor.document
         if start_period_id is None:
             if end_period_id is not None:
@@ -1304,11 +1025,8 @@ class PulseEditorController:
         if repeat == document.repeat:
             return None
         base_revision = self._editor.revision
-        self.replace_document(replace(document, repeat=repeat))
-        return self._local_delta(
-            base_revision,
-            period_structure=True,
-        )
+        revision = self.replace_document(replace(document, repeat=repeat))
+        return revision if revision != base_revision else None
 
     def replace_binding(
         self,
@@ -1347,7 +1065,7 @@ class PulseEditorController:
         )
         return self.replace_document(result.document)
 
-    def cycle_binding(self, field: PulseFieldRef) -> PulseEditorLocalDelta | None:
+    def cycle_binding(self, field: PulseFieldRef) -> int | None:
         document = self._editor.document
         base_revision = self._editor.revision
         result = cycle_field_binding(
@@ -1358,12 +1076,7 @@ class PulseEditorController:
         self.replace_document(result.document)
         if self._editor.revision == base_revision:
             return None
-        return self._local_delta(
-            base_revision,
-            fields=(field,),
-            refresh_bindings=True,
-            include_scan_workspace=True,
-        )
+        return self._editor.revision
 
     def scan_template_source(self, kind: str) -> str:
         """Return a template for the UI-owned draft without committing it."""
@@ -1435,7 +1148,7 @@ class PulseEditorController:
     def select_scan_source(
         self,
         source: ScanCandidateSource | str,
-    ) -> PulseEditorLocalDelta | None:
+    ) -> bool | None:
         """Apply the switch-selected candidate without fallback or reshaping."""
 
         self._require_scan_operation_available()
@@ -1461,20 +1174,14 @@ class PulseEditorController:
                 "Scan table is stale because the parameter schema changed; "
                 + ("reload the array" if normalized == "loaded" else "Run code again")
             )
-            return self._local_delta(
-                base_revision,
-                include_scan_workspace=True,
-            )
+            return True
         self._commit_scan_candidate(candidate, self._scan_selected)
         if (
             self._editor.revision == base_revision
             and previous_selected == self._scan_selected
         ):
             return None
-        return self._local_delta(
-            base_revision,
-            include_scan_workspace=True,
-        )
+        return True
 
     def save_scan_array(self, path: str | Path) -> None:
         """Export exactly the selected compatible frozen candidate on a worker."""
@@ -1901,9 +1608,10 @@ class PulseEditorController:
                 self._descriptor.manifest,
             )
             validate_pulse_document_clock_grid(rebound, self._descriptor.clock_hz)
-            if rebound != document:
-                self.replace_document(rebound)
-                document = rebound
+            # Binding is an execution concern.  Running must never rewrite the
+            # operator's authoring document; only an explicit connection
+            # replacement or Sync Applied changes the editor.
+            document = rebound
         if form in (
             PulseExecutionForm.STATIC_ONCE,
             PulseExecutionForm.CONTINUOUS_MONITOR,
@@ -2177,12 +1885,11 @@ class PulseEditorController:
     def pump(self) -> PulseOwnerUpdate | None:
         """Drain one owner wake into independent surface-local publications.
 
-        Synchronous Qt commands present their returned local delta directly.
-        This path therefore owns only worker/lifecycle facts that change while
-        the owner is asleep; it never returns ``PulseEditorControllerSnapshot``.
+        Synchronous Qt commands update their stable widgets directly.  This
+        path owns only worker/lifecycle results produced while the Qt owner was
+        asleep.
         """
 
-        base_revision = self._editor.revision
         changes = self._apply_borrowed_authority_retirement()
         changes.include(self._drain_results())
         if self._runtime_poll_required():
@@ -2192,11 +1899,6 @@ class PulseEditorController:
             return None
 
         editor = self.editor_projection() if changes.editor else None
-        editor_delta = (
-            self.scan_workspace_delta(base_revision=base_revision)
-            if changes.editor_delta and editor is None
-            else None
-        )
         file_update = (
             self.file_update()
             if changes.file and editor is None
@@ -2204,10 +1906,14 @@ class PulseEditorController:
         )
         return PulseOwnerUpdate(
             editor=editor,
-            editor_delta=editor_delta,
             file=file_update,
             preview=(self.preview_update() if changes.preview else None),
             runtime=(self.runtime_update() if changes.runtime else None),
+            scan_workspace=(
+                self.current_scan_workspace
+                if changes.scan_workspace and editor is None
+                else None
+            ),
             scan_progress=(
                 PulseScanProgressUpdate(
                     scan_progress=self._scan_progress,
@@ -2342,7 +2048,7 @@ class PulseEditorController:
                 operation, schema, source = token
                 if operation == self._scan_operation_generation:
                     self._scan_busy_operation = None
-                    changes.editor_delta = True
+                    changes.scan_workspace = True
                 try:
                     result = future.result()
                     if not isinstance(result, ScanCandidateResult):
@@ -2383,6 +2089,7 @@ class PulseEditorController:
                         f"Apply generated scan failed: {type(error).__name__}: {error}"
                     )
                     continue
+                changes.editor = True
                 changes.preview = True
                 adjusted = result.normalization.adjusted_cells
                 self._scan_diagnostic = (
@@ -2394,7 +2101,7 @@ class PulseEditorController:
                 operation, schema, resolved = token
                 if operation == self._scan_operation_generation:
                     self._scan_busy_operation = None
-                    changes.editor_delta = True
+                    changes.scan_workspace = True
                 try:
                     result = future.result()
                     if not isinstance(result, ScanCandidateResult):
@@ -2424,6 +2131,7 @@ class PulseEditorController:
                         f"Apply loaded scan failed: {type(error).__name__}: {error}"
                     )
                     continue
+                changes.editor = True
                 changes.preview = True
                 adjusted = result.normalization.adjusted_cells
                 self._scan_diagnostic = (
@@ -2436,7 +2144,7 @@ class PulseEditorController:
                 operation, resolved = token
                 if operation == self._scan_operation_generation:
                     self._scan_busy_operation = None
-                    changes.editor_delta = True
+                    changes.scan_workspace = True
                 try:
                     loaded_path, source = future.result()
                 except BaseException as error:
@@ -2455,7 +2163,7 @@ class PulseEditorController:
                 operation, _resolved = token
                 if operation == self._scan_operation_generation:
                     self._scan_busy_operation = None
-                    changes.editor_delta = True
+                    changes.scan_workspace = True
                 try:
                     saved = future.result()
                 except BaseException as error:
@@ -3136,9 +2844,7 @@ class PulseEditorController:
 __all__ = [
     "OwnedPulseConnection",
     "PulseEditorController",
-    "PulseEditorControllerSnapshot",
     "PulseFileUpdate",
-    "PulseEditorLocalDelta",
     "PulseOwnerUpdate",
     "PulseEditorProjection",
     "PulsePreviewUpdate",

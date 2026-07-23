@@ -101,7 +101,7 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
         _until(
             application,
             lambda: body.scan_view.scan_code.toPlainText()
-            == controller.snapshot().scan_workspace.source_text,
+            == controller.current_scan_workspace.source_text,
         )
         empty_switch = body.schedule_view.channel_panel.scan_source_toggle
         QtTest.QTest.mouseClick(
@@ -139,8 +139,8 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
         )
         _until(
             application,
-            lambda: controller.snapshot().document.scan_table is not None
-            and controller.snapshot().document.scan_table.rows == ((100,), (200,)),
+            lambda: controller.current_document.scan_table is not None
+            and controller.current_document.scan_table.rows == ((100,), (200,)),
         )
         assert not body.scan_view.scan_run_button.text().endswith("*")
 
@@ -173,8 +173,8 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
         assert not body.schedule_view.channel_panel.scan_source_toggle.isEnabled()
         _until(
             application,
-            lambda: controller.snapshot().document.scan_table is not None
-            and controller.snapshot().document.scan_table.rows == ((300,), (400,)),
+            lambda: controller.current_document.scan_table is not None
+            and controller.current_document.scan_table.rows == ((300,), (400,)),
         )
         assert body.scan_view.scan_run_button.isEnabled()
 
@@ -185,8 +185,8 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
         )
         _until(
             application,
-            lambda: controller.snapshot().scan_workspace.selected_source == "loaded"
-            and controller.snapshot().document.scan_table.rows == ((500,), (600,)),
+            lambda: controller.current_scan_workspace.selected_source == "loaded"
+            and controller.current_document.scan_table.rows == ((500,), (600,)),
         )
         switch = body.schedule_view.channel_panel.scan_source_toggle
         assert switch.isChecked()
@@ -197,8 +197,8 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
         )
         _until(
             application,
-            lambda: controller.snapshot().scan_workspace.selected_source == "generated"
-            and controller.snapshot().document.scan_table.rows == ((300,), (400,)),
+            lambda: controller.current_scan_workspace.selected_source == "generated"
+            and controller.current_document.scan_table.rows == ((300,), (400,)),
         )
         QtTest.QTest.mouseClick(
             switch,
@@ -207,7 +207,7 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
         )
         _until(
             application,
-            lambda: controller.snapshot().scan_workspace.selected_source == "loaded",
+            lambda: controller.current_scan_workspace.selected_source == "loaded",
         )
 
         _click_tab(body, body.scan_view)
@@ -246,7 +246,7 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
         assert body.schedule_view.channel_panel.scan_file_label.text() == str(array_path)
     finally:
         body.request_close(discard_unsaved=True)
-        _until(application, lambda: controller.snapshot().close_complete)
+        _until(application, lambda: controller.runtime_update().close_complete)
         body.close()
         body.deleteLater()
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)

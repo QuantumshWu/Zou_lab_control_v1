@@ -82,12 +82,12 @@ def test_operator_observes_holds_steps_and_stops_virtual_scan(tmp_path) -> None:
         )
         _until(
             application,
-            lambda: body._controller.snapshot().held_scan_point is not None
+            lambda: body._controller.runtime_update().held_scan_point is not None
             and body.scan_view.scan_progress_label.text().startswith(
                 "held at point "
             ),
         )
-        held = body._controller.snapshot().held_scan_point
+        held = body._controller.runtime_update().held_scan_point
         assert held is not None
         old_index, total, _values = held
         if old_index < total - 1:
@@ -99,8 +99,8 @@ def test_operator_observes_holds_steps_and_stops_virtual_scan(tmp_path) -> None:
         QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
         _until(
             application,
-            lambda: body._controller.snapshot().held_scan_point is not None
-            and body._controller.snapshot().held_scan_point[0] == expected,
+            lambda: body._controller.runtime_update().held_scan_point is not None
+            and body._controller.runtime_update().held_scan_point[0] == expected,
         )
         assert body.scan_view.scan_progress_label.text().startswith(
             f"held at point {expected + 1}/{total}:"
@@ -114,7 +114,7 @@ def test_operator_observes_holds_steps_and_stops_virtual_scan(tmp_path) -> None:
             application,
             lambda: body.active_snapshot is not None
             and body.active_snapshot.state is RunState.CANCELLED
-            and not body._controller.snapshot().run_busy,
+            and not body._controller.runtime_update().run_busy,
         )
     finally:
         experiment.close()

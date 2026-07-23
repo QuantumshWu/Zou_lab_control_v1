@@ -145,7 +145,9 @@ class PulseEditorSession:
         with self._lock:
             return self._dirty
 
-    def snapshot(self) -> tuple[int, PulseDocument]:
+    def capture_document(self) -> tuple[int, PulseDocument]:
+        """Freeze one immutable document reference for worker submission."""
+
         with self._lock:
             return self._revision, self._document
 
@@ -184,7 +186,7 @@ class PulseEditorSession:
         )
 
     def preview(self) -> tuple[int, PulseTimelineDocument]:
-        revision, document = self.snapshot()
+        revision, document = self.capture_document()
         timeline = project_pulse_preview(document)
         return revision, timeline
 
@@ -196,6 +198,7 @@ class PulseEditorSession:
     ) -> Path:
         with self._save_lock:
             with self._lock:
+                revision = self._revision
                 document = self._document
                 current_path = self._path
                 base_fingerprint = self._base_fingerprint
@@ -220,7 +223,9 @@ class PulseEditorSession:
                 self._path = saved
                 self._base_fingerprint = document.fingerprint
                 self._file_state = "saved"
-                self._dirty = False
+                self._dirty = not (
+                    self._revision == revision and self._document is document
+                )
             return saved
 
 

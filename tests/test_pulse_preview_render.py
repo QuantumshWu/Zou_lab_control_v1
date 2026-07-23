@@ -260,7 +260,12 @@ def test_middle_drag_repaints_continuously_before_mouse_release(preview_body) ->
     assert initial is not None
     initial_revision = initial.viewport.display_revision
     layout_bounds = initial.viewport.plot_bounds
-    authoring_before = body._controller.snapshot()
+    authoring_before = (
+        body._controller.current_document,
+        body._controller.current_document_generation,
+        body._controller.current_editor_revision,
+        body._controller.dirty,
+    )
     centre = board.rect().center()
     revisions_seen_while_held: set[int] = set()
 
@@ -314,11 +319,13 @@ def test_middle_drag_repaints_continuously_before_mouse_release(preview_body) ->
 
     # A Preview viewport is presentation-only: the continuously emitted view
     # candidates must never dirty or revise the authoritative pulse document.
-    authoring_after = body._controller.snapshot()
-    assert authoring_after.document == authoring_before.document
-    assert authoring_after.document_generation == authoring_before.document_generation
-    assert authoring_after.editor_revision == authoring_before.editor_revision
-    assert authoring_after.dirty == authoring_before.dirty
+    authoring_after = (
+        body._controller.current_document,
+        body._controller.current_document_generation,
+        body._controller.current_editor_revision,
+        body._controller.dirty,
+    )
+    assert authoring_after == authoring_before
 
     _until(application, lambda: body.worker_idle)
     settled = board.visible_pulse_payload()
@@ -400,7 +407,7 @@ def test_failed_latest_drag_frame_releases_its_exact_pending_intent(
         _until(
             application,
             lambda: "forced latest Preview render failure"
-            in body._controller.snapshot().preview_error,
+            in body._controller.preview_update().preview_error,
         )
     finally:
         QtTest.QTest.mouseRelease(

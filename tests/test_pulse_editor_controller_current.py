@@ -24,18 +24,11 @@ from zlc_workbench.pulse_editor.controller import (
 
 def _pump_until(controller, predicate, *, timeout: float = 10.0):
     deadline = time.monotonic() + timeout
-    snapshot = controller.snapshot()
-    while not predicate(snapshot) and time.monotonic() < deadline:
+    while not predicate(controller) and time.monotonic() < deadline:
         time.sleep(0.005)
-        publication = controller.pump()
-        if publication is not None:
-            snapshot = (
-                publication
-                if hasattr(publication, "document")
-                else controller.snapshot()
-            )
-    assert predicate(snapshot)
-    return snapshot
+        controller.pump()
+    assert predicate(controller)
+    return controller
 
 
 def _controller() -> PulseEditorController:
@@ -50,7 +43,7 @@ def test_owner_wake_without_new_fact_is_silent_and_runtime_poll_stays_narrow():
         assert offline.pump() is None
     finally:
         offline.request_close()
-        _pump_until(offline, lambda value: value.close_complete)
+        _pump_until(offline, lambda value: value.runtime_update().close_complete)
 
     target = load_deployed_pulse_target()
     running = RunSnapshot(
@@ -100,24 +93,9 @@ def test_owner_wake_without_new_fact_is_silent_and_runtime_poll_stays_narrow():
         (),
         None,
     )
-    snapshot = controller.snapshot
-    editor_projection = controller.editor_projection
-    scan_workspace_snapshot = controller._scan_workspace_snapshot
-    controller.snapshot = lambda: (_ for _ in ()).throw(
-        AssertionError("runtime polling must not build an application snapshot")
-    )
-    controller.editor_projection = lambda: (_ for _ in ()).throw(
-        AssertionError("runtime polling must not project the editor")
-    )
-    controller._scan_workspace_snapshot = lambda *_args: (_ for _ in ()).throw(
-        AssertionError("runtime polling must not format the Scan workspace")
-    )
     update = controller.poll_runtime_change()
     assert isinstance(update, PulseRuntimeUpdate)
     assert update.run_snapshot is running
-    controller.snapshot = snapshot
-    controller.editor_projection = editor_projection
-    controller._scan_workspace_snapshot = scan_workspace_snapshot
     controller._pulse = None
     controller.request_close()
     controller.pump()
@@ -125,8 +103,6 @@ def test_owner_wake_without_new_fact_is_silent_and_runtime_poll_stays_narrow():
 
 def test_preview_completion_publishes_only_preview_surface():
     controller = _controller()
-    snapshot = controller.snapshot
-    editor_projection = controller.editor_projection
     try:
         controller.request_preview()
         deadline = time.monotonic() + 10.0
@@ -138,35 +114,27 @@ def test_preview_completion_publishes_only_preview_surface():
         else:
             raise AssertionError("preview worker did not complete")
 
-        controller.snapshot = lambda: (_ for _ in ()).throw(
-            AssertionError("worker completion must not build a full snapshot")
-        )
-        controller.editor_projection = lambda: (_ for _ in ()).throw(
-            AssertionError("Preview completion must not project the editor")
-        )
         publication = controller.pump()
         assert isinstance(publication, PulseOwnerUpdate)
         assert publication.preview is not None
         assert publication.editor is None
-        assert publication.editor_delta is None
         assert publication.file is None
         assert publication.runtime is None
         assert publication.scan_progress is None
     finally:
-        controller.snapshot = snapshot
-        controller.editor_projection = editor_projection
         controller.request_close()
-        _pump_until(controller, lambda value: value.close_complete)
+        _pump_until(controller, lambda value: value.runtime_update().close_complete)
 
 
 def test_preview_worker_uses_document_identity_and_latest_presentation_revision():
     controller = _controller()
     try:
         controller.request_preview()
-        first = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.rendered_preview is not None,
-        ).rendered_preview
+            lambda value: value.preview_update().rendered_preview is not None,
+        )
+        first = controller.preview_update().rendered_preview
         assert first is not None
         assert first.payload.document_input.document_revision == 0
         assert first.payload.document_input.content_digest == first.timeline.fingerprint
@@ -174,11 +142,12 @@ def test_preview_worker_uses_document_identity_and_latest_presentation_revision(
         assert not hasattr(first.payload, "evaluated_input")
 
         controller.set_preview_include_off(True)
-        second = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.rendered_preview is not None
-            and value.rendered_preview.presentation_revision == 1,
-        ).rendered_preview
+            lambda value: value.preview_update().rendered_preview is not None
+            and value.preview_update().rendered_preview.presentation_revision == 1,
+        )
+        second = controller.preview_update().rendered_preview
         assert second is not None
         assert second.timeline is not first.timeline
         assert second.timeline.fingerprint == first.timeline.fingerprint
@@ -192,30 +161,31 @@ def test_preview_worker_uses_document_identity_and_latest_presentation_revision(
             (low + 0.2 * span, high - 0.2 * span),
             presentation_revision=2,
         )
-        third = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.rendered_preview is not None
-            and value.rendered_preview.presentation_revision == 2,
-        ).rendered_preview
+            lambda value: value.preview_update().rendered_preview is not None
+            and value.preview_update().rendered_preview.presentation_revision == 2,
+        )
+        third = controller.preview_update().rendered_preview
         assert third is not None
         assert third.payload.viewport.x_limits != third.payload.viewport.home_x_limits
         assert third.payload.document_input == second.payload.document_input
     finally:
         controller.request_close()
-        _pump_until(controller, lambda value: value.close_complete)
+        _pump_until(controller, lambda value: value.runtime_update().close_complete)
         assert controller.worker_idle
 
 
 def test_clear_row_and_clear_all_are_domain_edits_not_widget_reconstruction():
     controller = _controller()
     try:
-        initial = controller.snapshot().document
+        initial = controller.current_document
         digital = next(
             port.key for port in initial.target.ports if port.kind == PORT_DIGITAL
         )
         controller.set_digital(initial.periods[0].period_id, digital, True)
         controller.clear_port(digital)
-        row_cleared = controller.snapshot().document
+        row_cleared = controller.current_document
         lane = row_cleared.target.by_key[digital].lanes[0]
         lane_index = row_cleared.target.raw_lanes.index(lane)
         assert row_cleared.periods[0].states[lane_index] == 0
@@ -223,14 +193,14 @@ def test_clear_row_and_clear_all_are_domain_edits_not_widget_reconstruction():
         controller.rename_document("kept name")
         controller.set_visible_ports([digital])
         controller.clear_all()
-        cleared = controller.snapshot().document
+        cleared = controller.current_document
         assert cleared.name == "kept name"
         assert cleared.visible_ports == (digital,)
         assert len(cleared.periods) == 1
         assert (cleared.periods[0].duration, cleared.periods[0].unit) == (1, "us")
     finally:
         controller.request_close()
-        _pump_until(controller, lambda value: value.close_complete)
+        _pump_until(controller, lambda value: value.runtime_update().close_complete)
 
 
 def test_editor_file_state_distinguishes_loaded_from_saved(tmp_path: Path):
@@ -252,25 +222,27 @@ def test_preview_manual_size_is_transient_and_reset_on_reentry():
     controller = _controller()
     try:
         controller.set_preview_size("4x4")
-        pinned = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.rendered_preview is not None
-            and value.rendered_preview.size == "4x4",
+            lambda value: value.preview_update().rendered_preview is not None
+            and value.preview_update().rendered_preview.size == "4x4",
         )
-        assert pinned.rendered_preview is not None
+        pinned = controller.preview_update().rendered_preview
+        assert pinned is not None
 
         controller.reset_preview_size()
-        automatic = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.rendered_preview is not None
-            and value.rendered_preview.presentation_revision
-            > pinned.rendered_preview.presentation_revision,
+            lambda value: value.preview_update().rendered_preview is not None
+            and value.preview_update().rendered_preview.presentation_revision
+            > pinned.presentation_revision,
         )
-        assert automatic.rendered_preview is not None
-        assert automatic.rendered_preview.size != "4x4"
+        automatic = controller.preview_update().rendered_preview
+        assert automatic is not None
+        assert automatic.size != "4x4"
     finally:
         controller.request_close()
-        _pump_until(controller, lambda value: value.close_complete)
+        _pump_until(controller, lambda value: value.runtime_update().close_complete)
 
 
 def test_borrowed_experiment_retirement_detaches_before_runtime_timer_poll():
@@ -325,4 +297,4 @@ def test_borrowed_experiment_retirement_detaches_before_runtime_timer_poll():
 
     assert pulse.observe_calls == 0
     assert controller._pulse is None
-    _pump_until(controller, lambda value: value.close_complete)
+    _pump_until(controller, lambda value: value.runtime_update().close_complete)

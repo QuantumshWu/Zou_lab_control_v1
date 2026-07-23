@@ -201,8 +201,8 @@ def test_document_refresh_preserves_valid_selection_focus_cursor_and_scroll() ->
     view.show()
     try:
         _process_events(application)
-        assert view.scroll.horizontalScrollBar().maximum() > 0
-        assert view.dataset_scroll.verticalScrollBar().maximum() > 0
+        assert view.timeline_scroll.horizontalScrollBar().maximum() > 0
+        assert view.timeline_scroll.verticalScrollBar().maximum() > 0
 
         _click_period(view, 4)
         editor = view.period_cards()[4].name_edit
@@ -217,8 +217,8 @@ def test_document_refresh_preserves_valid_selection_focus_cursor_and_scroll() ->
         assert QtWidgets.QApplication.focusWidget() is editor
         assert editor.selectedText() == "x"
 
-        horizontal = view.scroll.horizontalScrollBar()
-        vertical = view.dataset_scroll.verticalScrollBar()
+        horizontal = view.timeline_scroll.horizontalScrollBar()
+        vertical = view.timeline_scroll.verticalScrollBar()
         horizontal.setValue(horizontal.maximum() // 2)
         vertical.setValue(vertical.maximum() // 2)
         expected_scroll = (horizontal.value(), vertical.value())

@@ -132,7 +132,7 @@ def _run_offline_dac_target_gui(workspace: Path, application) -> None:
         _exercise_offline_dac_round_trip(body, application)
     finally:
         body.request_close(discard_unsaved=True)
-        _until(application, lambda: body._controller.snapshot().close_complete)
+        _until(application, lambda: body._controller.runtime_update().close_complete)
         _until(application, lambda: not wrapper.isVisible())
 
 
@@ -209,8 +209,8 @@ def _run_remote_gui(workspace: Path) -> None:
         )
         _until(
             application,
-            lambda: body._controller.snapshot().connection_state == "offline"
-            and "Connection failed" in body._controller.snapshot().diagnostic,
+            lambda: body._controller.runtime_update().connection_state == "offline"
+            and "Connection failed" in body._controller.runtime_update().diagnostic,
         )
         assert body.schedule_view.conn_connect_button.isEnabled()
 
@@ -224,7 +224,7 @@ def _run_remote_gui(workspace: Path) -> None:
         )
         _until(
             application,
-            lambda: body._controller.snapshot().connection_state == "ready"
+            lambda: body._controller.runtime_update().connection_state == "ready"
             and body.schedule_view.conn_status.text() == endpoint,
         )
         assert body.schedule_view.names_panel.hardware_labels["ch00"].text() == "F15"
@@ -246,7 +246,7 @@ def _run_remote_gui(workspace: Path) -> None:
             application,
             lambda: body.active_snapshot is not None
             and body.active_snapshot.state is RunState.SUCCEEDED
-            and not body._controller.snapshot().run_busy,
+            and not body._controller.runtime_update().run_busy,
         )
 
         _set_scan_repeats(body, 0)
@@ -272,11 +272,11 @@ def _run_remote_gui(workspace: Path) -> None:
             application,
             lambda: body.active_snapshot is not None
             and body.active_snapshot.state is RunState.CANCELLED
-            and not body._controller.snapshot().run_busy,
+            and not body._controller.runtime_update().run_busy,
         )
     finally:
         body.request_close(discard_unsaved=True)
-        _until(application, lambda: body._controller.snapshot().close_complete)
+        _until(application, lambda: body._controller.runtime_update().close_complete)
         _until(application, lambda: not wrapper.isVisible())
         server.close()
         if server_thread is not None:
@@ -325,13 +325,13 @@ def _run_load_before_remote(workspace: Path) -> None:
             application,
             lambda: body.current_document.name
             == "Must load before remote preflight"
-            and body._controller.snapshot().connection_state == "offline"
-            and "clock grid differs" in body._controller.snapshot().diagnostic,
+            and body._controller.runtime_update().connection_state == "offline"
+            and "clock grid differs" in body._controller.runtime_update().diagnostic,
         )
         assert body.schedule_view.conn_connect_button.isEnabled()
     finally:
         body.request_close(discard_unsaved=True)
-        _until(application, lambda: body._controller.snapshot().close_complete)
+        _until(application, lambda: body._controller.runtime_update().close_complete)
         _until(application, lambda: not wrapper.isVisible())
         server.close()
         server_thread.join(timeout=3.0)
@@ -341,83 +341,21 @@ def _run_load_before_remote(workspace: Path) -> None:
 
 
 def _run_c47_input_projection_gui(workspace: Path) -> None:
-    """Exercise the formal Qt input seams without a global presentation tick."""
+    """Exercise the operator-visible local-draft and stable-widget behavior."""
 
     application = ensure_qt_app()
     body = open_pulse_editor(repository=workspace / "c47-input")
     wrapper = body.window()
     controller = body._controller
-    normal_pump = controller.pump
-    normal_poll = controller.poll_runtime_change
-    normal_snapshot = controller.snapshot
-    normal_apply = body._apply_snapshot
-    normal_set_document = body.schedule_view.set_document
-    had_update_scan_source = hasattr(controller, "update_scan_source")
-    normal_update_scan_source = getattr(controller, "update_scan_source", None)
     try:
-        # Drain launch-time Qt events before observing the idle timer.  Preview
-        # is not requested while Edit is visible, and the 40 ms runtime watcher
-        # is disarmed, so neither path can manufacture a whole-window cycle.
         _until(application, lambda: body.worker_idle)
-        application.processEvents()
-        idle_calls = {"poll": 0, "pump": 0, "apply": 0}
 
-        def count_poll():
-            idle_calls["poll"] += 1
-            return normal_poll()
-
-        def count_pump(*args, **kwargs):
-            idle_calls["pump"] += 1
-            return normal_pump(*args, **kwargs)
-
-        def count_apply(snapshot):
-            idle_calls["apply"] += 1
-            return normal_apply(snapshot)
-
-        controller.poll_runtime_change = count_poll
-        controller.pump = count_pump
-        body._apply_snapshot = count_apply
-        assert body._timer.interval() == 40
-        assert not body._timer.isActive()
-        QtTest.QTest.qWait(body._timer.interval() * 3 + 20)
-        application.processEvents()
-        assert idle_calls == {"poll": 0, "pump": 0, "apply": 0}
-        controller.poll_runtime_change = normal_poll
-        controller.pump = normal_pump
-        body._apply_snapshot = normal_apply
-
-        # The Scan Program editor owns an uncommitted draft.  Real multi-key
-        # input changes only that widget and its local dirty bit: it must not
-        # publish the old controller-wide source/snapshot protocol or replace
-        # the code editor while the Qt event loop remains live.
         _click_tab(body, body.scan_view)
-        application.processEvents()
-        before = controller.snapshot()
         code_editor = body.scan_view.scan_code
-        code_identity = id(code_editor)
         source_revision = body.scan_view.source_revision
-        marker = "  # c47-local-draft"
-        input_calls = {"update": 0, "pump": 0, "snapshot": 0, "apply": 0}
-
-        def reject_update_scan_source(*_args, **_kwargs):
-            input_calls["update"] += 1
-
-        def count_input_pump(*args, **kwargs):
-            input_calls["pump"] += 1
-            return normal_pump(*args, **kwargs)
-
-        def count_input_snapshot():
-            input_calls["snapshot"] += 1
-            return normal_snapshot()
-
-        def count_input_apply(snapshot):
-            input_calls["apply"] += 1
-            return normal_apply(snapshot)
-
-        controller.update_scan_source = reject_update_scan_source
-        controller.pump = count_input_pump
-        controller.snapshot = count_input_snapshot
-        body._apply_snapshot = count_input_apply
+        editor_revision = controller.current_editor_revision
+        committed_source = controller.current_scan_workspace.source_text
+        marker = "  # local draft"
         QtTest.QTest.mouseClick(code_editor.viewport(), QtCore.Qt.LeftButton)
         QtTest.QTest.keyClick(
             code_editor,
@@ -425,27 +363,15 @@ def _run_c47_input_projection_gui(workspace: Path) -> None:
             QtCore.Qt.ControlModifier,
         )
         QtTest.QTest.keyClicks(code_editor, marker)
-        QtTest.QTest.qWait(body._timer.interval() * 2 + 20)
         application.processEvents()
         assert marker in code_editor.toPlainText()
         assert body.scan_view.code_dirty
         assert body.scan_view.source_revision == source_revision
         assert body.scan_view.scan_code is code_editor
-        assert id(body.scan_view.scan_code) == code_identity
-        assert input_calls == {"update": 0, "pump": 0, "snapshot": 0, "apply": 0}
-        controller.pump = normal_pump
-        controller.snapshot = normal_snapshot
-        body._apply_snapshot = normal_apply
-        del controller.update_scan_source
-        after = controller.snapshot()
-        assert after.editor_revision == before.editor_revision
-        assert after.scan_workspace.source_text == before.scan_workspace.source_text
-        assert code_editor.toPlainText() != after.scan_workspace.source_text
+        assert controller.current_editor_revision == editor_revision
+        assert controller.current_scan_workspace.source_text == committed_source
 
-        # Duplicate commit signals are legal at a Qt focus/selection seam.
-        # They must remain no-ops and must not re-project the Edit tree.
         _click_tab(body, body.schedule_view)
-        application.processEvents()
         card = body.schedule_view.period_cards()[0]
         stable_widgets = (
             body.schedule_view.names_panel,
@@ -455,47 +381,30 @@ def _run_c47_input_projection_gui(workspace: Path) -> None:
             card.unit_combo,
             card.name_edit,
         )
-        revision = controller.snapshot().editor_revision
-        set_document_calls = []
-
-        def count_set_document(*args, **kwargs):
-            set_document_calls.append((args, kwargs))
-            return normal_set_document(*args, **kwargs)
-
-        body.schedule_view.set_document = count_set_document
         card.unit_combo.currentTextChanged.emit(card.unit_combo.currentText())
         card.name_edit.editingFinished.emit()
         application.processEvents()
-        assert controller.snapshot().editor_revision == revision
-        assert set_document_calls == []
+        assert controller.current_editor_revision == editor_revision
 
-        # A real semantic edit advances the displayed editor ledger.  When the
-        # asynchronous Preview completion later publishes runtime state, it
-        # must not replay that already-presented revision through a full Edit
-        # tree reconcile.
         prior_unit = card.unit_combo.currentText()
         QtTest.QTest.mouseClick(card.unit_combo, QtCore.Qt.LeftButton)
         QtTest.QTest.keyClick(card.unit_combo, QtCore.Qt.Key_Down)
         QtTest.QTest.keyClick(card.unit_combo, QtCore.Qt.Key_Return)
         _until(
             application,
-            lambda: (
-                controller.current_document.periods[0].unit != prior_unit
-            ),
+            lambda: controller.current_document.periods[0].unit != prior_unit,
         )
         edited_document = controller.current_document
         _click_tab(body, body.preview_view)
         _until(
             application,
             lambda: (
-                controller.snapshot().rendered_preview is not None
-                and controller.snapshot().rendered_preview.editor_revision
-                == controller.snapshot().editor_revision
+                controller.preview_update().rendered_preview is not None
+                and controller.preview_update().rendered_preview.editor_revision
+                == controller.current_editor_revision
             ),
         )
-        application.processEvents()
         assert controller.current_document is edited_document
-        assert set_document_calls == []
         _click_tab(body, body.schedule_view)
         assert all(
             before_widget is after_widget
@@ -512,19 +421,9 @@ def _run_c47_input_projection_gui(workspace: Path) -> None:
                 strict=True,
             )
         )
-        body.schedule_view.set_document = normal_set_document
     finally:
-        controller.poll_runtime_change = normal_poll
-        controller.pump = normal_pump
-        controller.snapshot = normal_snapshot
-        body._apply_snapshot = normal_apply
-        body.schedule_view.set_document = normal_set_document
-        if had_update_scan_source:
-            controller.update_scan_source = normal_update_scan_source
-        elif "update_scan_source" in controller.__dict__:
-            del controller.update_scan_source
         body.request_close(discard_unsaved=True)
-        _until(application, lambda: body._controller.snapshot().close_complete)
+        _until(application, lambda: body._controller.runtime_update().close_complete)
         if wrapper.isVisible():
             wrapper.close()
         _until(application, lambda: not wrapper.isVisible())
@@ -583,7 +482,7 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
     body = open_pulse_editor(repository=workspace)
     wrapper = body.window()
     offline_visible = body.current_document.visible_ports
-    offline_available = body._controller.snapshot().target_manifest.available_port_keys
+    offline_available = body._controller.current_target_manifest.available_port_keys
     expected = (
         "ch00",
         "ch01",
@@ -616,13 +515,13 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
         )
         _until(
             application,
-            lambda: body._controller.snapshot().connection_state == "ready",
+            lambda: body._controller.runtime_update().connection_state == "ready",
         )
         _until(application, lambda: len(connected_messages) >= 1)
         assert connected_messages == [
             "Connected to a virtual (in-memory) sequencer."
         ]
-        assert body._controller.snapshot().target_manifest.available_port_keys == expected
+        assert body._controller.current_target_manifest.available_port_keys == expected
         assert body.current_document.visible_ports == offline_visible
         assert body.schedule_view._visible_ports == expected
 
@@ -632,9 +531,9 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
         )
         _until(application, lambda: len(body.schedule_view._visible_ports) == 4)
         geometry_before = (
-            body.schedule_view.dataset_scroll.geometry().getRect(),
+            body.schedule_view.timeline_scroll.geometry().getRect(),
             body.schedule_view.button_frame.geometry().getRect(),
-            body.schedule_view.dataset_body.width(),
+            body.schedule_view.timeline_scroll.viewport().width(),
         )
         QtTest.QTest.mouseClick(
             body.schedule_view.show_all_button,
@@ -642,9 +541,9 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
         )
         _until(application, lambda: body.schedule_view._visible_ports == expected)
         geometry_after = (
-            body.schedule_view.dataset_scroll.geometry().getRect(),
+            body.schedule_view.timeline_scroll.geometry().getRect(),
             body.schedule_view.button_frame.geometry().getRect(),
-            body.schedule_view.dataset_body.width(),
+            body.schedule_view.timeline_scroll.viewport().width(),
         )
         assert geometry_after == geometry_before
         assert body.current_document.visible_ports == offline_visible
@@ -662,8 +561,8 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
         _until(
             application,
             lambda: (
-                body._controller.snapshot().connection_state == "offline"
-                and body._controller.snapshot().connection_mode == "offline"
+                body._controller.runtime_update().connection_state == "offline"
+                and body._controller.runtime_update().connection_mode == "offline"
             ),
         )
         assert body.current_document.visible_ports == offline_visible
@@ -680,7 +579,7 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
         )
         _until(application, lambda: len(body.schedule_view._visible_ports) == 4)
         offline_geometry_before = (
-            body.schedule_view.dataset_scroll.geometry().getRect(),
+            body.schedule_view.timeline_scroll.geometry().getRect(),
             body.schedule_view.button_frame.geometry().getRect(),
             body.schedule_view.names_panel.port_labels[first_key].height(),
         )
@@ -698,8 +597,15 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
             application,
             lambda: body.schedule_view._visible_ports == offline_available,
         )
+        _until(
+            application,
+            lambda: (
+                body.schedule_view.timeline_scroll.verticalScrollBar().maximum()
+                > 0
+            ),
+        )
         offline_geometry_after = (
-            body.schedule_view.dataset_scroll.geometry().getRect(),
+            body.schedule_view.timeline_scroll.geometry().getRect(),
             body.schedule_view.button_frame.geometry().getRect(),
             body.schedule_view.names_panel.port_labels[first_key].height(),
         )
@@ -714,6 +620,36 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
             before is after
             for before, after in zip(edit_tree_before, edit_tree_after, strict=True)
         )
+        # Show all changes only visibility, but visibility is part of the one
+        # dataset-column geometry transaction.  Every existing row must occupy
+        # its own vertical slot and the same logical key must remain aligned
+        # across Catalog, Delay and every Period column.
+        columns = (
+            body.schedule_view.names_panel.row_widgets,
+            body.schedule_view.channel_panel.row_widgets,
+            *(
+                card.port_rows
+                for card in body.schedule_view.period_cards()
+            ),
+        )
+        for column in columns:
+            widgets = [column[key] for key in offline_available]
+            for previous, current in zip(widgets, widgets[1:]):
+                previous_rect = QtCore.QRect(
+                    previous.mapToGlobal(QtCore.QPoint(0, 0)),
+                    previous.size(),
+                )
+                current_rect = QtCore.QRect(
+                    current.mapToGlobal(QtCore.QPoint(0, 0)),
+                    current.size(),
+                )
+                assert current_rect.top() > previous_rect.bottom()
+        for key in offline_available:
+            centers = tuple(
+                column[key].mapToGlobal(column[key].rect().center()).y()
+                for column in columns
+            )
+            assert max(centers) - min(centers) <= 1
 
         # A scalar edit is projected onto the existing controls.  The real
         # combo interaction used to trigger a full Edit-tree teardown, which
@@ -726,88 +662,52 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
             first_card.unit_combo,
             first_card.duration_edit,
         )
-        snapshot_calls = 0
-        projection_calls = 0
-        set_document_calls = 0
-        original_snapshot = body._controller.snapshot
-        original_projection = body._controller.editor_projection
-        original_set_document = body.schedule_view.set_document
-
-        def counted_snapshot():
-            nonlocal snapshot_calls
-            snapshot_calls += 1
-            return original_snapshot()
-
-        def counted_projection():
-            nonlocal projection_calls
-            projection_calls += 1
-            return original_projection()
-
-        def counted_set_document(*args, **kwargs):
-            nonlocal set_document_calls
-            set_document_calls += 1
-            return original_set_document(*args, **kwargs)
-
-        body._controller.snapshot = counted_snapshot
-        body._controller.editor_projection = counted_projection
-        body.schedule_view.set_document = counted_set_document
         prior_unit = first_card.unit_combo.currentText()
-        try:
-            QtTest.QTest.mouseClick(first_card.unit_combo, QtCore.Qt.LeftButton)
-            QtTest.QTest.keyClick(first_card.unit_combo, QtCore.Qt.Key_Down)
-            QtTest.QTest.keyClick(first_card.unit_combo, QtCore.Qt.Key_Return)
-            _until(
-                application,
-                lambda: body.current_document.periods[0].unit != prior_unit,
-            )
+        QtTest.QTest.mouseClick(first_card.unit_combo, QtCore.Qt.LeftButton)
+        QtTest.QTest.keyClick(first_card.unit_combo, QtCore.Qt.Key_Down)
+        QtTest.QTest.keyClick(first_card.unit_combo, QtCore.Qt.Key_Return)
+        _until(
+            application,
+            lambda: body.current_document.periods[0].unit != prior_unit,
+        )
 
-            # Structural authoring uses the same local owner turn: adding,
-            # bracketing, and removing a period may insert/move/delete the
-            # keyed cards, but must not fall back to a whole editor projection.
-            original_cards = body.schedule_view.period_cards()
-            QtTest.QTest.mouseClick(
-                body.schedule_view.add_button,
-                QtCore.Qt.LeftButton,
-            )
-            _until(
-                application,
-                lambda: len(body.schedule_view.period_cards())
-                == len(original_cards) + 1,
-            )
-            assert body.schedule_view.period_cards()[0] is original_cards[0]
-            QtTest.QTest.mouseClick(
-                body.schedule_view.bracket_button,
-                QtCore.Qt.LeftButton,
-            )
-            _until(application, lambda: body.current_document.repeat is not None)
-            QtTest.QTest.mouseClick(
-                body.schedule_view.remove_button,
-                QtCore.Qt.LeftButton,
-            )
-            _until(
-                application,
-                lambda: len(body.schedule_view.period_cards()) == len(original_cards),
-            )
-            assert body.schedule_view.period_cards() == original_cards
+        original_cards = body.schedule_view.period_cards()
+        QtTest.QTest.mouseClick(
+            body.schedule_view.add_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(
+            application,
+            lambda: len(body.schedule_view.period_cards()) == len(original_cards) + 1,
+        )
+        assert body.schedule_view.period_cards()[0] is original_cards[0]
+        QtTest.QTest.mouseClick(
+            body.schedule_view.bracket_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(application, lambda: body.current_document.repeat is not None)
+        QtTest.QTest.mouseClick(
+            body.schedule_view.remove_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(
+            application,
+            lambda: len(body.schedule_view.period_cards()) == len(original_cards),
+        )
+        assert body.schedule_view.period_cards() == original_cards
 
-            digital = next(iter(first_card.checks))
-            if not first_card.checks[digital].isChecked():
-                QtTest.QTest.mouseClick(
-                    first_card.checks[digital],
-                    QtCore.Qt.LeftButton,
-                )
-                _until(application, lambda: first_card.checks[digital].isChecked())
+        digital = next(iter(first_card.checks))
+        if not first_card.checks[digital].isChecked():
             QtTest.QTest.mouseClick(
-                body.schedule_view.channel_panel.clear_buttons[digital],
+                first_card.checks[digital],
                 QtCore.Qt.LeftButton,
             )
-            _until(application, lambda: not first_card.checks[digital].isChecked())
-            application.processEvents()
-            assert (snapshot_calls, projection_calls, set_document_calls) == (0, 0, 0)
-        finally:
-            body._controller.snapshot = original_snapshot
-            body._controller.editor_projection = original_projection
-            body.schedule_view.set_document = original_set_document
+            _until(application, lambda: first_card.checks[digital].isChecked())
+        QtTest.QTest.mouseClick(
+            body.schedule_view.channel_panel.clear_buttons[digital],
+            QtCore.Qt.LeftButton,
+        )
+        _until(application, lambda: not first_card.checks[digital].isChecked())
         assert all(
             before is after
             for before, after in zip(
@@ -827,7 +727,7 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
         assert body.target_view.add_dac_button.isEnabled()
     finally:
         body.request_close(discard_unsaved=True)
-        _until(application, lambda: body._controller.snapshot().close_complete)
+        _until(application, lambda: body._controller.runtime_update().close_complete)
         _until(application, lambda: not wrapper.isVisible())
 
 

@@ -25,18 +25,11 @@ from zlc_workbench.pulse_editor.scan_workspace import (
 
 def _pump_until(controller, predicate, *, timeout: float = 10.0):
     deadline = time.monotonic() + timeout
-    snapshot = controller.snapshot()
-    while not predicate(snapshot) and time.monotonic() < deadline:
+    while not predicate(controller) and time.monotonic() < deadline:
         time.sleep(0.005)
-        publication = controller.pump()
-        if publication is not None:
-            snapshot = (
-                publication
-                if hasattr(publication, "document")
-                else controller.snapshot()
-            )
-    assert predicate(snapshot), snapshot
-    return snapshot
+        controller.pump()
+    assert predicate(controller)
+    return controller
 
 
 def _controller_with_duration_columns(count: int = 2) -> PulseEditorController:
@@ -44,7 +37,7 @@ def _controller_with_duration_columns(count: int = 2) -> PulseEditorController:
     controller = PulseEditorController(
         PulseEditorSession.new(target, time_step_ns=20)
     )
-    first = controller.snapshot().document.periods[0].period_id
+    first = controller.current_document.periods[0].period_id
     controller.cycle_binding(PulseFieldRef(FIELD_DURATION, first))
     for _ in range(1, count):
         period_id = controller.add_period(duration=1, unit="us").period_ids[0]
@@ -54,15 +47,15 @@ def _controller_with_duration_columns(count: int = 2) -> PulseEditorController:
 
 def _close(controller: PulseEditorController) -> None:
     controller.request_close()
-    _pump_until(controller, lambda value: value.close_complete)
+    _pump_until(controller, lambda value: value.runtime_update().close_complete)
     assert controller.worker_idle
 
 
 def test_scan_program_requires_exact_finite_two_dimensional_parameter_matrix():
     controller = _controller_with_duration_columns(2)
     try:
-        assert not controller.snapshot().scan_workspace.source_dirty
-        document = controller.snapshot().document
+        assert not controller.current_scan_workspace.source_dirty
+        document = controller.current_document
         result = execute_scan_program(
             document,
             "scan_table = np.array([[20, 40], [60, 80]])\n"
@@ -130,39 +123,41 @@ def test_template_defaults_come_from_nominal_clock_units_and_real_dac_range():
 def test_controller_worker_commits_generated_recipe_in_stable_parameter_order():
     controller = _controller_with_duration_columns(2)
     try:
-        document = controller.snapshot().document
+        document = controller.current_document
         columns = tuple(item.parameter_id for item in document.scan_parameters)
         display_names = tuple(spec.name for spec in scan_column_specs(document))
         source = "import numpy as np\nscan_table = np.array([[20, 40], [60, 80]])\n"
         controller.generate_scan_source(source)
-        snapshot = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.scan_workspace.busy_operation is None
-            and value.document.scan_table is not None,
+            lambda value: value.current_scan_workspace.busy_operation is None
+            and value.current_document.scan_table is not None,
         )
-        assert snapshot.document.scan_table.columns == columns
-        assert snapshot.document.scan_recipe is not None
-        assert snapshot.document.scan_recipe.source == source
-        assert snapshot.scan_workspace.selected_source == "generated"
-        assert snapshot.scan_workspace.selected_compatible
-        assert not snapshot.scan_workspace.source_dirty
-        assert snapshot.scan_workspace.table_text.splitlines()[0] == "   ".join(
+        committed = controller.current_document
+        workspace = controller.current_scan_workspace
+        assert committed.scan_table.columns == columns
+        assert committed.scan_recipe is not None
+        assert committed.scan_recipe.source == source
+        assert workspace.selected_source == "generated"
+        assert workspace.selected_compatible
+        assert not workspace.source_dirty
+        assert workspace.table_text.splitlines()[0] == "   ".join(
             display_names
         )
         assert not any(
-            parameter_id in snapshot.scan_workspace.table_text
+            parameter_id in workspace.table_text
             for parameter_id in columns
             if parameter_id not in display_names
         )
 
         controller.generate_scan_source("scan_table = [1, 2]\n")
-        failed = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.scan_workspace.busy_operation is None
-            and "Scan code error" in value.scan_workspace.diagnostic,
+            lambda value: value.current_scan_workspace.busy_operation is None
+            and "Scan code error" in value.current_scan_workspace.diagnostic,
         )
-        assert failed.document.scan_table == snapshot.document.scan_table
-        assert failed.scan_workspace.source_dirty
+        assert controller.current_document.scan_table == committed.scan_table
+        assert controller.current_scan_workspace.source_dirty
     finally:
         _close(controller)
 
@@ -174,39 +169,41 @@ def test_loaded_and_generated_candidates_never_reconcile_after_slot_change(tmp_p
         controller.generate_scan_source(source)
         _pump_until(
             controller,
-            lambda value: value.scan_workspace.busy_operation is None
-            and value.document.scan_table is not None,
+            lambda value: value.current_scan_workspace.busy_operation is None
+            and value.current_document.scan_table is not None,
         )
 
         path = tmp_path / "loaded.csv"
         path.write_text("100,120\n140,160\n", encoding="utf-8")
         controller.load_scan_array(path)
-        loaded = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.scan_workspace.busy_operation is None
-            and value.scan_workspace.selected_source == "loaded",
+            lambda value: value.current_scan_workspace.busy_operation is None
+            and value.current_scan_workspace.selected_source == "loaded",
         )
-        assert loaded.scan_workspace.loaded is not None
-        assert loaded.document.scan_table.rows == ((100, 120), (140, 160))
+        loaded_workspace = controller.current_scan_workspace
+        loaded_document = controller.current_document
+        assert loaded_workspace.loaded is not None
+        assert loaded_document.scan_table.rows == ((100, 120), (140, 160))
 
-        removed = loaded.document.scan_parameters[-1].field
+        removed = loaded_document.scan_parameters[-1].field
         controller.cycle_binding(removed)  # scan -> API changes the ordered schema
-        stale = controller.snapshot()
-        assert stale.document.scan_table is None
-        assert stale.scan_workspace.selected_source == "loaded"
-        assert stale.scan_workspace.loaded is not None
-        assert not stale.scan_workspace.loaded.compatible
-        assert stale.scan_workspace.generated is not None
-        assert not stale.scan_workspace.generated.compatible
-        assert stale.scan_workspace.table_text.startswith("STALE")
-        assert stale.scan_workspace.loaded.table.columns == tuple(
-            item.parameter_id for item in loaded.document.scan_parameters
+        stale = controller.current_scan_workspace
+        assert controller.current_document.scan_table is None
+        assert stale.selected_source == "loaded"
+        assert stale.loaded is not None
+        assert not stale.loaded.compatible
+        assert stale.generated is not None
+        assert not stale.generated.compatible
+        assert stale.table_text.startswith("STALE")
+        assert stale.loaded.table.columns == tuple(
+            item.parameter_id for item in loaded_document.scan_parameters
         )
 
         with pytest.raises(ValueError, match="stale"):
             controller.save_scan_array(tmp_path / "must_not_save.npy")
         controller.select_scan_source("generated")
-        assert controller.snapshot().document.scan_table is None
+        assert controller.current_document.scan_table is None
     finally:
         _close(controller)
 
@@ -214,7 +211,7 @@ def test_loaded_and_generated_candidates_never_reconcile_after_slot_change(tmp_p
 def test_single_slot_accepts_one_dimensional_input_without_weakening_multi_slot_shape(tmp_path: Path):
     controller = _controller_with_duration_columns(1)
     try:
-        document = controller.snapshot().document
+        document = controller.current_document
         csv_path = tmp_path / "one_column.csv"
         csv_path.write_text("20\n40\n60\n", encoding="utf-8")
         loaded = load_scan_array(document, csv_path)
@@ -260,45 +257,49 @@ def test_program_and_array_file_operations_are_worker_observable(tmp_path: Path)
         program = tmp_path / "scan.txt"
         program.write_text("scan_table = [[20], [40]]\n", encoding="utf-8")
         controller.load_scan_program(program)
-        loaded_program = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.scan_workspace.busy_operation is None
-            and value.scan_workspace.source_text.startswith("scan_table"),
+            lambda value: value.current_scan_workspace.busy_operation is None
+            and value.current_scan_workspace.source_text.startswith("scan_table"),
         )
-        assert loaded_program.scan_workspace.source_dirty
+        assert controller.current_scan_workspace.source_dirty
 
         controller.generate_scan_source()
-        generated = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.scan_workspace.busy_operation is None
-            and value.document.scan_table is not None,
+            lambda value: value.current_scan_workspace.busy_operation is None
+            and value.current_document.scan_table is not None,
         )
-        assert not generated.scan_workspace.source_dirty
+        generated_document = controller.current_document
+        assert not controller.current_scan_workspace.source_dirty
 
         controller.save_scan_array(tmp_path / "selected.csv")
-        saved = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.scan_workspace.busy_operation is None
-            and value.scan_workspace.diagnostic.startswith("Saved scan array"),
+            lambda value: value.current_scan_workspace.busy_operation is None
+            and value.current_scan_workspace.diagnostic.startswith("Saved scan array"),
         )
         assert (tmp_path / "selected.csv").exists()
-        assert saved.scan_workspace.selected_table == generated.document.scan_table
+        assert (
+            controller.current_scan_workspace.selected_table
+            == generated_document.scan_table
+        )
 
         current_document = tmp_path / "current.json"
-        generated.document.save(current_document)
-        imported = load_scan_array(generated.document, current_document)
-        assert imported.candidate.table == generated.document.scan_table
+        generated_document.save(current_document)
+        imported = load_scan_array(generated_document, current_document)
+        assert imported.candidate.table == generated_document.scan_table
         controller.load_scan_program(current_document)
-        imported_by_formal_button = _pump_until(
+        _pump_until(
             controller,
-            lambda value: value.scan_workspace.busy_operation is None
-            and value.scan_workspace.selected_source == "loaded",
+            lambda value: value.current_scan_workspace.busy_operation is None
+            and value.current_scan_workspace.selected_source == "loaded",
         )
-        assert imported_by_formal_button.scan_workspace.loaded_path == current_document
+        assert controller.current_scan_workspace.loaded_path == current_document
 
         bad = tmp_path / "compiled_program.json"
         bad.write_text("{}", encoding="utf-8")
         with pytest.raises(ValueError, match="current PulseDocument"):
-            load_scan_array(generated.document, bad)
+            load_scan_array(generated_document, bad)
     finally:
         _close(controller)
