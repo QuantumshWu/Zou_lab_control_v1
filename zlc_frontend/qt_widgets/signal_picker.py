@@ -187,9 +187,9 @@ def read_editable_combo(combo) -> str:
 def coerce_short_labels(provider) -> dict:
     """Normalise a ``{full hub name -> short name}`` callback into the ``labels`` map every grouped
     signal picker feeds ``fill_grouped_signal_combo``: callable-guard, ``str()`` both ends, drop empty
-    short names, swallow any provider exception to ``{}``.  The ONE source the signal_expr / plot
-    Setting slot / form signal pickers share so they render IDENTICALLY (#combo-parity) instead of four
-    hand-copied dict comprehensions (the 4th of which had already dropped the try/except)."""
+    short names, swallow any provider exception to ``{}``.  The ONE source the plot Setting slot and
+    form signal pickers share so they render IDENTICALLY (#combo-parity) instead of hand-copied dict
+    comprehensions."""
     if not callable(provider):
         return {}
     try:

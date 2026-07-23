@@ -45,20 +45,8 @@ from zlc_frontend.form import (
     python_to_text as _py_to_text,
     text_to_python as _text_to_py,
 )
-from zlc_frontend.panel_params import (
-    PANEL_PARAMS,
-    panel_display_decls as _panel_display_decls,
-    resolved_cmap as _resolved_cmap,
-    resolved_param as _resolved_param,
-)
+from zlc_frontend.panel_params import panel_param_decls as _panel_param_decls
 from .plot_bridge import _RELIM_PARAM
-from zlc_data.console_records import (
-    BLANK_SOURCE as _BLANK_SOURCE,
-    PANEL_KINDS,
-    PanelConfig,
-    panel_allows_multi_slot,
-    panel_input_slots,
-)
 from zlc_storage.paths import display_path
 
 
@@ -123,10 +111,6 @@ class PanelEditor(QtWidgets.QWidget):
         self.card = card
         self.console = console
         self.setStyleSheet("background: transparent;")
-        # Which kind's PANEL_PARAMS this page baked its rows from -- a grid's resolved
-        # per-cell kind can change later, and refresh_on_show then rebuilds the page so
-        # the rows never lie.
-        self._param_kind_built = card._param_kind() if card is not None else None
         self._board = None
         self._displayed_figure = None
         self._displayed_display = None
@@ -241,7 +225,7 @@ class PanelEditor(QtWidgets.QWidget):
 
         # ---- Parameters: the plot's own functional params, auto-discovered from the
         # kind's declarations, so a kind that gains a knob shows it with no wiring here.
-        functional = [spec for spec in _panel_display_decls(card.config.kind, card._param_kind())
+        functional = [spec for spec in _panel_param_decls(card.config.kind)
                       if not spec.display]
         if functional:
             section("Parameters")
@@ -256,14 +240,14 @@ class PanelEditor(QtWidgets.QWidget):
         self.ed_fixed_lo = self.ed_fixed_hi = None
         self.ed_params = {}
         section("Display")
-        display_specs = ([spec for spec in _panel_display_decls(card.config.kind, card._param_kind())
-                          if spec.display] + [_RELIM_PARAM] + list(card._repeat_param_specs()))
+        display_specs = ([spec for spec in _panel_param_decls(card.config.kind)
+                          if spec.display] + [_RELIM_PARAM])
         self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, label_w)
         self.ed_cmap = self.ed_params.get("colormap")
         self.ed_relim = self.ed_params.get("relim")
         # An image's VALUE axis is its colour limit, pinned by the "colour range" row in
         # Limits; a second fixed lo/hi here would put two inputs on one source.
-        if card.config.kind not in ("2d", "sites"):
+        if card.config.kind != "2d":
             self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = card._make_fixed_lim_row(
                 self._edit_fixed_lim, label_w)
             col.addWidget(self.ed_fixed_row)
@@ -302,7 +286,7 @@ class PanelEditor(QtWidgets.QWidget):
         section("Limits")
         self.xmin = FluentLineEdit("")
         self.xmax = FluentLineEdit("")
-        if card.config.kind in ("2d", "sites"):
+        if card.config.kind == "2d":
             # An image's x AND y are pixel coordinates: pinning both is what makes a crop
             # real.  A curve's y is owned by the relim family instead, so it gets no row.
             self.ymin = FluentLineEdit("")
@@ -451,7 +435,7 @@ class PanelEditor(QtWidgets.QWidget):
                     if edit is not None and pkey in self.card.config.params:
                         edit.setText(f"{float(self.card.config.params[pkey]):g}")
         if key == "relim":
-            # a 2d/sites image has no Display fixed row (its clim lives in the Limits colour-range row):
+            # a 2D image has no Display fixed row (its clim lives in the Limits colour-range row):
             # re-seed THOSE boxes here so picking relim in the chooser fills/empties them to match the
             # pin -- runs even when ed_fixed_row is None, unlike the block above (#2 colour range).
             self._seed_clim_boxes()
@@ -476,10 +460,8 @@ class PanelEditor(QtWidgets.QWidget):
 
     def _edit_fixed_lim(self) -> None:
         """The Edit tab's fixed lo/hi committed (#H2): apply to the LIVE card through its ONE
-        ``apply_fixed_lims`` path (config.params + in-place apply_param; a zoomed grid also stores
-        onto the parked grid), then push onto THIS tab's SNAPSHOT in place too (the same apply_param
-        relim family; a GridPlot forwards to its focused cell) -- never a re-snapshot, which would
-        bounce a focused grid cell back to the grid."""
+        ``apply_fixed_lims`` path (config.params + local display commit), then let the next accepted
+        front update this tab.  It never re-reads acquisition merely because a limit changed."""
         if self.card is None:
             return
         lo = _safe_float(self.ed_fixed_lo.text(), 0.0)
@@ -595,14 +577,7 @@ class PanelEditor(QtWidgets.QWidget):
         fields to current view, re-read the producing source's 'now' acquisition values, and refresh
         any embedded source form's dynamic combos (the ONE hook the tab-switch handler calls -- nothing
         special-cases PanelEditor versus LogicNodeEditor)."""
-        # A grid's param rows follow its RESOLVED per-cell kind: when a facet / sub-plot pick changed
-        # it since this page was built, rebuild the page in place (fresh rows + snapshot) -- the Edit
-        # mirror of the Setting popup's _sync_settings_param_rows.
         card = self.card
-        if card is not None and card.config.kind == "grid" \
-                and card._param_kind() != self._param_kind_built:
-            self.console._refresh_panel_editor(card)
-            return
         self._refresh_display_params()
         self._seed_limit_boxes()        # re-seed the pin from config.params (may have changed in Setting)
         self.refresh_limit_hints()
@@ -688,7 +663,7 @@ class PanelEditor(QtWidgets.QWidget):
                     lo = hi = ""
             with _signals_blocked(lo_box, hi_box):
                 lo_box.setText(lo); hi_box.setText(hi)
-        self._seed_clim_boxes()          # keep the 2d/sites colour-range boxes in step with the clim pin
+        self._seed_clim_boxes()          # keep the 2D colour-range boxes in step with the clim pin
 
     def refresh_limit_hints(self) -> None:
         """Refresh ONLY the grey PLACEHOLDER of the x-range boxes to the panel's current x-window -- a
@@ -698,7 +673,7 @@ class PanelEditor(QtWidgets.QWidget):
         THIS, so the boxes stay a live VIEW of the x-window (unpinned) while remaining freely editable."""
         if self.xmin is None:
             return                          # no Limits controls on this editor instance
-        # colour-range (2d/sites) live hint: show the current clim as the grey PLACEHOLDER so an empty
+        # Colour-range live hint: show the current clim as the grey placeholder so an empty
         # box (= Auto) still tells the operator what range the image is using -- the clim counterpart of
         # the x-window hint below.  Non-destructive: Qt draws a placeholder only while the box is empty,
         # so a pinned/typed value is never overwritten.
@@ -720,10 +695,7 @@ class PanelEditor(QtWidgets.QWidget):
         """Apply the typed view-window pins -- PER AXIS: a filled pair pins that axis, an empty pair
         releases it (so 'clear the y boxes + Apply' un-pins y while keeping x).  Each pin is an ORDINARY
         display knob (``view_xlim``/``view_ylim``) applied through the SAME ``_edit_param`` entry as
-        bins / fit / relim -> the LIVE card (whose ``apply_param`` fans it to EVERY cell and re-asserts
-        it after each tick's autoscale) + the snapshot + ``config.params`` + save.  So Apply reaches the
-        RUNNING grid and STICKS (#3), not a one-shot on a throwaway ``_GridData`` the next redraw
-        autoscaled away."""
+        bins / relim -> the live card + accepted front + ``config.params`` + save."""
         if self.xmin is None:
             return
         applied, cleared, updates = [], [], {}
@@ -779,7 +751,7 @@ class PanelEditor(QtWidgets.QWidget):
                 combo.setCurrentIndex(idx)
 
     def apply_clim(self) -> None:
-        """Pin a 2d/sites panel's COLOUR limit to the typed lo/hi.  Routes through the ONE clim source the
+        """Pin a 2D panel's colour limit to the typed lo/hi.  Routes through the ONE clim source the
         relim family owns (relim="fixed" + the card's ``apply_fixed_lims``), so the live card (every cell,
         re-asserted each tick), this tab's snapshot, ``config.params`` and Save all move together -- there
         is no second hand-copied clim path.  Both boxes empty = Auto (release the pin)."""

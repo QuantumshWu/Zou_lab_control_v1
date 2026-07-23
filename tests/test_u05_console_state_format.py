@@ -1,12 +1,4 @@
-"""The saved-console FILE FORMAT lives in ``zlc_data.console_records`` -- and only there.
-
-The persisted schema identifier ``Zou_lab_control.frontend.TaskConsoleState`` reads like a
-module path, and it is not one: it is a format NAME that every layout a user has saved
-carries, and ``exact_mapping`` refuses a payload whose ``schema`` differs.  The module it
-was once named after is deleted (directive 2026-07-21); re-deriving the identifier from
-any code location would make every saved dashboard unopenable -- silently, at the moment
-an operator tries to load their work.  Hence the literal below.
-"""
+"""The current saved-console format lives in ``zlc_data.console_records``."""
 
 from __future__ import annotations
 
@@ -23,10 +15,8 @@ from zlc_data.console_records import (
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 
-def test_the_schema_is_a_format_name_not_a_module_path():
-    """Stated as a literal, so moving the class cannot quietly move the file format."""
-
-    assert CONSOLE_STATE_SCHEMA == "Zou_lab_control.frontend.TaskConsoleState"
+def test_the_schema_is_a_semantic_format_name_not_a_module_path():
+    assert CONSOLE_STATE_SCHEMA == "zlc.task_console.layout"
 
 
 def test_all_three_console_record_field_specs_live_together():
@@ -35,7 +25,7 @@ def test_all_three_console_record_field_specs_live_together():
     assert TASK_CONSOLE_STATE_FIELDS == {
         "schema": str, "name": str, "interval_ms": int, "panels": list, "logic": list}
     assert set(PANEL_CONFIG_FIELDS) == {
-        "kind", "title", "row", "col", "size", "source", "params", "inputs"}
+        "kind", "title", "row", "col", "size", "signal", "params"}
     assert set(LOGIC_NODE_CONFIG_FIELDS) == {"kind", "name", "title", "values"}
     # ``schema`` is a FIELD here, not merely a check: it round-trips into the file, and the
     # exact-key rule means a payload missing it is refused rather than defaulted.

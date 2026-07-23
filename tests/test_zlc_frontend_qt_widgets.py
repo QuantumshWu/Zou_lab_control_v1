@@ -1195,7 +1195,6 @@ def test_current_user_and_maintainer_docs_name_only_the_new_ui_owners() -> None:
     paths = [
         ROOT / "README.md",
         ROOT / "docs" / "MAINTAINER_NOTES.md",
-        ROOT / "docs" / "task_console_design" / "task_console_design_zh.texbody",
     ]
     forbidden = (
         "qt_fluent",

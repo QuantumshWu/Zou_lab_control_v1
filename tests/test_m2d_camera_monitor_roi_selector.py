@@ -229,8 +229,6 @@ def test_max_is_typed_validity_aware_and_all_roi_reducers_reject_valid_nonfinite
         omit,
     )
     assert all_invalid.values.item() == 0 and all_invalid.validity is INVALID
-    assert omit.reduction_scratch_nbytes == 2 * schema.dtype.itemsize
-
     signed_schema, signed_contract, signed_selection, *_ = _camera_kernel("<i2")
     signed = reduce_camera_roi(
         _sample(signed_schema, [-7, -2], [True, True]),
@@ -251,9 +249,6 @@ def test_max_is_typed_validity_aware_and_all_roi_reducers_reject_valid_nonfinite
         ValidityPolicy.OMIT_INVALID,
     )
     assert float_max.output_schema.dtype == np.dtype("<f4")
-    assert float_max.reduction_scratch_nbytes == 2 * (
-        np.dtype("<f4").itemsize + np.dtype(bool).itemsize
-    )
     invalid_nan = _sample(float_schema, [np.nan, 3.0], [False, True])
     valid_nan = _sample(float_schema, [np.nan, 3.0], [True, True])
     for method in (

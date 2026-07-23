@@ -1824,6 +1824,13 @@ class CameraMonitorWorkbenchWindow(QtWidgets.QWidget):
                 and not view_faulted
             ):
                 board.present_pending()
+                if live is not None:
+                    # See CaptureWorkbenchWindow: the status/source record may
+                    # follow the first publication wake, so always reconcile
+                    # against the front Qt is actually displaying.
+                    frame = self._board_widget.front_frame
+                    if frame is not None:
+                        live.accept_presented_front(frame.sequence)
             if live is not None and not view_faulted:
                 # Present the previous completed raster before admitting the
                 # next candidate, so front_status remains sequence-gated.

@@ -253,8 +253,8 @@ def decode(
     after framed JSON and every tagged node have been validated, but before any
     ndarray base64 is decoded or NumPy array is allocated.  Domain owners use
     it only for exact wire/schema facts such as forbidden arrays, declared
-    shapes and fixed chunk cardinality; it is not a host-memory or allocation
-    budget hook.  The second pass remains the sole value materializer.
+    shapes and fixed chunk cardinality.  The second pass remains the sole value
+    materializer.
     """
 
     if not isinstance(data, (bytes, bytearray, memoryview)):

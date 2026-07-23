@@ -967,6 +967,7 @@ def test_freeze_presentation_revokes_work_and_preserves_the_coherent_front_state
     controller._lock = threading.Lock()
     controller._closed = False
     controller._candidate = object()
+    controller._display_rerender = object()
     controller._port = object()
     controller._sources = (object(),)
     controller._dirty = True
@@ -976,10 +977,51 @@ def test_freeze_presentation_revokes_work_and_preserves_the_coherent_front_state
     controller._board = SimpleNamespace(freeze_front=lambda: frozen.append(True))
     controller.freeze_presentation()
     assert controller._candidate is None
+    assert controller._display_rerender is None
     assert controller._port is None and controller._sources is None
     assert not controller._dirty and not controller._active
     assert controller._presentation_frozen
     assert frozen == [True]
+
+
+def test_display_only_rerender_reuses_presented_source_without_freezing_latest():
+    controller = object.__new__(LiveBoardController)
+    controller._owner_thread = threading.get_ident()
+    controller._lock = threading.Lock()
+    controller._closed = False
+    controller._presentation_frozen = False
+    controller._fault = None
+    controller._dirty = False
+    controller._active = False
+    controller._candidate = None
+    held = object()
+    controller._display_rerender = held
+    wakes = []
+    controller._request_owner_wake = lambda: wakes.append("present")
+    controller._submit = lambda _work: pytest.fail(
+        "a display draft must not freeze the latest source"
+    )
+
+    controller._request_display_front()
+
+    assert controller._candidate is held
+    assert controller._display_rerender is None
+    assert controller._active and not controller._dirty
+    assert wakes == ["present"]
+
+
+def test_only_a_qt_presented_sequence_becomes_the_display_rerender_source():
+    controller = object.__new__(LiveBoardController)
+    controller._owner_thread = threading.get_ident()
+    controller._lock = threading.Lock()
+    source = ("run", "cause", object())
+    controller._published_source = (7, *source)
+    controller._presented_source = None
+
+    assert not controller.accept_presented_front(6)
+    assert controller._presented_source is None
+    assert controller.accept_presented_front(7)
+    assert controller._presented_source == source
 
 
 def test_scalar_control_change_reuses_layout_when_panel_ids_are_unchanged(monkeypatch):

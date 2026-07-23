@@ -738,6 +738,14 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                 board = self._board
                 if board is not None and board.fault is None:
                     board.present_pending()
+                    if live is not None:
+                        # The publication wake can reach Qt just before the
+                        # live owner records its matching source transaction.
+                        # A second coalesced wake therefore rechecks the actual
+                        # visible front even when there is nothing new to swap.
+                        frame = self._board_widget.front_frame
+                        if frame is not None:
+                            live.accept_presented_front(frame.sequence)
                 if live is not None:
                     live.admit_pending()
             except BaseException as error:

@@ -652,6 +652,22 @@ class LiveBoardController:
         self._dirty = False
         self._active = False
         self._candidate: _LiveCandidate | None = None
+        # Display-only pan/clim/threshold edits must repaint the exact front
+        # the operator touched.  They may not sample whatever source revision
+        # happens to be latest when the pointer moves.  The owner records the
+        # source transaction only after its BoardFrame is actually presented.
+        self._presented_source: tuple[
+            str,
+            str,
+            MonitorDatasetSnapshot | CameraMonitorSnapshot,
+        ] | None = None
+        self._published_source: tuple[
+            int,
+            str,
+            str,
+            MonitorDatasetSnapshot | CameraMonitorSnapshot,
+        ] | None = None
+        self._display_rerender: _LiveCandidate | None = None
         self._port: BoardPublishPort | None = None
         self._sources: tuple[SourceIdentity, ...] | None = None
         self._raw_source: SourceIdentity | None = None
@@ -838,6 +854,9 @@ class LiveBoardController:
             self._configuration = configuration
             self._configuration_epoch = epoch
             self._candidate = None
+            self._presented_source = None
+            self._published_source = None
+            self._display_rerender = None
             self._port = replacement_port
             self._sources = (
                 previous_sources if replacement_port is not None else None
@@ -939,7 +958,7 @@ class LiveBoardController:
             operation="image display",
         )
         if request_now:
-            self._request_snapshot()
+            self._request_display_front()
 
     def reconfigure_curve_display(self, state: CurveDisplayState) -> None:
         """Replace one CURVE presentation revision without touching its source."""
@@ -1001,7 +1020,7 @@ class LiveBoardController:
             operation="curve display",
         )
         if request_now:
-            self._request_snapshot()
+            self._request_display_front()
 
     def reconfigure_histogram_display(
         self,
@@ -1070,7 +1089,7 @@ class LiveBoardController:
             operation="histogram display",
         )
         if request_now:
-            self._request_snapshot()
+            self._request_display_front()
 
     def _install_display_configuration(
         self,
@@ -1115,6 +1134,12 @@ class LiveBoardController:
             self._configuration = configuration
             self._configuration_epoch = epoch
             self._candidate = None
+            presented = self._presented_source
+            self._display_rerender = (
+                None
+                if presented is None
+                else _LiveCandidate(*presented, configuration)
+            )
             self._port = replacement_port
             self._sources = previous_sources if replacement_port is not None else None
             self._dirty = True
@@ -1133,6 +1158,9 @@ class LiveBoardController:
             self._dirty = False
             self._active = False
             self._candidate = None
+            self._presented_source = None
+            self._published_source = None
+            self._display_rerender = None
             self._port = None
             self._sources = None
         # Clearing the live-side port makes all future jobs stale.  Revoking the
@@ -1170,6 +1198,9 @@ class LiveBoardController:
                 if failure is not None and self._fault is None:
                     self._fault = RuntimeError(failure)
                 self._candidate = None
+                self._presented_source = None
+                self._published_source = None
+                self._display_rerender = None
                 self._active = False
                 self._dirty = False
                 self._port = None
@@ -1182,12 +1213,51 @@ class LiveBoardController:
         with self._lock:
             if self._closed or self._presentation_frozen or self._fault is not None:
                 return
+            # A real source notice/authority change supersedes a pending
+            # presentation-only repaint.  This is the only path that is
+            # allowed to sample the latest dataset revision.
+            self._display_rerender = None
             self._dirty = True
             if self._active:
                 return
             self._active = True
             self._dirty = False
         self._submit(self._freeze_latest)
+
+    def _request_display_front(self) -> None:
+        """Repaint a view from its presented source; never freeze latest data."""
+
+        candidate = None
+        with self._lock:
+            if self._closed or self._presentation_frozen or self._fault is not None:
+                return
+            self._dirty = True
+            if self._active:
+                return
+            self._active = True
+            self._dirty = False
+            candidate, self._display_rerender = self._display_rerender, None
+            if candidate is not None:
+                self._candidate = candidate
+        if candidate is None:
+            # No view gesture is possible before a first front, but retain a
+            # safe construction-time fallback for programmatic reconfigure.
+            self._submit(self._freeze_latest)
+        else:
+            self._request_owner_wake()
+
+    def accept_presented_front(self, sequence: int) -> bool:
+        """Bind future display drafts to the exact BoardFrame Qt accepted."""
+
+        self._require_owner()
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            raise ValueError("presented sequence must be a nonnegative integer")
+        with self._lock:
+            published = self._published_source
+            if published is None or published[0] != sequence:
+                return False
+            self._presented_source = published[1:]
+            return True
 
     def _freeze_latest(self) -> None:
         try:
@@ -1711,6 +1781,12 @@ class LiveBoardController:
                             and self._port is job.port
                         ):
                             self._front_status = front_status
+                            self._published_source = (
+                                job.sequence,
+                                candidate.run_id,
+                                candidate.causation_domain_id,
+                                candidate.frozen,
+                            )
                             if image_display is not None:
                                 assert image_color_limits is not None
                                 self._image_color_limits = image_color_limits
@@ -1816,7 +1892,19 @@ class LiveBoardController:
             else:
                 self._active = False
         if restart:
+            self._restart_cycle()
+
+    def _restart_cycle(self) -> None:
+        """Continue with a held display front, or sample latest for real data work."""
+
+        with self._lock:
+            candidate, self._display_rerender = self._display_rerender, None
+            if candidate is not None:
+                self._candidate = candidate
+        if candidate is None:
             self._submit(self._freeze_latest)
+        else:
+            self._request_owner_wake()
 
     def _claim_scalar_dataset_identity(
         self,
@@ -1886,7 +1974,7 @@ class LiveBoardController:
                         else:
                             self._active = False
             if restart:
-                self._submit(self._freeze_latest)
+                self._restart_cycle()
 
         try:
             self._submit_worker(serialized)
@@ -1903,6 +1991,9 @@ class LiveBoardController:
             with self._lock:
                 if self._closed:
                     self._candidate = None
+                    self._presented_source = None
+                    self._published_source = None
+                    self._display_rerender = None
                     self._active = False
                     return False
                 if expected_job is not None and (
@@ -1913,6 +2004,9 @@ class LiveBoardController:
                 if self._fault is None:
                     self._fault = detached_render_fault(error)
                 self._candidate = None
+                self._presented_source = None
+                self._published_source = None
+                self._display_rerender = None
                 self._active = False
                 self._dirty = False
                 self._port = None
@@ -1937,6 +2031,9 @@ class LiveBoardController:
             self._active = False
             self._dirty = False
             self._candidate = None
+            self._presented_source = None
+            self._published_source = None
+            self._display_rerender = None
             self._presentation_frozen = False
             self._front_status = None
             self._front_invalidated = True

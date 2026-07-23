@@ -71,8 +71,7 @@ def test_panel_analyze_button_opens_and_focuses_the_exact_final_ref() -> None:
             PanelConfig(
                 kind="1d",
                 title="scan result",
-                inputs=("scan",),
-                source="value = signal",
+                signal="scan",
             ),
         ),
         logic=(LogicNodeConfig(kind="task", name=spec.name, title=spec.name),),

@@ -72,8 +72,8 @@ class MeasurementPanel(QtWidgets.QWidget):
         self._sources_provider = sources_provider
         self._formats_provider = formats_provider
         # The short-name map (full hub name -> short name) the signal picker uses as its ``labels`` so a
-        # leaf reads "frame_0" not the prefix-stripped "0" -- threaded into the signal_expr widget so THIS
-        # form's source picker renders IDENTICALLY to the plot Setting picker (#combo-parity).
+        # leaf reads "frame_0" not the prefix-stripped "0" and renders identically to the plot
+        # Setting picker (#combo-parity).
         self._short_names_provider = short_names_provider
         self._widgets: dict[str, object] = {}     # param key -> widget (or tuple for axis_range)
         self._running = False
@@ -171,7 +171,7 @@ class MeasurementPanel(QtWidgets.QWidget):
         self.form.addWidget(FluentSettingRow(label, control, label_width=self._form_label_w))
 
     def _add_span(self, widget: QtWidgets.QWidget) -> None:
-        """A composite control (signal_expr / pulse_slots) that carries its OWN FluentSectionLabel
+        """A composite control (currently pulse_slots) that carries its OWN FluentSectionLabel
         header spans the full width -- no outer row label (its header IS the label)."""
         self.form.addWidget(widget)
 

@@ -60,7 +60,7 @@ def layouts(tmp_path, monkeypatch):
 def _state():
     return TaskConsoleState(
         name="rb87", interval_ms=200,
-        panels=[PanelConfig(kind="1d", inputs=["cam/frame"], title="P #1")],
+        panels=[PanelConfig(kind="1d", signal="cam/frame", title="P #1")],
         logic=[LogicNodeConfig(kind="processor", name="Analysis", title="A #1")])
 
 

@@ -32,7 +32,7 @@ GRANDFATHERED = {
     "board.py": 4515,
     "fluent.py": 3820,
     "form.py": 735,
-    "param_widgets.py": 769,
+    "param_widgets.py": 676,
 }
 
 

@@ -1019,8 +1019,8 @@ which is why the "fixed" bug kept coming back on the real machine.
 
 ## 19. Generic scanned-measurement abstraction + release-recapture thermometry (2026-06-14)
 
-Design doc: `docs/task_console_design/` (Measurement + one-key-temperature chapters).
-This section is the maintainer-side condensate.
+This section records the physical background of the earlier implementation; current ownership
+and application structure are defined only by the authoritative architecture document.
 
 ### The one engine behind every live scan
 
@@ -1178,102 +1178,31 @@ Both are pinned by `tests/test_scan_slot_and_manual_parity.py`.
   aligns or reconstructs topology from parallel lists. The virtual device and shipped pulse templates
   use the same catalog contract. Pinned by `tests/test_port_catalog_contract.py`.
 
-### A task's mid-run panel is DECLARED, sized and coloured from single sources (no console special-case)
+### A task never manufactures a second live-data path
 
-The four fixes below all trace to ONE lesson: a task's mid-run visualization must be built by the SAME path,
-with the SAME single sources, a user's manually-composed panel uses — never a bespoke branch with magic numbers.
+TaskConsole shows a running task through its persistent lifecycle status and Stop action. It does not
+invent `__task_frame__`, poll an off-hub `TaskOutput`, or create a blank transient panel merely because
+the task started. If a task needs a live image, map, or trajectory, the composition root admits that
+product through the same typed monitor/data-plane seam every ordinary panel consumes; only then may an
+ordinary user-owned panel bind it. Successful task output remains one exact FINAL artifact reference,
+which is the sole source accepted by the shared Analysis/Fit entry.
 
-- **Declared, not hand-assembled.** `_set_task_running` no longer hand-builds a grid PanelConfig inline. A task
-  declares only DATA — its spec's `default_kind`/`mid_run_key` and (for a scanning task) `node.grid_shape` (a
-  plain tuple; `neutral_atom/**` never imports `frontend`) — and `_task_mid_run_config(spec, node)` maps that to
-  an ordinary `PanelConfig` fed to the SAME `_new_panel_card` that manual Add-Panel and save/load use. A scanning
-  task (`default_kind="grid"` + a ≥2-D grid_shape) faceting its LAST scan axis is the only special shape; its
-  `sub_plot_kind` auto-derives (`_resolved_sub_kind` → `default_sub_plot_kind`), not hand-set.
-- **Size from the ONE recommendation rule.** The panel's `size` is `recommended_grid_size(n_cells)`
-  (`live.py`: `optimal_grid_size(*grid_shape_for(n_cells, max_cols=_SITE_MAX_COLS))` — the SAME rule `GridPlot`
-  uses), never a magic constant. A 3-cell MOT grid opens `2x2`, not the old hardcoded `4x4`.
-- **cmap: render == Setting, one source.** A panel's default colormap has ONE home: `PANEL_PARAMS[kind].default`
-  now REFERENCES `PALETTE["cmap_scan"]`/`["cmap_camera"]` (not a `"inferno"`/`"gray"` literal), so `PALETTE` is
-  the single colour source. The live facet grid (`_build_facet_plotter`) resolves its cmap through the ONE
-  `_resolved_cmap(sub, params)` (operator's pick ELSE the kind default) — the SAME resolver the Setting popup,
-  the standalone 2-D panel and the save state use — so a grid whose params carry no explicit cmap draws with the
-  SAME default the Setting shows. (Before: the grid fell through to `ImageCell`'s own grey default while the
-  Setting said inferno — the render-vs-Setting divergence.) The na-side calibration report (`build_grid_figure`)
-  keeps its camera-crop grey default; that is a different, device-frame path, correctly separate.
+### Repeat and data axes stay authoritative; TaskConsole only chooses a view
 
-### Repeat is a measurement param; repeat_mode is a plot param (the typed data model)
+Every finite dataset preserves the physical shape **`(R, P, *data_shape)`** together with declared
+axis roles and component validity. `R` is repeat, `P` is the physical point domain, and every trailing
+data axis remains intact. Neither a producer nor a panel may infer an axis role from rank, flatten a
+multidimensional datum, take component zero, or silently average a data axis.
 
-**Uniform signal contract (#H3n), enforced at the hub boundary:** every registered signal has an
-authoritative `SignalSchema`, and every stored value is a `SignalTensor` in the physical shape
-**`(R, P, *data_shape)`**. `R` is repeat, `P = prod(point_shape)` is the one physical point axis,
-and `data_shape` is a non-empty trailing tuple that is preserved verbatim. Only the logical point
-geometry is flattened into `P`; multidimensional data is never collapsed into a single `D` item.
-The tensor also carries a `(R, P)` validity mask, so an integer camera buffer has no fake zero-valued
-"unfilled" cells.
+A TaskConsole card binds exactly one typed `signal`. It has no arbitrary signal expression and no
+panel-owned repeat-mode control. Work that needs multiple producers first becomes an explicit Processor
+or formal join and publishes one typed result. Presentation choices live in the figure/view contract;
+they are visible display intent and never mutate the dataset or silently become an authoritative Fit or
+Scan reduction.
 
-| signal | `point_shape` | `data_shape` | physical tensor |
-|------|------|------|------|
-| scalar | `(1,)` | `(1,)` | `(R, 1, 1)` |
-| camera frame | `(1,)` | `(H, W)` | `(R, 1, H, W)` |
-| scalar scan | `(n,)` or logical grid `(n0, n1, ...)` | `(1,)` | `(R, P, 1)` |
-| vector/image per point | any non-empty logical geometry | `(D,)` / `(H, W)` / higher rank | `(R, P, *data_shape)` |
-
-`SignalSpec` is the producer-facing declaration and converts directly to `SignalSchema`; the schema
-belongs to each signal, not to a `LogicNode`. A raw unregistered publish has one deterministic external
-meaning (`R=P=1`, the complete input array is one datum) rather than a rank-based guess.
-
-`repeat` is the **ONE measurement** param, **0 = ∞** (#H3u-2): the Acquisition `Repeat (0 = ∞)` int,
-declared ONCE in `_acquisition_param_decls(repeat_default)` and **auto-injected** through the SAME
-`_rebuild_form` as every param (never a hand-placed widget). There is **NO separate Free-run toggle** —
-0 IS infinite, the same semantics everywhere (and the same as the scan-repeat count). `_repeat_value(values)`
-→ **`int`**: `repeat=K>0` fills a K-deep block with K distinct passes/photos then **STOPS**; `repeat=0`
-rolls a **1-deep ring forever** (a live monitor showing the latest). The kept block depth is
-`_ring = max(1, repeat)` (K for finite, 1 for ∞). A scan re-runs the whole sweep `repeat` times; a
-**camera takes exactly `repeat` photos then FINISHES** (or rolls forever at 0). **Per-type default:** a
-camera defaults to `0` (∞, a live monitor); a scan defaults to `1` (one finite sweep) — the node ctor
-defaults mirror the GUI form defaults so a headless `run_to_completion()` terminates. Each trigger
- event is its own typed `frame_i=(R,1,H,W)` signal; there is no lumped frame output. Any cell-wise
- analysis bound to those frames must preserve every valid `(R,P)` address and declare its trailing axes.
-**Two-cameras fix:** the built node's `instance_label` is set to its row TITLE, so its provider label
-matches the declared row (the empty-prefix camera no longer shows `frame_0` under both "camera" and
-"Camera (live frames)").
-
-HOW the repeats become a picture is a **plot** parameter, `repeat_mode` (each plot panel's Setting
-combo, persisted in `config.params`): `average | add | replace | roll | create`. The pipeline
-(`PanelCard._signal_then_repeat` → `_eval_signal_per_slice`) runs a transformed expression **once
-per repeat**, presenting every registered input as that repeat's whole core. Identity sources retain
-their exact `SignalSchema`; transformed results cross one explicit external-data boundary rather than
-inventing axes from rank. The re-stacked block is then collapsed by the ONE owned reducer
-`frontend.live.reduce_repeat(raw, mode, valid=...)`: `average` = the mean over repeats whose validity
-mask contains data
-(the true running mean = a long exposure for a camera, magnitude-stable; this is what "average" means,
-not a sum), `add` = `nansum`, `replace`/`roll` = the latest, `create` = every repeat as its own column
-(one line per repeat, **1-D only**). A 1-D panel keeps the reduced 2-D shape so the dimension axis
-**and** `create` draw as **multiple lines** via Live1D's native multi-line + `×N` ylabel
-(`repeats_with_data` drives `update(repeat_cur=)`). Line style is **confocal-exact**: every line
-solid, `alpha=1`, the global `lines.linewidth=1`, colours CYCLE `LINE_CYCLE` (grey `#808080`,
-skyblue, …) by column index — a lone line is grey (identical to confocal's `repeat=1`), no per-repeat
-fade. There is **no** measurement-side averaging anywhere (that was the camera live-stutter); the
-plot owns every reduction.
-
-**Display adaptation (#H3o) is schema-driven, never rank-driven.** The three domains (repeat / logical
-points / trailing data) remain orthogonal. The console reads `hub.schema(name)` and threads
-`point_shape`, `data_shape`, grid metadata, and validity to the panel. Each plot kind then has an
-explicit input contract:
-- **1-D** accepts `data_shape=(D,)`; multidimensional `data_shape` requires an explicit component
-  selection instead of silently flattening it.
-- **2-D** accepts one image datum (`P=1, data_shape=(H,W)`) or a scalar point grid
-  (`data_shape=(1,)`, logical grid in `point_shape`).
-- **histogram** deliberately flattens its selected samples because flattening is that view's declared
-  operation; it does not mutate the transported tensor or its schema.
-- **monitor/site map/grid** validate their scalar/site/facet contracts explicitly. A mismatched schema
-  raises rather than squeezing, selecting component zero, or guessing from ndarray rank.
-
-`repeat_mode` stays orthogonal: `reduce_repeat`/`repeats_with_data` accept any `(R, P, *data_shape)`
-(camera 4-D block included), reducing axis 0 only; **`create` is orthogonal to the data axes** —
-a 3-D scan block → `(points, R*dim)` (confocal columns), a ≥4-D image block → `(prod(core), R)` so a
-camera frame + create draws **R repeat-traces, NOT H image-rows** (the bug #H3o fixed). `_DIM_MULTILINE_MAX`
-is deleted; `tests/test_panel_reshape_orthogonal.py` encodes the full corner-case matrix as the guard.
+Default display may derive a view from declared axis roles, but only the repeat role has a conventional
+display reduction. Spatial, spectral, site, and other information-bearing axes remain selected, faceted,
+or preserved until an explicit authoritative transform says otherwise.
 
 ### Single source of truth: build_*_scan + declarative spec
 
@@ -1285,7 +1214,7 @@ Start button drive identical acquisition — they cannot drift.
 `MeasurementSpec` / `ParamDecl` (declared once; API default AND GUI control derive
 from the one declaration — explicit declaration, NOT signature reflection/AST, to
 avoid the confocal AST-guess pitfall). `ParamDecl.kind` ∈
-`float/int/axis_range/bool/choice/text/path/signal/signal_expr/pulse_slots`
+`float/int/axis_range/bool/choice/text/path/signal/pulse_slots`
 (the whitelist is enforced in `measurement.py`); **no value is ever `eval`'d** — consumers
 validate/coerce by kind (the confocal free-text-eval lesson). `MeasurementSpec.build`
 closure captures `exp`, so the console never holds the session (decoupling).
@@ -1422,8 +1351,7 @@ did NOT — those were the axes whose ticks moved every frame. With them dead-ba
 and blit engages. Colorbar ticks now sit at the committed clim ends (guides still show the raw
 min/max). **Iron law: blit engages only if ALL of a panel's autoscale axes have a dead-band; a new
 plot with an autoscaling secondary axis must wire it in or it silently falls back to full draw.**
-Measured (2x2, offscreen, update() end-to-end): 1d 13→0.9 ms, 2d 20→2.3 ms, monitor 18→6.9 ms
-(monitor residual = the per-tick core histogram fit + mathtext in `update_core`, not the draw). Guarded by
+Measured (2x2, offscreen, update() end-to-end): 1d 13→0.9 ms, 2d 20→2.3 ms, monitor 18→6.9 ms. Guarded by
 `tests/test_frontend_blit_render.py` (engages + equals full draw + no ghosting + recapture-on-relim).
 
 A separately-rejected speed-up (still off the table): **freezing title/xlabel positions** — draw
@@ -1460,24 +1388,7 @@ RELATIONS (e.g. `panel_display_size == round((data+margins)*scale)`), never re-t
 literal — the fix for the bug where a test asserted a stale `(110,110,100,70)` long after
 the code had moved on.
 
-## 20. Decoupled pulse-scan node + the one `signal_expr` evaluator (2026-06-23)
-
-### `operations/signal_expr.py` — the single multi-slot signal + value-expression evaluator
-A "source" anywhere in the system — a plot panel's data source, a processor's input, a
-pulse-scan's y — is the SAME object: a list of picked hub-signal names (the *slots*, read as
-`signal` / `signal[i]`) plus a one-line `value = ...` expression. `SignalExpr` owns the
-slot-packing rule (scalar for one input, list for many), the `value` contract and `co_names()`
-(names referenced + picked slots). The caller supplies one typed, lineage-coherent snapshot; expression
-evaluation never rewrites a binding. The ONE namespace is defined by `NAMESPACE_HELPERS`
-(history/latest/names/shot/np/numpy/math), `namespace_helpers(hub)` binds it, and
-`hub_namespace(hub, snapshot=None)` layers those helpers on a signal snapshot (latest by
-default; the console passes its shot-coherent `snapshot_at` view + its reserved view keys,
-a reactive processor its coherent inputs) — so a panel, a pulse-scan y and a processor
-source have identical expression capabilities, and the GUI's reference-exclusion set
-derives from the same constant. Dependency-free, so the analysis layer and the GUI share
-ONE definition. `PanelCard._with_signal_slots` / `_evaluate` / `_co_names` delegate to it;
-`task_console.SOURCE_EXPR_HELP()` is a lazy getter of `signal_expr.SIGNAL_EXPR_HELP` (one
-help text). `tests/test_signal_expr.py` guards it.
+## 20. Decoupled pulse-scan node (2026-06-23)
 
 ### Pulse-scan is a device-driving `PulseScanNode`, with a DECOUPLED y
 `PulseScanNode` always owns only the sequencer plus an external-y cursor. `sweep_kind` selects exactly
@@ -1516,27 +1427,12 @@ values, `sweep_kind` selects execution, and `program` is the selected strategy's
 There are no camera/frame/delay/mode aliases. MOT-field's hardware-synchronous three-DAC template must
 select `scan_slot`; generic PulseScan supports both strategies.
 
-### Repeat: TWO systems, three orthogonal axes, processors are typed transforms (#H3o)
-There are exactly two repeat controls in the pipeline: acquisition `repeat` and display
-`repeat_mode`. A processor has neither.
+### Repeat, point, and trailing data axes are orthogonal
 
-1. **ACQUIRE-FILL (measurement layer).** Every acquiring `Measurement` owns the repeat axis and
-   fills typed `(R, P, *data_shape)` tensors where `R = max(1, repeat)`. Driven by one user field,
-   auto-injected as an acquisition
-   ParamDecl: `repeat:int`, **0 = ∞** (#H3u-2) — `K>0` fills K repeat slices then stops; `0` rolls
-   a 1-deep ring forever. No separate free-run toggle. The measurement NEVER collapses the repeat axis.
-2. **DISPLAY-COLLAPSE (plot layer).** The plot collapses the repeat axis FOR DISPLAY ONLY via
-   `repeat_mode` (`live.reduce_repeat`, modes `average/add/replace/roll/create`). Stored data is
-   never mutated; this is the SINGLE place a repeat axis is collapsed.
-
-Repeat, logical point geometry, and trailing data axes are orthogonal (#H3n/#H3o). The schema tells
-`reduce_repeat` that axis 0 is R; it never infers an axis from `ndim`.
-
-**A processor has no repeat mode or class-level repeat contract.** It is a pure typed transform. It
-reads input `SignalTensor` envelopes, including schema and validity, and publishes one explicitly
-declared schema per output. A cell-wise processor preserves every valid `(R,P)` cell; an aggregate
-processor returns a canonical `(1,1,*data_shape)` result and says so in its output schema. This is a
-mathematical property of each output, not a second runtime knob or a string attribute.
+Acquisition declares and preserves the repeat axis in its typed dataset. Display reduction is a view
+decision derived from the declared role, not a TaskConsole producer setting or a rank-based guess.
+A Processor has no repeat-mode knob: it publishes one explicitly declared output schema and either
+preserves each valid cell or declares the exact authoritative transform it performs.
 
 The current authoritative occupancy path is a finite-exact pipeline, not a live compatibility
 processor. `OccupancyPipelineSpec` freezes the calibration reference and model, and the completed
@@ -1583,26 +1479,6 @@ parent (header) row on a click ANYWHERE on the row (name or triangle), exactly o
 (on `expanded`/`collapsed` + `showPopup`) re-grows the open popup to fit every visible row
 (`n_visible × sizeHintForRow`, screen-clamped, forcing view + container `setFixedHeight`).  Guarded
 by `test_tree_combo_expand.py`.
-
-### One source MECHANISM everywhere; per-kind only the slot-count + the value SIZE
-The signal-picker + `value = ...` expression box (the `SignalExpr` mechanism) is on EVERY source
-field — every plot kind (the site map included), the occupancy source, the pulse-scan y. What
-differs per plot kind is only (a) whether it can GROW slots (`+signal` / `−signal`) and (b) the
-SHAPE its `value` must be. Both are data-driven, never an inline `kind == "sites"` check:
-`panel_allows_multi_slot` / `PANEL_SINGLE_SLOT_KINDS` declare the site map single-slot (its ring
-centres + frame underlay resolve from `signal[0]`'s producing node, so a 2nd slot is meaningless)
-— it keeps the expression box but has NO `+/-`; every other kind is multi-slot. `PANEL_INPUT_FORMAT`
-declares the accepted `value` size (sites = a per-site `(N,)` vector, 2D = an `(H×W)` frame,
-monitor = a scalar), enforced in `PanelCard._coerce`. Guard: `test_panel_slots_and_measurement_display`
-asserts sites is single-slot (no `add_slot_button`, keeps `source_edit`) while 2D is multi.
-
-### Every `kind="signal"` source is now `signal_expr`
-The `ParamDecl(kind="signal_expr")` record lives in `core/params.py` and dispatches through the
-registered `SignalExprHandler` to the reusable multi-input picker + `value = ...` editor. Its value is
-`{"inputs": [...], "source": "value = ..."}`. A reactive processor that declares this parameter builds
-one `SignalExpr`, derives `consumes` from its inputs, and evaluates a lineage-coherent cursor snapshot.
-There is no frontend binding rewrite: if two inputs are combined, their coherence requirement is
-explicit in the typed snapshot/provenance boundary.
 
 ## 21. The catalog / node / UI / layout base-class framework (#H3r, 2026-06-26)
 
@@ -1661,27 +1537,21 @@ contract test — the single mechanical guard. Change the framework = change the
     author can't declare one that degrades to a line edit. Guard:
     `test_device_runtime_controls.py::test_every_numeric_device_control_renders_a_scrollable_spinbox`.
   - **Row label + unit are one source.** `ParamDecl.row_label()` = `"<label> (<unit>) *"` — the ONE
-    thing the config editor, device viewer, measurement Edit, Setting popup, and signal-expr title read
+    thing the config editor, device viewer, measurement Edit and Setting popup read
     (no re-typed idiom). A live READ-BACK is engineering-scaled with its unit SI-prefixed via the ONE
     `param_widgets.format_reading` (`6.8e9 Hz -> "6.8 GHz"`, using `zlc_frontend.qt_widgets.eng_mantissa_prefix`); the
     editable spin box stays plain decimal (confocal never SI-scales its editor).
   - **Wiring rule is one helper.** Every handler routes its change signal through `param_widgets._wire`
-    (re-validate + optional instant-apply); the composite `signal_expr`/`pulse_slots` handlers were the
-    two that bypassed it. Guard: `test_param_widget_registry.py::test_editable_handlers_route_edits_through_instant_apply`.
-- **Plot selection -> scan range (confocal `_read_range`), enforced at the base.** A 1-D plot of a
-  scanning measurement's signal wires its area selector to `PanelEditor._read_x_range`, gated on the
-  producing node DECLARING a scan axis (`TaskConsole._node_scan_range_key` = the node's first
-  `axis_range` param) — so EVERY measurement with a scan range gets the linkage, never wired per node
-  (the drift that left `gm_detuning` without it). The selection is staged onto the producing
-  measurement's OWN Logic-tab Edit form (`_form_for_node` -> `MeasurementPanel.set_axis_range`); a 2-D
-  image plot still routes to the camera node's ROI (`_read_region` -> `region_to_acquisition_parameters`).
-  Guard: `test_frontend_smoke.py::test_1d_scan_plot_selection_stages_producing_measurement_range`.
-- **Plot kinds** — `frontend/live.py::PLOT_KINDS` (tuple of `PlotKind`: key/cls/label/render_family/
-  panel/input_format/input_slots/single_slot) is the single source; `live.plot()` looks the class up
-  and task_console's `PANEL_KINDS`/`PANEL_INPUT_FORMAT`/`PANEL_INPUT_SLOTS`/`PANEL_SINGLE_SLOT_KINDS`
-  are DERIVED from it (byte-identical to the old literals); `data_figure` reads the declared
-  `render_family` (`"auto"` sentinel keeps the site map's conditional 1D/2D). Guard:
-  `tests/test_plot_kind_table.py`.
+    (re-validate + optional instant-apply), including the composite `pulse_slots` handler. Guard:
+    `test_param_widget_registry.py::test_editable_handlers_route_edits_through_instant_apply`.
+- **Plot selection is presentation state until an explicit controller commits it.** A selector updates
+  the accepted/presented data front and display limits without rebuilding the panel or mutating a
+  Measurement form. A domain action such as ROI or scan-range control must cross its typed controller
+  boundary explicitly; the plot does not discover a producer parameter by reflection.
+- **Plot kinds** — `zlc_data.plot_kind.PLOT_KIND_SPECS` is the headless vocabulary consumed by the
+  TaskConsole menu and renderer dispatch. Each live card binds one typed dataset through
+  `PanelConfig.signal`; the table does not declare GUI input slots or arbitrary expressions. A view that
+  needs multiple producers consumes the one result of an explicit Processor/formal join.
 - **Panel layout** — `frontend/task_console.py::GAP` (= `GRID_UNIT`) is the ONE spacing setting;
   `_compact` is a top-left gravity packer (see the board section above) that leaves exactly `GAP` on
   all four sides of every card and as the origin margin, so spacing is uniform, never a leftover-pixel
@@ -1740,8 +1610,8 @@ Behaviour-neutral throughout. The single sources added/relocated, by layer:
 - `zlc_frontend.qt_widgets.fluent._bound_field_style(*, selector, text, border, fill)` — the private scan/api
   bound-field stylesheet recipe (`mark_scan_field` / `set_scan_bound` orange + `set_api_bound`
   violet).
-- `task_console`: `_new_panel_card` (the ONE PanelCard provider block), `_repeat_mode_value` (the ONE
-  clamped repeat-mode reader), `_kind_repeat_modes`, `_relim` (the ONE `relim` default reader).
+- `task_console`: `_new_panel_card` is the ONE PanelCard provider block; `PanelConfig.signal` is the
+  card's sole typed dataset binding; `_relim` is the ONE fixed/tight/normal display-limit reader.
 
 ### More single sources (the same "one fact, one home" pass, continued)
 
@@ -1818,8 +1688,8 @@ Behaviour-neutral throughout. The single sources added/relocated, by layer:
   validators in `core/analysis.py`; this seam never crosses the sealed boundary.
 - `param_widgets.coerce_short_labels(provider)` — the ONE `{full -> short}` label-map normaliser
   (callable-guard, `str()` both ends, drop empties, swallow provider errors to `{}`) every grouped
-  signal picker feeds `fill_grouped_signal_combo`, so the signal_expr / plot-Setting-slot / form
-  pickers render identically.  The whole grouped-picker cluster (`signal_state` /
+  signal picker feeds `fill_grouped_signal_combo`, so plot-Setting-slot and form pickers render
+  identically.  The whole grouped-picker cluster (`signal_state` /
   `grouped_signal_items` / `signal_tree_groups` / `fill_grouped_signal_combo` /
   `read_editable_combo` / `coerce_short_labels`) lives in `param_widgets` — the LEAF the console
   imports — so the leaf never lazy back-imports `task_console` (the old cycle);
@@ -1892,33 +1762,26 @@ so `test_device_config_io.py`'s expected name list includes `laser` / `rf`.
 Root cause of the real-pylon "camera measurement + 2d is very laggy / unable to allocate 18.xxM":
 a 1920x1200 float64 frame is exactly 17.58 MiB, and the live path allocated several per tick while
 the dis panel additionally ran `np.sort(2.3M)` (Otsu seed) + a raw-sample fit every tick on the GUI
-thread. Five orthogonal fixes, each at its own layer:
+thread. Four orthogonal fixes, each at its own layer:
 
 1. **Data plane = native dtype end-to-end.** `CameraMeasurement`'s finite ring is native-dtype and
    publishes `(R, 1, H, W)` plus a `(R,1)` validity mask — no NaN prefill and no float64
    forcing. The typed hub owns the one defensive immutable copy and validates the registered camera
-   schema. Consumers (`reduce_repeat` / `facet_cells` / `coerce_panel_value` / `_as_data_y` /
-   the console identity path) pass integer blocks through NATIVE — an integer block cannot carry
-   NaN sentinels, so the isfinite machinery is skipped and pool/replace are zero-copy views; float
-   blocks (a scan's NaN-prefilled array) keep gap semantics unchanged. A `facet=repeat` grid now
-   grows cells as repeats fill (the old up-front all-NaN R-deep block was itself the blow-up).
+   schema. Current `DataBlock`/view-contract consumers preserve that dtype and all declared axes;
+   display reductions are explicit `ViewSpec` operations rather than the retired shape-driven
+   `facet_cells`/panel coercion path. Integer blocks therefore do not acquire NaN sentinels, while
+   float scan blocks keep their declared validity/gap semantics.
    `_configure_signal_storage` fails LOUD if a node's `output_specs()` raises (the silent fallback
    used to downgrade image streams to the 2048-deep default ring).
 
-2. **dis panel is O(bins), never O(samples).** `core.fitting.fit_histogram(edges, counts, mode)` takes
-   ONLY the binned histogram: Otsu in its classic binned form, weighted-bin seeds, bounds from the
-   edges. `histogram_binned` adds an exact bincount fast path for small-domain integer samples
-   (bin-for-bin identical to `np.histogram`, ~5x at 2.3 MP). Threshold L/R fractions interpolate
-   inside the binned counts. Measured: 2.3 MP uint8 dis update with a NEW shot per tick ≈ 29 ms
-   (was 170+ ms).
-
-3. **Console tick: per-panel beat honoured; compose leaves the GUI thread.** The "coherence beats
+2. **Console tick: per-panel beat honoured; compose leaves the GUI thread.** The "coherence beats
    the throttle" override is gone (a live camera advanced `disp` every shot, so update_ms was dead
-   for camera panels); the beat gates WHEN, the coherent clock decides WHAT. Worker-side whole-board
-   compose publishes one immutable front, while the Qt owner only presents the completed front and
-   replaces not-yet-started stale revisions.
+   for camera panels). Each card keys itself only to the producer revisions it reads; batching is an
+   atomic presentation transaction and does not invent a board-wide physical shot. Worker-side
+   compose publishes immutable fronts, while Qt only presents completed fronts and replaces
+   not-yet-started stale revisions.
 
-4. **Selector-on-live protocol** (`selectors.begin/end_figure_interaction`): every drag freezes its
+3. **Selector-on-live protocol** (`selectors.begin/end_figure_interaction`): every drag freezes its
    own panel's recompose (catch-up on release via the frame key); a blitted panel
    (`fig._zlc_blit_dirty`, maintained by `BaseLivePlot.compose`) forces ONE full draw at drag start
    so widget useblit backgrounds are fresh (no ghost frame under the rectangle). `ZoomPan` batches
@@ -1926,28 +1789,11 @@ thread. Five orthogonal fixes, each at its own layer:
    `_zlc_lim_refresh` hook ONCE — half the re-decimation per zoom/pan. The image decimation layer
    itself (`_decimate_image_view`) is load-bearing and unchanged.
 
-5. **VirtualMotCamera is a faithful pylon twin** (1920x1200 @ 0.05 s, Mono8): elliptical 40x20 px
+4. **VirtualMotCamera is a faithful pylon twin** (1920x1200 @ 0.05 s, Mono8): elliptical 40x20 px
    FWHM spot at peak≈93 counts over offset 7 + read noise, and free-run mode runs a REAL producer
    thread at the exposure pace with a latest-frame slot (Basler LatestImageOnly) — a slow consumer
    genuinely drops frames, so the console's amber "display behind" advisory behaves identically on
    virtual and real rigs. Render ≈ 35 ms/frame < the 50 ms pace.
-
-Plus two architecture items from the same round: `RoiProcessor`
-(`operations/processors/roi.py`: a **Selection-driven region reducer generic over EVERY plot kind** —
-it carries a plot-independent `core.selection.Selection` + a `mean/sum/max` verb, exactly as
-`FitProcessor` carries a `FitRequest`, and reduces the selected cells to a scalar `roi_value` +
-republishes the region as `roi_frame`. WHAT the consumed block's cells mean per kind — image pixels, a
-1-D index, a distribution's sample value, site centres — is frontend knowledge: `live.region_binding`
-(the inverse of `coerce_panel_value`) ships it as a serializable axis-binding on the Selection's
-metadata, so the node has ZERO per-kind branch and the sealed seam holds. A drag on a 2d / 1d / hist /
-sites panel all drive it identically via `set_selection`; the region round-trips through
-`acquisition_parameters()['selection']` (+ a source-pixel `region` for an image crop, for the ROI-of-ROI
-case) — the stock chain for "select a region, watch its distribution / total counts"), and
-the sequencer family converged to **VirtualSequencer / RemoteSequencer (+ ManualSequencer
-first-light)** — RuntimeSequencer (a strict subset of Virtual) and VerilogSequencer (production
-dead code) are deleted, the service-level wall-clock scan-progress simulation went with them, and
-`VirtualSequencer.wait_done` enforces the same deadlock guard + protocol bookkeeping as the bare
-service (`WAIT_FOREVER_MESSAGE` single source).
 
 ## 25. The render thread + typed selection actions (2026-07-09, W round)
 
@@ -1988,12 +1834,6 @@ Tests drive ONE deterministic frame with `conftest.tick(con)` (= `_tick()` + `ba
 `_tick()` only SUBMITS, and without a Qt event loop the queued delivery never runs.  Contract:
 `tests/test_render_loop_contract.py`.
 
-**W-round data-plane regression fixed first** (`dfb5dde`): `SignalExpr.co_names()` folds the bound
-inputs in for version-gating, and the raw-signal detector used it — the identity zero-copy path
-NEVER fired and every bound panel float64-stacked the 2.3 MP frame per tick (~52 ms/panel).  The
-detector now uses `direct_names()` (the source TEXT's own identifiers); `reduce_repeat` passes a
-single integer repeat slice through as the native view.
-
 **Signal-loop guards** (user-reported): a processor could pick its own output as its source —
 fresh hub = silent starvation forever, primed hub = a full-CPU republish spiral with a frozen shot
 clock.  Three guards, one per scope: `Processor.__init__` rejects `consumes ∩ published_signals()`
@@ -2009,11 +1849,9 @@ itself only stores/highlights that value. The operator explicitly chooses `none`
 the console dispatches that action. ROI conversion alone translates displayed coordinates to a
 source-local region. Grid-cell scope is preserved so a cell request never broadcasts accidentally.
 
-**One fit request/core.** Setting and Edit both create the same `FitRequest` (model + `Selection`).
-`core.fitting` owns model registry, masking, solver, quality metrics and `FitResult`; DataFigure is
-an overlay adapter and `FitProcessor` is the hub adapter. The image processor publishes canonical
-scalar result tensors (`fit_x0`, `fit_y0`, amplitude, size, offset, validity and quality) and keeps
-status text on the result envelope rather than inventing a second frontend solver.
+**One typed fit program.** DataFigure authors a named-axis `FitSpec`; every interactive or saved
+analysis binds it through `zlc_data.bind_fit` and executes the same `BoundFit`, returning a complete
+`FitResultBatch`. TaskConsole only opens that owner for an exact FINAL dataset artifact.
 
 **Persistent status strip**: `zlc_frontend.qt_widgets.FluentStatusStrip` (severity dot + eliding message +
 optional action) replaces both the header summary label an error used to overwrite and the

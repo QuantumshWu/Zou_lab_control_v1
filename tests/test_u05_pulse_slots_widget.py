@@ -1,9 +1,8 @@
 """Current PulseSlots ownership: deferred values plus stable keyed Qt rows.
 
-``ParamWidgetContext`` carried two zero-arg factories whose only purpose was to build
-widgets that happened to live in ``task_console``.  ``signal_expr_factory`` went in the
-previous slice; ``pulse_slots_factory`` goes here.  The context now holds no callback
-that reaches back into the legacy tree at all - the handlers construct what they need.
+``ParamWidgetContext`` carried a zero-arg factory whose only purpose was to build a widget
+that happened to live in ``task_console``.  ``pulse_slots_factory`` is gone; the context now
+holds no callback that reaches back into the legacy tree at all.
 
 Seeding is deferred until a matching committed program arrives.  Reconcile is keyed by
 ``(program_id, slot_id)`` and never reconstructs the program editor.
@@ -331,21 +330,19 @@ def test_the_context_carries_no_factory_into_the_legacy_tree_any_more():
     assert not [name for name in fields if name.endswith("_factory")], fields
 
 
-@pytest.mark.parametrize("handler, built", [("PulseSlotsHandler", "PulseSlotsWidget"),
-                                            ("SignalExprHandler", "SignalExprWidget")])
-def test_each_handler_builds_its_own_widget(handler, built):
+def test_pulse_slots_handler_builds_its_own_widget():
     """Structural: a handler still calling a factory would pass every behaviour test."""
 
     from zlc_frontend.qt_widgets import param_widgets
 
     tree = ast.parse(pathlib.Path(param_widgets.__file__).read_text(encoding="utf-8"))
     node = next(n for n in ast.walk(tree)
-                if isinstance(n, ast.ClassDef) and n.name == handler)
+                if isinstance(n, ast.ClassDef) and n.name == "PulseSlotsHandler")
     build = next(n for n in node.body
                  if isinstance(n, ast.FunctionDef) and n.name == "build")
     constructed = {c.func.id for c in ast.walk(build)
                    if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-    assert built in constructed
+    assert "PulseSlotsWidget" in constructed
     assert "_factory" not in ast.dump(build)
 
 

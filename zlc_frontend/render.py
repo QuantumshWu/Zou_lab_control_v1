@@ -1267,7 +1267,12 @@ class PanelFrame:
 
 @dataclass(frozen=True)
 class BoardFrame:
-    """One atomic, shot-coherent presentation for a complete board layout."""
+    """One atomic presentation transaction for a complete board layout.
+
+    Coherence is scoped to each explicit ``coherence_group``.  Different
+    groups may intentionally carry independent producer revisions; merely
+    presenting them in one board transaction never means "the same shot".
+    """
 
     board_id: str
     layout_generation: int
@@ -1349,7 +1354,7 @@ class BoardFrame:
 
 @runtime_checkable
 class BoardPresenter(Protocol):
-    """GUI-side sink; one call presents the entire board coherently."""
+    """GUI-side sink; one call atomically installs one complete board frame."""
 
     def present(self, frame: BoardFrame) -> None: ...
 

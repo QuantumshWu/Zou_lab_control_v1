@@ -52,7 +52,6 @@ from PyQt5 import QtCore, QtWidgets
 from zlc_storage.paths import display_path
 
 from zlc_frontend.qt_widgets.pulse_slots_widget import PulseSlotsWidget
-from zlc_frontend.qt_widgets.signal_expr_widget import SignalExprWidget
 from zlc_frontend.form import FormChoice, FormFieldProps
 from zlc_frontend.qt_widgets import (
     FORM_WIDGET_HANDLERS,
@@ -109,7 +108,7 @@ class ParamWidgetContext:
                        leaves this None and reads back on Start via :meth:`read`.
     ``signals_provider`` / ``sources_provider`` / ``formats_provider``
                        the live-hub-signal name list + producer / format maps the
-                       grouped signal pickers (kinds ``signal`` / ``signal_expr``) need.
+                       grouped ``signal`` picker needs.
     """
 
     on_change: Callable[[], None] = _noop
@@ -136,65 +135,8 @@ class ParamWidgetContext:
     def labels(self) -> dict:
         """The SHORT-name map ({full hub name -> short name}) the grouped picker uses as ``labels`` so a
         leaf reads "frame_0", NOT the prefix-stripped "0" -- so a ``signal``-kind picker renders the SAME
-        as the plot Setting / signal_expr pickers (#combo-parity, ``coerce_short_labels`` below)."""
+        as the plot Setting picker (#combo-parity, ``coerce_short_labels`` below)."""
         return coerce_short_labels(self.labels_provider)
-
-
-#: Minimum spacing between two live "apply on edit" writes of the SAME key (ms).  200 ms = at most
-#: 5 writes/second, matching the device viewer's 200 ms read-back poll: a mouse-wheel scroll on a
-#: spin box in "Live" mode fires a valueChanged per tick, and an EXPENSIVE / blocking apply (a live
-#: device set-point) on every one of those can wedge the GUI -- this caps the rate.  A module-level
-#: constant (the repo's *_DEBOUNCE_MS convention) so it stays a single source.
-LIVE_WRITE_MIN_INTERVAL_MS = 200
-
-
-class RateLimitedApply:
-    """Rate-limit an ``(key, value) -> None`` apply-on-edit callback -- LEADING + TRAILING, per key.
-
-    A fast mouse-wheel scroll fires ``valueChanged`` per tick; routing an expensive / blocking apply
-    (a live device write, a re-render) through every one can freeze the GUI.  This wraps such a
-    callback so, PER KEY: the FIRST edit applies immediately (responsive -- you see the value move),
-    further edits within ``interval_ms`` are coalesced, and the LATEST value is applied when the
-    window elapses.  A pure trailing debounce (the repo's ``*_DEBOUNCE_MS`` timers) would give no live
-    feedback until the scroll stops; a pure leading throttle would DROP the final value.  Leading +
-    trailing gives both: at most one apply per window AND the final value always lands.
-
-    Timers are parented to ``parent`` so they die with it; :meth:`flush` applies any pending values
-    NOW (teardown / an explicit Apply / a test that must observe the trailing edge without pumping the
-    event loop).  Reusable: any apply-on-edit path can wrap its callback in this."""
-
-    def __init__(self, apply: Callable[[str, Any], None], *, parent: QtCore.QObject,
-                 interval_ms: int = LIVE_WRITE_MIN_INTERVAL_MS) -> None:
-        self._apply = apply
-        self._parent = parent
-        self._interval_ms = max(1, int(interval_ms))
-        self._pending: dict = {}        # key -> latest value awaiting the trailing edge
-        self._timers: dict = {}         # key -> its single-shot QTimer (window open while active)
-
-    def __call__(self, key, value) -> None:
-        timer = self._timers.get(key)
-        if timer is None or not timer.isActive():
-            self._apply(key, value)                      # leading edge: apply now, open the window
-            if timer is None:
-                timer = QtCore.QTimer(self._parent)
-                timer.setSingleShot(True)
-                timer.timeout.connect(lambda k=key: self._flush_key(k))
-                self._timers[key] = timer
-            self._pending.pop(key, None)
-            timer.start(self._interval_ms)
-        else:
-            self._pending[key] = value                   # inside the window: keep only the latest
-
-    def _flush_key(self, key) -> None:
-        if key in self._pending:
-            self._apply(key, self._pending.pop(key))     # trailing edge: apply the final value
-            self._timers[key].start(self._interval_ms)   # there was activity -> keep the window open
-        # else the window closes; the next edit is a fresh leading edge
-
-    def flush(self) -> None:
-        """Apply every pending trailing value immediately (teardown / explicit Apply / a test)."""
-        for key in list(self._pending):
-            self._apply(key, self._pending.pop(key))
 
 
 @dataclass
@@ -664,40 +606,6 @@ class SignalHandler(ParamWidgetHandler):
                                   formats=providers.formats, labels=providers.labels, current=current)
 
 
-class SignalExprHandler(ParamWidgetHandler):
-    """A multi-slot signal picker + ``value = ...`` expression (the COMPOSITE
-    ``_SignalExprWidget``).  Value is ``{"inputs": [...], "source": "value = ..."}``."""
-
-    def build(self, decl, value, ctx):
-        # Built HERE, not through an injected factory: the widget now lives beside this
-        # handler, so the inversion that existed only to reach into the legacy shell is gone.
-        widget = SignalExprWidget(
-            signals_provider=ctx.signals_provider, sources_provider=ctx.sources_provider,
-            formats_provider=ctx.formats_provider, labels_provider=ctx.labels_provider,
-            title=decl.row_label())                             # single source: label + (unit) [+ *]
-        seed = value if value is not None else (decl.default if decl.default is not None else {})
-        widget.set_value(seed)
-        widget.setToolTip(decl.tooltip)
-        # route through the ONE wiring rule (re-validate AND, where a form enables it, instant-apply),
-        # so a composite widget never silently misses the apply-on-edit path a scalar has
-        _wire(widget.changed, ctx, decl, lambda: self.read(widget))
-        return widget
-
-    def read(self, widget):
-        return widget.values_dict()
-
-    def write(self, widget, value):
-        widget.set_value(value)
-
-    def is_empty(self, widget) -> bool:
-        # a signal_expr always carries a usable {"inputs", "source"} (defaults to
-        # value=signal); it is never "missing".
-        return False
-
-    def refresh(self, widget, providers: RefreshProviders) -> None:
-        widget.rebuild_combos()
-
-
 class PulseSlotsHandler(ParamWidgetHandler):
     """An auto-generated per-slot sub-form for a pulse template (the COMPOSITE
     ``PulseSlotsWidget``), reconciled from a committed sibling ``path`` field. Value is
@@ -750,14 +658,13 @@ PARAM_WIDGETS: dict[str, ParamWidgetHandler] = {
     "device": DeviceRefHandler(),
     "path": PathHandler(),
     "signal": SignalHandler(),
-    "signal_expr": SignalExprHandler(),
     "pulse_slots": PulseSlotsHandler(),
 }
 
 # A composite kind carries its OWN section header (it spans the full width with no outer
 # row label); a scalar kind is a labelled row.  ONE list both form loops read, so the
 # row-vs-span decision is declared here next to the handlers, not re-spelled per form.
-SPAN_KINDS: frozenset = frozenset({"signal_expr", "pulse_slots"})
+SPAN_KINDS: frozenset = frozenset({"pulse_slots"})
 
 
 __all__ = [

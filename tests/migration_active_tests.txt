@@ -100,8 +100,6 @@ tests/test_u05_panel_size_vocabulary.py
 tests/test_u05_plot_kind.py
 tests/test_u05_project_root_single_source.py
 tests/test_u05_pulse_slots_widget.py
-tests/test_u05_repeat_modes.py
-tests/test_u05_signal_expr_widget.py
 tests/test_u06_shell_domain_ports.py
 tests/test_w1_capture_workbench.py
 tests/test_w2_pulse_application.py

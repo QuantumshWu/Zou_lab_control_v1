@@ -134,27 +134,15 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         (Path("zlc_neutral_atom/timing/runtime_compiler.py"), "RuntimeBusSegment.from_dict"),
         (Path("zlc_neutral_atom/timing/runtime_compiler.py"), "_slot_ref_index"),
         (Path("zlc_neutral_atom/timing/runtime_compiler.py"), "_pulse_table_bus_segments._emit"),
-    # The signal-expression composite moved into qt_widgets (S5-shell(o)); its two
-    # normalisation points came with it, so the named entries follow the code.
-    (Path("zlc_frontend/qt_widgets/signal_expr_widget.py"), "SignalExprWidget._open_editor"),
-    (Path("zlc_frontend/qt_widgets/signal_expr_widget.py"), "SignalExprWidget.values_dict"),
     # The pulse-slot composite moved into qt_widgets (S5-shell(p)); its normalisation
     # points came with it, so the named entries follow the code.
     (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget.reconcile"),
     (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget.values_dict"),
-    # The panel record sank into zlc_data (S5-shell(t)).  Its one normalisation point reads
-    # the ``value = ...`` expression a HUMAN typed into the Setting, so the named entry
-    # follows the code rather than the guard being widened.
-    (Path("zlc_data/console_records.py"), "PanelConfig.set_source"),
     # The saved-layout record moved into zlc_frontend (S5-shell(w)).  Both normalisation
     # points are exactly the boundary this guard reserves .strip() for: an environment
     # variable a human typed, and a task NAME a human typed on the CLI or in the GUI.
     (Path("zlc_frontend/console_state.py"), "task_files_dir"),
     (Path("zlc_frontend/console_state.py"), "resolve_task_state"),
-    # The panel-param catalog moved into zlc_frontend (S5-shell(y)).  Its one normalisation
-    # point reads the colormap NAME a human picked in the Setting combo, so the named entry
-    # follows the code rather than the guard being widened.
-    (Path("zlc_frontend/panel_params.py"), "resolved_cmap"),
     # The six pure helpers left the shell (S5-shell(z)); their normalisation points came with
     # them, and each is the boundary this guard reserves .strip() for -- a panel/logic-node TITLE
     # a human typed (or a saved layout carries), and two line-edit parsers.
@@ -176,24 +164,10 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         (Path("zlc_frontend/qt_widgets/param_widgets.py"), "DeviceRefHandler.is_empty"),
         (Path("zlc_frontend/qt_widgets/param_widgets.py"), "PathHandler.is_empty"),
         (Path("zlc_frontend/qt_widgets/param_widgets.py"), "PulseSlotsHandler.is_empty"),
-        # Salvaged fit/region core: each of these canonicalises a model key or
-        # an axis name that a human typed into a form or a saved recipe - the
-        # same named-adapter boundary .strip() is reserved for.
-        (Path("zlc_data/curve_fitting.py"), "FitRequest.__post_init__"),
-        (Path("zlc_data/curve_fitting.py"), "HistogramFitResult.__post_init__"),
-        (Path("zlc_data/curve_fitting.py"), "fit_model"),
-        (Path("zlc_data/curve_fitting.py"), "fit_models"),
-        (Path("zlc_data/curve_fitting.py"), "fit_histogram"),
-        (Path("zlc_data/plot_region.py"), "AxisRange.__post_init__"),
         # W1 - canonicalises the DISPLAY NAME a human typed into the machine token
         # every published signal name derives from: the same named human-input
         # adapter boundary .strip() is reserved for.
         (Path("zlc_data/shape_text.py"), "measurement_slug"),
-        # H2a - the value-expression language.  Every one of these reads the
-        # expression text a HUMAN typed into a panel or a logic-node source box.
-        (Path("zlc_data/signal_expr.py"), "is_identity_source"),
-        (Path("zlc_data/signal_expr.py"), "seed_source_for_slots"),
-        (Path("zlc_data/signal_expr.py"), "SignalExpr.__init__"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_TextHandler.is_empty"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.read"),
         (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.is_empty"),

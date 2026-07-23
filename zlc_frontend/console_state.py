@@ -62,9 +62,8 @@ def task_files_dir() -> Path:
 class TaskConsoleState:
     """The whole console layout: serialised as ONE machine-portable JSON file."""
 
-    #: The PERSISTED discriminator, defined in :mod:`zlc_data.console_records`.  It reads
-    #: like this module's path and must NOT track it: see CONSOLE_STATE_SCHEMA for why
-    #: re-deriving it would make every already-saved layout unopenable.
+    #: The persisted semantic discriminator, defined with the record shape in
+    #: :mod:`zlc_data.console_records`; it is intentionally independent of module paths.
     schema = CONSOLE_STATE_SCHEMA
 
     def __init__(

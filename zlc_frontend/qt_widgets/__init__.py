@@ -25,7 +25,6 @@ from .owner_wake import QtOwnerWake
 from .panel_host import SinglePanelHost
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
 from .fit_authoring import FitAuthoringPane
-from .signal_expr_widget import SignalExprWidget
 from .pulse_slots_widget import PulseSlotsWidget
 from .logic_node_row import LogicNodeRow
 from .flow_graph_view import FlowGraphView
@@ -168,7 +167,6 @@ __all__ = [
     "LogicNodeEditor",
     "MeasurementPanel",
     "PulseSlotsWidget",
-    "SignalExprWidget",
     "ACCENT",
     "API_VIOLET",
     "API_VIOLET_DARK",

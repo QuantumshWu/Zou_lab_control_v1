@@ -17,8 +17,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import time
 from typing import Mapping, Sequence
-
-import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 import zlc_frontend.qt_widgets as _qt_widgets
@@ -28,7 +26,6 @@ from zlc_frontend.qt_widgets import (
     CARD_TITLE_PX,
     FluentButton,
     FluentComboBox,
-    FluentFloatingEditor,
     FluentGroupBox,
     FluentLabel,
     FluentLineEdit,
@@ -51,26 +48,17 @@ from zlc_frontend import board_layout as _layout
 from zlc_frontend.form import lenient_float as _safe_float
 from zlc_frontend.render_style import panel_display_size
 from zlc_frontend.panel_params import (
-    PANEL_PARAMS,
-    panel_display_decls as _panel_display_decls,
-    resolved_cmap as _resolved_cmap,
-    resolved_param as _resolved_param,
+    panel_param_decls as _panel_param_decls,
+    resolved_panel_param as _resolved_panel_param,
 )
 from zlc_data.console_records import (
-    BLANK_SOURCE as _BLANK_SOURCE,
     DEFAULT_UPDATE_MS,
-    PANEL_INPUT_FORMAT,
     PANEL_KINDS,
     PanelConfig,
     UPDATE_INTERVALS,
-    panel_allows_multi_slot,
-    panel_input_slots,
-    repeat_mode_for_kind as _repeat_mode_for_kind,
-    repeat_modes_for_kind as _repeat_modes_for_kind,
 )
 from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
 from zlc_data.param_decl import ParamDecl
-from zlc_data.signal_expr import SIGNAL_EXPR_HELP
 
 # qt_widgets submodules are reached as ATTRIBUTES of the one facade binding: their names are
 # deliberately absent from the facade __all__, and the package forbids outside deep imports.
@@ -80,17 +68,6 @@ coerce_short_labels = _qt_widgets.param_widgets.coerce_short_labels
 fill_grouped_signal_combo = _qt_widgets.param_widgets.fill_grouped_signal_combo
 
 
-
-#: Per-signal publish counters ({name: version}) so a rolling monitor tells a new sample of
-#: its OWN source from an unrelated node's version bump.
-SIG_VERSIONS_KEY = "__sig_versions__"
-
-#: Shot-coherent per-signal physical validity masks ({name: (R,P) bool}).
-SIG_VALID_KEY = "__sig_valid__"
-
-#: Coordinate frames ({signal_name: [x0, x1, y0, y1]}) from any node whose acquisition source
-#: declares a ROI -- a 2D panel puts its axes in real camera pixels.
-COORD_FRAMES_KEY = "__coord_frames__"
 
 # A fresh plot panel is BLANK: a pure view is fully decoupled from acquisition, so
 # it shows nothing until the user picks a hub signal in its Setting (signal_combo)
@@ -114,20 +91,10 @@ def _panel_view_intents():
 
     return {
         "2d": ViewIntent.IMAGE,
-        "sites": ViewIntent.IMAGE,
         "1d": ViewIntent.CURVE,
         "monitor": ViewIntent.CURVE,
         "hist": ViewIntent.HISTOGRAM,
-        "grid": ViewIntent.IMAGE,
-        # PULSE has a document contract.  The dataset-only PanelComposer rejects
-        # it explicitly instead of silently drawing the signal as IMAGE.
-        "pulse": ViewIntent.PULSE,
     }
-
-#: Sentinel for "this panel has never stored a repeat mode".  A stored ``None``
-#: is a CHOICE the operator made; absence is not, and the kind's default only
-#: applies to absence.
-_MISSING_REPEAT_MODE = object()
 
 GRID_UNIT = 8
 
@@ -209,10 +176,6 @@ def _overlaps_with_gap(box: tuple[int, int, int, int], placed) -> bool:
     """See :func:`zlc_frontend.board_layout._overlaps_with_gap`."""
     return _layout._overlaps_with_gap(box, placed, _board_metrics())
 
-def _first_free_slot(cfg, placed, board_w: int) -> tuple[int, int]:
-    """See :func:`zlc_frontend.board_layout.first_free_slot`."""
-    return _layout.first_free_slot(cfg, placed, board_w, _board_metrics())
-
 def _board_width(configs: Sequence["PanelConfig"]) -> int:
     """See :func:`zlc_frontend.board_layout.board_width`."""
     return _layout.board_width(configs, _board_metrics())
@@ -242,24 +205,7 @@ _RELIM_PARAM = ParamDecl(
             "  normal = autoscale, holding the window until the data leaves it\n"
             "  fixed  = pin the y-axis / colour-limit to the lo/hi below")
 
-def panel_input_slots_is_single(kind: str) -> bool:
-    """Whether a plot kind takes EXACTLY one signal, so no slot grows beside it.
-
-    Read from the kind's own declaration (:data:`zlc_data.plot_kind.PLOT_KIND_SPEC_BY_KEY`)
-    rather than listed here: a site map states its single-slot nature once, and the Setting
-    popup asks.
-    """
-
-    from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY
-
-    spec = PLOT_KIND_SPEC_BY_KEY.get(str(kind or ""))
-    return bool(spec is not None and spec.single_slot)
-
-
 # ====================================================================== panels
-_MONITOR_UNSET = object()   # sentinel: a monitor panel that has never rolled yet
-
-
 @dataclass(frozen=True, slots=True)
 class _PanelRenderRequest:
     """One fully frozen worker request for a panel raster.
@@ -299,11 +245,8 @@ class PanelCard(FluentGroupBox):
     front_presented = QtCore.pyqtSignal()
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
-                 sources_provider=None, formats_provider=None, axes_provider=None,
-                 sites_inputs_provider=None, curve_x_provider=None,
-                 structure_provider=None, short_names_provider=None,
-                 live_namespace_provider=None, pulse_state_provider=None,
-                 grid_recipe_provider=None, render_request=None,
+                 sources_provider=None, formats_provider=None,
+                 short_names_provider=None, render_request=None,
                  fit_analysis_sink=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
@@ -316,40 +259,10 @@ class PanelCard(FluentGroupBox):
         # callable -> {signal name: array-format}, so the picker also shows each
         # signal's SHAPE (e.g. occupied -> per-site (N,)).
         self.formats_provider = formats_provider
-        # callable -> {signal name: (axis_label, unit)} from the PRODUCING node's
-        # SignalSpec, so a plot reads its y-axis label/unit from the measurement that
-        # makes the signal (confocal: the measurement owns its labels), not a per-kind
-        # hard-coded string.
-        self.axes_provider = axes_provider
         # callable -> {full hub signal: SHORT name} (the producing node's prefix stripped), so the
         # picker NEST shows the short name (frame / survival / rate) -- never the full prefixed key
         # nor the verbose SignalSpec axis label.  ONE rule, shared with the Logic tab.
         self.short_names_provider = short_names_provider
-        # callable(occupancy_signal) -> (centres_signal, image_signal): the site map takes
-        # ONE signal (occupancy) and resolves its centres + frame underlay from the SAME
-        # producing node (via that node's spec metadata), so rings + underlay are one shot.
-        self.sites_inputs_provider = sites_inputs_provider
-        # callable(y_signal) -> companion x_signal: a 1d plot wired to a scan's y curve
-        # draws it vs the swept x from the SAME producing node (one signal pick, #3).
-        self.curve_x_provider = curve_x_provider
-        # callable(signal) -> (points_shape, data_shape) from the producing node's output contract,
-        # so the plot auto-reshapes by the DATA dimensionality (1-D data -> multiple lines; 2-D data
-        # -> reshape/imshow) instead of guessing from sizes (#H3o).
-        self.structure_provider = structure_provider
-        # callable() -> the console's CURRENT shared per-tick namespace (a fresh hub snapshot).  An
-        # IMMEDIATE re-render (signal switch / colormap / resize) must draw from THIS -- the SAME shot
-        # every other panel is on this tick -- NOT the panel's own stale ``_last_namespace`` (a PAST
-        # tick).  Otherwise after switching a panel's source it shows an OLDER shot than its siblings,
-        # so e.g. a 2D image and the sitemap display different shots (#shot-coherence-on-switch).
-        self.live_namespace_provider = live_namespace_provider
-        # callable(value_signal) -> (PulseTableState, include_always_off): a PULSE panel resolves its
-        # reproduction state off the SAME producing node (the object is carried on the node, not the
-        # float-only hub) -- the SAME "aux data from the producing node" wiring the site map uses.
-        self.pulse_state_provider = pulse_state_provider
-        # callable(value_signal) -> grid recipe dict: a GRID panel resolves its replay recipe off the SAME
-        # producing node the SAME way a pulse panel resolves its state (a dict carried on the node, the
-        # float-only hub cannot hold it).
-        self.grid_recipe_provider = grid_recipe_provider
         # callable(card, force=False) -> enqueue one latest-only worker compose.
         # The callback receives no mutable render state: ``render_request`` asks
         # this card to freeze a request first, then the worker owns every
@@ -406,16 +319,6 @@ class PanelCard(FluentGroupBox):
         # regardless of the beat modulo, so a slow-beat panel can never phase-lock onto
         # busy ticks and starve behind a heavy fast-beat sibling (see TaskConsole._tick).
         self._beat_owed = False
-        self._compiled_source = config.source
-        # Monitor roll-gate: remembers the per-signal version of this panel's
-        # source at the last roll, so an unrelated node's version bump does not
-        # append a duplicate point.  `_MONITOR_UNSET` = never rolled yet.
-        self._last_monitor_key: object = _MONITOR_UNSET
-        self._ref_src: tuple | None = None      # (compiled_source, inputs) the names were derived from
-        self._ref_names: frozenset = frozenset()
-        # 2D coordinate frame: the ROI the axes were built from, so a ROI that
-        # SHIFTS (same shape, new origin) still triggers an axes rebuild.
-        self._roi_built: list | None = None
         self._drag_offset: QtCore.QPoint | None = None
         self.setCursor(QtCore.Qt.OpenHandCursor)   # the frame border drags
 
@@ -627,84 +530,10 @@ class PanelCard(FluentGroupBox):
         row = FluentSettingRow("unit", host, label_width=label_w)
         return row, button, label
 
-    def _kind_repeat_modes(self) -> list:
-        """The repeat modes THIS plot kind offers (its ``PLOT_KINDS`` entry, else the image
-        default) -- the ONE lookup shared by the param spec and strict value reader."""
-        return list(_repeat_modes_for_kind(self.config.kind))
-
     def _relim(self) -> str:
         """The panel's relim mode, defaulting to ``_RELIM_PARAM.default`` -- the ONE place that
         default lives, so every reader agrees instead of re-typing the 'tight' literal (#A3)."""
         return str(self.config.params.get("relim", _RELIM_PARAM.default))
-
-    def _repeat_param_specs(self) -> tuple:
-        """The PLOT's repeat-DISPLAY param (``repeat_mode``), DECLARED so the Setting auto-renders it
-        through the same widget path as every other param.  This is the ONLY repeat knob on the plot:
-        the COUNT (``repeat``) belongs to the MEASUREMENT (the plot cannot tell a measurement how many
-        times to run) -- the plot just chooses how to DISPLAY the repeats the measurement produced.
-        Each plot KIND exposes the repeat modes meaningful for it (#issue-1), read from the one
-        ``PLOT_KINDS`` table: the BASE verbs (average/add/replace) are GENERIC across EVERY kind (one
-        ``reduce_repeat`` collapses the axis the same way); a trace adds ``roll``; a DISTRIBUTION adds
-        ``pool`` (bin every repeat together) and defaults to it.  2d/sites omit per-repeat ``create``.
-        No kind offers a mode it would silently ignore; the default is the kind's first (canonical) mode."""
-        modes = self._kind_repeat_modes()
-        return (
-            ParamDecl(key="repeat_mode", label="repeat mode", kind="choice", default=modes[0],
-                      choices=tuple(modes),
-                      tooltip=self._repeat_mode_tooltip()),
-        )
-
-    def _repeat_mode_value(self) -> str:
-        """Return the kind-valid stored repeat mode or its declared default."""
-        return _repeat_mode_for_kind(
-            self.config.kind,
-            self.config.params.get("repeat_mode", _MISSING_REPEAT_MODE),
-        )
-
-    def _bound_is_occupancy(self) -> bool:
-        """Whether the bound producer declares site-map companion signals.
-
-        The decision follows producer metadata rather than a processor class or
-        panel-kind string, so any current occupancy producer can supply the same
-        centres/underlay contract.
-        """
-        occ = self.config.inputs[0] if self.config.inputs else ""
-        if not occ or not callable(self.sites_inputs_provider):
-            return False
-        try:
-            centers_name, _ = self.sites_inputs_provider(occ)
-        except Exception:
-            return False
-        return bool(centers_name)
-
-    def _repeat_mode_tooltip(self) -> str:
-        """The repeat-mode tooltip, SPECIALISED for an occupancy signal (#H3s-F5): when the bound
-        signal is per-site occupancy, ``average`` is the per-site LOADING PROBABILITY (mean of the N
-        shots' 0/1), ``add`` the total loads, ``replace`` the latest shot, ``roll`` the last N --
-        the experiment meaning, not a generic array verb.  Generic otherwise, driven off the signal's
-        role rather than the panel kind."""
-        if self.config.kind == "hist":
-            return ("How to combine the measurement's repeats into the distribution:\n"
-                    "  pool    = bin EVERY repeat's samples into ONE histogram (all repeats together)\n"
-                    "  average = bin the per-point MEAN over the repeats (one histogram)\n"
-                    "  add     = bin the per-point SUM over the repeats\n"
-                    "  replace = bin only the newest repeat's samples\n"
-                    "  create  = ONE filled histogram per repeat overlaid (each a different colour; the "
-                    "first repeat also draws the fit/threshold/stats)")
-        if self._bound_is_occupancy():
-            return ("How to combine the N shots of per-site occupancy for display:\n"
-                    "  average = per-site LOADING PROBABILITY = mean of the N shots' 0/1\n"
-                    "  add     = total loads per site over the N shots\n"
-                    "  replace = the latest shot's 0/1\n"
-                    "  roll    = the last N shots (rolling)\n"
-                    "  create  = draw EVERY shot as its own line (1-D only)")
-        return ("How to combine the measurement's repeats for display (decoupled from\n"
-                "the signal):\n"
-                "  average = mean over the repeats that have data (noise reduction)\n"
-                "  add     = sum over repeats\n"
-                "  replace = show the latest repeat\n"
-                "  roll    = show the newest repeat (rolling)\n"
-                "  create  = draw EVERY repeat as its own line (1-D only)")
 
     def refresh_on_show(self) -> None:
         """Re-seed every Setting control from ``config.params`` -- the SINGLE source of truth for a
@@ -771,9 +600,7 @@ class PanelCard(FluentGroupBox):
         the visible Refresh action and still creates exactly one request.
         """
 
-        from zlc_frontend.panel_render import PanelProvenance
-
-        name = next((item for item in (self.config.inputs or ()) if item), "")
+        name = self.config.signal
         if not name:
             self.set_status("pick a signal in Setting", error=False)
             return None
@@ -781,6 +608,51 @@ class PanelCard(FluentGroupBox):
         if value is None or getattr(value, "snapshot", None) is None:
             self.set_status(f"waiting for {name}", error=False)
             return None
+        return self._freeze_value_render_request(value, frame_key, force=force)
+
+    def freeze_current_view_request(
+        self,
+        *,
+        force: bool = False,
+    ) -> _PanelRenderRequest | None:
+        """Freeze a pure view edit against the already accepted data front.
+
+        A selector/display/title/size commit is not a data-acquisition boundary.
+        It must not advance ``ConsoleDataPlane`` merely because the operator
+        moved a control.  A source rebind whose selected name differs from the
+        accepted value waits for the next base tick or explicit Refresh.
+        """
+
+        name = self.config.signal
+        value = self._last_value
+        if (
+            not name
+            or value is None
+            or str(getattr(value, "name", "")) != str(name)
+            or getattr(value, "snapshot", None) is None
+        ):
+            if name:
+                self.set_status(f"waiting for {name}", error=False)
+            else:
+                self.set_status("pick a signal in Setting", error=False)
+            return None
+        return self._freeze_value_render_request(
+            value,
+            self._render_version,
+            force=force,
+        )
+
+    def _freeze_value_render_request(
+        self,
+        value,
+        frame_key,
+        *,
+        force: bool,
+    ) -> _PanelRenderRequest | None:
+        """Freeze one immutable value/display pair for the raster worker."""
+
+        from zlc_frontend.panel_render import PanelProvenance
+
         display = self._display_state()
         size = tuple(int(value) for value in panel_display_size(self.config.size))
         source_key = (
@@ -873,10 +745,6 @@ class PanelCard(FluentGroupBox):
 
         params = self.config.params
         intent = self.view_intent()
-        if intent is ViewIntent.PULSE:
-            raise ValueError(
-                "PULSE display state belongs to its document renderer, not the dataset composer"
-            )
         # The panel's relim vocabulary IS the renderer's: tight / normal / fixed.
         # Converting rather than re-deciding keeps one set of names, so a mode
         # the renderer grows is a mode the Setting can offer with no mapping to
@@ -895,14 +763,16 @@ class PanelCard(FluentGroupBox):
         if intent is ViewIntent.HISTOGRAM:
             return HistogramDisplayState(
                 revision=self._display_revision, relim_mode=mode,
-                bin_count=int(params.get("bins", 60) or 60),
+                bin_count=int(_resolved_panel_param(self.config.kind, params, "bins")),
                 fixed_count_limits=fixed,
                 x_view=pin_x,
             )
         return ImageDisplayState(
             revision=self._display_revision,
             relim_mode=mode,
-            colormap=ImageColormap(str(params.get("colormap", "gray") or "gray")),
+            colormap=ImageColormap(
+                str(_resolved_panel_param(self.config.kind, params, "colormap"))
+            ),
             fixed_color_limits=fixed,
             x_view=pin_x,
             y_view=pin_y,
@@ -956,7 +826,7 @@ class PanelCard(FluentGroupBox):
     def _build_settings(self) -> None:
         """The Setting popup: the sections the operator tunes this panel through.
 
-        Everything here is a VIEW of ``config.params`` / ``config.inputs``.  No control
+        Everything here is a VIEW of ``config.params`` / ``config.signal``.  No control
         owns state of its own: each writes through the card's one writer and is re-seeded
         from the stored value on open, which is what stops this popup and the Edit tab --
         which renders the same declarations -- from drifting apart.
@@ -977,6 +847,11 @@ class PanelCard(FluentGroupBox):
         self._settings_scroll.setWidget(content)
         outer.addWidget(self._settings_scroll)
         self.settings_popup = popup
+        # ``Qt.Popup`` closes on the press that lands on its own anchor.  Record
+        # that real hide edge so the matching release cannot immediately reopen
+        # the popup.  FluentPopup owns this lifecycle hook; no event filter or
+        # second visibility state is needed here.
+        popup._on_hidden = self._note_settings_dismissed
         self._settings_h_hwm = 0
 
         label_w = scaled_px(96, minimum=72)
@@ -989,53 +864,24 @@ class PanelCard(FluentGroupBox):
             self._settings_col.addWidget(box)
             return layout
 
-        # ---- Source: which signal(s) this panel reads, and the expression over them.
-        # The picker IS the "plot this" control; the expression is the advanced override,
-        # which is why picking a slot rewrites the canonical expression for a single-slot
-        # panel and leaves a hand-authored multi-slot one alone.
+        # ---- Source: one typed dataset.  Combining producers belongs to a
+        # Processor or explicit join, never an independent-latest GUI expression.
         source = section_box("Source")
-        self.slot_combos = []
-        slots = list(self.config.inputs) or [""]
-        for index in range(len(slots)):
-            combo = FluentTreeComboBox()
-            combo.setToolTip("The signal this slot reads, grouped by the node that produces it.")
-            combo.currentIndexChanged.connect(lambda _i, idx=index: self._on_slot_pick(idx))
-            self.slot_combos.append(combo)
-            name = "signal" if len(slots) == 1 else "signal[%d]" % index
-            source.addWidget(FluentSettingRow(name, combo, label_width=label_w))
-        if not panel_input_slots_is_single(self.config.kind):
-            grow = QtWidgets.QWidget()
-            grow_row = QtWidgets.QHBoxLayout(grow)
-            grow_row.setContentsMargins(0, 0, 0, 0)
-            grow_row.setSpacing(scaled_px(6, minimum=4))
-            add_slot = FluentButton("+", color=GREY)
-            add_slot.setToolTip("Add a signal slot so the expression can combine more signals")
-            add_slot.clicked.connect(self._add_signal_slot)
-            drop_slot = FluentButton("-", color=GREY)
-            drop_slot.setToolTip("Remove the last signal slot")
-            drop_slot.clicked.connect(self._remove_signal_slot)
-            grow_row.addWidget(add_slot, 0)
-            grow_row.addWidget(drop_slot, 0)
-            grow_row.addStretch(1)
-            source.addWidget(FluentSettingRow("slots", grow, label_width=label_w))
-        self.source_edit = FluentLineEdit(self.config.source)
-        self.source_edit.setPlaceholderText(_BLANK_SOURCE)
-        self.source_edit.setToolTip("value = <expression over the slots above>.  Click to edit in full.")
-        self.source_edit.textChanged.connect(lambda *_: self.apply_button.set_dirty(True))
-        self.source_edit.returnPressed.connect(self._apply_source)
-        self.source_edit.mouseDoubleClickEvent = lambda _e: self._open_expr_editor()
-        source.addWidget(FluentSettingRow("value", self.source_edit, label_width=label_w))
-        self.apply_button = FluentButton("Apply", color=ACCENT)
-        self.apply_button.setToolTip("Apply the expression (a slot pick applies on its own)")
-        self.apply_button.clicked.connect(self._apply_source)
-        source.addWidget(self.apply_button)
+        self.signal_combo = FluentTreeComboBox()
+        self.signal_combo.setToolTip(
+            "The typed dataset this panel displays, grouped by its producing node."
+        )
+        self.signal_combo.currentIndexChanged.connect(self._on_signal_pick)
+        source.addWidget(
+            FluentSettingRow("signal", self.signal_combo, label_width=label_w)
+        )
 
         # ---- Display: the declared view knobs for this kind, emitted through the SHARED
         # row builder, so a kind that gains a knob shows it in both surfaces with no
         # wiring here.
         display = section_box("Display")
-        display_specs = ([spec for spec in _panel_display_decls(self.config.kind, self._param_kind())
-                          if spec.display] + [_RELIM_PARAM] + list(self._repeat_param_specs()))
+        display_specs = ([spec for spec in _panel_param_decls(self.config.kind)
+                          if spec.display] + [_RELIM_PARAM])
         self.param_widgets = self._emit_param_rows(
             display_specs, display.addWidget, self._set_param, label_w)
         self.fixed_lim_row, self.fixed_lo_edit, self.fixed_hi_edit = self._make_fixed_lim_row(
@@ -1099,11 +945,8 @@ class PanelCard(FluentGroupBox):
             return
         if time.monotonic() - self._settings_dismissed_at < 0.25:
             return
-        self._sync_settings_param_rows()   # a grid's resolved kind may have changed since the last bake
-        popup = self.settings_popup        # (the sync may have swapped in a fresh popup)
         self.refresh_on_show()          # Setting controls are a VIEW of config.params -- refresh on open (#6)
         self._refresh_signal_combo()
-        self._refresh_sub_kind_combo()
         anchor = self.setting_button.mapToGlobal(
             QtCore.QPoint(self.setting_button.width(), self.setting_button.height()))
         self._size_settings_popup()                        # height: show-all, grow-not-shrink (#H3i-2)
@@ -1149,7 +992,7 @@ class PanelCard(FluentGroupBox):
         """Populate ONE slot combobox with ``(none)`` + every live hub signal GROUPED by its
         producing node (the shared :func:`fill_grouped_signal_combo`): bold non-selectable
         headers, indented signals.  Keeps the slot's current pick selected even when its source
-        node is not running yet (so a saved layout's ``signal[1]`` survives a restart)."""
+        node is not running yet, so a saved layout's one typed binding survives a restart."""
         fill_grouped_signal_combo(
             combo, names=(self.names_provider() if callable(self.names_provider) else []),
             sources=(self.sources_provider() if callable(self.sources_provider) else {}),
@@ -1165,77 +1008,23 @@ class PanelCard(FluentGroupBox):
         return coerce_short_labels(self.short_names_provider)
 
     def _refresh_signal_combo(self) -> None:
-        """Refresh the signal picker with the hub's current signals, each labelled with the
-        measurement/processor that PRODUCES it (``occupied — occupancy``) so the input is
-        filled by origin, not a bare name.  It keeps ``config.inputs[0]`` selected; the source
-        expression reads it as ``signal`` (``value = signal``)."""
-        for i, combo in enumerate(getattr(self, "slot_combos", [])):
-            cur = self.config.inputs[i] if i < len(self.config.inputs) else ""
-            self._fill_slot_combo(combo, cur)
+        """Refresh the one dataset picker without rebuilding the popup."""
 
-    def _on_slot_pick(self, idx: int) -> None:
-        """The signal picker changed: write its bare signal name into ``config.inputs[idx]``
-        and point the source at ``value = signal`` (a blank pick blanks the panel).  The
-        picker IS the "plot this signal" control; the expression box stays the advanced
-        override for a custom ``value = ...``.  Then re-apply so the pick takes effect now."""
-        name = str(self.slot_combos[idx].currentData() or "")   # bare name (not the labelled text)
-        while len(self.config.inputs) <= idx:
-            self.config.inputs.append("")
-        self.config.inputs[idx] = name
-        # Single-slot: the picker IS the "plot this signal" control -> point the source at it
-        # (value = signal).  Multi-slot: the expression (value = signal[0] - signal[1]) is
-        # user-authored and combines the slots, so a pick just rebinds slot idx -- don't clobber it.
-        if len(self.slot_combos) <= 1 and idx == 0:
-            self.source_edit.setText("value = signal" if name else _BLANK_SOURCE)
-        self._apply_source()                      # picking a slot applies instantly
-        self._sync_settings_param_rows()          # a grid's resolved cell kind follows the new bind
+        combo = getattr(self, "signal_combo", None)
+        if combo is not None:
+            self._fill_slot_combo(combo, self.config.signal)
 
-    def _add_signal_slot(self) -> None:
-        """Add a signal slot (signal[i]) so the panel can combine more signals.  When growing
-        from one slot to two, seed the canonical two-signal expression so the panel is usable
-        at once; the user can edit it.  Rebuilds the Setting popup so the new row appears."""
-        self.config.inputs.append("")
-        if len(self.config.inputs) == 2 and self.config.source.strip() in ("value = signal", "", _BLANK_SOURCE.strip()):
-            self.config.set_source("value = signal[0] - signal[1]")
-            self._compiled_source = self.config.source
-        self._rebuild_settings_popup()
-        self._apply_source()
+    def _on_signal_pick(self, _index: int) -> None:
+        """Commit one card-local dataset binding and request one compose."""
 
-    def _remove_signal_slot(self) -> None:
-        """Remove the LAST signal slot (never below one).  Back at a single slot, restore the
-        canonical ``value = signal`` so the picker drives the plot again."""
-        if len(self.config.inputs) <= 1:
+        name = str(self.signal_combo.currentData() or "")
+        if name == self.config.signal:
             return
-        self.config.inputs.pop()
-        if len(self.config.inputs) == 1:
-            self.config.set_source("value = signal" if self.config.inputs[0] else _BLANK_SOURCE)
-            self._compiled_source = self.config.source
-        self._rebuild_settings_popup()
-        self._apply_source()
-
-    def _rebuild_settings_popup(self, *, reopen: bool = True) -> None:
-        """Rebuild the Setting popup (the slot count and the per-kind param rows are fixed at build
-        time, so adding/removing a slot or a resolved-kind change rebuilds it).  ``reopen`` shows the
-        fresh popup at once (the user was in it); False rebuilds silently for the next open."""
-        old = getattr(self, "settings_popup", None)
-        if old is not None:
-            old.hide()
-            old.deleteLater()
-        self._build_settings()                    # builds a fresh self.settings_popup + combos
-        if reopen:
-            self._settings_dismissed_at = 0.0
-            self._open_settings()                 # reopen (positioned + height-capped)
-
-    def _sync_settings_param_rows(self) -> None:
-        """A grid panel's per-kind Setting rows (bins/fit/ylog for hist cells, the colormap for 2d
-        cells, ...) follow the RESOLVED per-cell kind: whenever the resolve changes -- a facet or
-        sub-plot pick, a signal bind, a load -- the popup is rebuilt so the rows are the new kind's
-        PANEL_PARAMS, never a stale bake of the kind the popup happened to open with."""
-        if self.config.kind != "grid":
-            return
-        if self._param_kind() == getattr(self, "_settings_param_kind", None):
-            return
-        self._rebuild_settings_popup(reopen=self.settings_popup.isVisible())
+        self.config.signal = name
+        self._invalidate_render_binding()
+        self._render_version = -1
+        self._request_display_render()
+        self.changed.emit()
 
     def _current_unit_text(self) -> str:
         """The bound signal's declared unit, or a neutral placeholder."""
@@ -1367,105 +1156,6 @@ class PanelCard(FluentGroupBox):
         self.config.params["update_ms"] = ms
         self.update_interval_changed.emit()    # console re-bases the shared timer
         self.changed.emit()                    # mark the layout dirty
-
-    def _param_kind(self) -> str:
-        """The plot kind whose :data:`PANEL_PARAMS` drive THIS panel's Setting / Edit param UI.
-
-        For every ordinary kind that is ``config.kind``.  A GRID panel's knobs are
-        its per-cell kind (``sub_plot_kind``): a histogram grid must offer bins /
-        fit, an image grid a colormap.  That choice is a stored panel param, so
-        the Setting rows follow it without asking a figure what it turned out to
-        be.
-        """
-
-        if self.config.kind != "grid":
-            return self.config.kind
-        sub = self.config.params.get("sub_plot_kind")
-        if sub:
-            return str(sub)
-        recipe = self._grid_recipe_or_none()
-        if recipe:
-            return str(recipe.get("sub_plot_kind") or "hist")
-        return "hist"
-
-    def _grid_recipe_or_none(self):
-        """The bound signal's grid RECIPE (a loaded saved-figure's reproduction dict) when its
-        producing node carries one -- else None.  The ONE probe _param_kind and the facet choices
-        share (a "(saved figure)" option only exists when there IS a saved figure to show)."""
-        if not (callable(self.grid_recipe_provider) and self.config.inputs and self.config.inputs[0]):
-            return None
-        try:
-            return self.grid_recipe_provider(self.config.inputs[0])
-        except Exception:
-            return None
-
-    def _grid_recipe_with_params(self, recipe: Mapping[str, object]) -> dict:
-        """Fold THIS panel's live grid DISPLAY knobs (the per-site ``sub_plot_kind``'s params -- ``bins`` /
-        ``fit`` / ``ylog`` for a hist grid, ``cmap`` for a 2d grid) from ``config.params`` into the producing
-        node's grid recipe, so a rebuild redraws the grid with the operator's current Setting choices (not just
-        the recipe's saved defaults).  The panel's params WIN over the recipe's stored ``display_params`` (the
-        operator's live pick is the source of truth); ``bins`` also overrides the recipe's top-level ``bins`` so
-        the thumbnails re-bin.  A copy -- the node's recipe is untouched."""
-        out = dict(recipe)
-        # The panel's CURRENT title wins over the recipe's saved one -- same "live pick beats stored
-        # default" rule as the display knobs below.  build_grid_figure reads recipe['title'], so without
-        # this an Edit-tab title edit on a RECIPE grid (a loaded figure) rebuilt the snapshot from the
-        # stale saved title and never followed the edit (the facet branch already passes config.title to
-        # _build_facet_plotter; this makes the recipe branch agree).  ONE injection point -> both the live
-        # card's recipe rebuild and the Edit snapshot rebuild pick up the edited title.
-        out["title"] = self.config.title or out.get("title") or ""
-        display = dict(out.get("display_params") or {})
-        for decl in _panel_display_decls(self.config.kind, self._param_kind()):   # sub-kind knobs + grid title
-            if decl.key in self.config.params:
-                display[decl.key] = self.config.params[decl.key]
-        # The relim family is display state too (it lives beside PANEL_PARAMS as _RELIM_PARAM + the
-        # bespoke lo/hi row): folded in like every other knob, so a rebuilt grid / Edit snapshot
-        # replays the operator's lim onto the thumbnails and the focus seed -- never a silent revert.
-        for lim_key in ("relim", "fixed_lo", "fixed_hi"):
-            if lim_key in self.config.params:
-                display[lim_key] = self.config.params[lim_key]
-        if "bins" in display:
-            out["bins"] = int(display["bins"])          # top-level bins drives the thumbnail binning
-        out["display_params"] = display
-        return out
-
-    # --------------------------------------------------------------- facet (the grid as an axis-expander)
-
-    def _refresh_sub_kind_combo(self) -> None:
-        """Re-select the stored ``sub_plot_kind`` pick ("" = auto) on the Setting's sub-plot chooser."""
-        combo = getattr(self, "sub_kind_combo", None)
-        if combo is None:
-            return
-        with _signals_blocked(combo):
-            combo.setCurrentIndex(max(0, combo.findData(str(self.config.params.get("sub_plot_kind") or ""))))
-
-    def _on_sub_kind_changed(self, index: int) -> None:
-        """The operator picked what each cell draws (auto / hist / 2d / 1d): persist + rebuild -- a
-        per-cell kind change is a structure change exactly like a facet change, and the Setting's
-        param rows follow the new resolve."""
-        value = str(self.sub_kind_combo.itemData(int(index)) or "")
-        if value == str(self.config.params.get("sub_plot_kind") or ""):
-            return
-        if value:
-            self.config.params["sub_plot_kind"] = value
-        else:
-            self.config.params.pop("sub_plot_kind", None)      # auto: derive from the slice
-        self._invalidate_render_binding()
-        self._render_version = -1
-        self._request_display_render()
-        self._sync_settings_param_rows()
-        self.changed.emit()
-
-    def _apply_display_params(self) -> None:
-        """Re-assert every stored display knob by re-composing this panel.
-
-        There is no second push path: the knobs ARE ``config.params``, the
-        composer reads them through :meth:`_display_state`, and re-composing is
-        how they take effect.  A panel whose producer has stopped still updates,
-        because the last frozen value is what it re-composes from.
-        """
-
-        self._request_display_render()
 
     def _refresh_title(self) -> None:
         """Compose the grey frame TITLE: the panel KIND + WHERE its signal comes from (the
@@ -1673,44 +1363,6 @@ class PanelCard(FluentGroupBox):
                     return (float(limits[0]), float(limits[1]))
         return None
 
-    def _apply_source(self) -> None:
-        previous_inputs = tuple(self.config.inputs)
-        self.config.set_source(self.source_edit.text())
-        if tuple(self.config.inputs) != previous_inputs:
-            self._refresh_signal_combo()
-        self._compiled_source = self.config.source
-        self._invalidate_render_binding()      # output shape may change with the expression
-        # Force the console's NEXT tick to re-render this panel against a FRESH hub namespace (the
-        # version gate honours -1), so re-picking a signal recovers a panel that previously errored
-        # on a now-available signal -- never "remove the panel to recover" (#H3w-2).
-        self._render_version = -1
-        self._request_display_render()
-        self.apply_button.set_dirty(False)
-        self.changed.emit()
-
-    def _open_expr_editor(self) -> None:
-        """Pop a NON-modal floating editor for the panel's source expression (the shared
-        :class:`FluentFloatingEditor`): the panel behind stays VISIBLE and live, and the
-        editor's Apply (below the box) writes the text back + re-renders so you watch the plot
-        change.  Parented to this panel's TOP-LEVEL window so it shares the same screen scale
-        (no DPI-mismatch shrink).  Re-clicking just raises the existing one."""
-        existing = getattr(self, "_expr_editor", None)
-        if existing is not None:
-            existing.raise_(); existing.activateWindow(); return
-        editor = FluentFloatingEditor(SIGNAL_EXPR_HELP, self.source_edit.text(), self.window(),
-                                      title="Edit panel source expression")
-
-        def _apply(text: str) -> None:
-            # the source is one Python line -> collapse any newlines to spaces, write back to
-            # the inline field, and apply live (the panel behind updates while the editor stays).
-            self.source_edit.setText(" ".join(text.split("\n")).strip())
-            self._apply_source()
-
-        editor.applied.connect(_apply)
-        editor.destroyed.connect(lambda *_: setattr(self, "_expr_editor", None))
-        self._expr_editor = editor
-        editor.show()
-
     def _request_display_render(self) -> None:
         """Commit one display revision and enqueue one latest-only compose.
 
@@ -1724,133 +1376,6 @@ class PanelCard(FluentGroupBox):
 
     def _request_current_render(self, *, force: bool = False) -> None:
         self._render_request(self, force=bool(force))
-
-    def _signal_expr(self):
-        """This panel's source as the ONE reusable :class:`SignalExpr` (the slot rule + the
-        ``value = ...`` contract live there, shared with processors / pulse-scan).  Lazy import
-        keeps the frontend module off neutral_atom's import graph (every neutral_atom use here
-        is lazy)."""
-        from zlc_data.signal_expr import SignalExpr
-        return SignalExpr(self.config.inputs, self._compiled_source)
-
-
-    @staticmethod
-    def _validate_canonical_block(value, structure, name="signal") -> np.ndarray:
-        from zlc_data.signal_tensor import canonical_physical_shape
-        array = np.asarray(value)
-        point_shape = tuple(int(n) for n in structure["points_shape"])
-        data_shape = tuple(int(n) for n in structure["data_shape"])
-        # (points, *data_shape) = the per-slice tail of the ONE canonical (R,P,*data) shape (single source).
-        expected_tail = canonical_physical_shape(1, point_shape, data_shape)[1:]
-        points = expected_tail[0]
-        if array.ndim != 1 + len(expected_tail) or tuple(array.shape[1:]) != expected_tail:
-            raise ValueError(
-                f"signal {name!r} violates its canonical schema: expected (R,{points},"
-                f"{','.join(map(str, data_shape))}), got {array.shape}")
-        return array
-
-    def _eval_signal_per_slice(self, namespace: Mapping[str, object]):
-        """Evaluate a transformed expression once per declared R slice."""
-        expr = self._signal_expr()
-        sig = expr.signal_for(namespace)
-        slots = sig if isinstance(sig, list) else [sig]
-        structured: dict[str, tuple[np.ndarray, Mapping[str, object]]] = {}
-        for name, value in zip(self.config.inputs, slots):
-            structure = self.structure_provider(name) if callable(self.structure_provider) and name else None
-            if structure is not None:
-                structured[f"slot:{len(structured)}"] = (
-                    self._validate_canonical_block(value, structure, name), structure)
-        raw_names = []
-        for name in expr.direct_names():
-            if name == "signal" or name not in namespace:
-                continue
-            structure = self.structure_provider(name) if callable(self.structure_provider) else None
-            if structure is not None:
-                structured[f"raw:{name}"] = (
-                    self._validate_canonical_block(namespace[name], structure, name), structure)
-                raw_names.append(name)
-        if not structured:
-            ns = dict(namespace); ns["signal"] = sig
-            return expr.exec_in(ns), False, None
-        repeats = {array.shape[0] for array, _structure in structured.values()}
-        if len(repeats) != 1:
-            raise ValueError(f"expression inputs have incompatible repeat sizes {sorted(repeats)}")
-        repeat = repeats.pop()
-        valid_by_name = namespace.get(SIG_VALID_KEY, {}) or {}
-        repeat_valid = np.ones(repeat, dtype=bool)
-        for name in (*self.config.inputs, *raw_names):
-            mask = valid_by_name.get(name)
-            if mask is not None:
-                mask = np.asarray(mask, dtype=bool)
-                if mask.ndim != 2 or mask.shape[0] != repeat:
-                    raise ValueError(f"signal {name!r} validity must be (R,P); got {mask.shape}")
-                repeat_valid &= mask.any(axis=1)
-
-        def _run(r):
-            ns = dict(namespace)
-            for name in raw_names:
-                ns[name] = np.asarray(namespace[name])[r]
-            sliced_slots = []
-            for name, value in zip(self.config.inputs, slots):
-                structure = self.structure_provider(name) if callable(self.structure_provider) and name else None
-                sliced_slots.append(np.asarray(value)[r] if structure is not None else value)
-            ns["signal"] = sliced_slots[0] if len(sliced_slots) == 1 else sliced_slots
-            return np.asarray(expr.exec_in(ns), dtype=float)
-
-        return np.stack([_run(r) for r in range(repeat)], axis=0), True, repeat_valid[:, None]
-
-    def _bound_structure(self):
-        """The producing node's ``{points_shape, data_shape, grid_shape}`` for this panel's bound
-        signal -- authoritative for any IDENTITY source: the canonical ``value = signal`` OR a bare
-        ``value = <the one input's name>`` (:func:`is_identity_source`), because naming the signal
-        passes it through unchanged so the node's declared structure still describes it.  A transforming
-        expression (``value = signal[0]-signal[1]``, ``value = np.log(f)``) rewrites the core shape (#H3o),
-        so it returns ``None`` and the reshape falls back to shape inference."""
-        from zlc_data.signal_expr import is_identity_source
-        if not is_identity_source(self._compiled_source, self.config.inputs):
-            return None
-        if not (self.config.inputs and callable(self.structure_provider)):
-            return None
-        try:
-            return self.structure_provider(self.config.inputs[0])
-        except Exception:
-            return None
-
-
-
-    def _co_names(self) -> frozenset:
-        """The hub-signal names this panel reads (cached) -- for the monitor roll-gate
-        and the 2D coordinate-frame (ROI) lookup.  This is BOTH the identifiers the source
-        expression names directly AND the picked input: the default ``value = signal`` form
-        references the pseudo ``signal`` (not the real name), so ``config.inputs`` is folded
-        in or version-gating would miss the input's updates."""
-        key = (self._compiled_source, tuple(self.config.inputs))
-        if key != self._ref_src:               # (re)derive on source OR slot change
-            self._ref_src = key
-            self._ref_names = self._signal_expr().co_names()   # names referenced + picked slots
-        return self._ref_names
-
-    def _source_coord_frame(self, namespace: Mapping[str, object] | None):
-        """The ROI ([x, w, y, h]) of the camera signal this 2D panel's source
-        reads, or None -- so the image axes can be real pixel coordinates."""
-        frames = (namespace or {}).get(COORD_FRAMES_KEY)
-        if not isinstance(frames, dict) or not frames:
-            return None
-        for name in self._co_names():
-            if name in frames:
-                return frames[name]
-        return None
-
-    def _monitor_source_key(self, namespace: Mapping[str, object] | None):
-        """Version key of the signals this panel's source reads, or None when
-        none are detectable.  None => caller rolls every tick (safe fallback)."""
-        versions = (namespace or {}).get(SIG_VERSIONS_KEY)
-        if not isinstance(versions, dict) or not versions:
-            return None
-        refs = [n for n in self._co_names() if n in versions]
-        if not refs:
-            return None
-        return tuple(sorted((n, versions[n]) for n in refs))
 
     def set_selectors_enabled(self, on: bool) -> None:
         """The console header's "Selectors" switch for THIS card: remember the desired state and
@@ -1872,63 +1397,7 @@ class PanelCard(FluentGroupBox):
         if board is not None and hasattr(board, "set_selectors_enabled"):
             board.set_selectors_enabled(bool(self._selectors_on))
 
-    def _source_axis_label(self) -> str | None:
-        """The y-axis label for this panel's sourced signal, taken from the PRODUCING
-        node's :class:`SignalSpec` (``axes_provider``) -- so a plot of ``rate`` is
-        labelled "loading rate" by the measurement that makes it, not a per-kind string.
-        ``None`` when the source is a free expression or its source node declares no axis."""
-        source = (self.config.source or "").strip()
-        if not source.startswith("value ="):
-            return None
-        name = source[len("value ="):].strip()
-        # The default source ``value = signal`` plots the picked input: resolve ``signal`` to
-        # the real hub-signal name (``config.inputs[0]``) so its producing node's axis label
-        # is found.
-        if name == "signal":
-            name = self.config.inputs[0] if self.config.inputs else ""
-        return self._axis_label_for(name)
-
-    def _axis_label_for(self, name: str | None) -> str | None:
-        """The axis label a producing node declares for hub signal ``name`` (via
-        ``axes_provider`` -> the node's :class:`SignalSpec`), or None."""
-        if not name or not callable(self.axes_provider):
-            return None
-        try:
-            axes = dict(self.axes_provider())
-        except Exception:
-            return None
-        entry = axes.get(str(name))
-        return entry[0] if entry else None
-
-    def _panel_labels(self, xlabel: str, ylabel: str, zlabel: str = "") -> tuple[str, str, str]:
-        """Resolve optional authored labels over the live schema-derived defaults.
-
-        Current saved figures retain their typed FigureDocument and DatasetSchema,
-        so this TaskConsole-only helper is not a persistence or replay contract.
-        Empty authored fields never erase a declared live label.
-        """
-        p = self.config.params
-        return (str(p.get("xlabel") or xlabel), str(p.get("ylabel") or ylabel), str(p.get("zlabel") or zlabel))
-
     # ------------------------------------------------------------- plot lifecycle
-    def _fixed_lim_kwargs(self) -> dict:
-        """``fixed_lo``/``fixed_hi`` kwargs for the plotter, ONLY when the lim mode is
-        "fixed" (#8) -- otherwise omitted so the plotter keeps its tight/normal autoscale."""
-        if self._relim() != "fixed":
-            return {}
-        return {"fixed_lo": float(self.config.params.get("fixed_lo", 0.0)),
-                "fixed_hi": float(self.config.params.get("fixed_hi", 1.0))}
-
-    def _view_kwargs(self, kind: str) -> dict:
-        """The relim / limit view kwargs EVERY relim-capable kind passes to its plotter -- the ONE
-        source for BOTH the live build (``_build_plot``) and the Edit snapshot (``PanelEditor.rebuild``),
-        so no kind can silently omit relim/fixed.  This is exactly what regressed: the ``sites`` panel
-        omitted these in both builders, so a Site map's lim mode / fixed lo-hi never re-rendered (#4).
-        For a histogram the relim/fixed pins the VALUE (x) axis (the count y-axis is always auto, #3);
-        every other kind pins its value axis (1D y-axis / 2D·sites clim)."""
-        return {"relim_mode": self._relim(), **self._fixed_lim_kwargs()}
-
-
     def _invalidate_render_binding(self) -> None:
         """Invalidate only the worker request identity, never the Qt surface.
 

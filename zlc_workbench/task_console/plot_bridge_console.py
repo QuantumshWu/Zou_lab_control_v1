@@ -58,7 +58,6 @@ from zlc_frontend.console_state import (
     task_files_dir as _task_files_dir,
 )
 from zlc_data.console_records import (
-    ADDABLE_PANEL_KINDS,
     DEFAULT_UPDATE_MS,
     LOGIC_KINDS,
     LogicNodeConfig,
@@ -67,15 +66,10 @@ from zlc_data.console_records import (
     UPDATE_INTERVALS,
 )
 from zlc_data.shape_text import indexed_unique_name, strip_node_prefix
-from zlc_data.vocabulary import DEFAULT_MID_RUN_KEY
-
 from .plot_bridge import (
-    COORD_FRAMES_KEY,
     GAP,
     PanelCard,
     _PanelRenderRequest,
-    SIG_VALID_KEY,
-    SIG_VERSIONS_KEY,
     _PanelBoard,
     _board_width,
     _opaque_white_composite,
@@ -85,15 +79,6 @@ from .plot_bridge import (
 from .data_plane import ConsoleDataPlane
 from .plot_bridge_editor import PanelEditor
 
-
-# ---- RESERVED expression-namespace keys (each spelled ONCE; every writer/reader shares these).
-#: The running task's typed mid-run tensor: injected off-hub by the console each tick, read by the
-#: task's dedicated panel (its source is ``value = {TASK_FRAME_KEY}``) -- never a hub signal.
-TASK_FRAME_KEY = "__task_frame__"
-
-#: The display suffix marking a task's SYNTHETIC mid-run entry in the picker / Logic legend
-#: (never part of a hub name) -- one spelling shared by the declared and the running paths.
-MID_RUN_TAG = " (mid-run)"
 
 # ====================================================================== console
 class TaskConsole(QtWidgets.QWidget):
@@ -160,6 +145,12 @@ class TaskConsole(QtWidgets.QWidget):
         self.window_ratio = float(window_ratio)
         self._window_px = window_px
         self.cards: list[PanelCard] = []
+        # The signal legend is a projection of two event-owned facts: provider
+        # topology and each card's binding.  Mutations below mark it dirty and
+        # reconcile it once; the refresh timer never rediscovers topology by
+        # enumerating every provider/card merely to learn that nothing changed.
+        self._signal_info_dirty = True
+        self._card_signal_bindings: dict[int, tuple[str, tuple[str, ...]]] = {}
         # The Logic-tab nodes.  Each entry maps a LogicNodeRow -> the live state for
         # that node: its built node (None until Started) + its Edit tab.
         self.logic_nodes: list[LogicNodeRow] = []
@@ -185,21 +176,13 @@ class TaskConsole(QtWidgets.QWidget):
         # Per-panel editors: one PanelEditor per opened PLOT panel, hosted as a
         # closable tab (keyed by id(card)).
         self._panel_editors: dict[int, "PanelEditor"] = {}
-        # A running TASK takes over the console (confocal-style): its mid-run output
-        # occupies a FIXED panel so the operator watches the work in progress, and all
-        # other actions are LOCKED until it finishes / is stopped.  ``_running_task_row``
-        # is the LogicNodeRow of the task currently running (None when idle);
-        # ``_task_card`` is its dedicated mid-run Monitor panel.
+        # A running TASK takes over the console: the status strip reports its
+        # lifecycle and all other actions remain locked until it finishes or is
+        # stopped.  Live task data belongs to the formal monitor seam; the console
+        # never invents an off-hub dataset or a blank transient plot for it.
         self._running_task_row: "LogicNodeRow | None" = None
-        self._task_card: "PanelCard | None" = None
-        self._task_mid_key = DEFAULT_MID_RUN_KEY   # which output-buffer key the task panel shows
-        self._task_output_node = None          # running Task whose typed TaskOutput feeds the panel
-        self._task_card_tensor = None          # immutable latest SignalTensor, including validity
+        self._task_status_text: str | None = None
         self._task_locked = False              # True while a task runs -> all other actions blocked
-        # During whole-console shutdown node termination detaches the task state and parks the
-        # card here; the UI-teardown phase removes it once the nodes have stopped.
-        self._defer_task_card_teardown = False
-        self._deferred_task_card: "PanelCard | None" = None
 
         # Multi-rate refresh: the timer ticks at the BASE interval (the smallest panel
         # update_ms, which divides every other so the rates co-align); each panel redraws
@@ -312,11 +295,10 @@ class TaskConsole(QtWidgets.QWidget):
         #   * "Task: Z"        -- a one-shot orchestration logic node (e.g. calibrate).
         # A logic node (measurement/processor/task) is added STOPPED to the Logic tab;
         # you Start/Stop it from its own Edit.  A plot is added to the Monitor board.
-        # The dropdown offers only the ADDABLE plot kinds (``panel=True``) -- the ones you add a
-        # BLANK panel of and wire live.  ``pulse`` is a real panel kind too, but it is not added
-        # blank live (it comes from a saved recipe / a fired sequence via the seed path), so it is
-        # not listed here.
-        for key, label in ADDABLE_PANEL_KINDS.items():
+        # The dropdown offers only current TaskConsole panel kinds: each has an
+        # end-to-end typed live payload and renderer.  Static/document figure
+        # kinds are not persisted as panel records.
+        for key, label in PANEL_KINDS.items():
             self.kind_combo.addItem(f"Plot: {label}", key)
         # The node LAYERS, straight off the catalog view: every entry carries its own
         # display title, so a renamed domain Definition reaches the dropdown AND the row
@@ -536,6 +518,7 @@ class TaskConsole(QtWidgets.QWidget):
                     )
             if replacement_nodes is not None:
                 self.running_nodes = replacement_nodes
+                self._signal_topology_changed()
             self.state = desired_state
             self.name_edit.setText(desired_state.name)
             for config in desired_state.panels:
@@ -545,6 +528,7 @@ class TaskConsole(QtWidgets.QWidget):
             self._arrange()
         finally:
             self._building = False
+        self._refresh_signal_info()
         for card in self.cards:            # force every panel to redraw on its next beat
             card._render_version = -1
         self._recompute_tick_interval()    # the loaded panels' rates set the timer base
@@ -568,11 +552,8 @@ class TaskConsole(QtWidgets.QWidget):
         return PanelCard(
             config, parent=self.board,
             names_provider=self._signal_names, sources_provider=self._signal_providers,
-            formats_provider=self._signal_formats, axes_provider=self._signal_axes,
-            sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x,
-            structure_provider=self._signal_structure, pulse_state_provider=self._pulse_state,
-            grid_recipe_provider=self._grid_recipe,
-            short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace,
+            formats_provider=self._signal_formats,
+            short_names_provider=self._signal_short_names,
             render_request=self._request_card_render,
             fit_analysis_sink=self._open_panel_fit)
 
@@ -581,10 +562,12 @@ class TaskConsole(QtWidgets.QWidget):
         card.show()
         card.changed.connect(self._mark_dirty)
         card.changed.connect(self._sync_fit_analysis_entries)
-        # Picking a signal / editing the source expression changes which signal the panel
-        # reads -> refresh the frame-title legend NOW (it is self-guarded, so this is cheap and
-        # a no-op when nothing changed), instead of lagging a tick behind the pick.
-        card.changed.connect(self._refresh_signal_info)
+        # ``changed`` also covers title/size/display edits.  Read only this
+        # card's tiny binding delta and rebuild legends only when its signal
+        # actually changed; ordinary display edits never enumerate providers.
+        card.changed.connect(
+            lambda c=card: self._card_signal_binding_changed(c)
+        )
         card.dropped.connect(self._snap_dropped_card)   # drag-release only: snap BEFORE the re-pack
         card.layout_changed.connect(self._arrange)
         card.update_interval_changed.connect(self._recompute_tick_interval)
@@ -596,6 +579,8 @@ class TaskConsole(QtWidgets.QWidget):
         if switch is not None:
             card.set_selectors_enabled(switch.isChecked())
         self.cards.append(card)
+        self._card_signal_bindings[id(card)] = self._card_signal_binding(card)
+        self._signal_topology_changed()
         self._sync_fit_analysis_entries()
         self._recompute_tick_interval()        # a new panel's rate may change the timer base
 
@@ -603,38 +588,13 @@ class TaskConsole(QtWidgets.QWidget):
     # ---- producing-node discovery: a panel's data comes from a logic node; its Edit
     # exposes THAT node's acquisition parameters (e.g. a raw-frame panel is
     # produced by the camera measurement -> exposure / roi).
-    @staticmethod
-    def _referenced_signals(source: str) -> set:
-        """The hub signal names a panel's source expression reads (AST Name nodes
-        minus the namespace builtins) -- used to map the panel to its node.  The
-        helper names come from the ONE signal_expr declaration (NAMESPACE_HELPERS),
-        so a helper added there can never surface here as a phantom hub signal;
-        ``value``/``signal`` are the expression-contract tokens (DEFAULT_SOURCE),
-        not namespace helpers, and are excluded separately."""
-        import ast
-
-        from zlc_data.signal_expr import NAMESPACE_HELPERS
-        try:
-            tree = ast.parse(str(source or ""), mode="exec")
-        except SyntaxError:
-            return set()
-        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        return names - set(NAMESPACE_HELPERS) - {"value", "signal"}
-
     def _card_reads(self, card: "PanelCard") -> set:
-        """The REAL hub signal names a panel reads: its picked input(s) (``config.inputs``)
-        plus any hub signal its expression names directly.  The pseudo ``signal`` token in
-        ``value = signal`` is NOT a hub name -- it stands for ``config.inputs[0]`` -- so it
-        is excluded by :meth:`_referenced_signals` and the picked input is unioned in
-        instead.  (Without this the signal-flow legend showed ``signal ← (no running
-        source)`` for a panel that IS wired to a running node.)"""
-        reads = set(self._referenced_signals(card.config.source))
-        reads |= {str(n) for n in getattr(card.config, "inputs", ()) if n}
-        return reads
+        """The panel's one typed dataset binding."""
+
+        return {card.config.signal} if card.config.signal else set()
 
     def _producing_node(self, card: "PanelCard"):
-        """The running node whose published signals the panel's source reads (None if
-        the expression touches no published signal, e.g. a pure constant)."""
+        """The running node that publishes the panel's bound dataset."""
         refs = self._card_reads(card)
         if not refs:
             return None
@@ -655,38 +615,6 @@ class TaskConsole(QtWidgets.QWidget):
         for row in self.logic_nodes:
             if self._logic_nodes.get(id(row)) is node:
                 return row
-        return None
-
-    def _node_scan_range_key(self, node) -> str | None:
-        """The first ``axis_range`` param key of ``node``'s spec -- i.e. the node's swept x-axis, or
-        None when it does not scan a range.  The ONE data-driven test for "a selection on this node's
-        1-D plot can set its scan range", so the plot-selection -> scan-range linkage is enforced for
-        EVERY measurement that declares a scan range, never wired per measurement.
-
-        ``node`` is a BUILT running node, so the spec is resolved via its Logic row's config
-        (``_spec_for_logic`` reads a ``LogicNodeConfig``, not a built node)."""
-        if node is None:
-            return None
-        for row in self.logic_nodes:
-            if self._logic_nodes.get(id(row)) is node:
-                spec = self._spec_for_logic(row.node)
-                for param in getattr(spec, "params", ()) or ():
-                    if getattr(param, "kind", "") == "axis_range":
-                        return param.key
-                return None
-        return None
-
-    def _form_for_node(self, node):
-        """The producing node's OWN Logic-tab Edit FORM (the :class:`MeasurementPanel` that carries its
-        scan range), OPENING its editor if not already open so a staged range always has somewhere to
-        land.  The seam a 1-D plot selection uses to reach the measurement's scan-range param
-        (node -> row -> editor.form), keeping the plot itself decoupled from the form's internals."""
-        for row in self.logic_nodes:
-            if self._logic_nodes.get(id(row)) is node:
-                if self._logic_editors.get(id(row)) is None:
-                    self._edit_logic_node(row)          # lazily create + show the node's Edit tab
-                editor = self._logic_editors.get(id(row))
-                return editor.form if editor is not None else None
         return None
 
     def _apply_source_params(self, row: "LogicNodeRow", values: dict) -> None:
@@ -737,9 +665,9 @@ class TaskConsole(QtWidgets.QWidget):
     def _provider_nodes(self) -> list:
         """Every node that can PROVIDE data or signals to a panel -- the RUNNING nodes plus the last
         build of each Logic-tab node (``_last_node``), kept past Stop.  The ONE source of "which nodes
-        count": signal resolution (:meth:`_node_for_signal`), the picker (:meth:`_signal_providers`),
-        AND the pulse/grid/sitemap/curve auxiliary-data providers all read this, so a stopped node's
-        panel keeps rendering its lingering state instead of erroring "needs a producing node"."""
+        count": signal resolution (:meth:`_node_for_signal`) and the picker
+        (:meth:`_signal_providers`) both read this, so a stopped node's panel keeps rendering its
+        lingering state instead of erroring "needs a producing node"."""
         return [*self.running_nodes, *self._last_node.values()]
 
     def _signal_providers(self) -> dict:
@@ -818,27 +746,6 @@ class TaskConsole(QtWidgets.QWidget):
                 continue
         return out
 
-    def _signal_axes(self) -> dict:
-        """``{signal name: (axis_label, unit)}`` from each PROVIDER node's ``output_specs`` -- so a plot
-        reads its y-axis label/unit from the producing measurement (the SignalSpec it declares), not a
-        hard-coded per-kind string.  Reads the SAME ``_provider_nodes()`` source as every other signal-
-        resolution site (running nodes + the last build kept past Stop), so a stopped node's panel keeps
-        its declared axis label/unit instead of falling back to a default -- its signal still lingers in
-        the hub, so its axis metadata must linger with it."""
-        out: dict[str, tuple[str, str]] = {}
-        for node in self._provider_nodes():
-            if not hasattr(node, "output_specs"):
-                continue
-            try:
-                for spec in node.output_specs():
-                    out[str(spec.name)] = (spec.axis_label, spec.unit)
-            except Exception:
-                continue
-        task_spec = self._task_mid_run_spec()
-        if task_spec is not None:
-            out[TASK_FRAME_KEY] = (task_spec.axis_label, task_spec.unit)
-        return out
-
     def _signal_short_names(self) -> dict:
         """``{full hub signal: SHORT name}`` = each PROVIDER node's published signals with that node's
         prefix stripped (``temperature_survival`` -> ``survival``, ``frame`` -> ``frame``).  The picker
@@ -856,104 +763,13 @@ class TaskConsole(QtWidgets.QWidget):
                 continue
         return out
 
-    def _sites_inputs(self, occ_signal) -> tuple[str | None, str | None]:
-        """For a site-map panel's ONE occupancy signal, return ``(centres_signal,
-        image_signal)`` resolved from the SAME producing node -- so the site map pulls its
-        centres + frame underlay from the one node that made the occupancy (rings + underlay
-        = same shot).  This is the #6 "one signal" wiring: the user picks occupancy, the
-        rest auto.
-
-        The producing node is found among actual running nodes first, reading the
-        centres/underlay output names from ``sitemap_centers_key`` and
-        ``sitemap_image_key``.  A configured-but-not-yet-started Logic-tab row is
-        the fallback, resolved from its spec metadata."""
-        occ = str(occ_signal or "")
-        if not occ:
-            return (None, None)
-        # 1) the producing node (ground truth: whatever publishes this signal) -- running OR kept
-        # past Stop, so a stopped site-map panel still resolves its centres/underlay.
-        for node in self._provider_nodes():
-            ck = getattr(node, "sitemap_centers_key", "")
-            if not ck:
-                continue
-            try:
-                names = set(node.published_signals())
-            except Exception:
-                names = set()
-            if occ in names:
-                prefix = getattr(node, "prefix", "")
-                ik = getattr(node, "sitemap_image_key", "")
-                return (prefix + ck, (prefix + ik) if ik else None)
-        # 2) a configured Logic-tab row whose node has not started yet (spec metadata)
-        for row in self.logic_nodes:
-            spec = self._spec_for_logic(row.node)
-            meta = getattr(spec, "metadata", {}) or {}
-            if not meta.get("centers_key"):
-                continue
-            node = self._logic_nodes.get(id(row))
-            prefix = getattr(node, "prefix", "") if node is not None else ""
-            names = set(node.published_signals()) if node is not None else set()
-            default_occ = prefix + str(getattr(spec, "default_value_key", "") or "")
-            if occ in names or (default_occ and occ == default_occ):
-                ck, ik = meta.get("centers_key"), meta.get("image_key")
-                return ((prefix + ck) if ck else None, (prefix + ik) if ik else None)
-        return (None, None)
-
-    def _curve_x(self, y_signal) -> str | None:
-        """For a 1d plot wired to a scan's y CURVE, the companion x-axis signal resolved
-        from the SAME producing node (the scan node exposes ``y_signal``/``x_signal``).  So
-        wiring a 1d panel to ``temperature_survival`` draws it vs ``temperature_t_off`` with
-        the right x-axis -- the user picks ONE signal (#3, same idea as the site map)."""
-        y = str(y_signal or "")
-        if not y:
-            return None
-        for node in self._provider_nodes():
-            if getattr(node, "y_signal", None) == y:
-                return getattr(node, "x_signal", None)
-        return None
-
-    def _pulse_state(self, value_signal):
-        """For a PULSE panel's ``value`` signal, resolve ``(PulseTableState, include_always_off)`` off the
-        SAME producing node (the loaded-figure node CARRIES the reproduction state as an attribute --
-        the float-only hub cannot hold the object).  This is the SAME "auxiliary data from the producing
-        node" wiring the site map uses for its centres / frame; the hub value is only a numeric
-        placeholder.  ``None`` when no running node produces this signal with a pulse state."""
-        name = str(value_signal or "")
-        if not name:
-            return None
-        for node in self._provider_nodes():
-            try:
-                published = set(node.published_signals())
-            except Exception:
-                published = set()
-            if name in published and getattr(node, "pulse_state", None) is not None:
-                return (node.pulse_state, bool(getattr(node, "pulse_include_always_off", True)))
-        return None
-
-    def _grid_recipe(self, value_signal):
-        """For a GRID panel's ``value`` signal, resolve its replay RECIPE (a dict) off the SAME producing
-        node -- the loaded-figure node CARRIES the recipe as an attribute (the float-only hub cannot hold
-        the dict), exactly as :meth:`_pulse_state` resolves a pulse panel's state.  ``None`` when no running
-        node produces this signal with a grid recipe."""
-        name = str(value_signal or "")
-        if not name:
-            return None
-        for node in self._provider_nodes():
-            try:
-                published = set(node.published_signals())
-            except Exception:
-                published = set()
-            if name in published and getattr(node, "grid_recipe", None) is not None:
-                return node.grid_recipe
-        return None
-
     def _live_node_formats(self, node) -> list[tuple[str, str, str]]:
         """``[(name, shape, description)]`` for a RUNNING node -- one ROW per output, each
         shape read off a real value via ``shape_text.describe_shape`` (auto, never hand-typed)
-        and each description from the node's ``output_specs`` (what the signal MEANS).  A
-        measurement / processor publishes to the hub under its prefix; a TASK is OFF the
-        hub, so it documents what it streams mid-run (its ``output`` buffer) + what it
-        produces (its ``result`` keys), shapes filled in as the values appear."""
+        and each description from the node's ``output_specs`` (what the signal MEANS).
+        Measurement and processor nodes publish to the data plane under their prefix.
+        Task outputs are FINAL artifact declarations and are rendered by the spec-only
+        branch in :meth:`_update_row_publishes`, never fabricated as live signals."""
         from zlc_data.shape_text import describe_shape
         specs = {s.name: s for s in node.output_specs()} if hasattr(node, "output_specs") else {}
 
@@ -961,30 +777,7 @@ class TaskConsole(QtWidgets.QWidget):
             spec = specs.get(name)
             return spec.description if spec is not None else ""
 
-        def schema_of(key: str):
-            spec = specs.get(key)
-            if spec is None:
-                return None
-            try:
-                return spec.to_schema()
-            except Exception:
-                return None
-
         rows: list[tuple[str, str, str]] = []
-        if getattr(node, "layer", "") == "task":
-            buf = getattr(node, "output", None)
-            for key in getattr(node, "mid_run", ()):
-                if key in ("progress", "stage"):          # progress %/text live on the banner
-                    continue
-                value = buf.latest(key) if buf else None
-                # #12: feed the declared schema so a task signal renders the SAME `R × P × (data)`
-                # a measurement/processor signal does -- not the raw one-outer-paren fallback.
-                rows.append((f"{key}{MID_RUN_TAG}", self._describe_from_schema(value, schema_of(key)), desc(key)))
-            result = getattr(node, "result", None) or {}
-            for key in getattr(node, "provides", ()):
-                value = result.get(key) if isinstance(result, dict) else None
-                rows.append((f"{key} (result)", self._describe_from_schema(value, schema_of(key)), desc(key)))
-            return rows
         # published_signals() are HUB names (incl. the node's disambiguating prefix when two
         # nodes would collide).  Show the SHORT natural name (strip the prefix) because the
         # Logic row is already titled by the node.  ``output_specs`` (and so ``desc``) is
@@ -1009,8 +802,16 @@ class TaskConsole(QtWidgets.QWidget):
         meaning).  Shapes are AUTO-EXTRACTED from the real published VALUES
         (``shape_text.describe_shape``) and the meaning from the node's ``output_specs`` --
         never a hand-typed map.  Running node: live shapes off the hub (measurement /
-        processor) or its mid-run buffer + result (task).  Stopped node: the NAMES it
-        will produce (shape ``—`` until it runs)."""
+        processor).  A task lists its declared FINAL artifact names at every
+        lifecycle state; those names never pretend to be live data-plane signals.
+        Stopped data-plane node: the NAMES it will publish (shape ``—`` until it runs)."""
+        if row.node.kind == "task":
+            spec = self._spec_for_logic(row.node)
+            outputs = getattr(spec, "declared_outputs", ()) or ()
+            row.set_publishes(
+                [(str(output.short or output.name), "FINAL", "") for output in outputs]
+            )
+            return
         node = self._logic_nodes.get(id(row))
         if node is not None and getattr(node, "running", False):
             row.set_publishes(self._live_node_formats(node))
@@ -1030,8 +831,8 @@ class TaskConsole(QtWidgets.QWidget):
         been built reads its node's own ``prefix`` back -- re-running the collision rule later
         would drift with hub state (a sibling stopped by the device exclusion before it ever
         published leaves no trace, so a recomputation would 'un-collide' a name that IS published).
-        Only a never-started row PREDICTS with the same rule.  A task is off the hub (its mid-run
-        entry is a synthetic display tag, not a hub name) -> ``""``."""
+        Only a never-started row PREDICTS with the same rule.  A task is off the
+        data plane and therefore has no prefix."""
         if row.node.kind == "task":
             return ""
         built = self._logic_nodes.get(id(row)) or (getattr(self, "_last_node", {}) or {}).get(id(row))
@@ -1046,11 +847,10 @@ class TaskConsole(QtWidgets.QWidget):
         start later" binding (and a save->load of one) re-attach automatically when the producer
         publishes that exact name.  The bare keys come from the ONE kind ladder
         (:meth:`_node_bare_keys` -- shared with the prefix collision check, so what the picker
-        declares is exactly what is checked and published); a task is off the hub and instead
-        shows a SYNTHETIC mid-run tag."""
-        if row.node.kind == "task":                        # off-hub one-shot (never a hub signal)
-            spec = self._spec_for_logic(row.node)
-            return [f"{getattr(spec, 'mid_run_key', DEFAULT_MID_RUN_KEY)}{MID_RUN_TAG}"]
+        declares is exactly what is checked and published).  A task publishes no live signal;
+        its declared FINAL artifact names are added separately for the exact Analysis entry."""
+        if row.node.kind == "task":
+            return []
         pfx = self._declared_node_prefix(row)              # prepend the node prefix -> == published_signals()
         return [f"{pfx}{k}" for k in self._node_bare_keys(row.node)]
 
@@ -1103,106 +903,10 @@ class TaskConsole(QtWidgets.QWidget):
             return describe_shape(value, points_shape=ps, data_shape=ds, grid_shape=gs)
         return contract_shape_label(int(st["ring"] or 1), ps, ds, gs)
 
-    def _task_mid_run_spec(self):
-        """The declared ``SignalSpec`` behind the running task panel's reserved source."""
-
-        node = self._task_output_node
-        if node is None or not hasattr(node, "output_specs"):
-            return None
-        try:
-            return next(
-                (spec for spec in node.output_specs() if str(spec.name) == self._task_mid_key),
-                None,
-            )
-        except Exception:
-            return None
-
-    def _task_mid_run_schema(self):
-        """The TaskOutput schema, available both before and after its first numeric publish."""
-
-        node = self._task_output_node
-        # A run node exposes spec / request / handle / snapshot; the mid-run OUTPUT channel is
-        # not wired to the monitor seam yet, and a node without one has no declared schema to
-        # report.  Saying so lets the panel open and wait; reaching for it aborts the process.
-        if node is None or not hasattr(node, "output"):
-            return None
-        try:
-            return node.output.schema(self._task_mid_key)
-        except KeyError:
-            spec = self._task_mid_run_spec()
-            return spec.to_schema() if spec is not None else None
-
-    def _task_mid_run_structure(self):
-        """Plot structure for the off-hub TaskOutput, without downgrading it to raw data."""
-
-        schema = self._task_mid_run_schema()
-        node = self._task_output_node
-        if schema is None or node is None:
-            return None
-        result = self._schema_structure(schema)
-        # A multidimensional TaskOutput point_shape is already the authoritative
-        # scan geometry; unrelated domain geometry must not override it.
-        if len(schema.point_shape) > 1:
-            result["grid_shape"] = tuple(schema.point_shape)
-
-        names = tuple(str(n) for n in (getattr(node, "scan_names", ()) or ()))
-        arrays = tuple(getattr(node, "scan_arrays", ()) or ())
-        if names:
-            result["param_names"] = list(names)
-        elif schema.metadata.get("coordinate_names"):
-            result["param_names"] = [str(n) for n in schema.metadata["coordinate_names"]]
-        if arrays:
-            point_shape = tuple(result["grid_shape"] or result["points_shape"])
-            if len(arrays) != len(point_shape):
-                raise ValueError(
-                    f"task declares {len(arrays)} coordinate arrays for point_shape {point_shape}.")
-            coordinates = []
-            for axis, (values, size) in enumerate(zip(arrays, point_shape)):
-                values = np.asarray(values).reshape(-1)
-                if values.size != size:
-                    raise ValueError(
-                        f"task coordinate axis {axis} has {values.size} values; expected {size}.")
-                coordinates.append(values.tolist())
-            result["points_coords"] = coordinates
-        return result
-
-    def _task_mid_run_config(self, *, title: str) -> PanelConfig:
-        """The dedicated Monitor panel a running task's mid-run buffer is shown in (#5/#8).
-
-        A task publishes NOTHING to the hub, so this panel cannot be bound the ordinary
-        way: its source names the reserved off-hub key the console injects each tick, and
-        ``PanelConfig.set_source`` binds the single input slot to that same key -- ONE
-        spelling of the binding instead of a source and an input that could disagree.
-
-        The kind is READ from what the task declared it streams, through the same
-        by-dimensionality rule the console's 'auto' sub-plot kind uses: a buffer of camera
-        frames opens an image, a scalar per scan point opens a curve.  When the task
-        declares no readable shape the buffer's default key is ``frame``, so an image is
-        the honest default rather than a guess.
-        """
-
-        from zlc_data.facet import default_sub_plot_kind
-
-        structure = self._task_mid_run_structure()
-        kind = "2d"                    # no readable declaration -> the buffer's default key is `frame`
-        if structure:
-            try:
-                kind = default_sub_plot_kind(
-                    "repeat",
-                    points_shape=tuple(structure.get("points_shape") or ()),
-                    data_shape=tuple(structure.get("data_shape") or ()),
-                )
-            except ValueError:
-                kind = "2d"            # ambiguous retained axes -- show the frame, not nothing
-        return PanelConfig(kind=kind, title=title, row=GAP, col=GAP, size="1x2",
-                           source=f"value = {TASK_FRAME_KEY}")
-
     def _signal_structure(self, name: str):
-        """Read the authoritative Hub or TaskOutput ``SignalSchema`` for plotting."""
+        """Read the authoritative data-plane ``SignalSchema`` for plotting."""
 
         name = str(name)
-        if name == TASK_FRAME_KEY:
-            return self._task_mid_run_structure()
         try:
             schema = self._signal_schema(name)
         except KeyError:
@@ -1226,21 +930,42 @@ class TaskConsole(QtWidgets.QWidget):
             result["points_coords"] = arrays
         return result
 
+    @staticmethod
+    def _card_signal_binding(card: "PanelCard") -> str:
+        """The only card fields that can change its signal-source legend."""
+
+        return str(card.config.signal or "")
+
+    def _card_signal_binding_changed(self, card: "PanelCard") -> None:
+        """Consume one card-local binding delta, not a whole-board snapshot."""
+
+        if card not in self.cards:
+            return
+        current = self._card_signal_binding(card)
+        if self._card_signal_bindings.get(id(card)) == current:
+            return
+        self._card_signal_bindings[id(card)] = current
+        self._signal_topology_changed()
+
+    def _signal_topology_changed(self) -> None:
+        """Reconcile legends after an explicit provider/card topology mutation."""
+
+        self._signal_info_dirty = True
+        if not self._building:
+            self._refresh_signal_info()
+
     def _refresh_signal_info(self) -> None:
         """Give every panel a legend (shown in its frame TITLE -- the grey strip, the old footer
-        was removed) naming, FOR EACH signal the
-        panel actually reads, WHICH node + layer produces it -- e.g.
-        ``occupied ← occupancy [processor]``.  It lists only the signals this panel
-        uses (not the producing node's whole output set), so the title answers
-        exactly "this plot's value comes from which measurement/processor".  A read
-        published by more than one running node is flagged ambiguous.  Self-guarded:
-        recomputes only when the sources / nodes / published names change."""
-        providers = self._signal_providers()
-        sig = (tuple(sorted((k, len(v)) for k, v in providers.items())),
-               tuple((id(c), c.config.source, tuple(c.config.inputs or ())) for c in self.cards))
-        if sig == getattr(self, "_signal_info_sig", None):
+        was removed) naming which node + layer produces the panel's one bound signal -- e.g.
+        ``occupied ← occupancy [processor]``.  It does not list the producing node's whole
+        output set, so the title answers exactly "this plot's value comes from which
+        measurement/processor".  A signal
+        published by more than one running node is flagged ambiguous.  The
+        caller is an explicit topology/card-binding mutation; a timer tick with
+        no such mutation does not enter this method's provider enumeration."""
+        if not self._signal_info_dirty:
             return
-        self._signal_info_sig = sig
+        providers = self._signal_providers()
         # GC the hub of ORPHANED signals (#5 unbound): the AUTHORITATIVE invariant -- a hub signal that NO
         # live producer still publishes is stale and must leave, else it piles up as an "(unbound)" picker
         # entry run-after-run.  ``providers`` is the single source of "who publishes what" (running nodes +
@@ -1274,6 +999,7 @@ class TaskConsole(QtWidgets.QWidget):
             # one read per line: "<signal> ← <node> [layer]" -- the value's origin only,
             # not the producing node's full output list.
             card.set_signal_info("\n".join(parts))
+        self._signal_info_dirty = False
 
     def _restart_node(self, node, new_params: dict):
         """Apply edited acquisition parameters to the producing node so the
@@ -1343,6 +1069,11 @@ class TaskConsole(QtWidgets.QWidget):
             time.sleep(0.01)
         if node in self.running_nodes:
             self.running_nodes.remove(node)
+            # A stopped Logic row remains represented by ``_last_node`` and
+            # therefore keeps the same provider legend.  Row-less injected
+            # nodes have no retained provider and are a real topology change.
+            if not any(value is node for value in self._last_node.values()):
+                self._signal_topology_changed()
         return True
 
     def _edit_card(self, card: "PanelCard") -> None:
@@ -1376,27 +1107,6 @@ class TaskConsole(QtWidgets.QWidget):
         editor.teardown()
         editor.setParent(None)
         editor.deleteLater()
-
-    def _refresh_panel_editor(self, card: "PanelCard") -> None:
-        """Rebuild a card's OPEN Edit tab in place (same tab slot, same selection) -- used when the
-        panel's resolved param kind changed underneath it (a grid's facet / sub-plot pick), so the
-        page's baked param rows follow instead of lying."""
-        old = self._panel_editors.get(id(card))
-        if old is None:
-            return
-        index = self.tabs.indexOf(old)
-        was_current = self.tabs.currentWidget() is old
-        self._close_panel_editor(card)
-        editor = PanelEditor(card, self)
-        self._panel_editors[id(card)] = editor
-        title = (card.config.title or PANEL_KINDS[card.config.kind]).strip() or "panel"
-        self.tabs.add_closable_tab(editor, title)
-        new_index = self.tabs.indexOf(editor)
-        if 0 <= index < new_index:
-            self.tabs.tabBar().moveTab(new_index, index)     # keep the tab where the user left it
-        if was_current:
-            self.tabs.setCurrentWidget(editor)
-        editor.rebuild()
 
     def _on_editor_tab_closed(self, widget) -> None:
         """X on a PanelEditor / LogicNodeEditor tab: tear it down + drop it from the
@@ -1518,10 +1228,6 @@ class TaskConsole(QtWidgets.QWidget):
         # one name in the card header / Edit tab / frame title.
         title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
         config = PanelConfig(kind=str(kind), title=title, row=GAP, col=GAP, size="1x2")
-        if str(kind) == "grid":
-            # An Add-Panel grid IS the axis-expander: default to faceting the repeat axis so binding
-            # a signal shows cells at once ("(recipe)" is only meaningful for a LOADED figure's grid).
-            config.params["facet"] = "repeat"
         # APPEND the new card LAST in order (``_attach_card`` adds it to the end of ``self.cards``);
         # the order-driven :func:`pack` in ``_arrange`` then lands it in the next free BOTTOM slot,
         # never a middle hole (#2).  No pixel seed needed -- pack recomputes every card's position from
@@ -1534,13 +1240,9 @@ class TaskConsole(QtWidgets.QWidget):
     def _remove_panel(
         self,
         card: PanelCard,
-        *,
-        allow_task_owned: bool = False,
     ) -> bool:
-        # User removal is blocked while a task owns the console.  The task lifecycle uses the
-        # explicit ``allow_task_owned`` capability; it never temporarily unlocks the UI merely to
-        # obtain teardown authority.
-        if self._task_locked and not allow_task_owned:
+        # User removal is blocked while a task owns the console.
+        if self._task_locked:
             return False
         phases = self._panel_teardown_phases.setdefault(id(card), set())
         if "detached" in phases:
@@ -1560,6 +1262,8 @@ class TaskConsole(QtWidgets.QWidget):
             phases.add("shutdown")
         if "removed" not in phases:
             self.cards.remove(card)
+            self._card_signal_bindings.pop(id(card), None)
+            self._signal_topology_changed()
             phases.add("removed")
         if "qt_detached" not in phases:
             card.setParent(None)
@@ -1707,6 +1411,7 @@ class TaskConsole(QtWidgets.QWidget):
         self.logic_layout.insertWidget(self.logic_layout.count() - 1, row)
         self.logic_nodes.append(row)
         self._logic_nodes[id(row)] = None
+        self._signal_topology_changed()
         self.logic_hint.hide()
         self._update_row_publishes(row)                       # show its outputs + shapes up front
         self._sync_fit_analysis_entries()
@@ -1891,6 +1596,7 @@ class TaskConsole(QtWidgets.QWidget):
         # other running node owns -> a switched/rebuilt node leaves NO orphan "(unbound)" signal behind.
         self._logic_nodes[id(row)] = node
         self._last_node[id(row)] = node           # survives Stop, for signal-source labelling
+        self._signal_topology_changed()
         self._sync_fit_analysis_entries()         # a new generation revoked the previous FINAL ref
         row.set_state("running", status="running")
         self._update_row_publishes(row)            # now show the LIVE node's published shapes
@@ -1899,10 +1605,11 @@ class TaskConsole(QtWidgets.QWidget):
             editor.set_status("running", error=False)
         self.status_dot.set_color(GREEN)
         self._mark_dirty()
-        # A TASK (one-shot orchestration) TAKES OVER the console (confocal-style): show
-        # its mid-run output in a dedicated Monitor panel + LOCK every other action.
+        # A TASK (one-shot orchestration) takes over the console while it runs.
+        # Status is honest lifecycle text; live plots appear only when a task
+        # exposes a formal monitor dataset through the ordinary data plane.
         if self._declared_layer(node) == "task":
-            self._set_task_running(row, node)
+            self._set_task_running(row)
 
     @staticmethod
     def _declared_layer(node) -> str:
@@ -1916,60 +1623,26 @@ class TaskConsole(QtWidgets.QWidget):
         spec = getattr(node, "spec", None)
         return str(getattr(spec, "kind", "") or "")
 
-    @staticmethod
-    def _declared_signal_names(node) -> tuple[str, ...]:
-        """The outputs a run node carries, from its catalog spec's declaration.
+    def _set_task_running(self, row: "LogicNodeRow") -> None:
+        """Engage task-run mode without manufacturing a display dataset.
 
-        Declared, not introspected: the catalog states a definition's outputs
-        before anything runs, so a row's signal list is the same whether the run
-        is stopped, starting or live -- the picker never has to wait for a first
-        publish to know what a node offers.
+        The Run lifecycle and its FINAL artifact are real; a mid-run plot exists
+        only when a formal monitor producer has been admitted to the ordinary
+        data plane.  Until then the persistent status strip is the complete,
+        truthful UI for a running task.
         """
 
-        spec = getattr(node, "spec", None)
-        return tuple(
-            str(decl.name) for decl in getattr(spec, "declared_outputs", ()) or ()
-        )
-
-    def _set_task_running(self, row: "LogicNodeRow", node) -> None:
-        """Engage task-run mode: open the task's dedicated mid-run panel (declared by
-        :meth:`_task_mid_run_config`, built through the generic panel path) and LOCK all other
-        controls so the only actions are Stop / wait (#5, confocal task semantics)."""
-        spec = self._spec_for_logic(row.node)
-        self._task_mid_key = str(getattr(spec, "mid_run_key", DEFAULT_MID_RUN_KEY))
-        # Bind the typed source BEFORE constructing the generic PanelCard: construction may ask its
-        # structure provider for the declared schema before the task's first numeric publish.
-        self._task_output_node = node
-        self._task_card_tensor = None
-        config = self._task_mid_run_config(title=f"Task: {row.node.title}")
-        card = self._new_panel_card(config)
-        self._attach_card(card)
-        self._task_card = card
         self._running_task_row = row
-        self._arrange()
-        # Assemble the strip's task line BEFORE engaging the lock: _apply_task_lock flips the
-        # strip immediately, so the text must already be there (never one tick of stale idle text).
-        self._update_task_status_text(node)
+        self._update_task_status_text()
         self._apply_task_lock(True)
 
-    def _update_task_status_text(self, node) -> None:
-        """Assemble the running task's one-line progress text for the persistent status strip
-        (its display -- and its priority against a node error -- is _update_summary's job)."""
+    def _update_task_status_text(self) -> None:
+        """Assemble the running task's honest lifecycle status line."""
+
         row = self._running_task_row
         if row is None:
             return
-        if not hasattr(node, "output"):
-            # No mid-run output channel on this node: report that it is running rather than
-            # inventing a percentage.  Wiring that channel to the monitor seam is its own piece.
-            self._task_status_text = f"⏳  Task running: {row.node.title}"
-            return
-        pct = int(round(float(getattr(node.output, "progress", 0.0)) * 100))
-        # the task's current STAGE (e.g. "reference frame 23/30", "fitting per-site
-        # thresholds") so the operator sees what step the calibration is on, not just %.
-        stage = node.output.latest("stage")
-        stage_txt = f"  —  {stage}" if stage else ""
-        self._task_status_text = (f"⏳  Task running: {row.node.title}  —  {pct}%{stage_txt}  "
-                                  "(all other controls locked until it finishes / you Stop it)")
+        self._task_status_text = f"⏳  Task running: {row.node.title}"
 
     def _apply_task_lock(self, locked: bool) -> None:
         """Disable / re-enable every mutating control while a task runs.  The strip's Stop
@@ -1989,59 +1662,11 @@ class TaskConsole(QtWidgets.QWidget):
         if row is not None:
             self._stop_logic_node(row)
 
-    def _clear_task_running(self) -> bool:
-        """Leave task-run mode (task finished OR stopped): drop the lock + banner and REMOVE the
-        transient mid-run panel the task owned.  Finish and Stop take the SAME path (#C) -- a task's
-        plot panel is transient (it only showed the work in progress), so it is auto-removed when the
-        task ends; the operator's own panels are never touched (only ``_task_card`` is removed)."""
-        card = self._task_card
-        if card is not None and card in self.cards:
-            if self._defer_task_card_teardown:
-                if self._deferred_task_card not in (None, card):
-                    raise RuntimeError("more than one task card was deferred during shutdown")
-                self._deferred_task_card = card
-            elif not self._remove_panel(card, allow_task_owned=True):
-                return False
+    def _clear_task_running(self) -> None:
+        """Leave task-run mode after either completion or an explicit Stop."""
+
         self._running_task_row = None
-        self._task_card = None
         self._apply_task_lock(False)
-        self._task_card_tensor = None
-        self._task_output_node = None
-        return True
-
-    def _refresh_task_panel(self) -> None:
-        """Pump the running task's mid-run output (from its OWN buffer) into the
-        dedicated panel + banner each tick, and leave task-run mode once it finishes."""
-        if self._task_card is None:
-            return
-        node = self._task_output_node
-        if node is None:
-            return
-        try:
-            self._task_card_tensor = (node.output.latest_tensor(self._task_mid_key)
-                                      if hasattr(node, "output") else None)
-        except KeyError:
-            pass
-        self._update_task_status_text(node)
-        # The task card is a normal member of ``self.cards``.  The tick below
-        # freezes and submits it through the same worker lane as every other
-        # panel; polling the task output never renders from this Qt callback.
-        # NB: leaving task-run mode on finish is handled in ONE place -- _poll_logic_nodes
-        # (the canonical node-lifecycle tick, which runs every tick regardless of whether
-        # a mid-run panel exists), so a self-finishing task always releases the lock.
-
-    @staticmethod
-    def _repeat_value(values: dict):
-        """The acquisition knob from the form -> ``repeat:int`` (#H3n, ONE knob with 0 = ∞).  ``repeat``
-        is the depth of the measurement's repeat axis: ``K`` keeps a K-deep block (K passes/frames
-        averaged) then STOPS; ``0`` rolls a 1-deep ring forever (a live monitor).  There is NO separate
-        free-run toggle -- 0 IS infinite, the SAME semantics as the pulse-scan / scan-repeat count, so
-        every measurement reads one number.  Pops the key so it never leaks into the build kwargs."""
-        rv = values.pop("repeat", 0)
-        try:
-            return max(0, int(float(rv)))
-        except (TypeError, ValueError):
-            return 0
 
     def _build_logic_node(self, node: LogicNodeConfig, values: dict):
         """Freeze this row into a ConsoleRunNode -- the RUN seam's unit of work.
@@ -2073,16 +1698,16 @@ class TaskConsole(QtWidgets.QWidget):
             )
 
     def _request_card_render(self, card: PanelCard, *, force: bool = False) -> bool:
-        """Freeze and enqueue one card from the latest immutable data front."""
+        """Re-render one card from its already accepted immutable data front.
+
+        This entry is used by Setting/selector view commits.  Advancing the
+        data plane belongs only to the base tick or explicit full Refresh; a
+        mouse/key event cannot materialize producer data as a side effect.
+        """
 
         if self._render_closing or card not in self.cards:
             return False
-        snapshot = self._data.freeze()
-        request = card.freeze_render_request(
-            snapshot,
-            self._panel_frame_key(card, snapshot.versions()),
-            force=bool(force),
-        )
+        request = card.freeze_current_view_request(force=bool(force))
         if request is None:
             return False
         self._enqueue_render_requests((request,))
@@ -2297,15 +1922,8 @@ class TaskConsole(QtWidgets.QWidget):
                             "stop pending: the run has not gone terminal", error=True
                         )
                 return False
-        # A failed clear keeps the task row/card references so the next tick or close retry
-        # can finish the teardown instead of destroying a Figure still in use.
-        if row is self._running_task_row and not self._clear_task_running():
-            row.set_state("stopped", status="panel teardown pending")
-            editor = self._logic_editors.get(id(row))
-            if editor is not None:
-                editor.set_running(False)
-                editor.set_status("panel teardown pending", error=True)
-            return False
+        if row is self._running_task_row:
+            self._clear_task_running()
         self._logic_nodes[id(row)] = None
         editor = self._logic_editors.get(id(row))
         if not _silent:
@@ -2349,6 +1967,7 @@ class TaskConsole(QtWidgets.QWidget):
         self._last_node.pop(id(row), None)
         if row in self.logic_nodes:
             self.logic_nodes.remove(row)
+        self._signal_topology_changed()
         self.logic_layout.removeWidget(row)
         row.setParent(None)
         row.deleteLater()
@@ -2449,88 +2068,6 @@ class TaskConsole(QtWidgets.QWidget):
         value = self._tick_data.value(str(name))
         return None if value is None else value.schema
 
-    def _expression_namespace(self, snapshot=None) -> dict[str, object]:
-        """The board's shared expression namespace, built from ONE frozen tick.
-
-        Coherence comes from the freeze itself, not from a clock: every signal in
-        a snapshot was materialised in the same pass, so a frame 2-D panel and an
-        occupancy sitemap fed from it cannot show different instants.  The old
-        console instead computed a global display shot (the min over co-displayed
-        producers' provenance) and re-read a mutable hub at it; a snapshot needs
-        no such arbitration, and there is no hub left to re-read.
-
-        Panel expressions keep the same vocabulary they always had -- ``latest``,
-        ``schema``, ``names``, ``np`` -- now answered by the snapshot, so what an
-        expression can see is exactly what the board is drawing.
-        """
-
-        import math
-
-        data = snapshot if snapshot is not None else self._tick_data
-        namespace: dict[str, object] = {
-            name: value.values for name, value in data.signals.items()
-        }
-        namespace.update({
-            "latest": lambda name: (
-                data.value(str(name)).values if data.value(str(name)) is not None else None
-            ),
-            "schema": lambda name: (
-                data.value(str(name)).schema if data.value(str(name)) is not None else None
-            ),
-            "names": lambda: data.names(),
-            "np": np,
-            "numpy": np,
-            "math": math,
-        })
-        valid = {}
-        task_tensor = self._task_card_tensor
-        namespace[TASK_FRAME_KEY] = task_tensor.data if task_tensor is not None else None
-        if task_tensor is not None:
-            valid[TASK_FRAME_KEY] = task_tensor.valid
-        namespace[SIG_VALID_KEY] = valid
-        # Per-signal versions (reserved key) so a rolling monitor can tell a new
-        # sample of its own source from an unrelated producer's advance.
-        namespace[SIG_VERSIONS_KEY] = data.versions()
-        # Coordinate frames (reserved key): {signal: [x, w, y, h]} for a source that
-        # declares a ROI, so a 2D panel's axes are REAL camera pixels, not 0..N.
-        namespace[COORD_FRAMES_KEY] = self._coord_frames()
-        return namespace
-
-    def _coord_frames(self) -> dict[str, list]:
-        """Map each node-published signal to its source's spatial ``region``
-        endpoints ``[x_min, x_max, y_min, y_max]`` (the acquisition-layer format)
-        when the node declares one (a camera frame), so a panel can put its axes in
-        real source pixels.  A panel reads index 0 (x_min) and index 2 (y_min) as
-        the axis origin, so this is robust to endpoints vs any position+size form.
-
-        Reads :meth:`_provider_nodes` -- the ONE source of "which nodes count" (running nodes first,
-        then each Logic row's last build kept past Stop) -- with ``setdefault`` so a RUNNING provider
-        wins, exactly the first-match semantics :meth:`_node_for_signal` uses.  The coordinate frame is
-        a property of the signal's producing node, NOT of its run state: a STOPPED camera's lingering
-        ``frame_0`` keeps its real pixel frame, so a bound 2-D panel's ``_needs_structural_build``
-        region comparison stays constant across stop/start and the panel is NEVER rebuilt (zoom /
-        selector geometry / clim all survive).  The old running-only scan flipped the frame to None on
-        Stop and back on Start -- two spurious full rebuilds that wiped the view (#3)."""
-        frames: dict[str, list] = {}
-        seen: set[int] = set()
-        for node in self._provider_nodes():
-            if node is None or id(node) in seen:
-                continue
-            seen.add(id(node))
-            try:
-                region = node.acquisition_parameters().get("region")
-            except Exception:
-                region = None
-            if not region:
-                continue
-            try:
-                sigs = node.published_signals() if hasattr(node, "published_signals") else ()
-            except Exception:
-                sigs = ()
-            for s in sigs:
-                frames.setdefault(str(s), list(region))
-        return frames
-
     def _recompute_tick_interval(self) -> None:
         """Re-base the shared timer to the SMALLEST panel ``update_ms`` (which divides every
         other rate in :data:`UPDATE_INTERVALS`, so the rates co-align) and reset the tick
@@ -2548,11 +2085,10 @@ class TaskConsole(QtWidgets.QWidget):
         self._paused = not self._paused
         self.pause_button.setText("Resume" if self._paused else "Pause")
         self.pause_button.set_color(GREEN if self._paused else ORANGE)
-        # A paused display freezes every panel: _tick returns early while paused (no card advances its
-        # _render_version), and the LAST live tick already presented ONE coherent shot (the two-phase
-        # compose-all-then-present-all render), so the frozen board is a single consistent shot.  On
-        # Resume every stale panel's frame key differs from what it drew, so each recomposes on its
-        # next update_ms beat (same-beat panels catch up together at the shared coherent shot).
+        # A paused display freezes every panel at its last accepted front.  Those
+        # fronts may belong to independent producers and therefore carry no
+        # board-wide same-shot claim.  On Resume each stale card catches up from
+        # its own source revisions on its next update_ms beat.
         if not self._paused:
             self._tick()
 
@@ -2614,10 +2150,9 @@ class TaskConsole(QtWidgets.QWidget):
     def _panel_frame_key(self, card, versions: Mapping[str, int]):
         """The identity of the frame this panel would draw from the current tick.
 
-        A panel is stale exactly when a signal it READS has advanced.  Coherence
-        across panels is a property of the freeze -- every panel in one tick reads
-        one snapshot, so the three frames of a pulse can never split -- which is
-        what the old global display shot was arbitrating by hand.
+        A panel is stale exactly when one of the signals it reads has advanced.
+        The key is deliberately per-card/per-signal: sharing a present cycle
+        never asserts that unrelated producers emitted the same physical shot.
         """
 
         return tuple(
@@ -2630,27 +2165,22 @@ class TaskConsole(QtWidgets.QWidget):
         # one-shot node's run-complete / error transition is never missed if the node
         # self-stops between version bumps.
         self._poll_logic_nodes()
-        self._refresh_signal_info()   # cheap + self-guarded: tracks source/node changes
-        # A running task's mid-run output is OFF the hub (#6), so it does NOT bump the
-        # hub version -- refresh its dedicated panel here every tick.
-        self._refresh_task_panel()
-        # PAUSE = freeze the board: skip the render below (no card advances its _render_version) while
-        # node polling / banners stay alive.  On Resume the coherent clock has moved on, so every stale
-        # panel's frame key differs from what it drew and the gate below recomposes them together.
+        # PAUSE = freeze the board: skip the render below (no card advances its
+        # _render_version) while node polling/banners stay alive.  On Resume each
+        # card compares only the revisions of the producers it actually reads.
         if self._paused:
             self._update_summary()
             return
         self._tick_count += 1
-        # ONE freeze for the whole tick: what every panel, legend and picker reads.
+        # One immutable front for this GUI pass.  It is a per-producer-latest
+        # observation, not a board-wide physical-shot join.
         self._tick_data = self._data.freeze()
         versions = self._tick_data.versions()
         elapsed = self._tick_count * self._base_interval_ms
-        # COLLECT every panel whose coherent frame changed and whose beat is due (or owed).  The panel's
-        # OWN beat (update_ms) gates WHEN it recomposes; the coherent clock decides WHAT it shows (the
-        # shared snapshot at ``disp``).  Panels on the same beat flip to the same shot in the same
-        # batch (the three emCCD frames of a pulse never split); a panel on a slower beat holds its
-        # previous coherent shot until its beat comes round -- that is what choosing a slower update
-        # interval MEANS.  A mid-drag panel is skipped whole (a live recompose under a drag stomps
+        # COLLECT every panel whose own source revisions changed and whose beat is
+        # due (or owed).  ``update_ms`` gates when that card recomposes; batching
+        # only makes presentation efficient and carries no cross-producer
+        # same-shot assertion.  A mid-drag panel is skipped whole (a live recompose under a drag stomps
         # the widget blit backgrounds); its beat is owed too, so it catches up right on release.
         batch = []
         for card in self.cards:
@@ -2681,7 +2211,6 @@ class TaskConsole(QtWidgets.QWidget):
 
         self._poll_logic_nodes()
         self._refresh_signal_info()
-        self._refresh_task_panel()
         self._tick_data = self._data.freeze()
         versions = self._tick_data.versions()
         self._enqueue_render_batch(
@@ -2788,10 +2317,9 @@ class TaskConsole(QtWidgets.QWidget):
         Distinct from :meth:`shutdown`, which also tears the cards/editors down.
 
         Going row-by-row through ``_stop_logic_node`` (never bare ``node.stop()``) is load-bearing:
-        a bare stop leaves the dead node in ``running_nodes`` and the row painted "running" -- the
-        zombie then freezes the WHOLE board's shot clock (``_display_shot`` takes the min over
-        bound-and-live signals, and a dead node's provenance never advances) and the reopened
-        window shows live-looking rows whose images never update."""
+        a bare stop leaves the dead node in ``running_nodes`` and the row painted
+        "running", so the reopened window exposes a false live owner even though
+        that producer can no longer advance."""
         if QtCore.QThread.currentThread() is not self.thread():
             raise RuntimeError("node shutdown must run on the TaskConsole Qt owner thread")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
@@ -2813,8 +2341,8 @@ class TaskConsole(QtWidgets.QWidget):
             ):
                 remaining = max(0.0, deadline - time.monotonic())
                 stopped = self._stop_logic_node(row, timeout=remaining) and stopped
-        # Row-less injected nodes (show_task_console(running_nodes=[...])) have no row to
-        # repaint but must leave the shot clock's live set all the same.
+        # Row-less injected nodes (show_task_console(running_nodes=[...])) have
+        # no row to repaint but must still leave the provider topology.
         for node in list(self.running_nodes):
             if id(node) in row_node_ids:
                 continue
@@ -2836,8 +2364,9 @@ class TaskConsole(QtWidgets.QWidget):
         INSTANCES).  A node is affected iff its :meth:`~LogicNode.referenced_devices` (EXCLUSIVE
         drivers AND OBSERVE records, unwrapped to real identity) intersect the swapped set, so
         reinitialising the camera stops every camera view / occupancy path riding it while a scan
-        on the untouched sequencer keeps running.  Goes through the SAME ``_stop_logic_node``
-        endpoint as every other stop (no zombie left to freeze the shot clock, #close-reopen)."""
+        on the untouched sequencer keeps running.  Goes through the SAME
+        ``_stop_logic_node`` endpoint as every other stop, so no dead provider is
+        left advertised as live after close/reopen."""
         if QtCore.QThread.currentThread() is not self.thread():
             raise RuntimeError("node shutdown must run on the TaskConsole Qt owner thread")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
@@ -2920,7 +2449,6 @@ class TaskConsole(QtWidgets.QWidget):
         self._timer.stop()
         if state in {"RUNNING", "BLOCKED_NODE_OWNERSHIP"}:
             self._shutdown_state = "STOPPING_NODES"
-            self._defer_task_card_teardown = True
             if not self.stop_all_nodes(timeout=max(0.0, deadline - time.monotonic())):
                 self._shutdown_state = "BLOCKED_NODE_OWNERSHIP"
                 return False
@@ -2947,14 +2475,6 @@ class TaskConsole(QtWidgets.QWidget):
             self._on_close_done = True
         self._shutdown_state = "TEARING_DOWN_UI"
         try:
-            deferred_task_card = self._deferred_task_card
-            if deferred_task_card is not None:
-                if not self._remove_panel(
-                    deferred_task_card,
-                    allow_task_owned=True,
-                ):
-                    raise RuntimeError("deferred task panel teardown was not acknowledged")
-                self._deferred_task_card = None
             for key, editor in list(self._panel_editors.items()):
                 editor.teardown()
                 self._panel_editors.pop(key, None)

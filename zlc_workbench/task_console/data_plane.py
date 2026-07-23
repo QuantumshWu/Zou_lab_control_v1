@@ -1,15 +1,17 @@
-"""MONITOR seam: a coherent, change-driven view of current run outputs.
+"""MONITOR seam: change-driven latest fronts from independent producers.
 
 Seam 3 of the composition root's rewiring contract (``app.py``).  A run node
 publishes into a ``LiveDatasetSlot``; this module freezes only slots that
-reported a new revision, then composes ONE board snapshot which every panel,
-picker and legend reads.
+reported a new revision.  Each slot is one producer transaction.  Combining
+their latest immutable fronts into one presentation cycle does *not* assert
+that independent producers observed the same physical shot.
 
 Freeze-latest, not a bus.  The old console read a mutable signal hub whenever it
-felt like it, so two widgets in the same tick could disagree about which shot
+felt like it, so two widgets could disagree about which revision of one signal
 they were showing.  Each changed slot materialises its own atomic transaction
 exactly once; unchanged slots reuse their immutable fronts.  The resulting
-:class:`ConsoleTickSnapshot` is immutable, so two readers cannot disagree.
+:class:`ConsoleDataFront` is immutable, so readers agree about every individual
+producer revision without inventing cross-producer causation.
 
 What replaced the shot clock: a monitor tap overwrites when the display falls
 behind rather than back-pressuring acquisition, and it says so per signal
@@ -26,19 +28,18 @@ import threading
 from types import MappingProxyType
 from typing import Mapping
 
-__all__ = ["ConsoleDataPlane", "ConsoleSignalValue", "ConsoleTickSnapshot"]
+__all__ = ["ConsoleDataFront", "ConsoleDataPlane", "ConsoleSignalValue"]
 
 
 @dataclass(frozen=True)
 class ConsoleSignalValue:
-    """One signal as of one tick: its block, how current it is, and its version."""
+    """One signal at one producer-owned immutable revision."""
 
     name: str
     source: str                     # the node title that produced it
     snapshot: object                # OwnedSnapshot -- the (ref, block) pair a render needs
     version: int                    # the producing stream's sequence at freeze time
     coverage: object | None         # MonitorCoverage, or None for a scalar-less signal
-    coherent: bool                  # derived alongside the same raw event
     # Lineage, carried because only the freeze knows it: a renderer stamps what
     # it drew with the run and event it came from, and a value that lost these
     # on the way to a panel could only be presented with an invented one.
@@ -106,8 +107,8 @@ class ConsoleSignalValue:
 
 
 @dataclass(frozen=True)
-class ConsoleTickSnapshot:
-    """Everything the board may read this tick.  Immutable by construction."""
+class ConsoleDataFront:
+    """Latest immutable value of each producer; no cross-producer join claim."""
 
     signals: Mapping[str, ConsoleSignalValue]
     failures: Mapping[str, str]     # node title -> why its freeze did not happen
@@ -146,7 +147,7 @@ class ConsoleDataPlane:
         self._failures: dict[int, str] = {}
         self._membership_changed = False
         empty = MappingProxyType({})
-        self._front = ConsoleTickSnapshot(signals=empty, failures=empty)
+        self._front = ConsoleDataFront(signals=empty, failures=empty)
 
     # ------------------------------------------------------------ membership
     def attach(self, node, slot) -> None:
@@ -182,7 +183,7 @@ class ConsoleDataPlane:
             return len(self._slots)
 
     # ---------------------------------------------------------------- freeze
-    def freeze(self) -> ConsoleTickSnapshot:
+    def freeze(self) -> ConsoleDataFront:
         """Return the current immutable board front, advancing changed sources.
 
         A slot that cannot be frozen (its run went terminal, its dataset was
@@ -192,7 +193,7 @@ class ConsoleDataPlane:
 
         With no producer revision or membership change this returns the exact
         same object.  The GUI timer is therefore only a polling clock; it cannot
-        manufacture a new whole-board snapshot merely because time passed.
+        manufacture a new aggregate data front merely because time passed.
         """
 
         with self._lock:
@@ -209,7 +210,7 @@ class ConsoleDataPlane:
             node, slot = slots[key]
             title = str(getattr(node, "name", "") or type(node).__name__)
             try:
-                frozen = self._freeze_one(node, slot, title)
+                frozen, alignment_failure = self._freeze_one(node, slot, title)
             except Exception as error:
                 failure = f"{type(error).__name__}: {error}"
                 with self._lock:
@@ -220,7 +221,10 @@ class ConsoleDataPlane:
             with self._lock:
                 if self._slots.get(key) == (node, slot):
                     self._cache[key] = frozen
-                    self._failures.pop(key, None)
+                    if alignment_failure is None:
+                        self._failures.pop(key, None)
+                    else:
+                        self._failures[key] = alignment_failure
         signals: dict[str, ConsoleSignalValue] = {}
         failures: dict[str, str] = {}
         with self._lock:
@@ -233,7 +237,7 @@ class ConsoleDataPlane:
             if failure is not None:
                 title = str(getattr(node, "name", "") or type(node).__name__)
                 failures[title] = failure
-        front = ConsoleTickSnapshot(
+        front = ConsoleDataFront(
             signals=MappingProxyType(signals),
             failures=MappingProxyType(failures),
         )
@@ -241,7 +245,12 @@ class ConsoleDataPlane:
             self._front = front
         return front
 
-    def _freeze_one(self, node, slot, title: str) -> dict[str, ConsoleSignalValue]:
+    def _freeze_one(
+        self,
+        node,
+        slot,
+        title: str,
+    ) -> tuple[dict[str, ConsoleSignalValue], str | None]:
         """One slot's atomic transaction, projected onto its declared outputs.
 
         A camera monitor freezes RAW plus an optional derived ROI SCALAR in one
@@ -261,7 +270,7 @@ class ConsoleDataPlane:
         metadata = snapshot.scalar_metadata
         # Same-transaction check, the presentation-layer half of coherence: the
         # scalar is only "of this frame" when it names the raw event it reduced.
-        coherent = (
+        scalar_matches_raw = (
             metadata is not None
             and raw is not None
             and getattr(metadata, "source_event_ref", None) == raw.head
@@ -270,21 +279,29 @@ class ConsoleDataPlane:
         if raw is not None and declared:
             out[declared[0]] = ConsoleSignalValue(
                 name=declared[0], source=title, snapshot=raw.snapshot,
-                version=self._sequence(raw), coverage=raw.coverage, coherent=True,
+                version=self._sequence(raw), coverage=raw.coverage,
                 run_id=run_id, epoch_id=causation,
                 join_digest=str(getattr(head, "payload_digest", "") or ""),
             )
-        if scalar is not None and len(declared) > 1:
+        alignment_failure = None
+        if scalar is not None and len(declared) > 1 and scalar_matches_raw:
             out[declared[1]] = ConsoleSignalValue(
                 name=declared[1], source=title, snapshot=scalar.snapshot,
                 version=self._sequence(scalar), coverage=scalar.coverage,
-                coherent=bool(coherent),
                 run_id=run_id, epoch_id=causation,
                 # A derived scalar names the raw event it reduced, so its join
                 # digest is that event's -- not a second digest of its own.
                 join_digest=str(getattr(head, "payload_digest", "") or ""),
             )
-        return out
+        elif scalar is not None and len(declared) > 1:
+            # Never stamp an unrelated derived value with the raw event's join
+            # digest.  Keep the valid raw front and expose the missing derived
+            # branch as a producer failure instead of drawing a plausible but
+            # falsely aligned scalar.
+            alignment_failure = (
+                f"{declared[1]} does not identify the raw event it reduced"
+            )
+        return out, alignment_failure
 
     @staticmethod
     def _sequence(dataset_snapshot) -> int:

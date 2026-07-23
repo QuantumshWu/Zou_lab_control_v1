@@ -1,33 +1,10 @@
-"""The panel record sinks, and the module that already held one console record is renamed.
+"""Current TaskConsole panel-record contract.
 
-``PanelConfig`` is what a saved console layout is made of: a plot kind, a size preset, a
-pixel position and the hub signals it reads.  Nothing about that needs Qt or Matplotlib --
-but one line, ``if kind not in PANEL_KINDS``, tied it to the whole render stack, because
-the panel vocabulary was derived from the plot-kind table inside the figure module.  The
-previous slice moved that table; this one moves the record and the derivation with it.
-
-``zlc_data/logic_node.py`` becomes ``zlc_data/console_records.py``.  A module named after
-one of the two records it holds would have been a small lie that costs nothing today and
-misleads every later reader.
-
-The golden below was captured from the legacy class immediately before the move and is
-deliberately weighted towards the branches that DIVERGE: every kind's default record is
-identical (blank input, blank source), so a defaults-only golden would have proved almost
-nothing.  What discriminates is the eight rejection paths, the per-kind repeat_mode
-vocabulary, the update_ms fallback, and the bare-name canonicalisation -- including the
-detail that ``value = fit/x0`` is NOT a bare name (a slash is not an identifier) while
-``value = zzz`` is.
-
-Every test that covers this record -- test_console_state_roundtrip.py,
-test_panel_hug_layout.py, test_board_gravity.py -- sits outside
-``tests/migration_active_tests.txt`` and is frozen: not run, not modified, not evidence.
-This file is the oracle.
+A panel binds one typed dataset.  Multi-producer calculations belong to an
+explicit Processor/join and cannot be smuggled into a saved GUI expression.
 """
 
 from __future__ import annotations
-
-#: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
-#: file guards the NEW structure and is permanent (swept by test_design_charter).
 
 import ast
 import pathlib
@@ -35,123 +12,81 @@ import pathlib
 import pytest
 
 from zlc_data.console_records import (
-    ADDABLE_PANEL_KINDS,
-    BLANK_SOURCE,
     DEFAULT_UPDATE_MS,
     PANEL_KINDS,
     UPDATE_INTERVALS,
     PanelConfig,
-    panel_allows_multi_slot,
-    panel_input_slots,
-    repeat_mode_for_kind,
 )
 
-REPO = pathlib.Path(__file__).resolve().parents[1]
 
-KINDS = ("2d", "sites", "1d", "monitor", "hist", "pulse", "grid")
+KINDS = ("2d", "1d", "monitor", "hist")
+DEFAULT = {
+    "title": "",
+    "row": 0,
+    "col": 0,
+    "size": "2x2",
+    "signal": "",
+    "params": {},
+}
 
-#: A default record is the SAME for every kind -- stated once, so the tests below can spend
-#: themselves on what actually differs.
-DEFAULT = {"title": "", "row": 0, "col": 0, "size": "2x2", "source": "",
-           "params": {}, "inputs": [""]}
 
-
-def test_a_default_record_is_identical_for_every_kind():
-    """The blank panel: no signal picked, so no source either.  A fresh panel must NOT
-    auto-bind to whatever is running -- that was a real bug, and it is why the site map's
-    'occupancy' slot carries a BLANK default rather than a signal name."""
-
+def test_a_fresh_panel_is_unbound_for_every_kind() -> None:
     for kind in KINDS:
-        assert PanelConfig(kind=kind).to_dict() == {"kind": kind, **DEFAULT}, kind
+        assert PanelConfig(kind=kind).to_dict() == {"kind": kind, **DEFAULT}
 
 
-@pytest.mark.parametrize("kwargs, expected", [
-    # Naming an input is what turns the source on.
-    ({"kind": "1d", "inputs": ["cam/frame"]},
-     {"source": "value = signal", "inputs": ["cam/frame"]}),
-    # A bare name in the source binds the sole input ...
-    ({"kind": "1d", "source": "value = zzz"},
-     {"source": "value = zzz", "inputs": ["zzz"]}),
-    # ... but a slashed hub name is not a bare name, so the input stays blank.
-    ({"kind": "1d", "source": "value = fit/x0"},
-     {"source": "value = fit/x0", "inputs": [""]}),
-    # Two inputs: a multi-slot expression leaves them alone.
-    ({"kind": "1d", "inputs": ["a", "b"], "source": "value = signal[0]-signal[1]"},
-     {"source": "value = signal[0]-signal[1]", "inputs": ["a", "b"]}),
-    # Too-few inputs pad to the kind's slot count.
-    ({"kind": "sites", "inputs": []}, {"source": "", "inputs": [""]}),
-    # Negative pixels clamp rather than raise -- they are only a packer seed.
-    ({"kind": "1d", "row": -5, "col": -3}, {"row": 0, "col": 0}),
-    ({"kind": "1d", "title": "T", "row": 7, "col": 9, "size": "1x2"},
-     {"title": "T", "row": 7, "col": 9, "size": "1x2"}),
-])
-def test_the_captured_construction_cases_are_reproduced(kwargs, expected):
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({"kind": "1d", "signal": "cam/frame"}, {"signal": "cam/frame"}),
+        ({"kind": "1d", "row": -5, "col": -3}, {"row": 0, "col": 0}),
+        (
+            {"kind": "1d", "title": "T", "row": 7, "col": 9, "size": "1x2"},
+            {"title": "T", "row": 7, "col": 9, "size": "1x2"},
+        ),
+    ],
+)
+def test_construction_keeps_the_declared_single_binding(kwargs, expected) -> None:
     record = PanelConfig(**kwargs).to_dict()
     for key, value in expected.items():
-        assert record[key] == value, key
+        assert record[key] == value
 
 
-@pytest.mark.parametrize("kind, mode, ok", [
-    ("hist", "pool", True),        # a distribution's default and only pooling verb
-    ("hist", "roll", False),       # 'roll' is a trace verb; a histogram would ignore it
-    ("2d", "create", False),       # a frame has no per-repeat lines to create
-    ("monitor", "roll", True),     # the rolling trace is the ONLY kind that rolls
-])
-def test_repeat_mode_is_validated_against_the_kinds_own_menu(kind, mode, ok):
-    if ok:
-        assert PanelConfig(kind=kind, params={"repeat_mode": mode}).params["repeat_mode"] == mode
-    else:
-        with pytest.raises(ValueError):
-            PanelConfig(kind=kind, params={"repeat_mode": mode})
-
-
-@pytest.mark.parametrize("kind, default", [("hist", "pool"), ("2d", "average"),
-                                           ("monitor", "average"), ("bogus", "average")])
-def test_an_unasked_repeat_mode_is_the_kinds_first_menu_entry(kind, default):
-    """Order in the vocabulary IS the default; an unknown kind falls back to the image set."""
-
-    assert repeat_mode_for_kind(kind) == default
-
-
-@pytest.mark.parametrize("stored, effective", [(200, 200), (999, DEFAULT_UPDATE_MS),
-                                               (0, DEFAULT_UPDATE_MS)])
-def test_an_out_of_set_refresh_interval_falls_back_to_the_harmonic_default(stored, effective):
-    """Off-set rates are not an error but they must not survive, or the console timer base
-    stops dividing every panel's rate and shot-coherence quietly breaks."""
-
+@pytest.mark.parametrize(
+    "stored, effective",
+    [(200, 200), (999, DEFAULT_UPDATE_MS), (0, DEFAULT_UPDATE_MS)],
+)
+def test_an_out_of_set_refresh_interval_falls_back(stored, effective) -> None:
     assert PanelConfig(kind="1d", params={"update_ms": stored}).update_ms == effective
     assert effective in UPDATE_INTERVALS
 
 
-def test_the_record_round_trips_through_its_codec():
-    payload = PanelConfig(kind="1d", inputs=["cam/frame"]).to_dict()
+def test_the_record_round_trips_through_its_codec() -> None:
+    payload = PanelConfig(kind="1d", signal="cam/frame").to_dict()
     assert PanelConfig.from_dict(payload).to_dict() == payload
 
 
-@pytest.mark.parametrize("mutate, error", [
-    (lambda d: d.pop("size"), ValueError),                    # exact key set
-    (lambda d: d.update(row="x"), TypeError),                 # exact field types
-    (lambda d: d.update(row=-1), ValueError),                 # a STORED negative is a broken file
-    (lambda d: d.update(col=-1), ValueError),
-    (lambda d: d.update(inputs=[1]), TypeError),
-    (lambda d: d.update(kind="zzz"), ValueError),
-    (lambda d: d.update(source="value = other"), ValueError),  # would re-normalise on read
-])
-def test_every_captured_rejection_path_still_refuses(mutate, error):
-    """The reader refuses rather than coercing.  The last case is the subtle one: the record
-    is well-formed, but reading it would rewrite ``inputs``, so a writer that emitted it and a
-    reader that loaded it would disagree -- caught at the boundary instead of silently."""
-
-    payload = PanelConfig(kind="1d", inputs=["cam/frame"]).to_dict()
+@pytest.mark.parametrize(
+    "mutate, error",
+    [
+        (lambda data: data.pop("size"), ValueError),
+        (lambda data: data.update(row="x"), TypeError),
+        (lambda data: data.update(row=-1), ValueError),
+        (lambda data: data.update(col=-1), ValueError),
+        (lambda data: data.update(signal=1), TypeError),
+        (lambda data: data.update(kind="zzz"), ValueError),
+        # The obsolete expression schema is rejected, not converted.
+        (lambda data: data.update(source="value = signal"), ValueError),
+    ],
+)
+def test_invalid_or_obsolete_records_fail_closed(mutate, error) -> None:
+    payload = PanelConfig(kind="1d", signal="cam/frame").to_dict()
     mutate(payload)
     with pytest.raises(error):
         PanelConfig.from_dict(payload)
 
 
-def test_construction_clamps_a_negative_position_but_loading_refuses_one():
-    """Deliberately asymmetric, and worth keeping honest: a caller passing -5 means 'top
-    left', while a stored -1 means the file is wrong."""
-
+def test_construction_clamps_a_negative_position_but_loading_refuses_one() -> None:
     assert PanelConfig(kind="1d", row=-5).row == 0
     payload = PanelConfig(kind="1d").to_dict()
     payload["row"] = -1
@@ -159,29 +94,14 @@ def test_construction_clamps_a_negative_position_but_loading_refuses_one():
         PanelConfig.from_dict(payload)
 
 
-def test_the_slot_helpers_answer_for_every_kind_and_for_none():
-    assert panel_input_slots("sites")[0][0] == "occupancy"
-    assert panel_allows_multi_slot("sites") is False
-    for kind in set(KINDS) - {"sites"}:
-        assert panel_input_slots(kind) == (("signal", "", "the hub signal to plot"),), kind
-        assert panel_allows_multi_slot(kind) is True, kind
-    # An unknown kind gets the universal single slot rather than an exception: the Setting
-    # must still render something for a record the vocabulary no longer knows.
-    assert panel_input_slots("bogus") == (("signal", "", "the hub signal to plot"),)
+def test_only_end_to_end_live_renderers_are_addable() -> None:
+    assert list(PANEL_KINDS) == ["2d", "1d", "monitor", "hist"]
+    for kind in ("sites", "pulse", "grid"):
+        with pytest.raises(ValueError):
+            PanelConfig(kind=kind)
 
 
-def test_the_addable_menu_is_the_panel_kinds_minus_pulse():
-    """``panel=False`` means 'not addable live', NOT 'cannot be a panel' -- a saved pulse
-    figure still seeds a normal panel, which is why PANEL_KINDS keeps it."""
-
-    assert set(PANEL_KINDS) - set(ADDABLE_PANEL_KINDS) == {"pulse"}
-    assert list(ADDABLE_PANEL_KINDS) == [k for k in PANEL_KINDS if k != "pulse"]
-    assert BLANK_SOURCE == ""
-
-
-def test_the_record_module_reaches_for_no_toolkit_and_no_renderer():
-    """The whole reason it could sink, asserted rather than assumed."""
-
+def test_the_record_module_reaches_for_no_toolkit_and_no_renderer() -> None:
     import zlc_data.console_records as records
 
     tree = ast.parse(pathlib.Path(records.__file__).read_text(encoding="utf-8"))
@@ -193,7 +113,3 @@ def test_the_record_module_reaches_for_no_toolkit_and_no_renderer():
             modules.add(node.module)
     roots = {name.split(".")[0] for name in modules} - {"__future__", "typing"}
     assert roots <= {"zlc_data", "zlc_storage"}, roots
-
-
-
-
