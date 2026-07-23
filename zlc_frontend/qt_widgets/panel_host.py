@@ -17,6 +17,8 @@ Qt signals carrying the same typed intents the unified owner emits.
 
 from __future__ import annotations
 
+import math
+
 from PyQt5 import QtCore, QtWidgets
 
 from ..render import (
@@ -113,6 +115,12 @@ class SinglePanelHost(QtWidgets.QWidget):
         delete and recreate this QWidget subtree.
         """
 
+        self._unbind_current_interaction()
+        self._board.clear()
+
+    def _unbind_current_interaction(self) -> None:
+        """Retire only the current gesture family, preserving the raster front."""
+
         if self._bound_kind == "pulse":
             self._board.unbind_pulse_interaction(self._panel_id)
         elif self._bound_kind == "curve":
@@ -122,7 +130,6 @@ class SinglePanelHost(QtWidgets.QWidget):
         elif self._bound_kind == "image":
             self._board.unbind_rectangle_selector(self._panel_id)
         self._bound_kind = None
-        self._board.clear()
 
     def visible_interaction_origin(self) -> PanelInteractionOrigin | None:
         """Return the exact painted origin for this host's bound family.
@@ -183,6 +190,15 @@ class SinglePanelHost(QtWidgets.QWidget):
                 "SinglePanelHost requires an interactive image, curve, "
                 "histogram, or pulse payload"
             )
+        ratio = float(pixel_ratio)
+        if not math.isfinite(ratio) or ratio <= 0.0:
+            raise ValueError("pixel_ratio must be positive and finite")
+        logical = (
+            int(round(raster.width / ratio)),
+            int(round(raster.height / ratio)),
+        )
+        if any(value <= 0 for value in logical):
+            raise ValueError("pixel_ratio resolves the raster to an empty widget")
         if isinstance(payload, PulsePanelPayload):
             source = payload.document_input
             presentation = PanelPresentationIdentity(
@@ -222,14 +238,38 @@ class SinglePanelHost(QtWidgets.QWidget):
         panel = PanelFrame(
             self._panel_id, self._group, source, stamp, raster, payload)
         self._sequence += 1
+        self._retire_incompatible_binding(payload)
         self._board.present(BoardFrame(
             f"{self._group}-board", 0, self._sequence, (panel,)))
         self._ensure_binding(payload)
-        ratio = float(pixel_ratio) or 1.0
-        logical = (int(round(raster.width / ratio)),
-                   int(round(raster.height / ratio)))
-        self._board.setFixedSize(logical[0], logical[1])
+        self.set_logical_size(logical)
         return logical
+
+    def set_logical_size(self, logical_size: tuple[int, int]) -> None:
+        """Pin this complete panel surface to its authored logical pixel size.
+
+        The worker raster may be denser because of screen DPR, but neither Qt
+        nor a containing card may invent another plot extent.  Pulse Preview
+        reaches this owner through :meth:`present_panel`; worker-rendered
+        TaskConsole panels call it when their ``PanelConfig.size`` changes.
+        """
+
+        if (
+            not isinstance(logical_size, tuple)
+            or len(logical_size) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in logical_size
+            )
+        ):
+            raise ValueError(
+                "logical_size must be a pair of positive integer pixels"
+            )
+        width, height = logical_size
+        self._board.setFixedSize(width, height)
+        self.setFixedSize(width, height)
 
     def present_frame(self, frame: BoardFrame) -> None:
         """Present one ALREADY-COHERENT frame (e.g. a worker compose product).
@@ -247,35 +287,58 @@ class SinglePanelHost(QtWidgets.QWidget):
             raise ValueError(
                 "SinglePanelHost requires its one configured panel"
             )
+        payload = frame.panels[0].display_payload
+        self._retire_incompatible_binding(payload)
         self._board.present(frame)
-        self._ensure_binding(frame.panels[0].display_payload)
+        self._ensure_binding(payload)
 
     # ------------------------------------------------------------------ #
     # gesture plumbing
     # ------------------------------------------------------------------ #
 
-    def _ensure_binding(self, payload) -> None:
-        """Bind the gesture family matching the first payload since ``clear``.
+    @staticmethod
+    def _binding_kind(payload) -> str | None:
+        if isinstance(payload, PulsePanelPayload):
+            return "pulse"
+        if isinstance(payload, CurvePanelPayload):
+            return "curve"
+        if isinstance(payload, HistogramPanelPayload):
+            return "histogram"
+        if isinstance(payload, (ImagePanelPayload, SiteMapPanelPayload)):
+            return "image"
+        return None
 
-        The binding is created READY (the panel was just presented, so its
-        provenance is current) and the board-wide arm state is then set from
-        the host's remembered switch -- so the surface comes up matching the
-        switch (default OFF) instead of coming up live behind the operator.
+    def _retire_incompatible_binding(self, payload) -> None:
+        """Unbind an old gesture family before the new front is validated."""
+
+        if self._bound_kind != self._binding_kind(payload):
+            self._unbind_current_interaction()
+
+    def _ensure_binding(self, payload) -> None:
+        """Bind the gesture family matching the currently presented payload.
+
+        A family change retires only the old interaction binding; the stable
+        host and newly presented raster remain in place.  The new binding is
+        created READY (the panel was just presented, so its provenance is
+        current) and inherits the host's remembered selector switch.
         """
 
-        if self._bound_kind is not None:
+        target_kind = self._binding_kind(payload)
+        if self._bound_kind == target_kind:
             return
-        if isinstance(payload, PulsePanelPayload):
+        if self._bound_kind is not None:
+            raise RuntimeError("incompatible interaction binding was not retired")
+        if target_kind == "pulse":
             self._board.bind_pulse_interaction(self._panel_id, self._on_intent)
             self._bound_kind = "pulse"
-        elif isinstance(payload, CurvePanelPayload):
+        elif target_kind == "curve":
             self._board.bind_curve_interaction(self._panel_id, self._on_intent)
             self._bound_kind = "curve"
-        elif isinstance(payload, HistogramPanelPayload):
+        elif target_kind == "histogram":
             self._board.bind_histogram_interaction(
                 self._panel_id, self._on_intent)
             self._bound_kind = "histogram"
-        elif isinstance(payload, (ImagePanelPayload, SiteMapPanelPayload)):
+        elif target_kind == "image":
             # The image family separates the operator's switch from readiness:
             # bind unarmed, then declare the just-presented provenance current
             # (the host's one source IS the frame the caller handed over).

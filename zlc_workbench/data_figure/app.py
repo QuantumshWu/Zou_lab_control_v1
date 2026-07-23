@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Mapping
+from pathlib import Path
 
 from zlc_data import FitResultBatch, Selection
 from zlc_frontend import DataFigure
@@ -11,6 +13,7 @@ from zlc_workbench.window_runtime import open_workbench_window
 
 from .projection import (
     _DEFAULT_FIT_TIMEOUT_SECONDS,
+    _FitSaveReceipt,
     _FitWorkbenchBindings,
     _GridFocusRequest,
     _TypedDisplayState,
@@ -219,6 +222,11 @@ def create_data_figure_pane(
     *,
     initial_display: _TypedDisplayState | None = None,
     initial_fit_result_identity: str | None = None,
+    local_fit: bool = False,
+    local_fit_initial_selection: Selection | None = None,
+    local_fit_archive_path: str | Path | None = None,
+    local_fit_archive_metadata: Mapping[str, object] | None = None,
+    open_fit_analysis: bool = False,
     embedded: bool = True,
 ) -> DataFigureWindow:
     """Build the one DataFigure interaction owner for embedding or launch.
@@ -231,8 +239,33 @@ def create_data_figure_pane(
 
     if not isinstance(figure, DataFigure):
         raise TypeError("figure must be DataFigure")
+    if not isinstance(local_fit, bool):
+        raise TypeError("local_fit must be bool")
+    if not local_fit and any(
+        value is not None
+        for value in (
+            local_fit_initial_selection,
+            local_fit_archive_path,
+            local_fit_archive_metadata,
+        )
+    ):
+        raise ValueError("local Fit options require local_fit=True")
+    if not local_fit and open_fit_analysis:
+        raise ValueError("open_fit_analysis requires local_fit=True")
+    fit_bindings = None
+    if local_fit:
+        from .local_fit import local_fit_bindings
+
+        fit_bindings = local_fit_bindings(
+            figure,
+            initial_selection=local_fit_initial_selection,
+            open_analysis=open_fit_analysis,
+            archive_path=local_fit_archive_path,
+            archive_metadata=local_fit_archive_metadata,
+        )
     return _figure_window_factory(
         lambda: figure,
+        fit_bindings=fit_bindings,
         initial_display=initial_display,
         initial_fit_result_identity=initial_fit_result_identity,
         embedded=embedded,
@@ -253,6 +286,43 @@ def open_data_figure_workbench(
             initial_display=initial_display,
         )
     )
+
+
+def open_local_data_figure_analysis(
+    figure: DataFigure,
+    *,
+    initial_selection: Selection | None = None,
+    archive_path: str | Path | None = None,
+    archive_metadata: Mapping[str, object] | None = None,
+    initial_display: _TypedDisplayState | None = None,
+    open_analysis: bool = True,
+) -> DataFigureWindow:
+    """Open one frozen panel in the sole DataFigure/Fit host.
+
+    Unlike Capture/Scan Fit this path has no neutral artifact authority.  Save
+    therefore publishes a current ``DataFigure`` archive (asking for a path
+    when the caller did not already open one).
+    """
+
+    if not isinstance(figure, DataFigure):
+        raise TypeError("figure must be DataFigure")
+    from .local_fit import local_fit_bindings
+
+    bindings = local_fit_bindings(
+        figure,
+        initial_selection=initial_selection,
+        open_analysis=open_analysis,
+        archive_path=archive_path,
+        archive_metadata=archive_metadata,
+    )
+    return open_workbench_window(
+        _figure_window_factory(
+            lambda: figure,
+            fit_bindings=bindings,
+            initial_display=initial_display,
+        )
+    )
+
 
 def open_figure_workbench(
     figure_factory,
@@ -281,20 +351,40 @@ def open_figure_workbench(
         callable(item) for item in fit_calls
     ):
         raise ValueError("all four Figure Fit capabilities must be supplied together")
-    fit_bindings = (
-        None
-        if not any(item is not None for item in fit_calls)
-        else _FitWorkbenchBindings(
+    fit_bindings = None
+    if any(item is not None for item in fit_calls):
+        from zlc_neutral_atom.artifacts import FitExecution, FitResultArtifactRef
+
+        def execution_result(execution) -> FitResultBatch:
+            if not isinstance(execution, FitExecution):
+                raise TypeError("artifact Fit executor must return FitExecution")
+            return execution.result
+
+        def save_execution(execution, destination, _display) -> _FitSaveReceipt:
+            if destination is not None:
+                raise ValueError("artifact Fit save does not accept an archive path")
+            reference = fit_saver(execution)
+            if not isinstance(reference, FitResultArtifactRef):
+                raise TypeError("artifact Fit saver returned another reference type")
+            identity = f"{reference.repository_id}:{reference.manifest_digest}"
+            return _FitSaveReceipt(
+                reference,
+                identity,
+                identity,
+                artifact_reference=reference,
+            )
+
+        fit_bindings = _FitWorkbenchBindings(
             fit_preparer,
             fit_executor,
-            fit_saver,
+            execution_result,
+            save_execution,
             fit_reloader,
             selected_model=fit_selected_model,
             initial_selection=fit_initial_selection,
             open_analysis=bool(open_fit_analysis),
             timeout_seconds=fit_timeout_seconds,
         )
-    )
     options = {
         "intent": intent,
         "selection": selection,
@@ -311,4 +401,9 @@ def open_figure_workbench(
     )
 
 
-__all__ = ["create_data_figure_pane", "open_data_figure_workbench", "open_figure_workbench"]
+__all__ = [
+    "create_data_figure_pane",
+    "open_data_figure_workbench",
+    "open_figure_workbench",
+    "open_local_data_figure_analysis",
+]

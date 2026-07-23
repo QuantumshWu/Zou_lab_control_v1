@@ -249,11 +249,26 @@ class FigureViewer(QtWidgets.QWidget):
         """Build a hidden candidate; its admitted first front commits the generation."""
 
         from zlc_workbench.data_figure.app import create_data_figure_pane
+        from zlc_frontend.figure import ViewIntent
 
         metadata = archive.metadata
         if not isinstance(metadata, Mapping):
             raise TypeError("FigureArchive metadata must be a mapping")
         info = project_figure_info(archive)
+        layers = tuple(archive.figure.document.layers)
+        local_fit = bool(
+            len(layers) == 1
+            and layers[0].view.intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
+        )
+        local_fit_options = (
+            {
+                "local_fit": True,
+                "local_fit_archive_path": archive.path,
+                "local_fit_archive_metadata": archive.metadata,
+            }
+            if local_fit
+            else {}
+        )
         candidate = create_data_figure_pane(
             archive.figure,
             initial_display=archive.display,
@@ -263,6 +278,7 @@ class FigureViewer(QtWidgets.QWidget):
                 else None
             ),
             embedded=True,
+            **local_fit_options,
         )
         if not isinstance(candidate, QtWidgets.QWidget):
             raise TypeError("create_data_figure_pane must return a QWidget")
@@ -281,6 +297,14 @@ class FigureViewer(QtWidgets.QWidget):
         )
         failed.connect(
             lambda detail, pane=candidate: self._reject_candidate(pane, detail),
+            QtCore.Qt.QueuedConnection,
+        )
+        saved = getattr(candidate, "fitSaved", None)
+        if saved is None:
+            candidate.shutdown()
+            raise TypeError("DataFigure pane must expose fitSaved")
+        saved.connect(
+            lambda handle, pane=candidate: self._accept_fit_save(pane, handle),
             QtCore.Qt.QueuedConnection,
         )
         self.info_pane.status.show_message(
@@ -327,6 +351,49 @@ class FigureViewer(QtWidgets.QWidget):
         )
         self.info_pane.status.show_message(
             f"Loaded {display_path(str(self._current_path))}"
+        )
+
+    def _accept_fit_save(self, pane: QtWidgets.QWidget, handle: object) -> None:
+        """Refresh archive identity after the current pane saves a local Fit."""
+
+        if self._closing or self.figure_pane is not pane:
+            return
+        from zlc_frontend.figure_archive import LoadedFigureArchive
+
+        if not isinstance(handle, LoadedFigureArchive):
+            # FigureViewer only injects local archive persistence.  A durable
+            # Capture/Scan artifact belongs to the notebook composition root.
+            self.info_pane.status.show_message(
+                "Fit save returned no Figure archive",
+                severity="error",
+            )
+            return
+        archive = handle
+        if self._current_path is None or archive.path != self._current_path.resolve():
+            self.info_pane.status.show_message(
+                "Fit save returned another Figure archive path",
+                severity="error",
+            )
+            return
+        self.archive = archive
+        self._current_path = archive.path
+        self.info_pane.path_edit.setText(str(archive.path))
+        (
+            plot_rows,
+            measurement_rows,
+            device_rows,
+            flow_graph,
+            raw_text,
+        ) = project_figure_info(archive)
+        self.info_pane.replace_info(
+            plot_rows=plot_rows,
+            measurement_rows=measurement_rows,
+            device_rows=device_rows,
+            flow_graph=flow_graph,
+            raw_text=raw_text,
+        )
+        self.info_pane.status.show_message(
+            f"Saved fitted figure {display_path(str(archive.path))}"
         )
 
     def _reject_candidate(

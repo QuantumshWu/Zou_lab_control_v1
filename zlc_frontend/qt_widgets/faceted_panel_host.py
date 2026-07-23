@@ -142,6 +142,12 @@ class FacetedPanelHost(QtWidgets.QWidget):
         self._overview_button.show()
         self._overview_button.raise_()
 
+    def set_logical_size(self, logical_size: tuple[int, int]) -> None:
+        """Give overview and focused-cell views the same authored plot extent."""
+
+        self._focus.set_logical_size(logical_size)
+        self.setFixedSize(*logical_size)
+
     def set_selectors_enabled(self, on: bool) -> None:
         self._selectors_on = bool(on)
         self._focus.set_selectors_enabled(self._selectors_on)

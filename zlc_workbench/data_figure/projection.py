@@ -298,26 +298,31 @@ class _GridFocusRequest:
 class _FitWorkbenchBindings:
     """Composition-owned capabilities for the optional Figure Fit surface.
 
-    The viewer receives only four narrow calls.  It never receives a repository,
-    Experiment, source resolver, or generic analysis registry.  ``prepare``
-    turns exact named display axes plus an optional authority candidate into
-    already-bound data-owned Fit requests; ``execute`` is the only materializing
-    operation; ``save`` publishes the process-local execution hidden behind
-    :class:`FitDraftAuthority`; and ``reload`` proves the saved reference before
-    the UI labels an overlay as durable.
+    The viewer receives only the fixed prepare/execute/result/save/reload
+    capabilities.  It never receives a repository, Experiment, source resolver,
+    or generic analysis registry.  ``prepare`` turns exact named display axes
+    plus an optional authority candidate into already-bound data-owned Fit
+    requests; ``execute`` is the only materializing operation; ``result``
+    projects the opaque execution for display; ``save`` persists that execution
+    behind :class:`FitDraftAuthority`; and ``reload`` proves the saved outcome
+    before the UI labels an overlay as persisted.
     """
 
     prepare: object
     execute: object
+    result: object
     save: object
     reload: object
     selected_model: str | None = None
     initial_selection: Selection | None = None
     open_analysis: bool = False
     timeout_seconds: float = _DEFAULT_FIT_TIMEOUT_SECONDS
+    save_requires_path: bool = False
+    initial_save_path: object | None = None
+    allow_prepared_transform: bool = False
 
     def __post_init__(self) -> None:
-        for name in ("prepare", "execute", "save", "reload"):
+        for name in ("prepare", "execute", "result", "save", "reload"):
             if not callable(getattr(self, name)):
                 raise TypeError(f"fit {name} capability must be callable")
         selected = self.selected_model
@@ -334,6 +339,45 @@ class _FitWorkbenchBindings:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("fit timeout_seconds must be finite and positive")
         object.__setattr__(self, "timeout_seconds", timeout)
+        if not isinstance(self.save_requires_path, bool):
+            raise TypeError("save_requires_path must be bool")
+        if not isinstance(self.allow_prepared_transform, bool):
+            raise TypeError("allow_prepared_transform must be bool")
+        path = self.initial_save_path
+        if path is not None:
+            from pathlib import Path
+
+            object.__setattr__(self, "initial_save_path", Path(path))
+        if not self.save_requires_path and path is not None:
+            raise ValueError(
+                "an initial Fit save path requires save_requires_path=True"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class _FitSaveReceipt:
+    """One admitted persistence result shared by artifact and archive saves."""
+
+    handle: object
+    identity: str
+    summary: str
+    reloaded_result: FitResultBatch | None = None
+    artifact_reference: object | None = None
+
+    def __post_init__(self) -> None:
+        if self.handle is None:
+            raise TypeError("Fit save receipt requires one persistence handle")
+        for name in ("identity", "summary"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Fit save receipt {name} must be non-empty text")
+        if self.reloaded_result is not None and not isinstance(
+            self.reloaded_result,
+            FitResultBatch,
+        ):
+            raise TypeError(
+                "Fit save receipt reloaded_result must be FitResultBatch or None"
+            )
 
 @dataclass(frozen=True, slots=True)
 class _FitSelectionCandidate:
@@ -509,6 +553,7 @@ def _validate_fit_replay_options(
     fit_axis_ids: tuple[AxisId, ...],
     axis_roles: tuple[tuple[AxisId, AxisViewRole], ...],
     selection: Selection | None,
+    allow_prepared_transform: bool = False,
 ) -> tuple[FitAuthoringOption, ...]:
     """Reject a solve whose named result rows cannot map to this exact panel."""
 
@@ -540,7 +585,7 @@ def _validate_fit_replay_options(
             continue
         transform = option.spec.committed_transform
         if selection is None:
-            if transform is not None:
+            if transform is not None and not allow_prepared_transform:
                 continue
         else:
             if transform is None:

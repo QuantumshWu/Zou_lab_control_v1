@@ -68,7 +68,7 @@ from zlc_frontend.selector import (
     PanelInteractionOrigin,
     RectangleGesture,
 )
-from zlc_neutral_atom.artifacts import FitExecution, FitResultArtifactRef
+from zlc_neutral_atom.artifacts import FitResultArtifactRef
 from zlc_workbench.fit import FitDraftAuthority, FitDraftResult
 from zlc_storage import nonnegative_integer
 from zlc_workbench.frozen_raster import FrozenRasterWindow
@@ -76,6 +76,7 @@ from zlc_workbench.window_runtime import cancel_export_commits, error_summary
 
 from .projection import (
     _DEFAULT_FIT_TIMEOUT_SECONDS,
+    _FitSaveReceipt,
     _TYPED_PANEL_ID,
     _FitOverlayRequest,
     _FitSelectionCandidate,
@@ -110,6 +111,7 @@ class DataFigureWindow(FrozenRasterWindow):
 
     initialReady = QtCore.pyqtSignal()
     initialFailed = QtCore.pyqtSignal(str)
+    fitSaved = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
@@ -189,19 +191,34 @@ class DataFigureWindow(FrozenRasterWindow):
         self._fit_draft: FitDraftResult | None = None
         self._fit_draft_summary: str | None = None
         self._fit_save_inflight: FitDraftResult | None = None
-        self._deferred_fit_reload: tuple[FitResultArtifactRef, int] | None = None
+        self._deferred_fit_reload: tuple[_FitSaveReceipt, int] | None = None
+        self._saved_fit_receipt: _FitSaveReceipt | None = None
         self._saved_fit_reference: FitResultArtifactRef | None = None
+        self._fit_save_path: Path | None = (
+            None
+            if fit_bindings is None
+            or fit_bindings.initial_save_path is None
+            else Path(fit_bindings.initial_save_path)
+        )
         self._close_deferred_during_fit_save = False
         self._fit_pane: FitAuthoringPane | None = None
         self._fit_authority: FitDraftAuthority | None = None
         if fit_bindings is not None:
-            self._fit_authority = FitDraftAuthority(
-                lambda spec, cancel_check, deadline: fit_bindings.execute(
+            def execute_for_authority(spec, cancel_check, deadline):
+                execution = fit_bindings.execute(
                     spec,
                     cancel_check,
                     deadline,
+                )
+                return execution, fit_bindings.result(execution)
+
+            self._fit_authority = FitDraftAuthority(
+                execute_for_authority,
+                lambda execution, destination, display: fit_bindings.save(
+                    execution,
+                    destination,
+                    display,
                 ),
-                lambda execution: fit_bindings.save(execution),
             )
 
         super().__init__(
@@ -921,6 +938,7 @@ class DataFigureWindow(FrozenRasterWindow):
             self._fit_axis_ids,
             self._fit_axis_roles,
             self._current_fit_selection(),
+            bindings.allow_prepared_transform,
         ):
             self._fit_job_revision = None
             pane.set_busy(None, draft_ready=self._fit_draft is not None)
@@ -1054,16 +1072,37 @@ class DataFigureWindow(FrozenRasterWindow):
             or self._closing
         ):
             return
+        destination = None
+        if bindings.save_requires_path:
+            destination = self._fit_save_path
+            if destination is None:
+                selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    "Save fitted DataFigure archive",
+                    "",
+                    "DataFigure archive (*.npz)",
+                )
+                if not selected:
+                    return
+                destination = Path(selected)
+                if not destination.suffix:
+                    destination = destination.with_suffix(".npz")
         self._fit_save_inflight = draft
         self._fit_job_revision = self._fit_analysis_revision
         pane.set_busy("save", draft_ready=True)
         self._status.setText("SAVING FIT")
-        self._summary.setText("Publishing and reopening the exact Fit artifact…")
+        self._summary.setText(
+            "Saving and reopening the fitted DataFigure archive…"
+            if bindings.save_requires_path
+            else "Publishing and reopening the exact Fit artifact…"
+        )
         self._diagnostic.setText("")
         if not self._submit_fit_future(
             "save",
             authority.save,
             draft,
+            destination,
+            self._display,
         ):
             self._fit_save_inflight = None
             self._fit_job_revision = None
@@ -1770,9 +1809,9 @@ class DataFigureWindow(FrozenRasterWindow):
                 if fit_cancelled is not None and fit_cancelled.is_set():
                     raise CancelledError()
             elif kind == "save":
-                if not isinstance(result, FitResultArtifactRef):
-                    raise TypeError("Fit save returned another reference type")
-                reference = result
+                if not isinstance(result, _FitSaveReceipt):
+                    raise TypeError("Fit save returned another receipt type")
+                receipt = result
             elif kind == "reload_saved":
                 if not isinstance(result, FitResultBatch):
                     raise TypeError("saved Fit reload returned another result type")
@@ -1857,44 +1896,62 @@ class DataFigureWindow(FrozenRasterWindow):
                     self._summary.setText(completed_summary)
                     self._diagnostic.setText("")
             elif kind == "save":
-                # The durable ref is accepted before any decode or rendering.
-                # Nothing after this assignment may erase it.
-                self._saved_fit_reference = reference
+                # The persistence receipt is accepted before any later overlay
+                # rendering.  Nothing after this assignment may erase it.
+                self._saved_fit_receipt = receipt
+                artifact_reference = receipt.artifact_reference
+                if artifact_reference is not None and not isinstance(
+                    artifact_reference,
+                    FitResultArtifactRef,
+                ):
+                    raise TypeError(
+                        "Fit save receipt carries another artifact reference type"
+                    )
+                self._saved_fit_reference = artifact_reference
+                saved_path = getattr(receipt.handle, "path", None)
+                if saved_path is not None:
+                    self._fit_save_path = Path(saved_path)
                 self._fit_draft = None
                 self._fit_draft_summary = None
+                self.fitSaved.emit(receipt.handle)
                 if job_revision != self._fit_analysis_revision:
                     self._status.setText("FIT SAVED · EDITOR CHANGED")
+                elif receipt.reloaded_result is not None and not close_after_save:
+                    self._queue_fit_overlay(
+                        receipt.reloaded_result,
+                        receipt.identity,
+                    )
+                    self._status.setText("FIT SAVED")
                 else:
                     self._status.setText("FIT SAVED · REOPENING")
-                self._summary.setText(
-                    f"{reference.repository_id}:{reference.manifest_digest}"
-                )
+                self._summary.setText(receipt.summary)
                 bindings = self._fit_bindings
                 if close_after_save:
                     self._diagnostic.setText(
-                        "Artifact reference accepted; completing the deferred close."
+                        "Saved Fit identity accepted; completing the deferred close."
                     )
                 elif job_revision != self._fit_analysis_revision:
                     self._diagnostic.setText(
-                        "Artifact is saved; stale editor authority was not reloaded."
+                        "Fit is saved; stale editor authority was not reloaded."
                     )
+                elif receipt.reloaded_result is not None and not close_after_save:
+                    self._diagnostic.setText("")
                 elif bindings is None:
                     self._diagnostic.setText(
-                        "Artifact is saved; no reload capability is available."
+                        "Fit is saved; no reload capability is available."
                     )
                 else:
-                    self._deferred_fit_reload = (reference, job_revision)
+                    self._deferred_fit_reload = (receipt, job_revision)
                     if pane is not None:
                         pane.set_busy("render", draft_ready=False)
             elif kind == "reload_saved":
-                reference = self._saved_fit_reference
-                if reference is None:
-                    raise RuntimeError("saved Fit reload lost its durable reference")
+                receipt = self._saved_fit_receipt
+                if receipt is None:
+                    raise RuntimeError("saved Fit reload lost its persistence receipt")
                 if job_revision == self._fit_analysis_revision:
-                    identity = f"{reference.repository_id}:{reference.manifest_digest}"
                     self._queue_fit_overlay(
                         reloaded_result,
-                        identity,
+                        receipt.identity,
                     )
                     self._status.setText("FIT SAVED")
                     self._diagnostic.setText("")
@@ -2058,7 +2115,7 @@ class DataFigureWindow(FrozenRasterWindow):
                 if self._fit_draft_summary is None:
                     raise RuntimeError("Fit draft summary was not returned by its worker")
                 self._summary.setText(self._fit_draft_summary)
-            elif self._saved_fit_reference is not None and request.result is not None:
+            elif self._saved_fit_receipt is not None and request.result is not None:
                 self._status.setText("FIT SAVED")
             else:
                 self._status.setText("READY")
@@ -2282,7 +2339,7 @@ class DataFigureWindow(FrozenRasterWindow):
                 self._start_pending_fit_overlay()
             deferred_reload = self._deferred_fit_reload
             if deferred_reload is not None and self._fit_future is None:
-                reference, revision = deferred_reload
+                receipt, revision = deferred_reload
                 self._deferred_fit_reload = None
                 bindings = self._fit_bindings
                 if (
@@ -2294,7 +2351,7 @@ class DataFigureWindow(FrozenRasterWindow):
                         "reload_saved",
                         _reload_fit_result,
                         bindings.reload,
-                        reference,
+                        receipt.handle,
                     ):
                         self._fit_job_revision = None
             if self._fit_prepare_pending and self._fit_future is None:
@@ -2309,6 +2366,7 @@ class DataFigureWindow(FrozenRasterWindow):
             self._fit_draft = None
             self._fit_draft_summary = None
             self._fit_save_inflight = None
+            self._saved_fit_receipt = None
             self._fit_candidate = None
             self._fit_options.clear()
             self._fit_options_release_pending = False
@@ -2321,6 +2379,7 @@ class DataFigureWindow(FrozenRasterWindow):
             self._typed_contract = None
             self._fit_overlay_renderer = None
             self._fit_bindings = None
+            self._fit_save_path = None
             self._fit_overlay_pending = None
             self._fit_overlay_inflight = None
             self._fit_overlay_desired = None
@@ -2336,7 +2395,7 @@ class DataFigureWindow(FrozenRasterWindow):
             self._close_deferred_during_fit_save = True
             self._status.setText("FIT SAVE IN PROGRESS · CLOSE DEFERRED")
             self._diagnostic.setText(
-                "The immutable reference will be accepted before close can continue."
+                "The saved Fit identity will be accepted before close can continue."
             )
             return
         cancel_export_commits(

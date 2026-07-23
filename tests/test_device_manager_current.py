@@ -65,7 +65,16 @@ def test_formal_device_manager_edits_locally_then_initializes_and_closes(
 
         QtTest.QTest.mouseClick(body.lifecycle_button, QtCore.Qt.LeftButton)
         until(application, lambda: body.experiment is not None, timeout=15.0)
-        until(application, lambda: len(body._loaded_cards) == 3)
+        until(
+            application,
+            lambda: set(body._loaded_cards)
+            == {
+                "camera",
+                "monitor_camera",
+                "mot_camera",
+                "sequencer",
+            },
+        )
         capture = capture_offscreen_window(
             application,
             body,

@@ -44,7 +44,6 @@ class ConsoleSignalValue:
     name: str
     source: str                     # the node title that produced it
     snapshot: object                # OwnedSnapshot -- the (ref, block) pair a render needs
-    version: int                    # the producing stream's sequence at freeze time
     coverage: object | None         # MonitorCoverage, or None for a scalar-less signal
     # Lineage, carried because only the freeze knows it: a renderer stamps what
     # it drew with the run and event it came from, and a value that lost these
@@ -125,17 +124,6 @@ class ConsoleDataFront:
 
     def value(self, name: str) -> ConsoleSignalValue | None:
         return self.signals.get(str(name))
-
-    def versions(self) -> dict[str, int]:
-        """Per-signal version, for change detection.
-
-        Derived from the producing stream's sequence rather than counted here:
-        a version that the console incremented itself would advance even when
-        the tap dropped the event, which is exactly the case a panel needs to
-        distinguish.
-        """
-
-        return {name: value.version for name, value in self.signals.items()}
 
 
 class ConsoleDataPlane:
@@ -393,7 +381,6 @@ class ConsoleDataPlane:
                 name=key,
                 source=title,
                 snapshot=snapshot,
-                version=int(snapshot.block.revision.value),
                 coverage=None,
                 run_id=run_id,
                 epoch_id=snapshot.ref.stream_generation.value,
@@ -560,7 +547,7 @@ class ConsoleDataPlane:
         if raw is not None and declared:
             out[declared[0]] = ConsoleSignalValue(
                 name=declared[0], source=title, snapshot=raw.snapshot,
-                version=self._sequence(raw), coverage=raw.coverage,
+                coverage=raw.coverage,
                 run_id=run_id, epoch_id=causation,
                 join_digest=str(getattr(head, "payload_digest", "") or ""),
             )
@@ -568,7 +555,7 @@ class ConsoleDataPlane:
         if scalar is not None and len(declared) > 1 and scalar_matches_raw:
             out[declared[1]] = ConsoleSignalValue(
                 name=declared[1], source=title, snapshot=scalar.snapshot,
-                version=self._sequence(scalar), coverage=scalar.coverage,
+                coverage=scalar.coverage,
                 run_id=run_id, epoch_id=causation,
                 # A derived scalar names the raw event it reduced, so its join
                 # digest is that event's -- not a second digest of its own.
@@ -607,7 +594,6 @@ class ConsoleDataPlane:
                 name=declared[0],
                 source=title,
                 snapshot=snapshot.snapshot,
-                version=self._sequence(snapshot),
                 coverage=snapshot.coverage,
                 run_id=run_id,
                 epoch_id=causation,
@@ -653,7 +639,6 @@ class ConsoleDataPlane:
                 name=name,
                 source=title,
                 snapshot=snapshot.snapshot,
-                version=int(snapshot.ref.revision.value),
                 coverage=snapshot.coverage,
                 run_id=run_id,
                 epoch_id=causation,
@@ -662,8 +647,3 @@ class ConsoleDataPlane:
                 ),
             )
         }, slot.failure
-
-    @staticmethod
-    def _sequence(dataset_snapshot) -> int:
-        head = getattr(dataset_snapshot, "head", None)
-        return int(getattr(head, "sequence", 0) or 0)

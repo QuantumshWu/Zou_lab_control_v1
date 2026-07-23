@@ -337,8 +337,9 @@ def _camera_capture_params(
             required=True,
             optional=False,
             tooltip=(
-                "Expected camera-triggered frames in each repeat; the console "
-                "live preview currently requires one"
+                "Expected camera-triggered frames in each repeat. A one-cell "
+                "capture also has a live preview; every other valid layout is "
+                "preserved in the complete FINAL capture without reduction"
             ),
         ),
     )
@@ -407,12 +408,14 @@ def _occupancy_params() -> tuple[ParamDecl, ...]:
     return (
         ParamDecl(
             "camera_frame",
-            "Camera capture",
+            "Capture recipe",
             "signal",
             required=True,
             tooltip=(
-                "Frame output of an exact Camera capture Measurement row in "
-                "this TaskConsole"
+                "Select the frame output only to identify a Camera capture "
+                "Measurement row. Occupancy reruns that row's frozen capture "
+                "recipe with calibration; it does not consume a previously "
+                "published frame"
             ),
         ),
         ParamDecl(
@@ -544,7 +547,7 @@ class ConsoleCatalogView:
                         "frame",
                         "Counts",
                         "counts",
-                        "latest exact capture frame",
+                        "complete exact capture dataset (R, P, *data_shape)",
                     ),
                 ),
                 build_request=build_camera_capture,

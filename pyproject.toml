@@ -42,6 +42,7 @@ hardware = [
     "rpyc",
 ]
 docs = [
+    "nbclient",
     "nbconvert",
     "nbformat",
 ]

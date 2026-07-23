@@ -1,109 +1,109 @@
-"""The calls the neutral-atom tutorial teaches, exercised end to end.
+"""The checked-in neutral-atom tutorial is the executable user contract.
 
-The tutorial went stale without anything going red: it was written against a
-facade that has since been deleted, and no test ever ran its calls, so the
-first person to find out would have been a reader typing them in.  This pins
-the spine -- the sequence a reader actually follows -- so that removing or
-reshaping any step of it fails here first.
-
-It is deliberately the WHOLE arc rather than one call per test: what the
-tutorial promises is that these steps compose, and a capture reference that
-no calibration will accept would pass every isolated check.
-
-The tutorial intentionally teaches the smallest complete current readout path.
-More advanced products join only with their own executable user workflow; this
-guard never promises calls that the checked-in tutorial does not make.
+The old guard copied selected notebook calls into Python.  That let the copy
+stay green when the actual notebook drifted.  This file instead validates and
+executes the one shipped notebook itself; product-level physics and data
+contracts remain covered by their owning tests.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
-import tempfile
 
-import Zou_lab_control.notebook as zlc
-from zlc_neutral_atom.artifacts import CaptureArtifactRef
-from zlc_neutral_atom.readout.sitemap import load_packaged_sitemap_pulse
-
-
-def _single_readout_event(document):
-    """The imaging document with only its SECOND trigger window left armed.
-
-    The tutorial reaches detection this way and the reason is physical: the
-    imaging template brackets a shot with three frames, while an occupancy
-    decision is about one readout event.  Keeping the middle window is what
-    makes the capture carry the single event detection requires.
-    """
-
-    trigger_index = document.target.raw_lanes.index("ch11")
-    periods, runs, previous = [], 0, False
-    for period in document.periods:
-        states = list(period.states)
-        high = bool(states[trigger_index])
-        if high and not previous:
-            runs += 1
-        states[trigger_index] = int(high and runs == 2)
-        periods.append(replace(period, states=tuple(states)))
-        previous = high
-    assert runs == 3, "the bracket is what makes this worth narrowing"
-    return replace(document, name="spine-readout", periods=tuple(periods), repeat=None)
+import nbformat
+from nbclient import NotebookClient
 
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+TUTORIALS = ROOT / "tutorials"
+TUTORIAL = TUTORIALS / "neutral_atom_tutorial.ipynb"
+
+_REQUIRED_MARKDOWN = (
+    "连上装置",
+    "拍一组图",
+    "标定:站点、PSF 与读出模型",
+    "阈值与保真度来自数据",
+    "逐发判定",
+    "自主 Pulse scan",
+    "Release-recapture survival scan",
+    "图形界面",
+    "收尾",
+)
+
+_REQUIRED_CURRENT_CODE = (
+    "resolve_api_parameters",
+    "FrozenScanTable",
+    "temperature_release_recapture_request",
+    "aggregate_fidelity",
+    "global_fidelity",
+    "schema.cell_schema.data_shape",
+)
+
+_FORBIDDEN_OLD_OR_RAW_CODE = (
+    "Zou_lab_control.frontend",
+    "Zou_lab_control.neutral_atom",
+    "load_packaged_sitemap_pulse",
+    ".target.raw_lanes",
+    'trigger_channel="ch11"',
+    "exp.devices",
+    "exp.camera",
+    "triggered_frames(",
+    "detection_time(",
+    "fit_temperature(",
+)
 
 
-def test_there_is_one_current_user_tutorial() -> None:
-    notebooks = sorted(path.name for path in (ROOT / "tutorials").glob("*.ipynb"))
+def _load_notebook():
+    notebook = nbformat.read(TUTORIAL, as_version=4)
+    nbformat.validate(notebook)
+    return notebook
+
+
+def test_there_is_one_complete_current_user_tutorial() -> None:
+    notebooks = sorted(path.name for path in TUTORIALS.glob("*.ipynb"))
     assert notebooks == ["neutral_atom_tutorial.ipynb"]
 
+    notebook = _load_notebook()
+    cell_ids = [cell["id"] for cell in notebook.cells]
+    assert all(cell_ids)
+    assert len(cell_ids) == len(set(cell_ids))
 
-def test_the_tutorial_spine_runs_on_the_virtual_installation() -> None:
-    assert IMAGING_PULSE.exists(), "the tutorial names this pulse by path"
+    markdown = "\n".join(
+        cell.source for cell in notebook.cells if cell.cell_type == "markdown"
+    )
+    code = "\n".join(
+        cell.source for cell in notebook.cells if cell.cell_type == "code"
+    )
+    for text in _REQUIRED_MARKDOWN:
+        assert text in markdown
+    for text in _REQUIRED_CURRENT_CODE:
+        assert text in code
+    for text in _FORBIDDEN_OLD_OR_RAW_CODE:
+        assert text not in code
 
-    with tempfile.TemporaryDirectory() as workspace:
-        with zlc.connect("virtual", repository=Path(workspace) / "ws") as exp:
-            # The tutorial opens by asking what the installation offers, so the
-            # reader binds roles rather than device names.
-            roles = set(exp.device_catalog)
-            assert {"camera", "sequencer"} <= roles
 
-            # Look before you run: the descriptor answers "what will this do?"
-            # off the same request object that is about to be executed, which is
-            # the habit the tutorial is teaching.
-            request = exp.readout.capture_request(IMAGING_PULSE)
-            descriptor = exp.inspect(request)
-            assert descriptor.camera_role == "camera"
-            assert descriptor.expected_frames > 0
+def test_the_checked_in_tutorial_executes_on_the_virtual_installation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "ZLC_TUTORIAL_WORKSPACE",
+        str(tmp_path / "tutorial-workspace"),
+    )
+    notebook = _load_notebook()
+    executed = NotebookClient(
+        notebook,
+        timeout=120,
+        kernel_name="python3",
+        allow_errors=False,
+    ).execute(cwd=str(TUTORIALS))
 
-            reference = exp.run(request)
-            assert isinstance(reference, CaptureArtifactRef)
-
-            # What was run is recoverable from the reference alone -- the point
-            # of handing back a reference instead of an array.
-            artifact = exp.readout.load_capture(reference)
-            assert artifact.frame_source.schema.physical_shape == descriptor.output_shape
-            assert artifact.pulse_evidence is not None
-
-            # The one-liner the tutorial offers once the long form is understood.
-            assert isinstance(exp.readout.capture(IMAGING_PULSE), CaptureArtifactRef)
-
-            # Site calibration: the tutorial's second act, and the input every
-            # per-site quantity downstream is expressed against.
-            calibration = exp.readout.sitemap(frames=6)
-            report = exp.readout.load_calibration_report(calibration)
-            assert report.labels.n_sites > 0
-            assert len(report.psf_fits) == report.labels.n_sites
-
-            # Third act: is this site loaded, on this shot?  A pulse document is
-            # ordinary data the tutorial edits in place -- no editor involved.
-            shot = exp.readout.capture(
-                _single_readout_event(load_packaged_sitemap_pulse()),
-                trigger_channel="ch11",
-                readout_events_per_repeat=1,
-            )
-            occupancy = exp.readout.detect(
-                exp.readout.detection_request(shot, calibration)
-            )
-            assert isinstance(occupancy, zlc.OccupancyArtifactRef)
-            assert exp.readout.load_occupancy(occupancy) is not None
+    code_cells = [cell for cell in executed.cells if cell.cell_type == "code"]
+    assert code_cells
+    assert all(cell.execution_count is not None for cell in code_cells)
+    assert not [
+        output
+        for cell in code_cells
+        for output in cell.get("outputs", ())
+        if output.get("output_type") == "error"
+    ]

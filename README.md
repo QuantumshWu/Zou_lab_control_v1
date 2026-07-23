@@ -29,8 +29,10 @@ to `PATH`.
 There is exactly one user tutorial:
 [`tutorials/neutral_atom_tutorial.ipynb`](tutorials/neutral_atom_tutorial.ipynb).
 It executes the current virtual installation from request inspection through
-capture, provenance, site-map/PSF calibration, occupancy, and the formal GUI
-entry points.
+capture, provenance, site-map/PSF calibration, per-model fidelity, occupancy,
+a named-axis autonomous scan, release-recapture survival, and the formal GUI
+entry points. The survival scan is not presented as a µK fit because that
+public analysis/artifact owner has not been delivered.
 
 For the currently supported real pulse-only path, follow
 [`docs/REAL_HARDWARE_BRINGUP_zh.md`](docs/REAL_HARDWARE_BRINGUP_zh.md) and start

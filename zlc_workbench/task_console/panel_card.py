@@ -147,6 +147,8 @@ class PanelCard(FluentGroupBox):
             raise TypeError("fit_analysis_sink must be callable or None")
         self.fit_analysis_sink = fit_analysis_sink
         self._fit_analysis_available = False
+        self._fit_selection_candidate = None
+        self._fit_selection_origin = None
         # The card's display surface: an immutable-bytes raster board (contract 4).
         # The panel's stable identity: the board, its composer and every frame
         # they exchange are keyed on it, so a presented frame can only ever land
@@ -239,7 +241,13 @@ class PanelCard(FluentGroupBox):
 
     # ------------------------------------------------------------- geometry
     def _apply_fixed_size(self) -> None:
-        """Card size = whole layout slots (the footer absorbs the slack)."""
+        """Apply one size fact to both Fluent chrome and the plot host."""
+
+        logical_size = tuple(
+            int(value) for value in panel_display_size(self.config.size)
+        )
+        if self.board is not None:
+            self.board.set_logical_size(logical_size)
         self.setFixedSize(*_card_size(self.config.size))
         self._place_setting_button()
 
@@ -277,17 +285,17 @@ class PanelCard(FluentGroupBox):
         parent=None,
         text: str = "Analyze → Fit",
     ) -> FluentButton:
-        """Build another view of this card's one FINAL-fit command.
+        """Build another view of this card's one exact-source Fit command.
 
         Title bar, Setting and Edit use this same builder.  The button owns no
         source reference, FitSpec, solver or result; it asks the composition
-        root again at click time, so a rerun cannot leave an old artifact
-        armed in a widget.
+        root again at click time, so a new panel front or durable artifact
+        cannot leave an old source armed in a widget.
         """
 
         button = FluentButton(text, parent, color=ORANGE)
         button.setToolTip(
-            "Open the shared Fit editor for this panel's current FINAL scan artifact"
+            "Open the shared Fit editor for this panel's exact current source"
         )
         button.setEnabled(self._fit_analysis_available)
         button.clicked.connect(self._open_fit_analysis)
@@ -295,7 +303,7 @@ class PanelCard(FluentGroupBox):
         return button
 
     def set_fit_analysis_available(self, available: bool) -> None:
-        """Project whether this card currently resolves one exact FINAL source."""
+        """Project whether this card currently resolves one exact Fit source."""
 
         available = bool(available and self.fit_analysis_sink is not None)
         if available == self._fit_analysis_available:
@@ -307,7 +315,7 @@ class PanelCard(FluentGroupBox):
         sink = self.fit_analysis_sink
         if sink is None or not self._fit_analysis_available:
             self.set_status(
-                "Fit requires this panel's current FINAL scan artifact",
+                "Fit requires this panel's exact current source",
                 error=True,
             )
             return
@@ -468,6 +476,10 @@ class PanelCard(FluentGroupBox):
             )
             self.board.focusRequested.connect(self._focus_grid_cell)
             self.board.overviewRequested.connect(self._return_to_grid_overview)
+            self.board.rangeSelected.connect(self._remember_fit_range)
+            self.board.rectangleSelected.connect(
+                self._remember_fit_rectangle
+            )
         else:
             self.board = SinglePanelHost(
                 self.panel_id, empty_text="waiting for data")
@@ -476,7 +488,11 @@ class PanelCard(FluentGroupBox):
             # routing belongs to the TaskConsole composition layer; keeping
             # that meaning out of this view is what lets every image-like
             # consumer share the same selector.
-            self.board.rectangleSelected.connect(self.rectangle_selected.emit)
+            self.board.rangeSelected.connect(self._remember_fit_range)
+            self.board.rectangleSelected.connect(
+                self._remember_and_forward_rectangle
+            )
+        self._apply_fixed_size()
         # The pulse-preview answer protocol, verbatim: a wheel-zoom / pan /
         # double-middle commit is answered by re-composing THIS card at the
         # candidate's view under the candidate's revision; a clim-rail commit
@@ -508,6 +524,103 @@ class PanelCard(FluentGroupBox):
                 "rectangle selection requires this card's single-panel host"
             )
         return self.board.board.selection_for_rectangle_gesture(gesture)
+
+    def _remember_fit_range(self, gesture) -> None:
+        """Retain the typed owner's exact CURVE range as a display candidate."""
+
+        from zlc_frontend.selector import CurveRangeGesture
+
+        if not isinstance(gesture, CurveRangeGesture):
+            return
+        if gesture.x_span is None:
+            self._fit_selection_candidate = None
+            self._fit_selection_origin = None
+            return
+        board = self.board
+        if board is None:
+            return
+        try:
+            selection = board.board.selection_for_curve_range_gesture(gesture)
+        except RuntimeError:
+            self._fit_selection_candidate = None
+            self._fit_selection_origin = None
+            return
+        self._fit_selection_candidate = selection
+        self._fit_selection_origin = gesture.origin
+
+    def _remember_fit_rectangle(self, gesture) -> None:
+        """Retain an IMAGE box while the board still holds its exact origin."""
+
+        from zlc_frontend.selector import RectangleGesture
+
+        if not isinstance(gesture, RectangleGesture):
+            return
+        board = self.board
+        if board is None:
+            return
+        try:
+            selection = board.board.selection_for_rectangle_gesture(gesture)
+        except RuntimeError:
+            # SiteMap boxes are valid display gestures but intentionally have
+            # no authoritative SITE Selection; stale origins are equally
+            # ineligible.  The ROI composition signal is still forwarded by
+            # the caller, which owns its own typed admission and diagnostics.
+            self._fit_selection_candidate = None
+            self._fit_selection_origin = None
+            return
+        origin = board.visible_interaction_origin()
+        if origin is None:
+            self._fit_selection_candidate = None
+            self._fit_selection_origin = None
+            return
+        self._fit_selection_candidate = selection
+        self._fit_selection_origin = origin
+
+    def _remember_and_forward_rectangle(self, gesture) -> None:
+        self._remember_fit_rectangle(gesture)
+        self.rectangle_selected.emit(gesture)
+
+    def fit_selection_candidate(self):
+        """Return only the candidate authored against the still-visible front."""
+
+        board = self.board
+        origin = None if board is None else board.visible_interaction_origin()
+        if (
+            origin is None
+            or origin != self._fit_selection_origin
+        ):
+            self._fit_selection_candidate = None
+            self._fit_selection_origin = None
+            return None
+        return self._fit_selection_candidate
+
+    def has_local_fit_source(self) -> bool:
+        """Whether the accepted front is one exact local CURVE/IMAGE panel."""
+
+        if self.config.kind in ("sites", "grid") or self._last_document is None:
+            return False
+        board = self.board
+        if board is None or board.front_frame is None:
+            return False
+        snapshot = getattr(self._last_value, "snapshot", None)
+        try:
+            visible_input = self._visible_evaluated_input()
+        except RuntimeError:
+            return False
+        if snapshot is None or snapshot.ref != visible_input.ref:
+            return False
+        datasets = tuple(self._last_document.datasets)
+        layers = tuple(self._last_document.layers)
+        if (
+            len(datasets) != 1
+            or len(layers) != 1
+            or datasets[0].dataset_id != visible_input.dataset_id
+            or layers[0].dataset_id != visible_input.dataset_id
+        ):
+            return False
+        from zlc_frontend.figure import ViewIntent
+
+        return layers[0].view.intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
 
     def _focus_grid_cell(self, panel_index: int, selection) -> None:
         """Show one exact cell from the currently painted coherent overview."""
@@ -931,27 +1044,75 @@ class PanelCard(FluentGroupBox):
             raise RuntimeError(
                 "Site map is an exact composite front, not a single-dataset DataFigure"
             )
-        if self._last_figure is not None:
-            return self._last_figure
-
         from zlc_frontend import DataFigure
         from zlc_frontend.figure import ResolvedDataset, ResolvedDatasetMap
 
+        if self._last_figure is not None:
+            figure = self._last_figure
+        else:
+            value = self._last_value
+            snapshot = None if value is None else getattr(value, "snapshot", None)
+            block = None if snapshot is None else getattr(snapshot, "block", None)
+            if block is None:
+                raise RuntimeError("the panel has no immutable data revision to save")
+            document = self._last_document
+            if document is None:
+                raise RuntimeError("the panel has no accepted render document to save")
+            if len(document.datasets) != 1:
+                raise RuntimeError("a saved panel must bind exactly one typed dataset")
+            dataset_id = document.datasets[0].dataset_id
+            figure = DataFigure(
+                document,
+                ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
+            )
+
+        visible_input = self._visible_evaluated_input()
+        entries = tuple(figure.datasets.entries)
+        if (
+            len(entries) != 1
+            or entries[0].dataset_id != visible_input.dataset_id
+            or entries[0].snapshot.ref != visible_input.ref
+        ):
+            raise RuntimeError("front replacement in progress")
+        return figure
+
+    def visible_run_id(self):
+        """Return the producer RunId only when ``_last_value`` is visibly painted.
+
+        A FINAL result and its projected dataset become available before the
+        worker necessarily presents that revision.  Analysis must not fit the
+        new artifact while the operator is still looking at the previous
+        front.  This is a comparison against the board's existing typed input,
+        not another snapshot or presentation cache.
+        """
+
         value = self._last_value
         snapshot = None if value is None else getattr(value, "snapshot", None)
-        block = None if snapshot is None else getattr(snapshot, "block", None)
-        if block is None:
-            raise RuntimeError("the panel has no immutable data revision to save")
-        document = self._last_document
-        if document is None:
-            raise RuntimeError("the panel has no accepted render document to save")
-        if len(document.datasets) != 1:
-            raise RuntimeError("a saved panel must bind exactly one typed dataset")
-        dataset_id = document.datasets[0].dataset_id
-        return DataFigure(
-            document,
-            ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
+        if snapshot is None:
+            return None
+        try:
+            visible_input = self._visible_evaluated_input()
+        except RuntimeError:
+            return None
+        if snapshot.ref != visible_input.ref:
+            return None
+        return getattr(value, "run_id", None)
+
+    def _visible_evaluated_input(self):
+        """Read the exact typed input painted by the one current board front."""
+
+        board = self.board
+        front = None if board is None else board.front_frame
+        if front is None or len(front.panels) != 1:
+            raise RuntimeError("front replacement in progress")
+        visible_input = getattr(
+            front.panels[0].display_payload,
+            "evaluated_input",
+            None,
         )
+        if visible_input is None:
+            raise RuntimeError("front replacement in progress")
+        return visible_input
 
     def present(self) -> None:
         """Flush this card's composed front to the screen.  GUI thread only.
@@ -1385,6 +1546,8 @@ class PanelCard(FluentGroupBox):
     def _grid_candidate_view(self, intent, facet_axis_id):
         """Resolve one explicit facet choice to the complete named facet tuple."""
 
+        from dataclasses import replace
+
         from zlc_frontend.figure import (
             AxisViewRole,
             RepeatViewMode,
@@ -1447,6 +1610,58 @@ class PanelCard(FluentGroupBox):
             selection,
             preferences=preferences,
         )
+        # A named facet can still leave a display slot ambiguous.  For example,
+        # the MOT result has three equally typed SCAN_POINT axes: after the
+        # operator picks Bx as the primary facet, CURVE still needs one of
+        # By/Bz as X (and IMAGE needs both X and Y).  Do not restate the
+        # ViewContract's axis-role rules here.  Instead, consume only
+        # ``suggest_view``'s typed alternatives, exclude the already-authored
+        # facet, and choose the stable AxisId for that display-only slot.  A
+        # retry may expose the next IMAGE slot; each role is filled at most
+        # once, so this loop is bounded by the typed display-slot vocabulary.
+        auto_display_roles = set()
+        preference_field = {
+            AxisViewRole.X: "x_axis_id",
+            AxisViewRole.IMAGE_X: "image_x_axis_id",
+            AxisViewRole.IMAGE_Y: "image_y_axis_id",
+        }
+        while suggestion.status is SuggestionStatus.NEEDS_INPUT:
+            if not any(
+                reason.code == "AMBIGUOUS_DISPLAY_AXIS"
+                for reason in suggestion.reasons
+            ):
+                break
+            alternatives = tuple(
+                alternative
+                for alternative in suggestion.alternatives
+                if alternative.axis_id != facet_axis_id
+            )
+            roles = {alternative.binding_role for alternative in alternatives}
+            if len(roles) != 1:
+                break
+            role = next(iter(roles))
+            field = preference_field.get(role)
+            if (
+                field is None
+                or role in auto_display_roles
+                or getattr(preferences, field) is not None
+            ):
+                break
+            chosen = min(
+                alternatives,
+                key=lambda alternative: alternative.axis_id.value,
+            )
+            preferences = replace(
+                preferences,
+                **{field: chosen.axis_id},
+            )
+            auto_display_roles.add(role)
+            suggestion = suggest_view(
+                schema,
+                intent,
+                selection,
+                preferences=preferences,
+            )
         if (
             suggestion.status is SuggestionStatus.NEEDS_INPUT
             or suggestion.spec is None
@@ -1605,12 +1820,21 @@ class PanelCard(FluentGroupBox):
         ) if schema is not None else None
         with _signals_blocked(facet_combo):
             facet_combo.clear()
-            from zlc_frontend.figure import dataset_axes
+            from zlc_frontend.figure import AxisViewRole, dataset_axes
 
             axes_by_id = {
                 axis.axis_id: axis
                 for axis in (() if schema is None else dataset_axes(schema))
             }
+
+            def axis_text(axis_id):
+                axis = axes_by_id.get(axis_id)
+                return (
+                    axis_id.value
+                    if axis is None
+                    else f"{axis.name} [{axis_id.value}]"
+                )
+
             for axis, view in self._grid_facet_choices(intent):
                 displayed_view = (
                     current
@@ -1621,19 +1845,33 @@ class PanelCard(FluentGroupBox):
                     )
                     else view
                 )
-                facet_summary = " × ".join(
-                    (
-                        f"{axes_by_id[axis_id].name} "
-                        f"[{axis_id.value}]"
-                        if axis_id in axes_by_id
-                        else axis_id.value
+                by_role = {
+                    binding.role: binding.axis_id
+                    for binding in displayed_view.axis_bindings
+                }
+                if AxisViewRole.X in by_role:
+                    display_summary = (
+                        f"auto x={axis_text(by_role[AxisViewRole.X])}"
                     )
+                elif (
+                    AxisViewRole.IMAGE_X in by_role
+                    and AxisViewRole.IMAGE_Y in by_role
+                ):
+                    display_summary = (
+                        "auto "
+                        f"x={axis_text(by_role[AxisViewRole.IMAGE_X])} + "
+                        f"y={axis_text(by_role[AxisViewRole.IMAGE_Y])}"
+                    )
+                else:
+                    display_summary = "value distribution"
+                facet_summary = " × ".join(
+                    axis_text(axis_id)
                     for axis_id in self._facet_axis_ids(displayed_view)
-                )
+                ) or "(none)"
                 facet_combo.addItem(
                     (
                         f"{axis.name} · {axis.role.value} → "
-                        f"{facet_summary}"
+                        f"{display_summary}; facets={facet_summary}"
                     ),
                     axis.axis_id,
                 )
@@ -1952,6 +2190,8 @@ class PanelCard(FluentGroupBox):
         self._candidate_value = None
         self._last_document = None
         self._last_figure = None
+        self._fit_selection_candidate = None
+        self._fit_selection_origin = None
         self._candidate_schema = None
         self._grid_focus = None
         self._pending_faceted_result = None
@@ -2279,7 +2519,9 @@ class PanelCard(FluentGroupBox):
             return
         layout = section_box("Analysis")
         layout.addWidget(self.make_fit_analysis_button())
-        note = FluentLabel("Available only for this panel's current FINAL scan artifact")
+        note = FluentLabel(
+            "Uses this exact frozen panel, or its durable Capture/Scan source"
+        )
         note.setWordWrap(True)
         note.setStyleSheet(
             f"color: {GREY}; background: transparent; border: none;"
@@ -2430,6 +2672,8 @@ class PanelCard(FluentGroupBox):
         self._last_figure = None
         self._last_document = None
         self._last_display = None
+        self._fit_selection_candidate = None
+        self._fit_selection_origin = None
         self._requested_signature = None
         if board is not None:
             self.canvas_holder.removeWidget(board)

@@ -10,7 +10,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5 import QtCore, QtTest  # noqa: E402
+from PyQt5 import QtCore, QtTest, QtWidgets  # noqa: E402
 
 from test_u03b_interactive_curve_figure import _curve_figure, _until  # noqa: E402
 from zlc_frontend import CurveDisplayState, load_figure_archive  # noqa: E402
@@ -38,6 +38,138 @@ def _saved_curve(path):
         metadata={"device": "virtual"},
     )
     return figure, display
+
+
+def _fit_ready_curve_figure():
+    """One saved Fit whose non-fit axes are uniquely selected."""
+
+    from zlc_data import (
+        REPEAT,
+        SCAN_POINT,
+        AxisId,
+        AxisSpec,
+        BlockId,
+        DataBlock,
+        DatasetRevision,
+        DatasetSchema,
+        OwnedSnapshot,
+        PointLayout,
+        StreamGenerationId,
+        VALID,
+        ValidityContract,
+        ValueSchema,
+        bind_fit,
+        fit_spec_for,
+    )
+    from zlc_frontend import DataFigure
+    from zlc_frontend.figure import (
+        AxisViewBinding,
+        AxisViewRole,
+        DatasetDescriptor,
+        DatasetId,
+        FixedIndex,
+        FigureDocument,
+        FigureLayer,
+        ResolvedDataset,
+        ResolvedDatasetMap,
+        ViewIntent,
+        ViewSpec,
+    )
+
+    repeat = AxisSpec(
+        AxisId("archive-local.repeat"),
+        "repeat",
+        REPEAT,
+        1,
+        (0,),
+    )
+    scan = AxisSpec(
+        AxisId("archive-local.detuning"),
+        "detuning",
+        SCAN_POINT,
+        31,
+        tuple(float(index) for index in range(31)),
+        "MHz",
+    )
+    x = np.asarray(scan.coordinates, dtype=np.float64)
+    values = (1.5 + 6.0 * np.exp(-((x - 14.0) / 3.5) ** 2))[None, :]
+    schema = DatasetSchema(
+        repeat,
+        (scan,),
+        PointLayout.rect_c((scan.size,)),
+        ValueSchema(
+            (),
+            ValidityContract.value(),
+            values.dtype,
+            "count",
+        ),
+    )
+    block = DataBlock(
+        BlockId("archive-local-curve"),
+        DatasetRevision(1),
+        values,
+        VALID,
+        schema,
+    )
+    snapshot = OwnedSnapshot(
+        block.ref(StreamGenerationId("archive-local-generation")),
+        block,
+    )
+    view = ViewSpec(
+        schema.fingerprint,
+        ViewIntent.CURVE,
+        (
+            AxisViewBinding(
+                repeat.axis_id,
+                AxisViewRole.SELECTED,
+                selector=FixedIndex(0),
+            ),
+            AxisViewBinding(scan.axis_id, AxisViewRole.X),
+        ),
+    )
+    dataset_id = DatasetId("archive-local-source")
+    document = FigureDocument(
+        "archive-local-document",
+        0,
+        (DatasetDescriptor(dataset_id, "fitted curve", schema.fingerprint),),
+        (FigureLayer("curve", dataset_id, view),),
+    )
+    source = DataFigure(
+        document,
+        ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
+    )
+    saved_result = bind_fit(
+        fit_spec_for(
+            schema,
+            "gaussian_offset",
+            fit_axis_ids=(scan.axis_id,),
+        ),
+        schema,
+    ).run(snapshot)
+    return source.with_fit_results({"curve": saved_result})
+
+
+def _pick_combo_value(combo, value, application) -> None:
+    """Commit one visible combo choice through keyboard navigation."""
+
+    index = combo.findData(value)
+    assert index >= 0
+    QtTest.QTest.mouseClick(combo, QtCore.Qt.LeftButton)
+    application.processEvents()
+    QtTest.QTest.keyClick(combo, QtCore.Qt.Key_Home)
+    for _ in range(index):
+        QtTest.QTest.keyClick(combo, QtCore.Qt.Key_Down)
+    QtTest.QTest.keyClick(combo, QtCore.Qt.Key_Return)
+    assert combo.currentData() == value
+
+
+def _archive_has_model(path, model_id: str) -> bool:
+    try:
+        archive = load_figure_archive(path)
+    except Exception:
+        return False
+    results = tuple(archive.figure.fit_results.values())
+    return len(results) == 1 and results[0].spec.model_id == model_id
 
 
 def test_archive_roundtrip_preserves_multidimensional_source_and_validity(tmp_path):
@@ -118,6 +250,94 @@ def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
         )
         assert viewer.figure_pane is pane
         assert viewer.archive.payload_digest == digest
+    finally:
+        wrapper.close()
+        _until(application, lambda: viewer._closed)
+
+
+def test_formal_viewer_refits_and_reopens_the_same_archive(
+    application,
+    tmp_path,
+):
+    path = tmp_path / "refitted-curve.npz"
+    original = _fit_ready_curve_figure()
+    original.save_archive(path, metadata={"source": "formal archive refit"})
+    original_ref = original.datasets.entries[0].snapshot.ref
+
+    viewer = open_figure_viewer()
+    wrapper = viewer._zlc_window
+    path_edit = viewer.info_pane.path_edit.edit
+    try:
+        wrapper.show()
+        application.processEvents()
+        QtTest.QTest.mouseClick(path_edit, QtCore.Qt.LeftButton)
+        QtTest.QTest.keyClicks(path_edit, str(path))
+        QtTest.QTest.keyClick(path_edit, QtCore.Qt.Key_Return)
+        _until(
+            application,
+            lambda: (
+                viewer.archive is not None
+                and viewer.figure_pane is not None
+                and viewer.figure_pane.worker_idle
+                and viewer.figure_pane.raster_ready
+            ),
+        )
+        pane = viewer.figure_pane
+        analyze = pane.findChild(
+            QtWidgets.QPushButton,
+            "figureViewerAnalyzeFitButton",
+        )
+        assert analyze is not None and analyze.isEnabled()
+        QtTest.QTest.mouseClick(analyze, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: pane.worker_idle and bool(pane.fit_models),
+        )
+
+        model = pane.findChild(QtWidgets.QComboBox, "fitAuthoringModel")
+        fit = pane.findChild(
+            QtWidgets.QPushButton,
+            "fitAuthoringFitButton",
+        )
+        save = pane.findChild(
+            QtWidgets.QPushButton,
+            "fitAuthoringSaveButton",
+        )
+        assert model is not None and fit is not None and save is not None
+        assert model.currentData() == "gaussian_offset"
+        _pick_combo_value(model, "lorentzian", application)
+        _until(
+            application,
+            lambda: pane.worker_idle and fit.isEnabled(),
+        )
+        QtTest.QTest.mouseClick(fit, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: (
+                pane.worker_idle
+                and pane.draft_ready
+                and pane.raster_ready
+                and save.isEnabled()
+            ),
+        )
+        QtTest.QTest.mouseClick(save, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: (
+                pane.worker_idle
+                and viewer.archive is not None
+                and tuple(viewer.archive.figure.fit_results.values())[0]
+                .spec.model_id
+                == "lorentzian"
+                and _archive_has_model(path, "lorentzian")
+            ),
+        )
+
+        reopened = load_figure_archive(path)
+        assert reopened.metadata["source"] == "formal archive refit"
+        assert reopened.figure.datasets.entries[0].snapshot.ref == original_ref
+        assert pane.saved_reference is None
+        assert not wrapper.grab().isNull()
     finally:
         wrapper.close()
         _until(application, lambda: viewer._closed)

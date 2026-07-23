@@ -39,7 +39,6 @@ from zlc_frontend.histogram_display import (
 from zlc_frontend.image_display import ImageDisplayState, image_viewport_for_display_state
 from zlc_frontend.image_display import resolve_image_color_limits
 from zlc_frontend.image_view import image_viewport_for_evaluated_image
-from zlc_neutral_atom.artifacts import FitResultArtifactRef
 from zlc_workbench.fit import FitDraftAuthority, FitDraftResult
 from zlc_workbench.window_runtime import stage_and_replace_export
 
@@ -173,6 +172,7 @@ def _prepare_fit_options(
     fit_axis_ids: tuple[AxisId, ...],
     axis_roles: tuple[tuple[AxisId, AxisViewRole], ...],
     selection: Selection | None,
+    allow_prepared_transform: bool = False,
 ) -> tuple[FitAuthoringOption, ...]:
     options = tuple(
         prepare(
@@ -195,6 +195,7 @@ def _prepare_fit_options(
         fit_axis_ids=fit_axis_ids,
         axis_roles=axis_roles,
         selection=selection,
+        allow_prepared_transform=allow_prepared_transform,
     )
 
 def _execute_fit_draft(
@@ -226,9 +227,9 @@ def _execute_fit_draft(
 
 def _reload_fit_result(
     reload_result,
-    reference: FitResultArtifactRef,
+    handle: object,
 ) -> FitResultBatch:
-    result = reload_result(reference)
+    result = reload_result(handle)
     if not isinstance(result, FitResultBatch):
         raise TypeError("saved Fit reload returned another result type")
     return result

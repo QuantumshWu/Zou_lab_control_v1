@@ -83,6 +83,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     )
     from .result_projection import project_final_signals
     from .window import show_task_console
+    from zlc_workbench.data_figure.app import open_local_data_figure_analysis
     from .run_bridge import ConsoleRunNode
 
     catalog_view = ConsoleCatalogView(experiment)
@@ -150,7 +151,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 ),
                 request_owner_wake=request_owner_wake,
             )
-            _bind_capture_preview(node, data_plane)
+            _bind_capture_execution(node, data_plane)
             node.bind_final_projector(
                 lambda result, current=node: project_final_signals(
                     experiment,
@@ -439,6 +440,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         run_factory=run_factory,
         data_plane=data_plane,
         fit_window_factory=experiment.fit_gui,
+        local_fit_window_factory=open_local_data_figure_analysis,
         rectangle_selection_sink=submit_rectangle_selection,
         **kwargs,
     )
@@ -479,8 +481,13 @@ def _bind_monitor_view(node, data_plane) -> None:
     node.bind_starter(start)
 
 
-def _bind_capture_preview(node, data_plane) -> None:
-    """Attach the exact capture's capacity-one preview to the console data plane."""
+def _bind_capture_execution(node, data_plane) -> None:
+    """Start one finite capture, attaching its optional single-event preview.
+
+    The preview is a presentation convenience, not part of the capture
+    contract.  Any layout outside the preview's one-cell contract therefore
+    starts without it and publishes its complete FINAL dataset after success.
+    """
 
     import uuid
 
@@ -488,11 +495,16 @@ def _bind_capture_preview(node, data_plane) -> None:
     from zlc_frontend.figure import DatasetId
     from zlc_workbench.live import LiveDatasetSlot
 
-    token = uuid.uuid4().hex
-    dataset_id = DatasetId(f"console-capture-{token}")
-    block_id = BlockId(f"console-capture-preview-{token}")
-
     def start(command):
+        try:
+            command.preview_schema
+        except ValueError:
+            return command.start()
+
+        token = uuid.uuid4().hex
+        dataset_id = DatasetId(f"console-capture-{token}")
+        block_id = BlockId(f"console-capture-preview-{token}")
+
         def factory(preview_spec):
             slot = LiveDatasetSlot(
                 preview_spec,

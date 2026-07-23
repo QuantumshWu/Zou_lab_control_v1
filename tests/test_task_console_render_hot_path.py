@@ -324,14 +324,13 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
         block,
     )
     value = ConsoleSignalValue(
-        "scan",
-        "virtual scan",
-        snapshot,
-        1,
-        None,
-        "run",
-        "epoch",
-        "0" * 64,
+        name="scan",
+        source="virtual scan",
+        snapshot=snapshot,
+        coverage=None,
+        run_id="run",
+        epoch_id="epoch",
+        join_digest="0" * 64,
     )
 
     application = ensure_qt_app()

@@ -2,8 +2,9 @@
 
 Worth a test where it touches reality: a live virtual monitor is frozen through
 the data plane and must yield the camera's actual block (shape, dtype, unit off
-the producer's own cell schema), a version that ADVANCES with the stream, and
-coverage instead of a global shot counter -- the fiction the purge removed.
+the producer's own cell schema), an exact revision that ADVANCES with the
+stream, and coverage instead of a global shot counter -- the fiction the purge
+removed.
 Independent producers may share a present cycle but never gain a same-shot
 claim from it.
 """
@@ -38,7 +39,7 @@ def test_unchanged_sources_reuse_their_immutable_front() -> None:
     assert len(calls) == 2
 
 
-def test_a_live_monitor_freezes_into_real_values_with_advancing_versions():
+def test_a_live_monitor_freezes_into_real_values_with_advancing_revisions():
     code = (
         "import tempfile, pathlib, time\n"
         "from Zou_lab_control.notebook import connect\n"
@@ -83,10 +84,11 @@ def test_a_live_monitor_freezes_into_real_values_with_advancing_versions():
         # coverage replaces the shot clock
         "    assert value.coverage.total_cells > 0\n"
         "    assert value.behind == value.coverage.missed_events\n"
-        "    first = snapshot.versions()\n"
+        "    first = {name: value.snapshot.ref for name, value in snapshot.signals.items()}\n"
         "    time.sleep(1.0)\n"
-        "    later = plane.freeze().versions()\n"
-        "    assert any(later[k] > first[k] for k in first), (first, later)\n"
+        "    later_front = plane.freeze()\n"
+        "    later = {name: value.snapshot.ref for name, value in later_front.signals.items()}\n"
+        "    assert any(later[k] != first[k] for k in first), (first, later)\n"
         "    node.cancel()\n"
         "    t = time.monotonic() + 60\n"
         "    while node.running and time.monotonic() < t:\n"
@@ -193,11 +195,11 @@ def test_independent_producers_keep_independent_causation_in_one_present_cycle()
     fast = front.value("fast_frame")
 
     assert slow is not None and fast is not None
-    assert (slow.run_id, slow.epoch_id, slow.version, slow.join_digest) == (
-        "run-slow", "epoch-slow", 3, "a" * 64,
+    assert (slow.run_id, slow.epoch_id, slow.join_digest) == (
+        "run-slow", "epoch-slow", "a" * 64,
     )
-    assert (fast.run_id, fast.epoch_id, fast.version, fast.join_digest) == (
-        "run-fast", "epoch-fast", 91, "b" * 64,
+    assert (fast.run_id, fast.epoch_id, fast.join_digest) == (
+        "run-fast", "epoch-fast", "b" * 64,
     )
     assert not hasattr(front, "run_id")
     assert not hasattr(front, "shot")

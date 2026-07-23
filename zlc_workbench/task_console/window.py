@@ -13,7 +13,7 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Sequence
 
 import numpy as np
 from PyQt5 import QtCore, QtWidgets
@@ -90,6 +90,7 @@ class TaskConsole(QtWidgets.QWidget):
         run_factory=None,
         data_plane=None,
         fit_window_factory=None,
+        local_fit_window_factory=None,
         rectangle_selection_sink=None,
         scale: float | None = None,
         window_ratio: float = WINDOW_SCREEN_FRACTION,
@@ -130,6 +131,14 @@ class TaskConsole(QtWidgets.QWidget):
         if fit_window_factory is not None and not callable(fit_window_factory):
             raise TypeError("fit_window_factory must be callable or None")
         self._fit_window_factory = fit_window_factory
+        if (
+            local_fit_window_factory is not None
+            and not callable(local_fit_window_factory)
+        ):
+            raise TypeError(
+                "local_fit_window_factory must be callable or None"
+            )
+        self._local_fit_window_factory = local_fit_window_factory
         if rectangle_selection_sink is not None and not callable(
             rectangle_selection_sink
         ):
@@ -550,6 +559,7 @@ class TaskConsole(QtWidgets.QWidget):
         card.show()
         card.changed.connect(self._mark_dirty)
         card.changed.connect(self._sync_fit_analysis_entries)
+        card.front_presented.connect(self._sync_fit_analysis_entries)
         # ``changed`` also covers title/size/display edits.  Read only this
         # card's tiny binding delta and rebuild legends only when its signal
         # actually changed; ordinary display edits never enumerate providers.
@@ -1594,17 +1604,19 @@ class TaskConsole(QtWidgets.QWidget):
         self._mark_dirty()
         return row
 
-    # --------------------------------------------------------- FINAL analysis
+    # -------------------------------------------------------------- analysis
     def _fit_source_for_card(self, card: "PanelCard"):
-        """Resolve one card binding to exactly one FINAL scan artifact.
+        """Resolve one card binding to exactly one durable Capture/Scan result.
 
-        A card stores only declared dataset names, so two task rows declaring
+        A card stores only declared dataset names, so two logic rows declaring
         the same name are ambiguous and must not be guessed.  With exactly one
-        matching row, the successful Run result is the authority; no display
-        snapshot, selector state or parallel fit draft is consulted.
+        matching row, its successful Run result is the authority.  A display
+        selection remains only a candidate until the operator clicks Analyze.
         """
 
         if self._fit_window_factory is None:
+            return None
+        if card.config.kind in ("sites", "grid"):
             return None
         reads = self._card_reads(card)
         if not reads:
@@ -1612,7 +1624,7 @@ class TaskConsole(QtWidgets.QWidget):
         matched_nodes = []
         for row in self.logic_nodes:
             spec = self._spec_for_logic(row.node)
-            if spec is None or str(getattr(spec, "kind", "")) != "task":
+            if spec is None:
                 continue
             outputs = set(self._declared_signal_keys(row))
             if reads.isdisjoint(outputs):
@@ -1623,34 +1635,71 @@ class TaskConsole(QtWidgets.QWidget):
         node = matched_nodes[0]
         if node is None:
             return None
+        handle = getattr(node, "handle", None)
+        run_id_value = getattr(handle, "run_id", None)
+        run_id = getattr(run_id_value, "value", run_id_value)
+        if card.visible_run_id() != run_id:
+            return None
+        from zlc_neutral_atom.artifacts import CaptureArtifactRef
         from zlc_neutral_atom.scan import ScanArtifactRef
 
         result = node.final_result
-        return result if isinstance(result, ScanArtifactRef) else None
+        return (
+            result
+            if isinstance(result, (CaptureArtifactRef, ScanArtifactRef))
+            else None
+        )
 
     def _sync_fit_analysis_entries(self, *_args) -> None:
         """Project current exact-source availability onto every card button."""
 
         for card in tuple(self.cards):
+            durable = self._fit_source_for_card(card) is not None
+            local = (
+                self._local_fit_window_factory is not None
+                and card.has_local_fit_source()
+            )
             card.set_fit_analysis_available(
-                self._fit_source_for_card(card) is not None
+                durable or local
             )
 
     def _open_panel_fit(self, card: "PanelCard") -> None:
-        """Open or focus the shared Fit host for the card's current FINAL ref."""
+        """Open the sole Fit host for the card's exact accepted source."""
 
         source = self._fit_source_for_card(card)
-        if source is None:
+        selection = card.fit_selection_candidate()
+        figure = None
+        if source is None and self._local_fit_window_factory is not None:
+            try:
+                figure = card.frozen_data_figure()
+            except (TypeError, ValueError, RuntimeError) as error:
+                card.set_fit_analysis_available(False)
+                card.set_status(str(error), error=True)
+                return
+        if source is None and figure is None:
             card.set_fit_analysis_available(False)
             card.set_status(
-                "Fit requires one unambiguous current FINAL scan artifact",
+                "Fit requires one current frozen panel or durable Capture/Scan",
                 error=True,
             )
             return
+        if source is not None:
+            analysis_source = ("artifact", source, selection)
+        else:
+            analysis_source = (
+                "panel",
+                figure.document.document_id,
+                figure.document.revision,
+                tuple(
+                    (entry.dataset_id, entry.snapshot.ref)
+                    for entry in figure.datasets.entries
+                ),
+                selection,
+            )
         current = self._analysis_window
         if (
             current is not None
-            and self._analysis_source == source
+            and self._analysis_source == analysis_source
             and not bool(getattr(current, "closed", False))
         ):
             restore = getattr(current, "restore_window", None)
@@ -1661,13 +1710,49 @@ class TaskConsole(QtWidgets.QWidget):
                 current.raise_()
                 current.activateWindow()
             return
-        factory = self._fit_window_factory
-        if factory is None:
-            raise RuntimeError("this TaskConsole has no Fit window capability")
-        window = factory(source)
+        if source is not None:
+            factory = self._fit_window_factory
+            if factory is None:
+                raise RuntimeError(
+                    "this TaskConsole has no durable Fit window capability"
+                )
+            if selection is None:
+                window = factory(source)
+            else:
+                from zlc_data import DataTransformSpec, commit_transform
+
+                figure = card.frozen_data_figure()
+                layer = figure.document.layers[0]
+                schema = figure.datasets.resolve(layer.dataset_id).block.schema
+                transform = commit_transform(
+                    schema,
+                    DataTransformSpec((selection,)),
+                )
+                window = factory(
+                    source,
+                    committed_transform=transform,
+                )
+            status = "opened exact Fit Analysis for the durable Capture/Scan"
+        else:
+            factory = self._local_fit_window_factory
+            if factory is None:
+                raise RuntimeError(
+                    "this TaskConsole has no local Fit window capability"
+                )
+            window = factory(
+                figure,
+                initial_selection=selection,
+                archive_metadata={
+                    "panel_kind": str(card.config.kind),
+                    "panel_title": str(card.config.title),
+                    "signal": str(card.config.signal),
+                },
+                open_analysis=True,
+            )
+            status = "opened exact Fit Analysis for the frozen panel"
         self._analysis_window = window
-        self._analysis_source = source
-        card.set_status("opened exact Fit Analysis for the FINAL scan", error=False)
+        self._analysis_source = analysis_source
+        card.set_status(status, error=False)
 
     def _edit_logic_node(self, row: "LogicNodeRow") -> None:
         """Open (or focus) a logic node's OWN closable Edit tab (param form + Start/Stop)."""
@@ -1696,8 +1781,22 @@ class TaskConsole(QtWidgets.QWidget):
         editor = self._logic_editors.get(id(row))
         try:
             values = editor.collect_values() if editor is not None else dict(row.node.values)
-        except Exception:
-            values = dict(row.node.values)
+        except Exception as error:
+            current = self._logic_nodes.get(id(row))
+            still_running = bool(
+                current is not None
+                and getattr(current, "running", False)
+            )
+            action = "restart" if still_running else "start"
+            status = f"{action} rejected: invalid form values: {error}"
+            row.set_state(
+                "running" if still_running else "error",
+                status=status,
+            )
+            if editor is not None:
+                editor.set_running(still_running)
+                editor.set_status(status, error=True)
+            return
         if editor is not None:
             # The form's collect_values returns only its DECLARED widgets, so a stored value the form
             # does not own (a drag-set ROI ``selection`` is DATA, not a form field) would be dropped on
@@ -2169,18 +2268,36 @@ class TaskConsole(QtWidgets.QWidget):
         self._last_save_dir = str(Path(path).parent)
         self._update_summary()
 
-    def _panel_frame_key(self, card, versions: Mapping[str, int]):
+    def _panel_frame_key(self, card, front):
         """The identity of the frame this panel would draw from the current tick.
 
         A panel is stale exactly when one of the signals it reads has advanced.
-        The key is deliberately per-card/per-signal: sharing a present cycle
-        never asserts that unrelated producers emitted the same physical shot.
+        Identity is the existing immutable source lineage, not its naked integer
+        revision: a new Run may legitimately restart at revision/sequence 1 and
+        must never compare equal to the previous Run's frame.  The key remains
+        per-card/per-signal; sharing a present cycle never asserts that unrelated
+        producers emitted the same physical shot.
         """
 
-        return tuple(
-            (str(name), int(versions.get(str(name), 0)))
-            for name in sorted(self._card_reads(card))
-        )
+        identity = []
+        for name in sorted(self._card_reads(card)):
+            signal_name = str(name)
+            value = front.value(signal_name)
+            snapshot = None if value is None else value.snapshot
+            if snapshot is None:
+                identity.append((signal_name, None))
+                continue
+            ref = snapshot.ref
+            identity.append(
+                (
+                    signal_name,
+                    value.run_id,
+                    value.epoch_id,
+                    ref,
+                    value.join_digest,
+                )
+            )
+        return tuple(identity)
 
     def _tick(self) -> None:
         # poll the logic nodes EVERY base tick (even when no new signal arrived) so a
@@ -2198,7 +2315,6 @@ class TaskConsole(QtWidgets.QWidget):
         # One immutable front for this GUI pass.  It is a per-producer-latest
         # observation, not a board-wide physical-shot join.
         self._tick_data = self._data.freeze()
-        versions = self._tick_data.versions()
         elapsed = self._tick_count * self._base_interval_ms
         # COLLECT every panel whose own source revisions changed and whose beat is
         # due.  ``update_ms`` gates when that card recomposes; batching
@@ -2207,7 +2323,7 @@ class TaskConsole(QtWidgets.QWidget):
         # unlike the removed live-artist path, they need no GUI-side blit lock.
         batch = []
         for card in self.cards:
-            key = self._panel_frame_key(card, versions)
+            key = self._panel_frame_key(card, self._tick_data)
             if key == card._render_version:
                 continue                       # nothing this panel shows changed
             if elapsed % card.config.update_ms != 0:
@@ -2229,10 +2345,9 @@ class TaskConsole(QtWidgets.QWidget):
         self._poll_logic_nodes()
         self._refresh_signal_info()
         self._tick_data = self._data.freeze()
-        versions = self._tick_data.versions()
         self._enqueue_render_batch(
             tuple(
-                (card, self._panel_frame_key(card, versions))
+                (card, self._panel_frame_key(card, self._tick_data))
                 for card in self.cards
             ),
             self._tick_data,
@@ -2477,6 +2592,7 @@ def show_task_console(
     run_factory=None,
     data_plane=None,
     fit_window_factory=None,
+    local_fit_window_factory=None,
     rectangle_selection_sink=None,
     scale: float | None = None,
     window_ratio: float = WINDOW_SCREEN_FRACTION,
@@ -2510,7 +2626,9 @@ def show_task_console(
     console = TaskConsole(state=state, running_nodes=running_nodes,
                           catalog_view=catalog_view, run_factory=run_factory,
                           data_plane=data_plane,
-                          fit_window_factory=fit_window_factory, scale=scale,
+                          fit_window_factory=fit_window_factory,
+                          local_fit_window_factory=local_fit_window_factory,
+                          scale=scale,
                           rectangle_selection_sink=rectangle_selection_sink,
                           window_ratio=window_ratio)
     console._on_close = on_close
