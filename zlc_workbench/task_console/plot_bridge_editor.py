@@ -243,6 +243,11 @@ class PanelEditor(QtWidgets.QWidget):
         display_specs = ([spec for spec in _panel_param_decls(card.config.kind)
                           if spec.display] + [_RELIM_PARAM])
         self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, label_w)
+        self.repeat_mode_row, self.repeat_mode_combo = card._make_repeat_mode_row(
+            self._edit_repeat_mode,
+            label_w,
+        )
+        col.addWidget(self.repeat_mode_row)
         self.ed_cmap = self.ed_params.get("colormap")
         self.ed_relim = self.ed_params.get("relim")
         # An image's VALUE axis is its colour limit, pinned by the "colour range" row in
@@ -442,6 +447,12 @@ class PanelEditor(QtWidgets.QWidget):
         # ``front_presented`` copies the accepted immutable raster into this
         # frozen view.  There is deliberately no Edit-side composer.
 
+    def _edit_repeat_mode(self, mode) -> None:
+        if self.card is None:
+            return
+        self._follow_next_front = True
+        self.card._commit_repeat_mode(mode)
+
     def _sync_fixed_lim_enabled(self, relim: str) -> None:
         """The Edit tab's fixed lo/hi row is ALWAYS in the layout -- only its INPUTS enable when
         ``relim == "fixed"``.  A ``setVisible`` toggle on a row that sits above the snapshot canvas in
@@ -579,6 +590,11 @@ class PanelEditor(QtWidgets.QWidget):
         special-cases PanelEditor versus LogicNodeEditor)."""
         card = self.card
         self._refresh_display_params()
+        if card is not None:
+            card._seed_repeat_mode_control(
+                self.repeat_mode_combo,
+                self.repeat_mode_row,
+            )
         self._seed_limit_boxes()        # re-seed the pin from config.params (may have changed in Setting)
         self.refresh_limit_hints()
         self.refresh_node_now_labels()

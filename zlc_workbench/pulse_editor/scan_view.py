@@ -361,6 +361,19 @@ class PulseScanView(QtWidgets.QWidget):
         self._source_revision = int(source_revision)
         self.set_run_dirty(dirty)
 
+    def replace_scan_draft(self, source: str) -> None:
+        """Replace the UI-owned draft without committing controller state."""
+
+        with signals_blocked(self.scan_code):
+            self.scan_code.setPlainText(str(source))
+        self.set_run_dirty(True)
+
+    def acknowledge_scan_draft(self, *, dirty: bool, source_revision: int) -> None:
+        """Advance committed metadata without rebuilding the editor widget."""
+
+        self._source_revision = int(source_revision)
+        self.set_run_dirty(dirty)
+
     def set_scan_table_text(self, text: str) -> None:
         self.scan_table_view.setPlainText(str(text))
 

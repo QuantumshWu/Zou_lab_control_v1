@@ -143,10 +143,20 @@ def scan_column_specs(document: PulseDocument) -> tuple[ScanColumnSpec, ...]:
         if field.kind == FIELD_DAC:
             port_title = document.target.by_key[field.port].label
             display_label = f"{period_title} · {port_title}"
-            raw_name = f"{port_title}_p{period_index + 1}"
+            semantic_name = f"{port_title}_p{period_index + 1}"
+            authored_label = (
+                "" if parameter.label == port_title else parameter.label
+            )
         elif field.kind == FIELD_DURATION:
             display_label = f"{period_title} · duration"
-            raw_name = f"duration_p{period_index + 1}"
+            semantic_name = f"duration_p{period_index + 1}"
+            authored_label = parameter.label
+        # ParameterId remains the compiler/table identity.  The code editor,
+        # table header and progress use one presentation name: an explicitly
+        # authored label when present, otherwise the physical field/period.
+        # This keeps an old opaque implementation id out of the UI without
+        # changing which column the compiler binds.
+        raw_name = authored_label or semantic_name
         stem = re.sub(r"[^A-Za-z0-9_]+", "_", raw_name).strip("_").lower()
         stem = stem or "scan_value"
         if stem[0].isdigit():
@@ -570,7 +580,9 @@ def _strict_numeric_matrix(
         array = np.asarray(value)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{field} must be one rectangular numeric matrix") from error
-    if array.ndim != 2:
+    if array.ndim == 1 and width == 1:
+        array = array.reshape((-1, 1))
+    elif array.ndim != 2:
         raise ValueError(f"{field} must be exactly two-dimensional")
     if array.shape[0] < 1:
         raise ValueError(f"{field} must contain at least one scan point")

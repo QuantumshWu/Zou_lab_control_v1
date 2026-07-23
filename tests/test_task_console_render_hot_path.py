@@ -9,6 +9,9 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -157,6 +160,103 @@ def test_timer_never_rediscovers_signal_topology_but_binding_commit_does() -> No
             console._tick()
         application.processEvents()
         assert provider_reads == reads_after_commit
+    finally:
+        assert console.shutdown()
+        console.close()
+        application.processEvents()
+
+
+def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_data import (
+        REPEAT,
+        SCAN_POINT,
+        AxisId,
+        AxisSpec,
+        DatasetSchema,
+        PointLayout,
+        ValidityContract,
+        ValueSchema,
+    )
+    from zlc_data.console_records import PanelConfig
+    from zlc_frontend.console_state import TaskConsoleState
+    from zlc_frontend.figure import (
+        AxisViewRole,
+        RepeatViewMode,
+        view_spec_from_tree,
+    )
+    from zlc_frontend.panel_render import PanelComposer
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.task_console.plot_bridge_console import TaskConsole
+
+    repeat = AxisSpec(
+        AxisId("task-console.repeat"),
+        "repeat",
+        REPEAT,
+        3,
+        (0, 1, 2),
+    )
+    scan = AxisSpec(
+        AxisId("task-console.scan"),
+        "detuning",
+        SCAN_POINT,
+        4,
+        (-1.0, 0.0, 1.0, 2.0),
+        "MHz",
+    )
+    schema = DatasetSchema(
+        repeat,
+        (scan,),
+        PointLayout.rect_c((scan.size,)),
+        ValueSchema((), ValidityContract.value(), np.dtype("float64"), "V"),
+    )
+
+    application = ensure_qt_app()
+    console = TaskConsole(
+        state=TaskConsoleState(
+            panels=(PanelConfig(kind="1d", title="typed repeat"),),
+        ),
+        window_px=(900, 650),
+    )
+    try:
+        console.show()
+        application.processEvents()
+        console._timer.stop()
+        card = console.cards[0]
+        card._last_value = SimpleNamespace(
+            snapshot=SimpleNamespace(block=SimpleNamespace(schema=schema))
+        )
+        requests: list[bool] = []
+        card._render_request = (
+            lambda _card, *, force=False: requests.append(bool(force)) or True
+        )
+
+        QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
+        application.processEvents()
+        card._refresh_repeat_mode_control()
+        combo = card.repeat_mode_combo
+        assert combo.isVisible()
+        assert combo.findData(RepeatViewMode.FACET) == -1
+        assert combo.findData(RepeatViewMode.BATCH) >= 0
+
+        combo.setFocus()
+        QtTest.QTest.keyClick(combo, QtCore.Qt.Key_End)
+        application.processEvents()
+
+        view = view_spec_from_tree(card.config.params["view_spec"])
+        assert view.binding(repeat.axis_id).role is AxisViewRole.BATCH
+        assert "repeat_mode" not in card.config.params
+        assert requests == [False]
+        composer = PanelComposer(
+            "typed-repeat",
+            intent=card.view_intent(),
+            view=view,
+        )
+        try:
+            assert composer.document_for(schema).layers[0].view == view
+        finally:
+            composer.close()
     finally:
         assert console.shutdown()
         console.close()

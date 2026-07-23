@@ -96,6 +96,28 @@ def _panel_view_intents():
         "hist": ViewIntent.HISTOGRAM,
     }
 
+
+# ``ViewSpec`` is the figure owner's sole persistent presentation value.  The
+# TaskConsole stores its owner-coded tree inside the application-local panel
+# params; it never persists a second string vocabulary such as
+# ``average/add/replace/create``.
+_VIEW_SPEC_PARAM = "view_spec"
+
+
+def _repeat_mode_label(mode) -> str:
+    """Operator label for one existing typed repeat policy."""
+
+    from zlc_frontend.figure import RepeatViewMode
+
+    return {
+        RepeatViewMode.MEAN: "Mean",
+        RepeatViewMode.SUM: "Sum",
+        RepeatViewMode.LATEST: "Latest repeat",
+        RepeatViewMode.BATCH: "Overlay repeats",
+        RepeatViewMode.SAMPLE: "Pool as samples",
+        RepeatViewMode.FACET: "Facet repeats",
+    }[mode]
+
 GRID_UNIT = 8
 
 # The ONE spacing setting (#H3s-F8).  GAP is the UNIFORM clear distance between any two cards on
@@ -226,6 +248,7 @@ class _PanelRenderRequest:
     label: str
     size: tuple[int, int]
     provenance: object
+    view: object
 
 class PanelCard(FluentGroupBox):
     """One dashboard panel: a TITLED frame (title strip = the panel KIND + the signal-source
@@ -552,6 +575,7 @@ class PanelCard(FluentGroupBox):
                     PARAM_WIDGETS[kind].write(widget, self.config.params[key])
                 except (TypeError, ValueError):
                     continue
+        self._refresh_repeat_mode_control()
 
     def _build_plot(self) -> None:
         """Give this card its raster surface.
@@ -654,6 +678,7 @@ class PanelCard(FluentGroupBox):
         from zlc_frontend.panel_render import PanelProvenance
 
         display = self._display_state()
+        view = self._saved_view_spec(value.snapshot.block.schema)
         size = tuple(int(value) for value in panel_display_size(self.config.size))
         source_key = (
             str(self.config.kind),
@@ -661,6 +686,7 @@ class PanelCard(FluentGroupBox):
             str(value.source),
             str(self.config.title),
             size,
+            view,
         )
         signature = (frame_key, source_key, display)
         if not force and signature == self._requested_signature:
@@ -679,6 +705,7 @@ class PanelCard(FluentGroupBox):
             str(self.config.title or value.name),
             size,
             PanelProvenance(value.run_id, value.epoch_id, value.join_digest),
+            view,
         )
 
     def accept_render_result(
@@ -710,6 +737,7 @@ class PanelCard(FluentGroupBox):
         self._last_value = request.value
         self._last_document = document
         self._last_display = request.display
+        self._refresh_repeat_mode_control()
         self.set_status("ok", error=False)
         return True
 
@@ -884,6 +912,11 @@ class PanelCard(FluentGroupBox):
                           if spec.display] + [_RELIM_PARAM])
         self.param_widgets = self._emit_param_rows(
             display_specs, display.addWidget, self._set_param, label_w)
+        self.repeat_mode_row, self.repeat_mode_combo = self._make_repeat_mode_row(
+            self._commit_repeat_mode,
+            label_w,
+        )
+        display.addWidget(self.repeat_mode_row)
         self.fixed_lim_row, self.fixed_lo_edit, self.fixed_hi_edit = self._make_fixed_lim_row(
             self._on_fixed_lim_edited, label_w)
         display.addWidget(self.fixed_lim_row)
@@ -1014,6 +1047,166 @@ class PanelCard(FluentGroupBox):
         if combo is not None:
             self._fill_slot_combo(combo, self.config.signal)
 
+    def _current_schema(self):
+        value = self._last_value
+        snapshot = None if value is None else getattr(value, "snapshot", None)
+        block = None if snapshot is None else getattr(snapshot, "block", None)
+        return None if block is None else getattr(block, "schema", None)
+
+    def _saved_view_spec(self, schema):
+        """Decode the one current owner-coded presentation value, if authored."""
+
+        raw = self.config.params.get(_VIEW_SPEC_PARAM)
+        if raw is None:
+            return None
+        from zlc_frontend.figure import view_spec_from_tree
+
+        view = view_spec_from_tree(raw)
+        if view.schema_fingerprint != schema.fingerprint:
+            # A producer schema generation is a real view boundary.  Never
+            # reinterpret the old bindings by axis position; discard this
+            # presentation-only value and let the Figure owner suggest a new
+            # typed default for the new schema.
+            self.config.params.pop(_VIEW_SPEC_PARAM, None)
+            return None
+        if view.intent is not self.view_intent():
+            raise ValueError("saved panel view belongs to a different panel kind")
+        return view
+
+    def _repeat_modes_for_current_schema(self):
+        """Typed repeat policies this one-panel host can actually render.
+
+        FACET intentionally stays out here: it evaluates to multiple cells and
+        belongs to the real Grid/Sites product.  Advertising it on a
+        SinglePanelHost would recreate the old inert control.  BATCH remains a
+        single cell with multiple series and is therefore valid here.  Rolling
+        retention is a dataset concern and has no entry in RepeatViewMode.
+        """
+
+        schema = self._current_schema()
+        if schema is None:
+            return ()
+        from zlc_frontend.figure import RepeatViewMode, dataset_contract_for
+
+        contract = dataset_contract_for(self.view_intent())
+        return tuple(
+            mode
+            for mode in contract.repeat_modes
+            if mode is not RepeatViewMode.FACET
+        )
+
+    def _repeat_mode_from_view(self, view, schema):
+        from zlc_frontend.figure import (
+            AxisViewRole,
+            DisplayReductionMethod,
+            RepeatViewMode,
+        )
+
+        binding = view.binding(schema.repeat_axis.axis_id)
+        if binding.role is AxisViewRole.REDUCED:
+            return (
+                RepeatViewMode.MEAN
+                if binding.reduction.method is DisplayReductionMethod.MEAN
+                else RepeatViewMode.SUM
+            )
+        if binding.role is AxisViewRole.BATCH:
+            return RepeatViewMode.BATCH
+        if binding.role is AxisViewRole.FACET:
+            return RepeatViewMode.FACET
+        if binding.role is AxisViewRole.SAMPLE:
+            return RepeatViewMode.SAMPLE
+        if binding.role is AxisViewRole.SELECTED:
+            # A one-repeat LATEST suggestion resolves to FixedIndex(0); for a
+            # larger axis it is LatestNonempty.  Both are the same authored
+            # policy, and no other repeat policy produces SELECTED.
+            return RepeatViewMode.LATEST
+        raise ValueError(f"unsupported repeat binding {binding.role.value}")
+
+    def _selected_repeat_mode(self, schema):
+        from zlc_frontend.figure import dataset_contract_for
+
+        view = self._saved_view_spec(schema)
+        if view is None and self._last_document is not None:
+            layers = tuple(self._last_document.layers)
+            if len(layers) == 1 and layers[0].view.schema_fingerprint == schema.fingerprint:
+                view = layers[0].view
+        if view is not None:
+            return self._repeat_mode_from_view(view, schema)
+        return dataset_contract_for(self.view_intent()).default_repeat_mode
+
+    def _seed_repeat_mode_control(self, combo, row) -> None:
+        modes = self._repeat_modes_for_current_schema()
+        schema = self._current_schema()
+        with _signals_blocked(combo):
+            combo.clear()
+            for mode in modes:
+                combo.addItem(_repeat_mode_label(mode), mode)
+            if modes and schema is not None:
+                selected = self._selected_repeat_mode(schema)
+                index = combo.findData(selected)
+                combo.setCurrentIndex(max(0, index))
+        row.setVisible(bool(modes))
+        combo.setEnabled(bool(modes))
+
+    def _make_repeat_mode_row(self, apply, label_w):
+        from zlc_frontend.figure import RepeatViewMode
+
+        combo = FluentComboBox()
+        combo.setToolTip(
+            "How the declared repeat axis is shown. Mean/Sum reduce only the "
+            "repeat axis; Latest selects the latest non-empty logical repeat; "
+            "Overlay keeps every repeat as a named series; Samples is the "
+            "histogram sample binding. Rolling history is controlled by the "
+            "rolling dataset, not by this menu."
+        )
+
+        def commit(index: int) -> None:
+            mode = combo.itemData(int(index))
+            if isinstance(mode, RepeatViewMode):
+                apply(mode)
+
+        combo.currentIndexChanged.connect(commit)
+        row = FluentSettingRow("repeat", combo, label_width=label_w)
+        self._seed_repeat_mode_control(combo, row)
+        return row, combo
+
+    def _refresh_repeat_mode_control(self) -> None:
+        combo = getattr(self, "repeat_mode_combo", None)
+        row = getattr(self, "repeat_mode_row", None)
+        if combo is not None and row is not None:
+            self._seed_repeat_mode_control(combo, row)
+
+    def _commit_repeat_mode(self, mode) -> bool:
+        """Resolve one typed preference to the sole persistent ViewSpec."""
+
+        from zlc_frontend.figure import (
+            RepeatViewMode,
+            SuggestionStatus,
+            ViewPreferences,
+            suggest_view,
+            view_spec_to_tree,
+        )
+
+        if not isinstance(mode, RepeatViewMode):
+            raise TypeError("repeat mode must be RepeatViewMode")
+        if mode not in self._repeat_modes_for_current_schema():
+            raise ValueError(f"repeat mode {mode.value} is not renderable by this panel")
+        schema = self._current_schema()
+        if schema is None:
+            return False
+        suggestion = suggest_view(
+            schema,
+            self.view_intent(),
+            preferences=ViewPreferences(repeat_mode=mode),
+        )
+        if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
+            self.set_status(
+                "repeat choice needs an explicit axis selection for this data",
+                error=True,
+            )
+            return False
+        return self._set_params({_VIEW_SPEC_PARAM: view_spec_to_tree(suggestion.spec)})
+
     def _on_signal_pick(self, _index: int) -> None:
         """Commit one card-local dataset binding and request one compose."""
 
@@ -1021,6 +1214,10 @@ class PanelCard(FluentGroupBox):
         if name == self.config.signal:
             return
         self.config.signal = name
+        self.config.params.pop(_VIEW_SPEC_PARAM, None)
+        self._last_value = None
+        self._last_document = None
+        self._refresh_repeat_mode_control()
         self._invalidate_render_binding()
         self._render_version = -1
         self._request_display_render()

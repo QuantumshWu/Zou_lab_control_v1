@@ -322,12 +322,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             self._invoke_connection
         )
         view.scanArrayLoadRequested.connect(self._load_scan_array)
-        view.scanSourceEdited.connect(
-            lambda use_loaded: self._invoke_editor(
-                self._controller.select_scan_source,
-                "loaded" if use_loaded else "generated",
-            )
-        )
+        view.scanSourceEdited.connect(self._select_scan_source)
         self.target_view.feedbackRequested.connect(self._message)
         self.target_view.applyRequested.connect(self._apply_target_manifest)
 
@@ -356,11 +351,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self.scan_view.holdRequested.connect(self._hold_scan_point)
         self.scan_view.stepRequested.connect(self._step_scan_point)
         self.scan_view.loadProgramRequested.connect(self._load_scan_program)
-        self.scan_view.templateRequested.connect(
-            lambda kind: self._invoke_editor(
-                self._controller.set_scan_template, kind
-            )
-        )
+        self.scan_view.templateRequested.connect(self._replace_scan_template)
         self.scan_view.runRequested.connect(
             lambda source: self._invoke_scan_worker(
                 self._controller.generate_scan_source, source
@@ -473,6 +464,37 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._apply_runtime_update(update)
         self._finish_close_if_ready(update)
         return result
+
+    def _replace_scan_template(self, kind: str) -> None:
+        """Unconditionally replace the local Scan draft with a fresh template."""
+
+        try:
+            source = self._controller.scan_template_source(kind)
+        except BaseException as error:
+            self._message(str(error))
+            return
+        self.scan_view.replace_scan_draft(source)
+
+    def _select_scan_source(self, use_loaded: bool) -> None:
+        """Commit a source toggle, restoring the displayed switch on rejection."""
+
+        try:
+            result = self._controller.select_scan_source(
+                "loaded" if use_loaded else "generated"
+            )
+        except BaseException as error:
+            workspace = self._controller.current_scan_workspace
+            self.schedule_view.set_scan_source(
+                use_loaded=workspace.selected_source == "loaded",
+                path="" if workspace.loaded_path is None else str(workspace.loaded_path),
+            )
+            self._message(str(error))
+            return
+        if result is not None and not self._apply_editor_delta(result):
+            self._message(
+                "Internal Pulse editor error: the Scan source change did not "
+                "match the displayed revision; reload the document."
+            )
 
     def _queue_full_editor_reconcile(self) -> None:
         if self._editor_projection_pending:
@@ -732,10 +754,10 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             self,
             "Load scan program / table",
             str(self._scan_file_start()),
-            "Scan program or saved table (*.py *.txt *.npy *.csv *.json);;"
-            "Python program (*.py *.txt);;"
+            "Scan program or current table (*.py *.txt *.npy *.csv *.json);;"
+            "Python scan program (*.py *.txt);;"
             "Scan array (*.npy *.csv);;"
-            "Saved pulse / program (*.json)",
+            "Current PulseDocument with scan table (*.json)",
         )
         if path:
             self._invoke_scan_worker(self._controller.load_scan_program, Path(path))
@@ -1268,6 +1290,10 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._apply_scan_workspace_value(
             editor.scan_workspace,
             None if previous_editor is None else previous_editor.scan_workspace,
+            replace_source=(
+                previous_editor is None
+                or editor.document_generation != previous_editor.document_generation
+            ),
         )
 
     def _apply_scan_progress(
@@ -1310,6 +1336,8 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self,
         workspace,
         previous_workspace,
+        *,
+        replace_source: bool = False,
     ) -> None:
         loaded_path = "" if workspace.loaded_path is None else str(workspace.loaded_path)
         self.schedule_view.set_scan_source(
@@ -1324,7 +1352,14 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             self.scan_view.set_slots_text(workspace.slots_text)
         if self.scan_view.scan_table_view.toPlainText() != workspace.table_text:
             self.scan_view.set_scan_table_text(workspace.table_text)
-        if self.scan_view.source_revision != workspace.source_revision:
+        loaded_program_completed = (
+            previous_workspace is not None
+            and previous_workspace.busy_operation == "load-program"
+            and workspace.busy_operation is None
+            and workspace.source_revision != previous_workspace.source_revision
+        )
+        current_source = self.scan_view.scan_code.toPlainText()
+        if replace_source or loaded_program_completed:
             self.scan_view.set_scan_code(
                 workspace.source_text,
                 dirty=workspace.source_dirty,
@@ -1333,9 +1368,15 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         elif self.scan_view.code_dirty:
             # Reading the full code buffer is reserved for a real workspace
             # transition (Run/load/template result), never a key event/timer.
-            if self.scan_view.scan_code.toPlainText() == workspace.source_text:
-                self.scan_view.set_run_dirty(workspace.source_dirty)
-        elif self.scan_view.scan_code.toPlainText() != workspace.source_text:
+            if current_source == workspace.source_text:
+                self.scan_view.acknowledge_scan_draft(
+                    dirty=workspace.source_dirty,
+                    source_revision=workspace.source_revision,
+                )
+        elif (
+            self.scan_view.source_revision != workspace.source_revision
+            or current_source != workspace.source_text
+        ):
             self.scan_view.set_scan_code(
                 workspace.source_text,
                 dirty=workspace.source_dirty,

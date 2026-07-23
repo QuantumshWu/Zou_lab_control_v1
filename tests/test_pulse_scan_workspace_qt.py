@@ -96,18 +96,43 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
     body, controller = _body()
     body.show()
     try:
+        messages: list[str] = []
+        body._message = messages.append
         _until(
             application,
             lambda: body.scan_view.scan_code.toPlainText()
             == controller.snapshot().scan_workspace.source_text,
         )
+        empty_switch = body.schedule_view.channel_panel.scan_source_toggle
+        QtTest.QTest.mouseClick(
+            empty_switch,
+            QtCore.Qt.LeftButton,
+            pos=QtCore.QPoint(10, empty_switch.height() // 2),
+        )
+        _until(application, lambda: not empty_switch.isChecked())
+        assert controller.current_scan_workspace.selected_source == "generated"
+        assert messages == ["no loaded scan array is available"]
+
         _click_tab(body, body.scan_view)
 
         editor = body.scan_view.scan_code
+        controller_source = controller.current_scan_workspace.source_text
         QtTest.QTest.mouseClick(editor.viewport(), QtCore.Qt.LeftButton)
         QtTest.QTest.keyClick(editor, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
         QtTest.QTest.keyClicks(editor, "scan_table = [[100], [200]]")
-        assert controller.snapshot().scan_workspace.source_dirty
+        assert body.scan_view.code_dirty
+        assert controller.current_scan_workspace.source_text == controller_source
+
+        # The UI draft is authoritative before Run: even the already-selected
+        # template must replace it rather than no-op against controller state.
+        QtTest.QTest.mouseClick(
+            body.scan_view.scan_column_template_button,
+            QtCore.Qt.LeftButton,
+        )
+        assert body.scan_view.scan_code.toPlainText() == controller_source
+        QtTest.QTest.mouseClick(editor.viewport(), QtCore.Qt.LeftButton)
+        QtTest.QTest.keyClick(editor, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
+        QtTest.QTest.keyClicks(editor, "scan_table = [[100], [200]]")
         QtTest.QTest.mouseClick(
             body.scan_view.scan_run_button,
             QtCore.Qt.LeftButton,
@@ -201,10 +226,10 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
             (
                 "Load scan program / table",
                 root,
-                "Scan program or saved table (*.py *.txt *.npy *.csv *.json);;"
-                "Python program (*.py *.txt);;"
+                "Scan program or current table (*.py *.txt *.npy *.csv *.json);;"
+                "Python scan program (*.py *.txt);;"
                 "Scan array (*.npy *.csv);;"
-                "Saved pulse / program (*.json)",
+                "Current PulseDocument with scan table (*.json)",
             ),
             (
                 "Load scan array",

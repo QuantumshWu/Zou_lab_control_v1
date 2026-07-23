@@ -1696,6 +1696,8 @@ DocumentViewContract:
 
 `ViewIntent`只表示renderer需要哪一种输入/轴合同，不是TaskConsole菜单、输入slot、panel复合布局或产品能力注册表。TaskConsole仅在自己的application包保留一个closed `PanelType(key,label,addable,input_binding,intent)` tuple；SITES是exact composite payload，GRID是board/facet布局，二者都不能伪装成普通IMAGE intent，PULSE也不能作为空dataset panel加入。`zlc_data`不得拥有label、panel尺寸、repeat菜单或render-family词汇；现有`zlc_data.plot_kind`与`console_records`中的应用状态必须随current consumer纵切迁到`zlc_workbench.task_console`后物理删除。禁止把该closed tuple升级成plugin、registry或class factory。
 
+删除旧plot-kind/repeat/facet模块只表示删除重复实现，绝不表示删除用户能力或把迁移中暂未接线误判为“零消费者”。TaskConsole的Setting/Edit必须把当前dataset schema交给同一个`ViewContract`，只展示该intent真实允许的`RepeatViewMode`；选择结果直接形成`ViewPreferences`，不能另存`average/add/replace/create/pool`字符串表。`roll`是Monitor rolling dataset的采集/历史策略，不是repeat reduction；`create`由CURVE的BATCH表达，histogram pool由SAMPLE表达。GRID的facet选择保存具名`AxisId`并由`FigureEvaluator`产生cells，复用同一DataFigure/SinglePanelHost的overview、focus、selector、fit与export；不得复活`points:k/data:k`、`facet_cells`、按shape/rank猜轴或第二Grid renderer。在repeat/sites/grid完整端到端接通前可以不把入口放进菜单，但不得删除其final-product要求、底层typed owner或以inert控件冒充交付；TaskConsole迁移关闭前必须恢复`main`的六种Add Panel用户面并由真实Qt流程证明。
+
 自动建议的输入只有 schema/axis metadata、视图意图、已有 Selection 和明确的用户 preference；禁止读取数组值后“猜哪条轴像信号”，禁止根据 rank、singleton、长度或 axis 顺序猜语义。
 
 ```text

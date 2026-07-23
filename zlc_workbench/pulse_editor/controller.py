@@ -1365,19 +1365,11 @@ class PulseEditorController:
             include_scan_workspace=True,
         )
 
-    def set_scan_template(self, kind: str) -> PulseEditorLocalDelta | None:
-        """Replace the code buffer with the current typed slot template."""
+    def scan_template_source(self, kind: str) -> str:
+        """Return a template for the UI-owned draft without committing it."""
 
         self._require_not_closing()
-        source = default_scan_program(self._editor.document, kind)
-        if source == self._scan_source_text:
-            return None
-        self._scan_source_text = source
-        self._scan_source_revision += 1
-        return self._local_delta(
-            self._editor.revision,
-            include_scan_workspace=True,
-        )
+        return default_scan_program(self._editor.document, kind)
 
     def generate_scan_source(self, source: str | None = None) -> None:
         """Run trusted local Scan-tab Python on the controller worker."""

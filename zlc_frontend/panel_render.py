@@ -37,7 +37,10 @@ from .figure import (
     ResolvedDatasetMap,
     SuggestionStatus,
     ViewIntent,
+    ViewSpec,
+    dataset_contract_for,
     suggest_view,
+    validate_view_spec,
 )
 from .histogram_display import HistogramDisplayState
 from .image_display import ImageDisplayState
@@ -88,7 +91,13 @@ def display_state_for_intent(intent: ViewIntent):
     raise PanelRenderError(f"no display state for view intent {intent!r}")
 
 
-def view_for_schema(schema, intent: ViewIntent, selection=None):
+def view_for_schema(
+    schema,
+    intent: ViewIntent,
+    selection=None,
+    *,
+    view: ViewSpec | None = None,
+):
     """The ViewSpec this schema admits for ``intent``.
 
     Raises rather than guessing: a schema that needs an explicit axis choice is
@@ -96,6 +105,18 @@ def view_for_schema(schema, intent: ViewIntent, selection=None):
     plausible-looking wrong picture on the board.
     """
 
+    if view is not None:
+        if not isinstance(view, ViewSpec):
+            raise TypeError("view must be ViewSpec or None")
+        if view.schema_fingerprint != schema.fingerprint:
+            raise PanelRenderError("saved panel view belongs to a different dataset schema")
+        if view.intent is not intent:
+            raise PanelRenderError("saved panel view belongs to a different view intent")
+        try:
+            validate_view_spec(schema, view, dataset_contract_for(intent))
+        except (TypeError, ValueError, IndexError) as error:
+            raise PanelRenderError(f"saved panel view is invalid: {error}") from error
+        return view
     suggestion = suggest_view(schema, intent, selection)
     if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
         raise PanelRenderError(
@@ -125,6 +146,7 @@ class PanelComposer:
         size: tuple[int, int] = (800, 520),
         selection=None,
         label: str = "",
+        view: ViewSpec | None = None,
     ) -> None:
         from .figure import dataset_contract_for
 
@@ -136,6 +158,9 @@ class PanelComposer:
         self._intent = intent
         self._size = (int(size[0]), int(size[1]))
         self._selection = selection
+        if view is not None and not isinstance(view, ViewSpec):
+            raise TypeError("view must be ViewSpec or None")
+        self._view = view
         self._label = str(label or panel_id)
         self._dataset_id = DatasetId(self._panel_id)
         self._evaluator = FigureEvaluator()
@@ -169,7 +194,12 @@ class PanelComposer:
         fingerprint = schema.fingerprint
         if self._document is not None and fingerprint == self._document_fingerprint:
             return self._document
-        view = view_for_schema(schema, self._intent, self._selection)
+        view = view_for_schema(
+            schema,
+            self._intent,
+            self._selection,
+            view=self._view,
+        )
         document = FigureDocument(
             f"panel-{self._panel_id}",
             0,

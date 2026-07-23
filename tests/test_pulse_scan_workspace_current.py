@@ -211,7 +211,7 @@ def test_loaded_and_generated_candidates_never_reconcile_after_slot_change(tmp_p
         _close(controller)
 
 
-def test_array_io_preserves_rows_without_one_dimensional_shape_guessing(tmp_path: Path):
+def test_single_slot_accepts_one_dimensional_input_without_weakening_multi_slot_shape(tmp_path: Path):
     controller = _controller_with_duration_columns(1)
     try:
         document = controller.snapshot().document
@@ -226,8 +226,22 @@ def test_array_io_preserves_rows_without_one_dimensional_shape_guessing(tmp_path
 
         ambiguous = tmp_path / "one_dimensional.npy"
         np.save(ambiguous, np.asarray([20.0, 40.0, 60.0]))
-        with pytest.raises(ValueError, match="exactly two-dimensional"):
-            load_scan_array(document, ambiguous)
+        assert load_scan_array(document, ambiguous).candidate.table.rows == (
+            (20,),
+            (40,),
+            (60,),
+        )
+        assert execute_scan_program(
+            document,
+            "scan_table = [80, 100]\n",
+        ).candidate.table.rows == ((80,), (100,))
+
+        multi_slot = _controller_with_duration_columns(2)
+        try:
+            with pytest.raises(ValueError, match="exactly two-dimensional"):
+                load_scan_array(multi_slot.current_document, ambiguous)
+        finally:
+            _close(multi_slot)
 
         saved = save_scan_array(loaded.candidate.table, tmp_path / "frozen")
         assert saved.suffix == ".npy"

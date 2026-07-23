@@ -1776,6 +1776,7 @@ class TaskConsole(QtWidgets.QWidget):
                     intent=request.intent,
                     size=request.size,
                     label=request.label,
+                    view=request.view,
                 )
                 self._render_worker_composers[request.panel_id] = (
                     request.source_key,
