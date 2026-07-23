@@ -488,9 +488,10 @@ class ConsoleCatalogView:
                 kind="measurement",
                 title=item.title,
                 description=(
-                    "Visible current Measurement intent; Start rejects until "
-                    "the installation exposes an RF Port with a preloaded "
-                    "hardware-synchronized detuning table"
+                    "Autonomous release-recapture scan whose two-photon "
+                    "detuning table advances from the same hardware scan "
+                    "clock; Start names the missing capability when no "
+                    "synchronized RF Port is installed"
                 ),
                 params=grey_molasses_detuning_params(
                     self.camera_roles(),
@@ -507,6 +508,7 @@ class ConsoleCatalogView:
                     ),
                 ),
                 build_request=build_grey_molasses_detuning_intent,
+                default_panel=("survival", "1d"),
             )
         kind = _GROUP_TO_KIND.get(item.group)
         if kind is None:
@@ -700,7 +702,10 @@ class ConsoleCatalogView:
         ):
             return bool(cameras and sequencers)
         if item.key == GREY_MOLASSES_DETUNING_KEY:
-            return bool(cameras and sequencers and self.rf_roles())
+            # A Definition is product vocabulary, not a capability probe.  An
+            # installation with camera+sequencer but no synchronized RF Port
+            # must still show this Measurement and reject Start by name.
+            return bool(cameras and sequencers)
         if item.key == OCCUPANCY_STREAM_PROCESSOR_KEY:
             return bool(cameras and sequencers)
         return True

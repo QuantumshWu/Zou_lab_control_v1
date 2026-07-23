@@ -111,11 +111,13 @@ from zlc_neutral_atom.readout.calibration_reference import (
     calibration_artifact_ref_to_tree,
 )
 from zlc_neutral_atom.readout.coupled_measurements import (
+    AutonomousMeasurementUnavailable,
+    GREY_MOLASSES_CAPABILITY_GAP,
     GreyMolassesDetuningRequest,
     ReadoutDurationFidelityRequest,
     TemperatureReleaseRecaptureRequest,
+    bind_grey_molasses_detuning,
     bind_temperature_release_recapture,
-    reject_grey_molasses_detuning,
     reject_readout_duration_fidelity,
 )
 from zlc_neutral_atom.readout.occupancy_reference import OccupancyArtifactRef
@@ -151,6 +153,7 @@ from zlc_neutral_atom.readout.occupancy import (
 from zlc_neutral_atom.readout.occupancy_pipeline import OccupancyPipelineSpec
 from zlc_neutral_atom.release_recapture_application import (
     PreparedTemperatureReleaseRecapture,
+    prepare_grey_molasses_detuning,
     prepare_temperature_release_recapture,
 )
 from zlc_neutral_atom.runtime.streams import StreamId
@@ -944,6 +947,17 @@ class ReadoutFacade:
                 "sequencer",
                 ("sequencer",),
             )
+            available_rf = services.catalog.roles("rf")
+            resolved_rf_role = (
+                _resolve_role(
+                    services.catalog,
+                    rf_role,
+                    "rf",
+                    ("rf",),
+                )
+                if available_rf
+                else rf_role
+            )
             return GreyMolassesDetuningRequest(
                 document,
                 tuple(detuning_gamma),
@@ -951,7 +965,7 @@ class ReadoutFacade:
                 shots,
                 services.catalog.require(camera).ref,
                 services.catalog.require(sequencer).ref,
-                rf_role,
+                resolved_rf_role,
                 calibration_ref,
                 model_kind,
                 per_site,
@@ -962,8 +976,11 @@ class ReadoutFacade:
         self,
         request: GreyMolassesDetuningRequest,
     ) -> RunHandle:
-        reject_grey_molasses_detuning(request)
-        raise AssertionError("capability rejection did not raise")
+        with _service_guard(self._token) as services:
+            return _prepare_grey_molasses_detuning_for_services(
+                services,
+                request,
+            ).start()
 
     def materialize_capture(self, reference: CaptureArtifactRef) -> OwnedSnapshot:
         """Load one FINAL capture as its canonical immutable dataset snapshot."""
@@ -3385,6 +3402,50 @@ def _prepare_temperature_release_recapture_for_workbench(
         raise TypeError("experiment must be Experiment")
     with _service_guard(experiment._authority_token) as services:
         return _prepare_temperature_release_recapture_for_services(
+            services,
+            request,
+        )
+
+
+def _prepare_grey_molasses_detuning_for_services(
+    services: _ExperimentServices,
+    request: GreyMolassesDetuningRequest,
+) -> PreparedTemperatureReleaseRecapture:
+    if not isinstance(request, GreyMolassesDetuningRequest):
+        raise TypeError("request must be GreyMolassesDetuningRequest")
+    rf_info = services.catalog.find(request.rf_role)
+    if rf_info is None or rf_info.domain != "rf":
+        raise AutonomousMeasurementUnavailable(
+            GREY_MOLASSES_CAPABILITY_GAP
+        )
+    calibration = _calibration_repository(services).admit(
+        request.calibration_ref,
+        services.capture_repository,
+    )
+    bound = bind_grey_molasses_detuning(
+        request,
+        calibration,
+        pulse_port=services.runtime.pulse_port(request.sequencer_ref),
+        camera_port=services.runtime.camera_port(request.camera_ref),
+        rf_port=services.runtime.rf_port(rf_info.ref),
+    )
+    return prepare_grey_molasses_detuning(
+        bound,
+        calibration,
+        start_run=services.runtime.start,
+    )
+
+
+def _prepare_grey_molasses_detuning_for_workbench(
+    experiment: Experiment,
+    request: GreyMolassesDetuningRequest,
+) -> PreparedTemperatureReleaseRecapture:
+    """Private friend seam for the TaskConsole Measurement presenter."""
+
+    if not isinstance(experiment, Experiment):
+        raise TypeError("experiment must be Experiment")
+    with _service_guard(experiment._authority_token) as services:
+        return _prepare_grey_molasses_detuning_for_services(
             services,
             request,
         )

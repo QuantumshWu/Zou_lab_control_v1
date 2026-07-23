@@ -35,6 +35,23 @@ from zlc_storage.canonical import positive_integer as _positive_int
 
 _K_B = 1.380649e-23
 _RB87_MASS_KG = 86.909180527 * 1.66053906660e-27
+_GREY_MOLASSES_HOT_FACTOR = 6.0
+
+
+def grey_molasses_cooling_factor(detuning_gamma: float) -> float:
+    """Main's virtual D1 grey-molasses floor at the default saturation of 3."""
+
+    detuning = float(detuning_gamma)
+    if not math.isfinite(detuning):
+        raise ValueError("two-photon detuning must be finite")
+    half_width = 0.05 + 0.02 * 3.0
+    wing = 3.0 if detuning >= 0.0 else 0.3
+    return float(
+        min(
+            _GREY_MOLASSES_HOT_FACTOR,
+            max(1.0, 1.0 + wing * (detuning / half_width) ** 2),
+        )
+    )
 
 
 def _positive(value: object, name: str) -> float:
@@ -180,6 +197,7 @@ class VirtualAtomArray:
         cooling_channels: Sequence[str],
         probe_channels: Sequence[str],
         trap_channels: Sequence[str],
+        rf: "VirtualRfSource | None" = None,
     ) -> None:
         if not isinstance(geometry, ReadoutGridGeometry):
             raise TypeError("geometry must be ReadoutGridGeometry")
@@ -189,6 +207,9 @@ class VirtualAtomArray:
         self.cooling_channels = _channel_tuple(cooling_channels, "cooling_channels")
         self.probe_channels = _channel_tuple(probe_channels, "probe_channels")
         self.trap_channels = _channel_tuple(trap_channels, "trap_channels")
+        if rf is not None and not isinstance(rf, VirtualRfSource):
+            raise TypeError("rf must be VirtualRfSource or None")
+        self.rf = rf
         self.loading_probability = 0.5
         self.load_time_constant_s = 0.5e-3
         self.atom_rate = 1_100.0
@@ -215,6 +236,7 @@ class VirtualAtomArray:
         self._site_shape_cache: tuple[np.ndarray, np.ndarray] | None = None
         self.occupancy = np.zeros(self.n_sites, dtype=bool)
         self.temperature_K = np.full(self.n_sites, self.cooled_temperature_K)
+        self._cooling_floor_factor = 1.0
         self.reload()
 
     @property
@@ -259,14 +281,18 @@ class VirtualAtomArray:
         self.occupancy = self.rng.random(self.n_sites) < self.loading_fraction(
             cooling_duration
         )
-        self.temperature_K = np.full(self.n_sites, self.cooled_temperature_K)
+        self.temperature_K = np.full(
+            self.n_sites,
+            self.cooled_temperature_K * self._cooling_floor_factor,
+        )
 
     def cool(self, duration: float) -> None:
         if duration <= 0.0:
             return
         decay = math.exp(-duration / self.pgc_cool_tau_s)
-        self.temperature_K = self.cooled_temperature_K + (
-            self.temperature_K - self.cooled_temperature_K
+        floor = self.cooled_temperature_K * self._cooling_floor_factor
+        self.temperature_K = floor + (
+            self.temperature_K - floor
         ) * decay
 
     def _render(self, occupancy: np.ndarray, signal_time: np.ndarray, exposure: float) -> np.ndarray:
@@ -412,14 +438,44 @@ class VirtualAtomArray:
         )
         if sum(groups) != frames:
             raise RuntimeError("pulse trigger groups do not exactly cover the camera arm")
+        group_points: tuple[int | None, ...]
+        if trigger_group_sizes is None:
+            selected = set(trigger_channels)
+            selected_groups = tuple(
+                group
+                for group in playback.trigger_groups
+                if any(channel in selected for channel, _count in group.channel_counts)
+            )
+            if tuple(
+                sum(
+                    count
+                    for channel, count in group.channel_counts
+                    if channel in selected
+                )
+                for group in selected_groups
+            ) != groups:
+                raise RuntimeError(
+                    "virtual source grouping differs from compiled trigger groups"
+                )
+            group_points = tuple(group.point_index for group in selected_groups)
+        else:
+            group_points = tuple(None for _group in groups)
         group_starts: set[int] = set()
+        point_by_start: dict[int, int | None] = {}
         cursor = 0
-        for size in groups:
+        for size, point_index in zip(groups, group_points):
             group_starts.add(cursor)
+            point_by_start[cursor] = point_index
             cursor += size
         for index in range(frames):
             group_start = index in group_starts
             if group_start:
+                point_index = point_by_start[index]
+                self._cooling_floor_factor = (
+                    1.0
+                    if self.rf is None
+                    else self.rf.cooling_factor_for_point(playback, point_index)
+                )
                 self.reload(cooling[index] if cooling[index] > 0.0 else None)
             elif cooling[index] > 0.0:
                 self.cool(cooling[index])
@@ -655,6 +711,121 @@ class VirtualSequencer:
         self.set_safe_state()
         with self._lock:
             self._listeners.clear()
+            self._open = False
+
+
+class VirtualRfSource:
+    """Preloaded RF table advanced only by the virtual sequencer scan clock."""
+
+    def __init__(self, sequencer: VirtualSequencer) -> None:
+        if not isinstance(sequencer, VirtualSequencer):
+            raise TypeError("virtual RF requires VirtualSequencer")
+        self.sequencer = sequencer
+        self._lock = threading.RLock()
+        self._open = True
+        self._session_id: str | None = None
+        self._pulse_artifact_digest: str | None = None
+        self._table_digest: str | None = None
+        self._table: tuple[float, ...] = ()
+
+    def ensure_open(self) -> "VirtualRfSource":
+        if not self._open:
+            raise RuntimeError("virtual RF is closed")
+        return self
+
+    def prepare_table(
+        self,
+        session_id: str,
+        pulse_artifact_digest: str,
+        table_digest: str,
+        values: tuple[float, ...],
+    ) -> None:
+        self.ensure_open()
+        table = tuple(float(value) for value in values)
+        if not table or any(not math.isfinite(value) for value in table):
+            raise ValueError("virtual RF table must contain finite values")
+        with self._lock:
+            if self._session_id is not None:
+                raise RuntimeError("virtual RF already owns a prepared table")
+            self._session_id = str(session_id)
+            self._pulse_artifact_digest = str(pulse_artifact_digest)
+            self._table_digest = str(table_digest)
+            self._table = table
+
+    def cooling_factor_for_point(
+        self,
+        playback: PulsePlayback,
+        point_index: int | None,
+    ) -> float:
+        with self._lock:
+            if self._session_id is None:
+                return 1.0
+            artifact = self.sequencer.output_artifact
+            if (
+                playback is not self.sequencer.last_fired
+                or artifact is None
+                or artifact.fingerprint != self._pulse_artifact_digest
+            ):
+                raise RuntimeError("virtual RF observed another pulse playback")
+            if point_index is None:
+                raise RuntimeError("virtual RF scan point is unavailable")
+            if point_index >= len(self._table):
+                raise RuntimeError("virtual RF scan clock exceeded its table")
+            return grey_molasses_cooling_factor(self._table[point_index])
+
+    def complete_table(
+        self,
+        session_id: str,
+        table_digest: str,
+    ) -> tuple[int, str]:
+        with self._lock:
+            if (
+                self._session_id != session_id
+                or self._table_digest != table_digest
+            ):
+                raise RuntimeError("virtual RF terminal belongs to another prepared table")
+            playback = self.sequencer.last_fired
+            artifact = self.sequencer.output_artifact
+            if (
+                playback is None
+                or artifact is None
+                or artifact.fingerprint != self._pulse_artifact_digest
+            ):
+                raise RuntimeError("virtual RF terminal has no matching sequencer FIRE")
+            point_indices = tuple(
+                group.point_index for group in playback.trigger_groups
+            )
+            if point_indices != tuple(range(len(self._table))):
+                raise RuntimeError(
+                    "virtual RF table does not exactly cover completed scan points"
+                )
+            return len(point_indices), canonical_digest(
+                {
+                    "pulse_artifact_digest": self._pulse_artifact_digest,
+                    "table_digest": table_digest,
+                    "advanced_points": point_indices,
+                }
+            )
+
+    def close_session(self, session_id: str) -> bool:
+        with self._lock:
+            if self._session_id not in (None, session_id):
+                raise RuntimeError("virtual RF close belongs to another session")
+            self._session_id = None
+            self._pulse_artifact_digest = None
+            self._table_digest = None
+            self._table = ()
+            return True
+
+    def set_safe_state(self) -> None:
+        with self._lock:
+            session_id = self._session_id
+        if session_id is not None:
+            self.close_session(session_id)
+
+    def close(self) -> None:
+        self.set_safe_state()
+        with self._lock:
             self._open = False
 
 

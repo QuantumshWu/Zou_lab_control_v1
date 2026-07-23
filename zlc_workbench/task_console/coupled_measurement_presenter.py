@@ -431,6 +431,29 @@ def freeze_temperature_release_recapture_request(
     )
 
 
+def freeze_grey_molasses_detuning_request(
+    experiment,
+    intent: GreyMolassesDetuningIntent,
+    *,
+    calibration_ref: CalibrationArtifactRef,
+):
+    if not isinstance(intent, GreyMolassesDetuningIntent):
+        raise TypeError("intent must be GreyMolassesDetuningIntent")
+    return experiment.readout.grey_molasses_detuning_request(
+        intent.pulse,
+        detuning_gamma=intent.detuning_gamma,
+        trap_off_seconds=intent.trap_off_seconds,
+        shots=intent.shots,
+        rf_role=intent.rf_role,
+        calibration_ref=_calibration(calibration_ref),
+        model_kind=intent.model_kind,
+        per_site=intent.per_site,
+        camera_role=intent.camera_role,
+        sequencer_role=intent.sequencer_role,
+        trigger_channel=intent.trigger_channel,
+    )
+
+
 __all__ = [
     "GreyMolassesDetuningIntent",
     "ReadoutDurationFidelityIntent",
@@ -438,6 +461,7 @@ __all__ = [
     "build_grey_molasses_detuning_intent",
     "build_readout_duration_fidelity_intent",
     "build_temperature_release_recapture_intent",
+    "freeze_grey_molasses_detuning_request",
     "freeze_temperature_release_recapture_request",
     "grey_molasses_detuning_params",
     "readout_duration_fidelity_params",

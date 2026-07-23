@@ -153,7 +153,6 @@ hardware_change_review_allowed :=
 
 | id | `main` 旧行为权威 | 当前分支/既有 checkpoint 的偏离 | 形成原因（非正当化） | 状态与必须关闭的证据 |
 |---|---|---|---|---|
-| `UX-001` | 修改已有 ROI 时 raw camera source 与可见 raw 画面不断流；running downstream 在 drag 完成后直接 retarget | M2d/M2e 以 immutable whole-Run replacement 重启 source/stream/history，且 draft 还需额外 `Apply ROI` | 为避免首个 consumer 前置 ControlTopic 而选了较小实现 | **待用户批准 / 默认必须修复**：drag release 自动提交 revisioned ROI ControlTopic，事务边界 APPLIED 后才显示 applied；新建/删除只替换下游 generation；source Run、raw front、tap topology 不变的 E2E |
 | `UX-002` | live plot 的 Area、锁定 Cross、zoom/pan、relim 与 cmap/limits 覆盖正式 plot contract；plot pointer-motion hover 明确不存在。拖动只冻结当前 panel，其它 panel 不停流，松手补拍。旧 1D/Monitor 的 Area 实际画二维矩形却只消费 x，纯水平拖会被误清 | 六个正式 kind 进入同一 `FigureSpec/Divider -> Agg RGBA -> SinglePanelHost/QtRasterBoard` 链；IMAGE/SITES 与 CURVE/MONITOR/HISTOGRAM 分别由两个具体交互族消费同一个 rectangle/handle 几何 owner，Grid overview 只负责精确 typed cell focus，focus 后复用同一个 host/selector。Area/Cross/Fit 是 Figure-owned、可绑定的派生 signal；它们不重配 Measurement、不启动 ROI processor，也不打开第二个 DataFigure 窗口 | 早期按窗口/plot kind 各写一套 selector 与近似 plot painter，导致复用、画面和连续拖动同时漂移；随后又错误加入 pointer-motion 数据 hover 与 Measurement ROI 控制 | **CLOSED**：Measurement-ROI/独立ROI processor/旧Analysis窗口闭包已物理删除；正式Camera→2D Qt流程证明普通mouseMove发布集合不变，Area完成手势后只发布`area.data`及具名轴范围，Cross只在右击锁定后发布坐标，Fit只发布`fit.<parameter>`并在原panel瞬时叠加。Setting/Edit共享同一Figure状态、无第二窗口；panel-local hold、最新front补拍、display-only不升级authority继续保留 |
 | `UX-003` | figure viewer 载入后是可交互 panel，可 zoom/pan、重新 fit 与导出；GridPlot 可 focus/返回 | U0.3a-h 已把单panel HISTOGRAM/CURVE/IMAGE/METER、fit-bearing CURVE/IMAGE，以及单layer METER/HISTOGRAM/CURVE多cell overview/focus接入同一 typed board；range/cross/zoom/pan/home、relim/cmap/limits、Setting/Edit、原子导出、即时 fit overlay 已恢复。FigureViewer打开current `.npz`后也在嵌入的同一DataFigure host显式Refit，Save写回同一archive并从LoadedFigureArchive重开，不产生neutral artifact。exact saved-fit GridPlot、METER grid、SITE-faceted occupancy counts Histogram与真实ScanArtifact CURVE都不暗选第一格，只在显式命中真实cell后focus，并从缓存返回overview；稀疏hole保持原逻辑位置。CURVE grid focus因其显示曲线已含display-only repeat reduction，不能伪装成轴完整Fit authority，故Analyze保持明确禁用；尚未闭合的是multi-layer DataFigure、faceted IMAGE及非Fit的其它archive plot kind，报告类多页仍是 frozen raster | 继续按真实consumer逐个恢复typed交互面；typed资格不足时保留完整whole-figure renderer，不以丢fit/轴/series换交互，也不先造通用dashboard框架 | **待用户批准 / 默认必须继续修复**：剩余multi-layer、faceted IMAGE与archive plot kind，以及CURVE grid的轴完整Analyze入口；U0.3a-h及W7已恢复的typed交互、explicit-cell focus/Refit与导出不得回退。**报告类多页zoom已闭合**：`FrozenRasterView(zoomable=True)` 提供滚轮放大(上限16x)、拖拽平移、放大后双击复位，可见窗口恒被夹在页内；live 面板默认关闭该开关，因为其 zoom 属于同 revision 的 `ViewportTransform`(§12.5 冻结条款)，证据 `tests/test_u04_frozen_report_zoom.py` |
 | `UX-004` | plot/panel 内直接发起 fit，框选与 fit selection 联动，普通 Fit 一步生效；2D box ROI fit 可见 | 通用Figure/FigureViewer继续拥有exact artifact或archive的显式Fit/Save/Refit；TaskConsole则在现有Setting/Edit内编辑同一FitSpec，对panel当前已呈现的exact snapshot运行唯一`BoundFit`，只把结果作为瞬时overlay并发布`fit.<parameter>`派生signal。TaskConsole不打开DataFigure窗口、不创建本地archive、不伪造neutral artifact；Area只有在用户发起Fit时才作为authority intent冻结，viewport/relim/cmap永不进入FitSpec | 先交付typed solver/editor与exact artifact，再删除独立W5 host；随后纠正了把TaskConsole按钮桥接到第二窗口/本地archive的错误产品解释 | **CLOSED**：通用Figure的持久Fit路径与TaskConsole的panel-local瞬时Fit边界分开；两者复用同一named-axis `bind_fit`/model catalog/result类型，但不共享窗口或持久化生命周期。TaskConsole的普通、无repeat和repeat×site/grid结果均保留batch轴及失败cell validity；不得恢复`Analyze`弹窗或把display selection自动升级为authority |
@@ -2047,6 +2046,13 @@ snapshot、调用全量 reconcile 或重建其它卡。`FluentParameterForm.read
 关闭：controller 只在明确按钮后启动一个非 Qt worker，并在真实完成时投递一次窄 lifecycle
 delta；idle 零轮询。
 
+从保存的 config path 打开时，composition 必须把 exact resolved path 与该 document 的 content digest
+交给同一个 `DeviceConfigEditorSession`，使普通 Save 继续对原文件做 CAS；不能把 Load 成功后的文档
+降成“无磁盘来源”的新草稿。standalone DeviceManager 拥有它初始化的唯一 Experiment；TaskConsole
+只借用这一个 runtime instance。TaskConsole/窗口关闭时同样走上述非 Qt shutdown 命令，成功 state delta
+之后才销毁窗口与退出 launcher；失败保留可见诊断，禁止在 Qt close callback 中同步调用
+`Experiment.close()` 或让 event loop 先退出而遗留后台清理。
+
 可见面继续以 main DeviceManager 的永久 Config tab、Devices header/status dot、3:2 双
 FluentScrollArea、New/Load/Save/Save-as/Init、Loaded 紧凑行与常驻 status strip 为 oracle。
 旧 `Open devices/Control/Snapshot` 依赖 raw device 的部分不伪造：runtime 在 Experiment 发布前
@@ -3598,6 +3604,11 @@ FigureViewer 的 current 落点为 `window + info_projection + FigureInfoPane`�
 Browse/`editingFinished` 才加载；候选首帧成功后才原子替换 pane 与五个 Info tab。以上模式是后续
 GUI 拆分的复用样板，但只复用已闭合的 owner，不复制仍在 C47 账本中 OPEN 的机制。
 
+`Experiment.figure_gui()` 的无参形式必须直接打开这一保存图浏览器；Browse 接受 current `.npz`，
+也接受有同 stem `.npz` 的 PNG/JPEG companion。archive decode、首帧 worker raster 与候选 pane 都成功
+后，generation commit 才把候选加入正式 holder 并显式发布为可见；不能先把状态标成 Loaded，却仍让
+用户看到占位页。带 typed source 的形式继续打开同一 DataFigure owner，不建立第二套 viewer/replay。
+
 所有 Fluent combo 的弹层宽度由完整可见选项决定，collapsed field 只负责当前摘要；普通列表量全部
 item，树形 signal picker 递归量 producer 与 leaf（含缩进、shape/state）。弹层不够宽时保持 field
 右边缘并向左扩展，只有物理屏幕边界可以钳制；纵向仍固定在 field 下方并以滚动吸收溢出。该合同
@@ -3621,20 +3632,29 @@ auto display axis 与完整 facet tuple。它不按 shape 猜轴，也不把显�
 绑定新family；不能保留错误selector，也不能为此删除重建QWidget。
 
 正式 `ensure_qt_app()` fast-path 使用真实 Qt click/type/drag 跑通：Camera monitor 连续发布不同
-revision 的 2D frame；Area selector 提交 ROI ControlTopic 后，同一 producer 的 ROI signal 驱动
-Rolling trace 连续更新；finite Camera capture 可完成并绑定 2D；Calibrate readout 产生 calibration
-Sites，Occupancy processor 消费该 calibration 并把 `occupied` 绑定 Sites；Temperature
+revision 的 2D frame；Area、锁定 Cross 与 Fit 都只由 Figure 在明确手势/提交后发布派生 signal，
+不重配 Measurement、不建立 ROI processor，也不打开第二个 DataFigure 窗口；finite Camera capture
+可完成并绑定 2D；Calibrate readout 产生 calibration Sites；Occupancy processor 绑定一个已经运行且
+已经发布 frame 的 live Camera 与 FINAL calibration，并原子发布 `counts/occupied`；Temperature
 release-recapture、Optimize MOT field 与 Pulse scan 均成功，后者保留 template、SCAN_SLOT/API
-program 与可编辑 scan table。Readout-duration 与 Grey-molasses 在冻结硬件未声明所需 exposure/rearm
-或同步 RF table Port 时必须在 Start 明确返回 capability rejection，不能以 virtual 假成功掩盖物理缺口。
-catalog 表单不再暴露通用 input-timeout 字段。
+program 与可编辑 scan table。Readout-duration 在冻结硬件未声明所需 exposure/rearm 时必须在 Start
+明确返回 capability rejection；Grey-molasses 只在 installation 真正发布同步 RF table Port 时运行。
+current virtual installation 已兑现该 Port：host 在 FIRE 前一次性冻结并预装完整 detuning table，随后
+RF table 的时序真相只来自同一个 completed compiled sequencer playback 的物理 `point_index`，顺序固定为
+R-major/P-fast；virtual camera 只按该点做无副作用 lookup，不得回调或推进 RF 状态；
+整个 run 仍是 camera 一次 arm、sequencer 一次 autonomous FIRE，结束时同时核对 pulse terminal、camera
+result 与 RF 的 session/table/count/ordered-advancement digest。任何缺点、错序或不同 table 都使整个
+Run 失败且不发布结果。不存在 GUI timer、host 逐点写值、逐点 snapshot、HOST_STEPPED_GROUP 或为此
+修改 RTL/bitstream；real installation 没有这一 Port 时 Definition 仍可见，但 Start 必须以具名
+capability gap 拒绝。catalog 表单不再暴露通用 input-timeout 字段。
 
 finite Camera 的 capacity-one preview 只是单cell布局可选的显示支路，不是Measurement成功条件；
 实际prepared command不满足preview contract时直接执行同一有限采集，FINAL仍发布完整
-`(R,P,*data_shape)`。Occupancy行选择的Camera输出只用来精确定位并冻结那一行的capture recipe，
-随后在同一个flat Run中执行新capture与真正的Occupancy StreamProcessor；它不读取先前已发布frame，
-UI因此必须明确显示`Capture recipe`，不能把它伪称为旧signal消费。普通Start/Restart只接受当前表单
-成功解析的值，解析失败原位拒绝且保留已运行owner，绝不退回旧保存值偷偷启动。
+`(R,P,*data_shape)`。Occupancy行选择的是已经运行的 live Camera `frame` signal，而不是一份随后重新
+采集的 recipe。binding 时必须冻结 producer object、handle、run/epoch 与初始 immutable front；后续
+只消费同一代新 revision，同名 Camera 停止或重启均使 processor 明确失败并要求重新绑定，绝不能静默
+接到新 generation。普通Start/Restart只接受当前表单成功解析的值，解析失败原位拒绝且保留已运行
+owner，绝不退回旧保存值偷偷启动。
 
 Signal picker 的状态只来自 current immutable `ConsoleDataFront`：catalog 声明但尚无值是
 `waiting`；有 `ConsoleSignalValue(values, DatasetSchema)` 时用

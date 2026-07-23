@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import InitVar, dataclass, field
 
 from zlc_neutral_atom.readout.release_recapture_pipeline import (
@@ -13,10 +14,12 @@ from zlc_neutral_atom.readout.release_recapture_pipeline import (
 from zlc_neutral_atom.runtime._failure import record_secondary_failure
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.run import PostSafetyContext, RunContext, RunPlan
+from zlc_neutral_atom.rf import BoundRfTablePort, RfDetuningTable, RfTableTerminal
 from zlc_storage import canonical_text
 
 from ._coordination import (
     execute_autonomous_single_fire,
+    execute_autonomous_single_fire_with_rf_table,
     run_cleanup_steps,
     validate_single_trigger_capture_binding,
 )
@@ -36,6 +39,8 @@ class TriggeredReleaseRecaptureSpec:
     pulse_request: FinitePulseExecutionRequest
     trigger_channel: InitVar[str]
     cell_plan: InitVar[CompiledCaptureCellPlan]
+    rf_port: BoundRfTablePort | None = None
+    rf_table: RfDetuningTable | None = None
     pulse_binding: PulseCaptureBinding = field(init=False)
 
     def __post_init__(
@@ -76,12 +81,22 @@ class TriggeredReleaseRecaptureSpec:
                 "release-recapture requires physical readout events 0 and 1"
             )
         object.__setattr__(self, "pulse_binding", binding)
+        if (self.rf_port is None) != (self.rf_table is None):
+            raise ValueError("RF Port and table must be supplied together")
+        if self.rf_port is not None:
+            if not isinstance(self.rf_port, BoundRfTablePort):
+                raise TypeError("rf_port must be BoundRfTablePort")
+            if not isinstance(self.rf_table, RfDetuningTable):
+                raise TypeError("rf_table must be RfDetuningTable")
+            if self.rf_table.pulse_artifact_digest != self.pulse_request.artifact_digest:
+                raise ValueError("RF table belongs to another pulse artifact")
 
 
 @dataclass(frozen=True, slots=True)
 class TriggeredReleaseRecaptureResult:
     release_recapture: ReleaseRecapturePipelineResult
     lineage: PulseCaptureLineage
+    rf_terminal: RfTableTerminal | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -93,6 +108,10 @@ class TriggeredReleaseRecaptureResult:
             )
         if not isinstance(self.lineage, PulseCaptureLineage):
             raise TypeError("lineage must be PulseCaptureLineage")
+        if self.rf_terminal is not None and not isinstance(
+            self.rf_terminal, RfTableTerminal
+        ):
+            raise TypeError("rf_terminal must be RfTableTerminal or None")
         pipeline = self.release_recapture.pipeline
         self.lineage.cell_plan.validate_dataset_schema(
             pipeline.source_dataset_schema
@@ -133,12 +152,14 @@ class TriggeredReleaseRecaptureResult:
 class _PreparedTriggeredReleaseRecapture:
     reducer: ExactReleaseRecaptureTransaction
     pulse: PulseSession
+    rf_session_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class _ExecutedTriggeredReleaseRecapture:
     release_recapture: ReleaseRecapturePipelineResult
     lineage: PulseCaptureLineage
+    rf_terminal: RfTableTerminal | None
 
 
 def compile_triggered_release_recapture_pipeline(
@@ -170,17 +191,36 @@ def compile_triggered_release_recapture_pipeline(
                     secondary,
                 )
             raise
-        return _PreparedTriggeredReleaseRecapture(reducer, pulse)
+        return _PreparedTriggeredReleaseRecapture(
+            reducer,
+            pulse,
+            None if spec.rf_port is None else uuid.uuid4().hex,
+        )
 
     def execute(
         context: RunContext,
         prepared: _PreparedTriggeredReleaseRecapture,
     ) -> _ExecutedTriggeredReleaseRecapture:
-        result, terminal = execute_autonomous_single_fire(
-            context,
-            pulse=prepared.pulse,
-            capture=prepared.reducer,
-        )
+        rf_terminal = None
+        if spec.rf_port is None:
+            result, terminal = execute_autonomous_single_fire(
+                context,
+                pulse=prepared.pulse,
+                capture=prepared.reducer,
+            )
+        else:
+            assert spec.rf_table is not None
+            assert prepared.rf_session_id is not None
+            result, terminal, rf_terminal = (
+                execute_autonomous_single_fire_with_rf_table(
+                    context,
+                    pulse=prepared.pulse,
+                    capture=prepared.reducer,
+                    rf_port=spec.rf_port,
+                    rf_session_id=prepared.rf_session_id,
+                    rf_table=spec.rf_table,
+                )
+            )
         if not isinstance(result, ReleaseRecapturePipelineResult):
             raise TypeError(
                 "release-recapture capture returned another result type"
@@ -188,6 +228,7 @@ def compile_triggered_release_recapture_pipeline(
         return _ExecutedTriggeredReleaseRecapture(
             result,
             PulseCaptureLineage(spec.pulse_binding, terminal),
+            rf_terminal,
         )
 
     def cleanup(
@@ -196,14 +237,23 @@ def compile_triggered_release_recapture_pipeline(
         _primary: BaseException | None,
     ) -> CleanupReport:
         if prepared is None:
-            return run_cleanup_steps(
+            steps = [
                 lambda: pulse_port.verify_idle(context),
                 lambda: camera_port.verify_idle(context),
-            )
-        return run_cleanup_steps(
+            ]
+            if spec.rf_port is not None:
+                steps.append(lambda: spec.rf_port.verify_idle(context))
+            return run_cleanup_steps(*steps)
+        steps = [
             lambda: prepared.pulse.cleanup(context),
             lambda: prepared.reducer.cleanup(context),
-        )
+        ]
+        if spec.rf_port is not None:
+            assert prepared.rf_session_id is not None
+            steps.append(
+                lambda: spec.rf_port.cleanup(context, prepared.rf_session_id)
+            )
+        return run_cleanup_steps(*steps)
 
     def finalize(
         context: PostSafetyContext,
@@ -224,15 +274,20 @@ def compile_triggered_release_recapture_pipeline(
         return TriggeredReleaseRecaptureResult(
             executed.release_recapture,
             executed.lineage,
+            executed.rf_terminal,
         )
 
+    rf_claims = () if spec.rf_port is None else (spec.rf_port.resource_claim,)
+    rf_devices = () if spec.rf_port is None else (spec.rf_port.device,)
+    rf_interrupts = () if spec.rf_port is None else spec.rf_port.interrupt_operations
     return RunPlan(
         name=spec.release_recapture.name,
         resource_claims=(
             pulse_port.resource_claim,
             camera_port.resource_claim,
+            *rf_claims,
         ),
-        bound_devices=(pulse_port.device, camera_port.device),
+        bound_devices=(pulse_port.device, camera_port.device, *rf_devices),
         preflight=preflight,
         execute=execute,
         cleanup=cleanup,
@@ -240,6 +295,7 @@ def compile_triggered_release_recapture_pipeline(
         interrupt_operations=(
             *pulse_port.interrupt_operations,
             *camera_port.interrupt_operations,
+            *rf_interrupts,
         ),
         requires_final_commit=False,
     )

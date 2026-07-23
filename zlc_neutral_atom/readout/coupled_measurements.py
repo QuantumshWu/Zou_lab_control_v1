@@ -22,8 +22,10 @@ from numbers import Integral, Real
 
 from zlc_data import (
     REPEAT,
+    SCAN_POINT,
     AxisId,
     AxisSpec,
+    PointLayout,
 )
 from zlc_neutral_atom.acquisition.camera import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
@@ -48,6 +50,7 @@ from zlc_neutral_atom.readout.physical_context import (
 )
 from zlc_neutral_atom.runtime.capture import BoundCapturePort
 from zlc_neutral_atom.runtime.pipeline import BoundMeasurement
+from zlc_neutral_atom.rf import BoundRfTablePort, RfDetuningTable
 from zlc_neutral_atom.scan import AutonomousScanSlotProgram
 from zlc_neutral_atom.timing.lineage import PulseCaptureBinding
 from zlc_neutral_atom.timing.pulse import BoundPulsePort
@@ -59,12 +62,13 @@ from zlc_pulse import (
     PulseFieldRef,
     RepeatRegion,
     bind_pulse_document_target,
+    build_pulse_playback,
     expand_autonomous_scan_repeats,
     freeze_scan_table,
     replace_pulse_field,
     require_autonomous_scan_resident_capacity,
 )
-from zlc_storage import canonical_text, positive_integer
+from zlc_storage import canonical_digest, canonical_text, positive_integer
 
 
 TEMPERATURE_RELEASE_RECAPTURE_KEY = DefinitionKey(
@@ -300,6 +304,53 @@ class GreyMolassesDetuningRequest:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _GreyMolassesDetuningProgram:
+    """Fixed release-recapture pulse rows plus the RF-owned logical scan axis."""
+
+    document: PulseDocument
+    detuning_axis: AxisSpec
+    shots: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.document, PulseDocument):
+            raise TypeError("document must be PulseDocument")
+        if (
+            not isinstance(self.detuning_axis, AxisSpec)
+            or self.detuning_axis.role != SCAN_POINT
+        ):
+            raise ValueError("detuning_axis must have SCAN_POINT role")
+        object.__setattr__(self, "shots", positive_integer(self.shots, "shots"))
+        table = self.document.scan_table
+        if table is None or len(table.rows) != self.detuning_axis.size:
+            raise ValueError("pulse scan rows must match the RF detuning axis")
+
+    @property
+    def point_layout(self) -> PointLayout:
+        return PointLayout.rect_c((self.detuning_axis.size,))
+
+    @property
+    def physical_detuning_gamma(self) -> tuple[float, ...]:
+        coordinates = self.detuning_axis.coordinates
+        assert coordinates is not None
+        return tuple(
+            float(value)
+            for _repeat in range(self.shots)
+            for value in coordinates
+        )
+
+    @property
+    def fingerprint(self) -> str:
+        return canonical_digest(
+            {
+                "owner": "zlc_neutral_atom.grey-molasses-detuning-program",
+                "pulse_document": self.document.fingerprint,
+                "detuning_gamma": self.detuning_axis.coordinates,
+                "shots": self.shots,
+            }
+        )
+
+
 def _finite_signed_axis(values: object, name: str) -> tuple[float, ...]:
     if isinstance(values, (str, bytes)):
         raise TypeError(f"{name} must be a numeric sequence")
@@ -437,6 +488,31 @@ def _release_recapture_template(
     return result
 
 
+def _freeze_release_recapture_rows(
+    document: PulseDocument,
+    calibration: CalibrationArtifact,
+    trap_off_seconds: tuple[float, ...],
+    shots: int,
+) -> PulseDocument:
+    """Freeze the physical pulse rows shared by Temperature and Grey molasses."""
+
+    document = _release_recapture_template(document, calibration)
+    parameter = document.scan_parameters[0]
+    unit_ns = TIME_UNIT_TO_NS[parameter.unit]
+    frozen, _normalization = freeze_scan_table(
+        document,
+        ("t_off",),
+        tuple((seconds * 1e9 / unit_ns,) for seconds in trap_off_seconds),
+    )
+    periods = document.periods
+    repeat = (
+        None
+        if shots == 1
+        else RepeatRegion(periods[0].period_id, periods[-1].period_id, shots)
+    )
+    return replace(document, scan_table=frozen, scan_recipe=None, repeat=repeat)
+
+
 def build_temperature_release_recapture_program(
     request: TemperatureReleaseRecaptureRequest,
     calibration: ResolvedCalibration,
@@ -449,38 +525,104 @@ def build_temperature_release_recapture_program(
         raise TypeError("calibration must be an admitted ResolvedCalibration")
     if calibration.reference != request.calibration_ref:
         raise ValueError("resolved calibration differs from the request")
-    document = _release_recapture_template(
+    document = _freeze_release_recapture_rows(
         request.pulse_document,
         calibration.artifact,
+        request.trap_off_seconds,
+        request.shots,
     )
-    parameter = document.scan_parameters[0]
-    unit_ns = TIME_UNIT_TO_NS[parameter.unit]
-    raw_rows = tuple(
-        (seconds * 1e9 / unit_ns,) for seconds in request.trap_off_seconds
+    return AutonomousScanSlotProgram(document)
+
+
+def _build_grey_molasses_detuning_program(
+    request: GreyMolassesDetuningRequest,
+    calibration: ResolvedCalibration,
+) -> _GreyMolassesDetuningProgram:
+    """Freeze one fixed-t_off pulse row per RF point without touching a Port."""
+
+    if not isinstance(request, GreyMolassesDetuningRequest):
+        raise TypeError("request must be GreyMolassesDetuningRequest")
+    if type(calibration) is not ResolvedCalibration:
+        raise TypeError("calibration must be an admitted ResolvedCalibration")
+    if calibration.reference != request.calibration_ref:
+        raise ValueError("resolved calibration differs from the request")
+    document = _freeze_release_recapture_rows(
+        request.pulse_document,
+        calibration.artifact,
+        tuple(request.trap_off_seconds for _value in request.detuning_gamma),
+        request.shots,
     )
-    frozen, _normalization = freeze_scan_table(
+    axis = AxisSpec(
+        AxisId("grey_molasses.detuning"),
+        "Two-photon detuning",
+        SCAN_POINT,
+        len(request.detuning_gamma),
+        request.detuning_gamma,
+        "Gamma",
+    )
+    return _GreyMolassesDetuningProgram(
         document,
-        ("t_off",),
-        raw_rows,
+        axis,
+        request.shots,
     )
-    periods = document.periods
-    repeated = (
-        None
-        if request.shots == 1
-        else RepeatRegion(
-            periods[0].period_id,
-            periods[-1].period_id,
-            request.shots,
-        )
+
+
+def _bind_release_recapture_camera(
+    document: PulseDocument,
+    *,
+    pulse_port: BoundPulsePort,
+    camera_port: BoundCapturePort,
+    trigger_channel: str | None,
+    repeat_axis: AxisSpec,
+    readout_event_axis_id: AxisId,
+    scan_axes: tuple[AxisSpec, ...],
+    point_layout: PointLayout,
+    definition: MeasurementDefinition,
+    calibration: ResolvedCalibration,
+) -> tuple[PulseDocument, TriggeredCameraBinding]:
+    """Bind the shared two-image physical acquisition, once, for both domains."""
+
+    if not isinstance(pulse_port, BoundPulsePort):
+        raise TypeError("pulse_port must be BoundPulsePort")
+    if not isinstance(camera_port, BoundCapturePort):
+        raise TypeError("camera_port must be BoundCapturePort")
+    logical_document = bind_pulse_document_target(
+        document,
+        pulse_port.capability.target,
     )
-    return AutonomousScanSlotProgram(
-        replace(
-            document,
-            scan_table=frozen,
-            scan_recipe=None,
-            repeat=repeated,
-        )
+    require_autonomous_scan_resident_capacity(
+        logical_document,
+        pulse_port.capability.resident_scan_point_capacity,
     )
+    binding = bind_triggered_camera_acquisition(
+        pulse_port,
+        camera_port,
+        pulse_document=expand_autonomous_scan_repeats(logical_document),
+        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
+        trigger_channel=trigger_channel,
+        layout=TriggeredCameraLayout(
+            repeat_axis=repeat_axis,
+            readout_event_axis_id=readout_event_axis_id,
+            readout_events_per_repeat=2,
+            scan_axes=scan_axes,
+            scan_point_layout=point_layout,
+        ),
+    )
+    base = binding.measurement
+    binding = TriggeredCameraBinding(
+        binding.pulse_port,
+        binding.pulse_request,
+        binding.trigger_channel,
+        BoundMeasurement(
+            definition,
+            base.capture_port,
+            base.capture_contract,
+            base.capture_spec,
+        ),
+        binding.cell_plan,
+    )
+    _validate_live_release_recapture_calibration(binding, calibration)
+    return logical_document, binding
 
 
 @dataclass(frozen=True)
@@ -511,58 +653,119 @@ def bind_temperature_release_recapture(
 ) -> BoundTemperatureReleaseRecapture:
     """Bind the one honest current autonomous coupled Measurement."""
 
-    if not isinstance(pulse_port, BoundPulsePort):
-        raise TypeError("pulse_port must be BoundPulsePort")
-    if not isinstance(camera_port, BoundCapturePort):
-        raise TypeError("camera_port must be BoundCapturePort")
     program = build_temperature_release_recapture_program(request, calibration)
-    logical_document = bind_pulse_document_target(
+    point_table = program.point_table
+    logical_document, binding = _bind_release_recapture_camera(
         program.execution_document,
-        pulse_port.capability.target,
+        pulse_port=pulse_port,
+        camera_port=camera_port,
+        trigger_channel=request.trigger_channel,
+        repeat_axis=AxisSpec(
+            AxisId("temperature.repeat"),
+            "repeat",
+            REPEAT,
+            request.shots,
+            tuple(range(request.shots)),
+        ),
+        readout_event_axis_id=AxisId("temperature.readout_event"),
+        scan_axes=point_table.point_axes,
+        point_layout=point_table.point_layout,
+        definition=TEMPERATURE_RELEASE_RECAPTURE_DEFINITION,
+        calibration=calibration,
     )
     program = AutonomousScanSlotProgram(logical_document)
-    require_autonomous_scan_resident_capacity(
-        logical_document,
-        pulse_port.capability.resident_scan_point_capacity,
-    )
-    execution_document = expand_autonomous_scan_repeats(logical_document)
-    point_table = program.point_table
-    binding = bind_triggered_camera_acquisition(
-        pulse_port,
-        camera_port,
-        pulse_document=execution_document,
-        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
-        trigger_channel=request.trigger_channel,
-        layout=TriggeredCameraLayout(
-            repeat_axis=AxisSpec(
-                AxisId("temperature.repeat"),
-                "repeat",
-                REPEAT,
-                request.shots,
-                tuple(range(request.shots)),
-            ),
-            readout_event_axis_id=AxisId("temperature.readout_event"),
-            readout_events_per_repeat=2,
-            scan_axes=point_table.point_axes,
-            scan_point_layout=point_table.point_layout,
-        ),
-    )
-    base = binding.measurement
-    domain_measurement = BoundMeasurement(
-        TEMPERATURE_RELEASE_RECAPTURE_DEFINITION,
-        base.capture_port,
-        base.capture_contract,
-        base.capture_spec,
-    )
-    binding = TriggeredCameraBinding(
-        binding.pulse_port,
-        binding.pulse_request,
-        binding.trigger_channel,
-        domain_measurement,
-        binding.cell_plan,
-    )
-    _validate_live_release_recapture_calibration(binding, calibration)
     return BoundTemperatureReleaseRecapture(request, program, binding)
+
+
+@dataclass(frozen=True)
+class BoundGreyMolassesDetuning:
+    request: GreyMolassesDetuningRequest
+    program: _GreyMolassesDetuningProgram
+    camera_binding: TriggeredCameraBinding
+    rf_port: BoundRfTablePort
+    rf_table: RfDetuningTable
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, GreyMolassesDetuningRequest):
+            raise TypeError("request has another type")
+        if not isinstance(self.program, _GreyMolassesDetuningProgram):
+            raise TypeError("program has another type")
+        if not isinstance(self.camera_binding, TriggeredCameraBinding):
+            raise TypeError("camera_binding has another type")
+        if not isinstance(self.rf_port, BoundRfTablePort):
+            raise TypeError("rf_port has another type")
+        if not isinstance(self.rf_table, RfDetuningTable):
+            raise TypeError("rf_table has another type")
+        if (
+            self.camera_binding.measurement.definition
+            != GREY_MOLASSES_DETUNING_DEFINITION
+        ):
+            raise ValueError("bound Measurement uses another definition")
+        if (
+            self.rf_table.pulse_artifact_digest
+            != self.camera_binding.compiled_artifact.fingerprint
+        ):
+            raise ValueError("RF table belongs to another compiled pulse")
+
+
+def bind_grey_molasses_detuning(
+    request: GreyMolassesDetuningRequest,
+    calibration: ResolvedCalibration,
+    *,
+    pulse_port: BoundPulsePort,
+    camera_port: BoundCapturePort,
+    rf_port: BoundRfTablePort,
+) -> BoundGreyMolassesDetuning:
+    if not isinstance(rf_port, BoundRfTablePort):
+        raise TypeError("rf_port must be BoundRfTablePort")
+    program = _build_grey_molasses_detuning_program(request, calibration)
+    logical_document, binding = _bind_release_recapture_camera(
+        program.document,
+        pulse_port=pulse_port,
+        camera_port=camera_port,
+        trigger_channel=request.trigger_channel,
+        repeat_axis=AxisSpec(
+            AxisId("grey_molasses.repeat"),
+            "repeat",
+            REPEAT,
+            request.shots,
+            tuple(range(request.shots)),
+        ),
+        readout_event_axis_id=AxisId("grey_molasses.readout_event"),
+        scan_axes=(program.detuning_axis,),
+        point_layout=program.point_layout,
+        definition=GREY_MOLASSES_DETUNING_DEFINITION,
+        calibration=calibration,
+    )
+    program = _GreyMolassesDetuningProgram(
+        logical_document,
+        program.detuning_axis,
+        program.shots,
+    )
+    table = RfDetuningTable(
+        binding.compiled_artifact.fingerprint,
+        program.physical_detuning_gamma,
+    )
+    playback = build_pulse_playback(binding.compiled_artifact)
+    physical_point_indices = tuple(
+        group.point_index for group in playback.trigger_groups
+    )
+    if physical_point_indices != tuple(range(len(table.detuning_gamma))):
+        raise RuntimeError(
+            "compiled trigger groups differ from the RF physical table order"
+        )
+    logical_values = tuple(float(value) for value in request.detuning_gamma)
+    for physical_index, value in enumerate(table.detuning_gamma):
+        repeat_index, point_index = divmod(physical_index, len(logical_values))
+        if repeat_index >= request.shots or value != logical_values[point_index]:
+            raise RuntimeError("RF table is not R-major/P-fast")
+    return BoundGreyMolassesDetuning(
+        request,
+        program,
+        binding,
+        rf_port,
+        table,
+    )
 
 
 def _validate_live_release_recapture_calibration(
@@ -617,7 +820,7 @@ READOUT_DURATION_CAPABILITY_GAP = (
 GREY_MOLASSES_CAPABILITY_GAP = (
     "grey-molasses detuning requires an RF Port that can preload and advance the "
     "complete two-photon-detuning table from the same hardware scan clock; the "
-    "current installation exposes no RF Port or synchronous RF table"
+    "selected installation exposes no such RF Port"
 )
 
 
@@ -639,6 +842,7 @@ def reject_grey_molasses_detuning(
 
 __all__ = [
     "AutonomousMeasurementUnavailable",
+    "BoundGreyMolassesDetuning",
     "BoundTemperatureReleaseRecapture",
     "COUPLED_MEASUREMENT_DEFINITIONS",
     "GREY_MOLASSES_CAPABILITY_GAP",
@@ -652,6 +856,7 @@ __all__ = [
     "TEMPERATURE_RELEASE_RECAPTURE_DEFINITION",
     "TEMPERATURE_RELEASE_RECAPTURE_KEY",
     "TemperatureReleaseRecaptureRequest",
+    "bind_grey_molasses_detuning",
     "bind_temperature_release_recapture",
     "build_temperature_release_recapture_program",
     "reject_grey_molasses_detuning",

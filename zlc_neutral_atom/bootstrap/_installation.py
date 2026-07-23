@@ -35,6 +35,7 @@ from zlc_neutral_atom.readout.sitemap import (
     SitemapAcquisitionProfile,
     load_packaged_sitemap_pulse,
 )
+from zlc_neutral_atom.rf import BoundRfTablePort
 from zlc_neutral_atom.runtime.capture import BoundCapturePort
 from zlc_neutral_atom.runtime.monitor import BoundCameraMonitorPort
 from zlc_neutral_atom.runtime.ports import (
@@ -71,10 +72,12 @@ from ._sequencer_endpoint import (
     RemotePulseExecutionEndpoint,
     VirtualSequencerExecutionEndpoint,
 )
+from ._rf_endpoint import VirtualRfTableEndpoint
 from ._virtual_hardware import (
     VirtualAtomArray,
     VirtualCamera,
     VirtualMotFrameSource,
+    VirtualRfSource,
     VirtualSequencer,
 )
 
@@ -329,6 +332,39 @@ def _bind_sequencer(
     )
 
 
+def _bind_rf(
+    broker: DeviceBroker,
+    asset: InstallationAsset,
+    asset_map_revision: str,
+    source: VirtualRfSource,
+    *,
+    maximum_points: int,
+) -> BoundRfTablePort:
+    endpoint = VirtualRfTableEndpoint(source, maximum_points)
+    binding: BoundDevice | None = None
+
+    def current_binding() -> BoundDevice:
+        if binding is None:
+            raise RuntimeError("RF endpoint binding is not installed")
+        return binding
+
+    identity = _identity_for(asset, asset_map_revision)
+    proof = broker.verify_identity(lambda: identity)
+    binding = broker.bind(
+        key=asset.resource_key,
+        identity=proof,
+        execute_command=lambda command: endpoint.execute_command(
+            current_binding(), command
+        ),
+        capability_probe=lambda: endpoint.capability_probe(current_binding()),
+        close_session=lambda command: endpoint.close_session(
+            current_binding(), command
+        ),
+        interrupt_operations={SafetyOperation.SAFE_STATE: endpoint.interrupt},
+    )
+    return BoundRfTablePort(broker.verify_capability(binding))
+
+
 def _bind_remote_sequencer(
     broker: DeviceBroker,
     asset: InstallationAsset,
@@ -412,6 +448,7 @@ class _InstallationRuntime:
         "_camera_ports",
         "_camera_monitor_ports",
         "_pulse_ports",
+        "_rf_ports",
         "_sitemap_profiles",
         "_raw_graph",
         "_close_order",
@@ -433,6 +470,7 @@ class _InstallationRuntime:
         camera_ports: Mapping[str, BoundCapturePort],
         camera_monitor_ports: Mapping[str, BoundCameraMonitorPort],
         pulse_ports: Mapping[str, BoundPulsePort],
+        rf_ports: Mapping[str, BoundRfTablePort],
         sitemap_profiles: Mapping[str, SitemapAcquisitionProfile],
         raw_graph: Mapping[str, object],
         close_order: tuple[str, ...],
@@ -449,6 +487,7 @@ class _InstallationRuntime:
         camera_ports = dict(camera_ports)
         camera_monitor_ports = dict(camera_monitor_ports)
         pulse_ports = dict(pulse_ports)
+        rf_ports = dict(rf_ports)
         sitemap_profiles = dict(sitemap_profiles)
         raw_graph = dict(raw_graph)
         close_order = tuple(close_order)
@@ -458,7 +497,12 @@ class _InstallationRuntime:
             raise ValueError(
                 "installation close order must cover the raw graph exactly"
             )
-        public_roles = set(camera_ports) | set(camera_monitor_ports) | set(pulse_ports)
+        public_roles = (
+            set(camera_ports)
+            | set(camera_monitor_ports)
+            | set(pulse_ports)
+            | set(rf_ports)
+        )
         if not public_roles.issubset(raw_graph):
             raise ValueError("installation ports reference roles outside the raw graph")
         if not public_roles.issubset(set(catalog)):
@@ -473,6 +517,8 @@ class _InstallationRuntime:
             catalog.require(role).domain != "sequencer" for role in pulse_ports
         ):
             raise ValueError("pulse port roles differ from catalog domains")
+        if any(catalog.require(role).domain != "rf" for role in rf_ports):
+            raise ValueError("RF port roles differ from catalog domains")
         if not set(sitemap_profiles).issubset(camera_ports):
             raise ValueError("sitemap profiles reference roles without camera ports")
         for role, profile in sitemap_profiles.items():
@@ -497,6 +543,7 @@ class _InstallationRuntime:
         self._camera_ports = camera_ports
         self._camera_monitor_ports = camera_monitor_ports
         self._pulse_ports = pulse_ports
+        self._rf_ports = rf_ports
         self._sitemap_profiles = sitemap_profiles
         self._raw_graph = raw_graph
         self._close_order = close_order
@@ -551,6 +598,18 @@ class _InstallationRuntime:
                 return self._pulse_ports[reference.role]
             except KeyError as exc:
                 raise ValueError(f"role {reference.role!r} is not a sequencer") from exc
+
+    def rf_port(self, reference: DeviceRef) -> BoundRfTablePort:
+        with self._lock:
+            if self._state != "RUNNING":
+                raise RuntimeError("installation runtime is not accepting operations")
+            self._require_current_reference(reference, "rf")
+            try:
+                return self._rf_ports[reference.role]
+            except KeyError as exc:
+                raise ValueError(
+                    f"RF role {reference.role!r} has no synchronized table Port"
+                ) from exc
 
     def sitemap_profile(self, reference: DeviceRef) -> SitemapAcquisitionProfile:
         """Return one immutable domain descriptor, never the private camera/trap."""
@@ -684,6 +743,7 @@ class _InstallationRuntime:
             self._camera_ports.clear()
             self._camera_monitor_ports.clear()
             self._pulse_ports.clear()
+            self._rf_ports.clear()
             self._sitemap_profiles.clear()
             return True
 
@@ -724,6 +784,7 @@ def _catalog(
         "camera": "camera",
         "mot_camera": "camera",
         "sequencer": "sequencer",
+        "rf": "rf",
         "trap": "trap",
     }
     return DeviceCatalogView(
@@ -758,6 +819,7 @@ def create_virtual_installation(
             raise ValueError("virtual installation seed must be non-negative")
     trap: VirtualAtomArray | None = None
     sequencer: VirtualSequencer | None = None
+    rf: VirtualRfSource | None = None
     camera: VirtualCamera | None = None
     mot_camera: VirtualCamera | None = None
     devices: dict[str, object] = {}
@@ -767,14 +829,6 @@ def create_virtual_installation(
         target = _deployed_target()
         target_manifest = _virtual_target_manifest(target)
         readout_geometry = _virtual_readout_geometry()
-        trap = VirtualAtomArray(
-            geometry=readout_geometry,
-            seed=seed,
-            cooling_channels=_COOLING_CHANNELS,
-            probe_channels=_PROBE_CHANNELS,
-            trap_channels=_TRAP_CHANNELS,
-        )
-        devices["trap"] = trap
         sequencer = VirtualSequencer(
             target,
             # Standard deployed virtual composition is one frozen config bundle.
@@ -783,6 +837,17 @@ def create_virtual_installation(
             clock_hz=default_clock_hz(DEFAULT_CONFIG_PATH),
         )
         devices["sequencer"] = sequencer
+        rf = VirtualRfSource(sequencer)
+        devices["rf"] = rf
+        trap = VirtualAtomArray(
+            geometry=readout_geometry,
+            seed=seed,
+            cooling_channels=_COOLING_CHANNELS,
+            probe_channels=_PROBE_CHANNELS,
+            trap_channels=_TRAP_CHANNELS,
+            rf=rf,
+        )
+        devices["trap"] = trap
         camera = VirtualCamera(
             trap,
             sequencer=sequencer,
@@ -806,13 +871,14 @@ def create_virtual_installation(
         assets = InstallationAssetMap.ephemeral(
             {
                 "sequencer": sequencer,
+                "rf": rf,
                 "camera": camera,
                 "mot_camera": mot_camera,
             }
         )
         installation_id = f"installation-{assets.revision[:20]}"
         runtime_instance_id = uuid.uuid4().hex
-        for role in ("sequencer", "camera", "mot_camera"):
+        for role in ("sequencer", "rf", "camera", "mot_camera"):
             devices[role].ensure_open()
         sequencer.set_safe_state()
         broker = DeviceBroker()
@@ -835,6 +901,13 @@ def create_virtual_installation(
             assets.revision,
             sequencer,
             target_manifest,
+        )
+        rf_port = _bind_rf(
+            broker,
+            assets.require("rf", rf),
+            assets.revision,
+            rf,
+            maximum_points=pulse_port.capability.resident_scan_point_capacity,
         )
         sitemap_profile = SitemapAcquisitionProfile(
             readout_binding=ReadoutBindingKey("camera"),
@@ -872,11 +945,13 @@ def create_virtual_installation(
                 "mot_camera": mot_camera_monitor_port,
             },
             pulse_ports={"sequencer": pulse_port},
+            rf_ports={"rf": rf_port},
             sitemap_profiles={"camera": sitemap_profile},
             raw_graph=devices,
             close_order=(
                 "mot_camera",
                 "camera",
+                "rf",
                 "sequencer",
                 "trap",
             ),
@@ -888,6 +963,7 @@ def create_virtual_installation(
             None if broker is None else broker.shutdown,
             None if mot_camera is None else mot_camera.close,
             None if camera is None else camera.close,
+            None if rf is None else rf.close,
             None if sequencer is None else sequencer.close,
             None if trap is None else getattr(trap, "close", None),
         )
@@ -1061,6 +1137,7 @@ def create_remote_pulse_installation(
             camera_ports={},
             camera_monitor_ports={},
             pulse_ports={"sequencer": pulse_port},
+            rf_ports={},
             sitemap_profiles={},
             raw_graph=devices,
             close_order=("sequencer",),

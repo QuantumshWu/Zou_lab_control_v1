@@ -45,6 +45,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
 
     from Zou_lab_control.notebook.facade import (
         _prepare_camera_measurement_for_workbench,
+        _prepare_grey_molasses_detuning_for_workbench,
         _prepare_temperature_release_recapture_for_workbench,
     )
     from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_KEY
@@ -59,7 +60,6 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
     from zlc_neutral_atom.readout.coupled_measurements import (
         AutonomousMeasurementUnavailable,
-        GREY_MOLASSES_CAPABILITY_GAP,
         GREY_MOLASSES_DETUNING_KEY,
         READOUT_DURATION_CAPABILITY_GAP,
         READOUT_DURATION_FIDELITY_KEY,
@@ -84,6 +84,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         GreyMolassesDetuningIntent,
         ReadoutDurationFidelityIntent,
         TemperatureReleaseRecaptureIntent,
+        freeze_grey_molasses_detuning_request,
         freeze_temperature_release_recapture_request,
     )
     from .result_projection import project_final_signals
@@ -102,6 +103,41 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         the GUI thread, and a surface that DID need an immediate repaint would
         hook it here rather than inside the run bridge.
         """
+
+    def resolve_calibration_reference(
+        signal_key: str,
+        *,
+        measurement_name: str,
+    ) -> CalibrationArtifactRef:
+        if not console:
+            raise RuntimeError(
+                "TaskConsole composition is not ready for calibration binding"
+            )
+        calibration = console[0].resolve_console_producer(signal_key)
+        if (
+            calibration.definition_key != SITEMAP_CALIBRATION_TASK_KEY
+            or calibration.output_name != "calibration"
+        ):
+            raise ValueError(
+                f"{measurement_name} Calibration must select the calibration "
+                "output of a Calibrate readout Task row"
+            )
+        if calibration.running:
+            raise RuntimeError(
+                "the selected Calibrate readout Task is still running"
+            )
+        if (
+            not calibration.final_result_resolved
+            or not isinstance(
+                calibration.final_result,
+                CalibrationArtifactRef,
+            )
+        ):
+            raise RuntimeError(
+                "the selected Calibrate readout row has no successful "
+                "current FINAL CalibrationArtifactRef"
+            )
+        return calibration.final_result
 
     def run_factory(spec, values):
         if spec.key == CAMERA_MEASUREMENT_KEY:
@@ -134,37 +170,10 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 raise TypeError(
                     "temperature form did not produce its typed intent"
                 )
-            if not console:
-                raise RuntimeError(
-                    "TaskConsole composition is not ready for calibration binding"
-                )
-            calibration = console[0].resolve_console_producer(
-                intent.calibration_signal
+            calibration_ref = resolve_calibration_reference(
+                intent.calibration_signal,
+                measurement_name="Temperature",
             )
-            if (
-                calibration.definition_key != SITEMAP_CALIBRATION_TASK_KEY
-                or calibration.output_name != "calibration"
-            ):
-                raise ValueError(
-                    "Temperature Calibration must select the calibration "
-                    "output of a Calibrate readout Task row"
-                )
-            if calibration.running:
-                raise RuntimeError(
-                    "the selected Calibrate readout Task is still running"
-                )
-            if (
-                not calibration.final_result_resolved
-                or not isinstance(
-                    calibration.final_result,
-                    CalibrationArtifactRef,
-                )
-            ):
-                raise RuntimeError(
-                    "the selected Calibrate readout row has no successful "
-                    "current FINAL CalibrationArtifactRef"
-                )
-            calibration_ref = calibration.final_result
 
             def prepare_temperature(current_intent):
                 if current_intent != intent:
@@ -227,22 +236,40 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                     "grey-molasses form did not produce its typed intent"
                 )
 
-            def reject_grey(current_intent):
+            calibration_ref = resolve_calibration_reference(
+                intent.calibration_signal,
+                measurement_name="Grey molasses detuning",
+            )
+
+            def prepare_grey(current_intent):
                 if current_intent != intent:
                     raise RuntimeError(
                         "grey-molasses intent changed after construction"
                     )
-                raise AutonomousMeasurementUnavailable(
-                    GREY_MOLASSES_CAPABILITY_GAP
+                request = freeze_grey_molasses_detuning_request(
+                    experiment,
+                    current_intent,
+                    calibration_ref=calibration_ref,
+                )
+                return _prepare_grey_molasses_detuning_for_workbench(
+                    experiment,
+                    request,
                 )
 
             node = ConsoleRunNode(
                 spec,
                 values,
-                prepare=reject_grey,
+                prepare=prepare_grey,
                 request_owner_wake=request_owner_wake,
             )
             node.bind_starter(lambda prepared: prepared.start())
+            node.bind_final_projector(
+                lambda result, current=node: project_final_signals(
+                    experiment,
+                    current,
+                    result,
+                )
+            )
             return node
         if spec.key == OCCUPANCY_STREAM_PROCESSOR_KEY:
             if not console:

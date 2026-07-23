@@ -16,6 +16,7 @@ from zlc_neutral_atom.runtime.capture import (
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.run import RunContext
 from zlc_neutral_atom.runtime._failure import record_secondary_failure
+from zlc_neutral_atom.rf import BoundRfTablePort, RfDetuningTable, RfTableTerminal
 from zlc_pulse import DigitalTriggerSchedule
 
 from .lineage import PulseCaptureBinding
@@ -43,15 +44,72 @@ def execute_autonomous_single_fire(
 ) -> tuple[_CaptureCompletionT, PulseTerminalAck]:
     """Run the one shared hardware sequence for an autonomous exact capture."""
 
+    result, terminal, rf_terminal = _execute_autonomous_single_fire(
+        context,
+        pulse=pulse,
+        capture=capture,
+    )
+    assert rf_terminal is None
+    return result, terminal
+
+
+def execute_autonomous_single_fire_with_rf_table(
+    context: RunContext,
+    *,
+    pulse: PulseSession,
+    capture: _AutonomousExactCapture[_CaptureCompletionT],
+    rf_port: BoundRfTablePort,
+    rf_session_id: str,
+    rf_table: RfDetuningTable,
+) -> tuple[_CaptureCompletionT, PulseTerminalAck, RfTableTerminal]:
+    """The concrete Grey-molasses seam: preload once, then scan-clock advance."""
+
+    if not isinstance(rf_port, BoundRfTablePort):
+        raise TypeError("rf_port must be BoundRfTablePort")
+    if not isinstance(rf_table, RfDetuningTable):
+        raise TypeError("rf_table must be RfDetuningTable")
+    result, terminal, rf_terminal = _execute_autonomous_single_fire(
+        context,
+        pulse=pulse,
+        capture=capture,
+        rf_port=rf_port,
+        rf_session_id=rf_session_id,
+        rf_table=rf_table,
+    )
+    assert rf_terminal is not None
+    return result, terminal, rf_terminal
+
+
+def _execute_autonomous_single_fire(
+    context: RunContext,
+    *,
+    pulse: PulseSession,
+    capture: _AutonomousExactCapture[_CaptureCompletionT],
+    rf_port: BoundRfTablePort | None = None,
+    rf_session_id: str | None = None,
+    rf_table: RfDetuningTable | None = None,
+) -> tuple[_CaptureCompletionT, PulseTerminalAck, RfTableTerminal | None]:
+    if (rf_port is None) != (rf_session_id is None) or (rf_port is None) != (
+        rf_table is None
+    ):
+        raise ValueError("RF Port, session id, and table must be supplied together")
     try:
         pulse.prepare(context)
+        if rf_port is not None:
+            assert rf_session_id is not None and rf_table is not None
+            rf_port.prepare(context, rf_session_id, rf_table)
         capture.start(context)
         pulse.fire(context)
         capture.capture_all(context)
         terminal = pulse.complete(context)
         if not pulse.owns_terminal(terminal):
             raise PermissionError("pulse terminal was not minted by this session")
-        return capture.complete(context), terminal
+        rf_terminal = (
+            None
+            if rf_port is None
+            else rf_port.complete(context, rf_session_id, rf_table)
+        )
+        return capture.complete(context), terminal, rf_terminal
     except BaseException as primary:
         for label, fail in (
             ("capture poison", lambda: capture.fail(primary)),
