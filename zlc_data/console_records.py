@@ -29,13 +29,33 @@ from zlc_storage.canonical import exact_mapping
 __all__ = ["DEFAULT_UPDATE_MS", "LOGIC_KINDS", "LOGIC_NODE_CONFIG_FIELDS",
            "LogicNodeConfig", "PANEL_CONFIG_FIELDS", "PANEL_KINDS",
            "CONSOLE_STATE_SCHEMA", "PanelConfig", "TASK_CONSOLE_STATE_FIELDS",
-           "UPDATE_INTERVALS", "layout_record"]
+           "UPDATE_INTERVALS", "console_signal_key", "layout_record"]
 
 
 #: The four node families the Logic tab can add.
 LOGIC_KINDS = ("camera", "measurement", "processor", "task")
 
 LOGIC_NODE_CONFIG_FIELDS = {"kind": str, "name": str, "title": str, "values": dict}
+
+
+def console_signal_key(producer_label: str, output_name: str) -> str:
+    """Return the persisted identity of one console-node output.
+
+    Output names such as ``frame`` describe a quantity, not a producer
+    instance.  A board may legitimately contain two camera rows, so a panel
+    binding must include both the saved row identity and the definition-owned
+    output name.  The picker still presents ``producer -> output``; this joined
+    string is only the exact key saved by :class:`PanelConfig` and used by the
+    live data plane.
+    """
+
+    producer = str(producer_label).strip()
+    output = str(output_name).strip()
+    if not producer:
+        raise ValueError("console signal producer label must not be empty")
+    if not output:
+        raise ValueError("console signal output name must not be empty")
+    return f"{producer} / {output}"
 
 
 def layout_record(

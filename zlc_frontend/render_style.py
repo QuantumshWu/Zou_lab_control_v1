@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from functools import lru_cache
 import math
-from pathlib import Path
 import threading
 from types import MappingProxyType
 from typing import Any, Iterator, Mapping
@@ -13,8 +11,23 @@ from typing import Any, Iterator, Mapping
 import matplotlib
 from matplotlib import font_manager as fm
 
-from zlc_storage import canonical_text
-
+from .image_display import ImageColormap
+from .plot_layout import (
+    DESIGN_DPI,
+    LIVE_PANEL_DPI,
+    PANEL_DISPLAY_SCALE,
+    PANEL_MARGINS_PX,
+    PANEL_UNIT_PX,
+    PULSE_LEFT_MARGIN_PX,
+    STOCK_DATA_PX,
+    STOCK_MARGINS_PX,
+    TITLE_SLOT_PX,
+    optimal_pulse_size,
+    panel_axes_bounds,
+    panel_display_size,
+    panel_figure_size_inches,
+    panel_margins_px,
+)
 from .site_map import (
     SITE_EMPTY_ALPHA,
     SITE_EMPTY_COLOR,
@@ -24,9 +37,9 @@ from .site_map import (
     SITE_OCCUPIED_COLOR,
     SITE_OCCUPIED_LINEWIDTH,
 )
+from .typography import FONT_FAMILY, FONT_PATH, SANS_SERIF
 
 NEW_BLACK = "black"
-FONT_PATH = Path(__file__).resolve().parent / "assets" / "helvetica-light-587ebe5a59211.ttf"
 
 _FONT_NAME = None
 if FONT_PATH.exists():
@@ -35,163 +48,8 @@ if FONT_PATH.exists():
         _FONT_NAME = fm.FontProperties(fname=str(FONT_PATH)).get_name()
     except Exception:
         _FONT_NAME = None
-
-SANS_SERIF = ((_FONT_NAME,) if _FONT_NAME else ()) + ("Arial",)
-
-# --------------------------------------------------------------------------- #
-# Geometry design tokens.  render_style.py is the lowest-level Matplotlib module (no
-# internal imports), so the ONE stock-figure geometry + the ONE design dpi live
-# here and every other module (canvas.FigureSpec, live's panel/pulse specs) reads
-# them -- a value is written ONCE and never re-typed, so nothing can drift.
-# These are OWNED constants of the frontend visual system, NOT per-call knobs.
-# --------------------------------------------------------------------------- #
-DESIGN_DPI = 300                          # the one DESIGN dpi; layout geometry + saved figures use it
-# The ONE panel display scale: how large an embedded live panel APPEARS on screen, as a fraction of
-# its DESIGN_DPI size (widget logical px = inches x DESIGN_DPI x PANEL_DISPLAY_SCALE).  It is the
-# single knob qt_canvas.EmbeddedFigureCanvas takes -- the Agg buffer is ALWAYS rendered at the
-# matching resolution (figure.dpi = DESIGN_DPI x real screen ratio x this), so the on-screen blit is
-# 1:1 crisp, never rendered small and stretched up.  SAVED figures use savefig.dpi, independent of
-# this.  (Lives HERE, the frontend's single source of truth -- NOT scattered across live.py /
-# qt_canvas as a display_scale/render_scale pair -- a value written ONCE so display size can't drift.)
-PANEL_DISPLAY_SCALE = 0.7
-STOCK_DATA_PX = (480, 360)                # the stock single-axes data region (confocal)
-STOCK_MARGINS_PX = (110, 110, 100, 40)    # confocal stock margins (L, R, B, T)
-
-# --- panel geometry: the ONE size table every dashboard card is laid out from ---
-# A panel size ("2x2", "4x8", ...) is rows x cols in HALF-UNITS; one half-unit is
-# PANEL_UNIT_PX.  The displayed pixel size of a panel is therefore a pure function of
-# its size preset -- data region + margins, scaled by PANEL_DISPLAY_SCALE -- and NOT of
-# what is drawn inside it.  That is what makes every kind's card at a given size line up
-# to the pixel, and what lets the board packer compute card boxes without asking the
-# renderer.  These are OWNED constants of the visual system, not per-call knobs.
-TITLE_SLOT_PX = 70                        # vertical px a centred panel title needs
-PANEL_UNIT_PX = (180, 240)                # (height, width) of one half-unit
-# L = STOCK_MARGINS_PX[0] (110): the MINIMUM that holds a 4-5 digit y-tick label (a qCMOS
-# ROI pixel value) PLUS the rotated y-title -- narrower clipped the title off the figure.
-PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 96, 80, TITLE_SLOT_PX)   # (L, R, B, T)
-PULSE_LEFT_MARGIN_PX = 122                # board-name y labels need the formal wider left slot
-
-
-def panel_margins_px(kind: str = "default") -> tuple[int, int, int, int]:
-    """The one fixed outer-margin source for a panel plot kind."""
-
-    left, right, bottom, top = PANEL_MARGINS_PX
-    if str(kind).strip().lower() == "pulse":
-        left = PULSE_LEFT_MARGIN_PX
-    return (left, right, bottom, top)
-
-
-def _panel_geometry_px(
-    size: str,
-    *,
-    kind: str,
-) -> tuple[int, int, int, int, int, int]:
-    from zlc_data.panel_size import panel_size_cells
-
-    rows, cols = panel_size_cells(size)
-    left, right, bottom, top = panel_margins_px(kind)
-    return (
-        cols * PANEL_UNIT_PX[1],
-        rows * PANEL_UNIT_PX[0],
-        left,
-        right,
-        bottom,
-        top,
-    )
-
-
-def panel_figure_size_inches(
-    size: str = "2x2",
-    *,
-    kind: str = "default",
-) -> tuple[float, float]:
-    """Figure size in INCHES for a panel of ``size`` -- the ONE source a renderer builds its
-    ``Figure(figsize=...)`` from (data region + margins over :data:`DESIGN_DPI`).
-
-    :func:`panel_display_size` is exactly this scaled to on-screen logical px, so a panel's rastered
-    figure and the card box a host reserves for it describe the SAME geometry and can never drift.
-    """
-
-    data_width, data_height, left, right, bottom, top = _panel_geometry_px(
-        size,
-        kind=kind,
-    )
-    width = data_width + left + right
-    height = data_height + bottom + top
-    return (width / DESIGN_DPI, height / DESIGN_DPI)
-
-
-def panel_display_size(
-    size: str = "2x2",
-    *,
-    kind: str = "default",
-) -> tuple[int, int]:
-    """On-screen (logical px) size of a panel of ``size`` -- the card's canvas box.
-
-    Pure geometry over the owned tokens: no figure, no renderer, no Qt.  A host
-    reserves exactly this much room for the panel's raster surface, so a card's
-    footprint is known before anything is drawn into it.  Derived from
-    :func:`panel_figure_size_inches` so the reserved box and the rastered figure share one source.
-    """
-
-    width_in, height_in = panel_figure_size_inches(size, kind=kind)
-    return (round(width_in * DESIGN_DPI * PANEL_DISPLAY_SCALE),
-            round(height_in * DESIGN_DPI * PANEL_DISPLAY_SCALE))
-
-
-def panel_axes_bounds(
-    size: str = "2x2",
-    *,
-    kind: str = "default",
-) -> tuple[float, float, float, float]:
-    """Fixed Matplotlib axes box ``(left, bottom, width, height)``.
-
-    Viewport limits never participate in this geometry.  It is the headless
-    equivalent of the formal ``FigureSpec + Divider`` layout: data box and
-    margins are derived once from the same size/kind tokens as the figure.
-    """
-
-    data_width, data_height, left, right, bottom, top = _panel_geometry_px(
-        size,
-        kind=kind,
-    )
-    figure_width = left + data_width + right
-    figure_height = bottom + data_height + top
-    return (
-        left / figure_width,
-        bottom / figure_height,
-        data_width / figure_width,
-        data_height / figure_height,
-    )
-
-
-# The readability floor a pulse timeline needs in the size-preset DATA region: enough px PER ROW that a
-# channel name is not squashed, and enough px PER PERIOD that periods do not blur into one band.  A busy
-# pulse (many channels / periods) therefore defaults to a BIGGER size preset (:func:`optimal_pulse_size`)
-# and the data region rescales with that preset like every other panel kind.  Owned ART tokens.
-_PULSE_ROW_MIN_PX = 26       # min data-region height per pulse row for a legible channel name
-_PULSE_PERIOD_MIN_PX = 46    # min data-region width per period so periods stay distinct
-
-
-def optimal_pulse_size(channel_count: int, period_count: int) -> str:
-    """The SMALLEST panel-size preset whose data region holds ``channel_count`` rows (>=
-    :data:`_PULSE_ROW_MIN_PX` each) and ``period_count`` periods (>= :data:`_PULSE_PERIOD_MIN_PX`
-    each), else the LARGEST preset.  The ONE default-size source for a pulse preview / a loaded pulse
-    panel: the size preset CARRIES the content density, and the data region rescales with the preset.
-    An extreme pulse beyond the largest preset still returns it and scrolls in its card."""
-
-    from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
-
-    rows_needed = max(1, int(channel_count))
-    periods_needed = max(1, int(period_count))
-    by_area = sorted(PANEL_SIZES, key=lambda name: (lambda rc: rc[0] * rc[1])(panel_size_cells(name)))
-    for name in by_area:
-        cells_r, cells_c = panel_size_cells(name)
-        data_w = cells_c * PANEL_UNIT_PX[1]
-        data_h = cells_r * PANEL_UNIT_PX[0]
-        if data_h >= rows_needed * _PULSE_ROW_MIN_PX and data_w >= periods_needed * _PULSE_PERIOD_MIN_PX:
-            return name
-    return by_area[-1]
+if _FONT_NAME != FONT_FAMILY:
+    _FONT_NAME = None
 
 # Stock figure size in inches = (data + L + R, data + B + T) / dpi.  Derived, so
 # it can never disagree with FigureSpec's defaults (which read the same tokens).
@@ -392,32 +250,19 @@ def _argb32(red: int, green: int, blue: int, alpha: int = 255) -> int:
     )
 
 
-@lru_cache(maxsize=8)
-def indexed_colormap(name: str) -> tuple[int, ...]:
-    """Return the canonical invalid + 255-sample QRgb table for one cmap.
+def colormap_argb_at(colormap: ImageColormap, fraction: float) -> int:
+    """Sample the render owner's typed colormap at one clamped fraction."""
 
-    The render owner samples Matplotlib once per closed colormap name.  Qt
-    installs this immutable table directly; a clim edit re-quantizes pixels in
-    the worker and never asks Qt to invent a second value-to-colour mapping.
-    """
-
-    name = canonical_text(name, "colormap name")
-    try:
-        cmap = matplotlib.colormaps[name]
-    except KeyError as exc:
-        raise ValueError(f"unknown Matplotlib colormap {name!r}") from exc
-    rgba = cmap([index / 254.0 for index in range(255)], bytes=True)
-    bad_rgba = tuple(
-        round(channel * 255)
-        for channel in matplotlib.colors.to_rgba(_PALETTE["bad"])
+    if not isinstance(colormap, ImageColormap):
+        raise TypeError("colormap must be ImageColormap")
+    fraction = float(fraction)
+    if not math.isfinite(fraction):
+        raise ValueError("colormap fraction must be finite")
+    red, green, blue, alpha = matplotlib.colormaps[colormap.value](
+        min(1.0, max(0.0, fraction)),
+        bytes=True,
     )
-    return (
-        _argb32(*bad_rgba),
-        *(
-            _argb32(int(red), int(green), int(blue), int(alpha))
-            for red, green, blue, alpha in rgba
-        ),
-    )
+    return _argb32(int(red), int(green), int(blue), int(alpha))
 
 # Current headless FigureDocument/Agg tokens extend the mature plotting system above; they do
 # not establish a second palette or rcParams owner.  Every renderer imports from this module.
@@ -429,12 +274,17 @@ FIT_CONTOUR_COLOR = "#FFFFFF"
 FIT_CONTOUR_LINEWIDTH = 0.8
 FIT_LINESTYLE = "--"
 CURVE_LINESTYLE = "-"
-CURVE_MARKER = "o"
-ANNOTATION_FONT_SIZE = "small"
+CURVE_MARKER = None
+ANNOTATION_FONT_SIZE = float(_DEFAULT_STYLE["legend.fontsize"])
 PULSE_SCAN_REGION_COLOR = "#D69A6E"
 PULSE_SCAN_ANNOTATION_COLOR = "#FFFFFF"
 PULSE_SCAN_ANNOTATION_FONT_SIZE = 3.36
-SERIES_COLORS = tuple(_PALETTE["series"])
+LINE_CYCLE = (
+    _PALETTE["line_single"],
+    _PALETTE["bright"],
+    *_PALETTE["series"],
+)
+SERIES_COLORS = LINE_CYCLE
 RENDER_RCPARAMS: Mapping[str, Any] = MappingProxyType(dict(_DEFAULT_STYLE))
 
 
@@ -514,8 +364,10 @@ __all__ = [
     "FONT_PATH",
     "NEW_BLACK",
     "PALETTE",
-    "indexed_colormap",
+    "colormap_argb_at",
     "PANEL_DISPLAY_SCALE",
+    "LIVE_PANEL_DPI",
+    "LINE_CYCLE",
     "PANEL_MARGINS_PX",
     "PANEL_UNIT_PX",
     "PULSE_LEFT_MARGIN_PX",

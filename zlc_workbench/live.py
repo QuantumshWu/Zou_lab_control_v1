@@ -38,7 +38,7 @@ from zlc_frontend.image_display import (
     ImageDisplayState,
     image_viewport_for_display_state,
 )
-from zlc_frontend.image_raster import rasterize_image_indexed8
+from zlc_frontend.image_display import resolve_image_color_limits
 from zlc_frontend.image_view import ImageViewportTransform
 from zlc_frontend.render import (
     BoardFrame,
@@ -596,8 +596,8 @@ class LiveBoardController:
             raise ValueError(
                 "curve and histogram display states must match the scalar panel set"
             )
-        if scalar_documents and not worker_thread_affine:
-            raise ValueError("live scalar Agg panels require a thread-affine worker lane")
+        if not worker_thread_affine:
+            raise ValueError("live Agg panels require a thread-affine worker lane")
         if (
             not isinstance(scalar_raster_size, tuple)
             or len(scalar_raster_size) != 2
@@ -643,6 +643,7 @@ class LiveBoardController:
         self._configuration_epoch = 0
         self._evaluator = FigureEvaluator()
         self._scalar_size = scalar_raster_size
+        self._image_renderer = None
         self._worker_thread_affine = worker_thread_affine
         self._submit_worker = submit_worker
         self._request_owner_wake = request_owner_wake
@@ -1526,12 +1527,7 @@ class LiveBoardController:
                         return
                     previous_color_limits = self._image_color_limits
                     previous_relim_mode = self._image_relim_mode
-                (
-                    image_raster,
-                    image_data_range,
-                    image_histogram,
-                    image_color_limits,
-                ) = rasterize_image_indexed8(
+                image_data_range, image_color_limits = resolve_image_color_limits(
                     data,
                     image_display,
                     current_color_limits=previous_color_limits,
@@ -1539,18 +1535,31 @@ class LiveBoardController:
                 )
                 if not self._job_is_current(job):
                     return
-                # Keep Matplotlib and its palette owner on the render worker;
-                # Qt receives only the immutable sampled QRgb table.
-                from zlc_frontend.render_style import indexed_colormap
+                from zlc_frontend.matplotlib_render import ImagePanelAggRenderer
+
+                if self._image_renderer is None:
+                    self._image_renderer = ImagePanelAggRenderer(
+                        width=self._scalar_size[0],
+                        height=self._scalar_size[1],
+                    )
+                image_raster, raster_geometry = self._image_renderer.render(
+                    data,
+                    image_viewport,
+                    image_display,
+                    color_limits=image_color_limits,
+                    data_range=image_data_range,
+                    title=configuration.image_document.layers[0].layer_id,
+                    value_label=configuration.image_document.datasets[0].label,
+                )
 
                 image_payload = ImagePanelPayload(
                     image=data,
                     evaluated_input=raw_input[0],
                     viewport=image_viewport,
                     data_range=image_data_range,
-                    histogram_counts=image_histogram,
-                    base_palette=indexed_colormap(image_display.colormap.value),
+                    colormap=image_display.colormap,
                     color_limits=image_color_limits,
+                    raster_geometry=raster_geometry,
                 )
             else:
                 raise RuntimeError("live IMAGE configuration has no display state")
@@ -2038,7 +2047,7 @@ class LiveBoardController:
             self._front_status = None
             self._front_invalidated = True
             configuration = self._configuration
-            schedule_renderer_close = bool(configuration.scalar_documents)
+            schedule_renderer_close = True
         try:
             self._slot.close()
         finally:
@@ -2060,6 +2069,12 @@ class LiveBoardController:
         configuration: _LiveRenderConfiguration,
     ) -> None:
         errors: list[BaseException] = []
+        image_renderer, self._image_renderer = self._image_renderer, None
+        if image_renderer is not None:
+            try:
+                image_renderer.close()
+            except BaseException as error:
+                errors.append(error)
         renderers = tuple(configuration.scalar_renderers)
         configuration.scalar_renderers[:] = [None for _renderer in renderers]
         for renderer in renderers:

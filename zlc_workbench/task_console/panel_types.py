@@ -10,12 +10,14 @@ from zlc_data.param_decl import ParamDecl
 
 
 VIEW_SPEC_PARAM = "view_spec"
+HISTOGRAM_THRESHOLDS_PARAM = "histogram_thresholds"
+HISTOGRAM_CELL_THRESHOLDS_PARAM = "histogram_cell_thresholds"
 RELIM_MODES = ("tight", "normal", "fixed")
 RELIM_PARAM = ParamDecl(
     key="relim",
     label="relim",
     kind="choice",
-    default="tight",
+    default="normal",
     choices=RELIM_MODES,
     display=True,
     tooltip=(
@@ -44,7 +46,7 @@ def grid_view_intents():
     return (
         ("Curves", ViewIntent.CURVE),
         ("Distribution", ViewIntent.HISTOGRAM),
-        ("Meter", ViewIntent.METER),
+        ("Images", ViewIntent.IMAGE),
     )
 
 

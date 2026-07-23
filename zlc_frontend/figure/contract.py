@@ -212,6 +212,7 @@ HISTOGRAM_CONTRACT = ViewContract(
         RepeatViewMode.MEAN,
         RepeatViewMode.SUM,
         RepeatViewMode.LATEST,
+        RepeatViewMode.FACET,
     ),
     RepeatViewMode.SAMPLE,
     (REPEAT,),

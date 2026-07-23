@@ -7,7 +7,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from zlc_storage import canonical_text
 
 from ..render import BoardFrame
-from ._raster_board_support import (
+from ._raster_front import (
     _aspect_target_for_source,
     _image_payload,
     _image_source_rect,

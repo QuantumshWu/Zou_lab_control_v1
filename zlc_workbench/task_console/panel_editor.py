@@ -72,15 +72,13 @@ def _front_qimage(frame):
     if not panels:
         return None
     raster = panels[0].raster
-    fmt = (QtGui.QImage.Format_Indexed8
-           if str(raster.pixel_format.value).lower().startswith("indexed")
-           else QtGui.QImage.Format_RGB32)
-    image = QtGui.QImage(bytes(raster.pixels), raster.width, raster.height,
-                         raster.stride_bytes, fmt)
-    payload = panels[0].display_payload
-    palette = tuple(getattr(payload, "base_palette", ()) or ())
-    if palette and fmt == QtGui.QImage.Format_Indexed8:
-        image.setColorTable(list(palette))
+    image = QtGui.QImage(
+        bytes(raster.pixels),
+        raster.width,
+        raster.height,
+        raster.width * 4,
+        QtGui.QImage.Format_RGBA8888,
+    )
     return image.copy()          # own the bytes: the raster is not ours to keep
 
 
@@ -261,6 +259,26 @@ class PanelEditor(QtWidgets.QWidget):
         if self.grid_bins_widget is not None:
             self.ed_params["bins"] = self.grid_bins_widget
         col.addWidget(self.grid_bins_row)
+        self.grid_ylog_row, self.grid_ylog_widget = card._make_grid_hist_param_row(
+            "ylog",
+            self._edit_param,
+            label_w,
+        )
+        if self.grid_ylog_widget is not None:
+            self.ed_params["ylog"] = self.grid_ylog_widget
+        col.addWidget(self.grid_ylog_row)
+        self.grid_colormap_row, self.grid_colormap_widget = (
+            card._make_grid_cell_param_row(
+                "2d",
+                "colormap",
+                card._image_intent(),
+                self._edit_param,
+                label_w,
+            )
+        )
+        if self.grid_colormap_widget is not None:
+            self.ed_params["colormap"] = self.grid_colormap_widget
+        col.addWidget(self.grid_colormap_row)
         self.repeat_mode_row, self.repeat_mode_combo = card._make_repeat_mode_row(
             self._edit_repeat_mode,
             label_w,
@@ -270,7 +288,7 @@ class PanelEditor(QtWidgets.QWidget):
         self.ed_relim = self.ed_params.get("relim")
         # An image's VALUE axis is its colour limit, pinned by the "colour range" row in
         # Limits; a second fixed lo/hi here would put two inputs on one source.
-        if card.config.kind != "2d":
+        if card.config.kind not in ("2d", "sites"):
             self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = card._make_fixed_lim_row(
                 self._edit_fixed_lim, label_w)
             col.addWidget(self.ed_fixed_row)
@@ -309,7 +327,7 @@ class PanelEditor(QtWidgets.QWidget):
         section("Limits")
         self.xmin = FluentLineEdit("")
         self.xmax = FluentLineEdit("")
-        if card.config.kind == "2d":
+        if card.config.kind in ("2d", "sites"):
             # An image's x AND y are pixel coordinates: pinning both is what makes a crop
             # real.  A curve's y is owned by the relim family instead, so it gets no row.
             self.ymin = FluentLineEdit("")
@@ -399,7 +417,7 @@ class PanelEditor(QtWidgets.QWidget):
         cost of every parameter change.
         """
 
-        from zlc_frontend.qt_widgets import FrozenRasterView
+        from zlc_frontend.qt_widgets import FrozenRasterView, SinglePanelHost
 
         card = self.card
         front = (
@@ -416,16 +434,29 @@ class PanelEditor(QtWidgets.QWidget):
             self.status.setText("open the panel with data first")
             return
         if self._board is None:
-            self._board = FrozenRasterView(card.panel_id, empty_text="no snapshot yet",
-                                       zoomable=True)
+            self._board = (
+                SinglePanelHost(card.panel_id, empty_text="no snapshot yet")
+                if card.config.kind == "sites"
+                else FrozenRasterView(
+                    card.panel_id,
+                    empty_text="no snapshot yet",
+                    zoomable=True,
+                )
+            )
             self.canvas_holder.addWidget(self._board)
-        try:
-            figure = card.frozen_data_figure()
-        except Exception as error:
-            self.status.setText("%s: %s" % (type(error).__name__, error))
-            return
+        if card.config.kind == "sites" and front is not None:
+            figure = None
+        else:
+            try:
+                figure = card.frozen_data_figure()
+            except Exception as error:
+                self.status.setText("%s: %s" % (type(error).__name__, error))
+                return
         if front is not None:
-            self._board.present(front)
+            if isinstance(self._board, SinglePanelHost):
+                self._board.present_frame(front)
+            else:
+                self._board.present(front)
             self._displayed_png = None
         else:
             self._board.present_encoded(overview_png, image_format="PNG")
@@ -629,8 +660,13 @@ class PanelEditor(QtWidgets.QWidget):
                 self.grid_intent_combo,
                 self.grid_facet_combo,
             )
-            self.grid_bins_row.setVisible(
+            histogram_grid = (
                 card._grid_cell_intent() is card._histogram_intent()
+            )
+            self.grid_bins_row.setVisible(histogram_grid)
+            self.grid_ylog_row.setVisible(histogram_grid)
+            self.grid_colormap_row.setVisible(
+                card._grid_cell_intent() is card._image_intent()
             )
             card._seed_repeat_mode_control(
                 self.repeat_mode_combo,
@@ -690,7 +726,8 @@ class PanelEditor(QtWidgets.QWidget):
         panels = tuple(getattr(front, "panels", ()) or ())
         if not panels:
             return None
-        viewport = getattr(panels[0].display_payload, "viewport", None)
+        payload = panels[0].display_payload
+        viewport = getattr(getattr(payload, "background", payload), "viewport", None)
         axes = tuple(getattr(viewport, "axes", ()) or ())
         bounds = tuple(getattr(viewport, "visible_bounds", ()) or ())
         if len(axes) != 2 or len(bounds) != 4:
@@ -893,8 +930,10 @@ class PanelEditor(QtWidgets.QWidget):
         """Show the actual file (full path) the next Save writes -- not just the folder."""
         if not hasattr(self, "save_preview"):
             return
+        archive_suffix = "" if self.card.config.kind == "sites" else " + .npz"
         self.save_preview.setText(
-            f"{display_path(str(self._save_stem(None)))}.{self._save_image_ext()} + .npz")
+            f"{display_path(str(self._save_stem(None)))}."
+            f"{self._save_image_ext()}{archive_suffix}")
 
     def save(self) -> None:
         """Write the exact visible pixels and their exact typed data revision."""
@@ -914,6 +953,12 @@ class PanelEditor(QtWidgets.QWidget):
             )
             if image is None or not image.save(str(target)):
                 raise RuntimeError("Qt refused to write %s" % target.name)
+            if self.card.config.kind == "sites":
+                self.console._last_save_dir = str(stem.parent)
+                self._update_save_preview()
+                self.status.setText("saved %s" % target.name)
+                self.status.setToolTip(str(stem.parent))
+                return
             figure = self._displayed_figure
             display = self._displayed_display
             if figure is None or display is None:

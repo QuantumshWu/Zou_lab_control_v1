@@ -416,7 +416,7 @@ def test_radial_fit_board_target_preserves_physical_circle_aspect() -> None:
     from PyQt5 import QtCore, QtGui
     from zlc_data import FitBatchStatus
     from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
-    from zlc_frontend.qt_widgets._raster_board_support import _panel_image_geometry
+    from zlc_frontend.qt_widgets._raster_front import _panel_image_geometry
 
     _application = ensure_qt_app()
     payload = _with_radial_fit_overlay(

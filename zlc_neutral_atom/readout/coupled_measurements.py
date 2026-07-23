@@ -1,0 +1,659 @@
+"""Coupled readout Measurements with explicit autonomous-hardware boundaries.
+
+The old implementation put a host-stepped scan loop, camera acquisition and a
+point reducer in one ``ScannedMeasurementNode``.  This module keeps the useful
+physics while making the ownership explicit:
+
+* release-recapture acquisition is one autonomous SCAN_SLOT camera Measurement;
+* its adjacent event-0/event-1 frames are reduced by one fixed 2:1
+  StreamReducer in the same exact Run;
+* readout-duration and grey-molasses requests exist as typed intents, but their
+  current hardware capability gaps are rejected instead of silently changing
+  the physical experiment or reaching around a Device Port.
+
+No public request contains a timeout.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from math import isfinite
+from numbers import Integral, Real
+
+from zlc_data import (
+    REPEAT,
+    AxisId,
+    AxisSpec,
+)
+from zlc_neutral_atom.acquisition.camera import (
+    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+)
+from zlc_neutral_atom.bootstrap._triggered_capture import (
+    TriggeredCameraBinding,
+    TriggeredCameraLayout,
+    bind_triggered_camera_acquisition,
+)
+from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
+from zlc_neutral_atom.installation import DeviceRef
+from zlc_neutral_atom.readout.calibration import (
+    CalibrationArtifact,
+    ReadoutModelKind,
+    ResolvedCalibration,
+)
+from zlc_neutral_atom.readout.calibration_reference import (
+    CalibrationArtifactRef,
+)
+from zlc_neutral_atom.readout.physical_context import (
+    derive_readout_physical_context,
+)
+from zlc_neutral_atom.runtime.capture import BoundCapturePort
+from zlc_neutral_atom.runtime.pipeline import BoundMeasurement
+from zlc_neutral_atom.scan import AutonomousScanSlotProgram
+from zlc_neutral_atom.timing.lineage import PulseCaptureBinding
+from zlc_neutral_atom.timing.pulse import BoundPulsePort
+from zlc_pulse import (
+    FIELD_DURATION,
+    TIME_UNIT_TO_NS,
+    PulseDocument,
+    PulseExecutionForm,
+    PulseFieldRef,
+    RepeatRegion,
+    bind_pulse_document_target,
+    expand_autonomous_scan_repeats,
+    freeze_scan_table,
+    replace_pulse_field,
+    require_autonomous_scan_resident_capacity,
+)
+from zlc_storage import canonical_text, positive_integer
+
+
+TEMPERATURE_RELEASE_RECAPTURE_KEY = DefinitionKey(
+    "zlc_neutral_atom.readout",
+    "temperature-release-recapture",
+)
+READOUT_DURATION_FIDELITY_KEY = DefinitionKey(
+    "zlc_neutral_atom.readout",
+    "readout-duration-fidelity",
+)
+GREY_MOLASSES_DETUNING_KEY = DefinitionKey(
+    "zlc_neutral_atom.readout",
+    "grey-molasses-detuning",
+)
+
+TEMPERATURE_RELEASE_RECAPTURE_DEFINITION = MeasurementDefinition(
+    TEMPERATURE_RELEASE_RECAPTURE_KEY,
+    "Temperature (release-recapture)",
+    "zlc.temperature-release-recapture-request",
+    "zlc.temperature-release-recapture-binding",
+    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+)
+READOUT_DURATION_FIDELITY_DEFINITION = MeasurementDefinition(
+    READOUT_DURATION_FIDELITY_KEY,
+    "Fidelity vs readout duration",
+    "zlc.readout-duration-fidelity-request",
+    "zlc.readout-duration-fidelity-binding",
+    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+)
+GREY_MOLASSES_DETUNING_DEFINITION = MeasurementDefinition(
+    GREY_MOLASSES_DETUNING_KEY,
+    "Grey molasses detuning",
+    "zlc.grey-molasses-detuning-request",
+    "zlc.grey-molasses-detuning-binding",
+    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+)
+
+# Every current user-facing Measurement remains visible.  Runnable capability
+# is a Start/preflight fact, not a catalog-discovery filter.
+COUPLED_MEASUREMENT_DEFINITIONS = (
+    TEMPERATURE_RELEASE_RECAPTURE_DEFINITION,
+    READOUT_DURATION_FIDELITY_DEFINITION,
+    GREY_MOLASSES_DETUNING_DEFINITION,
+)
+
+
+def _numeric_axis(
+    values: object,
+    name: str,
+    *,
+    positive: bool,
+) -> tuple[float, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{name} must be a numeric sequence")
+    try:
+        raw = tuple(values)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be a numeric sequence") from exc
+    if not raw:
+        raise ValueError(f"{name} must contain at least one value")
+    result = []
+    for value in raw:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError(f"{name} values must be real numbers")
+        item = float(value)
+        if not isfinite(item) or (positive and item <= 0.0) or (
+            not positive and item < 0.0
+        ):
+            qualifier = "positive" if positive else "non-negative"
+            raise ValueError(f"{name} values must be finite and {qualifier}")
+        result.append(item)
+    return tuple(result)
+
+
+def _optional_trigger(value: str | None) -> str | None:
+    return None if value is None else canonical_text(value, "trigger_channel")
+
+
+def _duration_axis_for_document(
+    values: object,
+    name: str,
+    document: PulseDocument,
+) -> tuple[float, ...]:
+    axis = _numeric_axis(values, name, positive=True)
+    minimum_seconds = document.time_step_ns * 1e-9
+    if any(value < minimum_seconds for value in axis):
+        raise ValueError(
+            f"{name} values must be at least one pulse target clock tick "
+            f"({minimum_seconds:.12g} s)"
+        )
+    return axis
+
+
+def _model_kind(value: ReadoutModelKind | None) -> ReadoutModelKind | None:
+    if value is not None and not isinstance(value, ReadoutModelKind):
+        raise TypeError("model_kind must be ReadoutModelKind or None")
+    return value
+
+
+@dataclass(frozen=True)
+class TemperatureReleaseRecaptureRequest:
+    pulse_document: PulseDocument
+    trap_off_seconds: tuple[float, ...]
+    shots: int
+    camera_ref: DeviceRef
+    sequencer_ref: DeviceRef
+    calibration_ref: CalibrationArtifactRef
+    model_kind: ReadoutModelKind | None = None
+    per_site: bool = False
+    trigger_channel: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pulse_document, PulseDocument):
+            raise TypeError("pulse_document must be PulseDocument")
+        object.__setattr__(
+            self,
+            "trap_off_seconds",
+            _duration_axis_for_document(
+                self.trap_off_seconds,
+                "trap_off_seconds",
+                self.pulse_document,
+            ),
+        )
+        object.__setattr__(self, "shots", positive_integer(self.shots, "shots"))
+        if not isinstance(self.camera_ref, DeviceRef):
+            raise TypeError("camera_ref must be DeviceRef")
+        if not isinstance(self.sequencer_ref, DeviceRef):
+            raise TypeError("sequencer_ref must be DeviceRef")
+        if not isinstance(self.calibration_ref, CalibrationArtifactRef):
+            raise TypeError("calibration_ref must be CalibrationArtifactRef")
+        object.__setattr__(self, "model_kind", _model_kind(self.model_kind))
+        if type(self.per_site) is not bool:
+            raise TypeError("per_site must be bool")
+        object.__setattr__(
+            self,
+            "trigger_channel",
+            _optional_trigger(self.trigger_channel),
+        )
+
+
+@dataclass(frozen=True)
+class ReadoutDurationFidelityRequest:
+    pulse_document: PulseDocument
+    duration_seconds: tuple[float, ...]
+    shots: int
+    camera_ref: DeviceRef
+    sequencer_ref: DeviceRef
+    calibration_ref: CalibrationArtifactRef
+    model_kind: ReadoutModelKind | None = None
+    site: int | None = None
+    trigger_channel: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pulse_document, PulseDocument):
+            raise TypeError("pulse_document must be PulseDocument")
+        object.__setattr__(
+            self,
+            "duration_seconds",
+            _duration_axis_for_document(
+                self.duration_seconds,
+                "duration_seconds",
+                self.pulse_document,
+            ),
+        )
+        object.__setattr__(self, "shots", positive_integer(self.shots, "shots"))
+        for name in ("camera_ref", "sequencer_ref"):
+            if not isinstance(getattr(self, name), DeviceRef):
+                raise TypeError(f"{name} must be DeviceRef")
+        if not isinstance(self.calibration_ref, CalibrationArtifactRef):
+            raise TypeError("calibration_ref must be CalibrationArtifactRef")
+        object.__setattr__(self, "model_kind", _model_kind(self.model_kind))
+        if self.site is not None:
+            if (
+                isinstance(self.site, bool)
+                or not isinstance(self.site, Integral)
+                or int(self.site) < 0
+            ):
+                raise ValueError("site must be a non-negative integer or None")
+            object.__setattr__(self, "site", int(self.site))
+        object.__setattr__(
+            self,
+            "trigger_channel",
+            _optional_trigger(self.trigger_channel),
+        )
+
+
+@dataclass(frozen=True)
+class GreyMolassesDetuningRequest:
+    pulse_document: PulseDocument
+    detuning_gamma: tuple[float, ...]
+    trap_off_seconds: float
+    shots: int
+    camera_ref: DeviceRef
+    sequencer_ref: DeviceRef
+    rf_role: str
+    calibration_ref: CalibrationArtifactRef
+    model_kind: ReadoutModelKind | None = None
+    per_site: bool = False
+    trigger_channel: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pulse_document, PulseDocument):
+            raise TypeError("pulse_document must be PulseDocument")
+        object.__setattr__(
+            self,
+            "detuning_gamma",
+            _finite_signed_axis(self.detuning_gamma, "detuning_gamma"),
+        )
+        value = _duration_axis_for_document(
+            (self.trap_off_seconds,),
+            "trap_off_seconds",
+            self.pulse_document,
+        )[0]
+        object.__setattr__(self, "trap_off_seconds", value)
+        object.__setattr__(self, "shots", positive_integer(self.shots, "shots"))
+        for name in ("camera_ref", "sequencer_ref"):
+            if not isinstance(getattr(self, name), DeviceRef):
+                raise TypeError(f"{name} must be DeviceRef")
+        object.__setattr__(
+            self,
+            "rf_role",
+            canonical_text(self.rf_role, "rf_role"),
+        )
+        if not isinstance(self.calibration_ref, CalibrationArtifactRef):
+            raise TypeError("calibration_ref must be CalibrationArtifactRef")
+        object.__setattr__(self, "model_kind", _model_kind(self.model_kind))
+        if type(self.per_site) is not bool:
+            raise TypeError("per_site must be bool")
+        object.__setattr__(
+            self,
+            "trigger_channel",
+            _optional_trigger(self.trigger_channel),
+        )
+
+
+def _finite_signed_axis(values: object, name: str) -> tuple[float, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{name} must be a numeric sequence")
+    try:
+        raw = tuple(values)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be a numeric sequence") from exc
+    if not raw:
+        raise ValueError(f"{name} must contain at least one value")
+    result = []
+    for value in raw:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError(f"{name} values must be real numbers")
+        item = float(value)
+        if not isfinite(item):
+            raise ValueError(f"{name} values must be finite")
+        result.append(item)
+    return tuple(result)
+
+
+def _calibrated_probe_seconds(
+    document: PulseDocument,
+    calibration: CalibrationArtifact,
+) -> float:
+    """Read the probe-light window from the calibration's physical trace.
+
+    A duration cannot be guessed from array shape or from the earliest unrelated
+    digital transition.  The pulse target must identify one digital ``probe``
+    port, and that same stable output key selects the calibrated trace.
+    """
+
+    context = calibration.readout_physical_context
+    probe_ports = tuple(
+        port
+        for port in document.target.ports
+        if port.kind == "digital"
+        and (port.key.casefold() == "probe" or port.label.casefold() == "probe")
+    )
+    if len(probe_ports) != 1:
+        raise ValueError(
+            "release-recapture target must identify exactly one digital probe port"
+        )
+    traces = tuple(
+        trace
+        for trace in context.digital
+        if trace.output_key == probe_ports[0].key
+    )
+    if len(traces) != 1 or not traces[0].high_at_window_start:
+        raise ValueError(
+            "calibration readout context does not start with the declared probe on"
+        )
+    falling_ticks = tuple(
+        tick for tick, high in traces[0].transitions if not high
+    )
+    if not falling_ticks:
+        return context.integration_seconds
+    duration = min(falling_ticks) / context.clock_hz
+    if not 0.0 < duration <= context.integration_seconds:
+        raise ValueError("calibration contains an invalid readout-light duration")
+    return duration
+
+
+def _release_recapture_template(
+    document: PulseDocument,
+    calibration: CalibrationArtifact,
+) -> PulseDocument:
+    if tuple(parameter.parameter_id for parameter in document.scan_parameters) != (
+        "t_off",
+    ):
+        raise ValueError(
+            "release-recapture template must declare exactly one t_off SCAN_SLOT"
+        )
+    parameter = document.scan_parameters[0]
+    if parameter.field.kind != FIELD_DURATION:
+        raise ValueError("t_off must bind a pulse-period duration")
+    if document.api_parameters:
+        raise ValueError(
+            "release-recapture autonomous Measurement has no unresolved API slots"
+        )
+    periods = {period.name: period for period in document.periods}
+    expected = {
+        "image1_expose",
+        "image1_settle",
+        "trap_off",
+        "trap_recapture",
+        "image2_expose",
+        "image2_settle",
+    }
+    if not expected.issubset(periods):
+        raise ValueError(
+            "release-recapture template must contain the six named physical periods"
+        )
+    positions = {
+        period.name: index for index, period in enumerate(document.periods)
+    }
+    if not (
+        positions["image1_expose"]
+        < positions["image1_settle"]
+        < positions["trap_off"]
+        < positions["trap_recapture"]
+        < positions["image2_expose"]
+        < positions["image2_settle"]
+    ):
+        raise ValueError(
+            "release-recapture physical periods are not in acquisition order"
+        )
+    if parameter.field.period_id != periods["trap_off"].period_id:
+        raise ValueError("t_off SCAN_SLOT must bind the named trap_off period")
+
+    probe_seconds = _calibrated_probe_seconds(document, calibration)
+    integration = calibration.frame_contract.exposure_seconds
+    # Keep the trap on until the sensor integration is complete.  One hardware
+    # tick beyond the boundary prevents an equal-endpoint rounding ambiguity.
+    settle_seconds = max(
+        integration - probe_seconds + document.time_step_ns * 1e-9,
+        0.0,
+    )
+    result = document
+    for name in ("image1_expose", "image2_expose"):
+        result = replace_pulse_field(
+            result,
+            PulseFieldRef(FIELD_DURATION, periods[name].period_id),
+            probe_seconds,
+            unit="s",
+        )
+    for name in ("image1_settle", "image2_settle"):
+        current = periods[name]
+        current_seconds = float(current.duration) * TIME_UNIT_TO_NS[current.unit] * 1e-9
+        result = replace_pulse_field(
+            result,
+            PulseFieldRef(FIELD_DURATION, current.period_id),
+            max(current_seconds, settle_seconds),
+            unit="s",
+        )
+    return result
+
+
+def build_temperature_release_recapture_program(
+    request: TemperatureReleaseRecaptureRequest,
+    calibration: ResolvedCalibration,
+) -> AutonomousScanSlotProgram:
+    """Freeze t_off rows and shots without touching a Device Port."""
+
+    if not isinstance(request, TemperatureReleaseRecaptureRequest):
+        raise TypeError("request must be TemperatureReleaseRecaptureRequest")
+    if type(calibration) is not ResolvedCalibration:
+        raise TypeError("calibration must be an admitted ResolvedCalibration")
+    if calibration.reference != request.calibration_ref:
+        raise ValueError("resolved calibration differs from the request")
+    document = _release_recapture_template(
+        request.pulse_document,
+        calibration.artifact,
+    )
+    parameter = document.scan_parameters[0]
+    unit_ns = TIME_UNIT_TO_NS[parameter.unit]
+    raw_rows = tuple(
+        (seconds * 1e9 / unit_ns,) for seconds in request.trap_off_seconds
+    )
+    frozen, _normalization = freeze_scan_table(
+        document,
+        ("t_off",),
+        raw_rows,
+    )
+    periods = document.periods
+    repeated = (
+        None
+        if request.shots == 1
+        else RepeatRegion(
+            periods[0].period_id,
+            periods[-1].period_id,
+            request.shots,
+        )
+    )
+    return AutonomousScanSlotProgram(
+        replace(
+            document,
+            scan_table=frozen,
+            scan_recipe=None,
+            repeat=repeated,
+        )
+    )
+
+
+@dataclass(frozen=True)
+class BoundTemperatureReleaseRecapture:
+    request: TemperatureReleaseRecaptureRequest
+    program: AutonomousScanSlotProgram
+    camera_binding: TriggeredCameraBinding
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, TemperatureReleaseRecaptureRequest):
+            raise TypeError("request has another type")
+        if not isinstance(self.program, AutonomousScanSlotProgram):
+            raise TypeError("program must be AutonomousScanSlotProgram")
+        if not isinstance(self.camera_binding, TriggeredCameraBinding):
+            raise TypeError("camera_binding must be TriggeredCameraBinding")
+        if (
+            self.camera_binding.measurement.definition
+            != TEMPERATURE_RELEASE_RECAPTURE_DEFINITION
+        ):
+            raise ValueError("bound Measurement uses another definition")
+
+def bind_temperature_release_recapture(
+    request: TemperatureReleaseRecaptureRequest,
+    calibration: ResolvedCalibration,
+    *,
+    pulse_port: BoundPulsePort,
+    camera_port: BoundCapturePort,
+) -> BoundTemperatureReleaseRecapture:
+    """Bind the one honest current autonomous coupled Measurement."""
+
+    if not isinstance(pulse_port, BoundPulsePort):
+        raise TypeError("pulse_port must be BoundPulsePort")
+    if not isinstance(camera_port, BoundCapturePort):
+        raise TypeError("camera_port must be BoundCapturePort")
+    program = build_temperature_release_recapture_program(request, calibration)
+    logical_document = bind_pulse_document_target(
+        program.execution_document,
+        pulse_port.capability.target,
+    )
+    program = AutonomousScanSlotProgram(logical_document)
+    require_autonomous_scan_resident_capacity(
+        logical_document,
+        pulse_port.capability.resident_scan_point_capacity,
+    )
+    execution_document = expand_autonomous_scan_repeats(logical_document)
+    point_table = program.point_table
+    binding = bind_triggered_camera_acquisition(
+        pulse_port,
+        camera_port,
+        pulse_document=execution_document,
+        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
+        trigger_channel=request.trigger_channel,
+        layout=TriggeredCameraLayout(
+            repeat_axis=AxisSpec(
+                AxisId("temperature.repeat"),
+                "repeat",
+                REPEAT,
+                request.shots,
+                tuple(range(request.shots)),
+            ),
+            readout_event_axis_id=AxisId("temperature.readout_event"),
+            readout_events_per_repeat=2,
+            scan_axes=point_table.point_axes,
+            scan_point_layout=point_table.point_layout,
+        ),
+    )
+    base = binding.measurement
+    domain_measurement = BoundMeasurement(
+        TEMPERATURE_RELEASE_RECAPTURE_DEFINITION,
+        base.capture_port,
+        base.capture_contract,
+        base.capture_spec,
+    )
+    binding = TriggeredCameraBinding(
+        binding.pulse_port,
+        binding.pulse_request,
+        binding.trigger_channel,
+        domain_measurement,
+        binding.cell_plan,
+    )
+    _validate_live_release_recapture_calibration(binding, calibration)
+    return BoundTemperatureReleaseRecapture(request, program, binding)
+
+
+def _validate_live_release_recapture_calibration(
+    binding: TriggeredCameraBinding,
+    calibration: ResolvedCalibration,
+) -> None:
+    contract = binding.measurement.capture_contract
+    provenance = contract.camera_provenance
+    frame_contract = calibration.artifact.frame_contract
+    for event in (0, 1):
+        frame_contract.assert_compatible(
+            frame_contract.binding,
+            provenance.descriptor,
+            contract.dataset_schema,
+            readout_event_index=event,
+        )
+    facts = contract.capability.camera_physical_facts
+    offset = facts.external_trigger_integration_start_offset_seconds
+    if offset is None:
+        raise ValueError(
+            "release-recapture requires a qualified camera integration offset"
+        )
+    pulse_binding = PulseCaptureBinding(
+        binding.compiled_artifact,
+        binding.trigger_channel,
+        binding.cell_plan,
+    )
+    for event in (0, 1):
+        observed = derive_readout_physical_context(
+            pulse_binding,
+            readout_event_index=event,
+            integration_start_offset_seconds=offset,
+            integration_seconds=frame_contract.exposure_seconds,
+        )
+        if observed != calibration.artifact.readout_physical_context:
+            raise ValueError(
+                f"release-recapture readout event {event} differs from calibration"
+            )
+
+
+class AutonomousMeasurementUnavailable(RuntimeError):
+    """The typed request is valid but the installed synchronous capability is absent."""
+
+
+READOUT_DURATION_CAPABILITY_GAP = (
+    "readout-duration fidelity changes both the pulse readout window and the "
+    "qCMOS integration time at each point; the current API-slot executor can "
+    "change only the finite FPGA segment while one camera arm keeps a single "
+    "frozen settings fingerprint. The camera adapter/Port has no exposure "
+    "configuration command and no exact point-group rearm contract"
+)
+GREY_MOLASSES_CAPABILITY_GAP = (
+    "grey-molasses detuning requires an RF Port that can preload and advance the "
+    "complete two-photon-detuning table from the same hardware scan clock; the "
+    "current installation exposes no RF Port or synchronous RF table"
+)
+
+
+def reject_readout_duration_fidelity(
+    request: ReadoutDurationFidelityRequest,
+) -> None:
+    if not isinstance(request, ReadoutDurationFidelityRequest):
+        raise TypeError("request must be ReadoutDurationFidelityRequest")
+    raise AutonomousMeasurementUnavailable(READOUT_DURATION_CAPABILITY_GAP)
+
+
+def reject_grey_molasses_detuning(
+    request: GreyMolassesDetuningRequest,
+) -> None:
+    if not isinstance(request, GreyMolassesDetuningRequest):
+        raise TypeError("request must be GreyMolassesDetuningRequest")
+    raise AutonomousMeasurementUnavailable(GREY_MOLASSES_CAPABILITY_GAP)
+
+
+__all__ = [
+    "AutonomousMeasurementUnavailable",
+    "BoundTemperatureReleaseRecapture",
+    "COUPLED_MEASUREMENT_DEFINITIONS",
+    "GREY_MOLASSES_CAPABILITY_GAP",
+    "GREY_MOLASSES_DETUNING_DEFINITION",
+    "GREY_MOLASSES_DETUNING_KEY",
+    "GreyMolassesDetuningRequest",
+    "READOUT_DURATION_CAPABILITY_GAP",
+    "READOUT_DURATION_FIDELITY_DEFINITION",
+    "READOUT_DURATION_FIDELITY_KEY",
+    "ReadoutDurationFidelityRequest",
+    "TEMPERATURE_RELEASE_RECAPTURE_DEFINITION",
+    "TEMPERATURE_RELEASE_RECAPTURE_KEY",
+    "TemperatureReleaseRecaptureRequest",
+    "bind_temperature_release_recapture",
+    "build_temperature_release_recapture_program",
+    "reject_grey_molasses_detuning",
+    "reject_readout_duration_fidelity",
+]

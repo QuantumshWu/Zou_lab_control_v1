@@ -1,0 +1,1356 @@
+"""Internal Matplotlib implementation owner: image."""
+
+from __future__ import annotations
+
+import gc
+import math
+import threading
+import warnings
+from numbers import Integral, Number
+import matplotlib
+import numpy as np
+from zlc_data import FitBatchStatus, FitResultBatch
+from zlc_storage import positive_integer
+from .figure import (
+    EvaluatedAxis,
+    EvaluatedCurve,
+    EvaluatedFigureData,
+    EvaluatedHistogram,
+    EvaluatedImage,
+    EvaluatedMeter,
+    FigureDocument,
+)
+from .fit_image_projection import (
+    RadialGaussianImageFitPanel,
+    address_label as _address_label,
+    evaluated_figure_panels as _panels,
+    figure_panel_title as _panel_title,
+    fit_batch_storage_index as _batch_storage_index,
+    fit_panel_selection as _fit_panel_selection,
+    panel_focus_selection as _panel_focus_selection,
+    radial_gaussian_fit_geometry,
+    reduction_label as _reduction_label,
+)
+from .image_display import (
+    ImageDisplayState,
+    evaluated_image_data_range,
+    image_viewport_for_display_state,
+)
+from .image_view import image_viewport_for_evaluated_image
+from .display_range import (
+    RelimMode,
+    deadband_display_range,
+    validated_display_range,
+)
+from .render import (
+    CurveFitOverlay,
+    CurvePanelPayload,
+    HistogramPanelPayload,
+    ImagePanelPayload,
+    ImagePanelRasterGeometry,
+    MeterPanelPayload,
+    PulsePanelPayload,
+    RadialGaussianImageFitOverlay,
+    RasterBuffer,
+    _validated_curve_fit_overlays,
+)
+from .axis_display import axis_label as _axis_label
+from .plot_layout import (
+    grid_shape_for,
+    grid_shape_for_aspect,
+    image_panel_layout,
+    image_panel_layout_for_raster,
+    LIVE_PANEL_DPI,
+    optimal_grid_size,
+    panel_data_box,
+    panel_data_box_for_raster,
+    panel_figure_size_inches,
+    rolling_panel_layout,
+    rolling_panel_layout_for_raster,
+    site_grid_geometry,
+)
+from .render_style import (
+    ANNOTATION_FONT_SIZE,
+    CURVE_LINESTYLE,
+    CURVE_MARKER,
+    FIT_CONTOUR_COLOR,
+    FIT_CONTOUR_LINEWIDTH,
+    FIT_FAILURE_COLOR,
+    FIT_LINESTYLE,
+    HIST_FILL_ALPHA,
+    LINE_CYCLE,
+    PALETTE,
+    SITE_OCCUPANCY_STYLE,
+    apply_title,
+    axis_label_fontsize,
+    bimodal_fit_line_specs,
+    render_style_context,
+    small_fontsize,
+    threshold_line_kwargs,
+    tick_fontsize,
+)
+from .site_map import (
+    SITE_INVALID_ALPHA,
+    SITE_INVALID_COLOR,
+    SITE_INVALID_LINEWIDTH,
+)
+
+from ._mpl_common import (
+    _fit_status,
+    _render_dpi,
+    raster_from_agg,
+    release_agg_figure,
+)
+
+def _numeric_centers(axis):
+    values = tuple(axis.coordinates)
+    if not values or any(
+        isinstance(value, (bool, np.bool_)) or not isinstance(value, Number)
+        for value in values
+    ):
+        return None
+    centers = np.asarray(values, dtype=np.float64)
+    if not np.all(np.isfinite(centers)):
+        return None
+    if len(centers) > 1:
+        delta = np.diff(centers)
+        if not (np.all(delta > 0) or np.all(delta < 0)):
+            return None
+    return centers
+
+def _image_axis(axis):
+    centers = _numeric_centers(axis)
+    if centers is None:
+        positions = np.arange(len(axis.coordinates), dtype=np.float64)
+        return (
+            np.arange(len(axis.coordinates) + 1, dtype=np.float64) - 0.5,
+            positions,
+            tuple(str(value) for value in axis.coordinates),
+        )
+    if len(centers) == 1:
+        edges = np.asarray((centers[0] - 0.5, centers[0] + 0.5))
+    else:
+        middle = (centers[:-1] + centers[1:]) / 2.0
+        edges = np.concatenate(
+            ((centers[0] - (middle[0] - centers[0]),), middle,
+             (centers[-1] + (centers[-1] - middle[-1]),))
+        )
+    return edges, centers, None
+
+def _draw_projected_image(
+    axis,
+    figure,
+    data: EvaluatedImage,
+    *,
+    colormap: str,
+    color_limits: tuple[float, float],
+    visible_bounds=(0.0, 0.0, 1.0, 1.0),
+    regular_pixel_contract: bool,
+    center: tuple[float, float] | None,
+    radius: float | None,
+    diagnostic: str | None,
+    show_colorbar: bool = True,
+):
+    """Draw one exact IMAGE projection with an optional radial-fit annotation."""
+
+    if np.iscomplexobj(data.values):
+        raise ValueError("complex images require an explicit real-valued display transform")
+    x_edges, _x_centers, x_labels = _image_axis(data.x_axis)
+    y_edges, _y_centers, y_labels = _image_axis(data.y_axis)
+    invalid = np.logical_not(data.validity)
+    if data.values.dtype.kind == "f":
+        invalid = np.logical_or(invalid, ~np.isfinite(data.values))
+    values = np.ma.array(data.values, mask=invalid)
+    if not isinstance(regular_pixel_contract, bool):
+        raise TypeError("regular_pixel_contract must be bool")
+    if regular_pixel_contract:
+        # Typed IMAGE and saved-fit panels have already crossed the strict
+        # regular-pixel viewport boundary.  Revalidate that declared contract
+        # here before projection; never infer it from shape.
+        image_viewport_for_evaluated_image(data)
+        if x_labels is not None or y_labels is not None:
+            raise ValueError("projected IMAGE export requires numeric pixel axes")
+        image_artist = axis.imshow(
+            values,
+            origin="upper",
+            extent=(x_edges[0], x_edges[-1], y_edges[-1], y_edges[0]),
+            interpolation="nearest",
+            cmap=colormap,
+            vmin=color_limits[0],
+            vmax=color_limits[1],
+            rasterized=True,
+        )
+        colorbar = figure.colorbar(image_artist, ax=axis) if show_colorbar else None
+    else:
+        # Canonical/encoded radial figures also admit irregular coordinates.
+        # Their geometry must remain cell-edge exact even though QuadMesh is
+        # more expensive; silently spreading those cells uniformly would move
+        # the physical image underneath an otherwise correct fit overlay.
+        image_artist = axis.pcolormesh(
+            x_edges,
+            y_edges,
+            values,
+            shading="flat",
+            cmap=colormap,
+            vmin=color_limits[0],
+            vmax=color_limits[1],
+            rasterized=True,
+        )
+        colorbar = figure.colorbar(image_artist, ax=axis) if show_colorbar else None
+        if x_labels is not None:
+            axis.set_xticks(_x_centers, x_labels)
+        if y_labels is not None:
+            axis.set_yticks(_y_centers, y_labels)
+    if colorbar is not None:
+        colorbar.set_label(
+            "Value" if data.value_unit is None else f"Value [{data.value_unit}]"
+        )
+    axis.set_xlabel(_axis_label(data.x_axis))
+    axis.set_ylabel(_axis_label(data.y_axis))
+    left, top, right, bottom = visible_bounds
+    x_start, x_stop = float(x_edges[0]), float(x_edges[-1])
+    y_start, y_stop = float(y_edges[0]), float(y_edges[-1])
+    x_limits = (
+        x_start + left * (x_stop - x_start),
+        x_start + right * (x_stop - x_start),
+    )
+    # The first declared Y coordinate/raster row is always at the top.
+    y_limits = (
+        y_start + bottom * (y_stop - y_start),
+        y_start + top * (y_stop - y_start),
+    )
+    axis.set_xlim(*x_limits)
+    axis.set_ylim(*y_limits)
+    axis.set_aspect("equal", adjustable="box")
+    if center is not None:
+        from matplotlib.patches import Circle
+
+        assert radius is not None and diagnostic is None
+        axis.scatter(*center, color=PALETTE["fit_right"], s=8, clip_on=True)
+        axis.add_patch(
+            Circle(
+                center,
+                radius=radius,
+                edgecolor=PALETTE["fit_right"],
+                facecolor="none",
+                linewidth=1.8,
+                alpha=0.9,
+                clip_on=True,
+            )
+        )
+        # Off-screen saved geometry is annotation, never an autoscale input.
+        axis.set_xlim(*x_limits)
+        axis.set_ylim(*y_limits)
+    elif diagnostic is not None:
+        assert radius is None
+        axis.text(
+            0.02,
+            0.98,
+            f"fit {diagnostic}",
+            transform=axis.transAxes,
+            va="top",
+            color=FIT_FAILURE_COLOR,
+            fontsize=ANNOTATION_FONT_SIZE,
+        )
+    else:
+        assert radius is None
+
+def _image(
+    axis,
+    figure,
+    layer,
+    cell,
+    series,
+    fit_result,
+    *,
+    radial_color_limits: tuple[float, float] | None = None,
+):
+    data = series.data
+    assert isinstance(data, EvaluatedImage)
+    if np.iscomplexobj(data.values):
+        raise ValueError("complex images require an explicit real-valued display transform")
+    radial_fit = (
+        fit_result is not None
+        and fit_result.spec.model_id == "radial_gaussian_center"
+    )
+    if radial_fit:
+        if radial_color_limits is None:
+            raise RuntimeError("radial image grid omitted its shared color limits")
+        index = _batch_storage_index(fit_result, layer, cell, series)
+        center = None
+        radius = None
+        if index is None:
+            diagnostic = "NOT_PRESENT"
+        else:
+            status = fit_result.statuses[index]
+            if status is FitBatchStatus.CONVERGED:
+                center, radius = radial_gaussian_fit_geometry(fit_result, index)
+                diagnostic = None
+            else:
+                diagnostic = status.value
+                if fit_result.errors[index]:
+                    diagnostic = f"{diagnostic}: {fit_result.errors[index]}"
+        _draw_projected_image(
+            axis,
+            figure,
+            data,
+            colormap="gray",
+            color_limits=radial_color_limits,
+            regular_pixel_contract=False,
+            center=center,
+            radius=radius,
+            diagnostic=diagnostic,
+        )
+        return
+
+    x_edges, x_centers, x_labels = _image_axis(data.x_axis)
+    y_edges, y_centers, y_labels = _image_axis(data.y_axis)
+    values = np.ma.array(data.values, mask=~data.validity)
+    mesh = axis.pcolormesh(x_edges, y_edges, values, shading="flat")
+    figure.colorbar(mesh, ax=axis)
+    if x_labels is not None:
+        axis.set_xticks(x_centers, x_labels)
+    if y_labels is not None:
+        axis.set_yticks(y_centers, y_labels)
+    axis.set_xlabel(_axis_label(data.x_axis))
+    axis.set_ylabel(_axis_label(data.y_axis))
+    if fit_result is not None:
+        index = _batch_storage_index(fit_result, layer, cell, series)
+        if _fit_status(axis, fit_result, index):
+            x_grid, y_grid = np.meshgrid(
+                np.asarray(data.x_axis.coordinates, dtype=np.float64),
+                np.asarray(data.y_axis.coordinates, dtype=np.float64),
+            )
+            grids = {
+                data.x_axis.axis_id: x_grid,
+                data.y_axis.axis_id: y_grid,
+            }
+            coordinates = tuple(
+                grids[item.axis_id] for item in fit_result.fit_axis_specs
+            )
+            predicted = fit_result.evaluate_batch(index, coordinates)
+            if np.ptp(predicted) > 0:
+                axis.contour(
+                    x_grid,
+                    y_grid,
+                    predicted,
+                    colors=FIT_CONTOUR_COLOR,
+                    linewidths=FIT_CONTOUR_LINEWIDTH,
+                )
+
+def _radial_image_color_limits_by_layer(
+    panels,
+    fit_results: dict[str, FitResultBatch],
+) -> dict[str, tuple[float, float]]:
+    """Resolve one default TIGHT range for every radial IMAGE grid layer."""
+
+    images_by_layer: dict[str, list[EvaluatedImage]] = {}
+    for layer, _cell, series_group in panels:
+        fit_result = fit_results.get(layer.layer_id)
+        if (
+            fit_result is None
+            or fit_result.spec.model_id != "radial_gaussian_center"
+        ):
+            continue
+        for series in series_group:
+            if not isinstance(series.data, EvaluatedImage):
+                raise ValueError("radial fit overlays require an IMAGE view")
+            images_by_layer.setdefault(layer.layer_id, []).append(series.data)
+
+    limits = {}
+    for layer_id, images in images_by_layer.items():
+        data_range = evaluated_image_data_range(images)
+        limits[layer_id] = (
+            (0.0, 1.0)
+            if data_range is None
+            else deadband_display_range(
+                RelimMode.TIGHT,
+                None,
+                data_range[0],
+                data_range[1],
+                force=True,
+            )
+        )
+    return limits
+
+def _radial_projected_image(
+    axis,
+    figure,
+    panel: RadialGaussianImageFitPanel,
+    display: ImageDisplayState,
+    color_limits: tuple[float, float],
+):
+    """Draw one already-projected saved-fit cell without fit authority."""
+
+    viewport = image_viewport_for_display_state(display, panel.home_viewport)
+    overlay = panel.fit_overlay
+    _draw_projected_image(
+        axis,
+        figure,
+        panel.image,
+        colormap=display.colormap.value,
+        color_limits=color_limits,
+        visible_bounds=viewport.visible_bounds,
+        regular_pixel_contract=True,
+        center=overlay.center_xy,
+        radius=overlay.one_over_e_radius,
+        diagnostic=(
+            None
+            if overlay.status is FitBatchStatus.CONVERGED
+            else overlay.diagnostic
+        ),
+    )
+    status = "NOT_PRESENT" if overlay.status is None else overlay.status.value
+    # The canonical Helvetica face lacks U+00B7; mathtext preserves the same
+    # visual separator without dropping a glyph in PDF/SVG/JPEG export.
+    axis.set_title(f"{overlay.caption} $\\cdot$ {status}")
+
+def _validated_radial_panels(
+    panels: tuple[RadialGaussianImageFitPanel, ...],
+) -> tuple[RadialGaussianImageFitPanel, ...]:
+    if not isinstance(panels, tuple) or not panels or any(
+        not isinstance(panel, RadialGaussianImageFitPanel) for panel in panels
+    ):
+        raise TypeError("panels must be a non-empty radial panel tuple")
+    first = panels[0].fit_overlay
+    if any(
+        panel.fit_overlay.artifact_identity != first.artifact_identity
+        or panel.fit_overlay.source_ref != first.source_ref
+        for panel in panels[1:]
+    ):
+        raise ValueError("radial saved-fit export cannot mix artifact revisions")
+    return panels
+
+def _validated_radial_grid_columns(columns: int, panel_count: int) -> int:
+    columns = positive_integer(columns, "columns")
+    if columns > panel_count:
+        raise ValueError("columns cannot exceed the radial panel count")
+    return columns
+
+def _validated_image_panel_export(
+    payload: ImagePanelPayload,
+    display: ImageDisplayState,
+) -> None:
+    if not isinstance(payload, ImagePanelPayload):
+        raise TypeError("payload must be ImagePanelPayload")
+    if not isinstance(display, ImageDisplayState):
+        raise TypeError("display must be ImageDisplayState")
+    home_viewport = image_viewport_for_evaluated_image(payload.image)
+    expected_viewport = image_viewport_for_display_state(display, home_viewport)
+    if expected_viewport != payload.viewport:
+        raise ValueError("image display state differs from the exact payload viewport")
+    if payload.colormap is not display.colormap:
+        raise ValueError("image display colormap differs from the exact payload")
+    if (
+        display.relim_mode is RelimMode.FIXED
+        and display.fixed_color_limits != payload.color_limits
+    ):
+        raise ValueError("fixed image display limits differ from the exact payload front")
+
+def _image_panel_fit_annotation(
+    payload: ImagePanelPayload,
+) -> tuple[
+    tuple[float, float] | None,
+    float | None,
+    str | None,
+    str | None,
+]:
+    """Project one immutable radial-fit DTO through the exact payload view.
+
+    The Qt front and this headless export share the same authority boundary:
+    fit geometry is expressed in the declared coordinate frame and is mapped
+    by :class:`ImageViewportTransform`.  Mapping the resulting visible point
+    and span back through the imshow extent keeps descending axes, cropped
+    viewports, and half-cell edges exact without letting Matplotlib infer a
+    pixel convention from array shape.
+
+    The returned tuple is ``(center, radius, diagnostic, title)``.  Failed and
+    sparse cells intentionally return no geometry, so a diagnostic can never
+    inherit a successful centre/ring.
+    """
+
+    overlay = payload.fit_overlay
+    if overlay is None:
+        return None, None, None, None
+    status_label = (
+        "NOT_PRESENT" if overlay.status is None else overlay.status.value
+    )
+    title = f"{overlay.caption} $\\cdot$ {status_label}"
+    if overlay.status is not FitBatchStatus.CONVERGED:
+        return None, None, overlay.diagnostic or status_label, title
+
+    center = overlay.center_xy
+    radius = overlay.one_over_e_radius
+    if center is None or radius is None:
+        raise RuntimeError("converged radial fit overlay lost its geometry")
+    viewport = payload.viewport
+    visible_center = viewport.unbounded_visible_point_for_coordinate(
+        center,
+        coordinate_frame=overlay.coordinate_frame,
+    )
+    visible_diameter = viewport.visible_span_for_coordinate_span(
+        (2.0 * radius, 2.0 * radius),
+        coordinate_frame=overlay.coordinate_frame,
+    )
+
+    x_edges, _x_centers, _x_labels = _image_axis(payload.image.x_axis)
+    y_edges, _y_centers, _y_labels = _image_axis(payload.image.y_axis)
+    left, top, right, bottom = viewport.visible_bounds
+    x_full_start, x_full_stop = float(x_edges[0]), float(x_edges[-1])
+    y_full_start, y_full_stop = float(y_edges[0]), float(y_edges[-1])
+    x_view_start = x_full_start + left * (x_full_stop - x_full_start)
+    x_view_stop = x_full_start + right * (x_full_stop - x_full_start)
+    y_view_top = y_full_start + top * (y_full_stop - y_full_start)
+    y_view_bottom = y_full_start + bottom * (y_full_stop - y_full_start)
+    projected_center = (
+        x_view_start + visible_center[0] * (x_view_stop - x_view_start),
+        y_view_top + visible_center[1] * (y_view_bottom - y_view_top),
+    )
+    projected_diameters = (
+        visible_diameter[0] * abs(x_view_stop - x_view_start),
+        visible_diameter[1] * abs(y_view_bottom - y_view_top),
+    )
+    tolerance = 16.0 * math.ulp(
+        max(1.0, abs(projected_diameters[0]), abs(projected_diameters[1]))
+    )
+    if not math.isclose(
+        projected_diameters[0],
+        projected_diameters[1],
+        rel_tol=1e-12,
+        abs_tol=tolerance,
+    ):
+        raise ValueError("radial fit viewport mapping produced anisotropic geometry")
+    return projected_center, projected_diameters[0] / 2.0, None, title
+
+def save_image_panel_png(
+    payload: ImagePanelPayload,
+    display: ImageDisplayState,
+    destination,
+    *,
+    dpi: float = 100.0,
+) -> None:
+    """Save one exact current IMAGE front without re-evaluation or fit authority.
+
+    The committed viewport, colormap, effective colour limits, and value unit
+    all come from the exact payload/display pair.  An attached immutable radial
+    fit DTO is exported as its centre/radius and status only; no fitted image or
+    contour is synthesized.  Pointer-drag rectangles remain absent because
+    they are transient Qt overlays, not committed display state.
+    """
+
+    _validated_image_panel_export(payload, display)
+    center, radius, diagnostic, title = _image_panel_fit_annotation(payload)
+    dpi = _render_dpi(dpi)
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    figure = None
+    try:
+        with render_style_context():
+            figure = Figure(figsize=(5.0, 4.0), dpi=dpi, constrained_layout=True)
+            FigureCanvasAgg(figure)
+            axis = figure.subplots()
+            _draw_projected_image(
+                axis,
+                figure,
+                payload.image,
+                colormap=display.colormap.value,
+                color_limits=payload.color_limits,
+                visible_bounds=payload.viewport.visible_bounds,
+                regular_pixel_contract=True,
+                center=center,
+                radius=radius,
+                diagnostic=diagnostic,
+            )
+            if title is not None:
+                axis.set_title(title)
+            figure.savefig(destination, format="png", dpi=dpi)
+    finally:
+        if figure is not None:
+            release_agg_figure(figure)
+        figure = None
+        gc.collect()
+
+def render_radial_gaussian_image_fit_panels(
+    panels: tuple[RadialGaussianImageFitPanel, ...],
+    display: ImageDisplayState,
+    current_color_limits: tuple[float, float],
+    *,
+    columns: int,
+    dpi: float = 100.0,
+):
+    """Render the current typed saved-fit IMAGE view from immutable projections.
+
+    No dataset lookup, view evaluation, predicted image, or solver is reachable
+    from this path.  The caller owns the returned Figure and must release it
+    with :func:`release_agg_figure`.
+    """
+
+    prepared = _validated_radial_panels(panels)
+    if not isinstance(display, ImageDisplayState):
+        raise TypeError("display must be ImageDisplayState")
+    limits = validated_display_range(
+        current_color_limits,
+        "current_color_limits",
+    )
+    dpi = _render_dpi(dpi)
+    columns = _validated_radial_grid_columns(columns, len(prepared))
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    rows = math.ceil(len(prepared) / columns)
+    with render_style_context():
+        figure = Figure(
+            figsize=(5.0 * columns, 4.0 * rows),
+            dpi=dpi,
+            constrained_layout=True,
+        )
+        axes = None
+        try:
+            FigureCanvasAgg(figure)
+            axes = figure.subplots(rows, columns, squeeze=False).reshape(-1)
+            for axis, panel in zip(axes, prepared, strict=False):
+                _radial_projected_image(axis, figure, panel, display, limits)
+            for unused in axes[len(prepared):]:
+                unused.set_visible(False)
+            return figure
+        except BaseException:
+            release_agg_figure(figure)
+            figure = axes = None
+            gc.collect()
+            raise
+
+def save_radial_gaussian_image_fit_panels(
+    panels: tuple[RadialGaussianImageFitPanel, ...],
+    display: ImageDisplayState,
+    current_color_limits: tuple[float, float],
+    destination,
+    *,
+    image_format: str,
+    columns: int,
+    dpi: float = 100.0,
+) -> None:
+    """Save the exact committed typed page/focus display.
+
+    Viewport, colormap, shared limits, saved-fit overlay, status, and frozen
+    board columns are preserved for PNG/PDF/SVG/JPEG.  A transient rectangle
+    selection candidate is intentionally absent: it is an uncommitted pointer
+    draft, not part of :class:`ImageDisplayState`.
+    """
+
+    if not isinstance(image_format, str):
+        raise TypeError("image_format must be str")
+    if image_format not in {"png", "pdf", "svg", "jpg", "jpeg"}:
+        raise ValueError("radial image export format must be png, pdf, svg, jpg, or jpeg")
+    figure = None
+    try:
+        figure = render_radial_gaussian_image_fit_panels(
+            panels,
+            display,
+            current_color_limits,
+            columns=columns,
+            dpi=dpi,
+        )
+        with render_style_context():
+            figure.savefig(destination, format=image_format, dpi=dpi)
+    finally:
+        if figure is not None:
+            release_agg_figure(figure)
+        figure = None
+        gc.collect()
+
+def _image_panel_extent(
+    image: EvaluatedImage,
+    *,
+    site_map: bool,
+) -> tuple[float, float, float, float]:
+    """Return main's pixel-edge extent ``left,right,bottom,top``."""
+
+    x_edges, x_centers, _x_labels = _image_axis(image.x_axis)
+    y_edges, y_centers, _y_labels = _image_axis(image.y_axis)
+    if site_map:
+        return (
+            float(x_edges[0]),
+            float(x_edges[-1]),
+            float(y_edges[-1]),
+            float(y_edges[0]),
+        )
+
+    def main_edges(centers: np.ndarray) -> tuple[float, float]:
+        if len(centers) == 1:
+            half_step = 0.5
+        else:
+            half_step = 0.5 * (
+                float(centers[-1]) - float(centers[0])
+            ) / len(centers)
+        return (
+            float(centers[0]) - half_step,
+            float(centers[-1]) + half_step,
+        )
+
+    x_start, x_stop = main_edges(x_centers)
+    y_start, y_stop = main_edges(y_centers)
+    return (
+        x_start,
+        x_stop,
+        y_stop,
+        y_start,
+    )
+
+def _image_view_limits(
+    viewport,
+    extent: tuple[float, float, float, float],
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    left, top, right, bottom = viewport.visible_bounds
+    x0, x1, y_bottom, y_top = extent
+    x_limits = (
+        x0 + left * (x1 - x0),
+        x0 + right * (x1 - x0),
+    )
+    # ``visible_bounds`` is first-row -> last-row, while imshow's extent stores
+    # bottom before top.  Main's upper origin therefore keeps this order.
+    y_limits = (
+        y_top + bottom * (y_bottom - y_top),
+        y_top + top * (y_bottom - y_top),
+    )
+    return x_limits, y_limits
+
+def _decimate_image_view(
+    grid: np.ndarray,
+    extent: tuple[float, float, float, float],
+    x_limits: tuple[float, float],
+    y_limits: tuple[float, float],
+    display_pixel_shape: tuple[int, int],
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """Main's view slice + NaN-aware integer-block area average."""
+
+    grid = np.asarray(grid)
+    rows, columns = grid.shape
+    x0, x1 = float(extent[0]), float(extent[1])
+    y1, y0 = float(extent[2]), float(extent[3])
+
+    def index_window(low, high, edge0, edge1, count):
+        step = (edge1 - edge0) / count
+        first, second = (low - edge0) / step, (high - edge0) / step
+        if first > second:
+            first, second = second, first
+        return (
+            max(0, min(int(np.floor(first)), count - 1)),
+            max(1, min(int(np.ceil(second)), count)),
+        )
+
+    col0, col1 = index_window(*x_limits, x0, x1, columns)
+    row0, row1 = index_window(*y_limits, y0, y1, rows)
+    subset = grid[row0:row1, col0:col1]
+    subset_rows, subset_columns = subset.shape
+    display_width, display_height = (
+        max(1, int(display_pixel_shape[0])),
+        max(1, int(display_pixel_shape[1])),
+    )
+    factor_x = max(1, subset_columns // display_width)
+    factor_y = max(1, subset_rows // display_height)
+    if factor_x == 1 and factor_y == 1:
+        small = subset
+        kept_rows, kept_columns = subset_rows, subset_columns
+    else:
+        kept_rows = (subset_rows // factor_y) * factor_y
+        kept_columns = (subset_columns // factor_x) * factor_x
+        blocks = subset[:kept_rows, :kept_columns].reshape(
+            kept_rows // factor_y,
+            factor_y,
+            kept_columns // factor_x,
+            factor_x,
+        )
+        if (
+            np.issubdtype(blocks.dtype, np.floating)
+            and np.isnan(blocks).any()
+        ):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                small = np.nanmean(blocks, axis=(1, 3))
+        else:
+            small = blocks.mean(axis=(1, 3))
+    x_step = (x1 - x0) / columns
+    y_step = (y1 - y0) / rows
+    return small, (
+        x0 + col0 * x_step,
+        x0 + (col0 + kept_columns) * x_step,
+        y0 + (row0 + kept_rows) * y_step,
+        y0 + row0 * y_step,
+    )
+
+def _compact_engineering(value: float, length: int = 5) -> str:
+    if not np.isfinite(value):
+        return "nan"
+    text = f"{float(value):.{max(0, length - 1)}g}"
+    if "e" not in text.lower():
+        return text
+    mantissa, exponent = f"{float(value):.1e}".split("e")
+    mantissa = mantissa.rstrip("0").rstrip(".")
+    return f"{mantissa}e{int(exponent)}"
+
+def _normalized_axis_bbox(axis, width: int, height: int):
+    x, y, box_width, box_height = (
+        float(value) for value in axis.bbox.bounds
+    )
+    return (
+        x / width,
+        1.0 - (y + box_height) / height,
+        (x + box_width) / width,
+        1.0 - y / height,
+    )
+
+class ImagePanelAggRenderer:
+    """Worker-affine full-panel image renderer using main's exact visible owner."""
+
+    __slots__ = (
+        "_axis",
+        "_bin_count",
+        "_colorbar",
+        "_count_ceiling",
+        "_distribution",
+        "_distribution_artist",
+        "_figure",
+        "_fit_center_artist",
+        "_fit_diagnostic_artist",
+        "_fit_ring_artist",
+        "_guide_lines",
+        "_image_artist",
+        "_layout",
+        "_limit_lines",
+        "_owner_thread",
+        "_render_count",
+        "_site_map",
+        "_site_artist",
+        "_size",
+        "_size_name",
+    )
+
+    def __init__(
+        self,
+        *,
+        width: int,
+        height: int,
+        dpi: float = LIVE_PANEL_DPI,
+        size_name: str | None = None,
+        site_map: bool = False,
+    ) -> None:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.collections import EllipseCollection, PolyCollection
+        from matplotlib.figure import Figure
+        from matplotlib.patches import Circle
+        from matplotlib.ticker import MaxNLocator, ScalarFormatter
+
+        width = positive_integer(width, "width")
+        height = positive_integer(height, "height")
+        dpi = _render_dpi(dpi)
+        if not isinstance(site_map, bool):
+            raise TypeError("site_map must be bool")
+        with render_style_context():
+            figure = Figure(
+                figsize=(
+                    panel_figure_size_inches(size_name)
+                    if size_name is not None
+                    else (width / dpi, height / dpi)
+                ),
+                dpi=dpi,
+            )
+            FigureCanvasAgg(figure)
+            layout = (
+                image_panel_layout(size_name)
+                if size_name is not None
+                else image_panel_layout_for_raster(width, height)
+            )
+            axis = figure.add_axes(layout.image.matplotlib_bounds())
+            distribution = figure.add_axes(
+                layout.distribution.matplotlib_bounds()
+            )
+            color_axis = figure.add_axes(layout.colorbar.matplotlib_bounds())
+            cmap = matplotlib.colormaps[PALETTE["cmap_camera"]].copy()
+            cmap.set_bad(PALETTE["bad"])
+            image_artist = axis.imshow(
+                np.zeros((1, 1), dtype=np.float64),
+                cmap=cmap,
+                origin="upper",
+                interpolation="antialiased",
+                extent=(-0.5, 0.5, 0.5, -0.5),
+            )
+            axis.set_anchor("W")
+            axis.set_aspect("equal", adjustable="box")
+            from .ticks import apply_smart_ticks
+
+            if site_map:
+                apply_smart_ticks(axis)
+            else:
+                apply_smart_ticks(axis, max_ticks_x=4, max_ticks_y=4)
+            distribution.tick_params(
+                axis="x",
+                which="both",
+                bottom=True,
+                top=False,
+                labelbottom=True,
+                labeltop=False,
+            )
+            distribution.tick_params(
+                axis="y",
+                which="both",
+                left=True,
+                right=False,
+                labelleft=False,
+                labelright=False,
+            )
+            distribution.xaxis.set_major_locator(
+                MaxNLocator(nbins=1, prune="lower")
+            )
+            distribution.xaxis.set_major_formatter(ScalarFormatter())
+            empty_vertices = np.zeros((1, 4, 2), dtype=np.float64)
+            distribution_artist = PolyCollection(
+                empty_vertices,
+                facecolors=PALETTE["hist_fill"],
+            )
+            distribution.add_collection(distribution_artist)
+            guide_lines = (
+                distribution.axhline(
+                    0.0,
+                    color=PALETTE["guide"],
+                    linewidth=small_fontsize() / 2.0,
+                    alpha=0.3,
+                ),
+                distribution.axhline(
+                    1.0,
+                    color=PALETTE["guide"],
+                    linewidth=small_fontsize() / 2.0,
+                    alpha=0.3,
+                ),
+            )
+            limit_lines = (
+                distribution.axhline(
+                    0.0,
+                    color=cmap(0.0),
+                    linewidth=small_fontsize() / 2.0,
+                ),
+                distribution.axhline(
+                    1.0,
+                    color=cmap(0.95),
+                    linewidth=small_fontsize() / 2.0,
+                ),
+            )
+            colorbar = figure.colorbar(image_artist, cax=color_axis)
+            site_artist = EllipseCollection(
+                widths=(1.0,),
+                heights=(1.0,),
+                angles=(0.0,),
+                units="xy",
+                offsets=np.empty((0, 2), dtype=np.float64),
+                transOffset=axis.transData,
+                facecolors="none",
+                edgecolors="none",
+                linewidths=(0.0,),
+                zorder=5,
+            )
+            site_artist.set_visible(False)
+            axis.add_collection(site_artist)
+            fit_center_artist = axis.scatter(
+                (),
+                (),
+                color=PALETTE["fit_right"],
+                s=8,
+                clip_on=True,
+                zorder=6,
+            )
+            fit_center_artist.set_visible(False)
+            fit_ring_artist = Circle(
+                (0.0, 0.0),
+                radius=1.0,
+                edgecolor=PALETTE["fit_right"],
+                facecolor="none",
+                linewidth=1.8,
+                alpha=0.9,
+                clip_on=True,
+                zorder=6,
+            )
+            fit_ring_artist.set_visible(False)
+            axis.add_patch(fit_ring_artist)
+            fit_diagnostic_artist = axis.text(
+                0.02,
+                0.98,
+                "",
+                transform=axis.transAxes,
+                va="top",
+                color=FIT_FAILURE_COLOR,
+                fontsize=ANNOTATION_FONT_SIZE,
+                zorder=6,
+            )
+            fit_diagnostic_artist.set_visible(False)
+        self._owner_thread = threading.get_ident()
+        self._figure = figure
+        self._fit_center_artist = fit_center_artist
+        self._fit_diagnostic_artist = fit_diagnostic_artist
+        self._fit_ring_artist = fit_ring_artist
+        self._axis = axis
+        self._distribution = distribution
+        self._image_artist = image_artist
+        self._layout = layout
+        self._distribution_artist = distribution_artist
+        self._guide_lines = guide_lines
+        self._limit_lines = limit_lines
+        self._colorbar = colorbar
+        self._site_artist = site_artist
+        self._site_map = site_map
+        self._size = (width, height)
+        self._size_name = None if size_name is None else str(size_name)
+        self._count_ceiling = 0.0
+        self._bin_count = 0
+        self._render_count = 0
+
+    def render(
+        self,
+        image: EvaluatedImage,
+        viewport,
+        display: ImageDisplayState,
+        *,
+        color_limits: tuple[float, float],
+        data_range: tuple[float, float] | None,
+        title: str,
+        value_label: str = "Signal",
+        distribution_guides: bool = True,
+        distribution_bins: int | None = None,
+        site_centers_xy: np.ndarray | None = None,
+        site_radius: float | None = None,
+        site_occupied: np.ndarray | None = None,
+        site_validity: np.ndarray | None = None,
+        colorbar_endpoints: bool | None = None,
+        fit_overlay: RadialGaussianImageFitOverlay | None = None,
+    ) -> tuple[RasterBuffer, ImagePanelRasterGeometry]:
+        self._require_owner()
+        if not isinstance(image, EvaluatedImage):
+            raise TypeError("image must be EvaluatedImage")
+        if not isinstance(display, ImageDisplayState):
+            raise TypeError("display must be ImageDisplayState")
+        with render_style_context():
+            width, height = self._size
+            extent = _image_panel_extent(image, site_map=self._site_map)
+            x_limits, y_limits = _image_view_limits(viewport, extent)
+            values = np.asarray(image.values)
+            validity = np.asarray(image.validity, dtype=bool)
+            finite_validity = validity & np.isfinite(values)
+            if np.all(finite_validity):
+                display_values = values
+            else:
+                display_values = np.asarray(values, dtype=np.float64).copy()
+                display_values[~finite_validity] = np.nan
+            display_pixel_shape = (
+                max(1, round(self._layout.image.width * width)),
+                max(1, round(self._layout.image.height * height)),
+            )
+            shown, shown_extent = _decimate_image_view(
+                display_values,
+                extent,
+                x_limits,
+                y_limits,
+                display_pixel_shape,
+            )
+            cmap = matplotlib.colormaps[display.colormap.value].copy()
+            cmap.set_bad(PALETTE["bad"])
+            self._image_artist.set_cmap(cmap)
+            self._image_artist.set_data(shown)
+            self._image_artist.set_extent(shown_extent)
+            self._image_artist.set_clim(*color_limits)
+            self._axis.set_xlim(*x_limits)
+            self._axis.set_ylim(*y_limits)
+            self._axis.set_xlabel(_axis_label(image.x_axis))
+            self._axis.set_ylabel(_axis_label(image.y_axis))
+            if title:
+                apply_title(self._axis, title)
+            else:
+                self._axis.title.set_text("")
+            self._update_site_overlay(
+                site_centers_xy,
+                site_radius,
+                site_occupied,
+                site_validity,
+            )
+            self._update_radial_fit_overlay(
+                fit_overlay,
+                viewport,
+                fallback_title=title,
+            )
+            # Static annotations are presentation only.  Adding or moving them
+            # may never participate in image autoscaling.
+            self._axis.set_xlim(*x_limits)
+            self._axis.set_ylim(*y_limits)
+
+            finite_values = np.asarray(values[finite_validity])
+            bin_count = (
+                max(8, min(max(image.values.size, 1) // 4, 50))
+                if distribution_bins is None
+                else positive_integer(
+                    distribution_bins,
+                    "distribution_bins",
+                )
+            )
+            counts, edges = np.histogram(
+                (
+                    finite_values
+                    if finite_values.size
+                    else np.asarray([color_limits[0]])
+                ),
+                bins=bin_count,
+                range=color_limits,
+            )
+            vertices = np.empty((bin_count, 4, 2), dtype=np.float64)
+            for index, count in enumerate(counts):
+                low, high = edges[index], edges[index + 1]
+                vertices[index] = (
+                    (0.0, low),
+                    (float(count), low),
+                    (float(count), high),
+                    (0.0, high),
+                )
+            self._distribution_artist.set_verts(vertices)
+            peak = float(np.max(counts)) if counts.size else 0.0
+            wanted = float(max(10, int(max(peak + 5.0, peak * 1.5))))
+            if (
+                self._count_ceiling <= 0.0
+                or wanted > self._count_ceiling
+                or wanted < 0.6 * self._count_ceiling
+            ):
+                self._count_ceiling = wanted
+            self._distribution.set_xlim(0.0, self._count_ceiling)
+            self._distribution.set_ylim(*color_limits)
+            for line, value in zip(
+                self._limit_lines,
+                color_limits,
+                strict=True,
+            ):
+                line.set_ydata((value, value))
+            self._limit_lines[0].set_color(cmap(0.0))
+            self._limit_lines[1].set_color(cmap(0.95))
+            for line in self._guide_lines:
+                line.set_visible(
+                    bool(distribution_guides and data_range is not None)
+                )
+            if distribution_guides and data_range is not None:
+                for line, value in zip(
+                    self._guide_lines,
+                    data_range,
+                    strict=True,
+                ):
+                    line.set_ydata((value, value))
+
+            self._colorbar.update_normal(self._image_artist)
+            self._colorbar.set_label(str(value_label))
+            if colorbar_endpoints is True or (
+                colorbar_endpoints is None and self._render_count > 0
+            ):
+                self._colorbar.set_ticks(color_limits)
+                self._colorbar.set_ticklabels(
+                    [_compact_engineering(value) for value in color_limits]
+                )
+            raster = raster_from_agg(
+                self._figure,
+                physical_size=self._size,
+            )
+            actual_width, actual_height = raster.width, raster.height
+            if self._size_name is None:
+                geometry = ImagePanelRasterGeometry(
+                    _normalized_axis_bbox(
+                        self._axis,
+                        actual_width,
+                        actual_height,
+                    ),
+                    _normalized_axis_bbox(
+                        self._distribution,
+                        actual_width,
+                        actual_height,
+                    ),
+                    _normalized_axis_bbox(
+                        self._colorbar.ax,
+                        actual_width,
+                        actual_height,
+                    ),
+                )
+            else:
+                # Named TaskConsole presets are authored in Main's design
+                # coordinate system.  Their Figure has a deliberately
+                # fractional nominal pixel bbox (480.2 px at DPR 1), so
+                # re-normalising its axes by the rounded Agg buffer would
+                # shift the published selector geometry.  Publish the exact
+                # boxes that authored the axes; arbitrary hosts still report
+                # their measured Agg geometry above.
+                geometry = ImagePanelRasterGeometry(
+                    (
+                        self._layout.image.left,
+                        self._layout.image.top,
+                        self._layout.image.right,
+                        self._layout.image.bottom,
+                    ),
+                    (
+                        self._layout.distribution.left,
+                        self._layout.distribution.top,
+                        self._layout.distribution.right,
+                        self._layout.distribution.bottom,
+                    ),
+                    (
+                        self._layout.colorbar.left,
+                        self._layout.colorbar.top,
+                        self._layout.colorbar.right,
+                        self._layout.colorbar.bottom,
+                    ),
+                )
+            self._bin_count = bin_count
+            self._render_count += 1
+            return raster, geometry
+
+    def _update_site_overlay(
+        self,
+        centers_xy: np.ndarray | None,
+        radius: float | None,
+        occupied: np.ndarray | None,
+        validity: np.ndarray | None,
+    ) -> None:
+        """Update Main's one hollow-ring collection, or hide it for IMAGE."""
+
+        artist = self._site_artist
+        if centers_xy is None:
+            if any(value is not None for value in (radius, occupied, validity)):
+                raise ValueError(
+                    "site overlay values require site_centers_xy"
+                )
+            artist.set_offsets(np.empty((0, 2), dtype=np.float64))
+            artist.set_visible(False)
+            return
+        centers = np.asarray(centers_xy, dtype=np.float64)
+        if centers.ndim != 2 or centers.shape[1:] != (2,):
+            raise ValueError("site_centers_xy must have shape (sites, 2)")
+        if not len(centers) or not np.all(np.isfinite(centers)):
+            raise ValueError("site_centers_xy must be nonempty and finite")
+        if (
+            radius is None
+            or not math.isfinite(float(radius))
+            or float(radius) <= 0.0
+        ):
+            raise ValueError("site_radius must be finite and positive")
+        if validity is None:
+            valid = np.ones(len(centers), dtype=np.bool_)
+        else:
+            valid = np.asarray(validity)
+            if valid.dtype != np.dtype(bool) or valid.shape != (len(centers),):
+                raise ValueError(
+                    "site_validity must have bool shape (sites,)"
+                )
+        if occupied is None:
+            states = np.zeros(len(centers), dtype=np.bool_)
+        else:
+            states = np.asarray(occupied)
+            if states.dtype != np.dtype(bool) or states.shape != (len(centers),):
+                raise ValueError(
+                    "site_occupied must have bool shape (sites,)"
+                )
+        from matplotlib.colors import to_rgba
+
+        empty_style = SITE_OCCUPANCY_STYLE["empty"]
+        occupied_style = SITE_OCCUPANCY_STYLE["occupied"]
+        invalid_color = to_rgba(SITE_INVALID_COLOR, SITE_INVALID_ALPHA)
+        edgecolors = []
+        linewidths = []
+        linestyles = []
+        for is_valid, is_occupied in zip(valid, states, strict=True):
+            if not is_valid:
+                edgecolors.append(invalid_color)
+                linewidths.append(float(SITE_INVALID_LINEWIDTH))
+                linestyles.append("dashed")
+                continue
+            style = occupied_style if is_occupied else empty_style
+            edgecolors.append(
+                to_rgba(style["color"], float(style["alpha"]))
+            )
+            linewidths.append(float(style["linewidth"]))
+            linestyles.append("solid")
+        diameter = 2.0 * float(radius)
+        artist.set_offsets(centers)
+        artist.set_widths(np.full(len(centers), diameter))
+        artist.set_heights(np.full(len(centers), diameter))
+        artist.set_angles(np.zeros(len(centers)))
+        artist.set_edgecolors(edgecolors)
+        artist.set_linewidths(linewidths)
+        artist.set_linestyles(linestyles)
+        artist.set_visible(True)
+
+    def _update_radial_fit_overlay(
+        self,
+        overlay: RadialGaussianImageFitOverlay | None,
+        viewport,
+        *,
+        fallback_title: str,
+    ) -> None:
+        """Update Main's radial-fit dot/ring/status on the same Agg axes."""
+
+        center_artist = self._fit_center_artist
+        ring_artist = self._fit_ring_artist
+        diagnostic_artist = self._fit_diagnostic_artist
+        center_artist.set_visible(False)
+        ring_artist.set_visible(False)
+        diagnostic_artist.set_visible(False)
+        if overlay is None:
+            if fallback_title:
+                apply_title(self._axis, fallback_title)
+            else:
+                self._axis.title.set_text("")
+            return
+        if not isinstance(overlay, RadialGaussianImageFitOverlay):
+            raise TypeError(
+                "fit_overlay must be RadialGaussianImageFitOverlay or None"
+            )
+        if overlay.coordinate_frame != viewport.coordinate_frame:
+            raise ValueError("fit overlay belongs to another coordinate frame")
+        status_label = (
+            "NOT_PRESENT"
+            if overlay.status is None
+            else overlay.status.value
+        )
+        apply_title(
+            self._axis,
+            f"{overlay.caption} $\\cdot$ {status_label}",
+        )
+        if overlay.status is FitBatchStatus.CONVERGED:
+            center = overlay.center_xy
+            radius = overlay.one_over_e_radius
+            if center is None or radius is None:
+                raise RuntimeError(
+                    "converged radial fit overlay lost its geometry"
+                )
+            center_artist.set_offsets(np.asarray((center,), dtype=np.float64))
+            center_artist.set_visible(True)
+            ring_artist.set_center(center)
+            ring_artist.set_radius(radius)
+            ring_artist.set_visible(True)
+            # Vector annotation can be off-screen but may never autoscale IMAGE.
+            return
+        diagnostic_artist.set_text(
+            f"fit {overlay.diagnostic or status_label}"
+        )
+        diagnostic_artist.set_visible(True)
+
+    def close(self) -> None:
+        self._require_owner()
+        figure, self._figure = self._figure, None
+        if figure is None:
+            return
+        release_agg_figure(figure)
+        gc.collect()
+
+    def _require_owner(self) -> None:
+        if threading.get_ident() != self._owner_thread:
+            raise RuntimeError("image-panel Agg renderer used from another thread")
+        if self._figure is None:
+            raise RuntimeError("image-panel Agg renderer is closed")
+
+__all__ = [
+    "save_image_panel_png",
+    "render_radial_gaussian_image_fit_panels",
+    "save_radial_gaussian_image_fit_panels",
+    "ImagePanelAggRenderer",
+]

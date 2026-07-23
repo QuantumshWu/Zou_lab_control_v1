@@ -7,18 +7,24 @@ contract and implements the established tight/normal/fixed range hysteresis.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import Enum
+
+import numpy as np
+
 from zlc_storage import exact_mapping, nonnegative_integer
 
 from .display_range import (
     DisplayRange,
     RelimMode,
+    deadband_display_range,
     display_range_form_values,
     display_range_from_form,
     optional_display_range,
     validated_display_range,
 )
+from .figure import EvaluatedImage
 from .form import FormChoice, FormFieldProps, FormSpec
 from .image_view import ImageViewportTransform
 
@@ -70,6 +76,106 @@ class ImageDisplayState:
             and self.fixed_color_limits is None
         ):
             raise ValueError("fixed relim_mode requires fixed_color_limits")
+
+
+def _automatic_image_range(
+    values: np.ndarray,
+    valid: np.ndarray,
+) -> tuple[float, float]:
+    if values.dtype.kind in "iu":
+        info = np.iinfo(values.dtype)
+        native_low = np.min(values, where=valid, initial=info.max)
+        native_high = np.max(values, where=valid, initial=info.min)
+        low, high = float(native_low), float(native_high)
+        if native_low != native_high and low == high:
+            raise TypeError(
+                "integer image range is not distinguishable in the float64 "
+                "display contract; apply an explicit display transform"
+            )
+    elif values.dtype.kind == "b":
+        low = np.min(values, where=valid, initial=True)
+        high = np.max(values, where=valid, initial=False)
+    else:
+        low = np.min(values, where=valid, initial=np.inf)
+        high = np.max(values, where=valid, initial=-np.inf)
+    return float(low), float(high)
+
+
+def evaluated_image_data_range(
+    images: Iterable[EvaluatedImage],
+) -> tuple[float, float] | None:
+    """Pool finite valid IMAGE values without creating a display raster."""
+
+    low = high = None
+    for image in images:
+        if not isinstance(image, EvaluatedImage):
+            raise TypeError("images must contain only EvaluatedImage values")
+        values = image.values
+        if values.dtype.kind not in "biuf":
+            raise TypeError("image display values must be real numeric arrays")
+        if values.dtype.kind in "biu":
+            valid = image.validity
+        else:
+            valid = np.empty(values.shape, dtype=bool)
+            np.isfinite(values, out=valid)
+            np.logical_and(valid, image.validity, out=valid)
+        if not bool(np.any(valid)):
+            continue
+        cell_low, cell_high = _automatic_image_range(values, valid)
+        low = cell_low if low is None else min(low, cell_low)
+        high = cell_high if high is None else max(high, cell_high)
+    return None if low is None else (low, high)
+
+
+def resolve_image_color_limits(
+    image: EvaluatedImage,
+    state: ImageDisplayState,
+    *,
+    current_color_limits: DisplayRange | None,
+    previous_relim_mode: RelimMode | None,
+) -> tuple[tuple[float, float] | None, tuple[float, float]]:
+    """Resolve one image's observed range and effective authored clim.
+
+    This function returns display facts only.  It never allocates a pixel
+    plane, palette, or histogram as a side effect.
+    """
+
+    if not isinstance(image, EvaluatedImage):
+        raise TypeError("image must be EvaluatedImage")
+    if not isinstance(state, ImageDisplayState):
+        raise TypeError("state must be ImageDisplayState")
+    if previous_relim_mode is not None and not isinstance(
+        previous_relim_mode,
+        RelimMode,
+    ):
+        raise TypeError("previous_relim_mode must be RelimMode or None")
+    data_range = evaluated_image_data_range((image,))
+    if data_range is None:
+        if (
+            state.relim_mode is RelimMode.FIXED
+            and state.fixed_color_limits is not None
+        ):
+            color_limits = state.fixed_color_limits
+        elif current_color_limits is not None:
+            color_limits = validated_display_range(
+                current_color_limits,
+                "current_color_limits",
+            )
+        else:
+            color_limits = (0.0, 1.0)
+    else:
+        color_limits = deadband_display_range(
+            state.relim_mode,
+            current_color_limits,
+            data_range[0],
+            data_range[1],
+            fixed_range=state.fixed_color_limits,
+            force=(
+                previous_relim_mode is None
+                or previous_relim_mode is not state.relim_mode
+            ),
+        )
+    return data_range, color_limits
 
 
 def image_viewport_for_display_state(
@@ -257,6 +363,7 @@ def image_display_from_form(
 
 
 __all__ = [
+    "evaluated_image_data_range",
     "ImageColormap",
     "ImageDisplayState",
     "image_display_form_spec",
@@ -264,4 +371,5 @@ __all__ = [
     "image_display_form_values",
     "image_display_from_form",
     "image_viewport_for_display_state",
+    "resolve_image_color_limits",
 ]

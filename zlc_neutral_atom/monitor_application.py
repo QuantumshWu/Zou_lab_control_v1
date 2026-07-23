@@ -28,6 +28,7 @@ from zlc_neutral_atom.acquisition.camera import (
     CameraSample,
     CameraSampleContract,
 )
+from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.processing.roi_monitor import (
     RoiScalarBinding,
@@ -73,10 +74,10 @@ from zlc_neutral_atom.runtime.streams import (
     TraceContext,
 )
 from zlc_storage import (
+    canonical_digest,
     canonical_text,
     nonnegative_integer,
     positive_integer,
-    positive_real,
 )
 
 
@@ -86,6 +87,26 @@ _ROI_SCALAR_REPEAT_AXIS_ID = AxisId("camera-monitor.roi-scalar-repeat")
 _ROI_SCALAR_HISTORY_AXIS_ID = AxisId("camera-monitor.roi-scalar-history")
 _STREAM_RETENTION_EVENTS = 1
 _TAP_BACKLOG_EVENTS = 1
+CAMERA_MONITOR_MEASUREMENT_KEY = DefinitionKey(
+    "zlc_neutral_atom.monitor_application",
+    "camera-monitor",
+)
+CAMERA_MONITOR_REQUEST_OWNER_FINGERPRINT = canonical_digest(
+    {
+        "owner": "zlc_neutral_atom.monitor_application",
+        "schema": "zlc.camera-monitor-request",
+    }
+)
+CAMERA_MONITOR_MEASUREMENT_DEFINITION = MeasurementDefinition(
+    CAMERA_MONITOR_MEASUREMENT_KEY,
+    "Camera monitor",
+    "zlc.camera-monitor-request",
+    "zlc.camera-monitor-binding",
+    CAMERA_MONITOR_REQUEST_OWNER_FINGERPRINT,
+)
+CAMERA_MONITOR_MEASUREMENT_DEFINITIONS = (
+    CAMERA_MONITOR_MEASUREMENT_DEFINITION,
+)
 
 
 @dataclass(frozen=True)
@@ -93,7 +114,6 @@ class CameraMonitorRequest:
     """Declarative request for one hardware-paced, display-only camera monitor."""
 
     camera_ref: DeviceRef
-    io_timeout_seconds: float = 2.0
     history_capacity: int = 8
     roi: Selection | None = None
     roi_reduction: ReductionMethod = ReductionMethod.MEAN
@@ -103,11 +123,6 @@ class CameraMonitorRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.camera_ref, DeviceRef):
             raise TypeError("camera_ref must be DeviceRef")
-        object.__setattr__(
-            self,
-            "io_timeout_seconds",
-            positive_real(self.io_timeout_seconds, "io_timeout_seconds"),
-        )
         object.__setattr__(
             self,
             "history_capacity",
@@ -945,7 +960,7 @@ class _CameraMonitorTransaction:
     stream: AcquisitionStream[CameraSample]
     producer: AcquisitionProducer[CameraSample]
     session_id: str
-    io_timeout_seconds: float
+    operation_deadline_seconds: float
     prepare_attempted: bool = False
     view_notifications_enabled: bool = True
 
@@ -962,7 +977,7 @@ class _CameraMonitorTransaction:
                 capability.capability_fingerprint,
                 capability.settings_fingerprint,
                 capability.max_source_burst_events,
-                self.io_timeout_seconds,
+                self.operation_deadline_seconds,
             )
         )
         if not isinstance(prepared, CameraMonitorPreparedAck):
@@ -975,7 +990,10 @@ class _CameraMonitorTransaction:
             raise RuntimeError("camera monitor prepare acknowledgement changed capability")
         context.checkpoint()
         started = device.execute(
-            StartCameraMonitorCommand(self.session_id, self.io_timeout_seconds)
+            StartCameraMonitorCommand(
+                self.session_id,
+                self.operation_deadline_seconds,
+            )
         )
         if not isinstance(started, CameraMonitorStartedAck):
             raise TypeError("camera monitor start returned an unexpected acknowledgement")
@@ -987,7 +1005,7 @@ class _CameraMonitorTransaction:
                 response = device.execute(
                     ReadCameraMonitorCommand(
                         self.session_id,
-                        self.io_timeout_seconds,
+                        self.operation_deadline_seconds,
                     )
                 )
             except CameraMonitorInterrupted:
@@ -1132,10 +1150,6 @@ class PreparedCameraMonitor:
         source_id = capability.camera_capability_evidence.source_id
         if source_id != request.camera_ref.role:
             raise ValueError("camera monitor capability source differs from requested role")
-        if request.io_timeout_seconds > capability.max_blocking_call_seconds:
-            raise ValueError(
-                "camera monitor I/O timeout exceeds the adapter blocking-call bound"
-            )
         schema = DatasetSchema(
             AxisSpec(
                 _MONITOR_REPEAT_AXIS_ID,
@@ -1396,7 +1410,7 @@ def _compile_camera_monitor_plan(
                 stream,
                 producer,
                 uuid.uuid4().hex,
-                request.io_timeout_seconds,
+                port.capability.max_blocking_call_seconds,
             )
         except BaseException as error:
             try:
@@ -1456,7 +1470,6 @@ def _compile_camera_monitor_plan(
         cleanup=cleanup,
         finalize=lambda _context, result: result,
         interrupt_operations=port.interrupt_operations,
-        timeout_seconds=None,
         requires_final_commit=False,
     )
 
@@ -1471,6 +1484,10 @@ def prepare_camera_monitor(
 
 
 __all__ = [
+    "CAMERA_MONITOR_MEASUREMENT_DEFINITION",
+    "CAMERA_MONITOR_MEASUREMENT_DEFINITIONS",
+    "CAMERA_MONITOR_MEASUREMENT_KEY",
+    "CAMERA_MONITOR_REQUEST_OWNER_FINGERPRINT",
     "CameraMonitorDescriptor",
     "CameraMonitorLiveDataset",
     "CameraMonitorRequest",

@@ -35,7 +35,7 @@ from zlc_frontend.qt_widgets import (
     set_fluent_scale,
     window_pad,
 )
-from Zou_lab_control.workbench._window_runtime import RASTER_WORK_EXECUTOR
+from zlc_workbench.window_runtime import RASTER_WORK_EXECUTOR
 
 from .info_projection import project_figure_info
 
@@ -248,7 +248,7 @@ class FigureViewer(QtWidgets.QWidget):
     def _accept_archive(self, revision: int, archive) -> None:
         """Build a hidden candidate; its admitted first front commits the generation."""
 
-        from Zou_lab_control.workbench import create_data_figure_pane
+        from zlc_workbench.data_figure.app import create_data_figure_pane
 
         metadata = archive.metadata
         if not isinstance(metadata, Mapping):

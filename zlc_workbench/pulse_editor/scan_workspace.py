@@ -217,11 +217,35 @@ def execute_scan_program(document: PulseDocument, source: str) -> ScanCandidateR
 
     if not isinstance(document, PulseDocument):
         raise TypeError("document must be PulseDocument")
+    if not document.scan_parameters:
+        raise ValueError("bind at least one field to a scan parameter first")
+    rows = execute_numeric_table_program(
+        source,
+        width=len(document.scan_parameters),
+    )
+    return _freeze_candidate(document, rows, recipe_source=str(source))
+
+
+def execute_numeric_table_program(
+    source: str,
+    *,
+    width: int,
+) -> tuple[tuple[int | float, ...], ...]:
+    """Execute the one trusted-local ``scan_table`` program contract.
+
+    Both SCAN_SLOT and API_SLOT editors expose the same program surface.  The
+    physical owner differs only after the numeric matrix exists: SCAN_SLOT rows
+    are clock/range-normalized into a :class:`FrozenScanTable`, while API_SLOT
+    rows become an :class:`ApiSegmentTable`.  Keeping execution and strict shape
+    validation here prevents those two visible editors from acquiring subtly
+    different Python/NumPy semantics.
+    """
+
+    if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+        raise ValueError("scan program width must be a positive integer")
     text = str(source)
     if not text.strip():
         raise ValueError("scan program source must be non-empty")
-    if not document.scan_parameters:
-        raise ValueError("bind at least one field to a scan parameter first")
     import numpy as np
 
     namespace = {
@@ -229,21 +253,20 @@ def execute_scan_program(document: PulseDocument, source: str) -> ScanCandidateR
         "np": np,
         "numpy": np,
         "math": math,
-        "n_slots": len(document.scan_parameters),
+        "n_slots": width,
     }
     # This is the formal trusted-local experiment-program surface.  It is not a
     # sandbox and intentionally retains normal Python/import semantics.
-    exec(compile(text, "<PulseGUI scan program>", "exec"), namespace, namespace)  # noqa: S102
+    exec(compile(text, "<Pulse scan program>", "exec"), namespace, namespace)  # noqa: S102
     if "scan_table" not in namespace:
         raise ValueError(
             "assign an N_points x N_parameters array to 'scan_table'"
         )
-    rows = _strict_numeric_matrix(
+    return _strict_numeric_matrix(
         namespace["scan_table"],
-        width=len(document.scan_parameters),
+        width=width,
         field="scan_table",
     )
-    return _freeze_candidate(document, rows, recipe_source=text)
 
 
 def load_scan_array(document: PulseDocument, path: str | Path) -> ScanCandidateResult:
@@ -647,6 +670,7 @@ __all__ = [
     "candidate_snapshot",
     "commit_scan_candidate",
     "default_scan_program",
+    "execute_numeric_table_program",
     "execute_scan_program",
     "format_scan_slots",
     "format_scan_table",

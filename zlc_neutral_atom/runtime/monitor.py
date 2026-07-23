@@ -1,9 +1,14 @@
-"""Typed authority for a hardware-paced free-running camera monitor.
+"""Typed authority for a hardware-paced camera monitor.
 
 The monitor port is deliberately distinct from finite exact capture authority:
 it may publish display-only samples, but it cannot mint an exact reservation or
 sealed artifact.  Both ports still use the same composition-owned camera
 endpoint, capability evidence, session cleanup, and physical DISARM boundary.
+
+A monitor source may be sensor-clocked (``FREE_RUNNING``) or passively observe
+an already external-triggered camera (``EXTERNAL_TRIGGERED``).  The latter does
+not grant trigger authority: it only arms the camera and drains records emitted
+by independent hardware timing.
 """
 
 from __future__ import annotations
@@ -38,14 +43,14 @@ class CameraMonitorInterrupted(RuntimeError):
 
 @dataclass(frozen=True)
 class CameraMonitorCapabilitySnapshot(CaptureCapabilitySnapshot):
-    """Broker-attested camera facts qualified only for monitor acquisition."""
+    """Broker-attested camera facts admitting display-only observation."""
 
     acquisition_mode: CameraAcquisitionMode
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.acquisition_mode is not CameraAcquisitionMode.FREE_RUNNING:
-            raise ValueError("camera monitor capability requires FREE_RUNNING mode")
+        if not isinstance(self.acquisition_mode, CameraAcquisitionMode):
+            raise TypeError("acquisition_mode must be CameraAcquisitionMode")
 
 
 @dataclass(frozen=True)

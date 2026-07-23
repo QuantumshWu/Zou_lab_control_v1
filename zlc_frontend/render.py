@@ -13,7 +13,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 import math
-from numbers import Integral
 import threading
 from typing import Protocol, runtime_checkable
 
@@ -41,6 +40,7 @@ from zlc_storage import (
 from .curve_display import CurveViewportTransform, NumericViewportTransform
 from .display_range import validated_display_range
 from .histogram_display import HistogramBinProjection, HistogramViewportTransform
+from .image_display import ImageColormap
 from .figure import (
     AxisAddress,
     DatasetId,
@@ -60,9 +60,9 @@ SITE_MAP_JOIN_SCHEMA_DIGEST = canonical_digest(
         "schema": "zlc_frontend.SiteMapJoinSchema",
         "value_schema": "zlc_frontend.SiteMapJoin",
         "fields": (
-            "cell_identity",
-            "occupancy.dataset_id",
-            "occupancy.ref[zlc_data.DatasetRevisionRef]",
+            "view_identity",
+            "site_state.dataset_id",
+            "site_state.ref[zlc_data.DatasetRevisionRef]",
             "background.dataset_id",
             "background.ref[zlc_data.DatasetRevisionRef]",
             "geometry_identity",
@@ -83,24 +83,6 @@ class RenderSurface(Enum):
     GUI_ARTIST = "gui-artist"
     WORKER_RASTER_LIVE = "worker-raster-live"
     WORKER_HEADLESS_EXPORT = "worker-headless-export"
-
-
-class PixelFormat(Enum):
-    """Canonical owned raster layouts accepted at the presentation boundary."""
-
-    RGBA8888 = "rgba8888"
-    RGB888 = "rgb888"
-    GRAY8 = "gray8"
-    INDEXED8 = "indexed8"
-
-    @property
-    def channels(self) -> int:
-        return {
-            PixelFormat.RGBA8888: 4,
-            PixelFormat.RGB888: 3,
-            PixelFormat.GRAY8: 1,
-            PixelFormat.INDEXED8: 1,
-        }[self]
 
 
 @dataclass(frozen=True)
@@ -301,29 +283,21 @@ class DocumentPresentationStamp:
 
 @dataclass(frozen=True)
 class RasterBuffer:
-    """An owned immutable raster; ``pixels`` can never alias a worker buffer."""
+    """One tight owned immutable RGBA8888 raster."""
 
     width: int
     height: int
-    stride_bytes: int
-    pixel_format: PixelFormat
     pixels: bytes
 
     def __post_init__(self) -> None:
         width = _nonnegative(self.width, "width")
         height = _nonnegative(self.height, "height")
-        stride = _nonnegative(self.stride_bytes, "stride_bytes")
         if width == 0 or height == 0:
             raise ValueError("raster width and height must be positive")
-        if not isinstance(self.pixel_format, PixelFormat):
-            raise TypeError("pixel_format must be PixelFormat")
-        minimum_stride = width * self.pixel_format.channels
-        if stride < minimum_stride:
-            raise ValueError("stride_bytes is too small for width and pixel format")
         if not isinstance(self.pixels, bytes):
             raise TypeError("pixels must be owned immutable bytes")
-        if len(self.pixels) != stride * height:
-            raise ValueError("pixels length must equal stride_bytes * height")
+        if len(self.pixels) != width * height * 4:
+            raise ValueError("RGBA8888 pixels length must equal width * height * 4")
 
     @classmethod
     def from_agg_rgba(cls, width: int, height: int, buffer) -> "RasterBuffer":
@@ -338,8 +312,7 @@ class RasterBuffer:
         about to overwrite.
         """
 
-        return cls(width, height, width * PixelFormat.RGBA8888.channels,
-                   PixelFormat.RGBA8888, bytes(buffer))
+        return cls(width, height, bytes(buffer))
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,22 +471,50 @@ class CurveFitOverlay:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ImagePanelRasterGeometry:
+    """Exact top-origin axes boxes inside a worker-composed image panel raster."""
+
+    image_bounds: tuple[float, float, float, float]
+    distribution_bounds: tuple[float, float, float, float]
+    colorbar_bounds: tuple[float, float, float, float]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "image_bounds",
+            "distribution_bounds",
+            "colorbar_bounds",
+        ):
+            values = tuple(float(value) for value in getattr(self, name))
+            if (
+                len(values) != 4
+                or any(not math.isfinite(value) for value in values)
+                or not 0.0 <= values[0] < values[2] <= 1.0
+                or not 0.0 <= values[1] < values[3] <= 1.0
+            ):
+                raise ValueError(
+                    f"{name} must be a non-degenerate normalized rectangle"
+                )
+            object.__setattr__(self, name, values)
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class ImagePanelPayload:
     """Exact immutable samples and display mapping for one IMAGE raster front.
 
-    Codes 1..255 always span ``color_limits``.  ``data_range`` retains the
-    full observed span for exact diagnostics and in-window guide lines even
-    when the painted/interactive colour domain is much narrower.
+    ``data_range`` retains the full observed span for exact diagnostics and
+    in-window guide lines even when the painted colour domain is narrower.
+    ``colormap`` is the typed identity used by both Agg and transient Qt
+    overlays; no second palette or quantized image plane crosses the boundary.
     """
 
     image: EvaluatedImage
     evaluated_input: EvaluatedInput
     viewport: ImageViewportTransform
     data_range: tuple[float, float] | None
-    histogram_counts: tuple[int, ...]
-    base_palette: tuple[int, ...]
+    colormap: ImageColormap
     color_limits: tuple[float, float]
+    raster_geometry: ImagePanelRasterGeometry
     fit_overlay: RadialGaussianImageFitOverlay | None = None
 
     def __post_init__(self) -> None:
@@ -561,33 +562,8 @@ class ImagePanelPayload:
             validated_display_range(self.color_limits, "image color_limits"),
         )
 
-        counts = tuple(self.histogram_counts)
-        if len(counts) != 255:
-            raise ValueError("image histogram_counts must contain 255 scalar codes")
-        if any(
-            isinstance(count, bool)
-            or not isinstance(count, Integral)
-            or int(count) < 0
-            for count in counts
-        ):
-            raise ValueError("image histogram counts must be nonnegative integers")
-        counts = tuple(int(count) for count in counts)
-        valid_count = sum(counts)
-        if valid_count > self.image.values.size:
-            raise ValueError("image histogram count exceeds raster cardinality")
-        if data_range is None and valid_count:
-            raise ValueError("image histogram cannot contain samples without data_range")
-        object.__setattr__(self, "histogram_counts", counts)
-
-        palette = tuple(self.base_palette)
-        if len(palette) != 256 or any(
-            isinstance(color, bool)
-            or not isinstance(color, Integral)
-            or not 0 <= int(color) <= 0xFFFFFFFF
-            for color in palette
-        ):
-            raise ValueError("image base_palette must contain 256 unsigned ARGB32 values")
-        object.__setattr__(self, "base_palette", tuple(int(color) for color in palette))
+        if not isinstance(self.colormap, ImageColormap):
+            raise TypeError("image colormap must be ImageColormap")
         overlay = self.fit_overlay
         if overlay is not None:
             if not isinstance(overlay, RadialGaussianImageFitOverlay):
@@ -598,6 +574,11 @@ class ImagePanelPayload:
                 raise ValueError("image fit overlay belongs to another evaluated input")
             if overlay.coordinate_frame != self.viewport.coordinate_frame:
                 raise ValueError("image fit overlay belongs to another coordinate frame")
+        if not isinstance(
+            self.raster_geometry,
+            ImagePanelRasterGeometry,
+        ):
+            raise TypeError("image raster_geometry must be ImagePanelRasterGeometry")
 
     @property
     def value_unit(self) -> str | None:
@@ -917,32 +898,30 @@ class MeterPanelPayload:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class SiteMapPanelPayload:
-    """One IMAGE background plus calibrated, exact per-site occupancy state.
+    """One IMAGE background plus calibrated sites and optional occupancy state.
 
     Site coordinates carry an explicit frame and are never inferred from array
-    shape.  Occupancy and background remain distinct evaluated inputs so a
+    shape.  Site state and background remain distinct evaluated inputs so a
     :class:`CoherenceStamp` can prove their exact joined revisions.
     """
 
     background: ImagePanelPayload
-    occupancy_input: EvaluatedInput
+    site_state_input: EvaluatedInput
     site_axis: AxisSpec
     coordinate_frame: CoordinateFrameId
     centers_xy: np.ndarray
-    occupied: np.ndarray
+    occupied: np.ndarray | None
     site_validity: np.ndarray
     calibration_identity: str
-    cell_identity: str
-    _full_normalized_centers_xy: np.ndarray = field(init=False, repr=False)
-    _visible_ring_span: tuple[float, float] = field(init=False, repr=False)
+    view_identity: str
     _geometry_identity: str = field(init=False, repr=False)
     _join_key_digest: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.background, ImagePanelPayload):
             raise TypeError("site-map background must be ImagePanelPayload")
-        if not isinstance(self.occupancy_input, EvaluatedInput):
-            raise TypeError("site-map occupancy_input must be EvaluatedInput")
+        if not isinstance(self.site_state_input, EvaluatedInput):
+            raise TypeError("site-map site_state_input must be EvaluatedInput")
         if not isinstance(self.site_axis, AxisSpec) or self.site_axis.role != SITE:
             raise ValueError("site-map site_axis must be an AxisSpec with role SITE")
         if not isinstance(self.coordinate_frame, CoordinateFrameId):
@@ -952,29 +931,29 @@ class SiteMapPanelPayload:
                 "site-map coordinate_frame differs from its background viewport"
             )
         if (
-            self.occupancy_input.dataset_id
+            self.site_state_input.dataset_id
             == self.background.evaluated_input.dataset_id
         ):
             raise ValueError(
-                "site-map occupancy and background require distinct dataset ids"
+                "site-map state and background require distinct dataset ids"
             )
 
         site_count = self.site_axis.size
+        occupancy_present = self.occupied is not None
         centers, occupied, validity = immutable_site_state(
             self.centers_xy,
-            self.occupied,
+            (
+                self.occupied
+                if occupancy_present
+                else np.zeros(site_count, dtype=np.bool_)
+            ),
             self.site_validity,
             site_count=site_count,
         )
         radius = site_ring_radius(centers)
-        viewport = self.background.viewport
         try:
-            normalized_centers = viewport.full_points_for_coordinates(
+            self.background.viewport.full_points_for_coordinates(
                 centers,
-                coordinate_frame=self.coordinate_frame,
-            )
-            visible_ring_span = viewport.visible_span_for_coordinate_span(
-                (2.0 * radius, 2.0 * radius),
                 coordinate_frame=self.coordinate_frame,
             )
         except ValueError as exc:
@@ -984,19 +963,17 @@ class SiteMapPanelPayload:
         object.__setattr__(self, "centers_xy", centers)
         object.__setattr__(
             self,
-            "_full_normalized_centers_xy",
-            normalized_centers,
+            "occupied",
+            occupied if occupancy_present else None,
         )
-        object.__setattr__(self, "_visible_ring_span", visible_ring_span)
-        object.__setattr__(self, "occupied", occupied)
         object.__setattr__(self, "site_validity", validity)
         calibration_identity = _text(
             self.calibration_identity,
             "site-map calibration_identity",
         )
-        cell_identity = _text(self.cell_identity, "site-map cell_identity")
+        view_identity = _text(self.view_identity, "site-map view_identity")
         object.__setattr__(self, "calibration_identity", calibration_identity)
-        object.__setattr__(self, "cell_identity", cell_identity)
+        object.__setattr__(self, "view_identity", view_identity)
         axis = self.site_axis
         geometry_identity = canonical_digest(
             {
@@ -1011,7 +988,7 @@ class SiteMapPanelPayload:
 
         input_trees = {}
         for name, value in (
-            ("occupancy", self.occupancy_input),
+            ("site_state", self.site_state_input),
             ("background", self.background.evaluated_input),
         ):
             ref = value.ref
@@ -1027,32 +1004,13 @@ class SiteMapPanelPayload:
             canonical_digest(
                 {
                     "schema": "zlc_frontend.SiteMapJoin",
-                    "cell_identity": cell_identity,
-                    "occupancy": input_trees["occupancy"],
+                    "view_identity": view_identity,
+                    "site_state": input_trees["site_state"],
                     "background": input_trees["background"],
                     "geometry_identity": geometry_identity,
                 }
             ),
         )
-
-    @property
-    def full_normalized_centers_xy(self) -> np.ndarray:
-        """Return immutable full-raster points used by the Qt paint hot path."""
-
-        return self._full_normalized_centers_xy
-
-    @property
-    def visible_ring_span(self) -> tuple[float, float]:
-        """Return the current viewport-normalized ring width and height."""
-
-        return self._visible_ring_span
-
-    @property
-    def visible_coordinate_aspect_ratio(self) -> float:
-        """Return target raster width/height for isotropic physical coordinates."""
-
-        width, height = self._visible_ring_span
-        return height / width
 
     @property
     def geometry_identity(self) -> str:
@@ -1062,7 +1020,7 @@ class SiteMapPanelPayload:
 
     @property
     def join_key_digest(self) -> str:
-        """Digest the exact cell, both data revisions, and calibration geometry."""
+        """Digest the typed view, both data revisions, and site geometry."""
 
         return self._join_key_digest
 
@@ -1122,8 +1080,6 @@ class PanelFrame:
                 raise TypeError(
                     "document-backed panels require PulsePanelPayload"
                 )
-            if self.raster.pixel_format is not PixelFormat.RGBA8888:
-                raise ValueError("pulse payload requires an RGBA8888 raster")
             if payload.document_input != self.source_identity:
                 raise ValueError(
                     "pulse payload differs from its document source identity"
@@ -1177,41 +1133,21 @@ class PanelFrame:
             if len(presentations) != 1:
                 raise ValueError("payload panel has no unique presentation identity")
             if isinstance(payload, ImagePanelPayload):
-                if self.raster.pixel_format is not PixelFormat.INDEXED8:
-                    raise ValueError("image payload requires an INDEXED8 raster")
-                if payload.viewport.raster_shape != (
-                    self.raster.height,
-                    self.raster.width,
-                ):
-                    raise ValueError("image payload and raster geometry differ")
                 payload_revision = payload.viewport.viewport_revision
                 source_input = payload.evaluated_input
             elif isinstance(payload, CurvePanelPayload):
-                if self.raster.pixel_format is not PixelFormat.RGBA8888:
-                    raise ValueError("curve payload requires an RGBA8888 raster")
                 payload_revision = payload.viewport.display_revision
                 source_input = payload.evaluated_input
             elif isinstance(payload, HistogramPanelPayload):
-                if self.raster.pixel_format is not PixelFormat.RGBA8888:
-                    raise ValueError("histogram payload requires an RGBA8888 raster")
                 payload_revision = payload.viewport.display_revision
                 source_input = payload.evaluated_input
             elif isinstance(payload, MeterPanelPayload):
-                if self.raster.pixel_format is not PixelFormat.RGBA8888:
-                    raise ValueError("meter payload requires an RGBA8888 raster")
                 payload_revision = payload.display_revision
                 source_input = payload.evaluated_input
             else:
                 background = payload.background
-                if self.raster.pixel_format is not PixelFormat.INDEXED8:
-                    raise ValueError("site-map payload requires an INDEXED8 raster")
-                if background.viewport.raster_shape != (
-                    self.raster.height,
-                    self.raster.width,
-                ):
-                    raise ValueError("site-map background and raster geometry differ")
                 payload_revision = background.viewport.viewport_revision
-                source_input = payload.occupancy_input
+                source_input = payload.site_state_input
                 try:
                     background_ref = next(
                         value.ref
@@ -1229,7 +1165,7 @@ class PanelFrame:
                     )
                 if self.coherence_stamp.join_key_digest != payload.join_key_digest:
                     raise ValueError(
-                        "site-map coherence digest omits or changes its exact cell, "
+                        "site-map coherence digest omits or changes its typed view, "
                         "inputs, or calibration geometry"
                     )
             if presentations[0].panel_revision != payload_revision:
@@ -1261,7 +1197,7 @@ class PanelFrame:
                 != source_input.ref.schema_fingerprint
             ):
                 raise ValueError(
-                    "site-map source identity differs from its occupancy input"
+                    "site-map source identity differs from its site-state input"
                 )
 
 
@@ -1405,9 +1341,9 @@ __all__ = [
     "SourceIdentity",
     "PanelFrame",
     "ImagePanelPayload",
+    "ImagePanelRasterGeometry",
     "RadialGaussianImageFitOverlay",
     "SiteMapPanelPayload",
-    "PixelFormat",
     "PulsePanelPayload",
     "RasterBuffer",
     "RenderSurface",

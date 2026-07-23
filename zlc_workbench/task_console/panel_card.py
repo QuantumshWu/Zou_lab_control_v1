@@ -14,6 +14,7 @@ tree, so deleting ``Zou_lab_control`` cannot orphan it.
 
 from __future__ import annotations
 
+import math
 from typing import Mapping
 from PyQt5 import QtCore, QtWidgets
 
@@ -60,6 +61,8 @@ from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY
 
 from .panel_board import card_size as _card_size
 from .panel_types import (
+    HISTOGRAM_CELL_THRESHOLDS_PARAM as _HISTOGRAM_CELL_THRESHOLDS_PARAM,
+    HISTOGRAM_THRESHOLDS_PARAM as _HISTOGRAM_THRESHOLDS_PARAM,
     RELIM_PARAM as _RELIM_PARAM,
     VIEW_SPEC_PARAM as _VIEW_SPEC_PARAM,
     grid_view_intents as _grid_view_intents,
@@ -85,8 +88,8 @@ fill_grouped_signal_combo = _qt_widgets.param_widgets.fill_grouped_signal_combo
 
 
 # Board layout (raw px).  The board is a pure PIXEL plane of card AABBs -- there is NO column
-# grid.  WIDTH still scales with the size (``cols // 2`` base-widths so 1x4 is wider than 1x2);
-# HEIGHT HUGS the plot -- the card is exactly tall enough for its figure + chrome, with NO blank
+# grid.  WIDTH and HEIGHT wrap the exact FigureSpec logical panel size plus Fluent chrome;
+# the card is exactly large enough for its figure, with NO stretch or blank
 # padding below (every size hugs like 1x2, #H3i-3).  ``PanelConfig.col`` is the card's pixel X and
 # ``row`` is the card's pixel Y; :func:`pack` is the order-driven TOP-LEFT GRAVITY packer that places
 # every card at the first free NW slot in list order.  The CARD'S FORMAT (rounded corners, shadow, grey title strip,
@@ -108,10 +111,12 @@ class PanelCard(FluentGroupBox):
     edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
     fit_analysis_available_changed = QtCore.pyqtSignal(bool)
     front_presented = QtCore.pyqtSignal()
+    rectangle_selected = QtCore.pyqtSignal(object)
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
                  sources_provider=None, formats_provider=None,
-                 short_names_provider=None, render_request=None,
+                 short_names_provider=None, axis_labels_provider=None,
+                 render_request=None,
                  fit_analysis_sink=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
@@ -128,6 +133,9 @@ class PanelCard(FluentGroupBox):
         # picker NEST shows the short name (frame / survival / rate) -- never the full prefixed key
         # nor the verbose SignalSpec axis label.  ONE rule, shared with the Logic tab.
         self.short_names_provider = short_names_provider
+        # callable -> {exact signal key: catalog-authored plot-axis label}.
+        # Routing keys identify data; they are never visible plot chrome.
+        self.axis_labels_provider = axis_labels_provider
         # callable(card, force=False) -> enqueue one latest-only worker compose.
         # The callback receives no mutable render state: ``render_request`` asks
         # this card to freeze a request first, then the worker owns every
@@ -160,6 +168,12 @@ class PanelCard(FluentGroupBox):
         self._grid_focus = None
         self._render_request_revision = 0
         self._requested_signature = None
+        # Qt paints the card in logical pixels, while the worker raster is
+        # authored at the physical-pixel ratio of the screen containing the
+        # TaskConsole.  The console owns screen observation and updates this
+        # value; a DPR change is therefore a render-key change even when the
+        # displayed dataset revision did not advance.
+        self._raster_pixel_ratio = 1.0
         self._pending_interaction_origin = None
         # Bumped by every display-knob edit.  The renderer reads it to tell a
         # genuinely new display from a repeat of the same one.
@@ -228,6 +242,17 @@ class PanelCard(FluentGroupBox):
         """Card size = whole layout slots (the footer absorbs the slack)."""
         self.setFixedSize(*_card_size(self.config.size))
         self._place_setting_button()
+
+    def set_raster_pixel_ratio(self, ratio: float) -> bool:
+        """Set the Qt-owner screen ratio used by the next worker request."""
+
+        ratio = float(ratio)
+        if not math.isfinite(ratio) or ratio <= 0.0:
+            raise ValueError("raster pixel ratio must be positive and finite")
+        if ratio == self._raster_pixel_ratio:
+            return False
+        self._raster_pixel_ratio = ratio
+        return True
 
     def _place_setting_button(self) -> None:
         if hasattr(self, "setting_button"):
@@ -446,18 +471,43 @@ class PanelCard(FluentGroupBox):
         else:
             self.board = SinglePanelHost(
                 self.panel_id, empty_text="waiting for data")
+            # A panel card exposes the frontend owner's complete typed gesture
+            # without deciding what that rectangle means.  ROI/control-domain
+            # routing belongs to the TaskConsole composition layer; keeping
+            # that meaning out of this view is what lets every image-like
+            # consumer share the same selector.
+            self.board.rectangleSelected.connect(self.rectangle_selected.emit)
         # The pulse-preview answer protocol, verbatim: a wheel-zoom / pan /
         # double-middle commit is answered by re-composing THIS card at the
         # candidate's view under the candidate's revision; a clim-rail commit
         # routes through the ONE fixed-limits writer the Setting inputs use.
         self.board.viewCommitted.connect(self._on_view_committed)
         self.board.colorLimitsCommitted.connect(self._on_color_limits_committed)
+        self.board.thresholdsCommitted.connect(
+            self._on_histogram_thresholds_committed
+        )
         # The console switch may have been armed before this card received its
         # first frame.  Replay the card-owned state onto the newly-created host;
         # otherwise the visible switch says ON while this first surface stays
         # inert until the operator toggles it twice.
         self._apply_selectors_state()
         self.canvas_holder.addWidget(self.board)
+
+    def selection_for_rectangle_gesture(self, gesture):
+        """Promote this card's exact held rectangle through its selector owner."""
+
+        from zlc_frontend.qt_widgets import SinglePanelHost
+        from zlc_frontend.selector import RectangleGesture
+
+        if not isinstance(gesture, RectangleGesture):
+            raise TypeError("gesture must be RectangleGesture")
+        if gesture.panel_id != self.panel_id:
+            raise ValueError("rectangle gesture belongs to another panel card")
+        if not isinstance(self.board, SinglePanelHost):
+            raise RuntimeError(
+                "rectangle selection requires this card's single-panel host"
+            )
+        return self.board.board.selection_for_rectangle_gesture(gesture)
 
     def _focus_grid_cell(self, panel_index: int, selection) -> None:
         """Show one exact cell from the currently painted coherent overview."""
@@ -554,6 +604,35 @@ class PanelCard(FluentGroupBox):
         from zlc_frontend.panel_render import PanelProvenance
 
         schema = value.snapshot.block.schema
+        site_map_view = None
+        if self.config.kind == "sites":
+            from zlc_frontend.site_map_render import (
+                CalibrationSiteMapView,
+                OccupancyCellView,
+                OccupancySummarySiteMapView,
+            )
+
+            site_map_view = getattr(value, "presentation", None)
+            if not isinstance(
+                site_map_view,
+                (
+                    OccupancyCellView,
+                    CalibrationSiteMapView,
+                    OccupancySummarySiteMapView,
+                ),
+            ):
+                self.set_status(
+                    "Site map needs a committed calibration or an exact "
+                    "single-cell occupancy result",
+                    error=True,
+                )
+                return None
+            if site_map_view.site_state_input.ref != value.snapshot.ref:
+                self.set_status(
+                    "Site map presentation belongs to another data revision",
+                    error=True,
+                )
+                return None
         if schema != self._candidate_schema:
             self._candidate_schema = schema
             self._grid_focus = None
@@ -562,7 +641,11 @@ class PanelCard(FluentGroupBox):
             self._refresh_grid_view_controls()
             self._refresh_repeat_mode_control()
         self._candidate_value = value
-        view = self._saved_view_spec(schema)
+        view = (
+            None
+            if self.config.kind == "sites"
+            else self._saved_view_spec(schema)
+        )
         if self.config.kind == "grid" and view is None:
             self.set_status(
                 "choose a named facet axis in Setting",
@@ -570,14 +653,30 @@ class PanelCard(FluentGroupBox):
             )
             return None
         display = self._display_state()
-        size = tuple(int(value) for value in panel_display_size(self.config.size))
+        logical_size = tuple(
+            int(value) for value in panel_display_size(self.config.size)
+        )
+        pixel_ratio = float(self._raster_pixel_ratio)
+        size = tuple(
+            max(1, QtCore.qRound(value * pixel_ratio))
+            for value in logical_size
+        )
         source_key = (
             str(self.config.kind),
             str(value.name),
             str(value.source),
             str(self.config.title),
             size,
+            pixel_ratio,
             view,
+            (
+                None
+                if site_map_view is None
+                else (
+                    site_map_view.view_identity,
+                    site_map_view.calibration_identity,
+                )
+            ),
         )
         focus = self._grid_focus if self.config.kind == "grid" else None
         signature = (frame_key, source_key, display, focus)
@@ -585,22 +684,45 @@ class PanelCard(FluentGroupBox):
             return None
         self._render_request_revision += 1
         self._requested_signature = signature
+        value_label = self._signal_axis_label(str(value.name))
         return _PanelRenderRequest(
             self.panel_id,
+            self.config.kind,
             self._render_request_revision,
             signature,
             source_key,
             frame_key,
             value,
             display,
-            self.view_intent(),
+            None if self.config.kind == "sites" else self.view_intent(),
             str(self.config.title or value.name),
+            value_label,
             size,
+            self.config.size,
+            pixel_ratio,
             PanelProvenance(value.run_id, value.epoch_id, value.join_digest),
             view,
             self.config.kind == "grid",
             focus,
         )
+
+    def _signal_axis_label(self, signal_key: str) -> str:
+        """Resolve one visible label without exposing a producer routing key."""
+
+        labels = (
+            self.axis_labels_provider()
+            if callable(self.axis_labels_provider)
+            else {}
+        )
+        authored = str(labels.get(signal_key, "")).strip() if labels else ""
+        if authored:
+            return authored
+        short = str(
+            self._signal_short_names_map().get(signal_key, "")
+        ).strip()
+        if short:
+            return short
+        return signal_key.rsplit("/", 1)[-1].strip() or "Signal"
 
     def accept_render_result(
         self,
@@ -638,7 +760,9 @@ class PanelCard(FluentGroupBox):
             self._pending_frame = None
             self._last_figure = faceted_result.figure
             document = faceted_result.figure.document
-        elif frame is None or document is None:
+        elif frame is None or (
+            self.config.kind != "sites" and document is None
+        ):
             self.set_status("render worker returned no complete front", error=True)
             return True
         else:
@@ -663,6 +787,10 @@ class PanelCard(FluentGroupBox):
         a second view of the same data.
         """
 
+        if self.config.kind == "sites":
+            raise ValueError(
+                "Site map is an exact composite payload, not a dataset ViewIntent"
+            )
         if self.config.kind == "grid":
             raw = self.config.params.get(_VIEW_SPEC_PARAM)
             if raw is None:
@@ -694,14 +822,24 @@ class PanelCard(FluentGroupBox):
         """
 
         from zlc_frontend.curve_display import CurveDisplayState
-        from zlc_frontend.histogram_display import HistogramDisplayState
+        from zlc_frontend.histogram_display import (
+            FacetedHistogramDisplayState,
+            HistogramCountScale,
+            HistogramDisplayState,
+            HistogramFitMode,
+            histogram_cell_thresholds_from_tree,
+        )
         from zlc_frontend.image_display import ImageColormap, ImageDisplayState
         from zlc_frontend.meter_display import MeterDisplayState
         from zlc_frontend.display_range import RelimMode
         from zlc_frontend.figure import ViewIntent
 
         params = self.config.params
-        intent = self.view_intent()
+        intent = (
+            None
+            if self.config.kind == "sites"
+            else self.view_intent()
+        )
         # The panel's relim vocabulary IS the renderer's: tight / normal / fixed.
         # Converting rather than re-deciding keeps one set of names, so a mode
         # the renderer grows is a mode the Setting can offer with no mapping to
@@ -718,17 +856,46 @@ class PanelCard(FluentGroupBox):
                 x_view=pin_x,
             )
         if intent is ViewIntent.HISTOGRAM:
-            return HistogramDisplayState(
+            param_kind = "hist" if self.config.kind == "grid" else self.config.kind
+            display = HistogramDisplayState(
                 revision=self._display_revision, relim_mode=mode,
+                count_scale=(
+                    HistogramCountScale.LOG
+                    if bool(_resolved_panel_param(param_kind, params, "ylog"))
+                    else HistogramCountScale.LINEAR
+                ),
                 bin_count=int(
                     _resolved_panel_param(
-                        "hist" if self.config.kind == "grid" else self.config.kind,
+                        param_kind,
                         params,
                         "bins",
                     )
                 ),
+                fit_mode=HistogramFitMode(
+                    str(_resolved_panel_param(param_kind, params, "fit"))
+                ),
                 fixed_count_limits=fixed,
                 x_view=pin_x,
+                thresholds=(
+                    ()
+                    if self.config.kind == "grid"
+                    else tuple(
+                        params.get(_HISTOGRAM_THRESHOLDS_PARAM, ())
+                    )
+                ),
+            )
+            if self.config.kind != "grid":
+                return display
+            raw_thresholds = params.get(
+                _HISTOGRAM_CELL_THRESHOLDS_PARAM
+            )
+            return FacetedHistogramDisplayState(
+                display,
+                (
+                    ()
+                    if raw_thresholds is None
+                    else histogram_cell_thresholds_from_tree(raw_thresholds)
+                ),
             )
         if intent is ViewIntent.METER:
             focus = self._grid_focus
@@ -737,11 +904,14 @@ class PanelCard(FluentGroupBox):
                 None if focus is None else focus.selection,
                 self._display_revision,
             )
+        image_param_kind = (
+            "2d" if self.config.kind == "grid" else self.config.kind
+        )
         return ImageDisplayState(
             revision=self._display_revision,
             relim_mode=mode,
             colormap=ImageColormap(
-                str(_resolved_panel_param(self.config.kind, params, "colormap"))
+                str(_resolved_panel_param(image_param_kind, params, "colormap"))
             ),
             fixed_color_limits=fixed,
             x_view=pin_x,
@@ -757,6 +927,10 @@ class PanelCard(FluentGroupBox):
         saving cannot re-guess axes or plot kind from an array shape.
         """
 
+        if self.config.kind == "sites":
+            raise RuntimeError(
+                "Site map is an exact composite front, not a single-dataset DataFigure"
+            )
         if self._last_figure is not None:
             return self._last_figure
 
@@ -924,6 +1098,26 @@ class PanelCard(FluentGroupBox):
         if self.grid_bins_widget is not None:
             self.param_widgets["bins"] = self.grid_bins_widget
         display.addWidget(self.grid_bins_row)
+        self.grid_ylog_row, self.grid_ylog_widget = self._make_grid_hist_param_row(
+            "ylog",
+            self._set_param,
+            label_w,
+        )
+        if self.grid_ylog_widget is not None:
+            self.param_widgets["ylog"] = self.grid_ylog_widget
+        display.addWidget(self.grid_ylog_row)
+        self.grid_colormap_row, self.grid_colormap_widget = (
+            self._make_grid_cell_param_row(
+                "2d",
+                "colormap",
+                self._image_intent(),
+                self._set_param,
+                label_w,
+            )
+        )
+        if self.grid_colormap_widget is not None:
+            self.param_widgets["colormap"] = self.grid_colormap_widget
+        display.addWidget(self.grid_colormap_row)
         (
             self.grid_intent_row,
             self.grid_intent_combo,
@@ -1159,8 +1353,37 @@ class PanelCard(FluentGroupBox):
             ),
         )
 
+    @staticmethod
+    def _display_selection_from_view(view):
+        """Merge the persisted display-only terms for a re-suggestion.
+
+        ``suggest_view`` accepts one Selection while ``ViewSpec`` stores a
+        normalized tuple.  Rebuilding a facet/repeat binding must therefore
+        carry the complete term set across instead of silently resetting ROI
+        or named-axis selections.
+        """
+
+        from zlc_data import Selection
+
+        terms = tuple(
+            term
+            for selection in view.display_selections
+            for term in selection.terms
+        )
+        return None if not terms else Selection(terms)
+
+    @staticmethod
+    def _facet_axis_ids(view):
+        from zlc_frontend.figure import AxisViewRole
+
+        return tuple(
+            binding.axis_id
+            for binding in view.axis_bindings
+            if binding.role is AxisViewRole.FACET
+        )
+
     def _grid_candidate_view(self, intent, facet_axis_id):
-        """Resolve one explicit named facet through the Figure contract."""
+        """Resolve one explicit facet choice to the complete named facet tuple."""
 
         from zlc_frontend.figure import (
             AxisViewRole,
@@ -1175,12 +1398,17 @@ class PanelCard(FluentGroupBox):
         if schema is None:
             return None
         saved = self._saved_view_spec(schema)
+        selection = (
+            None
+            if saved is None
+            else self._display_selection_from_view(saved)
+        )
         if saved is not None and saved.intent is intent:
             repeat_mode = self._repeat_mode_from_view(saved, schema)
-            # The live Grid deliberately authors one facet axis.  Moving the
-            # facet away from repeat therefore restores the intent's ordinary
-            # repeat default rather than silently creating a second dimension
-            # of panels.
+            # Moving the explicit primary choice away from repeat restores the
+            # intent's ordinary repeat default.  Other contract-required FACET
+            # axes remain explicit in the resolved ViewSpec and are shown in
+            # the control's complete tuple.
             if (
                 repeat_mode is RepeatViewMode.FACET
                 and facet_axis_id != schema.repeat_axis.axis_id
@@ -1216,6 +1444,7 @@ class PanelCard(FluentGroupBox):
         suggestion = suggest_view(
             schema,
             intent,
+            selection,
             preferences=preferences,
         )
         if (
@@ -1251,7 +1480,8 @@ class PanelCard(FluentGroupBox):
         )
         facet_combo = FluentComboBox()
         facet_combo.setToolTip(
-            "The declared AxisId expanded into coherent grid cells."
+            "Choose the primary declared facet. Each item shows the complete "
+            "named facet_axis_ids tuple persisted in the ViewSpec."
         )
         intent_row = FluentSettingRow(
             "cell view",
@@ -1259,7 +1489,7 @@ class PanelCard(FluentGroupBox):
             label_width=label_w,
         )
         facet_row = FluentSettingRow(
-            "facet axis",
+            "facet axes",
             facet_combo,
             label_width=label_w,
         )
@@ -1282,27 +1512,56 @@ class PanelCard(FluentGroupBox):
         facet_row.setVisible(visible)
         return intent_row, intent_combo, facet_row, facet_combo
 
-    def _make_grid_bins_row(self, apply, label_w):
-        """Build the histogram-only Grid knob through the shared param owner."""
+    def _make_grid_hist_param_row(self, key: str, apply, label_w):
+        """Build one histogram-only Grid knob through the shared param owner."""
+
+        return self._make_grid_cell_param_row(
+            "hist",
+            key,
+            self._histogram_intent(),
+            apply,
+            label_w,
+        )
+
+    def _make_grid_cell_param_row(
+        self,
+        param_kind: str,
+        key: str,
+        intent,
+        apply,
+        label_w,
+    ):
+        """Build one cell-family Grid knob from its ordinary panel declaration."""
 
         if self.config.kind != "grid":
-            row = FluentSettingRow("bins", QtWidgets.QWidget(), label_width=label_w)
+            row = FluentSettingRow(str(key), QtWidgets.QWidget(), label_width=label_w)
             row.hide()
             return row, None
         declaration = next(
-            item for item in _panel_param_decls("hist") if item.key == "bins"
+            item
+            for item in _panel_param_decls(str(param_kind))
+            if item.key == str(key)
         )
         widget = self._make_param_widget(declaration, apply=apply)
         self._param_kinds[declaration.key] = declaration.kind
         row = FluentSettingRow(declaration.label, widget, label_width=label_w)
-        row.setVisible(self._grid_cell_intent() is self._histogram_intent())
+        row.setVisible(self._grid_cell_intent() is intent)
         return row, widget
+
+    def _make_grid_bins_row(self, apply, label_w):
+        return self._make_grid_hist_param_row("bins", apply, label_w)
 
     @staticmethod
     def _histogram_intent():
         from zlc_frontend.figure import ViewIntent
 
         return ViewIntent.HISTOGRAM
+
+    @staticmethod
+    def _image_intent():
+        from zlc_frontend.figure import ViewIntent
+
+        return ViewIntent.IMAGE
 
     def _grid_cell_intent(self):
         if self.config.kind != "grid":
@@ -1346,11 +1605,35 @@ class PanelCard(FluentGroupBox):
         ) if schema is not None else None
         with _signals_blocked(facet_combo):
             facet_combo.clear()
-            for axis, _view in self._grid_facet_choices(intent):
+            from zlc_frontend.figure import dataset_axes
+
+            axes_by_id = {
+                axis.axis_id: axis
+                for axis in (() if schema is None else dataset_axes(schema))
+            }
+            for axis, view in self._grid_facet_choices(intent):
+                displayed_view = (
+                    current
+                    if (
+                        current is not None
+                        and current.intent is intent
+                        and axis.axis_id == preferred
+                    )
+                    else view
+                )
+                facet_summary = " × ".join(
+                    (
+                        f"{axes_by_id[axis_id].name} "
+                        f"[{axis_id.value}]"
+                        if axis_id in axes_by_id
+                        else axis_id.value
+                    )
+                    for axis_id in self._facet_axis_ids(displayed_view)
+                )
                 facet_combo.addItem(
                     (
-                        f"{axis.name} · {axis.role.value} · "
-                        f"{axis.axis_id.value}"
+                        f"{axis.name} · {axis.role.value} → "
+                        f"{facet_summary}"
                     ),
                     axis.axis_id,
                 )
@@ -1366,10 +1649,15 @@ class PanelCard(FluentGroupBox):
         if intent_combo is None or facet_combo is None:
             return
         self._seed_grid_view_controls(intent_combo, facet_combo)
-        bins_row = getattr(self, "grid_bins_row", None)
-        if bins_row is not None:
-            bins_row.setVisible(
-                self._grid_cell_intent() is self._histogram_intent()
+        histogram_grid = self._grid_cell_intent() is self._histogram_intent()
+        for row_name in ("grid_bins_row", "grid_ylog_row"):
+            row = getattr(self, row_name, None)
+            if row is not None:
+                row.setVisible(histogram_grid)
+        image_row = getattr(self, "grid_colormap_row", None)
+        if image_row is not None:
+            image_row.setVisible(
+                self._grid_cell_intent() is self._image_intent()
             )
 
     def _seed_grid_view_controls(self, intent_combo, facet_combo) -> None:
@@ -1415,6 +1703,8 @@ class PanelCard(FluentGroupBox):
     def _saved_view_spec(self, schema):
         """Decode the one current owner-coded presentation value, if authored."""
 
+        if self.config.kind == "sites":
+            return None
         raw = self.config.params.get(_VIEW_SPEC_PARAM)
         if raw is None:
             return None
@@ -1427,6 +1717,8 @@ class PanelCard(FluentGroupBox):
             # presentation-only value and let the Figure owner suggest a new
             # typed default for the new schema.
             self.config.params.pop(_VIEW_SPEC_PARAM, None)
+            self.config.params.pop(_HISTOGRAM_CELL_THRESHOLDS_PARAM, None)
+            self.config.params.pop(_HISTOGRAM_THRESHOLDS_PARAM, None)
             return None
         allowed_intents = (
             {item[1] for item in _grid_view_intents()}
@@ -1447,6 +1739,8 @@ class PanelCard(FluentGroupBox):
         concern and has no entry in RepeatViewMode.
         """
 
+        if self.config.kind == "sites":
+            return ()
         schema = self._current_schema()
         if schema is None:
             return ()
@@ -1618,7 +1912,17 @@ class PanelCard(FluentGroupBox):
             )
         else:
             preferences = ViewPreferences(repeat_mode=mode)
-        suggestion = suggest_view(schema, intent, preferences=preferences)
+        selection = (
+            None
+            if saved is None
+            else self._display_selection_from_view(saved)
+        )
+        suggestion = suggest_view(
+            schema,
+            intent,
+            selection,
+            preferences=preferences,
+        )
         if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
             self.set_status(
                 "repeat choice needs an explicit axis selection for this data",
@@ -1642,6 +1946,8 @@ class PanelCard(FluentGroupBox):
             return
         self.config.signal = name
         self.config.params.pop(_VIEW_SPEC_PARAM, None)
+        self.config.params.pop(_HISTOGRAM_CELL_THRESHOLDS_PARAM, None)
+        self.config.params.pop(_HISTOGRAM_THRESHOLDS_PARAM, None)
         self._last_value = None
         self._candidate_value = None
         self._last_document = None
@@ -1743,6 +2049,70 @@ class PanelCard(FluentGroupBox):
         lo, hi = (float(value) for value in commit.color_limits)
         self._store_fixed_lims(lo, hi)
         self._display_revision = old_revision + 1
+        self._pending_interaction_origin = commit.origin
+        self._request_current_render()
+        self.changed.emit()
+
+    def _on_histogram_thresholds_committed(self, commit) -> None:
+        """CAS one drag step into the exact visible histogram cell."""
+
+        from zlc_frontend.histogram_display import (
+            FacetedHistogramDisplayState,
+            faceted_histogram_display_with_thresholds,
+            histogram_cell_thresholds_to_tree,
+            histogram_display_with_thresholds,
+        )
+        from zlc_frontend.selector import HistogramThresholdCommit
+
+        if not isinstance(commit, HistogramThresholdCommit):
+            raise TypeError(
+                "threshold commit must retain its typed exact origin"
+            )
+        host = self.board
+        if host is None:
+            return
+        if commit.origin != host.visible_interaction_origin():
+            host.discard_pending_interaction(commit.origin)
+            return
+        if self._display_revision != commit.origin.presentation.panel_revision:
+            host.discard_pending_interaction(commit.origin)
+            return
+
+        display = self._display_state()
+        if self.config.kind == "grid":
+            focus = self._grid_focus
+            if (
+                focus is None
+                or not isinstance(display, FacetedHistogramDisplayState)
+            ):
+                host.discard_pending_interaction(commit.origin)
+                return
+            candidate = faceted_histogram_display_with_thresholds(
+                display,
+                focus.selection,
+                commit.thresholds,
+            )
+            if candidate == display:
+                host.discard_pending_interaction(commit.origin)
+                return
+            self.config.params[_HISTOGRAM_CELL_THRESHOLDS_PARAM] = (
+                histogram_cell_thresholds_to_tree(
+                    candidate.cell_thresholds
+                )
+            )
+            self._display_revision = candidate.revision
+        else:
+            candidate = histogram_display_with_thresholds(
+                display,
+                commit.thresholds,
+            )
+            if candidate == display:
+                host.discard_pending_interaction(commit.origin)
+                return
+            self.config.params[_HISTOGRAM_THRESHOLDS_PARAM] = list(
+                candidate.thresholds
+            )
+            self._display_revision = candidate.revision
         self._pending_interaction_origin = commit.origin
         self._request_current_render()
         self.changed.emit()

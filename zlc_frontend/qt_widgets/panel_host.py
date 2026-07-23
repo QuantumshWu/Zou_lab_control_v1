@@ -23,7 +23,7 @@ from ..render import (
     BoardFrame, CoherenceStamp, CurvePanelPayload, HistogramPanelPayload,
     DocumentPresentationStamp, ImagePanelPayload, PanelFrame,
     PanelPresentationIdentity,
-    PulsePanelPayload, RasterBuffer, SourceIdentity)
+    PulsePanelPayload, RasterBuffer, SiteMapPanelPayload, SourceIdentity)
 from ..selector import (
     CurveRangeGesture, CurveViewportCommit, HistogramRangeGesture,
     HistogramThresholdCommit, HistogramViewportCommit, ImageColorLimitsCommit,
@@ -275,13 +275,18 @@ class SinglePanelHost(QtWidgets.QWidget):
             self._board.bind_histogram_interaction(
                 self._panel_id, self._on_intent)
             self._bound_kind = "histogram"
-        elif isinstance(payload, ImagePanelPayload):
+        elif isinstance(payload, (ImagePanelPayload, SiteMapPanelPayload)):
             # The image family separates the operator's switch from readiness:
             # bind unarmed, then declare the just-presented provenance current
             # (the host's one source IS the frame the caller handed over).
+            image_payload = (
+                payload.background
+                if isinstance(payload, SiteMapPanelPayload)
+                else payload
+            )
             self._board.bind_rectangle_selector(
                 self._panel_id,
-                payload.viewport,
+                image_payload.viewport,
                 self.rectangleSelected.emit,
                 enabled=False,
                 interaction_callback=self._on_intent,

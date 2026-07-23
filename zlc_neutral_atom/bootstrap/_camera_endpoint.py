@@ -992,12 +992,13 @@ class CameraCaptureEndpoint:
 
 
 class CameraMonitorEndpoint(CameraCaptureEndpoint):
-    """The FREE_RUNNING command face of the shared camera endpoint owner.
+    """The display-only command face of the shared camera endpoint owner.
 
-    It deliberately has no exact prepare/read/complete commands.  The adapter
-    owns exposure cadence; the Run owner merely drains ordered records until
-    cancellation invokes the same bounded DISARM/session-close recipe used by
-    finite capture.
+    The adapter owns exposure cadence for a FREE_RUNNING camera.  For an
+    EXTERNAL_TRIGGERED camera, independent hardware owns trigger timing and the
+    monitor merely drains the resulting ordered records.  Exact capture
+    commands remain available through ``CameraCaptureEndpoint`` and retain all
+    of their qualification and finite-cardinality checks.
     """
 
     def __init__(
@@ -1007,13 +1008,18 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         *,
         max_source_burst_events: int | None = None,
         max_blocking_call_seconds: float | None = None,
+        exact_external_trigger_qualification_digest: str | None = None,
+        acquisition_mode: CameraAcquisitionMode = CameraAcquisitionMode.FREE_RUNNING,
     ) -> None:
         super().__init__(
             camera,
             source_id,
             max_source_burst_events=max_source_burst_events,
             max_blocking_call_seconds=max_blocking_call_seconds,
-            acquisition_mode=CameraAcquisitionMode.FREE_RUNNING,
+            exact_external_trigger_qualification_digest=(
+                exact_external_trigger_qualification_digest
+            ),
+            acquisition_mode=acquisition_mode,
         )
 
     def _make_capability_snapshot(
@@ -1026,7 +1032,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             binding_stamp=binding_stamp,
             payload_contract=payload_contract,
             camera_capability_evidence=capability_evidence,
-            acquisition_mode=CameraAcquisitionMode.FREE_RUNNING,
+            acquisition_mode=self._acquisition_mode,
         )
 
     def execute_command(self, binding: BoundDevice, command: object) -> object:
@@ -1036,7 +1042,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             return self._start_monitor(binding, command)
         if isinstance(command, ReadCameraMonitorCommand):
             return self._read_monitor(binding, command)
-        raise TypeError(f"camera monitor endpoint rejects command {type(command).__name__}")
+        return super().execute_command(binding, command)
 
     def _prepare_monitor(
         self,

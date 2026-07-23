@@ -7,6 +7,8 @@ domain-specific QPainter surfaces composed by Workbench windows.
 
 from __future__ import annotations
 
+from ..typography import FONT_FAMILY
+
 
 ACCENT = "#77AADD"
 HOVER = "#004578"
@@ -39,9 +41,18 @@ MUTED_LABEL_STYLE = f"color: {GREY}; background: transparent; border: none;"
 SELECTOR_COLOR = "#808080"       # matplotlib 'grey'
 SELECTOR_ALPHA = 204             # alpha 0.8
 SELECTOR_LINE_PX = 2.9           # lines.linewidth   1.0 pt @ 210 dpi
+SELECTOR_FONT_FAMILY = FONT_FAMILY
 SELECTOR_FONT_PX = 19            # legend.fontsize   6.5 pt @ 210 dpi
-SELECTOR_HANDLE_PX = 9           # legend.fontsize/2 3.25 pt @ 210 dpi (square side)
+SELECTOR_HANDLE_PX = 9.5         # legend.fontsize/2 3.25 pt @ 210 dpi (square side)
 SELECTOR_DOT_PX = 6              # lines.markersize  2.0 pt @ 210 dpi (dot diameter)
+# QFont's pixel size is its em size, not the painted line height.  These map to
+# 22 px / 19 px QFontMetrics line heights, matching Matplotlib's painted
+# 7.5 pt / 6.5 pt text in the established 210 dpi panel raster.  Feeding those
+# painted heights back into ``QFont.setPixelSize`` made Qt's lines 30/26 px and
+# overflowed the same fixed FigureSpec/Divider bottom margin.
+PLOT_AXIS_LABEL_FONT_PX = 16
+PLOT_TICK_FONT_PX = 14
+PLOT_TICK_LENGTH_PX = 7
 RADIUS = 4
 CARD_TITLE_PX = 32
 CARD_PAD = 10
@@ -122,6 +133,9 @@ __all__ = [
     "PADDING_H",
     "PADDING_V",
     "PLACEHOLDER",
+    "PLOT_AXIS_LABEL_FONT_PX",
+    "PLOT_TICK_FONT_PX",
+    "PLOT_TICK_LENGTH_PX",
     "RASTER_PLACEHOLDER_BACKGROUND",
     "RASTER_PLACEHOLDER_TEXT",
     "RADIUS",

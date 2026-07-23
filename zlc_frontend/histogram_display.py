@@ -14,7 +14,13 @@ import math
 
 import numpy as np
 
-from zlc_data import immutable_array
+from zlc_data import (
+    IndexSelection,
+    Selection,
+    immutable_array,
+    selection_from_tree,
+    selection_to_tree,
+)
 from zlc_storage import exact_mapping, finite_real, nonnegative_integer
 
 from .display_range import (
@@ -38,6 +44,14 @@ class HistogramCountScale(str, Enum):
 
     LINEAR = "linear"
     LOG = "log"
+
+
+class HistogramFitMode(str, Enum):
+    """The established bounded presentation fit shown on a Distribution."""
+
+    NONE = "none"
+    SINGLE = "single"
+    DOUBLE = "double"
 
 
 def _histogram_bin_count(value: object) -> int:
@@ -71,6 +85,7 @@ class HistogramDisplayState:
     relim_mode: RelimMode = RelimMode.TIGHT
     count_scale: HistogramCountScale = HistogramCountScale.LINEAR
     bin_count: int = DEFAULT_HISTOGRAM_BINS
+    fit_mode: HistogramFitMode = HistogramFitMode.DOUBLE
     x_view: DisplayRange | None = None
     fixed_count_limits: DisplayRange | None = None
     # ZERO OR MORE vertical threshold cut lines (the design's frozen histogram
@@ -89,6 +104,8 @@ class HistogramDisplayState:
             raise TypeError("relim_mode must be RelimMode")
         if not isinstance(self.count_scale, HistogramCountScale):
             raise TypeError("count_scale must be HistogramCountScale")
+        if not isinstance(self.fit_mode, HistogramFitMode):
+            raise TypeError("fit_mode must be HistogramFitMode")
         object.__setattr__(self, "bin_count", _histogram_bin_count(self.bin_count))
         object.__setattr__(
             self,
@@ -121,6 +138,178 @@ class HistogramDisplayState:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class HistogramCellThresholds:
+    """One Grid cell's display-only threshold set.
+
+    ``selection`` is the sparse logical cell identity painted in the overview,
+    not a dense storage row and not a transient ``LatestNonempty`` resolution.
+    """
+
+    selection: Selection
+    thresholds: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.selection, Selection):
+            raise TypeError("histogram cell threshold selection must be Selection")
+        if any(
+            not isinstance(term, IndexSelection)
+            for term in self.selection.terms
+        ):
+            raise TypeError(
+                "histogram cell threshold selection must use logical indices"
+            )
+        object.__setattr__(
+            self,
+            "thresholds",
+            tuple(
+                finite_real(value, "histogram cell threshold")
+                for value in self.thresholds
+            ),
+        )
+
+
+def _validated_cell_thresholds(
+    value: object,
+) -> tuple[HistogramCellThresholds, ...]:
+    entries = tuple(value)
+    if any(not isinstance(item, HistogramCellThresholds) for item in entries):
+        raise TypeError(
+            "cell_thresholds must contain HistogramCellThresholds values"
+        )
+    if len({item.selection for item in entries}) != len(entries):
+        raise ValueError("histogram cell threshold selections must be unique")
+    return tuple(
+        sorted(
+            entries,
+            key=lambda item: tuple(
+                (term.axis_id.value, getattr(term, "index", -1))
+                for term in item.selection.terms
+            ),
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FacetedHistogramDisplayState:
+    """One shared histogram style plus thresholds authored per logical cell."""
+
+    display: HistogramDisplayState
+    cell_thresholds: tuple[HistogramCellThresholds, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.display, HistogramDisplayState):
+            raise TypeError("faceted histogram display must wrap HistogramDisplayState")
+        if self.display.thresholds:
+            raise ValueError(
+                "faceted histogram thresholds belong to cells, not the shared display"
+            )
+        object.__setattr__(
+            self,
+            "cell_thresholds",
+            _validated_cell_thresholds(self.cell_thresholds),
+        )
+
+    @property
+    def revision(self) -> int:
+        return self.display.revision
+
+    def display_for(self, selection: Selection) -> HistogramDisplayState:
+        if not isinstance(selection, Selection):
+            raise TypeError("histogram cell selection must be Selection")
+        thresholds = next(
+            (
+                item.thresholds
+                for item in self.cell_thresholds
+                if item.selection == selection
+            ),
+            (),
+        )
+        return replace(self.display, thresholds=thresholds)
+
+
+_HISTOGRAM_CELL_THRESHOLDS_SCHEMA = (
+    "zlc_frontend.HistogramCellThresholds.v1"
+)
+
+
+def histogram_cell_thresholds_to_tree(
+    entries: tuple[HistogramCellThresholds, ...],
+) -> dict[str, object]:
+    """Encode the complete sparse threshold map through its frontend owner."""
+
+    resolved = _validated_cell_thresholds(entries)
+    return {
+        "schema": _HISTOGRAM_CELL_THRESHOLDS_SCHEMA,
+        "entries": [
+            {
+                "selection": selection_to_tree(item.selection),
+                "thresholds": list(item.thresholds),
+            }
+            for item in resolved
+        ],
+    }
+
+
+def histogram_cell_thresholds_from_tree(
+    tree: object,
+) -> tuple[HistogramCellThresholds, ...]:
+    """Decode a persisted sparse threshold map without positional inference."""
+
+    data = exact_mapping(
+        tree,
+        {"schema", "entries"},
+        _HISTOGRAM_CELL_THRESHOLDS_SCHEMA,
+    )
+    raw_entries = data["entries"]
+    if not isinstance(raw_entries, list):
+        raise ValueError("histogram cell threshold entries must be a list")
+    entries = []
+    for raw in raw_entries:
+        item = exact_mapping(
+            raw,
+            {"selection", "thresholds"},
+            "histogram cell threshold entry",
+            discriminator=None,
+        )
+        raw_thresholds = item["thresholds"]
+        if not isinstance(raw_thresholds, list):
+            raise ValueError("histogram cell thresholds must be a list")
+        entries.append(
+            HistogramCellThresholds(
+                selection_from_tree(item["selection"]),
+                tuple(raw_thresholds),
+            )
+        )
+    return _validated_cell_thresholds(entries)
+
+
+def faceted_histogram_display_with_thresholds(
+    base: FacetedHistogramDisplayState,
+    selection: Selection,
+    thresholds: tuple[float, ...],
+) -> FacetedHistogramDisplayState:
+    """Return one-cell candidate state; the host CAS-checks its painted origin."""
+
+    if not isinstance(base, FacetedHistogramDisplayState):
+        raise TypeError("base must be FacetedHistogramDisplayState")
+    candidate = HistogramCellThresholds(selection, tuple(thresholds))
+    by_selection = {
+        item.selection: item for item in base.cell_thresholds
+    }
+    if candidate.thresholds:
+        by_selection[candidate.selection] = candidate
+    else:
+        by_selection.pop(candidate.selection, None)
+    entries = _validated_cell_thresholds(by_selection.values())
+    if entries == base.cell_thresholds:
+        return base
+    return FacetedHistogramDisplayState(
+        replace(base.display, revision=base.display.revision + 1),
+        entries,
+    )
+
+
 _HISTOGRAM_DISPLAY_FORM = FormSpec(
     (
         FormFieldProps(
@@ -149,6 +338,16 @@ _HISTOGRAM_DISPLAY_FORM = FormSpec(
             default=DEFAULT_HISTOGRAM_BINS,
             minimum=MIN_HISTOGRAM_BINS,
         ),
+        FormFieldProps(
+            "fit_mode",
+            "choice",
+            "Fit",
+            default=HistogramFitMode.DOUBLE,
+            choices=tuple(
+                FormChoice(mode.value.title(), mode)
+                for mode in HistogramFitMode
+            ),
+        ),
         FormFieldProps("x_min", "float", "X minimum", default=None),
         FormFieldProps("x_max", "float", "X maximum", default=None),
         FormFieldProps("count_min", "float", "Count minimum", default=None),
@@ -174,6 +373,7 @@ def histogram_display_form_values(
         "relim_mode": state.relim_mode,
         "count_scale": state.count_scale,
         "bin_count": state.bin_count,
+        "fit_mode": state.fit_mode,
         "x_min": x_min,
         "x_max": x_max,
         "count_min": count_min,
@@ -208,6 +408,9 @@ def histogram_display_from_form(
     if not isinstance(count_scale, HistogramCountScale):
         raise TypeError("count_scale form value must be HistogramCountScale")
     bin_count = _histogram_bin_count(values["bin_count"])
+    fit_mode = values["fit_mode"]
+    if not isinstance(fit_mode, HistogramFitMode):
+        raise TypeError("fit_mode form value must be HistogramFitMode")
     x_view = display_range_from_form(values, "x_min", "x_max", "x_view")
     submitted_fixed = display_range_from_form(
         values,
@@ -244,6 +447,7 @@ def histogram_display_from_form(
         relim_mode=relim_mode,
         count_scale=count_scale,
         bin_count=bin_count,
+        fit_mode=fit_mode,
         x_view=x_view,
         fixed_count_limits=fixed_count_limits,
         # The display form does not edit thresholds; the authored cut lines
@@ -673,6 +877,59 @@ class HistogramBinProjection:
         object.__setattr__(self, "requested_bin_count", bins)
 
 
+@dataclass(frozen=True, slots=True, eq=False, init=False)
+class _WindowedHistogramProjection:
+    """Renderer-private robust bars for Main-equivalent Grid thumbnails."""
+
+    visible_bin_counts: tuple[np.ndarray, ...]
+    visible_bin_edges: np.ndarray
+
+    def __init__(
+        self,
+        series_samples: tuple[np.ndarray, ...],
+        bins: int,
+        *,
+        visible_range: DisplayRange,
+    ) -> None:
+        values_by_series = _histogram_series(series_samples)
+        bins = _histogram_bin_count(bins)
+        low, high = validated_display_range(
+            visible_range,
+            "windowed histogram visible_range",
+        )
+        # The live Grid's visible bars intentionally retain Main's robust
+        # uniformly-spaced thumbnail geometry, including boolean payloads.
+        edges = _immutable_histogram_array(
+            np.linspace(low, high, bins + 1, dtype=np.float64),
+            np.dtype(np.float64),
+        )
+        visible_counts = []
+        for values in values_by_series:
+            histogram_values = (
+                values.astype(np.uint8, copy=False)
+                if values.dtype.kind == "b"
+                else values
+            )
+            counts = np.histogram(histogram_values, bins=edges)[0]
+            underflow = int(np.count_nonzero(histogram_values < edges[0]))
+            overflow = int(np.count_nonzero(histogram_values > edges[-1]))
+            visible = int(np.sum(counts, dtype=np.int64))
+            if visible + underflow + overflow != int(values.size):
+                raise RuntimeError(
+                    "windowed histogram did not account for every sample"
+                )
+            visible_counts.append(
+                _immutable_histogram_array(
+                    np.asarray(counts, dtype=np.int64),
+                    np.dtype(np.int64),
+                )
+            )
+        # Under/overflow are construction-time conservation facts only.  A
+        # display micro-fit consumes the visible bars it actually annotates.
+        object.__setattr__(self, "visible_bin_counts", tuple(visible_counts))
+        object.__setattr__(self, "visible_bin_edges", edges)
+
+
 def histogram_home_x_limits(edges: np.ndarray) -> DisplayRange:
     """Return the exact finite bin domain used as the histogram home view."""
 
@@ -691,12 +948,18 @@ def histogram_home_x_limits(edges: np.ndarray) -> DisplayRange:
 
 __all__ = [
     "DEFAULT_HISTOGRAM_BINS",
+    "FacetedHistogramDisplayState",
     "HistogramCountScale",
+    "HistogramCellThresholds",
+    "HistogramFitMode",
     "HistogramBinProjection",
     "HistogramDisplayState",
     "HistogramViewportTransform",
     "MIN_HISTOGRAM_BINS",
+    "faceted_histogram_display_with_thresholds",
     "histogram_count_limits",
+    "histogram_cell_thresholds_from_tree",
+    "histogram_cell_thresholds_to_tree",
     "histogram_display_form_spec",
     "histogram_display_form_values",
     "histogram_display_from_form",

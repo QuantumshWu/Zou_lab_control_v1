@@ -15,8 +15,6 @@ from zlc_frontend.image_display import (
     image_display_form_values, image_display_from_form,
     image_viewport_for_display_state,
 )
-from zlc_frontend.image_raster import rasterize_image_indexed8
-from zlc_frontend.occupancy_render import OccupancyCellNavigation, OccupancyCellView
 from zlc_frontend.qt_widgets import (
     AxisLayoutNavigator, FluentButton, FluentLabel, FluentPopup, FluentSwitch,
     FluentRevisionedFormEditor, FluentTabWidget, GREY, QtOwnerWake,
@@ -24,114 +22,19 @@ from zlc_frontend.qt_widgets import (
     FluentSettingsPopupAnchor, runtime_range_placeholders, signals_blocked,
     sync_revisioned_form_editors,
 )
-from zlc_frontend.render import (
-    BoardFrame, CoherenceStamp, ImagePanelPayload, PanelFrame,
-    PanelPresentationIdentity, SITE_MAP_JOIN_SCHEMA_DIGEST, SiteMapPanelPayload,
-    SourceIdentity,
-)
-from zlc_frontend.render_style import indexed_colormap
+from zlc_frontend.render import SiteMapPanelPayload
 from zlc_frontend.selector import (
     ImageColorLimitsCommit, ImageInteractionCommit, ImageViewportCommit,
 )
 from zlc_neutral_atom.readout.occupancy_reference import OccupancyArtifactRef
 
-from ._window_runtime import (
+from zlc_workbench.window_runtime import (
     RASTER_WORK_EXECUTOR,
     error_summary,
-    open_workbench_window,
     release_window,
 )
 
-
-_PANEL_ID = "sites"
-_BOARD_ID = "occupancy-cell"
-def _cancel_point(cancelled: threading.Event) -> None:
-    if cancelled.is_set():
-        raise CancelledError()
-
-
-def _load_navigation(loader, reference, cancelled):
-    _cancel_point(cancelled)
-    result = loader(reference)
-    if not isinstance(result, OccupancyCellNavigation):
-        raise TypeError("navigation loader must return OccupancyCellNavigation")
-    if result.artifact_identity != reference.target_ref:
-        raise ValueError("occupancy navigation names a different artifact")
-    _cancel_point(cancelled)
-    return result
-
-
-def _build_front(
-    view, display, color_limits, previous_relim, cell_revision, sequence,
-    cancelled,
-):
-    if not isinstance(view, OccupancyCellView):
-        raise TypeError("cell loader must return OccupancyCellView")
-    _cancel_point(cancelled)
-    viewport = image_viewport_for_display_state(display, view.home_viewport)
-    raster, data_range, histogram, effective_limits = rasterize_image_indexed8(
-        view.background, display, current_color_limits=color_limits,
-        previous_relim_mode=previous_relim,
-    )
-    _cancel_point(cancelled)
-    background = ImagePanelPayload(
-        view.background, view.background_input, viewport, data_range, histogram,
-        indexed_colormap(display.colormap.value), effective_limits,
-    )
-    payload = SiteMapPanelPayload(
-        background, view.occupancy_input, view.site_axis, view.coordinate_frame,
-        view.centers_xy, view.occupied, view.site_validity,
-        view.calibration_identity, view.cell_identity,
-    )
-    presentation = PanelPresentationIdentity(
-        _PANEL_ID, f"exact-occupancy-cell:{view.cell_identity}", 0,
-        cell_revision, display.revision,
-    )
-    stamp = CoherenceStamp(
-        view.run_id,
-        view.provenance_epoch_id,
-        "ExactOccupancyCell",
-        SITE_MAP_JOIN_SCHEMA_DIGEST,
-        payload.join_key_digest, (view.background_input, view.occupancy_input),
-        (presentation,),
-    )
-    ref = view.occupancy_input.ref
-    source = SourceIdentity(
-        view.occupancy_input.dataset_id, ref.block_id, ref.stream_generation,
-        ref.schema_fingerprint,
-    )
-    panel = PanelFrame(
-        _PANEL_ID, "exact-occupancy-cell", source, stamp, raster, payload,
-    )
-    _cancel_point(cancelled)
-    return BoardFrame(_BOARD_ID, 0, sequence, (panel,))
-
-
-def _cell_job(
-    loader, reference, selection, navigation, loaded_view, display, color_limits,
-    previous_relim, cell_revision, sequence, cancelled,
-):
-    _cancel_point(cancelled)
-    if loaded_view is None:
-        loaded_view = loader(
-            reference, selection,
-            expected_navigation=navigation,
-        )
-    repeat, _storage, logical, _label = navigation.resolve_selection(selection)
-    expected_selection = navigation.selection_for_indices(repeat, logical)
-    if (
-        not isinstance(loaded_view, OccupancyCellView)
-        or loaded_view.cell_selection != expected_selection
-    ):
-        raise ValueError("cell loader returned a different exact selection")
-    frame = _build_front(
-        loaded_view, display, color_limits, previous_relim, cell_revision,
-        sequence, cancelled,
-    )
-    return (
-        navigation.identity, selection, cell_revision, display.revision,
-        loaded_view, frame, display.relim_mode,
-    )
+from .jobs import _PANEL_ID, _cell_job, _load_navigation
 
 
 def _label(parent, name, text, *, wrap=False):
@@ -677,19 +580,3 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         else:
             event.ignore()
             self.shutdown()
-
-
-def open_occupancy_cell_workbench(
-    navigation_loader, cell_loader, reference, *, selection=None,
-):
-    return open_workbench_window(
-        lambda: OccupancyCellWindow(
-            navigation_loader,
-            cell_loader,
-            reference,
-            selection=selection,
-        )
-    )
-
-
-__all__ = ["OccupancyCellWindow", "open_occupancy_cell_workbench"]

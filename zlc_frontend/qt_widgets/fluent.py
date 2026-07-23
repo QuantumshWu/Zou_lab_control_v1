@@ -19,6 +19,8 @@ import weakref
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from ..typography import FONT_FAMILY, FONT_PATH
+
 from .style import (
     ACCENT,
     API_VIOLET,
@@ -368,6 +370,26 @@ def _ensure_offscreen_fluent_fonts(app: QtWidgets.QApplication) -> bool:
     return added
 
 
+_PLOT_FONT_ID: int | None = None
+
+
+def _ensure_plot_font_registered() -> None:
+    """Register the same repository font used by the Main/Agg plot style."""
+
+    global _PLOT_FONT_ID
+    if _PLOT_FONT_ID is not None:
+        return
+    font_id = QtGui.QFontDatabase.addApplicationFont(str(FONT_PATH))
+    if font_id < 0:
+        raise RuntimeError(f"Qt could not register plot font asset {FONT_PATH}")
+    families = tuple(QtGui.QFontDatabase.applicationFontFamilies(font_id))
+    if FONT_FAMILY not in families:
+        raise RuntimeError(
+            f"plot font asset exposes {families!r}, expected {FONT_FAMILY!r}"
+        )
+    _PLOT_FONT_ID = font_id
+
+
 def ensure_qt_app() -> QtWidgets.QApplication:
     """Return the owner-thread QApplication, creating it only on Python's main thread.
 
@@ -385,6 +407,7 @@ def ensure_qt_app() -> QtWidgets.QApplication:
             app.setFont(QtGui.QFont(FONT, fluent_font_size()))
         _QT_APP = app
         _enable_ipython_qt_loop()
+        _ensure_plot_font_registered()
         return app
     if threading.current_thread() is not threading.main_thread():
         raise RuntimeError("QApplication must be created on the Python main thread")
@@ -396,6 +419,7 @@ def ensure_qt_app() -> QtWidgets.QApplication:
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
     _QT_APP = QtWidgets.QApplication(sys.argv)
     _ensure_offscreen_fluent_fonts(_QT_APP)
+    _ensure_plot_font_registered()
     _QT_APP.setFont(QtGui.QFont(FONT, fluent_font_size()))
     _enable_ipython_qt_loop()
     return _QT_APP

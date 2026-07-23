@@ -17,6 +17,8 @@ import math
 import numpy as np
 
 from zlc_data import AxisId, CoordinateFrameId, immutable_array
+from zlc_neutral_atom.capture_application import CaptureRequest
+from zlc_neutral_atom.catalog import DefinitionKey, TaskDefinition
 from zlc_neutral_atom.runtime.capture import CameraPhysicalFacts
 from zlc_pulse import (
     FIELD_DURATION,
@@ -48,6 +50,47 @@ _REFERENCE_BEFORE = "reference_probe_duration_before"
 _READOUT = "readout_probe_duration"
 _REFERENCE_AFTER = "reference_probe_duration_after"
 _EVENT_PARAMETER_IDS = (_REFERENCE_BEFORE, _READOUT, _REFERENCE_AFTER)
+SITEMAP_CALIBRATION_TASK_KEY = DefinitionKey(
+    "zlc_neutral_atom.readout",
+    "calibrate-readout",
+)
+SITEMAP_CALIBRATION_TASK_DEFINITION = TaskDefinition(
+    SITEMAP_CALIBRATION_TASK_KEY,
+    "Calibrate readout",
+    "zlc_neutral_atom.SitemapCalibrationRequest",
+)
+SITEMAP_CALIBRATION_TASK_DEFINITIONS = (
+    SITEMAP_CALIBRATION_TASK_DEFINITION,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SitemapCalibrationRequest:
+    """Freeze the two ordinary Runs that create one readout calibration.
+
+    The capture request is complete before execution.  The calibration request
+    itself can only be constructed after that capture has committed its exact
+    ``CaptureArtifactRef``, so this value carries the already-frozen analysis
+    intent and the internal analysis deadline for the second stage.
+    """
+
+    capture_request: CaptureRequest
+    analysis: CalibrationAnalysisRequest
+    calibration_timeout_seconds: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.capture_request, CaptureRequest):
+            raise TypeError("capture_request must be CaptureRequest")
+        if not isinstance(self.analysis, CalibrationAnalysisRequest):
+            raise TypeError("analysis must be CalibrationAnalysisRequest")
+        object.__setattr__(
+            self,
+            "calibration_timeout_seconds",
+            positive_real(
+                self.calibration_timeout_seconds,
+                "calibration_timeout_seconds",
+            ),
+        )
 
 
 def _pair(value: object, field: str) -> tuple[int, int]:
@@ -279,6 +322,10 @@ def load_packaged_sitemap_pulse() -> PulseDocument:
 
 __all__ = [
     "ReadoutGridGeometry",
+    "SITEMAP_CALIBRATION_TASK_DEFINITION",
+    "SITEMAP_CALIBRATION_TASK_DEFINITIONS",
+    "SITEMAP_CALIBRATION_TASK_KEY",
     "SitemapAcquisitionProfile",
+    "SitemapCalibrationRequest",
     "load_packaged_sitemap_pulse",
 ]

@@ -57,11 +57,10 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # which already carries start_requested(self) / stop_requested + the typed,
         # no-eval form).  A spec drives a real ParamDecl form; the camera (spec is
         # None) shows nothing here but Start/Stop still build/run the camera node.
-        # Acquisition knobs are NOT injected here any more: a definition declares
-        # its own parameters (the catalog spec's form), so a camera's history depth
-        # and IO deadline arrive with the definition rather than being added on the
-        # side by the editor.  One declaration, one form -- an editor that also
-        # invented fields could offer a knob the request has no place for.
+        # Acquisition knobs are NOT injected here: a definition declares its own
+        # physical parameters (for example a monitor's history depth), and the
+        # editor renders exactly that form.  Deadlines remain internal Port/Run
+        # mechanics, never generic Measurement inputs invented by the UI.
         acquisition = ()
         names_provider = getattr(console, "_signal_names", None)
         if row.node.kind == "processor" and callable(names_provider):

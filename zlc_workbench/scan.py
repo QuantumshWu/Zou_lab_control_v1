@@ -25,7 +25,7 @@ from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewPort
 from zlc_frontend.render import BoardPresenter
 from zlc_frontend.curve_display import CurveDisplayState
-from zlc_frontend.image_raster import png_raster_size
+from zlc_frontend.encoded_raster import png_raster_size
 
 from .progressive_scan import (
     ExactDatasetLiveSlot,

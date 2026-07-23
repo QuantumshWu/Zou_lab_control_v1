@@ -19,7 +19,7 @@ from zlc_frontend.qt_widgets import (
 )
 from zlc_storage import canonical_text
 
-from ._window_runtime import (
+from .window_runtime import (
     RASTER_WORK_EXECUTOR,
     error_summary,
     load_raster_bundle,

@@ -532,6 +532,37 @@ class ImageViewportTransform:
             min(1.0, max(0.0, (y - top) / (bottom - top))),
         )
 
+    def coordinate_rectangle_for_normalized_bounds(
+        self,
+        bounds: NormalizedRectangle,
+    ) -> tuple[float, float, float, float]:
+        """Map arbitrary display bounds to continuous axis coordinates.
+
+        Unlike :meth:`selection_for_normalized_bounds`, this method does not
+        require pixel-edge alignment and never creates data authority.  It is
+        the display-only coordinate bridge used while a rectangle is moving.
+        """
+
+        left, top, right, bottom = validate_normalized_rectangle(bounds)
+
+        def coordinate_interval(
+            axis: AxisSpec,
+            low: float,
+            high: float,
+        ) -> tuple[float, float]:
+            if axis.size == 1:
+                center = float(axis.coordinate_at(0))
+                start, stop = center - 0.5, center + 0.5
+            else:
+                start, stop = _axis_edge_coordinates(axis)
+            first = start + low * (stop - start)
+            second = start + high * (stop - start)
+            return tuple(sorted((first, second)))
+
+        x_low, x_high = coordinate_interval(self.x_axis, left, right)
+        y_low, y_high = coordinate_interval(self.y_axis, top, bottom)
+        return x_low, y_low, x_high, y_high
+
     def unbounded_visible_point_for_coordinate(
         self,
         coordinate_xy: object,
@@ -808,6 +839,56 @@ class ImageViewportTransform:
                 min(y0, y1) / self.y_axis.size,
                 (max(x0, x1) + 1) / self.x_axis.size,
                 (max(y0, y1) + 1) / self.y_axis.size,
+            )
+        )
+
+    def snapped_bounds_for_visible_rectangle(
+        self,
+        bounds: NormalizedRectangle,
+    ) -> NormalizedRectangle:
+        """Snap visible rectangle *edges* to complete-raster cell edges.
+
+        Unlike :meth:`snapped_bounds_for_drag`, both inputs here are already
+        rectangle edges rather than two sampled pixels.  This is the stable
+        path for moving or resizing a standing selector: an unchanged right
+        or bottom edge must not grow the selection by one cell.
+        """
+
+        left, top, right, bottom = validate_normalized_rectangle(bounds)
+        full_left, full_top = self.full_point_for_visible_point((left, top))
+        full_right, full_bottom = self.full_point_for_visible_point(
+            (right, bottom)
+        )
+
+        def snapped_edges(
+            start: float,
+            stop: float,
+            size: int,
+        ) -> tuple[int, int]:
+            tolerance = 1e-12
+            first = max(0, min(size - 1, math.floor(start * size + tolerance)))
+            last = max(
+                first + 1,
+                min(size, math.ceil(stop * size - tolerance)),
+            )
+            return first, last
+
+        x_start, x_stop = snapped_edges(
+            full_left,
+            full_right,
+            self.x_axis.size,
+        )
+        y_start, y_stop = snapped_edges(
+            full_top,
+            full_bottom,
+            self.y_axis.size,
+        )
+        return validate_normalized_rectangle(
+            (
+                x_start / self.x_axis.size,
+                y_start / self.y_axis.size,
+                x_stop / self.x_axis.size,
+                y_stop / self.y_axis.size,
             )
         )
 

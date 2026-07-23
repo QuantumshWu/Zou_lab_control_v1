@@ -61,9 +61,11 @@ PLOT_KIND_SPECS: tuple[PlotKindSpec, ...] = (
         input_format="value must be a 2D array / camera frame (H×W)",
     ),
     PlotKindSpec(
-        key="sites", label="Site map", render_family="auto", panel=False,
+        key="sites", label="Site map", render_family="auto", panel=True,
         input_format=(
-            "value must be a typed per-site (N,) dataset with its site coordinates"),
+            "value must carry a typed calibration site map, or an exact "
+            "single-cell occupancy view with its same-shot frame and "
+            "admitted calibration geometry"),
     ),
     PlotKindSpec(
         key="1d", label="1D vector", render_family="1D",
@@ -89,7 +91,7 @@ PLOT_KIND_SPECS: tuple[PlotKindSpec, ...] = (
         panel=True,
         input_format=(
             "value must admit an explicit named-axis CURVE, HISTOGRAM, or "
-            "METER facet view"
+            "IMAGE facet view"
         ),
     ),
 )

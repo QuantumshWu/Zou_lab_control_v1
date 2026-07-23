@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from typing import Callable
 
+from zlc_data.console_records import console_signal_key
 from zlc_workbench.run_owner import QtRunOwnerMailbox
 
 __all__ = ["ConsoleRunNode"]
@@ -43,6 +44,7 @@ class ConsoleRunNode:
         if not callable(prepare):
             raise TypeError("prepare must be callable")
         self._spec = spec
+        self.instance_label = str(spec.title)
         self._values = dict(values)
         self._prepare = prepare
         # One worker thread per node: a node's prepare/start/cancel jobs must not
@@ -60,6 +62,10 @@ class ConsoleRunNode:
         # deliberately not inferred from the terminal snapshot: only
         # RunHandle.result() carries the value committed by the Run.
         self._final_result = _UNRESOLVED_FINAL
+        self._final_projector = None
+        self._final_projection_submitted = False
+        self._projected_final_signals = None
+        self._final_projection_error: str | None = None
         self._error: str | None = None
         self._stop_requested = False
         self._stop_reason = "Console user requested stop"
@@ -73,6 +79,39 @@ class ConsoleRunNode:
     @property
     def name(self) -> str:
         return self._spec.name
+
+    @property
+    def display_label(self) -> str:
+        """The catalog title shown wherever the console names this producer."""
+
+        return self._spec.title
+
+    @property
+    def layer(self) -> str:
+        """Measurement / processor / task is a Definition fact, not runtime state."""
+
+        return self._spec.kind
+
+    @property
+    def prefix(self) -> str:
+        """Qualified signals no longer use mutable Hub-era prefixes."""
+
+        return ""
+
+    def signal_key(self, output_name: str) -> str:
+        """Exact panel-binding key for one definition-owned output."""
+
+        return console_signal_key(self.instance_label, output_name)
+
+    def published_signals(self) -> tuple[str, ...]:
+        """Return the exact producer-instance outputs published by this node.
+
+        The short names remain owned by the catalog.  Qualifying them with the
+        saved row title prevents two valid producers of ``frame`` or ``counts``
+        from overwriting one another in the board data plane.
+        """
+
+        return tuple(self.signal_key(item.name) for item in self._spec.declared_outputs)
 
     @property
     def request(self):
@@ -114,6 +153,33 @@ class ConsoleRunNode:
         return self._final_result is not _UNRESOLVED_FINAL
 
     @property
+    def final_projection_resolved(self) -> bool:
+        """Whether the optional FINAL dataset projection has finished.
+
+        A committed artifact remains a successful result even when its
+        presentation projection fails.  The separate projection error is shown
+        by the Workbench without rewriting Run terminal truth.
+        """
+
+        return (
+            self._final_result is not _UNRESOLVED_FINAL
+            and (
+                self._final_projector is None
+                or self._projected_final_signals is not None
+            )
+        )
+
+    @property
+    def projected_final_signals(self):
+        if self._projected_final_signals is None:
+            return None
+        return dict(self._projected_final_signals)
+
+    @property
+    def final_projection_error(self) -> str | None:
+        return self._final_projection_error
+
+    @property
     def running(self) -> bool:
         snapshot = self._snapshot
         if self._handle is None:
@@ -133,6 +199,23 @@ class ConsoleRunNode:
         if not callable(start):
             raise TypeError("starter must be callable")
         self._starter = start
+
+    def bind_final_projector(
+        self,
+        projector: Callable[[object], object],
+    ) -> None:
+        """Bind the composition-owned FINAL artifact -> display projection.
+
+        Projection may load a large artifact, so it always runs on this node's
+        worker after the Run result is available; the Qt owner only admits the
+        completed immutable snapshots.
+        """
+
+        if not callable(projector):
+            raise TypeError("final projector must be callable")
+        if self._final_projector is not None:
+            raise RuntimeError("this node already has a final projector")
+        self._final_projector = projector
 
     def start(self, start: Callable[[object], object] | None = None) -> None:
         """Prepare and start on the worker.  Returns immediately.
@@ -162,6 +245,9 @@ class ConsoleRunNode:
         self._handle = None
         self._snapshot = None
         self._final_result = _UNRESOLVED_FINAL
+        self._final_projection_submitted = False
+        self._projected_final_signals = None
+        self._final_projection_error = None
         request = self._request
         prepare = self._prepare
         self._owner.submit("start", lambda: start(prepare(request)),
@@ -189,6 +275,23 @@ class ConsoleRunNode:
         for completion in self._owner.drain_completions():
             if completion.generation != self._owner.generation:
                 continue          # a job from a superseded generation; its result is stale
+            if completion.kind == "project-final":
+                error = completion.future.exception()
+                if error is None:
+                    projected = completion.future.result()
+                    if not isinstance(projected, dict):
+                        self._final_projection_error = (
+                            "TypeError: final projector must return a dict"
+                        )
+                        self._projected_final_signals = {}
+                    else:
+                        self._projected_final_signals = dict(projected)
+                else:
+                    self._final_projection_error = (
+                        f"{type(error).__name__}: {error}"
+                    )
+                    self._projected_final_signals = {}
+                continue
             error = completion.future.exception()
             if error is not None:
                 self._error = f"{type(error).__name__}: {error}"
@@ -219,6 +322,18 @@ class ConsoleRunNode:
                         pass
                     else:
                         self._owner.mark_owner_reaped()
+                        projector = self._final_projector
+                        if (
+                            projector is not None
+                            and not self._final_projection_submitted
+                        ):
+                            result = self._final_result
+                            self._final_projection_submitted = True
+                            self._owner.submit(
+                                "project-final",
+                                lambda: projector(result),
+                                generation=self._owner.generation,
+                            )
                 elif self._snapshot.state.name != "SUCCEEDED":
                     self._final_result = _UNRESOLVED_FINAL
                     self._owner.mark_owner_reaped()

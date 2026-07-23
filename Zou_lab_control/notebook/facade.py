@@ -65,6 +65,7 @@ from zlc_neutral_atom.capture_application import (
     CaptureRequest,
     PlanDescriptor,
     PreparedFiniteCapture,
+    bind_finite_capture_request,
     bind_finite_capture_spec,
     prepare_finite_capture,
 )
@@ -73,6 +74,15 @@ from zlc_neutral_atom.monitor_application import (
     CameraMonitorRequest,
     PreparedCameraMonitor,
     prepare_camera_monitor,
+)
+from zlc_neutral_atom.mot_field import (
+    MotFieldRequest,
+    MotFieldResult,
+    build_mot_scan_program,
+)
+from zlc_neutral_atom.occupancy_application import (
+    PreparedFiniteOccupancy,
+    prepare_finite_occupancy,
 )
 from zlc_neutral_atom.pulse_application import (
     AppliedPulseSnapshot,
@@ -85,6 +95,7 @@ from zlc_neutral_atom.pulse_application import (
     PulseTargetDescriptor,
     prepare_pulse_execution,
 )
+from zlc_neutral_atom.pulse_programs import DEFAULT_MOT_FIELD_PULSE_PATH
 from zlc_neutral_atom.readout.calibration import (
     BackgroundMode,
     BoxReducer,
@@ -97,12 +108,23 @@ from zlc_neutral_atom.readout.calibration_reference import (
     CalibrationArtifactRef,
     calibration_artifact_ref_to_tree,
 )
+from zlc_neutral_atom.readout.coupled_measurements import (
+    GreyMolassesDetuningRequest,
+    ReadoutDurationFidelityRequest,
+    TemperatureReleaseRecaptureRequest,
+    bind_temperature_release_recapture,
+    reject_grey_molasses_detuning,
+    reject_readout_duration_fidelity,
+)
 from zlc_neutral_atom.readout.occupancy_reference import OccupancyArtifactRef
 from zlc_neutral_atom.readout.contracts import (
     CalibrationCaptureLayout,
     ReadoutBindingKey,
 )
-from zlc_neutral_atom.readout.sitemap import SitemapAcquisitionProfile
+from zlc_neutral_atom.readout.sitemap import (
+    SitemapAcquisitionProfile,
+    SitemapCalibrationRequest,
+)
 from zlc_neutral_atom.scan import (
     ApiSegmentTable,
     ApiSlotSegmentedProgram,
@@ -125,6 +147,10 @@ from zlc_neutral_atom.readout.occupancy import (
     resolve_occupancy_stream_schema,
 )
 from zlc_neutral_atom.readout.occupancy_pipeline import OccupancyPipelineSpec
+from zlc_neutral_atom.release_recapture_application import (
+    PreparedTemperatureReleaseRecapture,
+    prepare_temperature_release_recapture,
+)
 from zlc_neutral_atom.runtime.streams import StreamId
 from zlc_neutral_atom.runtime.pipeline import MinimalPipelineSpec
 from zlc_neutral_atom.timing.occupancy import TriggeredOccupancySpec
@@ -213,8 +239,7 @@ def _validate_scan_request_fields(
     sequencer_ref: DeviceRef,
     trigger_channel: str | None,
     output_transform_spec: DataTransformSpec | None,
-    timeout_seconds: float,
-) -> float:
+) -> None:
     if not isinstance(
         program,
         (AutonomousScanSlotProgram, ApiSlotSegmentedProgram),
@@ -231,7 +256,6 @@ def _validate_scan_request_fields(
             raise TypeError("output_transform_spec must be DataTransformSpec or None")
         if not output_transform_spec.operations:
             raise ValueError("empty output_transform_spec must be None")
-    return _positive_real(timeout_seconds, "timeout_seconds")
 
 
 def _resolve_scan_fixed_api(
@@ -271,18 +295,15 @@ class ScanRequest:
     sequencer_ref: DeviceRef
     trigger_channel: str | None = None
     output_transform_spec: DataTransformSpec | None = None
-    timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
-        timeout = _validate_scan_request_fields(
+        _validate_scan_request_fields(
             self.program,
             self.camera_ref,
             self.sequencer_ref,
             self.trigger_channel,
             self.output_transform_spec,
-            self.timeout_seconds,
         )
-        object.__setattr__(self, "timeout_seconds", timeout)
 
 
 @dataclass(frozen=True)
@@ -296,7 +317,6 @@ class OccupancyScanRequest:
     model_kind: ReadoutModelKind | None = None
     trigger_channel: str | None = None
     output_transform_spec: DataTransformSpec | None = None
-    timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.calibration_ref, CalibrationArtifactRef):
@@ -306,15 +326,13 @@ class OccupancyScanRequest:
             ReadoutModelKind,
         ):
             raise TypeError("model_kind must be ReadoutModelKind or None")
-        timeout = _validate_scan_request_fields(
+        _validate_scan_request_fields(
             self.program,
             self.camera_ref,
             self.sequencer_ref,
             self.trigger_channel,
             self.output_transform_spec,
-            self.timeout_seconds,
         )
-        object.__setattr__(self, "timeout_seconds", timeout)
 
 @dataclass(frozen=True)
 class CalibrationArtifactRequest:
@@ -521,7 +539,7 @@ def _occupancy_cell_navigation(
 ):
     """Project one admitted occupancy artifact into frontend navigation."""
 
-    from zlc_frontend.occupancy_render import OccupancyCellNavigation
+    from zlc_frontend.site_map_render import OccupancyCellNavigation
 
     schema = artifact.occupied.schema
     return OccupancyCellNavigation(
@@ -722,7 +740,6 @@ class ReadoutFacade:
         self,
         *,
         camera_role: str | None = None,
-        io_timeout_seconds: float = 2.0,
         history_capacity: int = 8,
         roi: Selection | None = None,
         roi_reduction: ReductionMethod = ReductionMethod.MEAN,
@@ -735,7 +752,6 @@ class ReadoutFacade:
             role = self._resolve_monitor_camera_role(services, camera_role)
             return CameraMonitorRequest(
                 camera_ref=services.catalog.require(role).ref,
-                io_timeout_seconds=io_timeout_seconds,
                 history_capacity=history_capacity,
                 roi=roi,
                 roi_reduction=roi_reduction,
@@ -791,7 +807,6 @@ class ReadoutFacade:
         repeat_count: int = 1,
         readout_events_per_repeat: int | None = None,
         within_point_grouping: tuple[tuple[int, int], ...] | None = None,
-        timeout_seconds: float = 30.0,
     ) -> CaptureRequest:
         with _service_guard(self._token) as services:
             document = (
@@ -818,7 +833,6 @@ class ReadoutFacade:
                 repeat_count,
                 readout_events_per_repeat,
                 within_point_grouping,
-                timeout_seconds,
             )
 
     def capture(self, pulse: PulseDocument | str | Path, **kwargs) -> CaptureArtifactRef:
@@ -831,6 +845,180 @@ class ReadoutFacade:
         with _service_guard(self._token) as services:
             return services.capture_repository.load(reference)
 
+    def temperature_release_recapture_request(
+        self,
+        pulse: PulseDocument | str | Path,
+        *,
+        trap_off_seconds: tuple[float, ...],
+        shots: int,
+        calibration_ref: CalibrationArtifactRef,
+        model_kind: ReadoutModelKind | None = None,
+        per_site: bool = False,
+        camera_role: str | None = None,
+        sequencer_role: str | None = None,
+        trigger_channel: str | None = None,
+    ) -> TemperatureReleaseRecaptureRequest:
+        """Freeze the autonomous two-readout temperature Measurement."""
+
+        if not isinstance(calibration_ref, CalibrationArtifactRef):
+            raise TypeError("calibration_ref must be CalibrationArtifactRef")
+        with _service_guard(self._token) as services:
+            document = (
+                pulse
+                if isinstance(pulse, PulseDocument)
+                else load_pulse_document(pulse)
+            )
+            camera = self._resolve_camera_role(services, camera_role)
+            sequencer = _resolve_role(
+                services.catalog,
+                sequencer_role,
+                "sequencer",
+                ("sequencer",),
+            )
+            return TemperatureReleaseRecaptureRequest(
+                document,
+                tuple(trap_off_seconds),
+                shots,
+                services.catalog.require(camera).ref,
+                services.catalog.require(sequencer).ref,
+                calibration_ref,
+                model_kind,
+                per_site,
+                trigger_channel,
+            )
+
+    def start_temperature_release_recapture(
+        self,
+        request: TemperatureReleaseRecaptureRequest,
+    ) -> RunHandle:
+        with _service_guard(self._token) as services:
+            return _prepare_temperature_release_recapture_for_services(
+                services,
+                request,
+            ).start()
+
+    def temperature_release_recapture(
+        self,
+        request: TemperatureReleaseRecaptureRequest,
+    ):
+        with _service_guard(self._token) as services:
+            handle = _prepare_temperature_release_recapture_for_services(
+                services,
+                request,
+            ).start()
+            runtime = services.runtime
+        return runtime.wait(handle)
+
+    def readout_duration_fidelity_request(
+        self,
+        pulse: PulseDocument | str | Path,
+        *,
+        duration_seconds: tuple[float, ...],
+        shots: int,
+        calibration_ref: CalibrationArtifactRef,
+        model_kind: ReadoutModelKind | None = None,
+        site: int | None = None,
+        camera_role: str | None = None,
+        sequencer_role: str | None = None,
+        trigger_channel: str | None = None,
+    ) -> ReadoutDurationFidelityRequest:
+        """Freeze valid intent even when this installation lacks its Port."""
+
+        if not isinstance(calibration_ref, CalibrationArtifactRef):
+            raise TypeError("calibration_ref must be CalibrationArtifactRef")
+        with _service_guard(self._token) as services:
+            document = (
+                pulse
+                if isinstance(pulse, PulseDocument)
+                else load_pulse_document(pulse)
+            )
+            camera = self._resolve_camera_role(services, camera_role)
+            sequencer = _resolve_role(
+                services.catalog,
+                sequencer_role,
+                "sequencer",
+                ("sequencer",),
+            )
+            return ReadoutDurationFidelityRequest(
+                document,
+                tuple(duration_seconds),
+                shots,
+                services.catalog.require(camera).ref,
+                services.catalog.require(sequencer).ref,
+                calibration_ref,
+                model_kind,
+                site,
+                trigger_channel,
+            )
+
+    def start_readout_duration_fidelity(
+        self,
+        request: ReadoutDurationFidelityRequest,
+    ) -> RunHandle:
+        reject_readout_duration_fidelity(request)
+        raise AssertionError("capability rejection did not raise")
+
+    def grey_molasses_detuning_request(
+        self,
+        pulse: PulseDocument | str | Path,
+        *,
+        detuning_gamma: tuple[float, ...],
+        trap_off_seconds: float,
+        shots: int,
+        rf_role: str,
+        calibration_ref: CalibrationArtifactRef,
+        model_kind: ReadoutModelKind | None = None,
+        per_site: bool = False,
+        camera_role: str | None = None,
+        sequencer_role: str | None = None,
+        trigger_channel: str | None = None,
+    ) -> GreyMolassesDetuningRequest:
+        """Freeze grey-molasses intent without inventing a missing RF Port."""
+
+        if not isinstance(calibration_ref, CalibrationArtifactRef):
+            raise TypeError("calibration_ref must be CalibrationArtifactRef")
+        with _service_guard(self._token) as services:
+            document = (
+                pulse
+                if isinstance(pulse, PulseDocument)
+                else load_pulse_document(pulse)
+            )
+            camera = self._resolve_camera_role(services, camera_role)
+            sequencer = _resolve_role(
+                services.catalog,
+                sequencer_role,
+                "sequencer",
+                ("sequencer",),
+            )
+            return GreyMolassesDetuningRequest(
+                document,
+                tuple(detuning_gamma),
+                trap_off_seconds,
+                shots,
+                services.catalog.require(camera).ref,
+                services.catalog.require(sequencer).ref,
+                rf_role,
+                calibration_ref,
+                model_kind,
+                per_site,
+                trigger_channel,
+            )
+
+    def start_grey_molasses_detuning(
+        self,
+        request: GreyMolassesDetuningRequest,
+    ) -> RunHandle:
+        reject_grey_molasses_detuning(request)
+        raise AssertionError("capability rejection did not raise")
+
+    def materialize_capture(self, reference: CaptureArtifactRef) -> OwnedSnapshot:
+        """Load one FINAL capture as its canonical immutable dataset snapshot."""
+
+        if not isinstance(reference, CaptureArtifactRef):
+            raise TypeError("reference must be CaptureArtifactRef")
+        with _service_guard(self._token) as services:
+            return services.capture_repository.materialize_final(reference)
+
     def scan_request(
         self,
         pulse: PulseDocument | str | Path,
@@ -840,7 +1028,6 @@ class ReadoutFacade:
         trigger_channel: str | None = None,
         api_values: Mapping[str, int | float] | None = None,
         output_transform_spec: DataTransformSpec | None = None,
-        timeout_seconds: float = 30.0,
     ) -> ScanRequest:
         """Build one direct-camera autonomous SCAN_SLOT request.
 
@@ -870,7 +1057,6 @@ class ReadoutFacade:
                 ).ref,
                 trigger_channel=trigger_channel,
                 output_transform_spec=output_transform_spec,
-                timeout_seconds=timeout_seconds,
             )
 
     def scan(self, pulse: PulseDocument | str | Path, **kwargs) -> ScanArtifactRef:
@@ -889,7 +1075,6 @@ class ReadoutFacade:
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
         output_transform_spec: DataTransformSpec | None = None,
-        timeout_seconds: float = 30.0,
     ) -> ScanRequest:
         """Build the accepted finite API_SLOT segmented exception explicitly."""
 
@@ -917,7 +1102,6 @@ class ReadoutFacade:
                 sequencer_ref=services.catalog.require(sequencer_role).ref,
                 trigger_channel=trigger_channel,
                 output_transform_spec=output_transform_spec,
-                timeout_seconds=timeout_seconds,
             )
 
     def api_scan(self, pulse: PulseDocument | str | Path, **kwargs) -> ScanArtifactRef:
@@ -941,7 +1125,6 @@ class ReadoutFacade:
         trigger_channel: str | None = None,
         api_values: Mapping[str, int | float] | None = None,
         output_transform_spec: DataTransformSpec | None = None,
-        timeout_seconds: float = 30.0,
     ) -> OccupancyScanRequest:
         """Build the first external Measurement→Processor SCAN_SLOT request."""
 
@@ -967,7 +1150,6 @@ class ReadoutFacade:
                 model_kind=model_kind,
                 trigger_channel=trigger_channel,
                 output_transform_spec=output_transform_spec,
-                timeout_seconds=timeout_seconds,
             )
 
     def occupancy_scan(
@@ -1002,7 +1184,6 @@ class ReadoutFacade:
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
         output_transform_spec: DataTransformSpec | None = None,
-        timeout_seconds: float = 30.0,
     ) -> OccupancyScanRequest:
         with _service_guard(self._token) as services:
             document = (
@@ -1030,7 +1211,6 @@ class ReadoutFacade:
                 model_kind=model_kind,
                 trigger_channel=trigger_channel,
                 output_transform_spec=output_transform_spec,
-                timeout_seconds=timeout_seconds,
             )
 
     def api_occupancy_scan(
@@ -1066,28 +1246,89 @@ class ReadoutFacade:
         with _service_guard(self._token) as services:
             return services.scan_repository.materialize(reference)
 
-    def sitemap(
+    def mot_field_request(
+        self,
+        pulse: PulseDocument | str | Path = DEFAULT_MOT_FIELD_PULSE_PATH,
+        *,
+        center_x: float = 0.0,
+        center_y: float = 0.0,
+        center_z: float = 0.0,
+        span: float = 12.0,
+        points: int = 7,
+        roi_cx: float | None = None,
+        roi_cy: float | None = None,
+        roi_radius: float = 8.0,
+        camera_role: str | None = None,
+        sequencer_role: str | None = None,
+        trigger_channel: str | None = None,
+    ) -> MotFieldRequest:
+        """Freeze one three-axis autonomous MOT scan and its ROI analysis."""
+
+        document = (
+            pulse
+            if isinstance(pulse, PulseDocument)
+            else load_pulse_document(pulse)
+        )
+        program = build_mot_scan_program(
+            document,
+            center_x=center_x,
+            center_y=center_y,
+            center_z=center_z,
+            span=span,
+            points=points,
+        )
+        with _service_guard(self._token) as services:
+            camera_role = "mot_camera" if camera_role is None else camera_role
+            camera_role = _resolve_role(
+                services.catalog,
+                camera_role,
+                "camera",
+                ("mot_camera",),
+            )
+            if camera_role != "mot_camera":
+                raise ValueError(
+                    "MOT field optimization requires the installation's "
+                    "'mot_camera' role; an arbitrary camera is not a "
+                    "coil-sensitive exact-scan sensor"
+                )
+            sequencer_role = _resolve_role(
+                services.catalog,
+                sequencer_role,
+                "sequencer",
+                ("sequencer",),
+            )
+            return MotFieldRequest(
+                program=program,
+                camera_ref=services.catalog.require(camera_role).ref,
+                sequencer_ref=services.catalog.require(sequencer_role).ref,
+                roi_cx=roi_cx,
+                roi_cy=roi_cy,
+                roi_radius=roi_radius,
+                trigger_channel=trigger_channel,
+            )
+
+    def _start_mot_field_scan(self, request: MotFieldRequest) -> RunHandle:
+        """Workbench-only first stage: start the request's exact scan Run."""
+
+        return _start_scan(self._token, _mot_field_scan_request(request))
+
+    def sitemap_request(
         self,
         *,
         frames: int = 20,
         camera_role: str | None = None,
-        capture_timeout_seconds: float = 30.0,
         calibration_timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS,
-    ) -> CalibrationArtifactRef:
-        """Capture and commit one installation-qualified site-map calibration.
+    ) -> SitemapCalibrationRequest:
+        """Freeze one installation-qualified capture-then-calibration request.
 
         ``frames`` is the number of complete reference/readout/reference groups,
         not the total camera-frame count.  The hardware repeats each complete
-        group.  This method composes two ordinary Runs in order; it is not a
-        child-plan engine or hidden current-calibration slot.  Advanced/custom
-        calibration remains available through ``calibration_request``.
+        group.  The returned value contains a complete finite ``CaptureRequest``
+        plus the immutable analysis intent for the second ordinary Run.  It
+        contains no current/latest calibration pointer.
         """
 
         repeat_groups = _positive_int(frames, "frames")
-        capture_timeout = _positive_real(
-            capture_timeout_seconds,
-            "capture_timeout_seconds",
-        )
         calibration_timeout = _positive_real(
             calibration_timeout_seconds,
             "calibration_timeout_seconds",
@@ -1114,14 +1355,38 @@ class ReadoutFacade:
             repeat_count=repeat_groups,
             readout_events_per_repeat=profile.event_count,
             within_point_grouping=grouping,
-            timeout_seconds=capture_timeout,
         )
-        source = _run(self._token, capture_request)
+        return SitemapCalibrationRequest(
+            capture_request,
+            analysis,
+            calibration_timeout,
+        )
+
+    def sitemap(
+        self,
+        *,
+        frames: int = 20,
+        camera_role: str | None = None,
+        calibration_timeout_seconds: float = _DEFAULT_CALIBRATION_TIMEOUT_SECONDS,
+    ) -> CalibrationArtifactRef:
+        """Capture and commit one installation-qualified site-map calibration.
+
+        This convenience composes two ordinary Runs in order; it is not a
+        child-plan engine or hidden current-calibration slot.  Advanced/custom
+        calibration remains available through ``calibration_request``.
+        """
+
+        sequence = self.sitemap_request(
+            frames=frames,
+            camera_role=camera_role,
+            calibration_timeout_seconds=calibration_timeout_seconds,
+        )
+        source = _run(self._token, sequence.capture_request)
         try:
             request = self.calibration_request(
                 source,
-                analysis,
-                timeout_seconds=calibration_timeout,
+                sequence.analysis,
+                timeout_seconds=sequence.calibration_timeout_seconds,
             )
             return self.calibrate(request)
         except KeyboardInterrupt as error:
@@ -1427,10 +1692,11 @@ class ReadoutFacade:
             raise TypeError("reference must be OccupancyArtifactRef")
         if selection is not None and not isinstance(selection, Selection):
             raise TypeError("selection must be Selection or None")
-        from zlc_frontend.occupancy_render import (
+        from zlc_frontend.site_map_render import (
             OccupancyCellNavigation,
             OccupancyCellView,
         )
+        from zlc_frontend.site_map import site_ring_radius
         from zlc_frontend.figure import (
             DatasetId,
             EvaluatedAxis,
@@ -1618,6 +1884,7 @@ class ReadoutFacade:
                 site_axis=site_axis,
                 coordinate_frame=coordinate_frame,
                 centers_xy=centers_xy,
+                site_radius=site_ring_radius(centers_xy),
                 occupied=occupied,
                 site_validity=site_validity,
                 calibration_identity=calibration_ref.target_ref,
@@ -1632,6 +1899,16 @@ class ReadoutFacade:
             )
             del source, source_artifact, frame_source, sample, frame_validity
             return view
+
+    def occupancy_cell_view(
+        self,
+        reference: OccupancyArtifactRef,
+        *,
+        selection: Selection | None = None,
+    ):
+        """Return the exact typed SiteMap presentation for one occupancy cell."""
+
+        return self._load_occupancy_cell_source(reference, selection)
 
     def occupancy_cell_gui(
         self,
@@ -2024,10 +2301,8 @@ class Experiment:
     def task_console(self, *, task=None, state=None, **kwargs):
         """Lazily open the task console bound to this experiment.
 
-        One composition root owns the window (``zlc_workbench.task_console.app``), so a
-        notebook and the double-clickable launcher open the SAME console.  The narrow
-        scan-intent editor this used to return is still reachable as a component:
-        ``Zou_lab_control.workbench.open_task_console(experiment, intent)``.
+        One composition root owns the window (``zlc_workbench.task_console.app``),
+        so a notebook and the double-clickable launcher open the SAME console.
         """
 
         from zlc_workbench.task_console.app import open_task_console
@@ -2883,6 +3158,89 @@ def _prepare_capture_for_workbench(
         return _prepare_capture_for_services(services, request)
 
 
+def _prepare_temperature_release_recapture_for_services(
+    services: _ExperimentServices,
+    request: TemperatureReleaseRecaptureRequest,
+) -> PreparedTemperatureReleaseRecapture:
+    if not isinstance(request, TemperatureReleaseRecaptureRequest):
+        raise TypeError(
+            "request must be TemperatureReleaseRecaptureRequest"
+        )
+    calibration = _calibration_repository(services).admit(
+        request.calibration_ref,
+        services.capture_repository,
+    )
+    bound = bind_temperature_release_recapture(
+        request,
+        calibration,
+        pulse_port=services.runtime.pulse_port(request.sequencer_ref),
+        camera_port=services.runtime.camera_port(request.camera_ref),
+    )
+    return prepare_temperature_release_recapture(
+        bound,
+        calibration,
+        start_run=services.runtime.start,
+    )
+
+
+def _prepare_temperature_release_recapture_for_workbench(
+    experiment: Experiment,
+    request: TemperatureReleaseRecaptureRequest,
+) -> PreparedTemperatureReleaseRecapture:
+    """Private friend seam for the TaskConsole Measurement presenter."""
+
+    if not isinstance(experiment, Experiment):
+        raise TypeError("experiment must be Experiment")
+    with _service_guard(experiment._authority_token) as services:
+        return _prepare_temperature_release_recapture_for_services(
+            services,
+            request,
+        )
+
+
+def _prepare_finite_occupancy_for_workbench(
+    experiment: Experiment,
+    capture_request: CaptureRequest,
+    calibration_ref: CalibrationArtifactRef,
+    *,
+    model_kind: ReadoutModelKind | None = None,
+) -> PreparedFiniteOccupancy:
+    """Bind one console-local capture intent and one admitted FINAL calibration.
+
+    The returned command still starts exactly one top-level Run.  Resolving a
+    producer row never starts or subscribes to that row's earlier Run.
+    """
+
+    if not isinstance(experiment, Experiment):
+        raise TypeError("experiment must be Experiment")
+    if not isinstance(capture_request, CaptureRequest):
+        raise TypeError("capture_request must be CaptureRequest")
+    if not isinstance(calibration_ref, CalibrationArtifactRef):
+        raise TypeError("calibration_ref must be CalibrationArtifactRef")
+    if model_kind is not None and not isinstance(model_kind, ReadoutModelKind):
+        raise TypeError("model_kind must be ReadoutModelKind or None")
+    with _service_guard(experiment._authority_token) as services:
+        binding = bind_finite_capture_request(
+            capture_request,
+            pulse_port=services.runtime.pulse_port(
+                capture_request.sequencer_ref
+            ),
+            camera_port=services.runtime.camera_port(
+                capture_request.camera_ref
+            ),
+        )
+        calibration = _calibration_repository(services).admit(
+            calibration_ref,
+            services.capture_repository,
+        )
+        return prepare_finite_occupancy(
+            binding,
+            calibration,
+            model_kind=model_kind,
+            start_run=services.runtime.start,
+        )
+
+
 def _prepare_camera_monitor_for_services(
     services: _ExperimentServices,
     request: CameraMonitorRequest,
@@ -3030,10 +3388,6 @@ def _bind_api_scan_camera(
         raise TypeError("request must be a current scan request")
     if not isinstance(request.program, ApiSlotSegmentedProgram):
         raise TypeError("API scan binding requires ApiSlotSegmentedProgram")
-    services.scan_repository.admit_api_execution_cardinality(
-        request.program.point_count,
-        request.program.repeat_count,
-    )
     binding = bind_api_slot_segmented_camera_acquisition(
         services.runtime.pulse_port(request.sequencer_ref),
         services.runtime.camera_port(request.camera_ref),
@@ -3100,7 +3454,6 @@ def _compile_direct_scan_for_services(
             camera_ref=request.camera_ref,
             sequencer_ref=request.sequencer_ref,
             execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
-            timeout_seconds=request.timeout_seconds,
             name_prefix="Direct scan",
         )
         plan = compile_direct_scan_artifact_plan(
@@ -3121,7 +3474,6 @@ def _compile_direct_scan_for_services(
         f"API segmented scan {program.document.name}",
         binding.measurement,
         BlockId(f"api-scan-camera-{compiled_digest[:20]}"),
-        timeout_seconds=request.timeout_seconds,
     )
     segmented = ApiSlotSegmentedSpec(
         capture,
@@ -3207,7 +3559,6 @@ def _bind_occupancy_scan_for_services(
         processor,
         BlockId(f"scan-counts-{identity}"),
         BlockId(f"scan-occupied-{identity}"),
-        request.timeout_seconds,
     )
     if isinstance(program, AutonomousScanSlotProgram):
         scan_spec = TriggeredOccupancySpec(
@@ -3324,6 +3675,18 @@ def _run_scan(
     if not isinstance(result, ScanArtifactRef):
         raise TypeError("scan Run returned a non-scan artifact ref")
     return result
+
+
+def _mot_field_scan_request(request: MotFieldRequest) -> ScanRequest:
+    if not isinstance(request, MotFieldRequest):
+        raise TypeError("request must be MotFieldRequest")
+    return ScanRequest(
+        program=request.program,
+        camera_ref=request.camera_ref,
+        sequencer_ref=request.sequencer_ref,
+        trigger_channel=request.trigger_channel,
+        output_transform_spec=None,
+    )
 
 
 def _compile_calibration_for_services(
@@ -3567,8 +3930,11 @@ __all__ = [
     "Experiment",
     "FitExecution",
     "GridOrder",
+    "GreyMolassesDetuningRequest",
     "InstallationConfigDocument",
     "MaterializedScanData",
+    "MotFieldRequest",
+    "MotFieldResult",
     "OccupancyScanRequest",
     "OccupancyArtifactRef",
     "PlanDescriptor",
@@ -3580,10 +3946,13 @@ __all__ = [
     "PulseRunResult",
     "PulseTargetDescriptor",
     "ReadoutFacade",
+    "ReadoutDurationFidelityRequest",
     "ReadoutModelKind",
     "ScanArtifactRef",
     "ScanPointTable",
     "ScanRequest",
+    "SitemapCalibrationRequest",
     "SitemapCalibrationFailed",
     "SitemapCalibrationInterrupted",
+    "TemperatureReleaseRecaptureRequest",
 ]

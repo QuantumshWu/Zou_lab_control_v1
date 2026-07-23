@@ -1140,7 +1140,7 @@ Naming note (two different "fidelity" things): **"Fidelity vs duration"** = `rea
 image GROUPS) is NOT a scan at all — no swept axis, no per-point acquire loop — so it is not a pulse-scan
 special case; it is the rigorous offline counterpart to the live `OtsuFidelityReducer` quick-look.
 
-### Two invariants every scan/pulse flow depends on (api slot AND scan slot must fire; manual config == one-click)
+### Signal-name invariant every scan/pulse flow depends on
 
 Both are pinned by `tests/test_scan_slot_and_manual_parity.py`.
 
@@ -1153,30 +1153,6 @@ Both are pinned by `tests/test_scan_slot_and_manual_parity.py`.
   `collect_values()` lost the input → `_start_logic_node` built a node with an EMPTY y-expression → every
   scan point NaN → an empty grid on Start (looked like an async/daemon race; it was the picker dropping the
   input). One rule for both branches — the flat branch's old special-case is gone.
-- **A fireable pulse template authors on the connected board's clock grid (resolution comes FROM the
-  device).** The ONE loader for a template that is about to fire is the timing layer's
-  `resolve_fireable_template(template, default_name=..., default_factory=..., sequencer=...)`
-  (`timing/pulse_table.py`, beside `resolve_pulse_template`): it resolves the file and then forces
-  `time_step_ns = hardware_tick_ns(seqr)` — the tick is read off the CONNECTED sequencer's `clock_hz` (a
-  `SequencerDevice` property the real `RemoteSequencer` reads back from the FPGA on connect, and the
-  `VirtualSequencer` carries), exactly as confocal reads a device's resolution off the device, NOT a constant
-  baked into a caller and NOT whatever a saved file under the (gitignored) `pulses/` folder carried. Only when
-  NO device is in scope (a GUI template preview) does it fall back to the streamer-config default
-  `DEFAULT_CLOCK_HZ`. A finer authoring grid (an old save with `time_step_ns = 1`) lets an api/scan DURATION
-  sweep produce sub-tick durations (`np.linspace` → 5.95 ns …) that `set_api` snaps to the template grid but
-  that still fail the clock-grid validation → the sweep cannot fire ("api slot does not work"). Snapping to
-  the board's tick at load makes **author == snap == fire** for every template on whatever clock the connected
-  board reports, for both a `scan_slot` hardware table and each finite `api_slot` pulse. Callers with a device in scope pass it:
-  `pulse_scan.build` → `s.devices.sequencer` (via `_resolve_probe_template`, the probe-flavoured binding of
-  the same helper, which the GUI slot preview also imports), `mot_field.run` → `self.sequencer`, and the
-  Calibrate task's `_resolve_template` (logic.py) → `self.sequencer` (its GUI slot preview calls the same
-  classmethod without a device and falls back to the config-default grid, like every other preview). The
-  tick is pinned by `tests/test_scan_slot_and_manual_parity.py`. Port topology follows the stricter
-  device-owned rule: XDC/device configuration constructs one immutable `PortCatalog`; every
-  `PulseTableState` stores that catalog as its sole topology and serialized documents carry its
-  fingerprint. Load/prepare requires the document and connected sequencer catalogs to match; it never
-  aligns or reconstructs topology from parallel lists. The virtual device and shipped pulse templates
-  use the same catalog contract. Pinned by `tests/test_port_catalog_contract.py`.
 
 ### A task never manufactures a second live-data path
 
@@ -1565,10 +1541,6 @@ into ONE structurally-enforced source (a helper / constant / `__post_init__` / c
 Behaviour-neutral throughout. The single sources added/relocated, by layer:
 
 **timing**
-- `timing.pulse_table.resolve_pulse_template(template, *, default_name, default_factory)` — the ONE
-  pulse-template path resolver (the Calibrate task + the Pulse-scan measurement delegate). Anchors
-  the `pulses/` lookup to the project root via `_paths.project_path`, NOT a per-caller `parents[N]`
-  count.
 - `PulseTableState._set_bus_target(bus, period_index, value)` — the ONE "keep a ramp, else force an
   edge" rule + `analog_bus_modes` plan writeback (scan-slot bind / api-field set / slot resolve).
 - `timing.pulse_table.scan_target_label` — the ONE STATE-FUL name label for a `(kind, target)`;

@@ -22,42 +22,21 @@ from .fluent import FluentTreeComboBox, signals_blocked as _signals_blocked
 # Qt-combo utilities: only qt_widgets (FluentTreeComboBox, signals_blocked) + plain data.
 
 
-def _common_token_prefix(names) -> str:
-    """The longest common UNDERSCORE-token prefix of ``names`` -- e.g. both
-    ``analysis_rate`` and ``analysis_score`` share ``analysis_``.
-    Empty for fewer than two names or no shared leading token.  Used to strip the producer
-    prefix the hub prepends from a grouped signal picker's labels (the producer is the group
-    header, so its name need not repeat in every signal)."""
-    import os.path as _op
-    names = [str(n) for n in names]
-    if len(names) < 2:
-        return ""
-    common = _op.commonprefix(names)
-    cut = common.rfind("_")
-    return common[: cut + 1] if cut >= 0 else ""
+def signal_state(name, formats, sources=None) -> str:
+    """Return ready/waiting, or unbound when no exact producer owns the key."""
 
-
-def signal_state(name, formats) -> str:
-    """A signal has exactly TWO states (G3): "ready" when it is PUBLISHED on the hub right now
-    (so it has a live shape in ``formats``), else "waiting" -- it is declared by a node that has
-    not started / not produced yet.  No more none/unbound/error/mid-run/unpublished clutter."""
+    if sources is not None and not (sources.get(str(name)) or ()):
+        return "unbound"
     return "ready" if formats.get(str(name)) else "waiting"
 
 
-def _signal_short_label(name, group, labels) -> str:
+def _signal_short_label(name, labels) -> str:
     """The leaf label for ``name`` under its producer node in the picker nest: the SHORT signal name --
-    the producing node's prefix stripped (``temperature_survival`` -> ``survival``, ``frame`` ->
-    ``frame``), passed in via ``labels`` (the ``short_names_provider`` map, built from each running
-    node's prefix; #design: the nest already names the producer, so the leaf is the short NAME, NOT the
-    verbose SignalSpec axis label like ``camera image``).  For a signal with no mapped short name (a
-    declared-but-not-running node), fall back to the shared-token prefix stripped from the group, else
-    the bare name."""
+    passed in via ``labels`` from the producer's exact catalog declaration.  A key with no declaration is shown
+    verbatim; this layer never guesses a short name from string prefixes."""
     short = (labels or {}).get(str(name))
     if short:
         return str(short)
-    strip = _common_token_prefix(group)
-    if strip and name.startswith(strip) and len(name) > len(strip):
-        return name[len(strip):]
     return str(name)
 
 
@@ -65,8 +44,8 @@ def grouped_signal_items(names, sources, formats, labels=None) -> list:
     """``[(display, bare_name | None)]`` for a signal picker, GROUPED by producing node: a
     non-selectable bold header per node (``bare_name`` is ``None``), then that node's signals
     indented beneath it -- shown by their HUMAN label (the SignalSpec the producing node declares),
-    with the SHAPE and the two-state tag (``    Loading rate  [(35,)] ready`` / ``    Survival
-    waiting``).  ``data`` stays the BARE signal name (the binding key); only the DISPLAY is humanised.
+    with the SHAPE and readiness tag.  ``data`` stays the exact signal key;
+    only the DISPLAY is humanised.
     The ONE source every signal picker shares (plot panel AND logic-node source)."""
     names = sorted(str(n) for n in (names or []))
     sources = dict(sources or {})
@@ -81,9 +60,9 @@ def grouped_signal_items(names, sources, formats, labels=None) -> list:
         group = by_producer[producer]
         items.append((producer, None))            # group header (rendered disabled + bold)
         for name in group:
-            short = _signal_short_label(name, group, labels)
+            short = _signal_short_label(name, labels)
             fmt = formats.get(name)
-            state = signal_state(name, formats)
+            state = signal_state(name, formats, sources)
             shape = f"  [{fmt}]" if fmt else ""
             items.append((f"    {short}{shape}  {state}", name))
     return items
@@ -109,17 +88,17 @@ def signal_tree_groups(names, sources, formats, labels=None) -> list:
         group = by_producer[producer]
         leaves = []
         for name in group:
-            short = _signal_short_label(name, group, labels)
+            short = _signal_short_label(name, labels)
             fmt = formats.get(name)
             shape = f"  [{fmt}]" if fmt else ""
-            leaf_label = f"{short}{shape}  {signal_state(name, formats)}"
+            leaf_label = f"{short}{shape}  {signal_state(name, formats, sources)}"
             leaves.append((leaf_label, name, f"{producer} · {short}"))
         groups.append((producer, leaves))
     return groups
 
 
 def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_label=None, labels=None) -> None:
-    """Populate ``combo`` with every live hub signal GROUPED by producing node (via
+    """Populate ``combo`` with every exact signal key GROUPED by producing node (via
     :func:`grouped_signal_items`): bold non-selectable headers, indented signals (data = the
     BARE name).  ``none_label`` adds a leading empty choice; a not-yet-published ``current``
     is kept selectable.  Read the pick back with ``currentData()`` (the bare name) -- the
@@ -128,7 +107,7 @@ def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_l
     cur = str(current or "")
     # A configured input may NAME a signal that is declared but not published yet -- for example a
     # PulseScan y supplied by a not-yet-started external producer.  The
-    # binding is by NAME, resolved at RUN time, so keep such a name in the pool: BOTH the tree and the
+    # binding is by exact key, resolved at RUN time, so keep such a key in the pool: BOTH the tree and the
     # flat picker then render it as a "waiting" leaf AND read it back.  Single-sources the docstring's
     # "kept selectable" promise across both branches -- the tree branch used to drop a not-listed name,
     # so ``read_editable_combo`` returned '' and the configured input vanished (e.g. a Start that then

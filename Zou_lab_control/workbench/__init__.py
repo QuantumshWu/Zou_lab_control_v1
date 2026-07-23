@@ -6,7 +6,9 @@ from __future__ import annotations
 def open_camera_monitor_workbench(prepare, request):
     """Open one free-running camera monitor without eager Qt imports."""
 
-    from ._camera_monitor import open_camera_monitor_workbench as _open
+    from zlc_workbench.camera_monitor.app import (
+        open_camera_monitor_workbench as _open,
+    )
 
     return _open(prepare, request)
 
@@ -14,7 +16,7 @@ def open_camera_monitor_workbench(prepare, request):
 def open_capture_workbench(experiment, request):
     """Open the finite exact-capture Workbench without owning the Experiment."""
 
-    from ._capture import open_capture_workbench as _open
+    from zlc_workbench.capture.app import open_capture_workbench as _open
 
     return _open(experiment, request)
 
@@ -25,7 +27,9 @@ def open_calibration_report_workbench(
 ):
     """Open one committed calibration report without eager Qt imports."""
 
-    from ._calibration import open_calibration_report_workbench as _open
+    from zlc_workbench.calibration_workbench.app import (
+        open_calibration_report_workbench as _open,
+    )
 
     return _open(computation_loader, reference)
 
@@ -40,7 +44,9 @@ def open_calibration_workbench(
 ):
     """Open formal calibration creation/editing without eager Qt imports."""
 
-    from ._calibration import open_calibration_workbench as _open
+    from zlc_workbench.calibration_workbench.app import (
+        open_calibration_workbench as _open,
+    )
 
     options = {"seed": seed, "reference": reference}
     if timeout_seconds is not None:
@@ -55,7 +61,7 @@ def open_calibration_workbench(
 def open_data_figure_workbench(figure):
     """Open one already-resolved DataFigure without eager Qt imports."""
 
-    from ._figure import open_data_figure_workbench as _open
+    from zlc_workbench.data_figure.app import open_data_figure_workbench as _open
 
     return _open(figure)
 
@@ -69,7 +75,7 @@ def create_data_figure_pane(
 ):
     """Build the shared DataFigure body for an owning Workbench shell."""
 
-    from ._figure import create_data_figure_pane as _create
+    from zlc_workbench.data_figure.app import create_data_figure_pane as _create
 
     return _create(
         figure,
@@ -88,7 +94,9 @@ def open_occupancy_cell_workbench(
 ):
     """Open one exact same-shot occupancy map without eager Qt imports."""
 
-    from ._occupancy import open_occupancy_cell_workbench as _open
+    from zlc_workbench.occupancy_viewer.app import (
+        open_occupancy_cell_workbench as _open,
+    )
 
     return _open(
         navigation_loader,
@@ -118,7 +126,7 @@ def open_figure_workbench(
 ):
     """Resolve and display one frozen artifact without blocking the Qt owner."""
 
-    from ._figure import open_figure_workbench as _open
+    from zlc_workbench.data_figure.app import open_figure_workbench as _open
 
     options = {
         "intent": intent,
@@ -152,7 +160,9 @@ def open_saved_fit_grid_workbench(
 ):
     """Open one exact saved-fit GridPlot without eager Qt imports."""
 
-    from ._fit_grid import open_saved_fit_grid_workbench as _open
+    from zlc_workbench.fit_grid.app import (
+        open_saved_fit_grid_workbench as _open,
+    )
 
     return _open(view_loader, refit_opener, reference)
 
@@ -160,17 +170,17 @@ def open_saved_fit_grid_workbench(
 def open_scan_workbench(experiment, request):
     """Open the current typed autonomous scan panel lazily."""
 
-    from ._scan import open_scan_workbench as _open
+    from zlc_workbench.scan_workbench.app import open_scan_workbench as _open
 
     return _open(experiment, request)
 
 
-def open_task_console(experiment, initial_intent=None):
-    """Open the current single-card SCAN_SLOT TaskConsole lazily."""
+def open_task_console(experiment, *, state=None, task=None, **kwargs):
+    """Open the sole current Monitor/Logic TaskConsole lazily."""
 
-    from ._task_console import open_task_console as _open
+    from zlc_workbench.task_console.app import open_task_console as _open
 
-    return _open(experiment, initial_intent)
+    return _open(experiment, state=state, task=task, **kwargs)
 
 
 __all__ = [

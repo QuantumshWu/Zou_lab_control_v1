@@ -13,7 +13,6 @@ from collections.abc import Sequence
 from PyQt5 import QtGui, QtWidgets
 
 from zlc_data.console_records import PanelConfig
-from zlc_data.panel_size import panel_size_cells
 from zlc_frontend import board_layout as _layout
 from zlc_frontend.qt_widgets import CARD_PAD, CARD_TITLE_PX, scaled_px
 from zlc_frontend.render_style import panel_display_size
@@ -39,14 +38,18 @@ def cell_size() -> tuple[int, int]:
 def card_size(size: str) -> tuple[int, int]:
     """Convert one declared panel-size preset to its exact card pixels."""
 
-    _rows, cols = panel_size_cells(size)
-    width_units = max(1, cols // 2)
-    cell_width, _cell_height = cell_size()
-    width = width_units * cell_width + (width_units - 1) * GAP
+    # FigureSpec owns the complete logical panel size, including its fixed
+    # margins.  Wider presets share those margins rather than repeating a
+    # whole 1x2 card, so multiplying ``cell_size`` stretches the Qt surface
+    # beyond the worker raster (1x4 is 816 px, not two 480 px plots).  The
+    # board packer already accepts arbitrary rectangles; the card therefore
+    # wraps the exact authored panel width and nothing else.
+    panel_width, panel_height = panel_display_size(size)
+    width = panel_width + 2 * CARD_PAD
     height = (
         scaled_px(CARD_TITLE_PX)
         + scaled_px(2)
-        + panel_display_size(size)[1]
+        + panel_height
         + CARD_PAD
     )
     return width, height

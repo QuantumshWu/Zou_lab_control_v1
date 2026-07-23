@@ -124,7 +124,7 @@ class FacetedPanelHost(QtWidgets.QWidget):
             )
         if len({region.key for region in resolved}) != len(resolved):
             raise ValueError("faceted overview region keys must be unique")
-        if any(region.selection is None for region in resolved):
+        if any(region.focus_selection is None for region in resolved):
             raise ValueError("faceted overview regions require exact selections")
         self._overview.present_encoded(png_bytes, image_format="PNG")
         self._overview_png = png_bytes
@@ -187,9 +187,9 @@ class FacetedPanelHost(QtWidgets.QWidget):
         if len(hits) != 1:
             return
         index, region = hits[0]
-        if region.selection is None:  # constructor/present closes this
+        if region.focus_selection is None:  # constructor/present closes this
             raise RuntimeError("faceted overview region lost its selection")
-        self.focusRequested.emit(index, region.selection)
+        self.focusRequested.emit(index, region.focus_selection)
 
 
 __all__ = ["FacetedPanelHost"]

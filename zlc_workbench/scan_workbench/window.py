@@ -9,7 +9,6 @@ from Zou_lab_control.notebook.facade import (
     Experiment,
     OccupancyScanRequest,
     ScanRequest,
-    _prepare_occupancy_scan_for_workbench,
 )
 from zlc_frontend.qt_widgets import (
     ElidedLabel,
@@ -25,15 +24,9 @@ from zlc_frontend.qt_widgets import (
     FrozenRasterView,
     QtOwnerWake,
     QtRasterBoard,
-    WINDOW_SCREEN_FRACTION,
-    center_window_on_primary_screen,
-    ensure_qt_app,
     release_window,
-    retain_window,
     runtime_range_placeholders,
-    screen_fit_window_size,
     scaled_px,
-    set_fluent_scale,
     FluentSettingsPopupAnchor,
     sync_revisioned_form_editors,
 )
@@ -44,7 +37,6 @@ from zlc_frontend.curve_display import (
     curve_display_from_form,
     curve_display_with_x_view,
 )
-from zlc_frontend.figure import ViewIntent
 from zlc_frontend.selector import (
     CurveInteractionIntent,
     CurveRangeGesture,
@@ -53,125 +45,18 @@ from zlc_frontend.selector import (
 )
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_neutral_atom.scan.contracts import AutonomousScanSlotProgram
-from zlc_storage import canonical_digest
-from zlc_workbench.progressive_scan import (
-    ProgressiveScanSpec,
-    ScanDisplayIntent,
-    build_occupancy_progressive_spec,
-)
+from zlc_workbench.progressive_scan import ScanDisplayIntent
 from zlc_workbench.scan import (
     FinalScanPresentation,
-    PreparedScanPanelRun,
     ScanPanelController,
     ScanPanelRuntimeUpdate,
     ScanPanelViewModel,
 )
 
+from .application import _FrozenScanApplication
+
 
 _SCAN_CURVE_PANEL_ID = "scan-curve"
-
-
-class _FrozenScanApplication:
-    """Composition-owned bridge from a frozen public request to the controller."""
-
-    __slots__ = (
-        "_experiment",
-        "_request",
-        "_display_intent",
-        "_final_selection",
-        "_final_preferences",
-    )
-
-    def __init__(
-        self,
-        experiment: Experiment,
-        request: ScanRequest | OccupancyScanRequest,
-        display_intent: ScanDisplayIntent = ScanDisplayIntent(),
-    ) -> None:
-        if not isinstance(display_intent, ScanDisplayIntent):
-            raise TypeError("display_intent must be ScanDisplayIntent")
-        if isinstance(request, ScanRequest) and display_intent != ScanDisplayIntent():
-            raise ValueError("direct-camera scan has no site display setting")
-        self._experiment = experiment
-        self._request = request
-        self._display_intent = display_intent
-        self._final_selection = None
-        self._final_preferences = None
-
-    def prepare(self):
-        if isinstance(self._request, ScanRequest):
-            def start_direct(preview):
-                if preview is not None:
-                    raise ValueError(
-                        "direct camera scan has no progressive counts port"
-                    )
-                return self._experiment.start_scan(self._request)
-
-            return PreparedScanPanelRun(None, start_direct)
-        command = _prepare_occupancy_scan_for_workbench(
-            self._experiment,
-            self._request,
-        )
-        identity = canonical_digest(
-            {
-                "owner": "Zou_lab_control.workbench.occupancy-scan",
-                "program": self._request.program.fingerprint,
-                "source_schema": command.source_schema.fingerprint,
-                "output_contract": command.output_contract.fingerprint,
-            }
-        )[:20]
-        progressive = build_occupancy_progressive_spec(
-            command.source_schema,
-            command.output_contract,
-            identity=identity,
-            display_intent=self._display_intent,
-        )
-        self._final_selection = progressive.display_selection
-        self._final_preferences = progressive.display_preferences
-        def start_occupancy(preview):
-            if preview is not None and preview.spec != progressive.preview_spec:
-                raise ValueError(
-                    "prepared progressive preview changed before start"
-                )
-            return command.start(preview)
-        progressive_enabled = isinstance(
-            self._request.program,
-            AutonomousScanSlotProgram,
-        )
-        return PreparedScanPanelRun(
-            progressive if progressive_enabled else None,
-            start_occupancy,
-        )
-
-    def project_final(
-        self,
-        source_ref: ScanArtifactRef,
-    ) -> FinalScanPresentation:
-        figure_options = {}
-        if isinstance(self._request, OccupancyScanRequest):
-            if self._final_preferences is None:
-                raise RuntimeError("occupancy display was not prepared")
-            figure_options.update(
-                intent=ViewIntent.CURVE,
-                selection=self._final_selection,
-                preferences=self._final_preferences,
-            )
-        figure = self._experiment.figure(source_ref, **figure_options)
-        layer = figure.document.layers[0]
-        bindings = " · ".join(
-            f"{binding.axis_id.value}={binding.role.value.lower()}"
-            for binding in layer.view.axis_bindings
-        )
-        summary = layer.view.intent.value.lower()
-        if bindings:
-            summary = f"{summary} · {bindings}"
-        if layer.view.display_selections:
-            summary += f" · selections={len(layer.view.display_selections)}"
-        return FinalScanPresentation(
-            source_ref,
-            figure.to_png_bytes(),
-            summary,
-        )
 
 
 class ScanWorkbenchWindow(QtWidgets.QWidget):
@@ -927,22 +812,3 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._selector_switch.setChecked(False)
         self._controller.close()
         self._owner_cycle()
-
-
-def open_scan_workbench(
-    experiment: Experiment,
-    request: ScanRequest | OccupancyScanRequest,
-) -> ScanWorkbenchWindow:
-    application = ensure_qt_app()
-    if QtCore.QThread.currentThread() != application.thread():
-        raise RuntimeError("scan Workbench must be opened on the Qt GUI thread")
-    set_fluent_scale(None)
-    window = ScanWorkbenchWindow(experiment, request)
-    window.resize(screen_fit_window_size(WINDOW_SCREEN_FRACTION))
-    retain_window(window)
-    window.show()
-    center_window_on_primary_screen(window, application)
-    return window
-
-
-__all__ = ["ScanWorkbenchWindow", "open_scan_workbench"]

@@ -204,7 +204,6 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         (Path("zlc_neutral_atom/timing/pulse_table.py"), "is_slot_ref"),
         (Path("zlc_neutral_atom/timing/pulse_table.py"), "load_scan_table"),
         (Path("zlc_neutral_atom/timing/pulse_table.py"), "period_index_by_name"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "resolve_pulse_template"),
         (Path("zlc_neutral_atom/timing/pulse_table.py"), "slot_ref_index"),
     }
 )

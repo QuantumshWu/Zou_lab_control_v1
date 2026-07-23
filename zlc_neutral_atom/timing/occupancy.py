@@ -304,7 +304,6 @@ def compile_triggered_occupancy_pipeline(
             *pulse_port.interrupt_operations,
             *camera_port.interrupt_operations,
         ),
-        timeout_seconds=spec.occupancy.timeout_seconds,
         requires_final_commit=False,
         dispose_unfinalized=_dispose_triggered_preview,
     )

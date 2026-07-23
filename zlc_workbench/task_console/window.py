@@ -9,6 +9,7 @@ Every import names a TRUE owner -- nothing here touches the legacy tree.
 from __future__ import annotations
 
 import inspect
+import math
 import os
 import time
 from pathlib import Path
@@ -59,8 +60,9 @@ from zlc_data.console_records import (
     PANEL_KINDS,
     PanelConfig,
     UPDATE_INTERVALS,
+    console_signal_key,
 )
-from zlc_data.shape_text import indexed_unique_name, strip_node_prefix
+from zlc_data.shape_text import indexed_unique_name
 from .panel_board import (
     GAP,
     PanelBoard,
@@ -88,6 +90,7 @@ class TaskConsole(QtWidgets.QWidget):
         run_factory=None,
         data_plane=None,
         fit_window_factory=None,
+        rectangle_selection_sink=None,
         scale: float | None = None,
         window_ratio: float = WINDOW_SCREEN_FRACTION,
         window_px: tuple[int, int] | None = None,
@@ -109,8 +112,8 @@ class TaskConsole(QtWidgets.QWidget):
         # width and reflows into 2+ columns.  Standalone (embedded=False) behaviour is byte-for-byte
         # unchanged.  The four omitted buttons are set to None so every reference guards on existence.
         self.embedded = bool(embedded)
-        # Nodes that are CURRENTLY running (their owner thread is publishing to
-        # the hub).  Populated on Start (``_start_logic_node``) and drained on Stop;
+        # Nodes that are CURRENTLY running.  Populated on Start
+        # (``_start_logic_node``) and drained on Stop;
         # an externally-supplied, already-running node may be adopted here too.
         # This is DISTINCT from ``self.logic_nodes`` (the Logic-tab ROWS): a row is a
         # declaration that exists whether or not its node is running.
@@ -127,6 +130,19 @@ class TaskConsole(QtWidgets.QWidget):
         if fit_window_factory is not None and not callable(fit_window_factory):
             raise TypeError("fit_window_factory must be callable or None")
         self._fit_window_factory = fit_window_factory
+        if rectangle_selection_sink is not None and not callable(
+            rectangle_selection_sink
+        ):
+            raise TypeError("rectangle_selection_sink must be callable or None")
+        self._rectangle_selection_sink = rectangle_selection_sink
+        # Accepted runtime controls are observed by the ordinary Qt tick.  The
+        # gesture callback never waits for hardware or for a derived stream to
+        # publish its first value.
+        self._rectangle_controls: dict[
+            tuple[int, int],
+            tuple[object, PanelCard, object],
+        ] = {}
+        self._latest_rectangle_control_by_card: dict[int, tuple[int, int]] = {}
         self._analysis_window = None
         self._analysis_source = None
         self._panel_teardown_phases: dict[int, set[str]] = {}
@@ -150,10 +166,9 @@ class TaskConsole(QtWidgets.QWidget):
         # that node: its built node (None until Started) + its Edit tab.
         self.logic_nodes: list[LogicNodeRow] = []
         self._logic_nodes: dict[int, object] = {}      # id(row) -> node (or None when stopped)
-        # id(row) -> the LAST built node, kept even after Stop (unlike _logic_nodes, which
-        # is None'd on stop) -- so a finished/stopped node's signals that LINGER in the hub
-        # still show WHICH node produced them in the signal picker (a stopped scan's
-        # `readout_fidelity`, a stopped camera's `frame`).  Cleared only on row removal.
+        # id(row) -> the LAST built node, kept after Stop so the retained final
+        # display front still has its producer identity.  Cleared on restart or
+        # row removal.
         self._last_node: dict[int, object] = {}
         self._logic_editors: dict[int, "LogicNodeEditor"] = {}  # id(row) -> Edit tab
         self._building = False
@@ -173,6 +188,9 @@ class TaskConsole(QtWidgets.QWidget):
         self._running_task_row: "LogicNodeRow | None" = None
         self._task_status_text: str | None = None
         self._task_locked = False              # True while a task runs -> all other actions blocked
+        self._raster_pixel_ratio = 1.0
+        self._raster_window_handle = None
+        self._observed_raster_screens: set[int] = set()
 
         # Multi-rate refresh: the timer ticks at the BASE interval (the smallest panel
         # update_ms, which divides every other so the rates co-align); each panel redraws
@@ -516,13 +534,16 @@ class TaskConsole(QtWidgets.QWidget):
         """Build a PanelCard wired to the console's signal providers -- the ONE place the
         provider block lives, so adding/renaming a provider is a single edit here instead of three
         parallel edits at every PanelCard construction site (load_state / _add_panel / a task run) (#A1)."""
-        return PanelCard(
+        card = PanelCard(
             config, parent=self.board,
             names_provider=self._signal_names, sources_provider=self._signal_providers,
             formats_provider=self._signal_formats,
             short_names_provider=self._signal_short_names,
+            axis_labels_provider=self._signal_axis_labels,
             render_request=self._request_card_render,
             fit_analysis_sink=self._open_panel_fit)
+        card.set_raster_pixel_ratio(self._raster_pixel_ratio)
+        return card
 
     def _attach_card(self, card: PanelCard) -> None:
         card.setParent(self.board)
@@ -540,6 +561,12 @@ class TaskConsole(QtWidgets.QWidget):
         card.update_interval_changed.connect(self._recompute_tick_interval)
         card.remove_requested.connect(self._remove_panel)
         card.edit_requested.connect(self._edit_card)
+        card.rectangle_selected.connect(
+            lambda gesture, current=card: self._submit_rectangle_selection(
+                current,
+                gesture,
+            )
+        )
         # a panel added (or loaded) while the header's "Selectors" switch is ON inherits it --
         # the guard covers construction order (state panels may attach before the header exists).
         switch = getattr(self, "selectors_switch", None)
@@ -562,14 +589,101 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _producing_node(self, card: "PanelCard"):
         """The running node that publishes the panel's bound dataset."""
+
         refs = self._card_reads(card)
-        if not refs:
+        if len(refs) != 1:
             return None
-        for node in self.running_nodes:
-            published = node.published_signals() if hasattr(node, "published_signals") else frozenset()
-            if refs & set(published):
-                return node
-        return None
+        entry = self._signal_topology().get(next(iter(refs)))
+        if entry is None or entry["state"] != "running":
+            return None
+        return entry["node"]
+
+    def _submit_rectangle_selection(
+        self,
+        card: "PanelCard",
+        gesture: object,
+    ) -> None:
+        """Route one typed image rectangle through the composition seam.
+
+        ``PanelCard`` owns gesture-to-Selection conversion because it owns the
+        exact painted viewport.  This window only resolves the card's exact
+        producer instance.  The injected composition callback decides whether
+        that producer admits a runtime ROI control; no plot widget imports a
+        camera or a processor.
+        """
+
+        if card not in self.cards:
+            return
+        sink = self._rectangle_selection_sink
+        if sink is None:
+            card.set_status("rectangle is display-only for this console", error=False)
+            return
+        node = self._producing_node(card)
+        if node is None:
+            card.set_status(
+                "ROI signal needs a running Camera monitor source",
+                error=True,
+            )
+            return
+        try:
+            selection = card.selection_for_rectangle_gesture(gesture)
+            receipt = sink(node, selection)
+            ack = receipt.snapshot()
+        except Exception as error:
+            card.set_status(f"ROI control rejected: {error}", error=True)
+            return
+        revision = int(ack.revision)
+        control_key = (id(node), revision)
+        self._rectangle_controls[control_key] = (node, card, receipt)
+        self._latest_rectangle_control_by_card[id(card)] = control_key
+        card.set_status(
+            f"ROI control accepted r{revision}; applying",
+            error=False,
+        )
+
+    def _drain_rectangle_controls(self) -> None:
+        """Fold terminal ROI receipts without blocking the GUI owner."""
+
+        for control_key in tuple(sorted(self._rectangle_controls)):
+            _node, card, receipt = self._rectangle_controls[control_key]
+            revision = control_key[1]
+            try:
+                ack = receipt.snapshot()
+            except Exception as error:
+                del self._rectangle_controls[control_key]
+                if card in self.cards:
+                    card.set_status(
+                        f"ROI control observation failed: {error}",
+                        error=True,
+                    )
+                continue
+            if not bool(getattr(ack, "terminal", False)):
+                continue
+            del self._rectangle_controls[control_key]
+            if (
+                card not in self.cards
+                or self._latest_rectangle_control_by_card.get(id(card))
+                != control_key
+            ):
+                continue
+            status = getattr(getattr(ack, "status", None), "value", "")
+            if status == "APPLIED":
+                card.set_status(
+                    "ROI signal applied; roi_value updates with the next frame",
+                    error=False,
+                )
+            elif status == "SUPERSEDED":
+                successor = getattr(ack, "superseded_by", None)
+                card.set_status(
+                    f"ROI control r{revision} superseded by r{successor}",
+                    error=False,
+                )
+            else:
+                reason = str(getattr(ack, "reason", "") or status or "rejected")
+                card.set_status(
+                    f"ROI control {status or 'REJECTED'}: {reason}",
+                    error=True,
+                )
 
     def _producing_row(self, card: "PanelCard"):
         """The Logic-tab ROW whose RUNNING node produces this panel's signal (None if
@@ -629,106 +743,187 @@ class TaskConsole(QtWidgets.QWidget):
             return str(label)
         return str(getattr(node, "prefix", "") or type(node).__name__)
 
-    def _provider_nodes(self) -> list:
-        """Every node that can PROVIDE data or signals to a panel -- the RUNNING nodes plus the last
-        build of each Logic-tab node (``_last_node``), kept past Stop.  The ONE source of "which nodes
-        count": signal resolution (:meth:`_node_for_signal`) and the picker
-        (:meth:`_signal_providers`) both read this, so a stopped node's panel keeps rendering its
-        lingering state instead of erroring "needs a producing node"."""
-        return [*self.running_nodes, *self._last_node.values()]
+    def _signal_topology(self) -> dict[str, dict[str, object]]:
+        """Project every signal into one exact catalog-owned producer state.
+
+        A valid key is always ``console_signal_key(row.title, output.name)``.
+        Runtime nodes may prove that key is running or retained, but may never
+        rename it.  A data-plane value without such a declaration is not a
+        picker candidate; an existing card that still names it is rendered
+        explicitly as truly unbound.
+        """
+
+        topology: dict[str, dict[str, object]] = {}
+        published_names = set(map(str, self._tick_data.names()))
+        row_runtime_ids: set[int] = set()
+
+        def add(
+            key: str,
+            *,
+            state: str,
+            label: str,
+            node: object | None,
+            declaration: object | None,
+            kind: str,
+        ) -> None:
+            if key in topology:
+                raise RuntimeError(
+                    f"duplicate exact TaskConsole signal declaration {key!r}"
+                )
+            topology[key] = {
+                "state": state,
+                "label": label,
+                "node": node,
+                "declaration": declaration,
+                "kind": kind,
+            }
+
+        for row in self.logic_nodes:
+            spec = self._spec_for_logic(row.node)
+            if spec is None:
+                continue
+            outputs = tuple(getattr(spec, "declared_outputs", ()) or ())
+            keys = tuple(self._declared_signal_keys(row))
+            live = self._logic_nodes.get(id(row))
+            retained = self._last_node.get(id(row))
+            for candidate in (live, retained):
+                if candidate is not None:
+                    row_runtime_ids.add(id(candidate))
+            node = live if live is not None else retained
+            if node is not None:
+                actual = tuple(node.published_signals())
+                if actual != keys:
+                    raise RuntimeError(
+                        f"{row.node.title!r} runtime outputs differ from its "
+                        "catalog-declared exact keys"
+                    )
+            if live is not None:
+                state = "running"
+            elif retained is not None and bool(
+                getattr(retained, "final_result_resolved", False)
+            ):
+                state = "retained-final"
+            elif retained is not None and any(key in published_names for key in keys):
+                state = "retained-view"
+            else:
+                state = "declared-not-started"
+                node = None
+            for key, output in zip(keys, outputs, strict=True):
+                add(
+                    key,
+                    state=state,
+                    label=str(row.node.title),
+                    node=node,
+                    declaration=output,
+                    kind=str(spec.kind),
+                )
+
+        # A notebook may inject an already-running ConsoleRunNode with no Logic
+        # row.  It is admitted only when its own catalog spec is present and its
+        # published keys exactly equal that spec's signal_key projection.
+        for node in self.running_nodes:
+            if id(node) in row_runtime_ids:
+                continue
+            spec = getattr(node, "spec", None)
+            catalog_spec = (
+                None
+                if self._catalog is None or spec is None
+                else self._catalog.spec_named(getattr(spec, "name", ""))
+            )
+            if (
+                catalog_spec is None
+                or getattr(catalog_spec, "key", None) != getattr(spec, "key", None)
+            ):
+                continue
+            outputs = tuple(getattr(catalog_spec, "declared_outputs", ()) or ())
+            keys = tuple(node.signal_key(output.name) for output in outputs)
+            if tuple(node.published_signals()) != keys:
+                raise RuntimeError(
+                    "row-less runtime outputs differ from catalog-declared exact keys"
+                )
+            label = str(
+                getattr(node, "instance_label", "")
+                or getattr(node, "display_label", "")
+                or catalog_spec.title
+            )
+            for key, output in zip(keys, outputs, strict=True):
+                add(
+                    key,
+                    state="running",
+                    label=label,
+                    node=node,
+                    declaration=output,
+                    kind=str(catalog_spec.kind),
+                )
+
+        return topology
 
     def _signal_providers(self) -> dict:
-        """``name -> [node labels]`` for every signal a node produces, so the picker shows
-        WHICH measurement / processor / camera each signal comes from.
+        """Exact key -> its one producer group, annotated with lifecycle state."""
 
-        Covers RUNNING nodes AND the last build of every Logic-tab node (``_last_node``,
-        kept past Stop): a finished scan's ``readout_fidelity`` or a stopped camera's
-        ``frame`` LINGER in the hub, and the picker must still name their source node rather
-        than show a bare signal.  Running nodes are listed first; a name carried by more
-        than one node lists every source node (so an ambiguous pick can be flagged)."""
-        providers: dict[str, list] = {}
-        seen: set[int] = set()
-        for node in self._provider_nodes():
-            if node is None or id(node) in seen or not hasattr(node, "published_signals"):
-                continue
-            seen.add(id(node))
-            label = self._node_label(node)
-            for name in node.published_signals():
-                bucket = providers.setdefault(str(name), [])
-                if label not in bucket:
-                    bucket.append(label)
-        # DECLARED (not-yet-started) Logic-tab nodes: list the signals they WILL publish too,
-        # tagged by their node title, so a Monitor can be wired to a node's output BEFORE that
-        # node is started (#6: connect first, start later).  Skip rows already covered above.
-        for row in self.logic_nodes:
-            node = self._logic_nodes.get(id(row))
-            if node is not None and getattr(node, "running", False):
-                continue
-            label = str(getattr(row.node, "title", "") or getattr(row.node, "name", "") or row.node.kind)
-            keys = list(self._declared_signal_keys(row))
-            if row.node.kind == "task":
-                spec = self._spec_for_logic(row.node)
-                keys.extend(
-                    str(output.name)
-                    for output in getattr(spec, "declared_outputs", ()) or ()
-                )
-            for key in keys:
-                bucket = providers.setdefault(str(key), [])
-                if label not in bucket:
-                    bucket.append(label)
+        state_labels = {
+            "running": "running",
+            "declared-not-started": "declared · not started",
+            "retained-final": "retained FINAL",
+            "retained-view": "retained view",
+        }
+        providers: dict[str, list[str]] = {}
+        for key, entry in self._signal_topology().items():
+            state = str(entry["state"])
+            providers[key] = [
+                f"{entry['label']}  [{state_labels[state]}]"
+            ]
         return providers
 
     def _signal_names(self) -> list[str]:
-        """Published datasets plus catalog-declared outputs not yet produced.
+        """Only exact catalog declarations are offered as picker candidates."""
 
-        The data plane is the runtime source; the catalog declaration is what
-        lets an operator wire a panel before pressing Start.  A FINAL task
-        artifact is deliberately not republished through a mutable signal hub,
-        but its declared output name remains the stable card-to-task binding
-        used by the exact Fit entrance.
-        """
-
-        names = {str(name) for name in self._tick_data.names()}
-        names.update(self._signal_providers().keys())
-        for row in self.logic_nodes:
-            spec = self._spec_for_logic(row.node)
-            for output in getattr(spec, "declared_outputs", ()) or ():
-                names.add(str(output.name))
-        return sorted(names)
+        return sorted(self._signal_topology())
 
     def _signal_formats(self) -> dict:
-        """``name -> standardized array shape`` for every LIVE hub signal, read straight
-        off the most recent published VALUE (``shape_text.describe_shape``) -- AUTO from real
-        data, never a hand-typed name->format map that could drift from what a node
-        actually emits.  Lets the signal picker show each signal's SHAPE, not just its
-        name (e.g. ``occupied  [(35,)]``)."""
-        from zlc_data.shape_text import describe_shape
+        """Describe every value present in the current immutable data front.
+
+        A catalog declaration with no current value deliberately has no format and
+        therefore remains ``waiting`` in the picker.  Once a retained/live
+        :class:`DataBlock` exists, its ``DatasetSchema`` must project successfully:
+        schema drift is a product error, not a reason to silently keep showing
+        ``waiting``.
+        """
+
         out: dict[str, str] = {}
         for name in self._signal_names():
-            try:
-                st = self._signal_structure(name) or {}
-                out[str(name)] = describe_shape(self._signal_values(name), points_shape=st.get("points_shape"),
-                                                data_shape=st.get("data_shape"), grid_shape=st.get("grid_shape"))
-            except Exception:
+            value = self._tick_data.value(str(name))
+            if value is None:
                 continue
+            out[str(name)] = self._describe_from_schema(
+                value.values,
+                value.schema,
+            )
         return out
 
     def _signal_short_names(self) -> dict:
-        """``{full hub signal: SHORT name}`` = each PROVIDER node's published signals with that node's
-        prefix stripped (``temperature_survival`` -> ``survival``, ``frame`` -> ``frame``).  The picker
-        nest binds this so the leaf shows the short name -- the SAME rule the Logic tab uses
-        (``strip_node_prefix``), never the verbose SignalSpec axis label.  Reads the SAME
-        ``_provider_nodes()`` source as every other signal-resolution site so a stopped node's lingering
-        signal keeps its short name instead of showing the verbose full name."""
+        """Map exact producer/output keys to catalog-owned short labels."""
+
         out: dict[str, str] = {}
-        for node in self._provider_nodes():
-            pfx = str(getattr(node, "prefix", "") or "")
-            try:
-                for full in node.published_signals():
-                    out[str(full)] = strip_node_prefix(str(full), pfx)
-            except Exception:
-                continue
+        for key, entry in self._signal_topology().items():
+            declaration = entry["declaration"]
+            if declaration is not None:
+                out[key] = str(declaration.short or declaration.name)
         return out
+
+    def _signal_axis_labels(self) -> dict[str, str]:
+        """Map exact producer/output keys to catalog-authored plot labels."""
+
+        labels: dict[str, str] = {}
+        for key, entry in self._signal_topology().items():
+            declaration = entry["declaration"]
+            if declaration is None:
+                continue
+            label = str(declaration.axis_label or "").strip()
+            labels[key] = label or str(
+                declaration.short or declaration.name
+            )
+        return labels
 
     def _live_node_formats(self, node) -> list[tuple[str, str, str]]:
         """``[(name, shape, description)]`` for a RUNNING node -- one ROW per output, each
@@ -738,37 +933,33 @@ class TaskConsole(QtWidgets.QWidget):
         Task outputs are FINAL artifact declarations and are rendered by the spec-only
         branch in :meth:`_update_row_publishes`, never fabricated as live signals."""
         from zlc_data.shape_text import describe_shape
-        specs = {s.name: s for s in node.output_specs()} if hasattr(node, "output_specs") else {}
-
-        def desc(name: str) -> str:
-            spec = specs.get(name)
-            return spec.description if spec is not None else ""
-
+        declarations = tuple(
+            getattr(getattr(node, "spec", None), "declared_outputs", ()) or ()
+        )
+        published = tuple(node.published_signals())
         rows: list[tuple[str, str, str]] = []
-        # published_signals() are HUB names (incl. the node's disambiguating prefix when two
-        # nodes would collide).  Show the SHORT natural name (strip the prefix) because the
-        # Logic row is already titled by the node.  ``output_specs`` (and so ``desc``) is
-        # keyed by the FULL published name: look descriptions up by ``full``.
-        pfx = str(getattr(node, "prefix", "") or "")
-        for full in sorted(node.published_signals()):
-            short = strip_node_prefix(full, pfx)             # ONE rule, shared with the picker nest
-            try:
-                # SAME schema-driven formatter as the task branch (#12): a hub signal and a task
-                # output of the same logical shape render byte-identically -- no drift possible.
-                # ZERO-COPY: read the tensor's ``.data`` (a reference -- only ``.shape`` is used) rather
-                # than ``hub.latest`` (which .copy()s the whole 2.3 MB frame every tick just to format a
-                # shape string, #4-E).
-                shape = self._describe_from_schema(self._signal_values(full), self._signal_schema(full))
-            except Exception:
-                shape = "—"
-            rows.append((short, shape, desc(full)))
+        for full, declaration in zip(published, declarations):
+            short = str(declaration.short or declaration.name)
+            # Same schema-driven formatter as the task branch: a live signal and a task
+            # output of the same logical shape render byte-identically -- no drift possible.
+            shape = self._describe_from_schema(
+                self._signal_values(full),
+                self._signal_schema(full),
+            )
+            rows.append(
+                (
+                    short,
+                    shape,
+                    str(declaration.description or declaration.axis_label),
+                )
+            )
         return rows
 
     def _update_row_publishes(self, row: "LogicNodeRow") -> None:
         """Fill a Logic-tab row's "publishes:" legend (ONE signal per line: name, shape,
         meaning).  Shapes are AUTO-EXTRACTED from the real published VALUES
         (``shape_text.describe_shape``) and the meaning from the node's ``output_specs`` --
-        never a hand-typed map.  Running node: live shapes off the hub (measurement /
+        never a hand-typed map.  Running node: live data-plane shapes (measurement /
         processor).  A task lists its declared FINAL artifact names at every
         lifecycle state; those names never pretend to be live data-plane signals.
         Stopped data-plane node: the NAMES it will publish (shape ``—`` until it runs)."""
@@ -783,119 +974,152 @@ class TaskConsole(QtWidgets.QWidget):
         if node is not None and getattr(node, "running", False):
             row.set_publishes(self._live_node_formats(node))
             return
-        # The legend shows the SHORT name (strip the node prefix), exactly like the running path
-        # (_live_node_formats); _declared_signal_keys now returns the FULL published names (#prebind).
-        pfx = self._declared_node_prefix(row)
-        row.set_publishes([(strip_node_prefix(k, pfx), "—", "") for k in self._declared_signal_keys(row)])
-
-    def _declared_node_prefix(self, row: "LogicNodeRow") -> str:
-        """The hub-signal PREFIX the row's node publishes under -- so a declared name == the
-        published name (a binding made before Start, or restored from a saved layout, re-attaches
-        the instant the producer starts, #prebind).
-
-        The prefix is allocated ONCE, at Start, by the shared per-instance rule
-        (``_logic_node_prefix``) and then STICKS as the instance's identity: a row that has (ever)
-        been built reads its node's own ``prefix`` back -- re-running the collision rule later
-        would drift with hub state (a sibling stopped by the device exclusion before it ever
-        published leaves no trace, so a recomputation would 'un-collide' a name that IS published).
-        Only a never-started row PREDICTS with the same rule.  A task is off the
-        data plane and therefore has no prefix."""
-        if row.node.kind == "task":
-            return ""
-        built = self._logic_nodes.get(id(row)) or (getattr(self, "_last_node", {}) or {}).get(id(row))
-        if built is not None and hasattr(built, "prefix"):
-            return str(built.prefix or "")
-        return self._logic_node_prefix(row.node)
+        spec = self._spec_for_logic(row.node)
+        outputs = tuple(getattr(spec, "declared_outputs", ()) or ())
+        row.set_publishes(
+            [
+                (
+                    str(output.short or output.name),
+                    "—",
+                    str(output.description or output.axis_label),
+                )
+                for output in outputs
+            ]
+        )
 
     def _declared_signal_keys(self, row: "LogicNodeRow") -> list[str]:
-        """The FULL hub names a STOPPED Logic-tab node WILL publish once started -- IDENTICAL to the
-        running node's ``published_signals()`` (same node prefix, #prebind), so the picker offers, and
-        a Monitor binding stores, the SAME name the node later emits.  That makes a "connect first,
-        start later" binding (and a save->load of one) re-attach automatically when the producer
-        publishes that exact name.  The bare keys come from the ONE kind ladder
-        (:meth:`_node_bare_keys` -- shared with the prefix collision check, so what the picker
-        declares is exactly what is checked and published).  A task publishes no live signal;
-        its declared FINAL artifact names are added separately for the exact Analysis entry."""
-        if row.node.kind == "task":
-            return []
-        pfx = self._declared_node_prefix(row)              # prepend the node prefix -> == published_signals()
-        return [f"{pfx}{k}" for k in self._node_bare_keys(row.node)]
+        """Exact keys a row will publish or commit, before it is started."""
+
+        spec = self._spec_for_logic(row.node)
+        return [
+            console_signal_key(row.node.title, output.name)
+            for output in getattr(spec, "declared_outputs", ()) or ()
+        ]
+
+    def resolve_console_producer(self, signal_key: str):
+        """Resolve one selected output against exactly one row in this console.
+
+        This is the processor-binding boundary, not a signal-name search.  The
+        selected value must equal a catalog-declared producer/output key; no
+        prefix parsing, filesystem lookup, ``latest`` artifact lookup, or
+        cross-console fallback is permitted.
+        """
+
+        from .occupancy_binding import ConsoleProducerBinding
+
+        if type(signal_key) is not str or not signal_key:
+            raise TypeError("console producer signal key must be a non-empty str")
+        matches: list[tuple[object, object, object]] = []
+        for row in self.logic_nodes:
+            spec = self._spec_for_logic(row.node)
+            if spec is None:
+                continue
+            outputs = tuple(getattr(spec, "declared_outputs", ()) or ())
+            keys = tuple(self._declared_signal_keys(row))
+            for key, output in zip(keys, outputs, strict=True):
+                if key == signal_key:
+                    matches.append((row, spec, output))
+        if not matches:
+            raise LookupError(
+                f"{signal_key!r} is not an output of a node in this TaskConsole"
+            )
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"{signal_key!r} resolves to more than one TaskConsole node"
+            )
+        row, spec, output = matches[0]
+        editor = self._logic_editors.get(id(row))
+        if editor is None:
+            values = dict(row.node.values or {})
+        else:
+            try:
+                edited = editor.collect_values()
+            except Exception as error:
+                raise ValueError(
+                    f"{row.node.title!r} has invalid current form values: {error}"
+                ) from error
+            values = {**dict(row.node.values or {}), **edited}
+        request = spec.build_request(values)
+        run_node = (
+            self._logic_nodes.get(id(row))
+            or self._last_node.get(id(row))
+        )
+        if run_node is not None:
+            runtime_spec = getattr(run_node, "spec", None)
+            if (
+                getattr(runtime_spec, "key", None) != spec.key
+                or str(getattr(run_node, "instance_label", ""))
+                != str(row.node.title)
+            ):
+                raise RuntimeError(
+                    "retained producer runtime does not belong to the selected row"
+                )
+        resolved = bool(
+            run_node is not None
+            and getattr(run_node, "final_result_resolved", False)
+        )
+        return ConsoleProducerBinding(
+            signal_key=signal_key,
+            producer_label=str(row.node.title),
+            definition_key=spec.key,
+            output_name=str(output.name),
+            request=request,
+            run_node=run_node,
+            final_result_resolved=resolved,
+            final_result=(
+                getattr(run_node, "final_result", None)
+                if resolved
+                else None
+            ),
+        )
 
     def _node_for_signal(self, name: str):
-        """The producing node for signal ``name``: a RUNNING node first, else the last build of a
-        Logic-tab node (``_last_node``, kept past Stop) so a stopped node's lingering signal still
-        resolves.  None if none publishes it."""
-        for node in self._provider_nodes():
-            if node is not None and hasattr(node, "published_signals"):
-                try:
-                    if name in node.published_signals():
-                        return node
-                except Exception:
-                    continue
-        return None
+        """Return the exact running/retained producer; declarations are not Runs."""
+
+        entry = self._signal_topology().get(str(name))
+        return None if entry is None else entry["node"]
 
     @staticmethod
     def _schema_structure(schema) -> dict[str, object]:
-        """Project one authoritative ``SignalSchema`` into the plot structure mapping."""
+        """Project the authoritative ``DatasetSchema`` into display shape groups."""
 
-        ps = tuple(schema.point_shape)
-        ds = tuple(schema.data_shape)
-        metadata = dict(schema.metadata)
-        grid = tuple(metadata.get("grid_shape", ()))
-        if not grid and len(ps) == 2:
-            grid = ps
+        from zlc_data import DatasetSchema
+
+        if not isinstance(schema, DatasetSchema):
+            raise TypeError("TaskConsole signals require zlc_data.DatasetSchema")
+        logical_points = tuple(schema.point_layout.logical_shape)
+        dense = schema.point_layout.storage_size == math.prod(logical_points)
+        points = (
+            logical_points
+            if logical_points and dense
+            else (schema.point_layout.storage_size,)
+        )
+        grid = logical_points if dense and len(logical_points) == 2 else ()
         return {
-            "points_shape": ps,
-            "data_shape": ds,
+            "points_shape": points,
+            "data_shape": tuple(schema.cell_schema.data_shape),
             "grid_shape": grid,
-            "ring": int(schema.repeat_capacity or 1),
-            "metadata": metadata,
+            "ring": int(schema.repeat_axis.size),
         }
 
     def _describe_from_schema(self, value, schema) -> str:
-        """The ONE declared-shape string for any legend/picker row.  Projects a ``SignalSchema``
-        through :meth:`_schema_structure` (the single grid rule) and renders it in the canonical
-        ``R × P × (data)`` grammar, so a TASK output, a hub signal, a running node and a
-        not-yet-published declared signal ALL read identically -- never the raw ``(R×P×data)``
-        one-outer-paren spelling ``describe_shape`` falls back to when a caller forgets the schema
-        (issue #12: calibration / mot-field task rows).  A canonical block's leading axis is R;
-        with no value yet, R is the schema's declared repeat capacity.  No schema -> the raw
-        value-only ``describe_shape`` (a scalar result still reads ``scalar``)."""
+        """Render one current ``DatasetSchema`` in canonical ``R × P × (data)`` form."""
+
         from zlc_data.shape_text import contract_shape_label, describe_shape
+
         if schema is None:
             return describe_shape(value)
         st = self._schema_structure(schema)
         ps, ds, gs = st["points_shape"], st["data_shape"], st["grid_shape"]
         if value is not None:
-            return describe_shape(value, points_shape=ps, data_shape=ds, grid_shape=gs)
+            actual_shape = tuple(int(size) for size in np.shape(value))
+            expected_shape = tuple(schema.physical_shape)
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    "signal value shape does not match DatasetSchema: "
+                    f"{actual_shape} != {expected_shape}"
+                )
         return contract_shape_label(int(st["ring"] or 1), ps, ds, gs)
-
-    def _signal_structure(self, name: str):
-        """Read the authoritative data-plane ``SignalSchema`` for plotting."""
-
-        name = str(name)
-        try:
-            schema = self._signal_schema(name)
-        except KeyError:
-            return None
-        result = self._schema_structure(schema)
-        metadata = dict(schema.metadata)
-        coordinate_names = tuple(metadata.get("coordinate_signals", ()))
-        if coordinate_names:
-            arrays = []
-            for coordinate_name in coordinate_names:
-                coordinate = np.asarray(self._signal_values(str(coordinate_name)), dtype=float)
-                coordinate_schema = self._signal_schema(str(coordinate_name))
-                expected = (coordinate.shape[0], coordinate_schema.point_count, 1)
-                if coordinate_schema.data_shape != (1,) or tuple(coordinate.shape) != expected:
-                    raise ValueError(
-                        f"coordinate signal {coordinate_name!r} must be canonical (R,P,1); "
-                        f"got {coordinate.shape}")
-                arrays.append(coordinate[-1, :, 0].tolist())
-            result["param_names"] = [str(value) for value in
-                                     metadata.get("axis_order", coordinate_names)]
-            result["points_coords"] = arrays
-        return result
 
     @staticmethod
     def _card_signal_binding(card: "PanelCard") -> str:
@@ -932,35 +1156,31 @@ class TaskConsole(QtWidgets.QWidget):
         no such mutation does not enter this method's provider enumeration."""
         if not self._signal_info_dirty:
             return
-        providers = self._signal_providers()
-        # GC the hub of ORPHANED signals (#5 unbound): the AUTHORITATIVE invariant -- a hub signal that NO
-        # live producer still publishes is stale and must leave, else it piles up as an "(unbound)" picker
-        # entry run-after-run.  ``providers`` is the single source of "who publishes what" (running nodes +
-        # stopped-but-kept rows via _last_node + declared rows); a hub name absent from it has no owner ->
-        # purge.  A STOPPED node's signals are KEPT (its row is still a provider via _last_node -- a finished
-        # scan stays plottable).  (A node error is surfaced via instance attrs + the banner, never as a hub
-        # signal, so there is no reserved health channel to exempt here.)  This runs only when the provider
-        # map / card sources CHANGED (the guard above), which a SWITCH does even with no rebuild: a live
-        # ``frames_per_cycle`` 3->1 shrinks a running camera's published set {frame_0,1,2}->{frame_0},
-        # dropping frame_1/frame_2 from ``providers`` -> they are caught here (the eager purges in
-        # _start/_remove_logic_node cover the rebuild / remove paths synchronously; THIS catches every
-        # remaining path, switches included).
+        topology = self._signal_topology()
+        short_names = self._signal_short_names()
         for card in self.cards:
             reads = sorted(self._card_reads(card))
             parts: list[str] = []
             for name in reads:
-                src = self._node_for_signal(name)
-                if src is not None:
-                    layer = str(getattr(src, "layer", ""))
-                    tag = self._node_label(src)
-                    tag = f"{tag} [{layer}]" if layer and layer != "node" else tag
-                    note = "  ⚠ also from another node" if len(providers.get(name, [])) > 1 else ""
-                    # The producing node is named to the RIGHT of the arrow, so the signal need
-                    # not repeat its prefix -- the ONE strip_node_prefix rule the nested combo uses.
-                    short = strip_node_prefix(name, getattr(src, "prefix", ""))
-                    parts.append(f"{short} ← {tag}{note}")
+                entry = topology.get(name)
+                if entry is None or entry["state"] == "truly-unbound":
+                    parts.append(
+                        f"{name} ← truly unbound "
+                        "(no catalog producer/output)"
+                    )
                 else:
-                    parts.append(f"{name} ← (no running source)")
+                    state = str(entry["state"])
+                    state_text = {
+                        "running": "running",
+                        "declared-not-started": "declared, not started",
+                        "retained-final": "retained FINAL",
+                        "retained-view": "retained view",
+                    }[state]
+                    label = str(entry["label"])
+                    layer = str(entry["kind"])
+                    tag = f"{label} [{layer}]" if layer else label
+                    short = short_names.get(name, name)
+                    parts.append(f"{short} ← {tag} · {state_text}")
             if not reads:
                 parts.append("(no signal set — pick one in Setting: value = <signal>)")
             # one read per line: "<signal> ← <node> [layer]" -- the value's origin only,
@@ -1022,7 +1242,10 @@ class TaskConsole(QtWidgets.QWidget):
             if snapshot is not None and snapshot.state.terminal:
                 if (
                     snapshot.state.name == "SUCCEEDED"
-                    and not node.final_result_resolved
+                    and (
+                        not node.final_result_resolved
+                        or not node.final_projection_resolved
+                    )
                 ):
                     if time.monotonic() >= deadline:
                         return False
@@ -1036,10 +1259,7 @@ class TaskConsole(QtWidgets.QWidget):
             time.sleep(0.01)
         if node in self.running_nodes:
             self.running_nodes.remove(node)
-            # A stopped Logic row remains represented by ``_last_node`` and
-            # therefore keeps the same provider legend.  Row-less injected
-            # nodes have no retained provider and are a real topology change.
-            if not any(value is node for value in self._last_node.values()):
+            if not any(value is node for value in self._logic_nodes.values()):
                 self._signal_topology_changed()
         return True
 
@@ -1114,6 +1334,73 @@ class TaskConsole(QtWidgets.QWidget):
         empty board, so an embedded console with nothing loaded yet does not thrash."""
         if getattr(self, "cards", None):
             self._arrange()
+
+    def _current_raster_pixel_ratio(self) -> float:
+        """Read the physical/logical ratio of this console's actual window."""
+
+        top = self.window()
+        ratio = float(
+            top.devicePixelRatioF()
+            if top is not None
+            else self.devicePixelRatioF()
+        )
+        return ratio if math.isfinite(ratio) and ratio > 0.0 else 1.0
+
+    def _sync_raster_pixel_ratio(self, *_args) -> None:
+        """Recompose accepted fronts when the window moves between DPRs."""
+
+        ratio = self._current_raster_pixel_ratio()
+        if ratio == self._raster_pixel_ratio:
+            return
+        self._raster_pixel_ratio = ratio
+        requests = []
+        for card in self.cards:
+            if not card.set_raster_pixel_ratio(ratio):
+                continue
+            request = card.freeze_current_view_request()
+            if request is not None:
+                requests.append(request)
+        if requests and not self._render_lane.closing:
+            self._render_lane.enqueue(tuple(requests))
+
+    def _observe_raster_screen(self, screen) -> None:
+        if screen is None or id(screen) in self._observed_raster_screens:
+            return
+        self._observed_raster_screens.add(id(screen))
+        for name in (
+            "logicalDotsPerInchChanged",
+            "physicalDotsPerInchChanged",
+        ):
+            signal = getattr(screen, name, None)
+            if signal is not None:
+                signal.connect(self._sync_raster_pixel_ratio)
+
+    def _raster_screen_changed(self, screen) -> None:
+        self._observe_raster_screen(screen)
+        QtCore.QTimer.singleShot(0, self._sync_raster_pixel_ratio)
+
+    def _bind_raster_screen(self) -> None:
+        """Observe the native window that determines TaskConsole raster DPR."""
+
+        if not self.isVisible():
+            return
+        top = self.window()
+        handle = None if top is None else top.windowHandle()
+        if handle is None:
+            QtCore.QTimer.singleShot(0, self._bind_raster_screen)
+            return
+        if handle is not self._raster_window_handle:
+            self._raster_window_handle = handle
+            handle.screenChanged.connect(self._raster_screen_changed)
+        self._observe_raster_screen(handle.screen())
+        self._sync_raster_pixel_ratio()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().showEvent(event)
+        # The native QWindow is only guaranteed after the formal Fluent host
+        # shows.  Bind on the next Qt owner turn for both standalone and
+        # embedded TaskConsoles.
+        QtCore.QTimer.singleShot(0, self._bind_raster_screen)
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
         # Re-pack the gravity board when its scroll viewport WIDTH changes (window resized): the pack
@@ -1229,6 +1516,12 @@ class TaskConsole(QtWidgets.QWidget):
             phases.add("shutdown")
         if "removed" not in phases:
             self.cards.remove(card)
+            self._latest_rectangle_control_by_card.pop(id(card), None)
+            self._rectangle_controls = {
+                revision: pending
+                for revision, pending in self._rectangle_controls.items()
+                if pending[1] is not card
+            }
             self._card_signal_bindings.pop(id(card), None)
             self._signal_topology_changed()
             phases.add("removed")
@@ -1268,89 +1561,9 @@ class TaskConsole(QtWidgets.QWidget):
         return spec if spec is not None and spec.kind == node.kind else None
 
     def _unique_logic_title(self, title: str) -> str:
-        """Make a logic-node title ``"<base> #N"`` and UNIQUE among the existing Logic rows
-        (G1) -- so two same-kind nodes are told apart in the Logic
-        rows AND get distinct per-instance signal prefixes (see _logic_node_prefix).  Re-indexes
-        a loaded title's root, so an already-clean saved layout round-trips."""
+        """Return the saved producer label, unique among the Logic rows."""
+
         return indexed_unique_name(title, {str(r.node.title) for r in self.logic_nodes})
-
-    def _node_bare_keys(self, node: LogicNodeConfig) -> list[str]:
-        """The SHORT (un-prefixed) output names a logic node emits -- the ONE derivation shared by
-        the prefix collision check (:meth:`_logic_node_prefix`) and the declared picker names
-        (:meth:`_declared_signal_keys`), so what is checked for collision is exactly what will be
-        published.  Processor: the spec's ``result_keys``; measurement: its x/y curve keys (or, when
-        the spec exposes a ``declared_keys`` deriver, the REAL published names for its form values --
-        pulse-scan overrides ``x_key="param"`` with the semantic scan coordinate, so the deriver keeps
-        declared == published); camera: ``frame_i`` per emCCD event (``frames_per_cycle``, the same
-        helper ``CameraMeasurement.published_signals`` uses so they can never drift)."""
-        spec = self._spec_for_logic(node)
-        declared = (getattr(spec, "metadata", None) or {}).get("declared_keys")
-        if callable(declared):
-            try:
-                return [str(k) for k in declared(node.values or {})]
-            except Exception:
-                pass                                       # fall back to the static spec keys below
-        keys = [str(k) for k in (getattr(spec, "result_keys", ()) or [])]
-        if not keys and node.kind == "measurement":
-            keys = [k for k in (getattr(spec, "x_key", ""), getattr(spec, "y_key", "")) if k]
-        if not keys and node.kind == "camera":
-            from zlc_data.shape_text import camera_frame_keys
-            keys = camera_frame_keys((node.values or {}).get("frames_per_cycle", 1))
-        return keys
-
-    def _logic_node_base_prefix(self, node: LogicNodeConfig) -> str:
-        """The KIND-semantic default prefix a logic node publishes under when nothing collides.
-        Measurement: ``f"{spec.key}_"`` so every signal self-describes its quantity
-        (``temperature_t_off`` -- one name, derived, #H3r).  Camera / processor: ``""`` -- the short
-        natural names (``frame_0`` / ``occupied``); the PRODUCER is shown by the signal-flow legend
-        and never baked into the signal (which camera INSTANCE, let alone which DEVICE, is not the
-        signal's business -- a consumer binds an instance's output, not a piece of hardware)."""
-        if node.kind == "measurement":
-            spec = self._spec_for_logic(node)
-            return f"{spec.key}_" if spec is not None else ""
-        return ""
-
-    def _logic_node_prefix(self, node: LogicNodeConfig) -> str:
-        """The hub-signal prefix for a logic node -- the ONE rule for EVERY kind (camera /
-        measurement / processor): the kind-semantic base prefix (:meth:`_logic_node_base_prefix`)
-        by default, upgraded to a per-INSTANCE slug (from the row's unique title, ``occupancy_2_``)
-        only when the base-prefixed names would COLLIDE with another node's signals.  A signal's
-        namespace is the logic-node INSTANCE that produces it: two rows of the same kind can never
-        overwrite each other, and no device / backend identity ever leaks into a signal name."""
-        keys = self._node_bare_keys(node)
-        base = self._logic_node_base_prefix(node)
-        # Collision is checked against EVERY signal live in the hub -- running nodes AND a STOPPED
-        # node's lingering signals -- not just running_nodes (#2): otherwise a new same-kind node added
-        # after an earlier one STOPPED (its signals deliberately linger) would see no running collision,
-        # take the empty prefix, and CLOBBER the stopped node's lingering data on the hub.
-        running: set[str] = set(self._tick_data.versions())
-        for n in self.running_nodes:
-            try:
-                running.update(str(s) for s in n.published_signals())  # just-started, maybe not in hub yet
-            except Exception:
-                pass
-        # A RESTART reclaims its OWN lingering signals -- they are not a collision (#issue-1): without
-        # this, restarting a node sees its own STOPPED outputs still in the hub, takes a fresh
-        # numbered prefix, and every panel bound to the original names goes UNBOUND.  Its
-        # prior built node survives Stop in _last_node tagged with instance_label == this node's title.
-        # (The same rule is what lets a row SWITCH its camera device and restart: the row keeps its
-        # signal names, the new device's frames simply flow under them -- panels follow seamlessly.)
-        for prev in (getattr(self, "_last_node", {}) or {}).values():
-            if prev is not None and str(getattr(prev, "instance_label", "")) == str(node.title):
-                try:
-                    running.difference_update(str(s) for s in prev.published_signals())
-                except Exception:
-                    pass
-        if not keys or not any((base + key) in running for key in keys):
-            return base                              # no collision (incl. own restart) -> the base names
-        from zlc_data.shape_text import measurement_slug
-        slug = measurement_slug(node.title or node.name) or str(node.kind) or "node"
-        prefix, k = f"{slug}_", 2
-        while prefix in {getattr(n, "prefix", "") for n in self.running_nodes} \
-                or any((prefix + key) in running for key in keys):
-            prefix = f"{slug}_{k}_"
-            k += 1
-        return prefix
 
     def _attach_logic_node(self, node: LogicNodeConfig, *, focus: bool = False) -> "LogicNodeRow | None":
         """Add a STOPPED logic-node row to the Logic tab (no node built yet).  A NO-OP when embedded:
@@ -1401,10 +1614,7 @@ class TaskConsole(QtWidgets.QWidget):
             spec = self._spec_for_logic(row.node)
             if spec is None or str(getattr(spec, "kind", "")) != "task":
                 continue
-            outputs = {
-                str(output.name)
-                for output in getattr(spec, "declared_outputs", ()) or ()
-            }
+            outputs = set(self._declared_signal_keys(row))
             if reads.isdisjoint(outputs):
                 continue
             matched_nodes.append(self._last_node.get(id(row)))
@@ -1494,10 +1704,8 @@ class TaskConsole(QtWidgets.QWidget):
             # an Edit-triggered restart.  Preserve those: form values WIN for keys it owns, stored fills
             # the rest -- the same "don't lose a param the UI can't show" rule the retarget seam relies on.
             values = {**dict(row.node.values or {}), **values}
-        # BUILD-VALIDATE-COMMIT (#A2): build the NEW node FIRST -- a bad param edit must never
-        # kill the run that is already going (the old order stopped the running node, then failed
-        # the build, leaving nothing running); and nothing is registered until start() succeeds,
-        # so a failed start can never leave a half-started ghost in running_nodes / the hub.
+        # Build the replacement before stopping the current run.  Invalid form
+        # values therefore cannot destroy a valid running node.
         try:
             node = self._build_logic_node(row.node, values)
         except Exception as exc:
@@ -1506,12 +1714,13 @@ class TaskConsole(QtWidgets.QWidget):
                 editor.set_status(f"build failed: {exc}", error=True)
             return
         row.node.values = dict(values)            # remember for the next Edit reopen + save
-        # Label the built node with its ROW TITLE so its provider label MATCHES the declared row's
-        # (the DEFAULT camera has prefix="" -> display_label would otherwise fall back to
-        # node_label="camera", which differs from the row title "Camera (live frames)", listing
-        # `frame` under TWO sources = the "two cameras" bug).  One label per node => one entry in
-        # the signal picker (#H3n).
+        # The saved row title is the producer-instance half of every exact
+        # panel binding; the catalog owns the output-name half.
         node.instance_label = str(getattr(row.node, "title", "") or getattr(node, "instance_label", ""))
+        previous = (
+            self._logic_nodes.get(id(row))
+            or self._last_node.get(id(row))
+        )
         # The build is good -- NOW stand the previous run of THIS node down (never pile up), and
         # apply the device-OCCUPANCY mutual exclusion over ALL running nodes (#A3): each node
         # declares the hardware INSTANCES it drives (``occupied_devices``, from its own
@@ -1532,13 +1741,6 @@ class TaskConsole(QtWidgets.QWidget):
         if not self._timer.isActive():
             self._timer.start()
         try:
-            # A restart of THIS logical row keeps its signal names.  Hand the stopped instance's
-            # schema-ownership proof to the replacement before its worker can publish: if switching
-            # devices/ROI changes data_shape, the replacement's first frame then takes the normal
-            # explicit schema-version path (which drops incompatible history) instead of looking like
-            # an unrelated producer trying to clobber the lingering signal.  The node base validates
-            # same hub + stopped owner + exact current definition; the console never relaxes shape
-            # compatibility and never reaches into the hub's schema internals.
             self._begin_run(node)
         except Exception as exc:
             row.set_state("error", status=f"start failed: {exc}")
@@ -1546,11 +1748,9 @@ class TaskConsole(QtWidgets.QWidget):
                 editor.set_running(False)
                 editor.set_status(f"start failed: {exc}", error=True)
             return
-        # COMMIT: the node is genuinely running -- only now does it enter the registries, and only
-        # now are the previous build's orphan signals unlinked (a failed start leaves the old
-        # signals in the hub untouched, exactly like a plain Stop, so nothing is lost).
-        # #5: unlink any signal the PREVIOUS build published that this new build no longer does AND no
-        # other running node owns -> a switched/rebuilt node leaves NO orphan "(unbound)" signal behind.
+        if previous is not None and previous is not node:
+            self._data.detach(previous)
+        # Commit the replacement to the row only after start submission succeeds.
         self._logic_nodes[id(row)] = node
         self._last_node[id(row)] = node           # survives Stop, for signal-source labelling
         self._signal_topology_changed()
@@ -1734,6 +1934,9 @@ class TaskConsole(QtWidgets.QWidget):
         if row is self._running_task_row:
             self._clear_task_running()
         self._logic_nodes[id(row)] = None
+        # Running, retained FINAL/view, and declared-not-started are
+        # intentionally different picker/legend states.
+        self._signal_topology_changed()
         editor = self._logic_editors.get(id(row))
         if not _silent:
             row.set_state("stopped", status="stopped")
@@ -1750,16 +1953,9 @@ class TaskConsole(QtWidgets.QWidget):
         # passes _rebuild=False and is never reached while locked.
         if self._task_locked and _rebuild:
             return False
-        # Capture this node's published signals so REMOVE can PURGE them from the hub -- a removed
-        # node's signals are stale and must leave, else they pile up run-after-run as "多余 signal" in
-        # every picker (#2).  STOPPING keeps them (a finished scan stays plottable / a panel can be
-        # wired before the next run); only REMOVING purges.  Use ``_last_node`` (the last built node,
-        # retained THROUGH stop) not ``_logic_nodes`` (None'd on stop): the common flow is STOP-then-
-        # REMOVE, where the live ref is already gone but the lingering hub signals are precisely the
-        # ones to purge.
+        # Removing a row also retires its retained terminal display source.
         gone = (
             self._logic_nodes.get(id(row))
-           
             or self._last_node.get(id(row))
         )
         if not self._stop_logic_node(row, _silent=True):
@@ -1774,6 +1970,8 @@ class TaskConsole(QtWidgets.QWidget):
             editor.deleteLater()
         self._logic_nodes.pop(id(row), None)
         self._last_node.pop(id(row), None)
+        if gone is not None:
+            self._data.detach(gone)
         if row in self.logic_nodes:
             self.logic_nodes.remove(row)
         self._signal_topology_changed()
@@ -1831,16 +2029,31 @@ class TaskConsole(QtWidgets.QWidget):
                         editor.set_running(False)
                         editor.set_status(f"error: {message}", error=True)
                 elif state == "SUCCEEDED":
-                    if not node.final_result_resolved:
+                    if (
+                        not node.final_result_resolved
+                        or not node.final_projection_resolved
+                    ):
                         row.set_state("running", status="finishing")
                         if editor is not None:
                             editor.set_running(True)
                             editor.set_status("finishing", error=False)
                         continue
-                    row.set_state("stopped", status="done")
+                    projected = node.projected_final_signals
+                    if projected is not None:
+                        self._data.publish_final(node, projected)
+                    projection_error = node.final_projection_error
+                    done_status = (
+                        "done"
+                        if projection_error is None
+                        else f"done; display unavailable: {projection_error}"
+                    )
+                    row.set_state("stopped", status=done_status)
                     if editor is not None:
                         editor.set_running(False)
-                        editor.set_status("done", error=False)
+                        editor.set_status(
+                            done_status,
+                            error=projection_error is not None,
+                        )
                 else:
                     row.set_state("stopped", status="stopped")
                     if editor is not None:
@@ -1974,6 +2187,7 @@ class TaskConsole(QtWidgets.QWidget):
         # one-shot node's run-complete / error transition is never missed if the node
         # self-stops between version bumps.
         self._poll_logic_nodes()
+        self._drain_rectangle_controls()
         # PAUSE = freeze the board: skip the render below (no card advances its
         # _render_version) while node polling/banners stay alive.  On Resume each
         # card compares only the revisions of the producers it actually reads.
@@ -2196,6 +2410,7 @@ class TaskConsole(QtWidgets.QWidget):
         # may finish in the background, but its result has no QWidget reference
         # and the closing gate discards it.
         self._shutdown_render_lane()
+        self._data.close()
         if not getattr(self, "_on_close_done", False):
             self._shutdown_state = "CLOSING_RESOURCES"
             on_close = getattr(self, "_on_close", None)
@@ -2262,6 +2477,7 @@ def show_task_console(
     run_factory=None,
     data_plane=None,
     fit_window_factory=None,
+    rectangle_selection_sink=None,
     scale: float | None = None,
     window_ratio: float = WINDOW_SCREEN_FRACTION,
     title: str = "TaskConsole@Zou lab",
@@ -2295,6 +2511,7 @@ def show_task_console(
                           catalog_view=catalog_view, run_factory=run_factory,
                           data_plane=data_plane,
                           fit_window_factory=fit_window_factory, scale=scale,
+                          rectangle_selection_sink=rectangle_selection_sink,
                           window_ratio=window_ratio)
     console._on_close = on_close
     # Closing the window must stop the node owner threads (else they keep running, blocked in

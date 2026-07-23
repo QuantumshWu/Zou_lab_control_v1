@@ -578,7 +578,6 @@ def compile_api_slot_segmented_pipeline(
             *pulse_port.interrupt_operations,
             *camera_port.interrupt_operations,
         ),
-        timeout_seconds=capture_spec.timeout_seconds,
         requires_final_commit=False,
     )
 
@@ -671,7 +670,6 @@ def compile_api_slot_segmented_occupancy_pipeline(
             *pulse_port.interrupt_operations,
             *camera_port.interrupt_operations,
         ),
-        timeout_seconds=occupancy_spec.timeout_seconds,
         requires_final_commit=False,
     )
 

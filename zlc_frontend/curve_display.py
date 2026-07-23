@@ -37,7 +37,7 @@ class CurveDisplayState:
     """
 
     revision: int = 0
-    relim_mode: RelimMode = RelimMode.TIGHT
+    relim_mode: RelimMode = RelimMode.NORMAL
     x_view: DisplayRange | None = None
     fixed_y_limits: DisplayRange | None = None
 
@@ -69,7 +69,7 @@ _CURVE_DISPLAY_FORM = FormSpec(
             "relim_mode",
             "choice",
             "Y limits",
-            default=RelimMode.TIGHT,
+            default=RelimMode.NORMAL,
             choices=tuple(
                 FormChoice(mode.value.title(), mode) for mode in RelimMode
             ),
@@ -231,7 +231,7 @@ def numeric_curve_coordinates(axis: EvaluatedAxis) -> tuple[Real, ...]:
 
 
 def curve_home_x_limits(axis: EvaluatedAxis) -> DisplayRange:
-    """Return a deterministic padded home view for a numeric curve axis."""
+    """Return main's exact coordinate span for a numeric curve axis."""
 
     coordinates = numeric_curve_coordinates(axis)
     low = min(coordinates)
@@ -242,11 +242,7 @@ def curve_home_x_limits(axis: EvaluatedAxis) -> DisplayRange:
             (low - half_span, high + half_span),
             "single-point curve home limits",
         )
-    margin = 0.05 * (high - low)
-    return validated_display_range(
-        (low - margin, high + margin),
-        "curve home limits",
-    )
+    return validated_display_range((low, high), "curve home limits")
 
 
 @dataclass(frozen=True, slots=True)

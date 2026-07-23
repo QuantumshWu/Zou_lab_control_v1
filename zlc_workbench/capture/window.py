@@ -9,21 +9,7 @@ import uuid
 
 from PyQt5 import QtCore, QtWidgets
 
-from Zou_lab_control.notebook.facade import (
-    CaptureRequest,
-    Experiment,
-    _prepare_capture_for_workbench,
-)
-from zlc_data import BlockId, SPATIAL_X, SPATIAL_Y
-from zlc_frontend.figure import (
-    DatasetDescriptor,
-    DatasetId,
-    FigureDocument,
-    FigureLayer,
-    SuggestionStatus,
-    ViewIntent,
-    suggest_view,
-)
+from zlc_data import BlockId
 from zlc_frontend.display_range import RelimMode
 from zlc_frontend.image_display import (
     ImageDisplayState,
@@ -47,15 +33,9 @@ from zlc_frontend.qt_widgets import (
     QtOwnerWake,
     QtRasterBoard,
     RectangleGesture,
-    WINDOW_SCREEN_FRACTION,
-    center_window_on_primary_screen,
-    ensure_qt_app,
     release_window,
-    retain_window,
     runtime_range_placeholders,
-    screen_fit_window_size,
     scaled_px,
-    set_fluent_scale,
     FluentSettingsPopupAnchor,
     sync_revisioned_form_editors,
 )
@@ -66,16 +46,17 @@ from zlc_frontend.selector import (
     ImageViewportCommit,
     PanelInteractionOrigin,
 )
-from zlc_neutral_atom.capture_application import PreparedFiniteCapture
+from zlc_neutral_atom.capture_application import CaptureRequest, PreparedFiniteCapture
 from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
 from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot, RunState
 from zlc_workbench.live import LiveBoardController, LiveDatasetSlot
 from zlc_workbench.run_owner import QtRunOwnerMailbox
 from zlc_workbench.workspace import BoardController, BoardModel, PanelSlot
-
-
-_IMAGE_PANEL_ID = "capture-image"
-_PROJECTION_TEXT = "latest rendered raw frame · DISPLAY ONLY"
+from .projection import (
+    IMAGE_PANEL_ID as _IMAGE_PANEL_ID,
+    PROJECTION_TEXT as _PROJECTION_TEXT,
+    prepare_capture_preview_projection,
+)
 
 
 class CaptureWorkbenchWindow(QtWidgets.QWidget):
@@ -83,15 +64,15 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
 
     def __init__(
         self,
-        experiment: Experiment,
+        prepare,
         request: CaptureRequest,
     ) -> None:
         super().__init__()
-        if not isinstance(experiment, Experiment):
-            raise TypeError("experiment must be Experiment")
+        if not callable(prepare):
+            raise TypeError("capture prepare must be callable")
         if not isinstance(request, CaptureRequest):
             raise TypeError("request must be CaptureRequest")
-        self._experiment = experiment
+        self._prepare = prepare
         self._request = request
         self._prepared: PreparedFiniteCapture | None = None
         self._slot: LiveDatasetSlot | None = None
@@ -547,10 +528,9 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         generation = self._run_owner.generation
 
         def prepare() -> PreparedFiniteCapture:
-            command = _prepare_capture_for_workbench(
-                self._experiment,
-                self._request,
-            )
+            command = self._prepare()
+            if not isinstance(command, PreparedFiniteCapture):
+                raise TypeError("capture prepare returned an unexpected command")
             command.preview_schema
             return command
 
@@ -569,51 +549,15 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         command = self._prepared
         next_generation = self._run_owner.generation + 1
         try:
-            schema = command.preview_schema
-            y_axes = tuple(
-                axis
-                for axis in schema.cell_schema.data_axes
-                if axis.role == SPATIAL_Y
+            projection = prepare_capture_preview_projection(
+                command,
+                next_generation,
+                self._image_display,
             )
-            x_axes = tuple(
-                axis
-                for axis in schema.cell_schema.data_axes
-                if axis.role == SPATIAL_X
-            )
-            if (
-                len(y_axes) != 1
-                or len(x_axes) != 1
-                or len(schema.cell_schema.data_axes) != 2
-            ):
-                raise ValueError(
-                    "finite capture image requires exactly one declared "
-                    "SPATIAL_Y and SPATIAL_X axis"
-                )
-            suggestion = suggest_view(schema, ViewIntent.IMAGE)
-            if (
-                suggestion.status is SuggestionStatus.NEEDS_INPUT
-                or suggestion.spec is None
-            ):
-                raise ValueError("IMAGE view needs an explicit axis choice")
-            view = suggestion.spec
-            dataset_id = DatasetId(f"capture-preview-{next_generation}")
-            document = FigureDocument(
-                f"capture-preview-{next_generation}",
-                0,
-                (
-                    DatasetDescriptor(
-                        dataset_id,
-                        "Raw camera frame",
-                        schema.fingerprint,
-                    ),
-                ),
-                (FigureLayer(_IMAGE_PANEL_ID, dataset_id, view),),
-            )
+            dataset_id = projection.dataset_id
+            document = projection.document
             image_display = self._image_display
-            image_viewport = image_viewport_for_display_state(
-                image_display,
-                ImageViewportTransform((y_axes[0], x_axes[0])),
-            )
+            image_viewport = projection.image_viewport
         except BaseException as error:
             self._record_local_failure(
                 f"Preview preflight failed: {type(error).__name__}: {error}"
@@ -979,6 +923,7 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
                     request_owner_wake=self._wake.request_owner_wake,
                     image_display=image_display,
                     image_viewport=image_viewport,
+                    worker_thread_affine=self._run_owner.worker_thread_affine,
                 )
                 self._slot = slot
                 self._board = board
@@ -1222,20 +1167,4 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, self.close)
 
 
-def open_capture_workbench(
-    experiment: Experiment,
-    request: CaptureRequest,
-) -> CaptureWorkbenchWindow:
-    application = ensure_qt_app()
-    if QtCore.QThread.currentThread() != application.thread():
-        raise RuntimeError("capture Workbench must be opened on the Qt GUI thread")
-    set_fluent_scale(None)
-    window = CaptureWorkbenchWindow(experiment, request)
-    window.resize(screen_fit_window_size(WINDOW_SCREEN_FRACTION))
-    retain_window(window)
-    window.show()
-    center_window_on_primary_screen(window, application)
-    return window
-
-
-__all__ = ["CaptureWorkbenchWindow", "open_capture_workbench"]
+__all__ = ["CaptureWorkbenchWindow"]

@@ -25,7 +25,7 @@ from zlc_neutral_atom.runtime.run import RunHandle, RunPlan
 from zlc_neutral_atom.timing.capture import TriggeredCaptureSpec
 from zlc_neutral_atom.timing.pulse import BoundPulsePort
 from zlc_pulse import PulseDocument, PulseExecutionForm
-from zlc_storage import canonical_text, positive_integer, positive_real
+from zlc_storage import canonical_text, positive_integer
 
 
 _CAPTURE_REPEAT_AXIS_ID = AxisId("capture.repeat")
@@ -43,7 +43,6 @@ class CaptureRequest:
     repeat_count: int = 1
     readout_events_per_repeat: int | None = None
     within_point_grouping: tuple[tuple[int, int], ...] | None = None
-    timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.pulse_document, PulseDocument):
@@ -80,11 +79,6 @@ class CaptureRequest:
                     "within_point_grouping must be an iterable of pairs"
                 ) from exc
             object.__setattr__(self, "within_point_grouping", grouping)
-        object.__setattr__(
-            self,
-            "timeout_seconds",
-            positive_real(self.timeout_seconds, "timeout_seconds"),
-        )
 
 
 @dataclass(frozen=True)
@@ -216,7 +210,6 @@ def bind_finite_capture_spec(
     camera_ref: DeviceRef,
     sequencer_ref: DeviceRef,
     execution_form: PulseExecutionForm,
-    timeout_seconds: float,
     name_prefix: str,
 ) -> tuple[TriggeredCaptureSpec, PlanDescriptor]:
     """Freeze the shared exact plan inputs after use-case intent is complete."""
@@ -225,7 +218,6 @@ def bind_finite_capture_spec(
         f"{name_prefix} {binding.pulse_request.document.name}",
         binding.measurement,
         block_id,
-        timeout_seconds=timeout_seconds,
     )
     triggered = TriggeredCaptureSpec(
         pipeline,
@@ -262,9 +254,33 @@ def prepare_finite_capture(
 ) -> PreparedFiniteCapture:
     """Bind one ordinary finite request into a narrow one-shot command."""
 
+    binding = bind_finite_capture_request(
+        request,
+        pulse_port=pulse_port,
+        camera_port=camera_port,
+    )
+    triggered, descriptor = bind_finite_capture_spec(
+        binding=binding,
+        block_id=BlockId(f"capture-{binding.compiled_artifact.fingerprint[:20]}"),
+        camera_ref=request.camera_ref,
+        sequencer_ref=request.sequencer_ref,
+        execution_form=request.execution_form,
+        name_prefix="Capture",
+    )
+    return PreparedFiniteCapture(triggered, repository, start_run, descriptor)
+
+
+def bind_finite_capture_request(
+    request: CaptureRequest,
+    *,
+    pulse_port: BoundPulsePort,
+    camera_port: BoundCapturePort,
+) -> TriggeredCameraBinding:
+    """Bind the physical camera/pulse source shared by capture and processors."""
+
     if not isinstance(request, CaptureRequest):
         raise TypeError("request must be CaptureRequest")
-    binding = bind_triggered_camera_acquisition(
+    return bind_triggered_camera_acquisition(
         pulse_port,
         camera_port,
         pulse_document=request.pulse_document,
@@ -284,16 +300,6 @@ def prepare_finite_capture(
             within_point_grouping=request.within_point_grouping,
         ),
     )
-    triggered, descriptor = bind_finite_capture_spec(
-        binding=binding,
-        block_id=BlockId(f"capture-{binding.compiled_artifact.fingerprint[:20]}"),
-        camera_ref=request.camera_ref,
-        sequencer_ref=request.sequencer_ref,
-        execution_form=request.execution_form,
-        timeout_seconds=request.timeout_seconds,
-        name_prefix="Capture",
-    )
-    return PreparedFiniteCapture(triggered, repository, start_run, descriptor)
 
 
 __all__ = [
@@ -301,5 +307,6 @@ __all__ = [
     "CaptureRequest",
     "PlanDescriptor",
     "PreparedFiniteCapture",
+    "bind_finite_capture_request",
     "bind_finite_capture_spec",
 ]

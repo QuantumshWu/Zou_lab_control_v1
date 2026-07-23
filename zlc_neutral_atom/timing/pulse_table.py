@@ -2187,72 +2187,6 @@ def default_periods(channels: Sequence[str]) -> list[PulsePeriod]:
 
 
 
-#: The shipped single-image probe program's project-relative path -- the ONE place the
-#: file name is typed.  This is the on-disk twin of :func:`single_imaging_template`
-#: (the in-memory factory below, whose state is likewise named ``probe_template``):
-#: every measurement that defaults to the single-image probe pulse (the generic
-#: Pulse-scan, the readout-duration fidelity scan) references THIS constant, so a
-#: rename of the shipped file can never silently strand one consumer on a fabricated
-#: default while the other still loads the tuned template.
-PROBE_TEMPLATE_PATH = "pulses/probe_template.json"
-
-
-def single_imaging_template(
-    channels: Sequence[str] | None = None,
-    *,
-    port_catalog: PortCatalog | None = None,
-    cooling: float = 2e-3,
-    exposure: float = 5e-3,
-    trap_channel: str = "trap",
-    cooling_channel: str = "cooling",
-    probe_channel: str = "probe",
-    trigger_channel: str = "emCCD",
-) -> "PulseTableState":
-    """A SINGLE-shot imaging program (``load`` -> one ``image`` frame, ONE camera trigger).
-
-    It is the compact probe program used wherever one editable image window is desired, including
-    as the generic Pulse-scan's default pulse table.  Acquisition remains a separate producer.
-    The ``image`` duration is API slot ``a1`` so a notebook/API can set the exposure by name."""
-
-    if port_catalog is not None:
-        chans = list(port_catalog.raw_lanes)
-        if channels is not None and tuple(channels) != port_catalog.raw_lanes:
-            raise ValueError("channels do not match port_catalog.raw_lanes")
-    else:
-        chans = list(channels) if channels else [trap_channel, cooling_channel, probe_channel, trigger_channel]
-        port_catalog = PortCatalog.from_channels(chans)
-
-    def states(active) -> tuple[int, ...]:
-        return tuple(1 if ch in active else 0 for ch in chans)
-
-    periods = [
-        PulsePeriod(float(cooling), states({trap_channel, cooling_channel}), unit="s", name="load"),
-        PulsePeriod(float(exposure), states({trap_channel, probe_channel, trigger_channel}), unit="s", name="image"),
-    ]
-    state = PulseTableState(port_catalog=port_catalog, periods=periods, name="probe_template")
-    state.bind_api_field("duration", "1", name="a1", unit="s")   # image exposure, settable by name
-    return state
-
-
-def resolve_pulse_template(template, *, default_name: str, default_factory) -> "PulseTableState":
-    """The resolver for remaining legacy PulseTableState template forms.  Load
-    order: the given path if it is a real file; else the
-    same-named file shipped under the project ``pulses/`` folder -- anchored to the PROJECT ROOT via
-    ``project_path`` (NOT a fragile ``parents[N]`` count that breaks when a caller moves); else the
-    in-memory ``default_factory()`` (e.g. the long-short-long or single-image default)."""
-    from zlc_storage.paths import project_path        # absolute import: the dependency-free path seam
-    text = str(template or "").strip() or default_name
-    path = Path(text)
-    if path.is_file():
-        return PulseTableState.load(path)
-    name = path.name
-    for base in (Path("pulses"), project_path("pulses")):     # CWD-relative, then project-anchored
-        shipped = base / name
-        if shipped.is_file():
-            return PulseTableState.load(shipped)
-    return default_factory()
-
-
 def hardware_tick_ns(sequencer=None) -> float:
     """The ONE hardware tick (ns) a fireable template must author on -- read FROM THE CONNECTED
     sequencer device (``sequencer.clock_hz``, a device property carried by both the real
@@ -2264,37 +2198,6 @@ def hardware_tick_ns(sequencer=None) -> float:
     if clock_hz <= 0.0:
         clock_hz = float(DEFAULT_CLOCK_HZ)
     return 1_000_000_000.0 / clock_hz
-
-
-def resolve_fireable_template(template, *, default_name: str, default_factory, sequencer=None) -> "PulseTableState":
-    """Load a pulse template that is about to be FIRED: :func:`resolve_pulse_template` plus the
-    mandatory hardware-tick snap and the device-catalog expansion -- the SINGLE loader every fire
-    path shares (the generic Pulse-scan, the MOT-field task, the GUI slot preview).
-
-    Fireable = the HARDWARE tick grid + the DEVICE channel catalog, both read off the connected
-    ``sequencer`` when one is given, never off whatever a saved file happened to carry:
-
-    * the ``time_step_ns`` is forced to the one hardware tick (:func:`hardware_tick_ns`).  A finer
-      authoring grid (an old save with ``time_step_ns = 1``, or a factory-built default) would let
-      an api/scan DURATION sweep produce sub-tick durations that fail the clock-grid validation
-      and cannot fire ("api slot does not work"); snapping the grid here makes author == snap ==
-      fire for every template, including a user-local one under ``pulses/``, on whatever clock the
-      connected board reports.
-    * a reusable template is projected onto the FULL device catalog through immutable
-      logical-port identity: exact key first, otherwise one unique same-kind semantic
-      label. Raw lanes, DAC width/index/clock and safe code always come from the device;
-      signed DAC values are re-encoded into that topology. Ambiguous or missing required
-      ports fail loudly. This lets a recipe use semantic ports without becoming a second
-      copy of the board wiring.
-    """
-    state = resolve_pulse_template(template, default_name=default_name, default_factory=default_factory)
-    tick_ns = hardware_tick_ns(sequencer)
-    if state.time_step_ns != tick_ns:
-        state.time_step_ns = tick_ns
-    device_catalog = getattr(sequencer, "port_catalog", None)
-    if device_catalog is not None and state.port_catalog.fingerprint != device_catalog.fingerprint:
-        state = state.aligned_to_catalog(device_catalog)
-    return state
 
 
 def default_visible_ports(port_catalog: PortCatalog) -> list[str]:
@@ -3017,7 +2920,6 @@ def period_index_by_name(state: "PulseTableState", name: str) -> int | None:
 
 __all__ = [
     "ANALOG_BUS_MODES",
-    "PROBE_TEMPLATE_PATH",
     "SCAN_SLOT_KINDS",
     "PulseParam",
     "PulsePeriod",
@@ -3035,7 +2937,6 @@ __all__ = [
     "positive_time_step_ns",
     "quantized_time_ns",
     "quantized_time_steps",
-    "resolve_fireable_template",
     "scan_table_template",
     "scan_target_label",
     "slot_var",

@@ -15,6 +15,7 @@ from fpga.pulse_streamer.host.image import (
     build_fingerprint,
     default_clock_hz,
 )
+from zlc_neutral_atom.acquisition.camera import CameraAcquisitionMode
 from zlc_neutral_atom.installation import (
     DeviceCatalogView,
     DeviceInfo,
@@ -73,6 +74,7 @@ from ._sequencer_endpoint import (
 from ._virtual_hardware import (
     VirtualAtomArray,
     VirtualCamera,
+    VirtualMotFrameSource,
     VirtualMonitorCamera,
     VirtualSequencer,
 )
@@ -202,8 +204,8 @@ def _bind_camera(
     asset: InstallationAsset,
     asset_map_revision: str,
     camera: VirtualCamera,
-) -> BoundCapturePort:
-    endpoint = CameraCaptureEndpoint(
+) -> tuple[BoundCapturePort, BoundCameraMonitorPort]:
+    endpoint = CameraMonitorEndpoint(
         camera,
         asset.role,
         exact_external_trigger_qualification_digest=canonical_digest(
@@ -214,14 +216,17 @@ def _bind_camera(
                 ),
             }
         ),
+        acquisition_mode=CameraAcquisitionMode.EXTERNAL_TRIGGERED,
     )
-    return BoundCapturePort(
-        _bind_camera_endpoint(
-            broker,
-            asset,
-            asset_map_revision,
-            endpoint,
-        )
+    attestation = _bind_camera_endpoint(
+        broker,
+        asset,
+        asset_map_revision,
+        endpoint,
+    )
+    return (
+        BoundCapturePort(attestation),
+        BoundCameraMonitorPort(attestation),
     )
 
 
@@ -709,6 +714,7 @@ def _catalog(
 ) -> DeviceCatalogView:
     domains = {
         "camera": "camera",
+        "mot_camera": "camera",
         "monitor_camera": "camera",
         "sequencer": "sequencer",
         "trap": "trap",
@@ -726,7 +732,8 @@ def _catalog(
             )
             for asset in assets.assets
             if asset.role in devices
-            and asset.role in {"camera", "monitor_camera", "sequencer"}
+            and asset.role in domains
+            and asset.role != "trap"
         ),
     )
 
@@ -745,6 +752,7 @@ def create_virtual_installation(
     trap: VirtualAtomArray | None = None
     sequencer: VirtualSequencer | None = None
     camera: VirtualCamera | None = None
+    mot_camera: VirtualCamera | None = None
     monitor_camera: VirtualMonitorCamera | None = None
     devices: dict[str, object] = {}
     resources: ResourceArbiter | None = None
@@ -775,6 +783,17 @@ def create_virtual_installation(
             capture_trigger_channels=_CAMERA_TRIGGER_CHANNELS,
         )
         devices["camera"] = camera
+        mot_camera = VirtualCamera(
+            VirtualMotFrameSource(
+                sequencer,
+                seed=None if seed is None else seed + 1,
+                coil_ports=_VIRTUAL_MOT_COIL_PORTS,
+            ),
+            sequencer=sequencer,
+            capture_trigger_channels=_CAMERA_TRIGGER_CHANNELS,
+            exposure=0.05,
+        )
+        devices["mot_camera"] = mot_camera
         monitor_camera = VirtualMonitorCamera(
             sequencer,
             coil_ports=_VIRTUAL_MOT_COIL_PORTS,
@@ -786,16 +805,17 @@ def create_virtual_installation(
             {
                 "sequencer": sequencer,
                 "camera": camera,
+                "mot_camera": mot_camera,
                 "monitor_camera": monitor_camera,
             }
         )
         installation_id = f"installation-{assets.revision[:20]}"
         runtime_instance_id = uuid.uuid4().hex
-        for role in ("sequencer", "camera", "monitor_camera"):
+        for role in ("sequencer", "camera", "mot_camera", "monitor_camera"):
             devices[role].ensure_open()
         sequencer.set_safe_state()
         broker = DeviceBroker()
-        camera_port = _bind_camera(
+        camera_port, readout_camera_monitor_port = _bind_camera(
             broker,
             assets.require("camera", camera),
             assets.revision,
@@ -806,6 +826,12 @@ def create_virtual_installation(
             assets.require("monitor_camera", monitor_camera),
             assets.revision,
             monitor_camera,
+        )
+        mot_camera_port, mot_camera_monitor_port = _bind_camera(
+            broker,
+            assets.require("mot_camera", mot_camera),
+            assets.revision,
+            mot_camera,
         )
         pulse_port = _bind_sequencer(
             broker,
@@ -841,12 +867,25 @@ def create_virtual_installation(
             resources=resources,
             broker=broker,
             controller=controller,
-            camera_ports={"camera": camera_port},
-            camera_monitor_ports={"monitor_camera": camera_monitor_port},
+            camera_ports={
+                "camera": camera_port,
+                "mot_camera": mot_camera_port,
+            },
+            camera_monitor_ports={
+                "camera": readout_camera_monitor_port,
+                "mot_camera": mot_camera_monitor_port,
+                "monitor_camera": camera_monitor_port,
+            },
             pulse_ports={"sequencer": pulse_port},
             sitemap_profiles={"camera": sitemap_profile},
             raw_graph=devices,
-            close_order=("monitor_camera", "camera", "sequencer", "trap"),
+            close_order=(
+                "monitor_camera",
+                "mot_camera",
+                "camera",
+                "sequencer",
+                "trap",
+            ),
         )
         return runtime
     except BaseException as primary:
@@ -854,9 +893,10 @@ def create_virtual_installation(
         authority_actions = (
             None if broker is None else broker.shutdown,
             None if monitor_camera is None else monitor_camera.close,
+            None if mot_camera is None else mot_camera.close,
             None if camera is None else camera.close,
             None if sequencer is None else sequencer.close,
-            None if trap is None else trap.close,
+            None if trap is None else getattr(trap, "close", None),
         )
         for action in authority_actions:
             if action is None:

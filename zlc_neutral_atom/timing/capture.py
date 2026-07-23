@@ -242,7 +242,6 @@ def compile_triggered_pipeline(
             *pulse_port.interrupt_operations,
             *camera_port.interrupt_operations,
         ),
-        timeout_seconds=spec.capture.timeout_seconds,
         requires_final_commit=False,
     )
 

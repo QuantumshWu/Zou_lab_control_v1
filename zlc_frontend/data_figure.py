@@ -30,6 +30,7 @@ from .figure import (
     EvaluatedCurve,
     EvaluatedFigureData,
     EvaluatedHistogram,
+    EvaluatedImage,
     EvaluatedLayer,
     EvaluatedMeter,
     FigureDocument,
@@ -51,10 +52,17 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class FigurePanelRegion:
-    """One display-only panel hit target in normalized raster coordinates."""
+    """One panel hit target with separate live-focus and fit identities.
+
+    ``focus_selection`` excludes dynamic evaluation resolutions so the same
+    logical cell survives a newer live snapshot. ``fit_selection`` is the
+    complete batch selection required by saved-fit storage and is absent when
+    the rendered layer has no fit result.
+    """
 
     key: str
-    selection: Selection | None
+    focus_selection: Selection | None
+    fit_selection: Selection | None
     fit_storage_index: int | None
     left: float
     top: float
@@ -63,8 +71,16 @@ class FigurePanelRegion:
 
     def __post_init__(self) -> None:
         canonical_text(self.key, "figure panel key")
-        if self.selection is not None and not isinstance(self.selection, Selection):
-            raise TypeError("panel selection must be Selection or None")
+        if self.focus_selection is not None and not isinstance(
+            self.focus_selection,
+            Selection,
+        ):
+            raise TypeError("panel focus_selection must be Selection or None")
+        if self.fit_selection is not None and not isinstance(
+            self.fit_selection,
+            Selection,
+        ):
+            raise TypeError("panel fit_selection must be Selection or None")
         if self.fit_storage_index is not None and (
             isinstance(self.fit_storage_index, bool)
             or not isinstance(self.fit_storage_index, Integral)
@@ -371,12 +387,12 @@ class DataFigure:
             raise TypeError("expected_intent must be ViewIntent")
         data_type = {
             ViewIntent.CURVE: EvaluatedCurve,
-            ViewIntent.METER: EvaluatedMeter,
             ViewIntent.HISTOGRAM: EvaluatedHistogram,
+            ViewIntent.IMAGE: EvaluatedImage,
         }.get(expected_intent)
         if data_type is None:
             raise ValueError(
-                "focused typed panels currently support CURVE, METER, or HISTOGRAM"
+                "focused typed panels currently support CURVE, HISTOGRAM, or IMAGE"
             )
         if self._fit_results:
             raise ValueError("focused typed display does not accept fit overlays")
@@ -411,6 +427,8 @@ class DataFigure:
             numeric_curve_coordinates(first_axis)
             if any(series.data.x_axis != first_axis for series in cell.series[1:]):
                 raise ValueError("focused CURVE series do not share one exact x axis")
+        if expected_intent is ViewIntent.IMAGE and len(cell.series) != 1:
+            raise ValueError("focused IMAGE display requires exactly one image")
         source_schemas = tuple(
             item for item in self._source_schemas if item[0] == layer.dataset_id
         )
@@ -442,10 +460,10 @@ class DataFigure:
         )
         # Imported lazily because fit_image_projection also imports the public
         # FigurePanelRegion DTO from this module.
-        from .fit_image_projection import fit_panel_selection
+        from .fit_image_projection import panel_focus_selection
 
         series_group = cell.series
-        actual_selection = fit_panel_selection(layer, cell, series_group, None)
+        actual_selection = panel_focus_selection(layer, cell, series_group)
         if actual_selection != expected_selection:
             raise ValueError("panel selection differs from the frozen overview region")
 
@@ -602,6 +620,42 @@ class DataFigure:
             dpi=dpi,
         )
         return payload, regions
+
+    def to_panel_png_bytes_with_panel_regions(
+        self,
+        *,
+        size: str,
+        width: int,
+        height: int,
+        dpi: float,
+        display_state: object,
+        title: str,
+        value_label: str,
+    ) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
+        """Encode a live grid into one named panel's fixed raster geometry.
+
+        The ordinary ``to_png_bytes_with_panel_regions`` remains the archival
+        page renderer.  A TaskConsole grid instead has a pre-existing panel
+        size: every cell must subdivide that exact data box and the returned
+        hit regions must come from the very same draw.
+        """
+
+        from .matplotlib_render import (
+            encode_evaluated_panel_with_regions,
+        )
+
+        return encode_evaluated_panel_with_regions(
+            self._document,
+            self._evaluated,
+            dict(self._fit_results),
+            size=size,
+            width=width,
+            height=height,
+            dpi=dpi,
+            display_state=display_state,
+            title=title,
+            value_label=value_label,
+        )
 
     def radial_gaussian_image_fit_panels(
         self,

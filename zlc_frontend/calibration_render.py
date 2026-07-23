@@ -16,8 +16,11 @@ from matplotlib.patches import Circle, Rectangle
 
 from zlc_storage import canonical_text
 
-from .encoded_raster import EncodedRasterDocument, EncodedRasterPage
-from .image_raster import png_raster_size
+from .encoded_raster import (
+    EncodedRasterDocument,
+    EncodedRasterPage,
+    png_raster_size,
+)
 from .matplotlib_render import release_agg_figure
 from .site_map import site_ring_radius
 from .render_style import (

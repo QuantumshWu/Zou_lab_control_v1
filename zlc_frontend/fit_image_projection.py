@@ -265,6 +265,45 @@ def fit_panel_selection(
     return None if not terms else Selection(terms)
 
 
+def panel_focus_selection(
+    layer: EvaluatedLayer,
+    cell: EvaluatedCell,
+    series_group: tuple[EvaluatedSeries, ...],
+) -> Selection | None:
+    """Return the stable logical cell identity used by live overview focus.
+
+    Facet and single-series batch addresses identify the cell.  Dynamic
+    resolution facts such as ``LatestNonempty`` identify the snapshot used to
+    evaluate it, not the cell itself; including them made a valid focus stale
+    whenever the next live snapshot advanced.
+    """
+
+    if not isinstance(layer, EvaluatedLayer):
+        raise TypeError("layer must be EvaluatedLayer")
+    if not isinstance(cell, EvaluatedCell):
+        raise TypeError("cell must be EvaluatedCell")
+    if not isinstance(series_group, tuple) or any(
+        not isinstance(series, EvaluatedSeries) for series in series_group
+    ):
+        raise TypeError("series_group must contain EvaluatedSeries values")
+    addresses = [*cell.facet_address]
+    if len(series_group) == 1:
+        addresses.extend(series_group[0].batch_address)
+    by_axis = {}
+    for address in addresses:
+        incumbent = by_axis.setdefault(address.axis_id, address.index)
+        if incumbent != address.index:
+            raise RuntimeError("figure panel addresses disagree")
+    terms = tuple(
+        IndexSelection(axis_id, index)
+        for axis_id, index in sorted(
+            by_axis.items(),
+            key=lambda item: item[0].value,
+        )
+    )
+    return None if not terms else Selection(terms)
+
+
 def figure_panel_title(
     document: FigureDocument,
     layer: EvaluatedLayer,
@@ -651,4 +690,5 @@ def radial_gaussian_image_fit_panels(
 
 __all__ = [
     "RadialGaussianImageFitPanel",
+    "panel_focus_selection",
 ]

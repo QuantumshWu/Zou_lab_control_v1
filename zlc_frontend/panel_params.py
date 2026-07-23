@@ -32,6 +32,17 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
             display=True,
         ),
     ),
+    "sites": (
+        ParamDecl(
+            key="colormap",
+            label="colormap",
+            kind="choice",
+            default=PALETTE["cmap_camera"],
+            choices=CMAPS,
+            tooltip="Colormap for the exact same-shot camera underlay",
+            display=True,
+        ),
+    ),
     "hist": (
         ParamDecl(
             key="bins",
@@ -42,6 +53,23 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
             hi=500,
             display=True,
             tooltip="Histogram bins",
+        ),
+        ParamDecl(
+            key="ylog",
+            label="log count",
+            kind="bool",
+            default=False,
+            display=True,
+            tooltip="Use a logarithmic count axis",
+        ),
+        ParamDecl(
+            key="fit",
+            label="fit",
+            kind="choice",
+            default="double",
+            choices=("none", "single", "double"),
+            display=True,
+            tooltip="Bounded presentation fit drawn over the distribution",
         ),
     ),
 }

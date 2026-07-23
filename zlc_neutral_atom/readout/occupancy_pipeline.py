@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from zlc_data import BlockId, ComponentValidity, DataBlock, DatasetSchema, OwnedSnapshot
-from zlc_storage import canonical_text, positive_real
+from zlc_storage import canonical_text
 
 from zlc_neutral_atom.acquisition.camera import (
     CameraFrameMetadata,
@@ -63,7 +63,6 @@ class OccupancyPipelineSpec:
     processor: OccupancyStreamProcessorSpec
     counts_block_id: BlockId
     occupied_block_id: BlockId
-    timeout_seconds: float
 
     def __post_init__(self) -> None:
         canonical_text(self.name, "name")
@@ -75,7 +74,6 @@ class OccupancyPipelineSpec:
             raise TypeError("counts_block_id and occupied_block_id must be BlockId")
         if self.counts_block_id == self.occupied_block_id:
             raise ValueError("counts and occupied require distinct BlockId values")
-        object.__setattr__(self, "timeout_seconds", positive_real(self.timeout_seconds, "timeout_seconds"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +135,7 @@ class ExactOccupancyTransaction:
     session: CaptureSession
     bound: BoundOccupancyStreamProcessor
     worker: ExactStreamProcessorWorker | None
+    worker_deadline_monotonic: float
     preview: ExactDatasetPreviewPort | None = None
 
     def start(self, context: RunContext) -> None:
@@ -157,7 +156,13 @@ class ExactOccupancyTransaction:
         if self.worker is None:
             raise RuntimeError("occupancy transaction is complete or released")
         completion = self.session.complete(context)
-        sealed = self.worker.finish(completion.eos, _remaining_seconds(context))
+        sealed = self.worker.finish(
+            completion.eos,
+            _remaining_worker_seconds(
+                context,
+                self.worker_deadline_monotonic,
+            ),
+        )
         pipeline = finalize_pipeline_result(
             dataset=sealed,
             capture_completion=completion,
@@ -261,14 +266,30 @@ class ExecutedOccupancy:
         self.cell_schedule.validate_schema(self.pipeline.dataset.block.schema)
         self.cell_schedule.validate_schema(self.occupied_schema)
 
-def _remaining_seconds(context: RunContext) -> float:
+def _remaining_worker_seconds(
+    context: RunContext,
+    deadline_monotonic: float,
+) -> float:
     context.checkpoint()
-    if context.deadline is None:
-        raise RuntimeError("occupancy pipeline requires a finite Run deadline")
-    remaining = float(context.deadline) - time.monotonic()
+    remaining = float(deadline_monotonic) - time.monotonic()
     if remaining <= 0:
-        raise TimeoutError("occupancy pipeline deadline expired")
+        raise TimeoutError("occupancy processor capability deadline expired")
     return remaining
+
+
+def _worker_deadline_monotonic(spec: OccupancyPipelineSpec) -> float:
+    """Derive the private worker bound from frozen capture capability.
+
+    The public Measurement request owns no timeout.  Its camera Port already
+    attests a maximum duration for every prepare/read/terminal device call, and
+    the capture contract freezes the exact event count.  The worker spans one
+    prepare, one start, every read, and one terminal call, so their finite sum
+    is the only deadline it needs.
+    """
+
+    contract = spec.measurement.capture_contract
+    call_bound = spec.measurement.capture_port.capability.max_blocking_call_seconds
+    return time.monotonic() + call_bound * (contract.total_events + 3)
 
 
 def _occupied_schema(bound: BoundOccupancyStreamProcessor) -> DatasetSchema:
@@ -388,6 +409,7 @@ def _open_exact_occupancy(
     session = measurement.capture_port.open_session(
         contract, TraceBinding(context.run_id.value, contract.source_id), measurement.capture_spec
     )
+    worker_deadline = _worker_deadline_monotonic(spec)
     worker = builder = source = output_reservation = None
     try:
         capture_input = session.processor_input_binding
@@ -427,11 +449,10 @@ def _open_exact_occupancy(
             except BaseException as preview_error:
                 _notify_preview_failure(bound_preview, preview_error)
                 bound_preview = None
-        _remaining_seconds(context)
-        assert context.deadline is not None
+        _remaining_worker_seconds(context, worker_deadline)
         worker = bound.create_exact_worker(
             source, source_cursor, output_producer=producer, output_cursor=output_cursor,
-            output_builder=builder, deadline_monotonic=float(context.deadline),
+            output_builder=builder, deadline_monotonic=worker_deadline,
             cancellation=context.cancellation,
         )
         worker.start()
@@ -442,6 +463,7 @@ def _open_exact_occupancy(
             session,
             bound,
             worker,
+            worker_deadline,
             bound_preview,
         )
     except BaseException as error:
@@ -537,7 +559,7 @@ def compile_occupancy_pipeline(spec: OccupancyPipelineSpec) -> RunPlan:
         resource_claims=(port.resource_claim,),
         bound_devices=(port.device,), preflight=lambda context: _open_exact_occupancy(spec, context),
         execute=execute, cleanup=cleanup, finalize=finalize,
-        interrupt_operations=port.interrupt_operations, timeout_seconds=spec.timeout_seconds,
+        interrupt_operations=port.interrupt_operations,
         requires_final_commit=False,
     )
 

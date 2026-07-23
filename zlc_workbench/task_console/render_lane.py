@@ -18,6 +18,7 @@ from zlc_frontend.qt_widgets import QtOwnerWake
 @dataclass(frozen=True, slots=True)
 class PanelRenderRequest:
     panel_id: str
+    kind: str
     request_revision: int
     signature: object
     source_key: object
@@ -26,7 +27,10 @@ class PanelRenderRequest:
     display: object
     intent: object
     label: str
+    value_label: str
     size: tuple[int, int]
+    size_name: str
+    pixel_ratio: float
     provenance: object
     view: object
     faceted: bool
@@ -112,6 +116,12 @@ class ConsoleRenderLane:
         requests: tuple[PanelRenderRequest, ...],
         reset_panel_ids: tuple[str, ...],
     ):
+        from zlc_frontend.site_map_render import (
+            CalibrationSiteMapView,
+            OccupancyCellView,
+            OccupancySummarySiteMapView,
+            SiteMapComposer,
+        )
         from zlc_frontend.panel_render import PanelComposer, PanelRenderError
 
         for panel_id in reset_panel_ids:
@@ -125,13 +135,27 @@ class ConsoleRenderLane:
             if owned is None or owned[0] != request.source_key:
                 if owned is not None:
                     owned[1].close()
-                composer = PanelComposer(
-                    request.panel_id,
-                    intent=request.intent,
-                    size=request.size,
-                    label=request.label,
-                    view=request.view,
-                )
+                if request.kind == "sites":
+                    composer = SiteMapComposer(
+                        request.panel_id,
+                        size=request.size,
+                        size_name=request.size_name,
+                        pixel_ratio=request.pixel_ratio,
+                        title=request.label,
+                        value_label=request.value_label,
+                    )
+                else:
+                    composer = PanelComposer(
+                        request.panel_id,
+                        intent=request.intent,
+                        size=request.size,
+                        size_name=request.size_name,
+                        pixel_ratio=request.pixel_ratio,
+                        label=request.label,
+                        value_label=request.value_label,
+                        view=request.view,
+                        rolling_distribution=request.kind == "monitor",
+                    )
                 self._worker_composers[request.panel_id] = (
                     request.source_key,
                     composer,
@@ -139,7 +163,26 @@ class ConsoleRenderLane:
             else:
                 composer = owned[1]
             try:
-                if request.faceted:
+                if request.kind == "sites":
+                    presentation = getattr(request.value, "presentation", None)
+                    if not isinstance(
+                        presentation,
+                        (
+                            OccupancyCellView,
+                            CalibrationSiteMapView,
+                            OccupancySummarySiteMapView,
+                        ),
+                    ):
+                        raise PanelRenderError(
+                            "Site map requires one typed physical SiteMap view"
+                        )
+                    frame = composer.compose(
+                        presentation,
+                        display=request.display,
+                    )
+                    faceted_result = None
+                    document = None
+                elif request.faceted:
                     faceted_result = composer.compose_faceted(
                         request.value.snapshot,
                         display=request.display,

@@ -26,44 +26,67 @@ def _pulse_state_from_dict(data):
     return PulseTableState.from_dict(data)
 
 
-def _unique_names(candidates):
-    from zlc_data.shape_text import measurement_slug
+def _slot_target(document, field) -> str:
+    """Return the shared, index-based target spelling used by ``slot_label``."""
 
-    names, counts = [], {}
-    for candidate in candidates:
-        base = measurement_slug(candidate) or "scan_parameter"
-        counts[base] = counts.get(base, 0) + 1
-        names.append(base if counts[base] == 1 else f"{base}_{counts[base]}")
-    return names
+    period_indices = {
+        period.period_id: index for index, period in enumerate(document.periods)
+    }
+    if field.kind == "duration":
+        return str(period_indices[field.period_id])
+    if field.kind == "dac":
+        return f"{field.port}@{period_indices[field.period_id]}"
+    return str(field.port)
 
 
-def _semantic_api_names(state) -> list[str]:
-    """Meaningful public coordinates for API handles.
+def _value_in_parameter_unit(document, parameter) -> int | float:
+    value, authored_unit = document.field_value(parameter.field)
+    if parameter.field.kind not in ("duration", "delay"):
+        return value
+    from zlc_pulse import TIME_UNIT_TO_NS
 
-    ``a1``/``a2`` are mutation handles, not experiment vocabulary; a sweep
-    publishes the bound pulse field (``da_x``, ``probe_duration``, ...) while
-    the handle stays available for ``PulseTableState.set_api``.
-    """
+    return (
+        float(value)
+        * TIME_UNIT_TO_NS[authored_unit]
+        / TIME_UNIT_TO_NS[parameter.unit]
+    )
 
-    from zlc_neutral_atom.timing.pulse_table import scan_target_label
 
-    candidates: list[str] = []
-    for slot in state.api_slots:
-        target = str(slot.target)
-        if slot.kind == "dac":
-            candidate = target.split("@", 1)[0]
-        elif slot.kind == "duration":
-            try:
-                period = state.periods[int(target)]
-                candidate = f"{period.name or f'period_{target}'}_duration"
-            except (IndexError, TypeError, ValueError):
-                candidate = f"period_{target}_duration"
-        elif slot.kind == "delay":
-            candidate = f"{target}_delay"
-        else:
-            candidate = scan_target_label(state, slot.kind, target)
-        candidates.append(candidate)
-    return _unique_names(candidates)
+def _api_column_specs(document):
+    """Derive starter ranges from the current PulseDocument's real fields."""
+
+    from zlc_data.scan_template import ScanColumnSpec
+    from zlc_pulse import FIELD_DAC, TIME_UNIT_TO_NS
+
+    result = []
+    for parameter in document.api_parameters:
+        value = _value_in_parameter_unit(document, parameter)
+        if parameter.field.kind == FIELD_DAC:
+            port = document.target.by_key[parameter.field.port]
+            assert port.signed_range is not None
+            lo, hi = port.signed_range
+            result.append(
+                ScanColumnSpec(
+                    parameter.parameter_id,
+                    float(lo),
+                    float(hi),
+                    is_dac=True,
+                    unit="value",
+                    label=parameter.parameter_id,
+                )
+            )
+            continue
+        tick = float(document.time_step_ns) / TIME_UNIT_TO_NS[parameter.unit]
+        result.append(
+            ScanColumnSpec(
+                parameter.parameter_id,
+                tick,
+                max(float(value) * 2.0, 100.0 * tick),
+                unit=parameter.unit,
+                label=parameter.parameter_id,
+            )
+        )
+    return tuple(result)
 
 
 def _read_pulse_template(path) -> PulseTemplateRows:
@@ -77,37 +100,48 @@ def _read_pulse_template(path) -> PulseTemplateRows:
     import hashlib
     from pathlib import Path
 
-    from zlc_neutral_atom.timing.pulse_table import (
-        PROBE_TEMPLATE_PATH,
-        resolve_fireable_template,
-        scan_column_spec,
-        single_imaging_template,
-    )
+    from zlc_neutral_atom.pulse_programs import DEFAULT_PROBE_PULSE_PATH
+    from zlc_pulse import load_pulse_document
     from zlc_storage.paths import PROJECT_ROOT, project_path
+    from zlc_workbench.pulse_editor.scan_workspace import scan_column_specs
 
-    state = resolve_fireable_template(path, default_name=PROBE_TEMPLATE_PATH,
-                                      default_factory=single_imaging_template)
-    api_names = _semantic_api_names(state)
+    source_text = str(path or "").strip() or DEFAULT_PROBE_PULSE_PATH
+    document = load_pulse_document(source_text)
     api_rows = tuple(
-        (slot.name, api_names[index], str(slot.kind), str(slot.target), str(slot.unit),
-         float(state._read_api_field(slot)))
-        for index, slot in enumerate(state.api_slots)
+        (
+            parameter.parameter_id,
+            parameter.parameter_id,
+            parameter.field.kind,
+            _slot_target(document, parameter.field),
+            parameter.unit,
+            _value_in_parameter_unit(document, parameter),
+        )
+        for parameter in document.api_parameters
     )
-    scan_names = list(state.scan_names)
     scan_rows = tuple(
-        (scan_names[i], str(s.kind), str(s.target), str(s.unit), s.label)
-        for i, s in enumerate(state.scan_slots)
+        (
+            parameter.parameter_id,
+            parameter.field.kind,
+            _slot_target(document, parameter.field),
+            parameter.unit,
+            parameter.label,
+        )
+        for parameter in document.scan_parameters
     )
-    code = str(getattr(state, "scan_code", "") or "")
-    if not code.strip() and getattr(state, "scan_table", None):
+    code = (
+        ""
+        if document.scan_recipe is None
+        else str(document.scan_recipe.source)
+    )
+    if not code.strip() and document.scan_table is not None:
         code = ("scan_table = np.array("
-                + repr([list(row) for row in state.scan_table]) + ", dtype=float)")
+                + repr([list(row) for row in document.scan_table.rows])
+                + ", dtype=float)")
     # ``program_id`` is the stable identity of the source document, not a digest
     # of its current contents.  A content digest changes precisely when a slot is
     # inserted/moved/edited and would force the frontend to throw away every
     # unaffected ``(program_id, slot_id)`` row.  Project-relative identity also
     # survives moving the checkout; external files retain their canonical path.
-    source_text = str(path or "").strip() or PROBE_TEMPLATE_PATH
     project_root = PROJECT_ROOT.resolve(strict=False)
     candidate = Path(source_text)
     source_path = candidate if candidate.is_file() else None
@@ -118,7 +152,7 @@ def _read_pulse_template(path) -> PulseTemplateRows:
                 source_path = shipped
                 break
     if source_path is None:
-        source_key = "builtin:single_imaging_template"
+        source_key = "declared:" + Path(source_text).as_posix()
     else:
         source_path = source_path.resolve(strict=False)
         try:
@@ -128,15 +162,8 @@ def _read_pulse_template(path) -> PulseTemplateRows:
     program_id = hashlib.sha256(
         source_key.encode("utf-8")
     ).hexdigest()
-    api_columns = tuple(
-        scan_column_spec(coordinate, "dac" if kind == "dac" else "duration",
-                         unit=(unit or "ns"))
-        for _handle, coordinate, kind, _target, unit, _current in api_rows
-    )
-    scan_columns = tuple(
-        scan_column_spec(coordinate, kind, unit=(unit or "ns"))
-        for coordinate, kind, _target, unit, _label in scan_rows
-    )
+    api_columns = _api_column_specs(document)
+    scan_columns = scan_column_specs(document)
     return PulseTemplateRows(api_rows=api_rows, scan_rows=scan_rows,
                              api_columns=api_columns, scan_columns=scan_columns,
                              program=code, program_id=program_id)

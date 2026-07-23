@@ -221,6 +221,10 @@ class VirtualAtomArray:
     def n_sites(self) -> int:
         return self.grid_shape[0] * self.grid_shape[1]
 
+    @property
+    def frame_dtype(self) -> np.dtype:
+        return np.dtype("<u2")
+
     def _site_centers(self) -> np.ndarray:
         return self.geometry.expected_centers_xy
 
@@ -380,6 +384,7 @@ class VirtualAtomArray:
         *,
         trigger_channels: tuple[str, ...],
         default_exposure: float,
+        trigger_group_sizes: tuple[int, ...] | None = None,
     ) -> Iterator[np.ndarray]:
         (
             _triggers,
@@ -397,7 +402,14 @@ class VirtualAtomArray:
             trap_channels=self.trap_channels,
             default_exposure=default_exposure,
         )
-        groups = playback.trigger_group_sizes(trigger_channels)
+        groups = (
+            playback.trigger_group_sizes(trigger_channels)
+            if trigger_group_sizes is None
+            else tuple(
+                _positive_int(size, "trigger group size")
+                for size in trigger_group_sizes
+            )
+        )
         if sum(groups) != frames:
             raise RuntimeError("pulse trigger groups do not exactly cover the camera arm")
         group_starts: set[int] = set()
@@ -624,25 +636,234 @@ class VirtualSequencer:
             self._open = False
 
 
+class VirtualMotFrameSource:
+    """MOT fluorescence computed from the compiled DAC point being played."""
+
+    def __init__(
+        self,
+        sequencer: VirtualSequencer,
+        *,
+        frame_shape: tuple[int, int] = (1200, 1920),
+        seed: int | None = 19,
+        coil_ports: Mapping[str, str] | None = None,
+        optimum_levels: Mapping[str, float] | None = None,
+        level_sigmas: Mapping[str, float] | None = None,
+        peak_counts: float = 93.0,
+        offset_counts: float = 7.0,
+        read_noise: float = 1.5,
+        spot_size_px: tuple[float, float] = (40.0, 20.0),
+    ) -> None:
+        if not isinstance(sequencer, VirtualSequencer):
+            raise TypeError("virtual MOT frame source requires VirtualSequencer")
+        if not isinstance(frame_shape, tuple) or len(frame_shape) != 2:
+            raise TypeError("MOT frame_shape must be a (height, width) tuple")
+        self.sequencer = sequencer
+        self.image_shape = tuple(
+            _positive_int(size, "MOT frame dimension") for size in frame_shape
+        )
+        self.coil_ports = {
+            str(name): str(port)
+            for name, port in dict(
+                coil_ports
+                or {
+                    "da_x": "da_bias_x",
+                    "da_y": "da_bias_y",
+                    "da_z": "da_bias_z",
+                }
+            ).items()
+        }
+        if not self.coil_ports or any(
+            not name or not port for name, port in self.coil_ports.items()
+        ):
+            raise ValueError("MOT coil_ports must map non-empty names to ports")
+        target_ports = sequencer.target.by_key
+        for port in self.coil_ports.values():
+            spec = target_ports.get(port)
+            if spec is None or spec.signed_range is None:
+                raise ValueError(f"MOT coil port {port!r} is not a target DAC")
+        self.optimum_levels = {
+            str(name): float(value)
+            for name, value in dict(
+                optimum_levels or {"da_x": 7.0, "da_y": -5.0, "da_z": 11.0}
+            ).items()
+        }
+        self.level_sigmas = {
+            str(name): _positive(value, f"MOT level sigma {name!r}")
+            for name, value in dict(
+                level_sigmas or {"da_x": 6.0, "da_y": 6.0, "da_z": 6.0}
+            ).items()
+        }
+        if (
+            set(self.optimum_levels) != set(self.coil_ports)
+            or set(self.level_sigmas) != set(self.coil_ports)
+        ):
+            raise ValueError("MOT coil, optimum, and sigma axes must match")
+        self.peak_counts = _nonnegative(peak_counts, "MOT peak_counts")
+        self.offset_counts = _nonnegative(offset_counts, "MOT offset_counts")
+        self.read_noise = _nonnegative(read_noise, "MOT read_noise")
+        if not isinstance(spot_size_px, tuple) or len(spot_size_px) != 2:
+            raise TypeError("MOT spot_size_px must be a two-item tuple")
+        self.spot_size_px = (
+            _positive(spot_size_px[0], "MOT spot width"),
+            _positive(spot_size_px[1], "MOT spot height"),
+        )
+        self.last_levels: dict[str, float] | None = None
+        self._rng = np.random.default_rng(seed)
+
+    @property
+    def frame_dtype(self) -> np.dtype:
+        return np.dtype("<u1")
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "frame_shape": self.image_shape,
+            "coil_ports": dict(self.coil_ports),
+            "optimum_levels": dict(self.optimum_levels),
+            "level_sigmas": dict(self.level_sigmas),
+            "peak_counts": self.peak_counts,
+            "offset_counts": self.offset_counts,
+            "read_noise": self.read_noise,
+            "spot_size_px": self.spot_size_px,
+        }
+
+    def mot_efficiency(self, levels: Mapping[str, float]) -> float:
+        distance_squared = sum(
+            (
+                (float(levels.get(name, 0.0)) - self.optimum_levels[name])
+                / self.level_sigmas[name]
+            )
+            ** 2
+            for name in self.coil_ports
+        )
+        return float(math.exp(-0.5 * distance_squared))
+
+    def levels_for_point(
+        self,
+        artifact: CompiledPulseArtifact,
+        point_index: int,
+    ) -> dict[str, float]:
+        codes = dict(
+            sample_compiled_bus_codes(
+                artifact,
+                point_index=point_index,
+                phase=0.5,
+            )
+        )
+        target_ports = self.sequencer.target.by_key
+        levels: dict[str, float] = {}
+        for name, port in self.coil_ports.items():
+            spec = target_ports[port]
+            assert spec.signed_range is not None
+            levels[name] = float(
+                codes.get(port, spec.safe_value) + spec.signed_range[0]
+            )
+        return levels
+
+    def _render_levels(self, levels: Mapping[str, float]) -> np.ndarray:
+        self.last_levels = dict(levels)
+        efficiency = self.mot_efficiency(levels)
+        height, width = self.image_shape
+        center_x, center_y = width / 2.0, height / 2.0
+        fwhm = 2.0 * math.sqrt(2.0 * math.log(2.0))
+        sigma_x = self.spot_size_px[0] / fwhm
+        sigma_y = self.spot_size_px[1] / fwhm
+        x0 = max(0, int(center_x - 3.0 * sigma_x))
+        x1 = min(width, int(math.ceil(center_x + 3.0 * sigma_x)))
+        y0 = max(0, int(center_y - 3.0 * sigma_y))
+        y1 = min(height, int(math.ceil(center_y + 3.0 * sigma_y)))
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        spot = np.exp(
+            -0.5
+            * (
+                ((xx - center_x) / sigma_x) ** 2
+                + ((yy - center_y) / sigma_y) ** 2
+            )
+        )
+        noise = self._rng.normal(
+            self.offset_counts,
+            self.read_noise,
+            size=(height, width),
+        )
+        frame = np.clip(noise, 0, 255).astype(np.uint8)
+        signal = self._rng.poisson(
+            self.peak_counts * efficiency * spot
+        ).astype(np.int32, copy=False)
+        region = frame[y0:y1, x0:x1].astype(np.int32)
+        region += signal
+        np.clip(region, 0, 255, out=region)
+        frame[y0:y1, x0:x1] = region
+        return frame
+
+    def render_current_output(self) -> np.ndarray:
+        artifact = self.sequencer.output_artifact
+        levels = (
+            {name: 0.0 for name in self.coil_ports}
+            if artifact is None
+            else self.levels_for_point(artifact, 0)
+        )
+        if artifact is not None and len(artifact.target_ir.scan_points or ((),)) != 1:
+            raise RuntimeError(
+                "free-running monitor frames have no declared association with "
+                "multi-point sequencer output"
+            )
+        return self._render_levels(levels)
+
+    def iter_frames(
+        self,
+        playback: PulsePlayback,
+        frames: int,
+        *,
+        trigger_channels: tuple[str, ...],
+        default_exposure: float,
+        trigger_group_sizes: tuple[int, ...] | None = None,
+    ) -> Iterator[np.ndarray]:
+        del default_exposure, trigger_group_sizes
+        if len(trigger_channels) != 1:
+            raise ValueError(
+                "virtual MOT point association requires exactly one trigger channel"
+            )
+        artifact = self.sequencer.output_artifact
+        if artifact is None:
+            raise RuntimeError("virtual MOT camera observed FIRE without an artifact")
+        trigger_channel = trigger_channels[0]
+        point_indices: list[int] = []
+        for group in playback.trigger_groups:
+            count = dict(group.channel_counts).get(trigger_channel, 0)
+            point_indices.extend([group.point_index] * count)
+        if len(point_indices) != frames:
+            raise RuntimeError(
+                "compiled trigger groups do not exactly associate MOT frames "
+                "with scan points"
+            )
+        for point_index in point_indices:
+            yield self._render_levels(
+                self.levels_for_point(artifact, point_index)
+            )
+
+
 class VirtualCamera:
-    """Finite externally-triggered camera with one bounded producer queue."""
+    """Externally-triggered camera with one bounded producer queue.
+
+    A finite arm is used by exact capture.  A ``None`` arm passively observes
+    any later finite sequencer FIRE without owning or scheduling its triggers.
+    """
 
     max_pending_records = 16
 
     def __init__(
         self,
-        atoms: VirtualAtomArray,
+        frame_source: VirtualAtomArray | VirtualMotFrameSource,
         sequencer: VirtualSequencer,
         *,
         capture_trigger_channels: Sequence[str],
         exposure: float = 20e-3,
         timeout: float = 2.0,
     ) -> None:
-        if not isinstance(atoms, VirtualAtomArray):
-            raise TypeError("virtual camera requires VirtualAtomArray")
+        if not isinstance(frame_source, (VirtualAtomArray, VirtualMotFrameSource)):
+            raise TypeError("virtual camera requires a supported frame source")
         if not isinstance(sequencer, VirtualSequencer):
             raise TypeError("virtual camera requires VirtualSequencer")
-        self.atoms = atoms
+        self.frame_source = frame_source
         self.sequencer = sequencer
         self.capture_trigger_channels = _channel_tuple(
             capture_trigger_channels,
@@ -655,7 +876,7 @@ class VirtualCamera:
         self._pending: deque[CameraFrameRecord] = deque()
         self._armed = False
         self._accepting = False
-        self._expected = 0
+        self._expected: int | None = 0
         self._capacity = self.max_pending_records
         self._produced = 0
         self._worker: threading.Thread | None = None
@@ -668,11 +889,15 @@ class VirtualCamera:
 
     @property
     def frame_shape(self) -> tuple[int, int]:
-        return self.atoms.image_shape
+        return self.frame_source.image_shape
 
     @property
     def sensor_shape(self) -> tuple[int, int]:
-        return self.atoms.image_shape
+        return self.frame_source.image_shape
+
+    @property
+    def frame_dtype(self) -> np.dtype:
+        return self.frame_source.frame_dtype
 
     @property
     def effective_trigger_channels(self) -> tuple[str, ...]:
@@ -684,11 +909,19 @@ class VirtualCamera:
         return self
 
     def snapshot(self) -> dict[str, object]:
+        source_snapshot = getattr(self.frame_source, "snapshot", None)
         return {
             "type": type(self).__name__,
             "exposure": self.exposure,
             "roi": self.roi,
             "timeout": self.timeout,
+            "frame_source_type": (
+                f"{type(self.frame_source).__module__}."
+                f"{type(self.frame_source).__qualname__}"
+            ),
+            "frame_source": (
+                None if not callable(source_snapshot) else source_snapshot()
+            ),
         }
 
     def capture_working_point(self) -> CameraWorkingPoint:
@@ -703,7 +936,7 @@ class VirtualCamera:
                 "adapter_type": f"{type(self).__module__}.{type(self).__qualname__}",
                 "frame_shape": shape,
                 "sensor_shape": sensor,
-                "frame_dtype": np.dtype("<u2").str,
+                "frame_dtype": self.frame_dtype.str,
                 "acquisition_mode": "EXTERNAL_TRIGGERED",
                 "capture_trigger_channels": tuple(self.capture_trigger_channels),
                 "effective_trigger_channels": tuple(self.effective_trigger_channels),
@@ -727,7 +960,7 @@ class VirtualCamera:
             roi_origin_yx=origin_yx,
             roi_shape_yx=roi_shape_yx,
             binning_yx=(1, 1),
-            dtype=np.dtype("<u2"),
+            dtype=self.frame_dtype,
             count_unit="count",
             capture_trigger_channels=tuple(self.capture_trigger_channels),
             exposure_seconds=float(self.exposure),
@@ -747,13 +980,13 @@ class VirtualCamera:
     ) -> None:
         del timeout, stop
         self.ensure_open()
-        expected = _positive_int(frames, "frames")
+        expected = None if frames is None else _positive_int(frames, "frames")
         capacity = (
-            expected
+            (self.max_pending_records if expected is None else expected)
             if max_inflight_frames is None
             else _positive_int(max_inflight_frames, "max_inflight_frames")
         )
-        if capacity > expected:
+        if expected is not None and capacity > expected:
             raise ValueError("max_inflight_frames cannot exceed expected_frames")
         if capacity > self.max_pending_records:
             raise ValueError("max_inflight_frames exceeds camera max_pending_records")
@@ -785,7 +1018,7 @@ class VirtualCamera:
                     "virtual camera rejects FIRE after a source failure"
                 ) from self._worker_error
             if not self._accepting:
-                if self._produced >= self._expected:
+                if self._expected is not None and self._produced >= self._expected:
                     raise RuntimeError(
                         "virtual camera received FIRE after its expected frame count was complete"
                     )
@@ -799,8 +1032,14 @@ class VirtualCamera:
                 self.capture_trigger_channels,
             )
             trigger_count = len(trigger_offsets)
-            remaining = self._expected - self._produced
+            remaining = (
+                None
+                if self._expected is None
+                else self._expected - self._produced
+            )
             if trigger_count < 1:
+                if self._expected is None:
+                    return
                 error = RuntimeError(
                     "finite FIRE emitted no camera trigger while an exact arm was active"
                 )
@@ -808,7 +1047,7 @@ class VirtualCamera:
                 self._accepting = False
                 self._condition.notify_all()
                 raise error
-            if trigger_count > remaining:
+            if remaining is not None and trigger_count > remaining:
                 error = RuntimeError(
                     f"virtual pulse emitted {trigger_count} camera edges with only "
                     f"{remaining} expected frames remaining"
@@ -825,11 +1064,18 @@ class VirtualCamera:
 
             def produce() -> None:
                 try:
-                    frames = self.atoms.iter_frames(
+                    frames = self.frame_source.iter_frames(
                         playback,
                         trigger_count,
                         trigger_channels=self.capture_trigger_channels,
                         default_exposure=self.exposure,
+                        # A passive arm has no exact capture plan from which to
+                        # obtain formal grouping.  One independently-fired pulse
+                        # is one display-only acquisition group.  Finite exact
+                        # capture still requires the compiled grouping below.
+                        trigger_group_sizes=(
+                            (trigger_count,) if self._expected is None else None
+                        ),
                     )
                     frame_iterator = iter(frames)
                     for local_ordinal, offset in enumerate(trigger_offsets):
@@ -888,7 +1134,10 @@ class VirtualCamera:
                         self._condition.notify_all()
                 finally:
                     with self._condition:
-                        if self._produced >= self._expected:
+                        if (
+                            self._expected is not None
+                            and self._produced >= self._expected
+                        ):
                             self._accepting = False
                         if self._worker is threading.current_thread():
                             self._worker = None
@@ -971,6 +1220,8 @@ class VirtualCamera:
                 if self._worker_error is not None:
                     raise RuntimeError("virtual camera source failed") from self._worker_error
                 if stop is not None and getattr(stop, "is_set", lambda: False)():
+                    break
+                if not self._accepting:
                     break
                 if self._worker is not None and not self._worker.is_alive():
                     break
@@ -1058,62 +1309,28 @@ class VirtualMonitorCamera:
     ) -> None:
         if not isinstance(sequencer, VirtualSequencer):
             raise TypeError("virtual monitor camera requires VirtualSequencer")
-        if (
-            not isinstance(frame_shape, tuple)
-            or len(frame_shape) != 2
-        ):
-            raise TypeError("monitor frame_shape must be a (height, width) tuple")
-        self._frame_shape = tuple(
-            _positive_int(size, "monitor frame dimension") for size in frame_shape
-        )
         self.exposure = _positive(exposure, "monitor exposure")
         self.timeout = _positive(timeout, "monitor timeout")
         self.sequencer = sequencer
-        self.coil_ports = {
-            str(name): str(port)
-            for name, port in dict(
-                coil_ports
-                or {
-                    "da_x": "da_bias_x",
-                    "da_y": "da_bias_y",
-                    "da_z": "da_bias_z",
-                }
-            ).items()
-        }
-        if not self.coil_ports or any(not name or not port for name, port in self.coil_ports.items()):
-            raise ValueError("monitor coil_ports must map non-empty names to ports")
-        target_ports = sequencer.target.by_key
-        for port in self.coil_ports.values():
-            spec = target_ports.get(port)
-            if spec is None or spec.signed_range is None:
-                raise ValueError(f"monitor coil port {port!r} is not a target DAC")
-        self.optimum_levels = {
-            str(name): float(value)
-            for name, value in dict(
-                optimum_levels or {"da_x": 7.0, "da_y": -5.0, "da_z": 11.0}
-            ).items()
-        }
-        self.level_sigmas = {
-            str(name): _positive(value, f"monitor level sigma {name!r}")
-            for name, value in dict(
-                level_sigmas or {"da_x": 6.0, "da_y": 6.0, "da_z": 6.0}
-            ).items()
-        }
-        if set(self.optimum_levels) != set(self.coil_ports) or set(self.level_sigmas) != set(
-            self.coil_ports
-        ):
-            raise ValueError("monitor coil, optimum, and sigma axes must match")
-        self.peak_counts = _nonnegative(peak_counts, "monitor peak_counts")
-        self.offset_counts = _nonnegative(offset_counts, "monitor offset_counts")
-        self.read_noise = _nonnegative(read_noise, "monitor read_noise")
-        if not isinstance(spot_size_px, tuple) or len(spot_size_px) != 2:
-            raise TypeError("monitor spot_size_px must be a two-item tuple")
-        self.spot_size_px = (
-            _positive(spot_size_px[0], "monitor spot width"),
-            _positive(spot_size_px[1], "monitor spot height"),
+        self._frame_source = VirtualMotFrameSource(
+            sequencer,
+            frame_shape=frame_shape,
+            seed=seed,
+            coil_ports=coil_ports,
+            optimum_levels=optimum_levels,
+            level_sigmas=level_sigmas,
+            peak_counts=peak_counts,
+            offset_counts=offset_counts,
+            read_noise=read_noise,
+            spot_size_px=spot_size_px,
         )
-        self.last_levels: dict[str, float] | None = None
-        self._rng = np.random.default_rng(seed)
+        self.coil_ports = self._frame_source.coil_ports
+        self.optimum_levels = self._frame_source.optimum_levels
+        self.level_sigmas = self._frame_source.level_sigmas
+        self.peak_counts = self._frame_source.peak_counts
+        self.offset_counts = self._frame_source.offset_counts
+        self.read_noise = self._frame_source.read_noise
+        self.spot_size_px = self._frame_source.spot_size_px
         self._condition = threading.Condition(threading.RLock())
         self._pending: deque[CameraFrameRecord] = deque()
         self._armed = False
@@ -1128,11 +1345,11 @@ class VirtualMonitorCamera:
 
     @property
     def frame_shape(self) -> tuple[int, int]:
-        return self._frame_shape
+        return self._frame_source.image_shape
 
     @property
     def sensor_shape(self) -> tuple[int, int]:
-        return self._frame_shape
+        return self._frame_source.image_shape
 
     def ensure_open(self) -> "VirtualMonitorCamera":
         if not self._open:
@@ -1266,15 +1483,7 @@ class VirtualMonitorCamera:
                 raise
 
     def mot_efficiency(self, levels: Mapping[str, float]) -> float:
-        z = sum(
-            (
-                (float(levels.get(name, 0.0)) - self.optimum_levels[name])
-                / self.level_sigmas[name]
-            )
-            ** 2
-            for name in self.coil_ports
-        )
-        return float(math.exp(-0.5 * z))
+        return self._frame_source.mot_efficiency(levels)
 
     def _sense_levels(self, _ordinal: int) -> dict[str, float]:
         artifact = self.sequencer.output_artifact
@@ -1286,56 +1495,11 @@ class VirtualMonitorCamera:
                 "free-running monitor frames have no declared association with "
                 "multi-point sequencer output"
             )
-        codes = dict(
-            sample_compiled_bus_codes(
-                artifact,
-                point_index=0,
-                phase=0.5,
-            )
-        )
-        target_ports = self.sequencer.target.by_key
-        levels: dict[str, float] = {}
-        for name, port in self.coil_ports.items():
-            spec = target_ports[port]
-            assert spec.signed_range is not None
-            levels[name] = float(codes.get(port, spec.safe_value) + spec.signed_range[0])
-        return levels
+        return self._frame_source.levels_for_point(artifact, 0)
 
     def _render(self, ordinal: int) -> np.ndarray:
-        levels = self._sense_levels(ordinal)
-        self.last_levels = dict(levels)
-        efficiency = self.mot_efficiency(levels)
-        height, width = self.frame_shape
-        center_x, center_y = width / 2.0, height / 2.0
-        fwhm = 2.0 * math.sqrt(2.0 * math.log(2.0))
-        sigma_x = self.spot_size_px[0] / fwhm
-        sigma_y = self.spot_size_px[1] / fwhm
-        x0 = max(0, int(center_x - 3.0 * sigma_x))
-        x1 = min(width, int(math.ceil(center_x + 3.0 * sigma_x)))
-        y0 = max(0, int(center_y - 3.0 * sigma_y))
-        y1 = min(height, int(math.ceil(center_y + 3.0 * sigma_y)))
-        yy, xx = np.mgrid[y0:y1, x0:x1]
-        spot = np.exp(
-            -0.5
-            * (
-                ((xx - center_x) / sigma_x) ** 2
-                + ((yy - center_y) / sigma_y) ** 2
-            )
-        )
-        noise = self._rng.normal(
-            self.offset_counts,
-            self.read_noise,
-            size=(height, width),
-        )
-        frame = np.clip(noise, 0, 255).astype(np.uint8)
-        signal = self._rng.poisson(
-            self.peak_counts * efficiency * spot
-        ).astype(np.int32, copy=False)
-        region = frame[y0:y1, x0:x1].astype(np.int32)
-        region += signal
-        np.clip(region, 0, 255, out=region)
-        frame[y0:y1, x0:x1] = region
-        return frame
+        del ordinal
+        return self._frame_source.render_current_output()
 
     def read_frame_records(
         self,

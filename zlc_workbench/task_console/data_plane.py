@@ -23,10 +23,16 @@ from different runs advance independently.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import threading
 from types import MappingProxyType
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping
+
+if TYPE_CHECKING:
+    from zlc_data import ReductionMethod, Selection
+    from zlc_neutral_atom.monitor_application import CameraMonitorRoiState
+    from zlc_neutral_atom.runtime.control import ControlReceipt
 
 __all__ = ["ConsoleDataFront", "ConsoleDataPlane", "ConsoleSignalValue"]
 
@@ -46,6 +52,7 @@ class ConsoleSignalValue:
     run_id: object
     epoch_id: object                # causation domain the run belongs to
     join_digest: str                # payload digest of the event this froze
+    presentation: object | None = None
 
     # The block is the value; these read off it rather than copying, so a panel
     # and a legend describing "the same signal" cannot describe different data.
@@ -142,10 +149,21 @@ class ConsoleDataPlane:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._slots: dict[int, tuple[object, object]] = {}   # id(node) -> (node, slot)
+        self._exact_watchers: dict[int, object] = {}
+        self._exact_candidates: dict[int, tuple[str, str, object]] = {}
+        self._exact_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="console-exact-preview",
+        )
         self._dirty: set[int] = set()
         self._cache: dict[int, dict[str, ConsoleSignalValue]] = {}
+        self._finals: dict[
+            int,
+            tuple[object, dict[str, ConsoleSignalValue]],
+        ] = {}
         self._failures: dict[int, str] = {}
         self._membership_changed = False
+        self._closed = False
         empty = MappingProxyType({})
         self._front = ConsoleDataFront(signals=empty, failures=empty)
 
@@ -155,11 +173,89 @@ class ConsoleDataPlane:
             raise ValueError("a monitor slot is required")
         key = id(node)
         with self._lock:
+            if self._closed:
+                raise RuntimeError("console data plane is closed")
             self._slots[key] = (node, slot)
-            self._dirty.add(key)
+            # The view factory attaches before the domain binds its materializer.
+            # Only the slot's first real revision marks it dirty; trying to freeze
+            # here would turn the normal ARMED/no-frame-yet state into a false
+            # "no active dataset" failure (notably for an externally triggered
+            # main camera waiting for PulseGUI).
+            self._dirty.discard(key)
+            self._exact_candidates.pop(key, None)
             self._cache.pop(key, None)
             self._failures.pop(key, None)
             self._membership_changed = True
+
+    def attach_exact(self, node, slot) -> None:
+        """Attach one exact provisional dataset without blocking the Qt owner."""
+
+        from zlc_workbench.progressive_scan import ExactDatasetLiveSlot
+
+        if not isinstance(slot, ExactDatasetLiveSlot):
+            raise TypeError("exact console preview requires ExactDatasetLiveSlot")
+        self.attach(node, slot)
+        try:
+            slot.set_change_listener(
+                lambda: self._ensure_exact_watcher(node, slot)
+            )
+        except BaseException:
+            self.detach(node)
+            raise
+
+    def _ensure_exact_watcher(self, node, slot) -> None:
+        key = id(node)
+        with self._lock:
+            if self._closed or self._slots.get(key) != (node, slot):
+                return
+            if self._exact_watchers.get(key) is slot:
+                return
+            self._exact_watchers[key] = slot
+            try:
+                self._exact_executor.submit(self._watch_exact, node, slot)
+            except BaseException:
+                self._exact_watchers.pop(key, None)
+                raise
+
+    def _watch_exact(self, node, slot) -> None:
+        """Wait for exact builder revisions on the data plane's sole view lane."""
+
+        from zlc_data import DatasetRevision
+
+        key = id(node)
+        after = DatasetRevision(0)
+        try:
+            while True:
+                candidate = slot.wait_and_freeze(after, timeout=0.1)
+                if candidate is not None:
+                    run_id, causation, snapshot = candidate
+                    after = snapshot.ref.revision
+                    with self._lock:
+                        if self._slots.get(key) != (node, slot):
+                            return
+                        self._exact_candidates[key] = (
+                            run_id,
+                            causation,
+                            snapshot,
+                        )
+                        self._dirty.add(key)
+                if slot.terminal:
+                    failure = slot.failure
+                    if failure is not None:
+                        with self._lock:
+                            if self._slots.get(key) == (node, slot):
+                                self._failures[key] = failure
+                                self._dirty.add(key)
+                    return
+        except Exception as error:
+            with self._lock:
+                if self._slots.get(key) == (node, slot):
+                    self._failures[key] = f"{type(error).__name__}: {error}"
+                    self._dirty.add(key)
+        finally:
+            with self._lock:
+                if self._exact_watchers.get(key) is slot:
+                    self._exact_watchers.pop(key, None)
 
     def mark_changed(self, node) -> None:
         """Mark one producer dirty from its worker-safe change listener."""
@@ -169,14 +265,180 @@ class ConsoleDataPlane:
             if key in self._slots:
                 self._dirty.add(key)
 
+    def submit_camera_roi_control(
+        self,
+        node: object,
+        selection: Selection | None,
+        reduction: ReductionMethod,
+    ) -> ControlReceipt:
+        """Submit one selector ROI to the exact attached camera-monitor slot.
+
+        Membership is sampled under the data-plane lock, while preparation and
+        publication run outside it.  A detach/replacement during either domain
+        call invalidates the operation instead of returning a receipt for a
+        producer this console no longer owns.
+        """
+
+        from zlc_data import ReductionMethod, Selection
+        from zlc_neutral_atom.monitor_application import CameraMonitorViewSpec
+        from zlc_neutral_atom.runtime.control import ControlReceipt
+        from zlc_workbench.live import LiveDatasetSlot
+
+        if selection is not None and not isinstance(selection, Selection):
+            raise TypeError("selection must be Selection or None")
+        if not isinstance(reduction, ReductionMethod):
+            raise TypeError("reduction must be ReductionMethod")
+        key = id(node)
+        with self._lock:
+            entry = self._slots.get(key)
+        if entry is None or entry[0] is not node:
+            raise LookupError("camera monitor node has no attached live slot")
+        slot = entry[1]
+        if not isinstance(slot, LiveDatasetSlot) or not isinstance(
+            getattr(slot, "spec", None),
+            CameraMonitorViewSpec,
+        ):
+            raise TypeError("node is not attached to a camera monitor live slot")
+
+        candidate = slot.prepare_camera_roi_control(selection, reduction)
+        with self._lock:
+            if self._slots.get(key) != (node, slot):
+                raise RuntimeError(
+                    "camera monitor membership changed while preparing ROI control"
+                )
+        receipt = slot.submit_camera_roi_control(candidate)
+        if not isinstance(receipt, ControlReceipt):
+            raise TypeError("camera monitor returned an invalid ControlReceipt")
+        with self._lock:
+            if self._slots.get(key) != (node, slot):
+                raise RuntimeError(
+                    "camera monitor membership changed while submitting ROI control"
+                )
+        return receipt
+
+    def current_camera_roi_state(
+        self,
+        node: object,
+    ) -> CameraMonitorRoiState:
+        """Return the applied ROI branch for one exact attached monitor node."""
+
+        from zlc_neutral_atom.monitor_application import (
+            CameraMonitorRoiState,
+            CameraMonitorViewSpec,
+        )
+        from zlc_workbench.live import LiveDatasetSlot
+
+        key = id(node)
+        with self._lock:
+            entry = self._slots.get(key)
+        if entry is None or entry[0] is not node:
+            raise LookupError("camera monitor node has no attached live slot")
+        slot = entry[1]
+        if not isinstance(slot, LiveDatasetSlot) or not isinstance(
+            getattr(slot, "spec", None),
+            CameraMonitorViewSpec,
+        ):
+            raise TypeError("node is not attached to a camera monitor live slot")
+        state = slot.current_camera_roi_state()
+        if not isinstance(state, CameraMonitorRoiState):
+            raise TypeError("camera monitor returned an invalid ROI state")
+        with self._lock:
+            if self._slots.get(key) != (node, slot):
+                raise RuntimeError(
+                    "camera monitor membership changed while reading ROI state"
+                )
+        return state
+
+    def publish_final(self, node, projected: Mapping[str, object]) -> None:
+        """Admit one successful Run's already-materialized FINAL datasets.
+
+        ``projected`` is keyed by the catalog's bare output names.  The data
+        plane qualifies them with the exact producer instance just like a live
+        slot; it never invents an output that the node did not declare.
+        """
+
+        from .result_projection import ProjectedFinalSignal
+
+        if not isinstance(projected, Mapping):
+            raise TypeError("projected FINAL signals must be a mapping")
+        declared = {
+            str(output.name)
+            for output in tuple(
+                getattr(getattr(node, "spec", None), "declared_outputs", ()) or ()
+            )
+        }
+        unknown = set(map(str, projected)).difference(declared)
+        if unknown:
+            raise ValueError(
+                "FINAL projection contains undeclared outputs: "
+                + ", ".join(sorted(unknown))
+            )
+        title = str(getattr(node, "name", "") or type(node).__name__)
+        handle = getattr(node, "handle", None)
+        run_id_value = getattr(handle, "run_id", None)
+        run_id = getattr(run_id_value, "value", run_id_value)
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError(
+                "a successful FINAL projection must retain its RunHandle RunId"
+            )
+        frozen: dict[str, ConsoleSignalValue] = {}
+        for output_name, value in projected.items():
+            if not isinstance(value, ProjectedFinalSignal):
+                raise TypeError(
+                    "FINAL projection values must be ProjectedFinalSignal"
+                )
+            key = node.signal_key(str(output_name))
+            snapshot = value.snapshot
+            frozen[key] = ConsoleSignalValue(
+                name=key,
+                source=title,
+                snapshot=snapshot,
+                version=int(snapshot.block.revision.value),
+                coverage=None,
+                run_id=run_id,
+                epoch_id=snapshot.ref.stream_generation.value,
+                join_digest=value.join_digest,
+                presentation=value.presentation,
+            )
+        key = id(node)
+        with self._lock:
+            self._finals[key] = (node, frozen)
+            self._membership_changed = True
+
     def detach(self, node) -> None:
         key = id(node)
         with self._lock:
-            self._slots.pop(key, None)
+            entry = self._slots.pop(key, None)
+            self._exact_watchers.pop(key, None)
+            self._exact_candidates.pop(key, None)
             self._dirty.discard(key)
             self._cache.pop(key, None)
+            self._finals.pop(key, None)
             self._failures.pop(key, None)
             self._membership_changed = True
+        if entry is not None:
+            _node, slot = entry
+            slot.close()
+
+    def close(self) -> None:
+        """Release every live slot owned by this console."""
+
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            entries = tuple(self._slots.values())
+            self._slots.clear()
+            self._exact_watchers.clear()
+            self._exact_candidates.clear()
+            self._dirty.clear()
+            self._cache.clear()
+            self._finals.clear()
+            self._failures.clear()
+            self._membership_changed = True
+        for _node, slot in entries:
+            slot.close()
+        self._exact_executor.shutdown(wait=True, cancel_futures=True)
 
     def __len__(self) -> int:
         with self._lock:
@@ -230,6 +492,10 @@ class ConsoleDataPlane:
         with self._lock:
             current = dict(self._slots)
             cached = {key: dict(value) for key, value in self._cache.items()}
+            finals = {
+                key: (node, dict(value))
+                for key, (node, value) in self._finals.items()
+            }
             failed = dict(self._failures)
         for key, (node, _slot) in current.items():
             signals.update(cached.get(key, {}))
@@ -237,6 +503,8 @@ class ConsoleDataPlane:
             if failure is not None:
                 title = str(getattr(node, "name", "") or type(node).__name__)
                 failures[title] = failure
+        for _key, (_node, values) in finals.items():
+            signals.update(values)
         front = ConsoleDataFront(
             signals=MappingProxyType(signals),
             failures=MappingProxyType(failures),
@@ -259,11 +527,24 @@ class ConsoleDataPlane:
         than against names invented here.
         """
 
-        run_id, causation, snapshot = slot.freeze_camera_current()
-        declared = tuple(
-            str(decl.name)
-            for decl in getattr(getattr(node, "spec", None), "declared_outputs", ()) or ()
+        from zlc_neutral_atom.monitor_application import CameraMonitorViewSpec
+        from zlc_neutral_atom.runtime.pipeline import (
+            CapturePreviewSpec,
+            ExactDatasetPreviewSpec,
         )
+
+        spec = getattr(slot, "spec", None)
+        if isinstance(spec, CapturePreviewSpec):
+            return self._freeze_capture_preview(node, slot, title)
+        if isinstance(spec, ExactDatasetPreviewSpec):
+            return self._freeze_exact_preview(node, slot, title)
+        if not isinstance(spec, CameraMonitorViewSpec):
+            raise TypeError(
+                "console live slot must own a camera monitor, capture preview, "
+                "or exact dataset preview"
+            )
+        run_id, causation, snapshot = slot.freeze_camera_current()
+        declared = tuple(node.published_signals())
         raw = snapshot.raw
         head = None if raw is None else raw.head
         scalar = snapshot.scalar
@@ -283,7 +564,7 @@ class ConsoleDataPlane:
                 run_id=run_id, epoch_id=causation,
                 join_digest=str(getattr(head, "payload_digest", "") or ""),
             )
-        alignment_failure = None
+        alignment_failure = getattr(slot, "notification_failure", None)
         if scalar is not None and len(declared) > 1 and scalar_matches_raw:
             out[declared[1]] = ConsoleSignalValue(
                 name=declared[1], source=title, snapshot=scalar.snapshot,
@@ -298,10 +579,89 @@ class ConsoleDataPlane:
             # digest.  Keep the valid raw front and expose the missing derived
             # branch as a producer failure instead of drawing a plausible but
             # falsely aligned scalar.
-            alignment_failure = (
+            scalar_failure = (
                 f"{declared[1]} does not identify the raw event it reduced"
             )
+            alignment_failure = (
+                scalar_failure
+                if alignment_failure is None
+                else f"{alignment_failure}; {scalar_failure}"
+            )
         return out, alignment_failure
+
+    def _freeze_capture_preview(
+        self,
+        node,
+        slot,
+        title: str,
+    ) -> tuple[dict[str, ConsoleSignalValue], str | None]:
+        """Freeze the exact capture preview without pretending it has ROI output."""
+
+        run_id, causation, snapshot = slot.freeze_current()
+        declared = tuple(node.published_signals())
+        if len(declared) != 1:
+            raise ValueError("camera capture must declare exactly one preview output")
+        head = snapshot.head
+        return {
+            declared[0]: ConsoleSignalValue(
+                name=declared[0],
+                source=title,
+                snapshot=snapshot.snapshot,
+                version=self._sequence(snapshot),
+                coverage=snapshot.coverage,
+                run_id=run_id,
+                epoch_id=causation,
+                join_digest=str(
+                    getattr(head, "payload_digest", "") or ""
+                ),
+            )
+        }, getattr(slot, "notification_failure", None)
+
+    def _freeze_exact_preview(
+        self,
+        node,
+        slot,
+        title: str,
+    ) -> tuple[dict[str, ConsoleSignalValue], str | None]:
+        """Project the occupancy builder's exact provisional counts dataset."""
+
+        from zlc_data import dataset_revision_ref_to_tree
+        from zlc_storage import canonical_digest
+
+        key = id(node)
+        with self._lock:
+            candidate = self._exact_candidates.get(key)
+        if candidate is None:
+            raise RuntimeError("exact preview has no materialized revision")
+        run_id, causation, snapshot = candidate
+        outputs = tuple(
+            getattr(getattr(node, "spec", None), "declared_outputs", ()) or ()
+        )
+        published = tuple(node.published_signals())
+        counts = [
+            full
+            for full, output in zip(published, outputs, strict=True)
+            if str(output.name) == "counts"
+        ]
+        if len(counts) != 1:
+            raise ValueError(
+                "exact occupancy preview requires one declared counts output"
+            )
+        name = counts[0]
+        return {
+            name: ConsoleSignalValue(
+                name=name,
+                source=title,
+                snapshot=snapshot.snapshot,
+                version=int(snapshot.ref.revision.value),
+                coverage=snapshot.coverage,
+                run_id=run_id,
+                epoch_id=causation,
+                join_digest=canonical_digest(
+                    dataset_revision_ref_to_tree(snapshot.ref)
+                ),
+            )
+        }, slot.failure
 
     @staticmethod
     def _sequence(dataset_snapshot) -> int:

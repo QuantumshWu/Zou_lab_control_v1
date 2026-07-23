@@ -97,7 +97,6 @@ class MinimalPipelineSpec:
     name: str
     measurement: BoundMeasurement
     block_id: BlockId
-    timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
         _canonical_text(self.name, "name")
@@ -282,14 +281,30 @@ class PipelineResult:
                 raise RuntimeError(
                     "processed dataset derivation differs from capture readiness chain"
                 )
-        count = provenance.end_sequence - provenance.start_sequence
-        if not dataset.coverage.complete or dataset.coverage.total_cells != count:
-            raise RuntimeError("pipeline dataset coverage differs from event interval")
+        output_count = provenance.end_sequence - provenance.start_sequence
         if (
-            capture_terminal.produced_count != count
-            or capture_terminal.drained_count != count
+            not dataset.coverage.complete
+            or dataset.coverage.total_cells != output_count
         ):
-            raise RuntimeError("pipeline terminal and dataset provenance differ")
+            raise RuntimeError("pipeline dataset coverage differs from event interval")
+        source_count = (
+            capture_completion.source_event_span.end_sequence
+            - capture_completion.source_event_span.start_sequence
+        )
+        if (
+            capture_terminal.produced_count != source_count
+            or capture_terminal.drained_count != source_count
+        ):
+            raise RuntimeError(
+                "pipeline terminal and root input provenance differ"
+            )
+        if (
+            capture_completion.direct_terminal_consumer
+            and output_count != source_count
+        ):
+            raise RuntimeError(
+                "direct capture dataset cardinality differs from its source"
+            )
         # A direct materializer projects the source event, so its dataset
         # metadata is exactly the metadata acknowledged by the physical source.
         # A processor is allowed (and normally expected) to define a different
@@ -777,7 +792,6 @@ def compile_pipeline(
         cleanup=cleanup,
         finalize=lambda _context, result: result,
         interrupt_operations=port.interrupt_operations,
-        timeout_seconds=spec.timeout_seconds,
         requires_final_commit=False,
     )
 

@@ -20,6 +20,7 @@ the same way -- that shared step is what this module holds.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from zlc_data import Selection
 
@@ -45,8 +46,15 @@ from .figure import (
     suggest_view,
     validate_view_spec,
 )
-from .histogram_display import HistogramDisplayState
-from .image_display import ImageDisplayState
+from .histogram_display import (
+    FacetedHistogramDisplayState,
+    HistogramDisplayState,
+)
+from .image_display import (
+    ImageDisplayState,
+    image_viewport_for_display_state,
+    resolve_image_color_limits,
+)
 
 __all__ = [
     "PanelComposer",
@@ -216,9 +224,13 @@ class PanelComposer:
         *,
         intent: ViewIntent = ViewIntent.IMAGE,
         size: tuple[int, int] = (800, 520),
+        size_name: str = "2x2",
+        pixel_ratio: float = 1.0,
         selection=None,
         label: str = "",
+        value_label: str = "Signal",
         view: ViewSpec | None = None,
+        rolling_distribution: bool = False,
     ) -> None:
         from .figure import dataset_contract_for
 
@@ -229,11 +241,21 @@ class PanelComposer:
         self._panel_id = str(panel_id)
         self._intent = intent
         self._size = (int(size[0]), int(size[1]))
+        from zlc_data.panel_size import panel_size_cells
+
+        panel_size_cells(size_name)
+        self._size_name = str(size_name)
+        pixel_ratio = float(pixel_ratio)
+        if not math.isfinite(pixel_ratio) or pixel_ratio <= 0.0:
+            raise ValueError("pixel_ratio must be positive and finite")
+        self._pixel_ratio = pixel_ratio
         self._selection = selection
         if view is not None and not isinstance(view, ViewSpec):
             raise TypeError("view must be ViewSpec or None")
         self._view = view
         self._label = str(label or panel_id)
+        self._value_label = str(value_label or "Signal")
+        self._rolling_distribution = bool(rolling_distribution)
         self._dataset_id = DatasetId(self._panel_id)
         self._evaluator = FigureEvaluator()
         self._document: FigureDocument | None = None
@@ -242,7 +264,7 @@ class PanelComposer:
         # Display continuity, carried between ticks (see the class docstring).
         self._color_limits: tuple[float, float] | None = None
         self._image_relim_mode = None
-        self._curve_y_limits = None
+        self._curve_y_limits = (0.0, 1.0)
         self._curve_relim_mode = None
         self._histogram_count_limits = None
         self._histogram_relim_mode = None
@@ -373,14 +395,24 @@ class PanelComposer:
             not in (
                 ViewIntent.CURVE,
                 ViewIntent.HISTOGRAM,
-                ViewIntent.METER,
+                ViewIntent.IMAGE,
             )
         ):
             raise PanelRenderError(
-                "a grid requires one multi-cell CURVE, HISTOGRAM, or METER view"
+                "a grid requires one multi-cell CURVE, HISTOGRAM, or IMAGE view"
             )
         if focus is None:
-            payload, regions = figure.to_png_bytes_with_panel_regions()
+            from .plot_layout import LIVE_PANEL_DPI
+
+            payload, regions = figure.to_panel_png_bytes_with_panel_regions(
+                size=self._size_name,
+                width=self._size[0],
+                height=self._size[1],
+                dpi=LIVE_PANEL_DPI * self._pixel_ratio,
+                display_state=display,
+                title=self._label,
+                value_label=self._value_label,
+            )
             if len(regions) != len(layers[0].cells):
                 raise PanelRenderError(
                     "grid hit regions do not cover every evaluated cell"
@@ -399,13 +431,23 @@ class PanelComposer:
             )
         except (TypeError, ValueError, IndexError, RuntimeError) as error:
             raise PanelRenderError(f"grid focus is stale: {error}") from error
-        raster, payload = self._rasterize_focused(focused, display)
+        focused_display = display
+        if self._intent is ViewIntent.HISTOGRAM:
+            if not isinstance(display, FacetedHistogramDisplayState):
+                raise PanelRenderError(
+                    "histogram grid requires per-cell threshold state"
+                )
+            focused_display = display.display_for(focus.selection)
+        raster, payload = self._rasterize_focused(
+            focused,
+            focused_display,
+        )
         frame = self._frame_for(
             focused.document,
             ref,
             raster,
             payload,
-            display,
+            focused_display,
             provenance,
         )
         return FacetedPanelResult(
@@ -492,12 +534,35 @@ class PanelComposer:
     def _rasterize_focused(self, figure: DataFigure, display):
         """Use the existing single-panel renderer for one typed grid cell."""
 
+        if self._intent is ViewIntent.IMAGE:
+            layer = figure.evaluated.layers[0]
+            series = layer.cells[0].series
+            if len(series) != 1 or not isinstance(
+                series[0].data,
+                EvaluatedImage,
+            ):
+                raise PanelRenderError(
+                    "focused image grid cell must contain exactly one image"
+                )
+            descriptor = figure.document.datasets[0]
+            resolved = figure.datasets.resolve(descriptor.dataset_id)
+            return self._image_front(
+                series[0].data,
+                display,
+                resolved.ref,
+                resolved.block.schema,
+            )
+
         from .matplotlib_render import SinglePanelAggRenderer
 
         renderer = SinglePanelAggRenderer(
             figure.document,
             width=self._size[0],
             height=self._size[1],
+            dpi=self._live_dpi(),
+            size_name=self._size_name,
+            value_label=self._value_label,
+            title=self._label,
         )
         try:
             if self._intent is ViewIntent.CURVE:
@@ -505,7 +570,11 @@ class PanelComposer:
                     figure.evaluated,
                     display,
                     current_y_limits=self._curve_y_limits,
-                    previous_relim_mode=self._curve_relim_mode,
+                    previous_relim_mode=(
+                        display.relim_mode
+                        if self._curve_relim_mode is None
+                        else self._curve_relim_mode
+                    ),
                 )
                 self._curve_y_limits = payload.viewport.y_limits
                 self._curve_relim_mode = display.relim_mode
@@ -522,11 +591,6 @@ class PanelComposer:
                 self._histogram_relim_mode = display.relim_mode
                 self._histogram_count_scale = display.count_scale
                 return raster, payload
-            if self._intent is ViewIntent.METER:
-                return renderer.render_meter(
-                    figure.evaluated,
-                    display_revision=getattr(display, "revision", 0),
-                )
         finally:
             renderer.close()
         raise PanelRenderError(
@@ -541,16 +605,40 @@ class PanelComposer:
                 raise PanelRenderError("the panel has no document to render")
             self._renderer = SinglePanelAggRenderer(
                 self._document, width=self._size[0], height=self._size[1],
+                dpi=self._live_dpi(),
+                rolling_distribution=self._rolling_distribution,
+                value_label=self._value_label,
+                title=self._label,
+                size_name=self._size_name,
             )
+        if not isinstance(self._renderer, SinglePanelAggRenderer):
+            raise PanelRenderError("panel renderer family changed without a source reset")
         return self._renderer
 
+    def _image_agg(self):
+        from .matplotlib_render import ImagePanelAggRenderer
+
+        if self._renderer is None:
+            self._renderer = ImagePanelAggRenderer(
+                width=self._size[0],
+                height=self._size[1],
+                dpi=self._live_dpi(),
+                size_name=self._size_name,
+            )
+        if not isinstance(self._renderer, ImagePanelAggRenderer):
+            raise PanelRenderError("panel renderer family changed without a source reset")
+        return self._renderer
+
+    def _live_dpi(self) -> float:
+        from .plot_layout import LIVE_PANEL_DPI
+
+        return LIVE_PANEL_DPI * self._pixel_ratio
+
     def _image_front(self, data: EvaluatedImage, display: ImageDisplayState, ref, schema):
-        from .image_raster import rasterize_image_indexed8
         from .image_view import ImageViewportTransform
         from .render import ImagePanelPayload
-        from .render_style import indexed_colormap
 
-        raster, data_range, histogram, color_limits = rasterize_image_indexed8(
+        data_range, color_limits = resolve_image_color_limits(
             data,
             display,
             current_color_limits=self._color_limits,
@@ -558,20 +646,30 @@ class PanelComposer:
         )
         self._color_limits = color_limits
         self._image_relim_mode = display.relim_mode
+        home_viewport = ImageViewportTransform(
+            self._image_axis_specs(data, schema),
+        )
+        viewport = image_viewport_for_display_state(display, home_viewport)
+        raster, raster_geometry = self._image_agg().render(
+            data,
+            viewport,
+            display,
+            color_limits=color_limits,
+            data_range=data_range,
+            title=self._label,
+            value_label=self._value_label,
+        )
         payload = ImagePanelPayload(
             image=data,
             evaluated_input=EvaluatedInput(self._dataset_id, ref),
             # The viewport revision tracks the display revision because a
             # viewport is a property OF a display state; a pair that drifted
             # would let a pan land on a colour window that no longer exists.
-            viewport=ImageViewportTransform(
-                self._image_axis_specs(data, schema),
-                viewport_revision=display.revision,
-            ),
+            viewport=viewport,
             data_range=data_range,
-            histogram_counts=histogram,
-            base_palette=indexed_colormap(display.colormap.value),
+            colormap=display.colormap,
             color_limits=color_limits,
+            raster_geometry=raster_geometry,
         )
         return raster, payload
 
@@ -598,7 +696,11 @@ class PanelComposer:
             evaluated,
             display,
             current_y_limits=self._curve_y_limits,
-            previous_relim_mode=self._curve_relim_mode,
+            previous_relim_mode=(
+                display.relim_mode
+                if self._curve_relim_mode is None
+                else self._curve_relim_mode
+            ),
         )
         self._curve_y_limits = payload.viewport.y_limits
         self._curve_relim_mode = display.relim_mode
