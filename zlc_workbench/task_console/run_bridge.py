@@ -26,6 +26,9 @@ from zlc_workbench.run_owner import QtRunOwnerMailbox
 __all__ = ["ConsoleRunNode"]
 
 
+_UNRESOLVED_FINAL = object()
+
+
 class ConsoleRunNode:
     """The Run lifecycle of ONE console node (a logic row / camera panel).
 
@@ -51,11 +54,15 @@ class ConsoleRunNode:
             max_workers=1,
         )
         self._request = spec.build_request(self._values)
-        self._prepared: object | None = None
         self._handle = None
         self._snapshot = None
+        # A FINAL value belongs to exactly one started generation.  It is
+        # deliberately not inferred from the terminal snapshot: only
+        # RunHandle.result() carries the value committed by the Run.
+        self._final_result = _UNRESOLVED_FINAL
         self._error: str | None = None
         self._stop_requested = False
+        self._stop_reason = "Console user requested stop"
         self._starter = None
 
     # ----------------------------------------------------------------- facts
@@ -80,6 +87,31 @@ class ConsoleRunNode:
     @property
     def last_error(self) -> str | None:
         return self._error
+
+    @property
+    def final_result(self):
+        """The successful Run result, or ``None`` until/when none exists.
+
+        The property never waits.  :meth:`poll` admits the result only after
+        the matching handle reports ``SUCCEEDED`` and its owner thread has
+        finished.  Starting another generation clears it before submission,
+        so a panel can never keep offering an earlier artifact while a rerun
+        is in flight.
+        """
+
+        return None if self._final_result is _UNRESOLVED_FINAL else self._final_result
+
+    @property
+    def final_result_resolved(self) -> bool:
+        """Whether the successful Run result has been joined without waiting.
+
+        ``None`` may itself be a legitimate successful result, so callers must
+        not use :attr:`final_result` as a completion flag.  This property is the
+        narrow distinction needed by the GUI owner: keep polling a terminal
+        Run until its owner thread has exited, then detach it.
+        """
+
+        return self._final_result is not _UNRESOLVED_FINAL
 
     @property
     def running(self) -> bool:
@@ -125,7 +157,11 @@ class ConsoleRunNode:
             return
         self._error = None
         self._stop_requested = False
+        self._stop_reason = "Console user requested stop"
         generation = self._owner.begin_generation()
+        self._handle = None
+        self._snapshot = None
+        self._final_result = _UNRESOLVED_FINAL
         request = self._request
         prepare = self._prepare
         self._owner.submit("start", lambda: start(prepare(request)),
@@ -136,6 +172,7 @@ class ConsoleRunNode:
 
         handle = self._handle
         self._stop_requested = True
+        self._stop_reason = str(reason)
         if handle is None or handle.snapshot().state.terminal:
             return
         handle.cancel(reason)
@@ -156,16 +193,35 @@ class ConsoleRunNode:
             if error is not None:
                 self._error = f"{type(error).__name__}: {error}"
                 self._handle = None
+                self._snapshot = None
+                self._final_result = _UNRESOLVED_FINAL
                 self._owner.mark_owner_reaped()
                 continue
             if completion.kind == "start":
                 self._handle = completion.future.result()
                 self._owner.set_handle(self._handle)
+                if self._stop_requested:
+                    self._handle.cancel(self._stop_reason)
         handle = self._handle
         if handle is not None:
             self._snapshot = handle.snapshot()
             if self._snapshot.state.terminal:
-                self._owner.mark_owner_reaped()
+                if (
+                    self._snapshot.state.name == "SUCCEEDED"
+                    and self._final_result is _UNRESOLVED_FINAL
+                ):
+                    try:
+                        # A Run publishes terminal state just before its owner
+                        # thread exits.  timeout=0 keeps the Qt polling path
+                        # non-blocking; the next tick retries that narrow join.
+                        self._final_result = handle.result(timeout=0.0)
+                    except TimeoutError:
+                        pass
+                    else:
+                        self._owner.mark_owner_reaped()
+                elif self._snapshot.state.name != "SUCCEEDED":
+                    self._final_result = _UNRESOLVED_FINAL
+                    self._owner.mark_owner_reaped()
         return self._snapshot
 
     def shutdown(self) -> None:

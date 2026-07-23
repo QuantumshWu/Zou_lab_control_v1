@@ -130,6 +130,47 @@ print(dark)
     )
 
 
+def test_owner_wake_coalesces_queued_requests_and_replays_only_during_dispatch() -> None:
+    """A level-triggered worker wake cannot manufacture empty owner turns."""
+
+    source = r'''
+from zlc_frontend.qt_widgets import QtOwnerWake, ensure_qt_app
+
+app = ensure_qt_app()
+queued_calls = []
+queued = QtOwnerWake()
+queued.bind(lambda: queued_calls.append("turn"))
+queued.request_owner_wake()
+queued.request_owner_wake()
+app.processEvents()
+
+replay_calls = []
+replay = QtOwnerWake()
+def callback():
+    replay_calls.append("turn")
+    if len(replay_calls) == 1:
+        replay.request_owner_wake()
+replay.bind(callback)
+replay.request_owner_wake()
+for _ in range(4):
+    app.processEvents()
+print(len(queued_calls), len(replay_calls))
+'''
+    environment = dict(os.environ)
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=REPO,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1 2"
+
+
 def _call_name(node: ast.Call) -> str:
     target = node.func
     return target.attr if isinstance(target, ast.Attribute) else getattr(target, "id", "")

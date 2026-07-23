@@ -27,12 +27,12 @@ def test_unchanged_sources_reuse_their_immutable_front() -> None:
     plane._freeze_one = lambda *_args: calls.append(object()) or {}
     plane.attach(node, slot)
 
-    plane.freeze()
-    plane.freeze()
+    first = plane.freeze()
+    assert plane.freeze() is first
     assert len(calls) == 1
 
     plane.mark_changed(node)
-    plane.freeze()
+    assert plane.freeze() is not first
     assert len(calls) == 2
 
 

@@ -1,12 +1,11 @@
-"""The grid-as-axis-expander facet slicer -- the SINGLE, headless data rule shared by the frontend
-GridPlot (which lays a faceted axis out as N aligned cells) and the live FitProcessor (which fits each
-of those cells on its worker).  A grid picks ONE axis of a canonical measurement block ``(R, P,
+"""The grid-as-axis-expander facet slicer -- the SINGLE, headless data rule for a frontend
+grid that lays one declared axis out as N aligned cells.  A grid picks ONE axis of a canonical measurement block ``(R, P,
 *data_shape)`` and expands it into N cells, each a standard ``sub_plot_kind`` panel of the REMAINING
 axes; ``facet_cells`` below is the ONE place "which axis becomes the cells and what each cell shows" is
-defined, so the plot and the fit node can never slice differently.
+defined.
 
 Pure numpy (+ the ``_readout_math`` gap-safe mean): no Qt / Matplotlib / frontend dependency, so the
-neutral_atom fit node can import it without breaking the sealed frontend boundary.
+axis projection stays independently testable.
 """
 
 from __future__ import annotations

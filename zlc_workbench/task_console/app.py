@@ -43,8 +43,8 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     """
 
     from Zou_lab_control.notebook.facade import _prepare_camera_monitor_for_workbench
-    from zlc_frontend.figure import DatasetId
-    from zlc_workbench.live import LiveDatasetSlot
+    from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_KEY
+    from zlc_neutral_atom.scan import PULSE_SCAN_TASK_KEY
 
     from .catalog_bridge import ConsoleCatalogView
     from .data_plane import ConsoleDataPlane
@@ -65,19 +65,36 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         """
 
     def run_factory(spec, values):
-        node = ConsoleRunNode(
-            spec, values,
-            prepare=lambda request: _prepare_camera_monitor_for_workbench(experiment, request),
-            request_owner_wake=request_owner_wake,
+        if spec.key == CAMERA_MEASUREMENT_KEY:
+            node = ConsoleRunNode(
+                spec,
+                values,
+                prepare=lambda request: _prepare_camera_monitor_for_workbench(
+                    experiment, request
+                ),
+                request_owner_wake=request_owner_wake,
+            )
+            _bind_monitor_view(node, data_plane)
+            return node
+        if spec.key == PULSE_SCAN_TASK_KEY:
+            node = ConsoleRunNode(
+                spec,
+                values,
+                prepare=lambda request: request,
+                request_owner_wake=request_owner_wake,
+            )
+            node.bind_starter(experiment.readout.start_scan)
+            return node
+        raise NotImplementedError(
+            f"TaskConsole has no current runtime binding for {spec.key}"
         )
-        _bind_monitor_view(node, data_plane)
-        return node
 
     body = show_task_console(
         state=state, task=task,
         catalog_view=catalog_view,
         run_factory=run_factory,
         data_plane=data_plane,
+        fit_window_factory=experiment.readout.fit_gui,
         **kwargs,
     )
     console.append(body)

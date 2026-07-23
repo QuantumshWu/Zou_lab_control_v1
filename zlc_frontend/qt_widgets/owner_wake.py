@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Callable
 
 from PyQt5 import QtCore
@@ -18,6 +19,10 @@ class QtOwnerWake(QtCore.QObject):
         super().__init__(parent)
         self._callback: Callable[[], object] | None = None
         self._fault: BaseException | None = None
+        self._pending_lock = threading.Lock()
+        self._scheduled = False
+        self._dispatching = False
+        self._replay = False
         self.requested.connect(self._dispatch, QtCore.Qt.QueuedConnection)
 
     @property
@@ -34,6 +39,25 @@ class QtOwnerWake(QtCore.QObject):
         self._fault = None
 
     def request_owner_wake(self) -> None:
+        """Queue at most one owner turn while retaining a concurrent replay.
+
+        Worker completions are level-triggered: the owner callback drains every
+        result currently available.  Emitting one queued Qt event per completed
+        future therefore manufactures redundant owner turns when several
+        futures finish together.  A completion arriving while the callback is
+        running requests exactly one replay, so no result can be stranded.
+        """
+
+        with self._pending_lock:
+            if self._scheduled:
+                # Several completions can arrive before Qt begins the already
+                # queued owner turn.  That turn drains all of them, so another
+                # event would be empty work.  Replay is needed only when a
+                # completion races with the callback that is already draining.
+                if self._dispatching:
+                    self._replay = True
+                return
+            self._scheduled = True
         self.requested.emit()
 
     def detach(self) -> None:
@@ -42,13 +66,25 @@ class QtOwnerWake(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def _dispatch(self) -> None:
-        callback = self._callback
-        if callback is None:
-            return
+        with self._pending_lock:
+            self._dispatching = True
         try:
-            callback()
+            callback = self._callback
+            if callback is not None:
+                callback()
         except BaseException as error:
             self._fault = detached_render_fault(error)
+        finally:
+            with self._pending_lock:
+                self._dispatching = False
+                if self._replay:
+                    self._replay = False
+                    replay = True
+                else:
+                    self._scheduled = False
+                    replay = False
+            if replay:
+                self.requested.emit()
 
     def _require_owner(self) -> None:
         if QtCore.QThread.currentThread() != self.thread():

@@ -162,10 +162,6 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
     (Path("zlc_data/shape_text.py"), "indexed_unique_name"),
     (Path("zlc_frontend/form.py"), "lenient_float"),
     (Path("zlc_frontend/form.py"), "text_to_python"),
-    # The Analysis controls moved into qt_widgets; the fix/seed editor reads the numbers a HUMAN
-    # typed into two line edits, which is exactly the boundary this guard reserves .strip() for,
-    # so the named entry follows the code rather than the guard being widened.
-    (Path("zlc_frontend/qt_widgets/analysis_controls.py"), "_FitFixSeedEditor.values"),
         (Path("zlc_frontend/qt_widgets/fluent.py"), "align_to_resolution"),
         (Path("zlc_frontend/qt_widgets/fluent.py"), "FluentPathEdit._dialog_start"),
         (Path("zlc_frontend/qt_widgets/fluent.py"), "FluentTreeComboBox.current_signal"),

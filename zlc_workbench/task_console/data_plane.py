@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
+from types import MappingProxyType
 from typing import Mapping
 
 __all__ = ["ConsoleDataPlane", "ConsoleSignalValue", "ConsoleTickSnapshot"]
@@ -143,6 +144,9 @@ class ConsoleDataPlane:
         self._dirty: set[int] = set()
         self._cache: dict[int, dict[str, ConsoleSignalValue]] = {}
         self._failures: dict[int, str] = {}
+        self._membership_changed = False
+        empty = MappingProxyType({})
+        self._front = ConsoleTickSnapshot(signals=empty, failures=empty)
 
     # ------------------------------------------------------------ membership
     def attach(self, node, slot) -> None:
@@ -154,6 +158,7 @@ class ConsoleDataPlane:
             self._dirty.add(key)
             self._cache.pop(key, None)
             self._failures.pop(key, None)
+            self._membership_changed = True
 
     def mark_changed(self, node) -> None:
         """Mark one producer dirty from its worker-safe change listener."""
@@ -170,6 +175,7 @@ class ConsoleDataPlane:
             self._dirty.discard(key)
             self._cache.pop(key, None)
             self._failures.pop(key, None)
+            self._membership_changed = True
 
     def __len__(self) -> int:
         with self._lock:
@@ -177,18 +183,28 @@ class ConsoleDataPlane:
 
     # ---------------------------------------------------------------- freeze
     def freeze(self) -> ConsoleTickSnapshot:
-        """Materialise every attached slot into one immutable tick snapshot.
+        """Return the current immutable board front, advancing changed sources.
 
         A slot that cannot be frozen (its run went terminal, its dataset was
         withdrawn) contributes a FAILURE entry, never an exception: one dead
         source must not blank the whole board, and the operator still needs to
         see why that one row stopped moving.
+
+        With no producer revision or membership change this returns the exact
+        same object.  The GUI timer is therefore only a polling clock; it cannot
+        manufacture a new whole-board snapshot merely because time passed.
         """
 
         with self._lock:
+            if not self._dirty and not self._membership_changed:
+                return self._front
             slots = dict(self._slots)
             dirty = self._dirty.intersection(slots)
             self._dirty.difference_update(dirty)
+            # Consume only the membership state observed above.  A concurrent
+            # attach/detach after this lock is released sets it again and is
+            # therefore rebuilt on the next owner tick.
+            self._membership_changed = False
         for key in dirty:
             node, slot = slots[key]
             title = str(getattr(node, "name", "") or type(node).__name__)
@@ -217,7 +233,13 @@ class ConsoleDataPlane:
             if failure is not None:
                 title = str(getattr(node, "name", "") or type(node).__name__)
                 failures[title] = failure
-        return ConsoleTickSnapshot(signals=signals, failures=failures)
+        front = ConsoleTickSnapshot(
+            signals=MappingProxyType(signals),
+            failures=MappingProxyType(failures),
+        )
+        with self._lock:
+            self._front = front
+        return front
 
     def _freeze_one(self, node, slot, title: str) -> dict[str, ConsoleSignalValue]:
         """One slot's atomic transaction, projected onto its declared outputs.

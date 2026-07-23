@@ -52,6 +52,8 @@ from .controller import (
     PulseEditorControllerSnapshot,
     PulseEditorLocalDelta,
     PulseEditorProjection,
+    PulseRuntimeUpdate,
+    PulseScanProgressUpdate,
 )
 from .preview_view import PulsePreviewView
 from .scan_view import (
@@ -102,12 +104,18 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         super().__init__(parent)
         self._controller = controller
         self._window = None
-        self._last_snapshot: PulseEditorControllerSnapshot | None = None
+        self._last_runtime: (
+            PulseEditorControllerSnapshot | PulseRuntimeUpdate | None
+        ) = None
         self._last_editor_projection: PulseEditorProjection | None = None
         self._last_scan_workspace = None
+        self._last_scan_progress_key = None
+        self._last_preview_key = None
+        self._last_preview_notice = ""
         self._editor_projection_pending = False
         self._owner_cycle_active = False
         self._owner_cycle_pending = False
+        self._owner_cycle_force_pending = False
         self._shown_preview_key: tuple[int, int, int] | None = None
         self._pending_preview_origin = None
         self._pending_preview_revision: int | None = None
@@ -301,7 +309,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         )
         view.runRequested.connect(self._run_from_edit)
         view.stopRequested.connect(
-            lambda: self._invoke(self._controller.cancel)
+            lambda: self._invoke_runtime(self._controller.cancel)
         )
         view.syncRequested.connect(self._sync_applied)
         view.feedbackRequested.connect(self._message)
@@ -378,11 +386,12 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         # A semantic command owns one controller turn.  Project its committed
         # result only after the originating Qt signal returns; there is no idle
         # timer backstop and no per-keystroke application snapshot bus.
+        self._owner_cycle_force_pending = True
         wake = getattr(self, "_wake", None)
-        if wake is not None:
-            wake.request_owner_wake()
-        else:
+        if wake is None:
             QtCore.QTimer.singleShot(0, self._owner_cycle)
+        else:
+            wake.request_owner_wake()
         return result
 
     def _invoke_editor(self, action: Callable, *args, **kwargs):
@@ -409,6 +418,19 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         )
         return None
 
+    def _invoke_runtime(self, action: Callable, *args, **kwargs):
+        """Commit one same-thread Run command through the narrow runtime view."""
+
+        try:
+            result = action(*args, **kwargs)
+        except BaseException as error:
+            self._message(str(error))
+            return None
+        update = self._controller.runtime_update()
+        self._apply_runtime_update(update)
+        self._finish_close_if_ready(update)
+        return result
+
     def _queue_full_editor_reconcile(self) -> None:
         if self._editor_projection_pending:
             return
@@ -418,7 +440,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     def _apply_editor_delta(self, delta: PulseEditorLocalDelta) -> bool:
         """Present one local edit without constructing a document projection."""
 
-        runtime = self._last_snapshot
+        runtime = self._last_runtime
         previous_editor = self._last_editor_projection
         if runtime is None or previous_editor is None:
             return False
@@ -432,7 +454,6 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         if delta.scan_workspace is not None:
             self._apply_scan_workspace_value(
                 delta.scan_workspace,
-                runtime,
                 self._last_scan_workspace,
             )
             self._last_scan_workspace = delta.scan_workspace
@@ -595,19 +616,19 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._sync_preview_pixel_ratio()
 
     def _run_from_edit(self) -> None:
-        editor = self._controller.editor_projection()
-        if editor.document.scan_parameters:
+        document = self._controller.current_document
+        if document.scan_parameters:
             form = (
                 PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS
-                if editor.document.scan_sweep_count == 0
+                if document.scan_sweep_count == 0
                 else PulseExecutionForm.AUTONOMOUS_SCAN_ONCE
             )
         else:
             form = PulseExecutionForm.CONTINUOUS_MONITOR
-        self._invoke(
+        self._invoke_runtime(
             self._controller.start,
             form,
-            scan_sweep_count=max(1, editor.document.scan_sweep_count),
+            scan_sweep_count=max(1, document.scan_sweep_count),
         )
 
     def _sync_applied(self) -> None:
@@ -622,14 +643,14 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         if action is None:
             self._message("No running scan point is available to hold.")
             return
-        self._invoke(action)
+        self._invoke_runtime(action)
 
     def _step_scan_point(self, delta: int) -> None:
         action = getattr(self._controller, "step_scan_point", None)
         if action is None:
             self._message("No held scan point is available to step.")
             return
-        self._invoke(action, int(delta))
+        self._invoke_runtime(action, int(delta))
 
     def _scan_file_start(self) -> Path:
         editor = self._controller.editor_projection()
@@ -773,23 +794,35 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     # ------------------------------------------------------------------
 
     def _owner_cycle(self) -> None:
+        force = self._owner_cycle_force_pending
+        self._owner_cycle_force_pending = False
+        self._run_owner_cycle(force=force)
+
+    def _run_owner_cycle(self, *, force: bool) -> None:
         # ``fluent_message`` runs a nested Qt event loop.  A timer firing in
         # that loop must not re-enter snapshot projection while the previous
-        # transition still owns ``_last_snapshot``; otherwise one connection
-        # transition creates two identical modal dialogs.  Coalesce that wake
-        # and replay it after the current owner turn commits.
+        # transition still owns the displayed runtime state; otherwise one
+        # connection transition creates two identical modal dialogs.  Coalesce
+        # that wake and replay it after the current owner turn commits.
         if self._owner_cycle_active:
             self._owner_cycle_pending = True
+            self._owner_cycle_force_pending |= bool(force)
             return
         self._owner_cycle_active = True
         try:
-            snapshot = self._controller.pump()
+            publication = self._controller.pump(force=force)
+            if publication is None:
+                return
+            if isinstance(publication, PulseScanProgressUpdate):
+                self._present_scan_progress(publication)
+                return
+            if isinstance(publication, PulseRuntimeUpdate):
+                self._apply_runtime_update(publication)
+                self._finish_close_if_ready(publication)
+                return
+            snapshot = publication
             self._apply_snapshot(snapshot)
-            if snapshot.close_complete and self._window is not None:
-                if self._owner_retiring:
-                    self._commit_owner_retirement()
-                else:
-                    QtCore.QTimer.singleShot(0, self._window.close)
+            self._finish_close_if_ready(snapshot)
         finally:
             self._owner_cycle_active = False
             if self._owner_cycle_pending:
@@ -803,18 +836,19 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             return
         self._owner_cycle_active = True
         try:
-            snapshot = self._controller.poll_runtime_change()
-            if snapshot is not None:
-                self._apply_snapshot(snapshot)
+            update = self._controller.poll_runtime_change()
+            if update is not None:
+                self._apply_runtime_update(update)
+                self._finish_close_if_ready(update)
         finally:
             self._owner_cycle_active = False
 
     def _reconcile_editor_fields(
         self,
         editor: PulseEditorProjection,
-        runtime: PulseEditorControllerSnapshot,
+        runtime: PulseEditorControllerSnapshot | PulseRuntimeUpdate,
         previous_editor: PulseEditorProjection | None,
-        previous_runtime: PulseEditorControllerSnapshot | None,
+        previous_runtime: PulseEditorControllerSnapshot | PulseRuntimeUpdate | None,
     ) -> bool:
         """Reconcile only document-derived widgets; return revision change."""
 
@@ -891,7 +925,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     def _apply_editor_projection(self, projection: PulseEditorProjection) -> None:
         """Present a synchronous editor commit without polling application state."""
 
-        runtime = self._last_snapshot
+        runtime = self._last_runtime
         previous_editor = self._last_editor_projection
         if runtime is None or previous_editor is None:
             # Construction installs the initial full snapshot before any Qt
@@ -924,7 +958,6 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         if projection.scan_workspace != previous_editor.scan_workspace:
             self._apply_scan_workspace(
                 projection,
-                runtime,
                 previous_editor,
             )
             self._last_scan_workspace = projection.scan_workspace
@@ -949,7 +982,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         )
 
     def _apply_snapshot(self, snapshot: PulseEditorControllerSnapshot) -> None:
-        previous_runtime = self._last_snapshot
+        previous_runtime = self._last_runtime
         previous_editor = self._last_editor_projection
         editor = self._editor_from_snapshot(snapshot)
         self._reconcile_editor_fields(
@@ -1013,23 +1046,81 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
                 snapshot.rendered_preview.presentation_revision,
             ),
         )
-        old_preview_key = None if previous_runtime is None else (
-            previous_runtime.preview_revision,
-            previous_runtime.preview_generation,
-            previous_runtime.preview_error,
-            previous_runtime.preview_notice,
-            None
-            if previous_runtime.rendered_preview is None
-            else (
-                previous_runtime.rendered_preview.document_generation,
-                previous_runtime.rendered_preview.editor_revision,
-                previous_runtime.rendered_preview.presentation_revision,
-            ),
-        )
-        if preview_key != old_preview_key:
+        if preview_key != self._last_preview_key:
             self._apply_preview(snapshot)
-        scan_key = (
-            editor.scan_workspace,
+        self._last_preview_key = preview_key
+        self._last_preview_notice = snapshot.preview_notice
+        workspace_key = editor.scan_workspace
+        old_workspace_key = (
+            None if previous_editor is None else previous_editor.scan_workspace
+        )
+        if workspace_key != old_workspace_key:
+            self._apply_scan_workspace(
+                editor,
+                previous_editor,
+            )
+        progress_key = self._scan_progress_key(snapshot)
+        if progress_key != self._last_scan_progress_key:
+            self._apply_scan_progress(snapshot)
+        self._last_scan_progress_key = progress_key
+        self._last_runtime = snapshot
+        self._last_editor_projection = editor
+        self._last_scan_workspace = editor.scan_workspace
+        self._sync_runtime_watchers()
+
+    def _apply_runtime_update(self, update: PulseRuntimeUpdate) -> None:
+        """Present changed Run facts without touching editor/Scan projections."""
+
+        editor = self._last_editor_projection
+        previous = self._last_runtime
+        if editor is None:
+            raise RuntimeError("Pulse runtime update preceded initial composition")
+        self._reconcile_editor_fields(editor, update, editor, previous)
+        previous_diagnostic = "" if previous is None else previous.diagnostic
+        if update.diagnostic and update.diagnostic != previous_diagnostic:
+            lowered = update.diagnostic.lower()
+            if "failed" in lowered or "error" in lowered:
+                self._message(update.diagnostic)
+        file_run_key = (
+            update.run_snapshot,
+            update.run_generation,
+            update.run_revision,
+            update.file_busy,
+            update.run_busy,
+            update.connection_state,
+        )
+        previous_file_run_key = None if previous is None else (
+            previous.run_snapshot,
+            previous.run_generation,
+            previous.run_revision,
+            previous.file_busy,
+            previous.run_busy,
+            previous.connection_state,
+        )
+        if file_run_key != previous_file_run_key:
+            self._apply_file_and_run_state(editor, update)
+        self._apply_connection_state(update, previous)
+        progress_key = self._scan_progress_key(update)
+        if progress_key != self._last_scan_progress_key:
+            self._apply_scan_progress(update)
+            self._last_scan_progress_key = progress_key
+        self._last_runtime = update
+        self._sync_runtime_watchers()
+
+    def _finish_close_if_ready(
+        self,
+        runtime: PulseEditorControllerSnapshot | PulseRuntimeUpdate,
+    ) -> None:
+        if not runtime.close_complete or self._window is None:
+            return
+        if self._owner_retiring:
+            self._commit_owner_retirement()
+        else:
+            QtCore.QTimer.singleShot(0, self._window.close)
+
+    @staticmethod
+    def _scan_progress_key(snapshot) -> tuple[object, ...]:
+        return (
             snapshot.scan_progress,
             snapshot.held_scan_point,
             None
@@ -1039,31 +1130,13 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
                 snapshot.applied_snapshot.artifact_digest,
             ),
         )
-        old_scan_key = (
-            None
-            if previous_editor is None or previous_runtime is None
-            else (
-                previous_editor.scan_workspace,
-                previous_runtime.scan_progress,
-                previous_runtime.held_scan_point,
-                None
-                if previous_runtime.applied_snapshot is None
-                else (
-                    previous_runtime.applied_snapshot.run_id,
-                    previous_runtime.applied_snapshot.artifact_digest,
-                ),
-            )
-        )
-        if scan_key != old_scan_key:
-            self._apply_scan_workspace(
-                editor,
-                snapshot,
-                previous_editor,
-            )
-        self._last_snapshot = snapshot
-        self._last_editor_projection = editor
-        self._last_scan_workspace = editor.scan_workspace
-        self._sync_runtime_watchers()
+
+    def _present_scan_progress(self, update: PulseScanProgressUpdate) -> None:
+        key = self._scan_progress_key(update)
+        if key == self._last_scan_progress_key:
+            return
+        self._apply_scan_progress(update)
+        self._last_scan_progress_key = key
 
     def _sync_runtime_watchers(self) -> None:
         """Arm periodic compatibility readers only while they have a consumer."""
@@ -1081,29 +1154,22 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     def _apply_scan_workspace(
         self,
         editor: PulseEditorProjection,
-        runtime: PulseEditorControllerSnapshot,
         previous_editor: PulseEditorProjection | None,
     ) -> None:
         self._apply_scan_workspace_value(
             editor.scan_workspace,
-            runtime,
             None if previous_editor is None else previous_editor.scan_workspace,
         )
 
-    def _apply_scan_workspace_value(
+    def _apply_scan_progress(
         self,
-        workspace,
-        runtime: PulseEditorControllerSnapshot,
-        previous_workspace,
+        runtime: (
+            PulseEditorControllerSnapshot
+            | PulseRuntimeUpdate
+            | PulseScanProgressUpdate
+        ),
     ) -> None:
-        loaded_path = "" if workspace.loaded_path is None else str(workspace.loaded_path)
-        self.schedule_view.set_scan_source(
-            use_loaded=workspace.selected_source == "loaded",
-            path=loaded_path,
-        )
-        busy = workspace.busy_operation is not None
-        self.schedule_view.set_scan_workspace_busy(busy)
-        self.scan_view.set_workspace_busy(busy)
+        """Update only the active scan cursor text, never the Scan draft."""
 
         held_text = format_held_scan_point(runtime.held_scan_point)
         progress_values: tuple[tuple[str, int | float], ...] = ()
@@ -1130,6 +1196,20 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             held_text
             or format_scan_progress(progress, values=progress_values)
         )
+
+    def _apply_scan_workspace_value(
+        self,
+        workspace,
+        previous_workspace,
+    ) -> None:
+        loaded_path = "" if workspace.loaded_path is None else str(workspace.loaded_path)
+        self.schedule_view.set_scan_source(
+            use_loaded=workspace.selected_source == "loaded",
+            path=loaded_path,
+        )
+        busy = workspace.busy_operation is not None
+        self.schedule_view.set_scan_workspace_busy(busy)
+        self.scan_view.set_workspace_busy(busy)
 
         if self.scan_view.scan_slots_label.text() != workspace.slots_text:
             self.scan_view.set_slots_text(workspace.slots_text)
@@ -1164,13 +1244,13 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             lowered = workspace.diagnostic.lower()
             if "error" in lowered or "failed" in lowered:
                 self._message(workspace.diagnostic)
-            elif not runtime.preview_notice:
+            elif not self._last_preview_notice:
                 self.preview_view.set_status(workspace.diagnostic)
 
     def _apply_file_and_run_state(
         self,
         editor: PulseEditorProjection,
-        runtime: PulseEditorControllerSnapshot,
+        runtime: PulseEditorControllerSnapshot | PulseRuntimeUpdate,
     ) -> None:
         self._apply_file_and_run_state_values(
             name=editor.document.name,
@@ -1191,7 +1271,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         dirty: bool,
         document_generation: int,
         editor_revision: int,
-        runtime: PulseEditorControllerSnapshot,
+        runtime: PulseEditorControllerSnapshot | PulseRuntimeUpdate,
     ) -> None:
         local = path.name if path is not None else ""
         name = str(name).strip() or "pulse"
@@ -1242,8 +1322,8 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 
     def _apply_connection_state(
         self,
-        snapshot: PulseEditorControllerSnapshot,
-        previous: PulseEditorControllerSnapshot | None,
+        snapshot: PulseEditorControllerSnapshot | PulseRuntimeUpdate,
+        previous: PulseEditorControllerSnapshot | PulseRuntimeUpdate | None,
     ) -> None:
         connection_key = (
             snapshot.connection_state,
@@ -1405,7 +1485,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 
     @property
     def active_snapshot(self):
-        return None if self._last_snapshot is None else self._last_snapshot.run_snapshot
+        return None if self._last_runtime is None else self._last_runtime.run_snapshot
 
     def request_close(self, *, discard_unsaved: bool = False) -> bool:
         if not self._close_decided:
@@ -1423,14 +1503,14 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         if not self._close_requested:
             self._close_requested = True
             self._controller.request_close()
-        snapshot = self._controller.pump()
-        self._apply_snapshot(snapshot)
-        if snapshot.close_complete and self._window is not None:
+        update = self._controller.runtime_update()
+        self._apply_runtime_update(update)
+        if update.close_complete and self._window is not None:
             # ``request_close`` is also a public notebook/test entry point; a
             # synchronously completed controller close has no later worker wake
             # on which ``_owner_cycle`` could hide the wrapper.
             QtCore.QTimer.singleShot(0, self._window.close)
-        return snapshot.close_complete
+        return update.close_complete
 
     @property
     def permanently_closed(self) -> bool:

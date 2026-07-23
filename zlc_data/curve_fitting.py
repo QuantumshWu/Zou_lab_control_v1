@@ -1,9 +1,8 @@
-"""Headless fitting shared by DataFigure and live FitProcessor.
+"""Headless fitting primitives for the remaining histogram display contract.
 
 This module owns model definitions, selection, seeds/bounds, the solver, and
-fit quality.  Frontends only adapt plot data into
-``SelectedData`` and draw ``FitResult``; processors only adapt signal tensors
-and publish the same result.  There is no Qt/Matplotlib dependency here.
+fit quality.  Frontends adapt plot data into ``SelectedData`` and draw the
+result.  There is no Qt/Matplotlib dependency here.
 """
 
 from __future__ import annotations

@@ -25,10 +25,16 @@ from zlc_workbench.pulse_editor.scan_workspace import (
 
 def _pump_until(controller, predicate, *, timeout: float = 10.0):
     deadline = time.monotonic() + timeout
-    snapshot = controller.pump()
+    snapshot = controller.snapshot()
     while not predicate(snapshot) and time.monotonic() < deadline:
         time.sleep(0.005)
-        snapshot = controller.pump()
+        publication = controller.pump()
+        if publication is not None:
+            snapshot = (
+                publication
+                if hasattr(publication, "document")
+                else controller.snapshot()
+            )
     assert predicate(snapshot), snapshot
     return snapshot
 

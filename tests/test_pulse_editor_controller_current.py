@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.pulse_application import PulseTargetDescriptor
@@ -14,15 +15,24 @@ from zlc_pulse import (
     pulse_target_manifest_from_lanes,
 )
 from zlc_workbench.pulse import PulseEditorSession
-from zlc_workbench.pulse_editor.controller import PulseEditorController
+from zlc_workbench.pulse_editor.controller import (
+    PulseEditorController,
+    PulseRuntimeUpdate,
+)
 
 
 def _pump_until(controller, predicate, *, timeout: float = 10.0):
     deadline = time.monotonic() + timeout
-    snapshot = controller.pump()
+    snapshot = controller.snapshot()
     while not predicate(snapshot) and time.monotonic() < deadline:
         time.sleep(0.005)
-        snapshot = controller.pump()
+        publication = controller.pump()
+        if publication is not None:
+            snapshot = (
+                publication
+                if hasattr(publication, "document")
+                else controller.snapshot()
+            )
     assert predicate(snapshot)
     return snapshot
 
@@ -31,6 +41,85 @@ def _controller() -> PulseEditorController:
     target = load_deployed_pulse_target()
     session = PulseEditorSession.new(target, time_step_ns=20)
     return PulseEditorController(session)
+
+
+def test_owner_wake_without_new_fact_is_silent_and_runtime_poll_stays_narrow():
+    offline = _controller()
+    try:
+        assert offline.pump() is None
+    finally:
+        offline.request_close()
+        _pump_until(offline, lambda value: value.close_complete)
+
+    target = load_deployed_pulse_target()
+    running = RunSnapshot(
+        RunId("narrow-runtime-update"),
+        RunState.RUNNING,
+        "execute",
+        False,
+        None,
+        None,
+        (),
+        None,
+    )
+
+    class Pulse:
+        def observe_active(self):
+            return SimpleNamespace(
+                run=running,
+                applied=None,
+                request=SimpleNamespace(document=None),
+            )
+
+        def cancel_active(self, _reason=""):
+            return None
+
+        def snapshot(self):
+            return None
+
+    controller = PulseEditorController(
+        PulseEditorSession.new(target, time_step_ns=20),
+        pulse=Pulse(),
+        descriptor=PulseTargetDescriptor(
+            DeviceRef("test-installation", "test-runtime", "sequencer"),
+            pulse_target_manifest_from_lanes(target),
+            50_000_000.0,
+            0,
+            1,
+        ),
+        initial_connection_mode="virtual",
+    )
+    controller._run_snapshot = RunSnapshot(
+        running.run_id,
+        RunState.RUNNING,
+        "queued",
+        False,
+        None,
+        None,
+        (),
+        None,
+    )
+    snapshot = controller.snapshot
+    editor_projection = controller.editor_projection
+    scan_workspace_snapshot = controller._scan_workspace_snapshot
+    controller.snapshot = lambda: (_ for _ in ()).throw(
+        AssertionError("runtime polling must not build an application snapshot")
+    )
+    controller.editor_projection = lambda: (_ for _ in ()).throw(
+        AssertionError("runtime polling must not project the editor")
+    )
+    controller._scan_workspace_snapshot = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("runtime polling must not format the Scan workspace")
+    )
+    update = controller.poll_runtime_change()
+    assert isinstance(update, PulseRuntimeUpdate)
+    assert update.run_snapshot is running
+    controller.snapshot = snapshot
+    controller.editor_projection = editor_projection
+    controller._scan_workspace_snapshot = scan_workspace_snapshot
+    controller._pulse = None
+    controller.request_close()
+    controller.pump(force=True)
 
 
 def test_preview_worker_uses_document_identity_and_latest_presentation_revision():

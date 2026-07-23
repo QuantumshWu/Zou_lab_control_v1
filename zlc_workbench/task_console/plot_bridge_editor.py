@@ -63,7 +63,6 @@ from zlc_data.console_records import (
 from zlc_storage.paths import display_path
 
 
-AnalysisControls = _qt_widgets.analysis_controls.AnalysisControls
 PARAM_WIDGETS = _qt_widgets.param_widgets.PARAM_WIDGETS
 ParamWidgetContext = _qt_widgets.param_widgets.ParamWidgetContext
 fill_grouped_signal_combo = _qt_widgets.param_widgets.fill_grouped_signal_combo
@@ -108,8 +107,8 @@ class PanelEditor(QtWidgets.QWidget):
     Setting popup AND do NOT duplicate it (Setting owns source / size / colormap
     / relim / unit):
 
-      * curve fit -- a structured model request gated by the plot family,
-        shared with the live overlay and :class:`DataFigure`;
+      * the panel's exact FINAL-artifact Fit entrance, with all fit authoring
+        delegated to the one shared :class:`DataFigure` host;
       * manual x/y limits + Save Fig;
       * for a panel that came from a measurement, that measurement's
         AUTO-generated parameter form (the same ParamDecl form the launcher
@@ -139,7 +138,6 @@ class PanelEditor(QtWidgets.QWidget):
         self._node = None                       # the node that produces this panel's data
         self._node_widgets = {}                 # acquisition-param name -> editable field
         self._node_now_labels = {}              # acquisition-param name -> "now: X" reference
-        self.fit_combo = None
         self.xmin = self.xmax = self.ymin = self.ymax = None
         self.clo = self.chi = None
 
@@ -290,20 +288,13 @@ class PanelEditor(QtWidgets.QWidget):
         self.canvas_holder.setContentsMargins(0, 0, 0, 0)
         col.addLayout(self.canvas_holder)
 
-        # ---- Analysis: the same control set the Setting popup builds, through the ONE
-        # composite; every action routes through the card's one fit mutator.
-        self.ed_fix_seed = None
-        self._analysis_controls = None
-        if self.card is not None:
-            controls = AnalysisControls(self.card, surface="edit", label_w=label_w)
-            if controls.empty:
-                controls.deleteLater()
-            else:
-                section("Analysis")
-                col.addWidget(controls)
-                self._analysis_controls = controls
-                self.fit_combo = controls.model_combo
-                self.ed_fix_seed = controls.fix_seed
+        # ---- Analysis: another view of the card's one FINAL-artifact command.
+        # Model/axis/constraint authoring and the result overlay live in the
+        # shared DataFigure host; this Edit tab does not create a parallel
+        # parallel fit draft or worker.
+        if self.card is not None and self.card.fit_analysis_sink is not None:
+            section("Analysis")
+            col.addWidget(self.card.make_fit_analysis_button())
 
         # ---- Limits: the view-window pins.  A box holds the STORED pin (empty =
         # autoscale) and is re-seeded only on build / show / Clear, so the refresh tick
@@ -526,73 +517,6 @@ class PanelEditor(QtWidgets.QWidget):
         self._update_save_preview()               # default save name follows the title
         self.rebuild()
 
-    def _selected_rect(self):
-        """The panel's stored selection as ``(xlo, xhi, ylo, yhi)``, else all None.
-
-        A selection is DATA, not a figure state: it is what the operator marked,
-        it survives a re-compose, and it is the same object the ROI and the fit
-        act on.  Reading it here rather than asking a figure for its view box
-        keeps one answer to "what was selected".
-        """
-
-        selection = None if self.card is None else self.card.current_selection()
-        ranges = tuple(getattr(selection, "ranges", ()) or ())
-        if len(ranges) < 2:
-            return (None, None, None, None)
-        try:
-            x1, x2 = (float(ranges[0].start), float(ranges[0].stop))
-            y1, y2 = (float(ranges[1].start), float(ranges[1].stop))
-        except (AttributeError, TypeError, ValueError):
-            return (None, None, None, None)
-        return (min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2))
-
-    def _read_region(self) -> None:
-        """Confocal ``_read_range`` for a 2D panel, GENERIC over the source.
-
-        ZOOM/PAN or an area SELECTION yields the marked rectangle as endpoints
-        (x_min, x_max, y_min, y_max) in the panel's axis coordinates (the area
-        selection overrides the view box when drawn).  Those ENDPOINTS -- the only
-        thing the selector knows -- are handed to the producing source via
-        ``region_to_acquisition_parameters``; the SOURCE converts them to its own
-        Acquisition parameters (a camera node -> a ROI rectangle; a 2-D scan ->
-        axis ranges).  Whatever fields it names are filled in the Edit form, then
-        Apply pushes them.  The frontend encodes NO device-specific shape."""
-        if self._node is None:
-            return
-        convert = getattr(self._node, "region_to_acquisition_parameters", None)
-        if convert is None:
-            return
-        x1, x2, y1, y2 = self._selected_rect()
-        if x1 is None:
-            return
-        params = convert(x1, x2, y1, y2) or {}
-        filled = {}
-        for name, value in params.items():
-            edit = self._node_widgets.get(name)
-            if edit is not None:
-                edit.setText(_py_to_text(value))
-                filled[name] = value
-        if filled:
-            self.status.setText(f"region from view: {filled} — Apply to use it")
-
-    def _read_x_range(self) -> None:
-        """Confocal ``_read_range`` for a 1-D CURVE panel, GENERIC over the source.
-
-        A drag-selected x-interval on a scanning measurement's plot becomes that measurement's NEXT
-        scan x-range.  The selector knows only the endpoints (plot coords); they are staged onto the
-        PRODUCING measurement's OWN Logic-tab Edit form (its first ``axis_range`` param, via
-        ``MeasurementPanel.set_axis_range``), so ANY measurement that declares a scan range gets this by
-        construction and the plot stays a pure view with no measurement internals.  ``Start`` on that
-        form then re-runs the scan over the marked range (confocal's mark-then-rerun)."""
-        if self._node is None:                     # the plotter-dependence lives in _selected_rect (None-safe)
-            return
-        x1, x2, y1, y2 = self._selected_rect()
-        if x1 is None:
-            return
-        form = self.console._form_for_node(self._node)
-        if form is not None and form.set_axis_range(x1, x2):
-            self.status.setText(f"scan range from view: [{x1:g}, {x2:g}] — Start to use it")
-
     def refresh_node_now_labels(self) -> None:
         """Update the 'now: <value>' references beside each Acquisition field to the
         source's CURRENT values.  The console calls this each tick for the visible
@@ -676,33 +600,6 @@ class PanelEditor(QtWidgets.QWidget):
         from PyQt5 import QtCore
         QtCore.QTimer.singleShot(25, lambda: self._await_fresh_frame(node, epoch0, _tries=_tries + 1))
 
-    def do_fit(self) -> None:
-        """Apply a curve fit from the Edit tab through the ONE :class:`AnalysisControls` composite (which
-        funnels into card.set_fit_request), so the live overlay, the hub node, and the Setting popup's
-        Analysis controls all follow the same config.params['fit_request'] state.  No-op when the panel
-        family offers no fit (kept as a public method the tests + Fit button call)."""
-        controls = getattr(self, "_analysis_controls", None)
-        if controls is None:
-            return
-        controls.do_fit()
-        if self.fit_combo is not None and self.fit_combo.currentData():
-            self.status.setText(f"fit {self.fit_combo.currentText()}: applied (see panel)")
-
-    def clear_fit(self) -> None:
-        controls = getattr(self, "_analysis_controls", None)
-        if controls is not None:
-            controls.clear_fit()
-        elif self.card is not None:
-            self.card.set_fit_request(None)
-        self.status.setText("fit cleared")
-
-    def _refresh_edit_analysis(self) -> None:
-        """Re-derive the Edit tab's Analysis controls from the card's stored state -- so the Edit surface
-        always shows the SAME fit the Setting popup set, the two being pure views of the single source (#8)."""
-        controls = getattr(self, "_analysis_controls", None)
-        if controls is not None:
-            controls.derive()
-
     def refresh_on_show(self) -> None:
         """When this panel's Edit tab becomes visible, refresh anything that may have changed
         since it was last shown: re-seed the display knobs from config.params, snap the manual-limit
@@ -718,7 +615,6 @@ class PanelEditor(QtWidgets.QWidget):
             self.console._refresh_panel_editor(card)
             return
         self._refresh_display_params()
-        self._refresh_edit_analysis()   # re-seed the fit model + fix/seed from config.params['fit_request']
         self._seed_limit_boxes()        # re-seed the pin from config.params (may have changed in Setting)
         self.refresh_limit_hints()
         self.refresh_node_now_labels()

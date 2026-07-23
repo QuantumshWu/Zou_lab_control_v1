@@ -67,14 +67,12 @@ from zlc_data.console_records import (
     repeat_mode_for_kind as _repeat_mode_for_kind,
     repeat_modes_for_kind as _repeat_modes_for_kind,
 )
-from zlc_data.curve_fitting import build_fit_request
 from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
 from zlc_data.param_decl import ParamDecl
 from zlc_data.signal_expr import SIGNAL_EXPR_HELP
 
 # qt_widgets submodules are reached as ATTRIBUTES of the one facade binding: their names are
 # deliberately absent from the facade __all__, and the package forbids outside deep imports.
-AnalysisControls = _qt_widgets.analysis_controls.AnalysisControls
 PARAM_WIDGETS = _qt_widgets.param_widgets.PARAM_WIDGETS
 ParamWidgetContext = _qt_widgets.param_widgets.ParamWidgetContext
 coerce_short_labels = _qt_widgets.param_widgets.coerce_short_labels
@@ -274,15 +272,15 @@ class PanelCard(FluentGroupBox):
     update_interval_changed = QtCore.pyqtSignal()  # per-panel refresh rate change (console re-bases the timer)
     remove_requested = QtCore.pyqtSignal(object)
     edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
+    fit_analysis_available_changed = QtCore.pyqtSignal(bool)
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
                  sources_provider=None, formats_provider=None, axes_provider=None,
                  sites_inputs_provider=None, curve_x_provider=None,
                  structure_provider=None, short_names_provider=None,
                  live_namespace_provider=None, pulse_state_provider=None,
-                 grid_recipe_provider=None, render_barrier=None, area_select_sink=None,
-                 selection_clear_sink=None, fit_node_sink=None,
-                 analysis_actions_provider=None):
+                 grid_recipe_provider=None, render_barrier=None,
+                 fit_analysis_sink=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent)
@@ -334,28 +332,10 @@ class PanelCard(FluentGroupBox):
         # is in flight the render thread owns the figure (see frontend/render_loop.py).  None
         # (a standalone/test card) makes it a no-op via _wait_render_idle.
         self.render_barrier = render_barrier
-        # callable(card, (x_min, x_max, y_min, y_max)) -> the console's ROI-chain sink: a
-        # rectangle drawn on this LIVE image panel retargets/creates a RoiProcessor consuming
-        # this panel's signal (the "draw a box -> get roi_frame/roi_value signals" gesture).
-        self.area_select_sink = area_select_sink
-        # callable(card, action) -> the console's ONE selection-teardown sink, symmetric for BOTH
-        # analyses (#10): leaving/clearing an analysis STOPS + removes the hub node it created for this
-        # card's signal -- a FitProcessor for "fit" (clearing the curve fit / picking a non-fit action),
-        # a RoiProcessor for "roi" (switching the ROI action off).  Both have a full create-on-apply /
-        # remove-on-clear lifecycle, so neither lingers as an orphan republishing after the operator
-        # turned its analysis off.
-        self.selection_clear_sink = selection_clear_sink
-        # callable(card, request) -> the console's ONE fit-node sink: create OR retarget the hub
-        # FitProcessor that publishes a 2-D image fit's parameters as signals (fit_x0/... ), for the
-        # non-grid image case.  Its teardown counterpart is ``selection_clear_sink(card, "fit")``.  The
-        # ONE mutator :meth:`set_fit_request` calls this, so the overlay + the hub node stay in lockstep.
-        self.fit_node_sink = fit_node_sink
-        # callable() -> the analysis actions this host can actually carry out, as a subset of
-        # ``zlc_data.vocabulary.ANALYSIS_ACTIONS``.  The panel asks rather than assumes: the
-        # host owns the catalog and therefore knows whether the seam each action needs is
-        # present, and an action absent here is one the Setting popup never offers.  None =
-        # ask nothing and offer nothing beyond plain selection.
-        self.analysis_actions_provider = analysis_actions_provider
+        if fit_analysis_sink is not None and not callable(fit_analysis_sink):
+            raise TypeError("fit_analysis_sink must be callable or None")
+        self.fit_analysis_sink = fit_analysis_sink
+        self._fit_analysis_available = False
         # The card's display surface: an immutable-bytes raster board (contract 4).
         # The panel's stable identity: the board, its composer and every frame
         # they exchange are keyed on it, so a presented frame can only ever land
@@ -379,10 +359,6 @@ class PanelCard(FluentGroupBox):
         # Every plotter (re)build parks its selector layer to this flag (``_apply_selectors_state``),
         # so a fresh figure always inherits the switch instead of coming up live.
         self._selectors_on = False
-        # Last DATA selection made on this panel.  It is plot-independent and
-        # serializable; selecting never implies an ROI or a fit.  The explicit
-        # ``selection_action`` config decides what a later release does.
-        self._active_selection = None
         # When the Setting popup last dismissed itself.  The button re-opens it, and a
         # click that DISMISSED the popup would otherwise arrive here as "open" a moment
         # later -- the popup would flicker shut and straight back open.  Zero means it
@@ -436,6 +412,16 @@ class PanelCard(FluentGroupBox):
         self.setting_button.setToolTip("Panel settings")
         self.setting_button.clicked.connect(self._open_settings)
 
+        self.fit_analysis_button = None
+        if self.fit_analysis_sink is not None:
+            self.fit_analysis_button = self.make_fit_analysis_button(
+                parent=self,
+                text="Analyze",
+            )
+            self.fit_analysis_button.setFixedSize(
+                scaled_px(78, minimum=66), scaled_px(26, minimum=22)
+            )
+
         self._apply_fixed_size()
         self.set_status("waiting for data…", error=False)
 
@@ -452,6 +438,60 @@ class PanelCard(FluentGroupBox):
                 self.width() - self.setting_button.width() - scaled_px(8),
                 scaled_px(4))
             self.setting_button.raise_()
+        fit_button = getattr(self, "fit_analysis_button", None)
+        if fit_button is not None:
+            fit_button.move(
+                self.setting_button.x()
+                - fit_button.width()
+                - scaled_px(5, minimum=3),
+                scaled_px(4),
+            )
+            fit_button.raise_()
+
+    def make_fit_analysis_button(
+        self,
+        *,
+        parent=None,
+        text: str = "Analyze → Fit",
+    ) -> FluentButton:
+        """Build another view of this card's one FINAL-fit command.
+
+        Title bar, Setting and Edit use this same builder.  The button owns no
+        source reference, FitSpec, solver or result; it asks the composition
+        root again at click time, so a rerun cannot leave an old artifact
+        armed in a widget.
+        """
+
+        button = FluentButton(text, parent, color=ORANGE)
+        button.setToolTip(
+            "Open the shared Fit editor for this panel's current FINAL scan artifact"
+        )
+        button.setEnabled(self._fit_analysis_available)
+        button.clicked.connect(self._open_fit_analysis)
+        self.fit_analysis_available_changed.connect(button.setEnabled)
+        return button
+
+    def set_fit_analysis_available(self, available: bool) -> None:
+        """Project whether this card currently resolves one exact FINAL source."""
+
+        available = bool(available and self.fit_analysis_sink is not None)
+        if available == self._fit_analysis_available:
+            return
+        self._fit_analysis_available = available
+        self.fit_analysis_available_changed.emit(available)
+
+    def _open_fit_analysis(self) -> None:
+        sink = self.fit_analysis_sink
+        if sink is None or not self._fit_analysis_available:
+            self.set_status(
+                "Fit requires this panel's current FINAL scan artifact",
+                error=True,
+            )
+            return
+        try:
+            sink(self)
+        except Exception as error:
+            self.set_status(f"Fit failed to open: {error}", error=True)
 
     # ------------------------------------------------------------- settings UI
 
@@ -977,7 +1017,6 @@ class PanelCard(FluentGroupBox):
         self._sync_settings_param_rows()   # a grid's resolved kind may have changed since the last bake
         popup = self.settings_popup        # (the sync may have swapped in a fresh popup)
         self.refresh_on_show()          # Setting controls are a VIEW of config.params -- refresh on open (#6)
-        self._refresh_analysis_controls()   # the Analysis section derives on every open too (#6 result-row fix)
         self._refresh_signal_combo()
         self._refresh_sub_kind_combo()
         anchor = self.setting_button.mapToGlobal(
@@ -1500,173 +1539,25 @@ class PanelCard(FluentGroupBox):
         finally:
             self.setUpdatesEnabled(True)
 
-    def current_selection(self):
-        """This panel's stored data selection -- plot-independent and serializable.
-
-        A selection is DATA, not a figure state: it survives a re-compose, a
-        source re-pick and a saved layout, and it is what an ROI or a fit is
-        later asked to act on.  Selecting never implies either.
-        """
-
-        from zlc_data.plot_region import Selection
-
-        selection = self._active_selection
-        if selection is None:
-            payload = self.config.params.get("selection")
-            if isinstance(payload, Mapping):
-                selection = Selection.from_dict(payload)
-        if selection is None:
-            selection = Selection()
-        metadata = dict(selection.metadata)
-        roi = getattr(self, "_roi_built", None)
-        if roi and len(roi) >= 4:
-            metadata["origin"] = [float(roi[0]), float(roi[2])]
-        return Selection(selection.ranges, frame=selection.frame,
-                         scope=selection.scope, metadata=metadata)
-
-    def _selection_coordinates_for_binding(self) -> dict:
-        """Per-axis coordinates an ROI binding needs, from the composed front.
-
-        The front's typed payload carries the viewport that maps a pointer
-        rectangle back onto the declared axes; reading them from the SAME front
-        the operator dragged on is what keeps a box drawn on screen and the
-        block it crops in the same coordinate system.  Empty until this card's
-        surface exposes a selector (a 2-D / histogram ROI needs no extra
-        coordinate: pixel index and sample value carry themselves).
-        """
-
-        return {}
-
     def _build_analysis_section(self, section_box, label_w) -> None:
-        """Build the Setting popup's "Analysis" section through the ONE :class:`AnalysisControls` builder
-        (shared VERBATIM with the Edit tab, ``surface='setting'``).  The composite owns the action / model
-        / fix-seed / result widgets + their handlers; this only embeds it and aliases the test-keyed
-        attribute names so nothing that keys off ``analysis_combo`` / ``fit_model_combo`` / ``fit_fix_seed``
-        / ``fit_result_label`` has to change."""
-        controls = AnalysisControls(self, surface="setting", label_w=label_w)
-        # Kind offers neither a fit nor an ROI -> no Analysis section at all (empty controls discarded).
-        if controls.empty:
-            controls.deleteLater()
-            self._analysis_controls = None
-            self.analysis_combo = self.fit_model_combo = self.fit_fix_seed = self.fit_result_label = None
+        """Expose the card's one exact-source Fit entrance in Setting.
+
+        Fit authoring itself lives in the shared DataFigure host.  Repeating its
+        model/constraint widgets here would create a second draft and a second
+        solver lifecycle, while the old Hub Analysis controls cannot represent
+        the current named-axis FitSpec at all.
+        """
+
+        if self.fit_analysis_sink is None:
             return
-        section_box("Analysis").addWidget(controls)
-        self._analysis_controls = controls
-        # The test-keyed aliases (single builder, unchanged public names): the card exposes the SAME
-        # attributes as before, now backed by the shared composite.
-        self.analysis_combo = controls.action_combo
-        self.fit_model_combo = controls.model_combo
-        self.fit_fix_seed = controls.fix_seed
-        self.fit_result_label = controls.result_label
-
-
-    def _default_fit_model(self) -> str:
-        """The model a fit starts from when no surface has chosen one yet.
-
-        Taken from the catalog rather than a literal here: the definitions know
-        which models exist and what each one renders as, so a panel that gains a
-        new admissible model does not need a second list updating to offer it.
-        """
-
-        from zlc_data import fit_model_catalog
-
-        catalog = fit_model_catalog()
-        if not catalog:
-            raise RuntimeError("no fit model is defined")
-        return str(catalog[0].model_id)
-
-    def _build_fit_request_from_widgets(self, model_combo, fix_seed, selection):
-        """Build a fresh fit request from a surface's OWN model combo + fix/seed editor + the selection
-        (through the ONE :func:`build_fit_request`).  Used when a curve fit is first turned on from the
-        Setting popup or the Edit tab -- each surface passes ITS widgets, so neither reads the other."""
-        model = (str(model_combo.currentData()) if (model_combo is not None and model_combo.currentData())
-                 else self._default_fit_model())
-        fixed, initial = fix_seed.values() if fix_seed is not None else ({}, None)
-        return build_fit_request(model, selection, fixed=fixed, initial=initial,
-                                 coordinate_frame=selection.frame)
-
-    def _retarget_fit_request(self, selection):
-        """Rebuild the ACTIVE fit's request onto a NEW selection, preserving its model + fixed/initial
-        (the stored request is the single source) -- the drag-to-retarget path."""
-        from zlc_data.curve_fitting import FitRequest
-        saved = self.config.params.get("fit_request")
-        req = FitRequest.from_dict(saved) if isinstance(saved, Mapping) else None
-        model = req.model if req is not None else self._default_fit_model()
-        fixed = dict(req.fixed) if req is not None else {}
-        initial = req.initial if req is not None else None
-        return build_fit_request(model, selection, fixed=fixed, initial=initial,
-                                 coordinate_frame=selection.frame)
-
-    def set_fit_request(self, request) -> None:
-        """The ONE mutator for this panel's fit: store it, then tell the console.
-
-        A fit is a PROCESSOR's job -- it consumes the same signal and publishes
-        its parameters -- so this stores what was asked for and hands it to the
-        console's fit-node sink.  Clearing removes the node the fit created,
-        rather than leaving it republishing after the operator turned it off.
-        """
-
-        payload = request.to_dict() if request is not None else None
-        self._set_param("fit_request", payload)
-        self._refresh_analysis_controls()
-        if request is None:
-            if callable(self.selection_clear_sink):
-                self.selection_clear_sink(self, "fit")
-        elif callable(self.fit_node_sink):
-            self.fit_node_sink(self, request)
-
-    def _select_analysis_action(self, action, *, model_combo=None, fix_seed=None) -> None:
-        """Apply a chosen post-drag action from EITHER surface: ``fit`` turns the curve fit ON (build +
-        apply a request from the given model/fix-seed + the current selection), ``roi`` arms the crop,
-        ``none`` clears both.  fit-vs-roi are the TWO independent analyses -- picking one clears the
-        other so a single drag has one meaning; leaving ROI stops its node (#10)."""
-        action = str(action or "none")
-        if action == "fit":
-            self.config.params["selection_action"] = "none"     # roi off; the fit lives in fit_request
-            self.set_fit_request(
-                self._build_fit_request_from_widgets(model_combo, fix_seed, self.current_selection()))
-            return
-        if self.config.params.get("fit_request"):
-            self.set_fit_request(None)                          # leaving a fit removes overlay + node
-        old = str(self.config.params.get("selection_action") or "none")
-        self.config.params["selection_action"] = action
-        if old == "roi" and action != old and callable(self.selection_clear_sink):
-            self.selection_clear_sink(self, old)
-        self._refresh_analysis_controls()
-        self.changed.emit()
-
-    def _refresh_analysis_controls(self) -> None:
-        """Re-derive THIS card's Setting Analysis controls from state (fit_request presence +
-        selection_action) -- called from :meth:`set_fit_request`, the section build, and Setting open.
-        The Edit tab derives its OWN copy the same way, so both are pure views of the one source (#8)."""
-        controls = getattr(self, "_analysis_controls", None)
-        if controls is not None:
-            controls.derive()
-        if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
-            self._size_settings_popup()
-
-    def _fit_result_text(self, result=None) -> str:
-        """The one-line fit-result string, shared VERBATIM by Setting and Edit.
-
-        ``result`` comes from the fit processor's published output; there is no
-        figure to interrogate for one, because the panel displays a fit rather
-        than owning it.
-        """
-
-        if result is None:
-            return "not fitted"
-        if result.valid:
-            quality = result.quality
-            return (f"ok · {result.n_points} points · R²={quality.get('r2', float('nan')):.4g} · "
-                    f"RMSE={quality.get('rmse', float('nan')):.4g}")
-        return f"invalid · {result.status}"
-
-    def _set_fit_result_text(self, result=None) -> None:
-        """Push the fit-result string to this card's Setting Analysis result line (change-gated).  The
-        Edit tab's copy is refreshed alongside by the console's overlay push (both surfaces, one source)."""
-        controls = getattr(self, "_analysis_controls", None)
-        if controls is not None:
-            controls.set_result(self._fit_result_text(result))
+        layout = section_box("Analysis")
+        layout.addWidget(self.make_fit_analysis_button())
+        note = FluentLabel("Available only for this panel's current FINAL scan artifact")
+        note.setWordWrap(True)
+        note.setStyleSheet(
+            f"color: {GREY}; background: transparent; border: none;"
+        )
+        layout.addWidget(note)
 
     def _set_param(self, key: str, value) -> None:
         """The ONE writer for a display knob: store it, then re-compose.
@@ -1963,20 +1854,8 @@ class PanelCard(FluentGroupBox):
         focus swap re-applies it through ``_apply_selectors_state``, so a fresh figure always
         inherits the switch."""
         self._wait_render_idle()
-        was_on = self._selectors_on
         self._selectors_on = bool(on)
         self._apply_selectors_state()
-        # Turning the Selectors switch OFF tears down this panel's analysis whole (#1): the operator
-        # has stopped driving it, so its Analysis node must not keep republishing.  An armed FIT
-        # clears through the ONE fit mutator (:meth:`set_fit_request(None)`) so the persisted
-        # ``fit_request`` state dies WITH the node -- never a zombie "fit on but computing nothing"
-        # config the next save would replay (BUG-F).  Anything else (an armed ROI) goes straight
-        # through the teardown seam; both funnel into ``_remove_panel_analysis`` (idempotent).
-        if was_on and not on:
-            if self.config.params.get("fit_request"):
-                self.set_fit_request(None)
-            elif callable(self.selection_clear_sink):
-                self.selection_clear_sink(self, "selectors")
 
     def _apply_selectors_state(self) -> None:
         """Carry the board header's Selectors switch onto this card's surface.

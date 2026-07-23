@@ -73,7 +73,7 @@ def test_operator_observes_holds_steps_and_stops_virtual_scan(tmp_path) -> None:
             lambda: body.scan_view.scan_progress_label.text().startswith(
                 "Scan: point "
             )
-            and "duration = " in body.scan_view.scan_progress_label.text(),
+            and "duration_p1 = " in body.scan_view.scan_progress_label.text(),
         )
 
         QtTest.QTest.mouseClick(

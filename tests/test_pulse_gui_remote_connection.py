@@ -366,9 +366,9 @@ def _run_c47_input_projection_gui(workspace: Path) -> None:
             idle_calls["poll"] += 1
             return normal_poll()
 
-        def count_pump():
+        def count_pump(*args, **kwargs):
             idle_calls["pump"] += 1
-            return normal_pump()
+            return normal_pump(*args, **kwargs)
 
         def count_apply(snapshot):
             idle_calls["apply"] += 1
@@ -402,9 +402,9 @@ def _run_c47_input_projection_gui(workspace: Path) -> None:
         def reject_update_scan_source(*_args, **_kwargs):
             input_calls["update"] += 1
 
-        def count_input_pump():
+        def count_input_pump(*args, **kwargs):
             input_calls["pump"] += 1
-            return normal_pump()
+            return normal_pump(*args, **kwargs)
 
         def count_input_snapshot():
             input_calls["snapshot"] += 1

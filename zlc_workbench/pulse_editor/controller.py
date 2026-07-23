@@ -312,6 +312,44 @@ class PulseEditorControllerSnapshot:
 
 
 @dataclass(frozen=True)
+class PulseScanProgressUpdate:
+    """One changed scan cursor front, independent of the Scan editor draft."""
+
+    scan_progress: PulseScanProgress | None
+    applied_snapshot: AppliedPulseSnapshot | None
+    held_scan_point: tuple[
+        int,
+        int,
+        tuple[tuple[str, int | float], ...],
+    ] | None
+
+
+@dataclass(frozen=True)
+class PulseRuntimeUpdate:
+    """Changed Run/connection facts without an editor or Scan projection."""
+
+    connection_state: str
+    connection_mode: str
+    connection_endpoint: str
+    target_descriptor: PulseTargetDescriptor | None
+    run_snapshot: RunSnapshot | None
+    run_generation: int | None
+    run_revision: int | None
+    applied_snapshot: AppliedPulseSnapshot | None
+    scan_progress: PulseScanProgress | None
+    held_scan_point: tuple[
+        int,
+        int,
+        tuple[tuple[str, int | float], ...],
+    ] | None
+    diagnostic: str
+    file_busy: bool
+    run_busy: bool
+    close_requested: bool
+    close_complete: bool
+
+
+@dataclass(frozen=True)
 class PulseEditorProjection:
     """Only the editor revision and facts derived from that revision.
 
@@ -468,6 +506,8 @@ class PulseEditorController:
         self._handle: RunHandle | None = None
         self._run_snapshot: RunSnapshot | None = None
         self._applied_snapshot: AppliedPulseSnapshot | None = None
+        self._applied_authoring_cache_source: AppliedPulseSnapshot | None = None
+        self._applied_authoring_cache_fingerprint: str | None = None
         self._run_generation: int | None = None
         self._run_revision: int | None = None
         self._owner_reaped = True
@@ -543,6 +583,122 @@ class PulseEditorController:
             target_manifest=target_manifest,
             display_visible_ports=display_visible_ports,
             scan_workspace=self._scan_workspace_snapshot(document),
+        )
+
+    def _presentation_state_key(
+        self,
+        *,
+        include_scan_progress: bool = True,
+    ) -> tuple[object, ...]:
+        """Return cheap owner facts without constructing any GUI projection.
+
+        Worker completion is a reason to wake the owner, not proof that a
+        visible fact changed.  This key deliberately uses immutable values and
+        stable object identities; it never formats the scan workspace, rebuilds
+        an effective PulseDocument, or snapshots a RunHandle.
+        """
+
+        editor = self._editor
+        return (
+            self._editor_generation,
+            editor.revision,
+            id(editor.document),
+            editor.path,
+            editor.file_state,
+            editor.dirty,
+            self._connection_state,
+            self._connection_mode,
+            self._connection_endpoint,
+            self._active_manifest_mode,
+            id(self._descriptor),
+            tuple(sorted(self._display_ports_by_mode.items())),
+            self._run_snapshot,
+            self._applied_snapshot,
+            self._run_generation,
+            self._run_revision,
+            self._run_starting,
+            self._pending_start is not None,
+            id(self._handle),
+            self._owner_reaped,
+            self._reap_inflight,
+            self._preview_revision,
+            self._preview_generation,
+            id(self._preview),
+            id(self._rendered_preview),
+            self._preview_error,
+            self._preview_notice,
+            self._preview_export_inflight,
+            self._scan_source_revision,
+            self._scan_source_baseline,
+            self._scan_selected,
+            id(self._scan_generated),
+            id(self._scan_loaded),
+            self._scan_busy_operation,
+            self._scan_diagnostic,
+            self._scan_progress if include_scan_progress else None,
+            id(self._held_scan_source),
+            self._held_scan_index,
+            self._save_inflight,
+            self._load_inflight,
+            self._connect_inflight,
+            self._owned_close_inflight,
+            self._diagnostic,
+            self._close_requested,
+            self._close_complete,
+        )
+
+    def _full_projection_state_key(self) -> tuple[object, ...]:
+        """Facts that actually require rebuilding a full GUI projection."""
+
+        editor = self._editor
+        return (
+            self._editor_generation,
+            editor.revision,
+            id(editor.document),
+            editor.path,
+            editor.file_state,
+            editor.dirty,
+            self._active_manifest_mode,
+            id(self._descriptor),
+            tuple(sorted(self._display_ports_by_mode.items())),
+            self._preview_revision,
+            self._preview_generation,
+            id(self._preview),
+            id(self._rendered_preview),
+            self._preview_error,
+            self._preview_notice,
+            self._scan_source_revision,
+            self._scan_source_baseline,
+            self._scan_selected,
+            id(self._scan_generated),
+            id(self._scan_loaded),
+            self._scan_busy_operation,
+            self._scan_diagnostic,
+        )
+
+    def runtime_update(self) -> PulseRuntimeUpdate:
+        """Project current narrow runtime facts without polling or editor work."""
+
+        return PulseRuntimeUpdate(
+            connection_state=self._connection_state,
+            connection_mode=self._connection_mode,
+            connection_endpoint=self._connection_endpoint,
+            target_descriptor=self._descriptor,
+            run_snapshot=self._run_snapshot,
+            run_generation=self._run_generation,
+            run_revision=self._run_revision,
+            applied_snapshot=self._applied_snapshot,
+            scan_progress=self._scan_progress,
+            held_scan_point=self._held_scan_snapshot(),
+            diagnostic=self._diagnostic,
+            file_busy=(
+                self._save_inflight
+                or self._load_inflight
+                or self._preview_export_inflight
+            ),
+            run_busy=self._run_busy(),
+            close_requested=self._close_requested,
+            close_complete=self._close_complete,
         )
 
     def snapshot(self) -> PulseEditorControllerSnapshot:
@@ -1671,9 +1827,27 @@ class PulseEditorController:
         self._descriptor = None
         self._run_snapshot = None
         self._applied_snapshot = None
+        self._applied_authoring_cache_source = None
+        self._applied_authoring_cache_fingerprint = None
         self._run_generation = None
         self._run_revision = None
         self._scan_progress = None
+
+    def _applied_authoring_fingerprint(
+        self,
+        snapshot: AppliedPulseSnapshot,
+    ) -> str:
+        """Resolve execution-time API values once for one applied identity."""
+
+        if snapshot is not self._applied_authoring_cache_source:
+            self._applied_authoring_cache_source = snapshot
+            self._applied_authoring_cache_fingerprint = (
+                _applied_authoring_document(snapshot).fingerprint
+            )
+        fingerprint = self._applied_authoring_cache_fingerprint
+        if fingerprint is None:
+            raise RuntimeError("applied Pulse authoring fingerprint was not cached")
+        return fingerprint
 
     def start(
         self,
@@ -1803,6 +1977,8 @@ class PulseEditorController:
         self._handle = None
         self._run_snapshot = None
         self._applied_snapshot = None
+        self._applied_authoring_cache_source = None
+        self._applied_authoring_cache_fingerprint = None
         self._run_generation = editor_generation
         self._run_revision = revision
 
@@ -1822,20 +1998,20 @@ class PulseEditorController:
         """Schedule one read-only observation; never perform transport I/O on Qt."""
 
         pulse = self._pulse
+        run = self._run_snapshot
         if (
             pulse is None
             or self._scan_progress_inflight
             or self._close_requested
         ):
             return
-        active = pulse.observe_active()
-        if active is None or active.run.state.terminal:
+        if run is None or run.state.terminal:
             self._scan_progress = None
             return
         self._scan_progress_inflight = True
         self._submit(
             "scan-progress",
-            active.run.run_id.value,
+            run.run_id.value,
             pulse.observe_scan_progress,
         )
 
@@ -1927,7 +2103,8 @@ class PulseEditorController:
         if pulse is not None:
             pulse.cancel_active(str(reason))
         handle = self._handle
-        if handle is not None and not handle.snapshot().state.terminal:
+        run = self._run_snapshot
+        if handle is not None and (run is None or not run.state.terminal):
             handle.cancel(str(reason))
 
     def sync_applied(self) -> int:
@@ -1969,16 +2146,55 @@ class PulseEditorController:
         self._borrowed_authority_retire.set()
         self._notify()
 
-    def pump(self) -> PulseEditorControllerSnapshot:
-        """Consume a real owner event and publish its resulting state once."""
+    def pump(
+        self,
+        *,
+        force: bool = False,
+    ) -> (
+        PulseEditorControllerSnapshot
+        | PulseRuntimeUpdate
+        | PulseScanProgressUpdate
+        | None
+    ):
+        """Consume one owner wake and publish only an actual visible change.
 
+        ``force`` is reserved for a synchronous semantic command whose state
+        changed before this owner turn began.  Worker wakes are change-gated,
+        so stale completions, equal progress observations, and a coalesced
+        replay cannot manufacture an application snapshot.
+        """
+
+        before = None if force else self._presentation_state_key()
+        before_without_progress = (
+            None
+            if force
+            else self._presentation_state_key(include_scan_progress=False)
+        )
+        before_full_projection = (
+            None if force else self._full_projection_state_key()
+        )
         self._apply_borrowed_authority_retirement()
         self._drain_results()
         self._poll_run()
         self._advance_close()
+        if before is not None:
+            after = self._presentation_state_key()
+            if after == before:
+                return None
+            if (
+                before_without_progress
+                == self._presentation_state_key(include_scan_progress=False)
+            ):
+                return PulseScanProgressUpdate(
+                    scan_progress=self._scan_progress,
+                    applied_snapshot=self._applied_snapshot,
+                    held_scan_point=self._held_scan_snapshot(),
+                )
+            if before_full_projection == self._full_projection_state_key():
+                return self.runtime_update()
         return self.snapshot()
 
-    def poll_runtime_change(self) -> PulseEditorControllerSnapshot | None:
+    def poll_runtime_change(self) -> PulseRuntimeUpdate | None:
         """Poll an active Run without manufacturing unchanged GUI snapshots.
 
         This is the narrow compatibility seam for ``RunHandle``, whose current
@@ -1999,7 +2215,7 @@ class PulseEditorController:
         self._advance_close()
         if self._runtime_presentation_key() == before:
             return None
-        return self.snapshot()
+        return self.runtime_update()
 
     def _runtime_poll_required(self) -> bool:
         snapshot = self._run_snapshot
@@ -2038,6 +2254,10 @@ class PulseEditorController:
 
     def _runtime_presentation_key(self) -> tuple[object, ...]:
         return (
+            self._connection_state,
+            self._connection_mode,
+            self._connection_endpoint,
+            id(self._descriptor),
             self._run_snapshot,
             self._applied_snapshot,
             self._run_generation,
@@ -2051,7 +2271,9 @@ class PulseEditorController:
             self._pending_start is not None,
             self._owner_reaped,
             self._reap_inflight,
-            self._connection_state,
+            self._save_inflight,
+            self._load_inflight,
+            self._preview_export_inflight,
             self._diagnostic,
             self._close_requested,
             self._close_complete,
@@ -2075,6 +2297,8 @@ class PulseEditorController:
         if self._handle is None:
             self._run_snapshot = None
             self._applied_snapshot = None
+            self._applied_authoring_cache_source = None
+            self._applied_authoring_cache_fingerprint = None
             self._run_generation = None
             self._run_revision = None
         self._connection_state = "closing"
@@ -2109,9 +2333,10 @@ class PulseEditorController:
                         raise TypeError("scan progress reader returned another type")
                 except BaseException:
                     progress = None
-                pulse = self._pulse
-                active = None if pulse is None else pulse.observe_active()
-                if active is not None and active.run.run_id.value == token:
+                run = self._run_snapshot
+                if run is not None and run.run_id.value == token:
+                    if progress == self._scan_progress:
+                        continue
                     self._scan_progress = progress
                 continue
             if kind == "scan-generate":
@@ -2686,10 +2911,10 @@ class PulseEditorController:
             return True
         if self._run_snapshot is not None and not self._run_snapshot.state.terminal:
             return True
-        handle = self._handle
-        return handle is not None and (
-            not handle.snapshot().state.terminal or not self._owner_reaped
-        )
+        # ``_poll_run`` owns the sole RunSnapshot read for an observation turn.
+        # A retained local handle remains busy until its owner has been reaped,
+        # including the terminal-but-not-yet-joined interval.
+        return self._handle is not None and not self._owner_reaped
 
     def _require_authoring_available(self) -> None:
         self._require_not_closing()
@@ -2705,6 +2930,16 @@ class PulseEditorController:
     def _poll_run(self) -> None:
         pulse = self._pulse
         observation = None if pulse is None else pulse.observe_active()
+        handle = self._handle
+        local_run = (
+            observation.run
+            if (
+                observation is not None
+                and handle is not None
+                and observation.run.run_id == handle.run_id
+            )
+            else None
+        )
         if observation is not None:
             if (
                 self._scan_progress is not None
@@ -2714,11 +2949,15 @@ class PulseEditorController:
             self._run_snapshot = observation.run
             self._applied_snapshot = observation.applied
             if observation.applied is None:
+                self._applied_authoring_cache_source = None
+                self._applied_authoring_cache_fingerprint = None
                 self._run_generation = None
                 self._run_revision = None
             else:
-                applied_document = _applied_authoring_document(observation.applied)
-                if applied_document.fingerprint == self._editor.document.fingerprint:
+                if (
+                    self._applied_authoring_fingerprint(observation.applied)
+                    == self._editor.document.fingerprint
+                ):
                     self._run_generation = self._editor_generation
                     self._run_revision = self._editor.revision
                 else:
@@ -2747,12 +2986,18 @@ class PulseEditorController:
                     self._held_scan_index = None
         else:
             self._scan_progress = None
-        handle = self._handle
         if handle is not None and observation is None:
-            self._run_snapshot = handle.snapshot()
+            local_run = handle.snapshot()
+            self._run_snapshot = local_run
+        elif handle is not None and local_run is None:
+            # Another application owner may have replaced the active Run.  The
+            # GUI still has to reap its own handle, so this is the only case
+            # where two distinct handles are observed in one turn.
+            local_run = handle.snapshot()
         if (
             handle is not None
-            and handle.snapshot().state.terminal
+            and local_run is not None
+            and local_run.state.terminal
             and not self._owner_reaped
             and not self._reap_inflight
         ):
@@ -2786,7 +3031,9 @@ class PulseEditorController:
             return
         handle = self._handle
         if handle is not None:
-            snapshot = handle.snapshot()
+            snapshot = self._run_snapshot
+            if snapshot is None:
+                return
             if not snapshot.state.terminal:
                 return
             if not self._owner_reaped:
@@ -2822,6 +3069,8 @@ __all__ = [
     "PulseEditorControllerSnapshot",
     "PulseEditorLocalDelta",
     "PulseEditorProjection",
+    "PulseRuntimeUpdate",
+    "PulseScanProgressUpdate",
     "PulseRunFacade",
     "RenderedPulsePreview",
     "parse_remote_endpoint",

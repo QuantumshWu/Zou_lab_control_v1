@@ -331,7 +331,6 @@ from . import param_widgets  # noqa: E402,F401
 # qt_widgets is where the placement axiom puts them; bound as an attribute for the same reason
 # as the two above -- the package's own guard forbids outside consumers from deep-importing a
 # submodule path.
-from . import analysis_controls  # noqa: E402,F401
 
 # The two editor widgets salvaged from the console shell.  Imported AFTER ``param_widgets``:
 # they reach it via ``from . import param_widgets``, which needs the registry importable, and

@@ -104,8 +104,8 @@ def confidence_weighted_fidelity(threshold, mu0, sigma0, weight0, mu1, sigma1, w
 
 def gaussian2d_center(coord, amplitude, offset, size, x0, y0):
     """The 2-D radial-Gaussian CENTER model ``A e^{-((x-x0)^2+(y-y0)^2)/R^2} + B`` -- the ONE
-    definition shared by the display-side fit (DataFigure.center, popt names A/B/R/x0/y0) and
-    the hub-side FitProcessor, so a fitted centre means the same thing wherever it appears.
+    numerical definition shared by every current radial-image fit path, so a
+    fitted centre means the same thing wherever it appears.
     ``coord`` is ``(x, y)`` -- arrays of matching shape."""
     x, y = np.asarray(coord[0]), np.asarray(coord[1])
     return amplitude * np.exp(-((x - x0) ** 2 + (y - y0) ** 2) / size ** 2) + offset

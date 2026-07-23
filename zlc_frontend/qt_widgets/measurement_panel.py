@@ -206,10 +206,9 @@ class MeasurementPanel(QtWidgets.QWidget):
             return
         # the spec's declared params PLUS the auto-injected acquisition knob (repeat, 0 = ∞) --
         # ONE list so both the label-width and the widget loop see the same declarations.
-        # ``display=False`` marks a NON-FORM payload (a structured value another surface injects --
-        # e.g. the Analysis spec's fit_request the panel's Analysis section round-trips): it is not
-        # renderable as a usable control, so the manual form skips it (its saved value still rides
-        # ``row.node.values`` untouched -- the _start_logic_node merge preserves non-form keys).
+        # ``display=False`` marks a structured payload supplied by another
+        # composition surface.  It is not renderable as a scalar form control,
+        # so the manual form skips it while its value remains part of the row.
         decls = [d for d in list(spec.params) + list(self._acquisition_params)
                  if getattr(d, "display", True)]
         # ONE label-column width for this form: fit the widest SCALAR-row label (composites carry

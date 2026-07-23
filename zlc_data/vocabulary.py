@@ -24,8 +24,6 @@ one it is not vocabulary and it does not belong here.
 from __future__ import annotations
 
 __all__ = [
-    "ANALYSIS_ACTIONS",
-    "ANALYSIS_SPEC_NAME",
     "DEFAULT_MID_RUN_KEY",
     "NO_LINEAGE",
     "PULSE_SWEEP_KINDS",
@@ -46,14 +44,6 @@ NO_LINEAGE = -1
 SWEEP_SCAN_SLOT = "scan_slot"
 SWEEP_API_SLOT = "api_slot"
 PULSE_SWEEP_KINDS: tuple[str, str] = (SWEEP_SCAN_SLOT, SWEEP_API_SLOT)
-
-#: The catalog/spec display name -- the ONE string the console resolves the
-#: analysis spec by.
-ANALYSIS_SPEC_NAME = "Analysis"
-
-#: The action vocabulary -- single source for the node's dispatch, the ParamDecl
-#: choices AND the panel Setting's Analysis combo.
-ANALYSIS_ACTIONS = ("roi", "fit")
 
 #: The default mid-run buffer key a task streams (``TaskSpec.mid_run_key``'s
 #: default) -- the ONE spelling of ``"frame"``.  A consumer that must fall back
