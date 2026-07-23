@@ -1785,16 +1785,27 @@ class TaskConsole(QtWidgets.QWidget):
             else:
                 composer = owned[1]
             try:
-                frame = composer.compose(
-                    request.value.snapshot,
-                    display=request.display,
-                    provenance=request.provenance,
-                )
-                document = composer.document_for(
-                    request.value.snapshot.block.schema
-                )
+                if request.faceted:
+                    faceted_result = composer.compose_faceted(
+                        request.value.snapshot,
+                        display=request.display,
+                        provenance=request.provenance,
+                        focus=request.focus,
+                    )
+                    frame = None
+                    document = faceted_result.figure.document
+                else:
+                    frame = composer.compose(
+                        request.value.snapshot,
+                        display=request.display,
+                        provenance=request.provenance,
+                    )
+                    faceted_result = None
+                    document = composer.document_for(
+                        request.value.snapshot.block.schema
+                    )
             except PanelRenderError as error:
-                results.append((request, None, None, str(error)))
+                results.append((request, None, None, None, str(error)))
             except BaseException as error:
                 # Never retain the raw exception/traceback: it may own the
                 # entire frozen dataset and Agg graph.
@@ -1803,11 +1814,14 @@ class TaskConsole(QtWidgets.QWidget):
                         request,
                         None,
                         None,
+                        None,
                         f"{type(error).__name__}: {error}",
                     )
                 )
             else:
-                results.append((request, frame, document, None))
+                results.append(
+                    (request, frame, faceted_result, document, None)
+                )
         return tuple(results)
 
     def _render_batch_finished(self, future: Future) -> None:
@@ -1840,11 +1854,12 @@ class TaskConsole(QtWidgets.QWidget):
             )
         else:
             by_id = {card.panel_id: card for card in self.cards}
-            for request, frame, document, error in completion:
+            for request, frame, faceted_result, document, error in completion:
                 card = by_id.get(request.panel_id)
                 if card is None or not card.accept_render_result(
                     request,
                     frame=frame,
+                    faceted_result=faceted_result,
                     document=document,
                     error=error,
                 ):

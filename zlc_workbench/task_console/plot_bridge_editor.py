@@ -114,6 +114,7 @@ class PanelEditor(QtWidgets.QWidget):
         self._board = None
         self._displayed_figure = None
         self._displayed_display = None
+        self._displayed_png: bytes | None = None
         self._follow_next_front = False
         card.front_presented.connect(self._on_card_front_presented)
         # A plot panel's Edit never carries a measurement form or Start/Stop: a plot is a
@@ -243,6 +244,24 @@ class PanelEditor(QtWidgets.QWidget):
         display_specs = ([spec for spec in _panel_param_decls(card.config.kind)
                           if spec.display] + [_RELIM_PARAM])
         self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, label_w)
+        (
+            self.grid_intent_row,
+            self.grid_intent_combo,
+            self.grid_facet_row,
+            self.grid_facet_combo,
+        ) = card._make_grid_view_rows(
+            label_w,
+            apply=self._edit_grid_facet,
+        )
+        col.addWidget(self.grid_intent_row)
+        col.addWidget(self.grid_facet_row)
+        self.grid_bins_row, self.grid_bins_widget = card._make_grid_bins_row(
+            self._edit_param,
+            label_w,
+        )
+        if self.grid_bins_widget is not None:
+            self.ed_params["bins"] = self.grid_bins_widget
+        col.addWidget(self.grid_bins_row)
         self.repeat_mode_row, self.repeat_mode_combo = card._make_repeat_mode_row(
             self._edit_repeat_mode,
             label_w,
@@ -389,7 +408,12 @@ class PanelEditor(QtWidgets.QWidget):
             if card is None or card.board is None
             else card.board.front_frame
         )
-        if front is None:
+        overview_png = (
+            None
+            if front is not None or card is None or card.board is None
+            else getattr(card.board, "overview_png", None)
+        )
+        if front is None and overview_png is None:
             self.status.setText("open the panel with data first")
             return
         if self._board is None:
@@ -401,7 +425,12 @@ class PanelEditor(QtWidgets.QWidget):
         except Exception as error:
             self.status.setText("%s: %s" % (type(error).__name__, error))
             return
-        self._board.present(front)
+        if front is not None:
+            self._board.present(front)
+            self._displayed_png = None
+        else:
+            self._board.present_encoded(overview_png, image_format="PNG")
+            self._displayed_png = bytes(overview_png)
         self._displayed_figure = figure
         self._displayed_display = card._last_display
         self.status.setText("")
@@ -452,6 +481,12 @@ class PanelEditor(QtWidgets.QWidget):
             return
         self._follow_next_front = True
         self.card._commit_repeat_mode(mode)
+
+    def _edit_grid_facet(self, intent, axis_id) -> None:
+        if self.card is None:
+            return
+        self._follow_next_front = True
+        self.card._commit_grid_facet(intent, axis_id)
 
     def _sync_fixed_lim_enabled(self, relim: str) -> None:
         """The Edit tab's fixed lo/hi row is ALWAYS in the layout -- only its INPUTS enable when
@@ -591,6 +626,13 @@ class PanelEditor(QtWidgets.QWidget):
         card = self.card
         self._refresh_display_params()
         if card is not None:
+            card._seed_grid_view_controls(
+                self.grid_intent_combo,
+                self.grid_facet_combo,
+            )
+            self.grid_bins_row.setVisible(
+                card._grid_cell_intent() is card._histogram_intent()
+            )
             card._seed_repeat_mode_control(
                 self.repeat_mode_combo,
                 self.repeat_mode_row,
@@ -859,14 +901,18 @@ class PanelEditor(QtWidgets.QWidget):
         """Write the exact visible pixels and their exact typed data revision."""
 
         front = None if self._board is None else self._board.front_frame
-        if front is None:
+        if front is None and self._displayed_png is None:
             self.status.setText("no snapshot to save")
             return
         try:
             stem = self._save_stem(time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime()))
             stem.parent.mkdir(parents=True, exist_ok=True)
             target = stem.with_suffix(".%s" % self._save_image_ext())
-            image = _front_qimage(front)
+            image = (
+                _front_qimage(front)
+                if front is not None
+                else QtGui.QImage.fromData(self._displayed_png, "PNG")
+            )
             if image is None or not image.save(str(target)):
                 raise RuntimeError("Qt refused to write %s" % target.name)
             figure = self._displayed_figure

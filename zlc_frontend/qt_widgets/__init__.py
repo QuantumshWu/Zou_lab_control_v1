@@ -21,6 +21,7 @@ from ..selector import (
 from .axis_navigator import AxisLayoutNavigator
 from .board import QtRasterBoard
 from .frozen_raster import FrozenRasterView
+from .faceted_panel_host import FacetedPanelHost
 from .owner_wake import QtOwnerWake
 from .panel_host import SinglePanelHost
 from .form import FORM_WIDGET_HANDLERS, FluentParameterForm, FormWidgetHandler
@@ -191,6 +192,7 @@ __all__ = [
     "FluentDoubleSpinBox",
     "FluentFloatingEditor",
     "FitAuthoringPane",
+    "FacetedPanelHost",
     "FluentFormGrid",
     "FluentFrame",
     "FluentGroupBox",

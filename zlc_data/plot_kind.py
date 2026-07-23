@@ -79,9 +79,19 @@ PLOT_KIND_SPECS: tuple[PlotKindSpec, ...] = (
     ),
     # Static timing diagram -- not a blank live-console panel.
     PlotKindSpec(key="pulse", label="Pulse sequence", render_family="1D", panel=False),
-    # Saved grid figures remain readable.  The live console does not expose a blank grid
-    # until a typed facet payload and renderer consume its setting end to end.
-    PlotKindSpec(key="grid", label="Site grid", render_family="1D", panel=False),
+    # GRID is a TaskConsole layout over one typed dataset ViewSpec.  Its exact
+    # named FACET bindings are evaluated by the ordinary FigureEvaluator; it
+    # does not own a second shape-driven slicer or renderer.
+    PlotKindSpec(
+        key="grid",
+        label="Site grid",
+        render_family="1D",
+        panel=True,
+        input_format=(
+            "value must admit an explicit named-axis CURVE, HISTOGRAM, or "
+            "METER facet view"
+        ),
+    ),
 )
 
 #: ``key -> PlotKindSpec`` for O(1) lookup.  Insertion order = menu order.

@@ -21,7 +21,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from zlc_data import Selection
+
 from .curve_display import CurveDisplayState
+from .data_figure import DataFigure, FigurePanelRegion
 from .figure import (
     DatasetDescriptor,
     DatasetId,
@@ -47,6 +50,8 @@ from .image_display import ImageDisplayState
 
 __all__ = [
     "PanelComposer",
+    "FacetedPanelFocus",
+    "FacetedPanelResult",
     "PanelProvenance",
     "PanelRenderError",
     "display_state_for_intent",
@@ -71,6 +76,73 @@ class PanelProvenance:
     run_id: object
     epoch_id: object
     join_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class FacetedPanelFocus:
+    """One exact display cell chosen from a previously painted overview."""
+
+    panel_index: int
+    selection: Selection
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.panel_index, bool)
+            or not isinstance(self.panel_index, int)
+            or self.panel_index < 0
+        ):
+            raise ValueError("faceted focus panel_index must be non-negative")
+        if not isinstance(self.selection, Selection):
+            raise TypeError("faceted focus selection must be Selection")
+
+
+@dataclass(frozen=True, slots=True)
+class FacetedPanelResult:
+    """One complete faceted compose result.
+
+    Exactly one surface is present: immutable PNG + hit regions for overview,
+    or one ordinary ``BoardFrame`` for the selected cell.  ``figure`` is the
+    exact typed value behind that visible surface and crosses the worker
+    boundary only after its evaluation is complete.
+    """
+
+    figure: DataFigure
+    overview_png: bytes | None = None
+    regions: tuple[FigurePanelRegion, ...] = ()
+    frame: object | None = None
+    focus: FacetedPanelFocus | None = None
+
+    def __post_init__(self) -> None:
+        from .render import BoardFrame
+
+        if not isinstance(self.figure, DataFigure):
+            raise TypeError("faceted result figure must be DataFigure")
+        regions = tuple(self.regions)
+        object.__setattr__(self, "regions", regions)
+        overview = self.overview_png is not None
+        focused = self.frame is not None
+        if overview == focused:
+            raise ValueError(
+                "faceted result requires exactly one overview or focus front"
+            )
+        if overview:
+            if not isinstance(self.overview_png, bytes):
+                raise TypeError("faceted overview must be owned PNG bytes")
+            if self.focus is not None:
+                raise ValueError("faceted overview cannot carry focus")
+            if len(regions) <= 1 or any(
+                not isinstance(item, FigurePanelRegion) for item in regions
+            ):
+                raise ValueError(
+                    "faceted overview requires multiple exact panel regions"
+                )
+        else:
+            if not isinstance(self.frame, BoardFrame):
+                raise TypeError("faceted focus frame must be BoardFrame")
+            if self.focus is None:
+                raise ValueError("faceted focus result requires its exact focus")
+            if regions:
+                raise ValueError("faceted focus does not carry overview regions")
 
 
 def display_state_for_intent(intent: ViewIntent):
@@ -237,9 +309,6 @@ class PanelComposer:
         re-deriving them from a newer frame.
         """
 
-        from .render import BoardFrame, PanelFrame, PanelPresentationIdentity, SourceIdentity
-        from .render import CoherenceStamp
-
         block = getattr(snapshot, "block", None)
         ref = getattr(snapshot, "ref", None)
         if block is None or ref is None:
@@ -258,6 +327,112 @@ class PanelComposer:
         raster, payload = self._rasterize(
             evaluated, series, display, ref, block.schema,
         )
+        return self._frame_for(
+            document,
+            ref,
+            raster,
+            payload,
+            display,
+            provenance,
+        )
+
+    def compose_faceted(
+        self,
+        snapshot,
+        *,
+        display,
+        provenance: PanelProvenance,
+        focus: FacetedPanelFocus | None = None,
+    ) -> FacetedPanelResult:
+        """Compose one complete typed grid or one exact focused cell.
+
+        The full ``DataFigure`` is evaluated once from one immutable snapshot.
+        Overview encoding consumes that same evaluation for every cell.  Focus
+        derives one typed panel from it without re-resolving the dataset, so a
+        live grid never becomes N independently-latest cells.
+        """
+
+        if focus is not None and not isinstance(focus, FacetedPanelFocus):
+            raise TypeError("focus must be FacetedPanelFocus or None")
+        block = getattr(snapshot, "block", None)
+        ref = getattr(snapshot, "ref", None)
+        if block is None or ref is None:
+            raise PanelRenderError(
+                "a faceted panel needs an owned (ref, block) snapshot"
+            )
+        document = self.document_for(block.schema)
+        datasets = ResolvedDatasetMap(
+            (ResolvedDataset(self._dataset_id, snapshot),)
+        )
+        figure = DataFigure(document, datasets)
+        layers = figure.evaluated.layers
+        if (
+            len(layers) != 1
+            or len(layers[0].cells) <= 1
+            or self._intent
+            not in (
+                ViewIntent.CURVE,
+                ViewIntent.HISTOGRAM,
+                ViewIntent.METER,
+            )
+        ):
+            raise PanelRenderError(
+                "a grid requires one multi-cell CURVE, HISTOGRAM, or METER view"
+            )
+        if focus is None:
+            payload, regions = figure.to_png_bytes_with_panel_regions()
+            if len(regions) != len(layers[0].cells):
+                raise PanelRenderError(
+                    "grid hit regions do not cover every evaluated cell"
+                )
+            return FacetedPanelResult(
+                figure,
+                overview_png=payload,
+                regions=regions,
+            )
+
+        try:
+            focused = figure.focused_typed_panel(
+                focus.panel_index,
+                expected_selection=focus.selection,
+                expected_intent=self._intent,
+            )
+        except (TypeError, ValueError, IndexError, RuntimeError) as error:
+            raise PanelRenderError(f"grid focus is stale: {error}") from error
+        raster, payload = self._rasterize_focused(focused, display)
+        frame = self._frame_for(
+            focused.document,
+            ref,
+            raster,
+            payload,
+            display,
+            provenance,
+        )
+        return FacetedPanelResult(
+            focused,
+            frame=frame,
+            focus=focus,
+        )
+
+    def _frame_for(
+        self,
+        document,
+        ref,
+        raster,
+        payload,
+        display,
+        provenance: PanelProvenance,
+    ):
+        """Stamp one already-rendered front with its exact source facts."""
+
+        from .render import (
+            BoardFrame,
+            CoherenceStamp,
+            PanelFrame,
+            PanelPresentationIdentity,
+            SourceIdentity,
+        )
+
         self._sequence += 1
         presentation = PanelPresentationIdentity(
             self._panel_id,
@@ -308,8 +483,55 @@ class PanelComposer:
         if self._intent is ViewIntent.METER:
             if not isinstance(data, EvaluatedMeter):
                 raise PanelRenderError("this signal does not evaluate to a meter")
-            return self._agg().render_meter(evaluated, display_revision=0)
+            return self._agg().render_meter(
+                evaluated,
+                display_revision=getattr(display, "revision", 0),
+            )
         raise PanelRenderError(f"no panel renderer for view intent {self._intent!r}")
+
+    def _rasterize_focused(self, figure: DataFigure, display):
+        """Use the existing single-panel renderer for one typed grid cell."""
+
+        from .matplotlib_render import SinglePanelAggRenderer
+
+        renderer = SinglePanelAggRenderer(
+            figure.document,
+            width=self._size[0],
+            height=self._size[1],
+        )
+        try:
+            if self._intent is ViewIntent.CURVE:
+                raster, payload = renderer.render_interactive_curve(
+                    figure.evaluated,
+                    display,
+                    current_y_limits=self._curve_y_limits,
+                    previous_relim_mode=self._curve_relim_mode,
+                )
+                self._curve_y_limits = payload.viewport.y_limits
+                self._curve_relim_mode = display.relim_mode
+                return raster, payload
+            if self._intent is ViewIntent.HISTOGRAM:
+                raster, payload = renderer.render_interactive_histogram(
+                    figure.evaluated,
+                    display,
+                    current_count_limits=self._histogram_count_limits,
+                    previous_relim_mode=self._histogram_relim_mode,
+                    previous_count_scale=self._histogram_count_scale,
+                )
+                self._histogram_count_limits = payload.viewport.count_limits
+                self._histogram_relim_mode = display.relim_mode
+                self._histogram_count_scale = display.count_scale
+                return raster, payload
+            if self._intent is ViewIntent.METER:
+                return renderer.render_meter(
+                    figure.evaluated,
+                    display_revision=getattr(display, "revision", 0),
+                )
+        finally:
+            renderer.close()
+        raise PanelRenderError(
+            f"no focused renderer for view intent {self._intent!r}"
+        )
 
     def _agg(self):
         from .matplotlib_render import SinglePanelAggRenderer
