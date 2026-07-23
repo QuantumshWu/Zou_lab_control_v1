@@ -14,6 +14,7 @@ tree, so deleting ``Zou_lab_control`` cannot orphan it.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
 from typing import Mapping, Sequence
 
@@ -258,6 +259,28 @@ def panel_input_slots_is_single(kind: str) -> bool:
 # ====================================================================== panels
 _MONITOR_UNSET = object()   # sentinel: a monitor panel that has never rolled yet
 
+
+@dataclass(frozen=True, slots=True)
+class _PanelRenderRequest:
+    """One fully frozen worker request for a panel raster.
+
+    The worker never reads ``PanelCard`` or its mutable ``PanelConfig``.  Every
+    display fact used by the compose is captured on the Qt owner before the
+    request crosses the thread boundary.
+    """
+
+    panel_id: str
+    request_revision: int
+    signature: object
+    source_key: object
+    frame_key: object
+    value: object
+    display: object
+    intent: object
+    label: str
+    size: tuple[int, int]
+    provenance: object
+
 class PanelCard(FluentGroupBox):
     """One dashboard panel: a TITLED frame (title strip = the panel KIND + the signal-source
     legend, top-left) holding the frontend canvas, and a text
@@ -273,13 +296,14 @@ class PanelCard(FluentGroupBox):
     remove_requested = QtCore.pyqtSignal(object)
     edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
     fit_analysis_available_changed = QtCore.pyqtSignal(bool)
+    front_presented = QtCore.pyqtSignal()
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
                  sources_provider=None, formats_provider=None, axes_provider=None,
                  sites_inputs_provider=None, curve_x_provider=None,
                  structure_provider=None, short_names_provider=None,
                  live_namespace_provider=None, pulse_state_provider=None,
-                 grid_recipe_provider=None, render_barrier=None,
+                 grid_recipe_provider=None, render_request=None,
                  fit_analysis_sink=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
@@ -326,12 +350,13 @@ class PanelCard(FluentGroupBox):
         # producing node the SAME way a pulse panel resolves its state (a dict carried on the node, the
         # float-only hub cannot hold it).
         self.grid_recipe_provider = grid_recipe_provider
-        # callable() -> waits until the console's render worker is idle.  EVERY GUI-thread path
-        # that mutates this card's figure/plotter (a Setting edit, a source apply, the coalesced
-        # rebuild, the selectors switch, teardown) must hold this barrier first -- while a batch
-        # is in flight the render thread owns the figure (see frontend/render_loop.py).  None
-        # (a standalone/test card) makes it a no-op via _wait_render_idle.
-        self.render_barrier = render_barrier
+        # callable(card, force=False) -> enqueue one latest-only worker compose.
+        # The callback receives no mutable render state: ``render_request`` asks
+        # this card to freeze a request first, then the worker owns every
+        # PanelComposer/Agg object and Qt only presents its immutable result.
+        if not callable(render_request):
+            raise TypeError("render_request must be callable")
+        self._render_request = render_request
         if fit_analysis_sink is not None and not callable(fit_analysis_sink):
             raise TypeError("fit_analysis_sink must be callable or None")
         self.fit_analysis_sink = fit_analysis_sink
@@ -343,9 +368,12 @@ class PanelCard(FluentGroupBox):
         self.panel_id = f"panel-{id(self):x}"
         self.board = None
         self._pending_frame = None    # composed front awaiting its present pass
-        self._composer_obj = None
-        self._compose_key = None
         self._last_value = None       # last value drawn, for an immediate re-render
+        self._last_document = None
+        self._last_display = None
+        self._render_request_revision = 0
+        self._requested_signature = None
+        self._pending_interaction_origin = None
         # Bumped by every display-knob edit.  The renderer reads it to tell a
         # genuinely new display from a repeat of the same one.
         self._display_revision = 0
@@ -499,18 +527,41 @@ class PanelCard(FluentGroupBox):
         self._settings_dismissed_at = time.monotonic()
 
     def _make_param_widget(self, spec: ParamDecl, *, apply=None) -> QtWidgets.QWidget:
-        """One widget per declarative ParamDecl; edits apply INSTANTLY.
+        """One widget per declarative ParamDecl with a semantic commit edge.
 
         ``apply`` overrides where the edit goes (default ``self._set_param``); the
-        Edit tab passes its own callback so a functional-param edit re-renders the
-        live panel AND its snapshot.  Dispatches through the SAME PARAM_WIDGETS
-        registry the measurement form uses (one handler per kind), with the edit
-        wired as the ``instant_apply`` path so a plot param applies on each edit."""
+        Edit tab passes its own callback.  Choice/toggle activation is already a
+        complete user command.  Numeric spins disable keyboard tracking so an
+        in-progress token remains local until Qt commits it.  Free text is a
+        local draft until ``editingFinished``; no character can start a render.
+        """
 
         cb = apply if apply is not None else self._set_param
         current = self.config.params.get(spec.key, spec.default)
-        ctx = ParamWidgetContext(instant_apply=cb)
-        return PARAM_WIDGETS[spec.kind].build(spec, current, ctx)
+        if spec.kind == "text":
+            widget = PARAM_WIDGETS[spec.kind].build(
+                spec,
+                current,
+                ParamWidgetContext(),
+            )
+
+            def commit() -> None:
+                try:
+                    value = PARAM_WIDGETS[spec.kind].read(widget)
+                except (TypeError, ValueError):
+                    return
+                cb(spec.key, value)
+
+            widget.editingFinished.connect(commit)
+            return widget
+        widget = PARAM_WIDGETS[spec.kind].build(
+            spec,
+            current,
+            ParamWidgetContext(instant_apply=cb),
+        )
+        if isinstance(widget, QtWidgets.QAbstractSpinBox):
+            widget.setKeyboardTracking(False)
+        return widget
 
     def _emit_param_rows(self, specs, add, apply, label_w) -> dict:
         """Render each declarative ParamDecl in ``specs`` as a ``[label | control]`` row through the
@@ -660,8 +711,8 @@ class PanelCard(FluentGroupBox):
         panel's params -- so the Setting popup shows the CURRENT values whenever it opens, even if they
         were changed elsewhere (the Edit tab writes the same config.params).  Each widget is re-seeded
         through its kind's ``PARAM_WIDGETS.write`` (one entry point, no per-key handwiring), with its
-        change signals blocked so re-seeding does not re-fire ``_set_param`` (which would needlessly
-        rebuild).  This is the #6 fix: a control is a VIEW of config.params, refreshed on show, never a
+        change signals blocked so re-seeding does not re-fire ``_set_param`` (which would enqueue a
+        duplicate compose).  This is the #6 fix: a control is a VIEW of config.params, refreshed on show, never a
         private copy that drifts from the other surface."""
         for key, widget in self.param_widgets.items():
             kind = self._param_kinds.get(key)
@@ -706,64 +757,96 @@ class PanelCard(FluentGroupBox):
         self._apply_selectors_state()
         self.canvas_holder.addWidget(self.board)
 
-    def _composer(self, value):
-        """This panel's composer for the currently bound signal.
+    def freeze_render_request(
+        self,
+        snapshot,
+        frame_key,
+        *,
+        force: bool = False,
+    ) -> _PanelRenderRequest | None:
+        """Freeze one worker request without exposing mutable Qt/card state.
 
-        Rebuilt when the panel's kind or its source changes, because a composer
-        carries the colour/count window already on screen: a new signal must not
-        inherit the previous one's limits, which would show the new data through
-        the old one's contrast.
+        Repeated timer ticks for the same source/display signature are folded
+        here, before they can become executor work.  ``force`` is reserved for
+        the visible Refresh action and still creates exactly one request.
         """
 
-        from zlc_frontend.figure import ViewIntent
-        from zlc_frontend.panel_render import PanelComposer
+        from zlc_frontend.panel_render import PanelProvenance
 
-        key = (self.config.kind, str(value.name), str(value.source))
-        if self._compose_key != key:
-            self._composer_obj = PanelComposer(
-                self.panel_id, intent=self.view_intent(), label=str(value.name),
-            )
-            self._compose_key = key
-        return self._composer_obj
-
-    def compose_signal_value(self, value) -> bool:
-        """Rasterise one frozen signal value.  Worker-safe; returns whether it drew.
-
-        Phase 1 of the board's two-phase render: this produces immutable bytes
-        and touches no Qt, so the console runs it off the GUI thread.  A value
-        this panel's kind cannot show says so on the status line rather than
-        leaving the last frame up pretending to be current.
-        """
-
-        from zlc_frontend.panel_render import PanelProvenance, PanelRenderError
-
+        name = next((item for item in (self.config.inputs or ()) if item), "")
+        if not name:
+            self.set_status("pick a signal in Setting", error=False)
+            return None
+        value = None if snapshot is None else snapshot.value(name)
         if value is None or getattr(value, "snapshot", None) is None:
+            self.set_status(f"waiting for {name}", error=False)
+            return None
+        display = self._display_state()
+        size = tuple(int(value) for value in panel_display_size(self.config.size))
+        source_key = (
+            str(self.config.kind),
+            str(value.name),
+            str(value.source),
+            str(self.config.title),
+            size,
+        )
+        signature = (frame_key, source_key, display)
+        if not force and signature == self._requested_signature:
+            return None
+        self._render_request_revision += 1
+        self._requested_signature = signature
+        return _PanelRenderRequest(
+            self.panel_id,
+            self._render_request_revision,
+            signature,
+            source_key,
+            frame_key,
+            value,
+            display,
+            self.view_intent(),
+            str(self.config.title or value.name),
+            size,
+            PanelProvenance(value.run_id, value.epoch_id, value.join_digest),
+        )
+
+    def accept_render_result(
+        self,
+        request: _PanelRenderRequest,
+        *,
+        frame=None,
+        document=None,
+        error: str | None = None,
+    ) -> bool:
+        """Accept one worker result on the Qt owner and nothing else."""
+
+        if request.request_revision != self._render_request_revision:
             return False
-        try:
-            frame = self._composer(value).compose(
-                value.snapshot,
-                display=self._display_state(),
-                provenance=PanelProvenance(
-                    value.run_id, value.epoch_id, value.join_digest,
-                ),
+        self._render_version = request.frame_key
+        if error is not None:
+            origin, self._pending_interaction_origin = (
+                self._pending_interaction_origin,
+                None,
             )
-        except PanelRenderError as error:
-            self.set_status(str(error), error=True)
-            return False
-        except Exception as error:                 # one bad panel never kills the batch
-            self.set_status(f"{type(error).__name__}: {error}", error=True)
-            return False
+            if origin is not None and self.board is not None:
+                self.board.discard_pending_interaction(origin)
+            self.set_status(error, error=True)
+            return True
+        if frame is None or document is None:
+            self.set_status("render worker returned no complete front", error=True)
+            return True
         self._pending_frame = frame
-        self._last_value = value
+        self._last_value = request.value
+        self._last_document = document
+        self._last_display = request.display
         self.set_status("ok", error=False)
         return True
 
     def view_intent(self):
         """Which view this panel's kind asks its data for.
 
-        Public because the Edit tab composes the same panel on its own surface:
-        both must ask for the same view, or the snapshot would be a different
-        picture of the same data.
+        Public because the worker request must carry the exact view requested
+        by this card.  The Edit tab copies the accepted front and never derives
+        a second view of the same data.
         """
 
         try:
@@ -825,7 +908,7 @@ class PanelCard(FluentGroupBox):
             y_view=pin_y,
         )
 
-    def frozen_data_figure(self, *, value=None, composer=None):
+    def frozen_data_figure(self):
         """Return the exact typed figure behind the currently displayed panel.
 
         This is a projection of the already-owned immutable monitor revision,
@@ -837,14 +920,14 @@ class PanelCard(FluentGroupBox):
         from zlc_frontend import DataFigure
         from zlc_frontend.figure import ResolvedDataset, ResolvedDatasetMap
 
-        if value is None:
-            value = self._last_value
+        value = self._last_value
         snapshot = None if value is None else getattr(value, "snapshot", None)
         block = None if snapshot is None else getattr(snapshot, "block", None)
         if block is None:
             raise RuntimeError("the panel has no immutable data revision to save")
-        owner = self._composer(value) if composer is None else composer
-        document = owner.document_for(block.schema)
+        document = self._last_document
+        if document is None:
+            raise RuntimeError("the panel has no accepted render document to save")
         if len(document.datasets) != 1:
             raise RuntimeError("a saved panel must bind exactly one typed dataset")
         dataset_id = document.datasets[0].dataset_id
@@ -867,6 +950,8 @@ class PanelCard(FluentGroupBox):
         self._pending_frame = None
         self._build_plot()
         self.board.present_frame(frame)
+        self._pending_interaction_origin = None
+        self.front_presented.emit()
 
     def _build_settings(self) -> None:
         """The Setting popup: the sections the operator tunes this panel through.
@@ -968,7 +1053,7 @@ class PanelCard(FluentGroupBox):
         panel = section_box("Panel")
         self.title_edit = FluentLineEdit(self.config.title)
         self.title_edit.setToolTip("Rename this panel (also the default save name)")
-        self.title_edit.textChanged.connect(self._on_title)
+        self.title_edit.editingFinished.connect(self._commit_title)
         panel.addWidget(FluentSettingRow("title", self.title_edit, label_width=label_w))
         self.size_combo = FluentComboBox()
         for preset in PANEL_SIZES:
@@ -1211,27 +1296,13 @@ class PanelCard(FluentGroupBox):
             home = tuple(float(value) for value in candidate.home_x_limits)
             pin = None if span == home else (span, None)
             revision = int(candidate.display_revision)
-        old_pin = self._view_pin
-        old_revision = self._display_revision
         self._view_pin = pin
         self._display_revision = revision
-        if self._last_value is None:
-            # An arriving source tick will answer the already-authored state.
-            # Production panels retain their last value; this branch also
-            # makes a pre-source gesture safe rather than inventing a frame.
-            return
-        if not self.compose_signal_value(self._last_value):
-            self._view_pin = old_pin
-            self._display_revision = old_revision
-            host.discard_pending_interaction(commit.origin)
-            return
-        try:
-            self.present()
-        except Exception as error:
-            self._view_pin = old_pin
-            self._display_revision = old_revision
-            host.discard_pending_interaction(commit.origin)
-            self.set_status(f"{type(error).__name__}: {error}", error=True)
+        self._pending_interaction_origin = commit.origin
+        # The commit changes only the card-owned display state.  The worker
+        # answers it from the already accepted immutable data revision; Qt
+        # never composes or waits for that answer.
+        self._request_current_render()
 
     def _on_color_limits_committed(self, commit) -> None:
         """CAS one clim-rail commit into the shared fixed-limits fact."""
@@ -1250,39 +1321,12 @@ class PanelCard(FluentGroupBox):
             host.discard_pending_interaction(commit.origin)
             return
 
-        params = self.config.params
-        missing = object()
-        old = {
-            key: params.get(key, missing)
-            for key in ("relim", "fixed_lo", "fixed_hi")
-        }
         old_revision = self._display_revision
-
-        def restore() -> None:
-            for key, value in old.items():
-                if value is missing:
-                    params.pop(key, None)
-                else:
-                    params[key] = value
-            self._display_revision = old_revision
-
         lo, hi = (float(value) for value in commit.color_limits)
         self._store_fixed_lims(lo, hi)
         self._display_revision = old_revision + 1
-        if self._last_value is None:
-            self.changed.emit()
-            return
-        if not self.compose_signal_value(self._last_value):
-            restore()
-            host.discard_pending_interaction(commit.origin)
-            return
-        try:
-            self.present()
-        except Exception as error:
-            restore()
-            host.discard_pending_interaction(commit.origin)
-            self.set_status(f"{type(error).__name__}: {error}", error=True)
-            return
+        self._pending_interaction_origin = commit.origin
+        self._request_current_render()
         self.changed.emit()
 
     def _store_fixed_lims(self, lo: float, hi: float) -> None:
@@ -1300,9 +1344,13 @@ class PanelCard(FluentGroupBox):
         display state on the next compose.
         """
 
-        self._store_fixed_lims(lo, hi)
-        self._rerender_now()
-        self.changed.emit()
+        self._set_params(
+            {
+                "relim": "fixed",
+                "fixed_lo": float(lo),
+                "fixed_hi": float(hi),
+            }
+        )
 
     def _on_fixed_lim_edited(self) -> None:
         """The Setting popup's fixed lo/hi inputs committed (#8): read + apply via the ONE path."""
@@ -1398,14 +1446,13 @@ class PanelCard(FluentGroupBox):
         value = str(self.sub_kind_combo.itemData(int(index)) or "")
         if value == str(self.config.params.get("sub_plot_kind") or ""):
             return
-        self._wait_render_idle()   # reset/re-compose must own the render state
         if value:
             self.config.params["sub_plot_kind"] = value
         else:
             self.config.params.pop("sub_plot_kind", None)      # auto: derive from the slice
-        self._reset_plot()
+        self._invalidate_render_binding()
         self._render_version = -1
-        self._rerender_now()
+        self._request_display_render()
         self._sync_settings_param_rows()
         self.changed.emit()
 
@@ -1418,7 +1465,7 @@ class PanelCard(FluentGroupBox):
         because the last frozen value is what it re-composes from.
         """
 
-        self._rerender_now()
+        self._request_display_render()
 
     def _refresh_title(self) -> None:
         """Compose the grey frame TITLE: the panel KIND + WHERE its signal comes from (the
@@ -1441,13 +1488,11 @@ class PanelCard(FluentGroupBox):
         # No per-shot status line in the panel any more (it needed a footer, which broke the
         # height proportion).  The status lives in the Setting popup + the Setting-button
         # tooltip; an error turns the Setting button red.  Restyle only on the ok<->error edge.
-        # THREAD-SAFE by deferral: compose() may run on the console's render thread, and Qt
-        # widget calls (setText/setStyleSheet) are GUI-thread-only -- park the newest status and
-        # let the GUI flush it when the batch is presented (flush_deferred_status).  Keeping the
-        # deferral INSIDE the one status funnel means compose never forks per thread.
+        # Render workers return string-only outcomes.  This funnel is therefore
+        # Qt-owner-only; no worker ever reaches a widget or parks a mutable
+        # exception on the card.
         if QtCore.QThread.currentThread() is not self.thread():
-            self._deferred_status = (str(text), bool(error))
-            return
+            raise RuntimeError("panel status is Qt-owner-only")
         self._status_text = str(text)
         if hasattr(self, "status"):
             self.status.setText(str(text))
@@ -1458,12 +1503,6 @@ class PanelCard(FluentGroupBox):
             if hasattr(self, "status"):
                 self.status.setStyleSheet(f"color: {colour}; background: transparent; border: none;")
             self.setting_button.set_color(colour)
-
-    def flush_deferred_status(self) -> None:
-        """Apply the newest status a render-thread compose parked (GUI thread, present phase)."""
-        pending = self.__dict__.pop("_deferred_status", None)
-        if pending is not None:
-            self.set_status(pending[0], error=pending[1])
 
     # ------------------------------------------------------------- drag to grid
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
@@ -1500,40 +1539,39 @@ class PanelCard(FluentGroupBox):
         super().resizeEvent(event)
         self._place_setting_button()
 
-    def _on_title(self, text: str) -> None:
-        """Rename the panel.  The title is the card's, and the figure's label.
+    def _commit_title(self) -> None:
+        """Commit the locally edited title once focus/Return finishes it.
 
         One string: the frame header shows it and the composer carries it as the
         dataset label, so the picture and the card can never be captioned
         differently.
         """
 
-        self.config.title = str(text)
-        self._compose_key = None          # the label is part of the composer's identity
-        self._rerender_now()
+        text = str(self.title_edit.text())
+        if text == self.config.title:
+            return
+        self.config.title = text
+        self._invalidate_render_binding()
+        self._request_display_render()
         self.changed.emit()
 
     def _on_size(self, size: str) -> None:
-        self._wait_render_idle()   # the worker must not compose while semantics/size change
+        if str(size) == self.config.size:
+            return
         self.config.size = str(size)
-        # ATOMIC relayout transaction.  A size change is three synchronous steps: clear the old front,
-        # grow the card to the new preset, re-compose on the same host.  If any event-loop slice runs between the grow
-        # and the re-compose -- a closing size-combo popup, a deferred paint -- the operator sees one
-        # frame of a BIG EMPTY card before the picture lands, which is what the "resize jump" was.
-        # Freezing this card's repaints for the whole mutation makes the paint system composite ONE
-        # clean final frame.  The layout_changed emit -- and the sibling repack it drives -- runs
-        # INSIDE the freeze, so position, size and picture all land together; the finally re-enables
-        # even if the re-compose raises.
+        # The accepted front remains installed while the card and its siblings
+        # relayout.  Repaints are held only for that synchronous geometry
+        # transaction; the worker later swaps in the correctly sized immutable
+        # raster without ever clearing/rebuilding this Qt surface.
         self.setUpdatesEnabled(False)
         try:
-            self._reset_plot()
+            self._invalidate_render_binding()
             self._apply_fixed_size()
             # If the Setting frame is open, GROW it immediately to match the new (taller) panel -- but
             # the high-water mark means a SMALLER size never snaps it shorter (#H3i-2).
             if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
                 self._size_settings_popup()
-            self._rerender_now()   # re-draw at the new size NOW, even if the source is stopped (else the
-                                    # torn-down panel stays blank until the next hub tick -- same as _set_param)
+            self._request_display_render()
             self.changed.emit()
             self.layout_changed.emit()
         finally:
@@ -1559,8 +1597,11 @@ class PanelCard(FluentGroupBox):
         )
         layout.addWidget(note)
 
-    def _set_param(self, key: str, value) -> None:
-        """The ONE writer for a display knob: store it, then re-compose.
+    def _set_param(self, key: str, value) -> bool:
+        return self._set_params({str(key): value})
+
+    def _set_params(self, updates: Mapping[str, object]) -> bool:
+        """Commit one semantic parameter transaction and request one compose.
 
         Every surface that edits this panel (the Setting popup, the Edit tab, a
         drag that arms an analysis) comes through here, so a knob has one home
@@ -1569,16 +1610,25 @@ class PanelCard(FluentGroupBox):
         stored and what is drawn cannot drift.
         """
 
-        if self.config.params.get(key) == value:
-            return
-        self.config.params[key] = value
-        if key == "relim":
+        missing = object()
+        changed = {
+            str(key): value
+            for key, value in dict(updates).items()
+            if self.config.params.get(str(key), missing) != value
+        }
+        if not changed:
+            return False
+        self.config.params.update(changed)
+        if "relim" in changed:
+            value = changed["relim"]
             # Flipping INTO ``fixed`` FREEZES the window currently on screen.
             # Seeding from the composed front's own limits (never the default
             # 0..1 pair) is what keeps the picture: pinning a counts histogram
             # or a camera frame to 0..1 empties it, which reads as "the panel
             # just died".  The operator then types exact bounds.
-            if str(value) == "fixed":
+            if str(value) == "fixed" and not {
+                "fixed_lo", "fixed_hi"
+            }.issubset(changed):
                 shown = self._shown_limits()
                 if shown is not None:
                     lo, hi = shown
@@ -1595,8 +1645,9 @@ class PanelCard(FluentGroupBox):
                 # fixed frame (which reads as a jump).
                 if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
                     self._size_settings_popup()
-        self._rerender_now()
+        self._request_display_render()
         self.changed.emit()
+        return True
 
     def _shown_limits(self):
         """The value window the last composed front actually used, or None.
@@ -1623,18 +1674,17 @@ class PanelCard(FluentGroupBox):
         return None
 
     def _apply_source(self) -> None:
-        self._wait_render_idle()
         previous_inputs = tuple(self.config.inputs)
         self.config.set_source(self.source_edit.text())
         if tuple(self.config.inputs) != previous_inputs:
             self._refresh_signal_combo()
         self._compiled_source = self.config.source
-        self._reset_plot()      # output shape may change with the expression
+        self._invalidate_render_binding()      # output shape may change with the expression
         # Force the console's NEXT tick to re-render this panel against a FRESH hub namespace (the
         # version gate honours -1), so re-picking a signal recovers a panel that previously errored
         # on a now-available signal -- never "remove the panel to recover" (#H3w-2).
         self._render_version = -1
-        self._rerender_now()   # also re-evaluate on the last GOOD data at once (stopped node)
+        self._request_display_render()
         self.apply_button.set_dirty(False)
         self.changed.emit()
 
@@ -1661,58 +1711,19 @@ class PanelCard(FluentGroupBox):
         self._expr_editor = editor
         editor.show()
 
-    def _rerender_now(self) -> None:
-        """Re-compose + present from the LAST frozen value, now.
+    def _request_display_render(self) -> None:
+        """Commit one display revision and enqueue one latest-only compose.
 
-        Every display edit lands here.  The display revision advances first so
-        the rasteriser can tell a genuinely new display from a repeat of the
-        same one -- that distinction is what lets ``normal`` relim hold the
-        window it already resolved instead of re-resolving it every edit.
-
-        A stopped producer publishes no new tick, so re-composing the value this
-        panel last drew is the only way a display edit can show up at all.
+        This method never rasterises and never waits.  The console freezes the
+        latest immutable source value and coalesces requests while its one
+        render worker is busy.
         """
 
         self._display_revision += 1
-        if self._last_value is None:
-            return
-        if self.compose_signal_value(self._last_value):
-            self.present()
+        self._request_current_render()
 
-    def compose(self, snapshot, *, offthread: bool = False) -> bool:
-        """Rasterise this panel from ONE frozen tick.  Phase 1 of the board's render.
-
-        Every panel of a tick composes from the SAME freeze, so the board cannot
-        show a 2-D image of one shot beside a histogram of another.  A panel with
-        no bound signal, or one whose signal is not in this freeze yet (a producer
-        still waiting), sits quietly with a hint -- it is decoupled, and a missing
-        source is a state, not an error.
-
-        ``offthread=True`` is the render-worker entry.  Nothing here touches Qt:
-        the product is immutable bytes, which is exactly why the worker may run
-        it while the GUI thread stays responsive.
-        """
-
-        name = next((item for item in (self.config.inputs or ()) if item), "")
-        if not name:
-            self.set_status("pick a signal in Setting", error=False)
-            return True
-        value = None if snapshot is None else snapshot.value(name)
-        if value is None:
-            self.set_status(f"waiting for {name}", error=False)
-            return True
-        self.compose_signal_value(value)
-        return True
-
-    def refresh(self, snapshot) -> None:
-        """Compose + present this ONE card now -- a single-card refresh.
-
-        The board (TaskConsole._tick) instead splits those two phases across ALL
-        its panels for cross-panel coherence; a lone card just does both.
-        """
-
-        self.compose(snapshot)
-        self.present()
+    def _request_current_render(self, *, force: bool = False) -> None:
+        self._render_request(self, force=bool(force))
 
     def _signal_expr(self):
         """This panel's source as the ONE reusable :class:`SignalExpr` (the slot rule + the
@@ -1841,19 +1852,11 @@ class PanelCard(FluentGroupBox):
             return None
         return tuple(sorted((n, versions[n]) for n in refs))
 
-    def _wait_render_idle(self) -> None:
-        """Hold until the console's render worker is idle -- a GUI path must OWN the figure before
-        mutating it (frontend/render_loop.py ownership protocol).  No-op on a standalone card and
-        free when the worker is idle.  Never call from the render thread itself."""
-        if callable(self.render_barrier):
-            self.render_barrier()
-
     def set_selectors_enabled(self, on: bool) -> None:
         """The console header's "Selectors" switch for THIS card: remember the desired state and
         gate the CURRENT plotter now (in place -- no rebuild, no flash).  Every later rebind /
         focus swap re-applies it through ``_apply_selectors_state``, so a fresh figure always
         inherits the switch."""
-        self._wait_render_idle()
         self._selectors_on = bool(on)
         self._apply_selectors_state()
 
@@ -1926,25 +1929,19 @@ class PanelCard(FluentGroupBox):
         return {"relim_mode": self._relim(), **self._fixed_lim_kwargs()}
 
 
-    def _reset_plot(self) -> None:
-        """Reset render semantics without replacing the stable Qt surface.
+    def _invalidate_render_binding(self) -> None:
+        """Invalidate only the worker request identity, never the Qt surface.
 
-        ``SinglePanelHost`` is the card-owned presenter.  A source expression,
-        display kind, size, or data shape change requires a fresh composer, not
-        a fresh QWidget: the next immutable frame carries the new semantics and
-        the host reconciles them when it presents that frame.  Destroying the
-        host here used to rebuild the card subtree for ordinary edits, dropping
-        interaction state and making a scalar Setting change visibly stall.
-        Widget destruction belongs only to :meth:`shutdown`.
+        Source/title/size changes cause the worker to replace its composer from
+        the next request's frozen ``source_key``.  The accepted front stays in
+        place until that replacement is ready, so an edit cannot flash an empty
+        card or rebuild a widget subtree.
         """
 
         self._pending_frame = None
-        self._composer_obj = None
-        self._compose_key = None
+        self._render_request_revision += 1
+        self._requested_signature = None
         self._value_shape = None
-        board = self.board
-        if board is not None:
-            board.clear()
 
     def _teardown_plot(self) -> None:
         """Drop this card's surface, leaving nothing painted behind it.
@@ -1958,17 +1955,21 @@ class PanelCard(FluentGroupBox):
         board = self.board
         self.board = None
         self._pending_frame = None
-        self._composer_obj = None
-        self._compose_key = None
+        self._last_document = None
+        self._last_display = None
+        self._requested_signature = None
         if board is not None:
             self.canvas_holder.removeWidget(board)
             board.setParent(None)
             board.deleteLater()
 
     def shutdown(self) -> None:
-        """Release this card's surface.  The worker must not be composing into it."""
+        """Release this card's Qt surface.
 
-        self._wait_render_idle()
+        Worker requests contain no card/QWidget reference and are rejected by
+        panel identity after removal, so teardown never waits on raster work.
+        """
+
         self._teardown_plot()
 
 class _PanelBoard(QtWidgets.QWidget):

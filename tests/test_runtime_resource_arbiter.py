@@ -7,13 +7,11 @@ import threading
 import pytest
 
 from zlc_neutral_atom.runtime.resources import (
-    ClaimMode,
     ResourceArbiter,
     ResourceBusy,
     ResourceClaim,
     ResourceKey,
     ResourceLease,
-    _mint_terminal_publication,
 )
 
 
@@ -31,34 +29,24 @@ def acquire(
     return result
 
 
-def test_hierarchical_claims_are_atomic_and_observers_can_share() -> None:
+def test_exact_device_claim_sets_are_atomic() -> None:
     arbiter = ResourceArbiter()
-    parent = key("device/camera")
-    child = parent.child("serial")
-    held = acquire(arbiter, "writer", parent)
+    camera = key("device/camera")
+    fpga = key("device/fpga")
+    held = acquire(arbiter, "writer", camera)
 
     result = arbiter.acquire_all(
         "all-or-nothing",
-        (ResourceClaim(child), ResourceClaim(key("device/fpga"))),
+        (ResourceClaim(camera), ResourceClaim(fpga)),
     )
     assert isinstance(result, ResourceBusy)
-    assert "all-or-nothing" not in arbiter.active_claims()
     held._release_unarmed()
 
     first = arbiter.acquire_all(
-        "observer-1", (ResourceClaim(child, ClaimMode.OBSERVE),)
-    )
-    second = arbiter.acquire_all(
-        "observer-2", (ResourceClaim(child, ClaimMode.OBSERVE),)
+        "retry", (ResourceClaim(camera), ResourceClaim(fpga))
     )
     assert isinstance(first, ResourceLease)
-    assert isinstance(second, ResourceLease)
-    assert isinstance(
-        arbiter.acquire_all("exclusive", (ResourceClaim(parent),)),
-        ResourceBusy,
-    )
     first._release_unarmed()
-    second._release_unarmed()
     arbiter.shutdown()
 
 
@@ -94,15 +82,13 @@ def test_terminal_publication_and_release_are_one_transition() -> None:
     lease = acquire(arbiter, "first", resource)
     events: list[str] = []
 
-    publication = _mint_terminal_publication(
+    assert lease.release_terminal(
         lambda: events.append("published"),
         lambda: events.append("released"),
     )
-    assert lease.release_terminal(publication, disposition="SUCCEEDED")
     assert events == ["published", "released"]
     assert lease.released
-    assert lease.disposition == "SUCCEEDED"
-    assert not lease.release_terminal(publication, disposition="SUCCEEDED")
+    assert not lease.release_terminal(lambda: None, lambda: None)
 
     next_lease = acquire(arbiter, "next", resource)
     next_lease._release_unarmed()
@@ -111,15 +97,14 @@ def test_terminal_publication_and_release_are_one_transition() -> None:
 
 def test_invalid_claim_sets_and_duplicate_run_ids_are_rejected() -> None:
     arbiter = ResourceArbiter()
-    parent = key("device/camera")
-    child = parent.child("serial")
-    with pytest.raises(ValueError, match="overlapping resources"):
+    camera = key("device/camera")
+    with pytest.raises(ValueError, match="cannot request resource"):
         arbiter.acquire_all(
-            "overlap",
-            (ResourceClaim(parent), ResourceClaim(child)),
+            "duplicate",
+            (ResourceClaim(camera), ResourceClaim(camera)),
         )
 
-    lease = acquire(arbiter, "same-run", parent)
+    lease = acquire(arbiter, "same-run", camera)
     with pytest.raises(RuntimeError, match="already owns"):
         arbiter.acquire_all("same-run", (ResourceClaim(key("device/fpga")),))
     lease._release_unarmed()

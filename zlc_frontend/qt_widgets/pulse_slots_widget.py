@@ -1,21 +1,15 @@
-"""The pulse-template slot editor: API parameter fields plus the sweep/program selector.
+"""The pulse-template slot editor.
 
-The composite the ``pulse_slots`` ParamDecl kind renders.  Everything it reads had
-already migrated - the sweep-kind vocabulary and the scan-table template into
-``zlc_data``, the slot label into ``zlc_data.shape_text``, the derived column specs
-arriving through the ``PulseTemplateRows`` port - so the widget was the last piece
-still sitting in the legacy shell, and the only reason ``ParamWidgetContext`` still
-carried a factory to reach back for it.  With this move that field is gone and the
-context needs no callback into the console at all.
-
-Seeding is deliberately DEFERRED: ``seed_value`` remembers a payload against its
-``program_id`` and the next matching ``rebuild`` restores it.  A saved workspace is
-loaded before the template rows are known, so applying eagerly would write values
-into fields that do not exist yet.
+The template path is a document boundary, but the controls inside this widget are
+not disposable projections of that document.  API and program-column rows are
+owned by their stable ``(program_id, slot_id)`` keys and reconciled in place.  The
+program editor and sweep selector are constructed once and live for the lifetime
+of the widget, so a slot insertion or move cannot steal a code cursor/selection.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Mapping
 
 from PyQt5 import QtCore, QtWidgets
@@ -25,283 +19,531 @@ from zlc_data.scan_template import scan_table_template
 from zlc_data.vocabulary import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
 
 from .fluent import (
-    FluentButton, FluentCodeEdit, FluentComboBox, FluentLabel, FluentLineEdit,
-    FluentSectionLabel, FluentSettingRow, scaled_px, setting_label_width)
+    FluentButton,
+    FluentCodeEdit,
+    FluentComboBox,
+    FluentLabel,
+    FluentLineEdit,
+    FluentSectionLabel,
+    FluentSettingRow,
+    scaled_px,
+    setting_label_width,
+    signals_blocked,
+)
 from .style import GREY
 
 __all__ = ["PulseSlotsWidget"]
 
 
-def _is_number(v) -> bool:
-    """True when ``v`` can be read as a finite float (a saved numeric param), else False."""
+def _is_number(value) -> bool:
+    """True when ``value`` can be read as a finite-form numeric field."""
+
     try:
-        float(v)
+        float(value)
         return True
     except (TypeError, ValueError):
         return False
 
 
+@dataclass
+class _ApiRow:
+    slot_id: str
+    host: FluentSettingRow
+    edit: FluentLineEdit
+    baseline: str
+    dirty: bool = False
+
+
 class PulseSlotsWidget(QtWidgets.QWidget):
     """Structured editor for the two PulseScan execution strategies.
 
-    A scan-slot sweep uploads one complete FPGA table; an API-slot sweep submits one finite pulse
-    per row.  The selector changes the meaning and columns of a single program editor.  Each
-    strategy keeps its own in-memory buffer because those column spaces are not interchangeable.
-    Selecting a pulse template seeds the scan-slot buffer from that template's persisted program;
-    the API-slot buffer is generated from its API fields.
+    ``reconcile`` consumes one committed template description.  Rows that retain
+    the same program and slot identities retain their Qt objects; changed row
+    metadata is written in place, order changes only move the existing row in its
+    layout, and only removed rows are destroyed.  The code editor is never part of
+    that lifecycle.
 
-    A saved task override is tied to ``program_id``.  It is restored only when that exact template
-    is selected; values named ``a1`` or a code buffer can therefore never leak from one template
-    into another template whose opaque internal slot happens to have the same index."""
+    A saved task override is deferred until the matching ``program_id`` arrives,
+    because a workspace can be loaded before its template rows are known.
+    """
 
     changed = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
-        self._api_widgets: dict[str, QtWidgets.QWidget] = {}
-        from zlc_data.vocabulary import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
         self._scan_slot_kind = SWEEP_SCAN_SLOT
         self._api_slot_kind = SWEEP_API_SLOT
-        self._program_code = None
-        self._sweep_combo = None
-        self._sweep_kind = ""
-        self._program_buffers = {SWEEP_SCAN_SLOT: "", SWEEP_API_SLOT: ""}
-        self._columns: dict[str, list] = {SWEEP_SCAN_SLOT: [], SWEEP_API_SLOT: []}
-        self._specs: dict[str, list] = {SWEEP_SCAN_SLOT: [], SWEEP_API_SLOT: []}
-        self._available = {SWEEP_SCAN_SLOT: False, SWEEP_API_SLOT: False}
         self._program_id = ""
+        self._sweep_kind = ""
+        self._available = {SWEEP_SCAN_SLOT: False, SWEEP_API_SLOT: False}
+        self._program_buffers = {SWEEP_SCAN_SLOT: "", SWEEP_API_SLOT: ""}
+        self._program_initialized = {SWEEP_SCAN_SLOT: False, SWEEP_API_SLOT: False}
+        self._program_baselines = {SWEEP_SCAN_SLOT: "", SWEEP_API_SLOT: ""}
+        self._program_dirty = {SWEEP_SCAN_SLOT: False, SWEEP_API_SLOT: False}
+        self._specs: dict[str, list] = {SWEEP_SCAN_SLOT: [], SWEEP_API_SLOT: []}
+
+        self._api_rows: dict[tuple[str, str], _ApiRow] = {}
+        self._api_order: list[tuple[str, str]] = []
+        self._column_rows: dict[str, dict[tuple[str, str], FluentLabel]] = {
+            SWEEP_SCAN_SLOT: {},
+            SWEEP_API_SLOT: {},
+        }
+        self._column_order: dict[str, list[tuple[str, str]]] = {
+            SWEEP_SCAN_SLOT: [],
+            SWEEP_API_SLOT: [],
+        }
+
         self._pending_program_id = ""
         self._pending_api: dict[str, str] = {}
         self._pending_sweep_kind = ""
         self._pending_program = ""
+
         self._box = QtWidgets.QVBoxLayout(self)
         self._box.setContentsMargins(0, 0, 0, 0)
         self._box.setSpacing(scaled_px(6, minimum=4))
+        self._build_api_surface()
+        self._build_selector_surface()
+        self._build_program_surface()
+        self._present_program()
+
+    # ----------------------------------------------------------- stable surfaces
+    def _build_api_surface(self) -> None:
         self._api_box = QtWidgets.QVBoxLayout()
         self._api_box.setContentsMargins(0, 0, 0, 0)
         self._api_box.setSpacing(scaled_px(6, minimum=4))
         self._box.addLayout(self._api_box)
+        self._api_header = FluentSectionLabel("API parameters")
+        self._api_empty = FluentLabel("(this template has no API parameter)", self)
+        self._api_empty.setWordWrap(True)
+        self._api_empty.setStyleSheet(
+            f"color: {GREY}; background: transparent; border: none;"
+        )
+        self._api_box.addWidget(self._api_header)
+        self._api_box.addWidget(self._api_empty)
+
+    def _build_selector_surface(self) -> None:
         self._selector_box = QtWidgets.QVBoxLayout()
         self._selector_box.setContentsMargins(0, 0, 0, 0)
         self._selector_box.setSpacing(scaled_px(6, minimum=4))
         self._box.addLayout(self._selector_box)
+
+        combo = FluentComboBox()
+        combo.addItem("Scan slots (hardware table)", self._scan_slot_kind)
+        combo.addItem("API slots (one pulse per point)", self._api_slot_kind)
+        combo.setToolTip(
+            "Scan slots upload one complete FPGA table. API slots resolve and submit one "
+            "finite pulse per program row."
+        )
+        combo.currentIndexChanged.connect(self._on_sweep_changed)
+        self._sweep_combo = combo
+        self._selector_row = FluentSettingRow(
+            "Sweep",
+            combo,
+            label_width=setting_label_width(["Sweep"], minimum=72),
+        )
+        self._selector_box.addWidget(self._selector_row)
+
+    def _build_program_surface(self) -> None:
         self._program_box = QtWidgets.QVBoxLayout()
         self._program_box.setContentsMargins(0, 0, 0, 0)
         self._program_box.setSpacing(scaled_px(6, minimum=4))
         self._box.addLayout(self._program_box)
 
+        self._program_empty = FluentLabel(
+            "(bind at least one scan slot or API slot in the Pulse GUI)", self
+        )
+        self._program_empty.setWordWrap(True)
+        self._program_empty.setStyleSheet(
+            f"color: {GREY}; background: transparent; border: none;"
+        )
+        self._program_title = FluentSectionLabel("")
+        self._columns_intro = FluentLabel(
+            "Columns of scan_table (one row = one point, columns advance in lockstep):",
+            self,
+        )
+        self._columns_intro.setWordWrap(True)
+        self._columns_intro.setStyleSheet(
+            f"color: {GREY}; background: transparent; border: none;"
+        )
+
+        self._column_hosts: dict[str, QtWidgets.QWidget] = {}
+        self._column_boxes: dict[str, QtWidgets.QVBoxLayout] = {}
+        for kind in (self._scan_slot_kind, self._api_slot_kind):
+            host = QtWidgets.QWidget(self)
+            host.setStyleSheet("background: transparent;")
+            box = QtWidgets.QVBoxLayout(host)
+            box.setContentsMargins(0, 0, 0, 0)
+            box.setSpacing(scaled_px(2, minimum=1))
+            self._column_hosts[kind] = host
+            self._column_boxes[kind] = box
+
+        self._template_host = QtWidgets.QWidget(self)
+        self._template_host.setStyleSheet("background: transparent;")
+        btn_row = QtWidgets.QHBoxLayout(self._template_host)
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(scaled_px(6, minimum=4))
+        btn_row.addWidget(FluentLabel("template:", self._template_host))
+        for template in ("column_stack", "grid"):
+            button = FluentButton(template, self._template_host, color=GREY)
+            button.clicked.connect(
+                lambda *_args, value=template: self._insert_template(value)
+            )
+            btn_row.addWidget(button, 0)
+        btn_row.addStretch(1)
+
+        # This editor is deliberately constructed exactly once.  Slot reconcile,
+        # sweep changes, empty templates, and program generation changes only update
+        # its text/visibility and can never replace its QObject identity.
+        self._program_code = FluentCodeEdit("", self)
+        self._program_code.setMinimumHeight(scaled_px(120, minimum=90))
+        self._program_code.setToolTip(
+            "Python assigning an (N_points x n_columns) array to scan_table. Values use each "
+            "selected slot's native unit."
+        )
+        self._program_code.textChanged.connect(self._on_program_edited)
+
+        self._program_box.addWidget(self._program_empty)
+        self._program_box.addWidget(self._program_title)
+        self._program_box.addWidget(self._columns_intro)
+        self._program_box.addWidget(self._column_hosts[self._scan_slot_kind])
+        self._program_box.addWidget(self._column_hosts[self._api_slot_kind])
+        self._program_box.addWidget(self._template_host)
+        self._program_box.addWidget(self._program_code)
+
+    # --------------------------------------------------------------- reconcile
     @staticmethod
-    def _drop_layout(layout) -> None:
-        """Tear down every child widget + nested layout under ``layout`` (rebuilt from scratch)."""
-        while layout.count():
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None); w.deleteLater()
-            child = item.layout()
-            if child is not None:
-                PulseSlotsWidget._drop_layout(child)
+    def _normal_api_rows(rows) -> list[tuple[str, str, str, str, str, object]]:
+        result = []
+        seen: set[str] = set()
+        for raw in rows:
+            try:
+                slot_id, coordinate, kind, target, unit, current = raw
+            except (TypeError, ValueError) as exc:
+                raise ValueError("an API row must have six fields") from exc
+            slot_id = str(slot_id)
+            if not slot_id or slot_id in seen:
+                raise ValueError(f"API slot_id must be non-empty and unique, got {slot_id!r}")
+            seen.add(slot_id)
+            result.append(
+                (slot_id, str(coordinate), str(kind), str(target), str(unit), current)
+            )
+        return result
 
-    def rebuild(self, api_rows, scan_rows, *, api_columns=(), scan_columns=(),
-                hardware_program: str = "", program_id: str = "") -> None:
-        """Rebuild from one pulse template.
+    @staticmethod
+    def _normal_scan_rows(rows) -> list[tuple[str, str, str, str, str]]:
+        result = []
+        seen: set[str] = set()
+        for raw in rows:
+            try:
+                slot_id, kind, target, unit, stored_label = raw
+            except (TypeError, ValueError) as exc:
+                raise ValueError("a scan row must have five fields") from exc
+            slot_id = str(slot_id)
+            if not slot_id or slot_id in seen:
+                raise ValueError(f"scan slot_id must be non-empty and unique, got {slot_id!r}")
+            seen.add(slot_id)
+            result.append(
+                (slot_id, str(kind), str(target), str(unit), str(stored_label or ""))
+            )
+        return result
 
-        ``api_rows`` entries are ``(handle, coordinate, kind, target, unit, current)``;
-        ``scan_rows`` entries are ``(coordinate, kind, target, unit, label)``.
-        ``*_columns`` are the matching ``ScanColumnSpec`` per slot, already derived
-        by the domain -- their per-kind default sweep needs the bus signed range and
-        the clock tick, which this layer may not reach.
-        """
+    def reconcile(
+        self,
+        api_rows,
+        scan_rows,
+        *,
+        api_columns=(),
+        scan_columns=(),
+        hardware_program: str = "",
+        program_id: str = "",
+    ) -> None:
+        """Apply one committed template description without rebuilding this tree."""
 
+        api = self._normal_api_rows(api_rows)
+        scan = self._normal_scan_rows(scan_rows)
         program_id = str(program_id or "")
         same_program = bool(program_id and program_id == self._program_id)
         restore_saved = bool(program_id and program_id == self._pending_program_id)
 
-        remembered_api = {}
-        if same_program:
-            remembered_api = {name: widget.text().strip()
-                              for name, widget in self._api_widgets.items()}
-            self._stash_program()
+        self._stash_program()
+        if not same_program:
+            self._remove_all_slot_rows()
+            self._program_buffers = {self._scan_slot_kind: "", self._api_slot_kind: ""}
+            self._program_initialized = {
+                self._scan_slot_kind: False,
+                self._api_slot_kind: False,
+            }
+            self._program_baselines = {self._scan_slot_kind: "", self._api_slot_kind: ""}
+            self._program_dirty = {self._scan_slot_kind: False, self._api_slot_kind: False}
 
-        self._drop_layout(self._api_box)
-        self._drop_layout(self._selector_box)
-        self._drop_layout(self._program_box)
-        self._api_widgets = {}
-        self._program_code = None
-        self._sweep_combo = None
         self._program_id = program_id
-
-        self._api_box.addWidget(FluentSectionLabel("API parameters"))
-        if api_rows:
-            labels = [slot_label(kind, target)
-                      for _handle, _coord, kind, target, _unit, _current in api_rows]
-            label_width = setting_label_width(labels, minimum=72)
-            for handle, _coordinate, kind, target, unit, current in api_rows:
-                label = slot_label(kind, target)
-                seed = (self._pending_api.get(handle) if restore_saved else None)
-                if seed is None and same_program:
-                    seed = remembered_api.get(handle)
-                if seed is None:
-                    seed = f"{float(current):g}"
-                edit = FluentLineEdit(seed, self)
-                edit.setMinimumWidth(scaled_px(120, minimum=96))
-                edit.setPlaceholderText(str(unit))
-                edit.setToolTip(
-                    f"Resting value for {label} ({unit}).  In an API-slot sweep, the program "
-                    "overrides this handle once per row.")
-                edit.textChanged.connect(self.changed)
-                self._api_box.addWidget(FluentSettingRow(label, edit, label_width=label_width))
-                self._api_widgets[str(handle)] = edit
-        else:
-            note = FluentLabel("(this template has no API parameter)", self)
-            note.setWordWrap(True)
-            note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self._api_box.addWidget(note)
-
-        self._columns[self._api_slot_kind] = [
-            (coordinate, slot_label(kind, target), str(unit or ""))
-            for _handle, coordinate, kind, target, unit, _current in api_rows
-        ]
         self._specs[self._api_slot_kind] = list(api_columns)
-        self._columns[self._scan_slot_kind] = []
         self._specs[self._scan_slot_kind] = list(scan_columns)
-        for coordinate, kind, target, unit, stored_label in scan_rows:
+        scan_source = str(hardware_program or "")
+        if scan and not scan_source.strip():
+            scan_source = scan_table_template("column_stack", self._specs[self._scan_slot_kind])
+        self._accept_program_source(self._scan_slot_kind, scan_source, available=bool(scan))
+        api_source = scan_table_template("column_stack", self._specs[self._api_slot_kind]) \
+            if api else ""
+        self._accept_program_source(self._api_slot_kind, api_source, available=bool(api))
+
+        self._reconcile_api_rows(api, restore_saved=restore_saved)
+        api_legend = [
+            (slot_id, coordinate, slot_label(kind, target), unit)
+            for slot_id, coordinate, kind, target, unit, _current in api
+        ]
+        scan_legend = []
+        for slot_id, kind, target, unit, stored_label in scan:
             display = stored_label or slot_label(kind, target)
             display_unit = "ns ticks" if kind == "duration" else (
-                "integer code (LSB)" if kind == "dac" else str(unit or ""))
-            self._columns[self._scan_slot_kind].append((coordinate, display, display_unit))
+                "integer code (LSB)" if kind == "dac" else unit
+            )
+            scan_legend.append((slot_id, slot_id, display, display_unit))
+        self._reconcile_column_rows(self._api_slot_kind, api_legend)
+        self._reconcile_column_rows(self._scan_slot_kind, scan_legend)
 
         self._available = {
-            self._scan_slot_kind: bool(scan_rows),
-            self._api_slot_kind: bool(api_rows),
+            self._scan_slot_kind: bool(scan),
+            self._api_slot_kind: bool(api),
         }
-        if not same_program:
-            self._program_buffers = {
-                self._scan_slot_kind: str(hardware_program or ""),
-                self._api_slot_kind: "",
-            }
-        elif not self._program_buffers[self._scan_slot_kind].strip():
-            self._program_buffers[self._scan_slot_kind] = str(hardware_program or "")
-
-        default_kind = self._scan_slot_kind if scan_rows else (
-            self._api_slot_kind if api_rows else "")
+        default_kind = self._scan_slot_kind if scan else (
+            self._api_slot_kind if api else ""
+        )
         if restore_saved and self._available.get(self._pending_sweep_kind, False):
             self._sweep_kind = self._pending_sweep_kind
             self._program_buffers[self._sweep_kind] = self._pending_program
+            self._program_initialized[self._sweep_kind] = True
+            self._program_dirty[self._sweep_kind] = True
         elif not same_program or not self._available.get(self._sweep_kind, False):
             self._sweep_kind = default_kind
 
-        self._build_sweep_selector()
-        self._render_program()
+        self._ensure_program_buffer(self._sweep_kind)
+        self._present_program()
         self._pending_program_id = ""
         self._pending_api = {}
         self._pending_sweep_kind = ""
         self._pending_program = ""
         self.changed.emit()
 
-    def _build_sweep_selector(self) -> None:
-        combo = FluentComboBox()
-        choices = (
-            ("Scan slots (hardware table)", self._scan_slot_kind),
-            ("API slots (one pulse per point)", self._api_slot_kind),
-        )
-        for label, kind in choices:
-            combo.addItem(label, kind)
-            item = combo.model().item(combo.count() - 1)
+    def _remove_all_slot_rows(self) -> None:
+        for row in self._api_rows.values():
+            self._api_box.removeWidget(row.host)
+            row.host.setParent(None)
+            row.host.deleteLater()
+        self._api_rows.clear()
+        self._api_order.clear()
+        for kind, rows in self._column_rows.items():
+            box = self._column_boxes[kind]
+            for host in rows.values():
+                box.removeWidget(host)
+                host.setParent(None)
+                host.deleteLater()
+            rows.clear()
+            self._column_order[kind].clear()
+
+    def _reconcile_api_rows(self, rows, *, restore_saved: bool) -> None:
+        wanted = [(self._program_id, slot_id) for slot_id, *_rest in rows]
+        wanted_set = set(wanted)
+        for key in tuple(self._api_rows):
+            if key in wanted_set:
+                continue
+            row = self._api_rows.pop(key)
+            self._api_box.removeWidget(row.host)
+            row.host.setParent(None)
+            row.host.deleteLater()
+
+        labels = [slot_label(kind, target) for _sid, _coord, kind, target, _unit, _cur in rows]
+        label_width = setting_label_width(labels or [""], minimum=72)
+        for slot_id, _coordinate, kind, target, unit, current in rows:
+            key = (self._program_id, slot_id)
+            label = slot_label(kind, target)
+            baseline = f"{float(current):g}"
+            row = self._api_rows.get(key)
+            if row is None:
+                seed = self._pending_api[slot_id] if (
+                    restore_saved and slot_id in self._pending_api
+                ) else baseline
+                edit = FluentLineEdit(seed, self)
+                edit.setMinimumWidth(scaled_px(120, minimum=96))
+                host = FluentSettingRow(label, edit, label_width=label_width)
+                row = _ApiRow(
+                    slot_id=slot_id,
+                    host=host,
+                    edit=edit,
+                    baseline=baseline,
+                )
+                self._api_rows[key] = row
+                edit.textEdited.connect(
+                    lambda _text, row_key=key: self._on_api_edited(row_key)
+                )
+            else:
+                row.host.set_label(label, width=label_width)
+                if restore_saved and slot_id in self._pending_api:
+                    self._write_api_text(row, self._pending_api[slot_id])
+                elif not row.dirty and row.baseline != baseline:
+                    self._write_api_text(row, baseline)
+                row.baseline = baseline
+            row.edit.setPlaceholderText(unit)
+            row.edit.setToolTip(
+                f"Resting value for {label} ({unit}). In an API-slot sweep, the program "
+                "overrides this handle once per row."
+            )
+
+        for offset, key in enumerate(wanted, start=1):
+            host = self._api_rows[key].host
+            if self._api_box.indexOf(host) != offset:
+                self._api_box.removeWidget(host)
+                self._api_box.insertWidget(offset, host)
+        self._api_box.removeWidget(self._api_empty)
+        self._api_box.addWidget(self._api_empty)
+        self._api_empty.setVisible(not wanted)
+        self._api_order = wanted
+
+    @staticmethod
+    def _write_api_text(row: _ApiRow, text: str) -> None:
+        if row.edit.text() != str(text):
+            with signals_blocked(row.edit):
+                row.edit.setText(str(text))
+        row.dirty = False
+
+    def _on_api_edited(self, key: tuple[str, str]) -> None:
+        row = self._api_rows.get(key)
+        if row is None:
+            return
+        row.dirty = True
+        self.changed.emit()
+
+    def _reconcile_column_rows(self, kind: str, rows) -> None:
+        current = self._column_rows[kind]
+        box = self._column_boxes[kind]
+        wanted = [(self._program_id, slot_id) for slot_id, *_rest in rows]
+        wanted_set = set(wanted)
+        for key in tuple(current):
+            if key in wanted_set:
+                continue
+            host = current.pop(key)
+            box.removeWidget(host)
+            host.setParent(None)
+            host.deleteLater()
+
+        for slot_id, coordinate, display, unit in rows:
+            key = (self._program_id, slot_id)
+            text = f"{coordinate}: {display}  [{unit}]"
+            host = current.get(key)
+            if host is None:
+                host = FluentLabel(text, self._column_hosts[kind])
+                host.setStyleSheet(
+                    f"color: {GREY}; background: transparent; border: none;"
+                )
+                current[key] = host
+            elif host.text() != text:
+                host.setText(text)
+
+        for offset, key in enumerate(wanted):
+            host = current[key]
+            if box.indexOf(host) != offset:
+                box.removeWidget(host)
+                box.insertWidget(offset, host)
+        self._column_order[kind] = wanted
+
+    # ------------------------------------------------------------ program draft
+    def _accept_program_source(self, kind: str, source: str, *, available: bool) -> None:
+        """Update one clean buffer from its source without overwriting a local draft."""
+
+        if not available:
+            return
+        source = str(source)
+        if not self._program_initialized[kind]:
+            self._program_buffers[kind] = source
+            self._program_initialized[kind] = True
+        elif not self._program_dirty[kind] and self._program_baselines[kind] != source:
+            self._program_buffers[kind] = source
+        self._program_baselines[kind] = source
+
+    def _ensure_program_buffer(self, kind: str) -> None:
+        if not kind or self._program_initialized.get(kind, False):
+            return
+        source = scan_table_template(kind="column_stack", columns=self._specs[kind])
+        self._program_buffers[kind] = source
+        self._program_baselines[kind] = source
+        self._program_initialized[kind] = True
+
+    def _stash_program(self) -> None:
+        if self._sweep_kind:
+            self._program_buffers[self._sweep_kind] = self._program_code.toPlainText()
+
+    def _present_program(self) -> None:
+        available = bool(self._sweep_kind and self._available.get(self._sweep_kind, False))
+        for index in range(self._sweep_combo.count()):
+            kind = str(self._sweep_combo.itemData(index) or "")
+            item = self._sweep_combo.model().item(index)
             if item is not None:
-                item.setEnabled(bool(self._available[kind]))
-        index = combo.findData(self._sweep_kind)
-        combo.setCurrentIndex(index if index >= 0 else 0)
-        combo.currentIndexChanged.connect(self._on_sweep_changed)
-        combo.setToolTip(
-            "Scan slots upload one complete FPGA table. API slots resolve and submit one finite "
-            "pulse per program row.")
-        self._sweep_combo = combo
-        self._selector_box.addWidget(FluentSettingRow(
-            "Sweep", combo, label_width=setting_label_width(["Sweep"], minimum=72)))
+                item.setEnabled(bool(self._available.get(kind, False)))
+        with signals_blocked(self._sweep_combo):
+            index = self._sweep_combo.findData(self._sweep_kind)
+            self._sweep_combo.setCurrentIndex(index if index >= 0 else 0)
+
+        self._program_empty.setVisible(not available)
+        self._program_title.setVisible(available)
+        self._columns_intro.setVisible(available)
+        self._template_host.setVisible(available)
+        self._program_code.setVisible(available)
+        for kind, host in self._column_hosts.items():
+            host.setVisible(available and kind == self._sweep_kind)
+        if not available:
+            return
+
+        title = "Hardware scan-slot program" if self._sweep_kind == self._scan_slot_kind else (
+            "API-slot sweep program"
+        )
+        if self._program_title.text() != title:
+            self._program_title.setText(title)
+        text = self._program_buffers[self._sweep_kind]
+        if self._program_code.toPlainText() != text:
+            with signals_blocked(self._program_code):
+                self._program_code.setPlainText(text)
 
     def _on_sweep_changed(self, *_args) -> None:
-        if self._sweep_combo is None:
-            return
         kind = str(self._sweep_combo.currentData() or "")
         if kind == self._sweep_kind or not self._available.get(kind, False):
             return
         self._stash_program()
         self._sweep_kind = kind
-        self._render_program()
+        self._ensure_program_buffer(kind)
+        self._present_program()
         self.changed.emit()
 
-    def _stash_program(self) -> None:
-        if self._program_code is not None and self._sweep_kind:
-            self._program_buffers[self._sweep_kind] = self._program_code.toPlainText()
-
-    def _render_program(self) -> None:
-        self._drop_layout(self._program_box)
-        self._program_code = None
-        if not self._sweep_kind or not self._available.get(self._sweep_kind, False):
-            note = FluentLabel(
-                "(bind at least one scan slot or API slot in the Pulse GUI)", self)
-            note.setWordWrap(True)
-            note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self._program_box.addWidget(note)
+    def _on_program_edited(self) -> None:
+        if not self._sweep_kind:
             return
-
-        title = "Hardware scan-slot program" if self._sweep_kind == self._scan_slot_kind \
-            else "API-slot sweep program"
-        self._program_box.addWidget(FluentSectionLabel(title))
-        columns = self._columns[self._sweep_kind]
-        legend = ["Columns of scan_table (one row = one point, columns advance in lockstep):"]
-        legend.extend(f"  {name}: {display}  [{unit}]" for name, display, unit in columns)
-        legend_label = FluentLabel("\n".join(legend), self)
-        legend_label.setWordWrap(True)
-        legend_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-        self._program_box.addWidget(legend_label)
-
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.setContentsMargins(0, 0, 0, 0)
-        btn_row.setSpacing(scaled_px(6, minimum=4))
-        btn_row.addWidget(FluentLabel("template:", self))
-        for template in ("column_stack", "grid"):
-            button = FluentButton(template, color=GREY)
-            button.clicked.connect(lambda *_a, value=template: self._insert_template(value))
-            btn_row.addWidget(button, 0)
-        btn_row.addStretch(1)
-        self._program_box.addLayout(btn_row)
-
-        from zlc_data.scan_template import scan_table_template
-        seed = str(self._program_buffers[self._sweep_kind] or "").strip()
-        if not seed:
-            seed = scan_table_template("column_stack", self._specs[self._sweep_kind])
-        self._program_buffers[self._sweep_kind] = seed
-        editor = FluentCodeEdit(seed)
-        editor.setMinimumHeight(scaled_px(120, minimum=90))
-        editor.setToolTip(
-            "Python assigning an (N_points x n_columns) array to scan_table. Values use each "
-            "selected slot's native unit.")
-        editor.textChanged.connect(self.changed)
-        self._program_box.addWidget(editor)
-        self._program_code = editor
+        self._program_buffers[self._sweep_kind] = self._program_code.toPlainText()
+        self._program_initialized[self._sweep_kind] = True
+        self._program_dirty[self._sweep_kind] = True
+        self.changed.emit()
 
     def _insert_template(self, template: str) -> None:
-        from zlc_data.scan_template import scan_table_template
-        if self._program_code is not None and self._sweep_kind:
-            self._program_code.setPlainText(
-                scan_table_template(template, self._specs[self._sweep_kind]))
+        if not self._sweep_kind or not self._available.get(self._sweep_kind, False):
+            return
+        self._program_code.setPlainText(
+            scan_table_template(template, self._specs[self._sweep_kind])
+        )
 
+    # ------------------------------------------------------------------- value
     def values_dict(self) -> dict:
         """Return the sole structured PulseScan form value."""
 
         api: dict[str, float] = {}
-        for name, widget in self._api_widgets.items():
-            text = widget.text().strip()
+        for key in self._api_order:
+            row = self._api_rows[key]
+            text = row.edit.text().strip()
             if not text:
                 continue
             try:
-                api[name] = float(text)
+                api[row.slot_id] = float(text)
             except ValueError:
                 continue
-        program = self._program_code.toPlainText() if self._program_code is not None else ""
+        program = self._program_code.toPlainText() if self._sweep_kind else ""
         return {
             "program_id": self._program_id,
             "api": api,
@@ -310,10 +552,11 @@ class PulseSlotsWidget(QtWidgets.QWidget):
         }
 
     def seed_value(self, value) -> None:
-        """Queue a saved override, applied only to the exact matching pulse program."""
+        """Queue a saved override for the next matching committed program."""
 
         if not isinstance(value, Mapping):
             return
+        self._pending_api = {}
         for name, item in dict(value.get("api") or {}).items():
             self._pending_api[str(name)] = f"{float(item):g}" if _is_number(item) else str(item)
         self._pending_sweep_kind = str(value.get("sweep_kind") or "")

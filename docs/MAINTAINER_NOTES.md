@@ -207,9 +207,8 @@ slot **expressions** (`"s0"`, `"20+s0"`, anything non-numeric) are preserved
 literally — the compiler snaps their affine base instead, so bindings are never
 corrupted. It never raises (it auto-snaps), mirroring the confocal
 `align_to_resolution`. The same grid rule is applied on both ends so what the user
-sees and what the hardware runs always agree: the pulse-transfer API snaps the
-whole state once via `snapped()` in `sequencer.timing_payload_to_dict`, and the GUI
-applies the identical rule field-by-field through the `align_to_resolution`-backed
+sees and what the hardware runs always agree: the current PulseDocument compiler
+owns the execution-side quantization, and the GUI applies the identical rule through the `align_to_resolution`-backed
 resolution widgets (`pulse_gui.py` `set_resolution`) plus `snap_scan_table`, all of
 which share the `quantized_time_steps` floor/round-to-nearest logic in
 `timing/pulse_table.py`.
@@ -777,10 +776,6 @@ CLI for its pre-build estimate, with the configured `fpga_part`.
 - `compile_pulse_table_scan_runtime_program` didn't snap on a DIRECT call → a 0 ns scanned
   duration became a 0-tick period. Snap now happens inside the compiler, regardless of entry
   point. (Each guarded by a regression test.)
-- `compile_runtime_program_for_payload`: bound slots + EMPTY table intentionally degrades to
-  a static program (a run is never blocked); documented inline (a direct `compile_scan` still
-  errors — the strict explicit-scan path).
-
 ### Signed DAC semantics + period names (2026-06-09; **REBUILD REQUIRED** — BUS_SAFE_VALUE)
 The DAC driver is bipolar OFFSET-BINARY: wire code 0 = −FS, code 2^(B−1) (=512) = true 0 V.
 - **User layer is SIGNED LSB** (−512..+511, 0 = 0 V): GUI value fields, `analog_bus_modes`

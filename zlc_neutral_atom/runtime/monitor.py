@@ -28,7 +28,7 @@ from .ports import (
     admit_bound_capability,
     cleanup_device_session,
 )
-from .resources import ClaimMode, ResourceClaim
+from .resources import ResourceClaim
 from .run import RunContext
 
 
@@ -168,7 +168,7 @@ class BoundCameraMonitorPort:
 
     @property
     def resource_claim(self) -> ResourceClaim:
-        return ResourceClaim(self.device.key, ClaimMode.EXCLUSIVE)
+        return ResourceClaim(self.device.key)
 
     @property
     def interrupt_operations(self) -> tuple[SafetyInterrupt, ...]:

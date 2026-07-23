@@ -9,6 +9,7 @@ behind :class:`PulseEditorController`.
 
 from __future__ import annotations
 
+from dataclasses import replace as dataclass_replace
 import math
 import os
 from pathlib import Path
@@ -50,8 +51,11 @@ from ._layout import px
 from .controller import (
     PulseEditorController,
     PulseEditorControllerSnapshot,
+    PulseFileUpdate,
     PulseEditorLocalDelta,
+    PulseOwnerUpdate,
     PulseEditorProjection,
+    PulsePreviewUpdate,
     PulseRuntimeUpdate,
     PulseScanProgressUpdate,
 )
@@ -115,7 +119,6 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._editor_projection_pending = False
         self._owner_cycle_active = False
         self._owner_cycle_pending = False
-        self._owner_cycle_force_pending = False
         self._shown_preview_key: tuple[int, int, int] | None = None
         self._pending_preview_origin = None
         self._pending_preview_revision: int | None = None
@@ -316,9 +319,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         view.saveRequested.connect(self._save_document)
         view.loadRequested.connect(self._load_document)
         view.connectionRequested.connect(
-            lambda mode, endpoint: self._invoke(
-                self._controller.connect, mode, endpoint
-            )
+            self._invoke_connection
         )
         view.scanArrayLoadRequested.connect(self._load_scan_array)
         view.scanSourceEdited.connect(
@@ -361,7 +362,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             )
         )
         self.scan_view.runRequested.connect(
-            lambda source: self._invoke(
+            lambda source: self._invoke_scan_worker(
                 self._controller.generate_scan_source, source
             )
         )
@@ -375,23 +376,65 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     # Qt intents
     # ------------------------------------------------------------------
 
-    def _invoke(self, action: Callable, *args, **kwargs):
-        """Run a lifecycle/worker command and publish its application state."""
+    def _invoke_worker(self, action: Callable, *args, **kwargs):
+        """Start one worker command and present only its immediate busy state."""
 
         try:
             result = action(*args, **kwargs)
         except BaseException as error:
             self._message(str(error))
             return None
-        # A semantic command owns one controller turn.  Project its committed
-        # result only after the originating Qt signal returns; there is no idle
-        # timer backstop and no per-keystroke application snapshot bus.
-        self._owner_cycle_force_pending = True
-        wake = getattr(self, "_wake", None)
-        if wake is None:
-            QtCore.QTimer.singleShot(0, self._owner_cycle)
-        else:
-            wake.request_owner_wake()
+        update = self._controller.runtime_update()
+        self._apply_runtime_update(update)
+        self._finish_close_if_ready(update)
+        return result
+
+    def _invoke_scan_worker(self, action: Callable, *args, **kwargs):
+        """Start Scan work and update only the Scan workspace in place."""
+
+        previous = self._last_editor_projection
+        if previous is None:
+            raise RuntimeError("Pulse Scan command preceded initial composition")
+        try:
+            result = action(*args, **kwargs)
+        except BaseException as error:
+            self._message(str(error))
+            return None
+        self._apply_editor_delta(
+            self._controller.scan_workspace_delta(
+                base_revision=previous.editor_revision,
+            )
+        )
+        return result
+
+    def _invoke_connection(self, mode: str, endpoint: str) -> None:
+        """Apply a connection intent without projecting unrelated surfaces."""
+
+        try:
+            editor_boundary = self._controller.connect(mode, endpoint)
+        except BaseException as error:
+            self._message(str(error))
+            return
+        update = self._controller.runtime_update()
+        self._apply_runtime_update(update)
+        if editor_boundary:
+            self._apply_editor_projection(self._controller.editor_projection())
+
+    def _invoke_editor_boundary(self, action: Callable, *args, **kwargs):
+        """Apply a command that intentionally replaces document/target authority."""
+
+        previous = self._last_editor_projection
+        if previous is None:
+            raise RuntimeError("Pulse editor command preceded initial composition")
+        try:
+            result = action(*args, **kwargs)
+        except BaseException as error:
+            self._message(str(error))
+            return None
+        update = self._controller.runtime_update()
+        self._apply_runtime_update(update)
+        if result != previous.editor_revision:
+            self._apply_editor_projection(self._controller.editor_projection())
         return result
 
     def _invoke_editor(self, action: Callable, *args, **kwargs):
@@ -636,7 +679,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         if action is None:
             self._message("The sequencer has no applied pulse yet (nothing was prepared).")
             return
-        self._invoke(action)
+        self._invoke_editor_boundary(action)
 
     def _hold_scan_point(self) -> None:
         action = getattr(self._controller, "hold_scan_point", None)
@@ -653,10 +696,10 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._invoke_runtime(action, int(delta))
 
     def _scan_file_start(self) -> Path:
-        editor = self._controller.editor_projection()
+        path = self._controller.current_path
         return (
-            editor.path.parent
-            if editor.path is not None
+            path.parent
+            if path is not None
             else _pulse_files_dir()
         )
 
@@ -682,7 +725,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             "Scan array (*.npy *.csv *.txt *.json)",
         )
         if path:
-            self._invoke(self._controller.load_scan_array, Path(path))
+            self._invoke_scan_worker(self._controller.load_scan_array, Path(path))
 
     def _load_scan_program(self) -> None:
         path, _filter = QtWidgets.QFileDialog.getOpenFileName(
@@ -695,17 +738,18 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             "Saved pulse / program (*.json)",
         )
         if path:
-            self._invoke(self._controller.load_scan_program, Path(path))
+            self._invoke_scan_worker(self._controller.load_scan_program, Path(path))
 
     def _save_scan_array(self) -> None:
-        editor = self._controller.editor_projection()
-        if editor.scan_workspace.selected_table is None:
+        workspace = self._controller.current_scan_workspace
+        document = self._controller.current_document
+        if workspace.selected_table is None:
             self._message(
                 "No scan table to save yet. Run code or load a file first."
             )
             return
         suggested = self._scan_file_start() / (
-            f"{_safe_file_stem(editor.document.name)}_scan.npy"
+            f"{_safe_file_stem(document.name)}_scan.npy"
         )
         path, _filter = QtWidgets.QFileDialog.getSaveFileName(
             self,
@@ -714,13 +758,13 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             "Scan array (*.npy *.csv)",
         )
         if path:
-            self._invoke(self._controller.save_scan_array, Path(path))
+            self._invoke_scan_worker(self._controller.save_scan_array, Path(path))
 
     def _save_document(self) -> None:
-        editor = self._controller.editor_projection()
-        suggested = editor.path or (
+        document = self._controller.current_document
+        suggested = self._controller.current_path or (
             _pulse_files_dir()
-            / f"{_safe_file_stem(editor.document.name)}.json"
+            / f"{_safe_file_stem(document.name)}.json"
         )
         path, _filter = QtWidgets.QFileDialog.getSaveFileName(
             self,
@@ -729,7 +773,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             "ZLC pulse (*.json)",
         )
         if path:
-            self._invoke(self._controller.save, Path(path), overwrite=True)
+            self._invoke_worker(self._controller.save, Path(path), overwrite=True)
 
     def _load_document(self) -> None:
         path, _filter = QtWidgets.QFileDialog.getOpenFileName(
@@ -739,12 +783,12 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             "ZLC pulse (*.json)",
         )
         if path:
-            self._invoke(self._controller.open_path, Path(path))
+            self._invoke_worker(self._controller.open_path, Path(path))
 
     def _save_preview(self) -> None:
-        editor = self._controller.editor_projection()
+        document = self._controller.current_document
         suggested = _pulse_files_dir() / (
-            f"{_safe_file_stem(editor.document.name)}.png"
+            f"{_safe_file_stem(document.name)}.png"
         )
         path, _filter = QtWidgets.QFileDialog.getSaveFileName(
             self,
@@ -758,7 +802,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         if action is None:
             self._message("Pulse preview export is unavailable.")
             return
-        self._invoke(action, Path(path))
+        self._invoke_worker(action, Path(path))
 
     def _preview_view_committed(self, commit) -> None:
         visible = self.preview_host.visible_interaction_origin()
@@ -794,11 +838,9 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     # ------------------------------------------------------------------
 
     def _owner_cycle(self) -> None:
-        force = self._owner_cycle_force_pending
-        self._owner_cycle_force_pending = False
-        self._run_owner_cycle(force=force)
+        self._run_owner_cycle()
 
-    def _run_owner_cycle(self, *, force: bool) -> None:
+    def _run_owner_cycle(self) -> None:
         # ``fluent_message`` runs a nested Qt event loop.  A timer firing in
         # that loop must not re-enter snapshot projection while the previous
         # transition still owns the displayed runtime state; otherwise one
@@ -806,23 +848,30 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         # that wake and replay it after the current owner turn commits.
         if self._owner_cycle_active:
             self._owner_cycle_pending = True
-            self._owner_cycle_force_pending |= bool(force)
             return
         self._owner_cycle_active = True
         try:
-            publication = self._controller.pump(force=force)
+            publication = self._controller.pump()
             if publication is None:
                 return
-            if isinstance(publication, PulseScanProgressUpdate):
-                self._present_scan_progress(publication)
-                return
-            if isinstance(publication, PulseRuntimeUpdate):
-                self._apply_runtime_update(publication)
-                self._finish_close_if_ready(publication)
-                return
-            snapshot = publication
-            self._apply_snapshot(snapshot)
-            self._finish_close_if_ready(snapshot)
+            if not isinstance(publication, PulseOwnerUpdate):
+                raise TypeError("Pulse owner published an obsolete full snapshot")
+            runtime = publication.runtime
+            if runtime is not None:
+                self._apply_runtime_update(runtime)
+            if publication.editor is not None:
+                self._apply_editor_projection(publication.editor)
+            elif publication.editor_delta is not None:
+                if not self._apply_editor_delta(publication.editor_delta):
+                    raise RuntimeError("Pulse worker delta missed the displayed revision")
+            if publication.file is not None:
+                self._apply_file_update(publication.file)
+            if publication.preview is not None:
+                self._present_preview_update(publication.preview)
+            if publication.scan_progress is not None:
+                self._present_scan_progress(publication.scan_progress)
+            if runtime is not None:
+                self._finish_close_if_ready(runtime)
         finally:
             self._owner_cycle_active = False
             if self._owner_cycle_pending:
@@ -962,6 +1011,47 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             )
             self._last_scan_workspace = projection.scan_workspace
         self._last_editor_projection = projection
+
+    def _apply_file_update(self, update: PulseFileUpdate) -> None:
+        """Reconcile Save/Open header facts without touching Edit widgets."""
+
+        editor = self._last_editor_projection
+        runtime = self._last_runtime
+        if editor is None or runtime is None:
+            raise RuntimeError("Pulse file update preceded initial composition")
+        key = (
+            update.path,
+            update.file_state,
+            update.dirty,
+            update.document_name,
+            update.document_generation,
+            update.editor_revision,
+        )
+        old_key = (
+            editor.path,
+            editor.file_state,
+            editor.dirty,
+            editor.document.name,
+            editor.document_generation,
+            editor.editor_revision,
+        )
+        if key == old_key:
+            return
+        self._apply_file_and_run_state_values(
+            name=update.document_name,
+            path=update.path,
+            file_state=update.file_state,
+            dirty=update.dirty,
+            document_generation=update.document_generation,
+            editor_revision=update.editor_revision,
+            runtime=runtime,
+        )
+        self._last_editor_projection = dataclass_replace(
+            editor,
+            path=update.path,
+            file_state=update.file_state,
+            dirty=update.dirty,
+        )
 
     @staticmethod
     def _editor_from_snapshot(
@@ -1137,6 +1227,25 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             return
         self._apply_scan_progress(update)
         self._last_scan_progress_key = key
+
+    def _present_preview_update(self, update: PulsePreviewUpdate) -> None:
+        key = (
+            update.preview_revision,
+            update.preview_generation,
+            update.preview_error,
+            update.preview_notice,
+            None
+            if update.rendered_preview is None
+            else (
+                update.rendered_preview.document_generation,
+                update.rendered_preview.editor_revision,
+                update.rendered_preview.presentation_revision,
+            ),
+        )
+        if key != self._last_preview_key:
+            self._apply_preview(update)
+            self._last_preview_key = key
+        self._last_preview_notice = update.preview_notice
 
     def _sync_runtime_watchers(self) -> None:
         """Arm periodic compatibility readers only while they have a consumer."""
@@ -1416,7 +1525,10 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._pending_preview_origin = None
         self._pending_preview_revision = None
 
-    def _apply_preview(self, snapshot: PulseEditorControllerSnapshot) -> None:
+    def _apply_preview(
+        self,
+        snapshot: PulseEditorControllerSnapshot | PulsePreviewUpdate,
+    ) -> None:
         notice = snapshot.preview_notice
         rendered = snapshot.rendered_preview
         if rendered is None:

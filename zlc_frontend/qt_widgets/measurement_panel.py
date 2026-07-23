@@ -77,6 +77,7 @@ class MeasurementPanel(QtWidgets.QWidget):
         self._short_names_provider = short_names_provider
         self._widgets: dict[str, object] = {}     # param key -> widget (or tuple for axis_range)
         self._running = False
+        self._pulse_path_dirty: set[str] = set()
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -156,6 +157,7 @@ class MeasurementPanel(QtWidgets.QWidget):
         self._widgets = {}       # param key -> widget
         self._handlers = {}      # param key -> ParamWidgetHandler (kept in lockstep with _widgets)
         self._decls = {}         # param key -> ParamDecl
+        self._pulse_path_dirty.clear()
         while self.form.count():
             item = self.form.takeAt(0)
             widget = item.widget()
@@ -237,13 +239,22 @@ class MeasurementPanel(QtWidgets.QWidget):
             self._decls[decl.key] = decl
             if kind == "pulse_slots":
                 self._pulse_slots_decls[decl.key] = decl
-        # Wire each pulse_slots widget to its template path after the build loop so the
+        # A template read is a committed path action, never a ``textChanged`` side effect.
+        # Keep the line edit as the local draft while typing; Browse and editingFinished
+        # are the only human events that resolve it.  Wire after the build loop so the
         # source field exists regardless of declaration order.
         for key, decl in self._pulse_slots_decls.items():
             src = self._sibling_path_widget(decl)
             if src is not None:
-                src.changed.connect(lambda *_a, k=key: self._repopulate_pulse_slots(k))
-            self._repopulate_pulse_slots(key)
+                src.changed.connect(lambda *_args, k=key: self._mark_pulse_path_dirty(k))
+                src.selected.connect(
+                    lambda *_args, k=key: self._commit_pulse_slots_path(k, force=True)
+                )
+                src.edit.editingFinished.connect(
+                    lambda k=key: self._commit_pulse_slots_path(k)
+                )
+            # First composition is a real document boundary, so populate once.
+            self._commit_pulse_slots_path(key, force=True)
         self._refresh_start_enabled()
 
     def _sibling_path_widget(self, decl):
@@ -254,11 +265,16 @@ class MeasurementPanel(QtWidgets.QWidget):
             return self._widgets.get(dep)
         return None
 
-    def _repopulate_pulse_slots(self, key: str) -> None:
-        """Rebuild the auto-form rows of a ``pulse_slots`` widget from the pulse template
-        named in its ``depends_on`` path field: one numeric input per API slot, one points-
-        expression input per scan slot.  Preserves any value the operator already typed (the
-        widget seeds each row from its current value when the slot survives the reload)."""
+    def _mark_pulse_path_dirty(self, key: str) -> None:
+        """Record a local path draft; deliberately performs no parsing or I/O."""
+
+        self._pulse_path_dirty.add(key)
+
+    def _commit_pulse_slots_path(self, key: str, *, force: bool = False) -> None:
+        """Resolve one explicitly committed template path and reconcile its stable slots."""
+
+        if not force and key not in self._pulse_path_dirty:
+            return
         widget = self._widgets.get(key)
         decl = self._pulse_slots_decls.get(key)
         if widget is None or decl is None:
@@ -271,11 +287,17 @@ class MeasurementPanel(QtWidgets.QWidget):
         try:
             rows = pulse_template_rows(path)
         except Exception:
-            widget.rebuild([], [], program_id="")
+            self._pulse_path_dirty.add(key)
             return
-        widget.rebuild(list(rows.api_rows), list(rows.scan_rows),
-                       api_columns=rows.api_columns, scan_columns=rows.scan_columns,
-                       hardware_program=rows.program, program_id=rows.program_id)
+        self._pulse_path_dirty.discard(key)
+        widget.reconcile(
+            rows.api_rows,
+            rows.scan_rows,
+            api_columns=rows.api_columns,
+            scan_columns=rows.scan_columns,
+            hardware_program=rows.program,
+            program_id=rows.program_id,
+        )
 
     # ------------------------------------------------------------- value read
     def collect_values(self) -> dict[str, object]:
@@ -300,14 +322,8 @@ class MeasurementPanel(QtWidgets.QWidget):
         labels = coerce_short_labels(self._short_names_provider)
         for key, widget in list(self._widgets.items()):
             kind = self._decls[key].kind
-            # pulse_slots repopulates via the form's per-key hook (it reads the sibling
-            # template); a signal picker refills from live providers.
-            if kind == "pulse_slots":
-                repopulate = lambda _w, k=key: self._repopulate_pulse_slots(k)
-            else:
-                repopulate = None
             providers = RefreshProviders(signals=names, sources=sources, formats=formats,
-                                         labels=labels, repopulate=repopulate)
+                                         labels=labels)
             self._handlers[key].refresh(widget, providers)
         self._refresh_start_enabled()
 
@@ -368,11 +384,10 @@ class MeasurementPanel(QtWidgets.QWidget):
                 self._handlers[key].write(widget, values[key])
             except (TypeError, ValueError):
                 continue
-        # A pulse_slots auto-form rebuilds from its template field too: repopulate AFTER seeding so
-        # the rebuild runs with the stash write() left (saved fixed values + hardware program) and
-        # the round-trip restores them, regardless of seed order.
+        # Load is a document-generation boundary: resolve each seeded template once AFTER
+        # pulse_slots has received its deferred saved value, regardless of key order.
         for key in getattr(self, "_pulse_slots_decls", {}):
-            self._repopulate_pulse_slots(key)
+            self._commit_pulse_slots_path(key, force=True)
         self._refresh_start_enabled()
 
     def set_running(self, running: bool) -> None:

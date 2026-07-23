@@ -178,8 +178,23 @@ class PanelComposer:
         )
         self._document = document
         self._document_fingerprint = fingerprint
-        self._renderer = None            # a new view needs its own Agg renderer
+        # The Agg surface is thread-affine to this composer's worker.  A schema
+        # change replaces the view, so retire the old surface on that same
+        # worker before forgetting it; merely dropping the Python reference
+        # leaves the Figure/Canvas artist cycle alive until a later GC pass.
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
         return document
+
+    def close(self) -> None:
+        """Release the worker-owned Agg surface on its owner thread."""
+
+        renderer, self._renderer = self._renderer, None
+        if renderer is not None:
+            renderer.close()
+        self._document = None
+        self._document_fingerprint = None
 
     # -------------------------------------------------------------- compose
     def compose(self, snapshot, *, display, provenance: PanelProvenance):

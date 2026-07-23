@@ -39,7 +39,6 @@ from zlc_neutral_atom.runtime.ports import (
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.resources import (
-    ClaimMode,
     DeviceBindingStamp,
     ResourceClaim,
 )
@@ -570,7 +569,7 @@ class BoundPulsePort:
 
     @property
     def resource_claim(self) -> ResourceClaim:
-        return ResourceClaim(self.device.key, ClaimMode.EXCLUSIVE)
+        return ResourceClaim(self.device.key)
 
     @property
     def interrupt_operations(self) -> tuple[SafetyInterrupt, ...]:

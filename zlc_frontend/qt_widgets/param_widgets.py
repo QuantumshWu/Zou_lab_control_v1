@@ -202,17 +202,12 @@ class RefreshProviders:
     """What :meth:`ParamWidgetHandler.refresh` needs to repopulate a dynamic control.
 
     ``signals`` / ``sources`` / ``formats`` populate the grouped signal pickers.
-    ``repopulate`` is a per-widget hook the form supplies for the ``pulse_slots``
-    composite whose choices come from a sibling template
-    field -- the inter-field reactivity stays owned by the form (it knows the sibling
-    layout); the handler just calls it.
     """
 
     signals: list[str]
     sources: dict
     formats: dict
     labels: dict = field(default_factory=dict)   # short-name map -> picker leaf "frame_0" not "0"
-    repopulate: Optional[Callable[[QtWidgets.QWidget], None]] = None
 
 
 # --------------------------------------------------------------------- abstract handler
@@ -705,7 +700,7 @@ class SignalExprHandler(ParamWidgetHandler):
 
 class PulseSlotsHandler(ParamWidgetHandler):
     """An auto-generated per-slot sub-form for a pulse template (the COMPOSITE
-    ``_PulseSlotsWidget``), repopulated from a sibling ``path`` field.  Value is
+    ``PulseSlotsWidget``), reconciled from a committed sibling ``path`` field. Value is
     ``{"program_id": "...", "api": {...}, "sweep_kind": "scan_slot"|"api_slot",
     "program": "..."}``: fixed API overrides plus exactly one selected sweep program.
     ``program_id`` prevents an override from one template leaking into another template that
@@ -724,10 +719,9 @@ class PulseSlotsHandler(ParamWidgetHandler):
         return widget.values_dict()
 
     def write(self, widget, value):
-        # The auto-form rebuilds from the template path, so the SLOT ROWS come from the template,
-        # not the blob -- but the saved fixed values + active program DO round-trip: stash
-        # them on the widget so the next repopulation (driven by the seeded template field) restores
-        # them.  The form calls refresh()/repopulate AFTER seeding so this stash is consumed.
+        # Slot rows come from the committed template, not the saved-value blob. Stash
+        # fixed values + active program until the owning form commits that template,
+        # after all saved keys have been seeded.
         if hasattr(widget, "seed_value"):
             widget.seed_value(value)
 
@@ -737,8 +731,9 @@ class PulseSlotsHandler(ParamWidgetHandler):
             or not str(value.get("program") or "").strip()
 
     def refresh(self, widget, providers: RefreshProviders) -> None:
-        if providers.repopulate is not None:
-            providers.repopulate(widget)
+        # Template paths are committed by their owning form on Browse or
+        # editingFinished. Merely showing/refreshing a form performs no I/O.
+        return None
 
 
 # --------------------------------------------------------------------------- the registry

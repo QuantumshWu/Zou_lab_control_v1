@@ -31,14 +31,11 @@ from .ports import (
     _open_device_run,
 )
 from .resources import (
-    ClaimMode,
     ResourceArbiter,
     ResourceBusy,
     ResourceClaim,
     ResourceKey,
     ResourceLease,
-    TerminalPublication,
-    _mint_terminal_publication,
 )
 
 
@@ -120,13 +117,13 @@ class RunPlan(Generic[PreparedT, ExecutedT, FinalT]):
             raise TypeError("bound_devices must contain BoundDevice values")
         if len({device.key for device in devices}) != len(devices):
             raise ValueError("bound_devices must have unique ResourceKeys")
-        exclusive_devices = {
+        claimed_devices = {
             claim.key
             for claim in claims
-            if claim.mode is ClaimMode.EXCLUSIVE and claim.key.segments[0] == "device"
+            if claim.key.segments[0] == "device"
         }
-        if {device.key for device in devices} != exclusive_devices:
-            raise ValueError("every EXCLUSIVE device claim requires exactly one BoundDevice")
+        if {device.key for device in devices} != claimed_devices:
+            raise ValueError("every device claim requires exactly one BoundDevice")
         object.__setattr__(self, "bound_devices", devices)
         interrupts = tuple(self.interrupt_operations)
         if any(not isinstance(value, SafetyInterrupt) for value in interrupts):
@@ -1254,14 +1251,15 @@ class RunHandle(Generic[FinalT]):
             self._condition.notify_all()
         return committed, committed_result
 
-    def _terminal_publication(
+    def _publish_terminal_and_release(
         self,
+        lease: ResourceLease,
         *,
         state: RunState,
         result: object,
         primary_error: str | None,
         cleanup_errors: tuple[str, ...],
-    ) -> TerminalPublication:
+    ) -> None:
         if not state.terminal:
             raise ValueError("terminal publication requires terminal state")
 
@@ -1277,7 +1275,7 @@ class RunHandle(Generic[FinalT]):
             with self._condition:
                 self._condition.notify_all()
 
-        return _mint_terminal_publication(publish, after_release)
+        lease.release_terminal(publish, after_release)
 
     def _publish_terminal(
         self,
@@ -1497,13 +1495,13 @@ class RunController:
         post = seed.mint()
         post._revoke()
         state = RunState.CANCELLED if cancelled else RunState.FAILED
-        publication = handle._terminal_publication(
+        handle._publish_terminal_and_release(
+            lease,
             state=state,
             result=_MISSING,
             primary_error=summary,
             cleanup_errors=(),
         )
-        lease.release_terminal(publication, disposition=state.value)
 
     @staticmethod
     def _run_execution_guarded(
@@ -1531,13 +1529,13 @@ class RunController:
             summary = safe_error_summary(error)
             detach_failure(error, note_prefix="detached terminal lifecycle traceback")
             handle._mark_post_safety()
-            publication = handle._terminal_publication(
+            handle._publish_terminal_and_release(
+                lease,
                 state=RunState.FAILED,
                 result=_MISSING,
                 primary_error=summary,
                 cleanup_errors=(),
             )
-            lease.release_terminal(publication, disposition=RunState.FAILED.value)
             return
         summary = safe_error_summary(error)
         cleanup_summaries: list[str] = []
@@ -1562,13 +1560,13 @@ class RunController:
         detach_failure(error, note_prefix="detached lifecycle traceback")
         post = seed.mint()
         post._revoke()
-        publication = handle._terminal_publication(
+        handle._publish_terminal_and_release(
+            lease,
             state=RunState.FAILED,
             result=_MISSING,
             primary_error=summary,
             cleanup_errors=_diagnostics(tuple(cleanup_summaries)),
         )
-        lease.release_terminal(publication, disposition=RunState.FAILED.value)
 
     @staticmethod
     def _run_execution(
@@ -1700,13 +1698,13 @@ class RunController:
             error_summary: str | None,
             errors: tuple[str, ...],
         ) -> None:
-            publication = handle._terminal_publication(
+            handle._publish_terminal_and_release(
+                lease,
                 state=state,
                 result=terminal_result,
                 primary_error=error_summary,
                 cleanup_errors=errors,
             )
-            lease.release_terminal(publication, disposition=state.value)
 
         if pending_control:
             pending = handle._pending_commit

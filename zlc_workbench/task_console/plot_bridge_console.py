@@ -10,6 +10,7 @@ Every import names a TRUE owner -- nothing here touches the legacy tree.
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import inspect
 import os
 import threading
@@ -36,6 +37,7 @@ from zlc_frontend.qt_widgets import (
     GREEN,
     GREY,
     LogicNodeEditor,
+    QtOwnerWake,
     LogicNodeRow,
     ORANGE,
     WINDOW_SCREEN_FRACTION,
@@ -71,6 +73,7 @@ from .plot_bridge import (
     COORD_FRAMES_KEY,
     GAP,
     PanelCard,
+    _PanelRenderRequest,
     SIG_VALID_KEY,
     SIG_VERSIONS_KEY,
     _PanelBoard,
@@ -207,10 +210,25 @@ class TaskConsole(QtWidgets.QWidget):
         # related view signals publishes them atomically, so companion values remain
         # shot-coherent without console-side joins.
 
-        # Rendering is SYNCHRONOUS on the GUI thread: _tick composes due panels directly (the
-        # same two-phase compose/present path refresh_once always used).  The legacy render
-        # worker and its hand-off bridge died with the legacy tree (purge 2026-07-21); a
-        # threaded pipeline, if wanted, is rebuilt on the current zlc_frontend render stack.
+        # One thread-affine worker owns every PanelComposer/Agg object.  Qt only
+        # freezes immutable requests and presents immutable BoardFrames.  While
+        # one batch is running, newer requests replace the not-yet-started
+        # request for that panel; the next batch is not dispatched until the Qt
+        # owner has accepted/rejected the current result, so render continuity
+        # is never determined by executor timing.
+        self._render_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="zlc-task-console-raster",
+        )
+        self._render_lock = threading.Lock()
+        self._render_future: Future | None = None
+        self._render_completion = None
+        self._render_pending: dict[str, _PanelRenderRequest] = {}
+        self._render_reset_pending: set[str] = set()
+        self._render_worker_composers: dict[str, tuple[object, object]] = {}
+        self._render_closing = False
+        self._render_wake = QtOwnerWake(self)
+        self._render_wake.bind(self._render_owner_cycle)
 
         self._build_ui()
         self.load_state(self.state)
@@ -512,12 +530,9 @@ class TaskConsole(QtWidgets.QWidget):
                 if not self._remove_logic_node(row, _rebuild=False):
                     raise RuntimeError("stopped logic node could not be removed")
             for card in list(self.cards):
-                if not self._remove_panel(
-                    card,
-                    timeout=max(0.0, deadline - time.monotonic()),
-                ):
+                if not self._remove_panel(card):
                     raise RuntimeError(
-                        "cannot load a new console state while a render worker still owns a panel"
+                        "cannot remove a panel while loading the new console state"
                     )
             if replacement_nodes is not None:
                 self.running_nodes = replacement_nodes
@@ -558,7 +573,7 @@ class TaskConsole(QtWidgets.QWidget):
             structure_provider=self._signal_structure, pulse_state_provider=self._pulse_state,
             grid_recipe_provider=self._grid_recipe,
             short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace,
-            render_barrier=self._render_barrier,
+            render_request=self._request_card_render,
             fit_analysis_sink=self._open_panel_fit)
 
     def _attach_card(self, card: PanelCard) -> None:
@@ -1340,10 +1355,6 @@ class TaskConsole(QtWidgets.QWidget):
         produced by a Logic-tab node, not by this Edit)."""
         if card is None or self._task_locked:
             return
-        # the Edit snapshot reads the live plotter's data arrays -- own the figure first
-        if not self._render_barrier():
-            self._render_handoff_failed("Edit")
-            return
         existing = self._panel_editors.get(id(card))
         if existing is not None:
             self.tabs.setCurrentWidget(existing)
@@ -1524,8 +1535,6 @@ class TaskConsole(QtWidgets.QWidget):
         self,
         card: PanelCard,
         *,
-        timeout: float = 5.0,
-        render_already_stopped: bool = False,
         allow_task_owned: bool = False,
     ) -> bool:
         # User removal is blocked while a task owns the console.  The task lifecycle uses the
@@ -1538,9 +1547,7 @@ class TaskConsole(QtWidgets.QWidget):
             return True
         if card not in self.cards and "removed" not in phases:
             return False
-        if not render_already_stopped:
-            if not self._render_barrier(max(0.0, float(timeout))):
-                return False
+        self._forget_card_render(card)
         if "editor" not in phases:
             card.settings_popup.hide()
             self._close_panel_editor(card)     # drop this card's Edit tab too
@@ -1982,7 +1989,7 @@ class TaskConsole(QtWidgets.QWidget):
         if row is not None:
             self._stop_logic_node(row)
 
-    def _clear_task_running(self, *, timeout: float = 2.0) -> bool:
+    def _clear_task_running(self) -> bool:
         """Leave task-run mode (task finished OR stopped): drop the lock + banner and REMOVE the
         transient mid-run panel the task owned.  Finish and Stop take the SAME path (#C) -- a task's
         plot panel is transient (it only showed the work in progress), so it is auto-removed when the
@@ -1993,11 +2000,7 @@ class TaskConsole(QtWidgets.QWidget):
                 if self._deferred_task_card not in (None, card):
                     raise RuntimeError("more than one task card was deferred during shutdown")
                 self._deferred_task_card = card
-            elif not self._remove_panel(
-                card,
-                timeout=timeout,
-                allow_task_owned=True,
-            ):
+            elif not self._remove_panel(card, allow_task_owned=True):
                 return False
         self._running_task_row = None
         self._task_card = None
@@ -2020,9 +2023,9 @@ class TaskConsole(QtWidgets.QWidget):
         except KeyError:
             pass
         self._update_task_status_text(node)
-        # The mid-run panel refresh touches its figure on the GUI thread, which owns every
-        # figure now that rendering is synchronous.
-        self._task_card.refresh(self._tick_data)
+        # The task card is a normal member of ``self.cards``.  The tick below
+        # freezes and submits it through the same worker lane as every other
+        # panel; polling the task output never renders from this Qt callback.
         # NB: leaving task-run mode on finish is handled in ONE place -- _poll_logic_nodes
         # (the canonical node-lifecycle tick, which runs every tick regardless of whether
         # a mid-run panel exists), so a self-finishing task always releases the lock.
@@ -2060,21 +2063,218 @@ class TaskConsole(QtWidgets.QWidget):
             )
         return self._run_factory(spec, dict(values))
 
-    def _render_barrier(self, timeout: float = 5.0) -> bool:
-        """Rendering is synchronous on the GUI thread, so the GUI always owns every
-        Figure; the bool-returning contract stays because nine call sites hold it."""
+    @property
+    def render_worker_idle(self) -> bool:
+        with self._render_lock:
+            return (
+                self._render_future is None
+                and self._render_completion is None
+                and not self._render_pending
+            )
 
+    def _request_card_render(self, card: PanelCard, *, force: bool = False) -> bool:
+        """Freeze and enqueue one card from the latest immutable data front."""
+
+        if self._render_closing or card not in self.cards:
+            return False
+        snapshot = self._data.freeze()
+        request = card.freeze_render_request(
+            snapshot,
+            self._panel_frame_key(card, snapshot.versions()),
+            force=bool(force),
+        )
+        if request is None:
+            return False
+        self._enqueue_render_requests((request,))
         return True
 
-    def _render_handoff_failed(self, what: str) -> None:
-        """Tell the operator WHICH action was refused, on the permanent status strip."""
+    def _enqueue_render_batch(self, batch, snapshot, *, force: bool = False) -> None:
+        requests = []
+        for card, key in batch:
+            request = card.freeze_render_request(snapshot, key, force=force)
+            if request is not None:
+                requests.append(request)
+        self._enqueue_render_requests(tuple(requests))
 
+    def _enqueue_render_requests(
+        self,
+        requests: tuple[_PanelRenderRequest, ...],
+    ) -> None:
+        if not requests or self._render_closing:
+            return
+        with self._render_lock:
+            if self._render_future is not None or self._render_completion is not None:
+                for request in requests:
+                    self._render_pending[request.panel_id] = request
+                return
+        self._start_render_batch(requests, ())
+
+    def _start_render_batch(
+        self,
+        requests: tuple[_PanelRenderRequest, ...],
+        reset_panel_ids: tuple[str, ...],
+    ) -> None:
+        if self._render_closing:
+            return
+        future = self._render_pool.submit(
+            self._compose_render_requests,
+            requests,
+            reset_panel_ids,
+        )
+        with self._render_lock:
+            if self._render_future is not None:
+                raise RuntimeError("TaskConsole render lane admitted overlapping batches")
+            self._render_future = future
+        future.add_done_callback(self._render_batch_finished)
+
+    def _compose_render_requests(
+        self,
+        requests: tuple[_PanelRenderRequest, ...],
+        reset_panel_ids: tuple[str, ...],
+    ):
+        """Worker-only PanelComposer/Agg owner."""
+
+        from zlc_frontend.panel_render import PanelComposer, PanelRenderError
+
+        for panel_id in reset_panel_ids:
+            owned = self._render_worker_composers.pop(panel_id, None)
+            if owned is not None:
+                owned[1].close()
+        results = []
+        for request in requests:
+            owned = self._render_worker_composers.get(request.panel_id)
+            if owned is None or owned[0] != request.source_key:
+                if owned is not None:
+                    owned[1].close()
+                composer = PanelComposer(
+                    request.panel_id,
+                    intent=request.intent,
+                    size=request.size,
+                    label=request.label,
+                )
+                self._render_worker_composers[request.panel_id] = (
+                    request.source_key,
+                    composer,
+                )
+            else:
+                composer = owned[1]
+            try:
+                frame = composer.compose(
+                    request.value.snapshot,
+                    display=request.display,
+                    provenance=request.provenance,
+                )
+                document = composer.document_for(
+                    request.value.snapshot.block.schema
+                )
+            except PanelRenderError as error:
+                results.append((request, None, None, str(error)))
+            except BaseException as error:
+                # Never retain the raw exception/traceback: it may own the
+                # entire frozen dataset and Agg graph.
+                results.append(
+                    (
+                        request,
+                        None,
+                        None,
+                        f"{type(error).__name__}: {error}",
+                    )
+                )
+            else:
+                results.append((request, frame, document, None))
+        return tuple(results)
+
+    def _render_batch_finished(self, future: Future) -> None:
         try:
+            completion = future.result()
+        except BaseException as error:
+            completion = f"{type(error).__name__}: {error}"
+        with self._render_lock:
+            if self._render_closing:
+                return
+            self._render_completion = completion
+        self._render_wake.request_owner_wake()
+
+    def _render_owner_cycle(self) -> None:
+        """Qt-only accept/present point, then release the next latest batch."""
+
+        if self._render_closing:
+            return
+        with self._render_lock:
+            completion = self._render_completion
+            if completion is None:
+                return
+            self._render_completion = None
+            self._render_future = None
+        reset = set()
+        to_present = []
+        if isinstance(completion, str):
             self.status_strip.show_message(
-                f"{what} cancelled: the render worker did not hand back the figures in time.",
-                severity="error")
-        except BaseException:
-            pass
+                f"Render failed: {completion}", severity="error"
+            )
+        else:
+            by_id = {card.panel_id: card for card in self.cards}
+            for request, frame, document, error in completion:
+                card = by_id.get(request.panel_id)
+                if card is None or not card.accept_render_result(
+                    request,
+                    frame=frame,
+                    document=document,
+                    error=error,
+                ):
+                    reset.add(request.panel_id)
+                    continue
+                if error is None:
+                    to_present.append(card)
+            # Every accepted card swaps only after the whole worker batch has
+            # been examined, so Qt never composes and a batch cannot be half
+            # accepted because one sibling raised.
+            for card in to_present:
+                card.present()
+        with self._render_lock:
+            reset.update(self._render_reset_pending)
+            self._render_reset_pending.clear()
+            pending = tuple(self._render_pending.values())
+            self._render_pending.clear()
+        if pending or reset:
+            self._start_render_batch(pending, tuple(sorted(reset)))
+
+    def _forget_card_render(self, card: PanelCard) -> None:
+        """Revoke queued results without waiting for immutable worker work."""
+
+        card._render_request_revision += 1
+        card._requested_signature = None
+        start_reset = False
+        with self._render_lock:
+            self._render_pending.pop(card.panel_id, None)
+            if self._render_future is None and self._render_completion is None:
+                start_reset = True
+            else:
+                self._render_reset_pending.add(card.panel_id)
+        if start_reset:
+            # No completion will arrive to drain ``_render_reset_pending``.
+            # Queue the disposal directly on the same worker that owns Agg.
+            self._start_render_batch((), (card.panel_id,))
+
+    def _shutdown_render_lane(self) -> None:
+        if self._render_closing:
+            return
+        self._render_closing = True
+        self._render_wake.detach()
+        with self._render_lock:
+            self._render_pending.clear()
+            self._render_completion = None
+
+        def release_worker_state() -> None:
+            for _key, composer in tuple(self._render_worker_composers.values()):
+                composer.close()
+            self._render_worker_composers.clear()
+
+        # The executor is serial: cleanup runs after an already-started compose
+        # on the same owner thread.  Qt does not block while that finite work
+        # drains, and the closing gate refuses every late completion.
+        self._render_pool.submit(release_worker_state)
+        self._render_pool.shutdown(wait=False)
 
     def _stop_logic_node(
         self,
@@ -2099,16 +2299,12 @@ class TaskConsole(QtWidgets.QWidget):
                 return False
         # A failed clear keeps the task row/card references so the next tick or close retry
         # can finish the teardown instead of destroying a Figure still in use.
-        if row is self._running_task_row and not self._clear_task_running(
-            timeout=max(0.0, deadline - time.monotonic())
-        ):
-            row.set_state("stopped", status="panel teardown pending: render worker still active")
+        if row is self._running_task_row and not self._clear_task_running():
+            row.set_state("stopped", status="panel teardown pending")
             editor = self._logic_editors.get(id(row))
             if editor is not None:
                 editor.set_running(False)
-                editor.set_status(
-                    "panel teardown pending: render worker still owns the Figure", error=True
-                )
+                editor.set_status("panel teardown pending", error=True)
             return False
         self._logic_nodes[id(row)] = None
         editor = self._logic_editors.get(id(row))
@@ -2398,11 +2594,9 @@ class TaskConsole(QtWidgets.QWidget):
         # one GAP margin), NOT the whole board widget -- the board is sized to fill the scroll viewport
         # (setWidgetResizable), so grabbing it would bake in a big empty plot area below/right of the
         # panels.  Clamp to the board so the sub-rect is valid; empty board -> the whole (tiny) board.
-        # board.grab() forces a synchronous paint of EVERY canvas -- settle the render loop first
-        # (the file dialog above kept ticks running, so a batch may be in flight right now).
-        if not self._render_barrier():
-            self._render_handoff_failed("Save image")
-            return
+        # Save the currently accepted immutable fronts.  A worker may be
+        # preparing a newer batch, but Qt never waits for it or reads its Agg
+        # state; the saved board is exactly what the operator currently sees.
         cards = list(self.cards)
         if cards:
             rect = cards[0].geometry()
@@ -2447,10 +2641,6 @@ class TaskConsole(QtWidgets.QWidget):
             self._update_summary()
             return
         self._tick_count += 1
-        # Rendering is synchronous on the GUI thread, so nothing is ever mid-flight when a tick
-        # runs; the beat-owed bookkeeping stays because a mid-drag panel is still skipped and
-        # served on the next tick.
-        busy = False
         # ONE freeze for the whole tick: what every panel, legend and picker reads.
         self._tick_data = self._data.freeze()
         versions = self._tick_data.versions()
@@ -2471,14 +2661,13 @@ class TaskConsole(QtWidgets.QWidget):
                 continue                       # beat not due (and none owed)
             # A card mid-gesture is skipped whole: recomposing under a drag would
             # replace the very front the pointer is measuring against.
-            if busy or bool(getattr(card, "_interacting", False)):
+            if bool(getattr(card, "_interacting", False)):
                 card._beat_owed = True         # due but unservable this tick -> next idle tick serves it
                 continue
             card._beat_owed = False
             batch.append((card, key))
         if batch:
-            # Compose and present in place -- the same two-phase path refresh_once uses.
-            self._on_render_batch(self._compose_batch(batch))
+            self._enqueue_render_batch(batch, self._tick_data)
         # keep the visible Edit tab's 'now:' acquisition references live, so a queued
         # parameter edit shows as applied once the loop picks it up.
         editor = self.tabs.currentWidget()
@@ -2487,66 +2676,22 @@ class TaskConsole(QtWidgets.QWidget):
             editor.refresh_limit_hints()  # #3a: tick updates only the grey placeholder hint, never the text
         self._update_summary()
 
-    def _compose_batch(self, batch):
-        """Compose every batched panel from the tick's ONE namespace.
-
-        Returns the per-panel outcome for the present pass.  All panels in a
-        batch share the frozen tick, so a batch is coherent by construction.
-        """
-        snapshot = self._tick_data
-        composed, structural = [], []
-        for card, key in batch:
-            try:
-                done = card.compose(snapshot, offthread=True)
-            except Exception:
-                done = True            # compose() latches errors itself; never kill the batch
-            (composed if done else structural).append((card, key))
-        return {"snapshot": snapshot, "composed": composed, "structural": structural}
-
-    def _on_render_batch(self, result) -> None:
-        """GUI THREAD (queued from the render thread): finish the batch -- run the structural
-        builds the worker handed back, then PRESENT every panel TOGETHER so the board flips ONE
-        coherent shot (never frame_0 at shot S beside frame_2 at S-1)."""
-        if not isinstance(result, dict):
-            return                     # a job that raised whole (already latched per panel) -- drop
-        snapshot = result["snapshot"]
-        # Membership gate FIRST: a card removed (or shut down) while the batch was in flight must
-        # not get a structural compose / status flush either -- composing into a torn-down card
-        # resurrects Qt widgets its removal already deleted.
-        alive = lambda c: c in self.cards or c is self._task_card
-        structural = [(c, k) for c, k in result["structural"] if alive(c)]
-        composed = [(c, k) for c, k in result["composed"] if alive(c)]
-        for card, _key in structural:
-            try:
-                card.compose(snapshot)           # the GUI-thread compose (a card that needs Qt)
-            except Exception:
-                pass                             # compose latches its own status
-        for card, _key in composed:
-            card.flush_deferred_status()
-        for card, key in structural + composed:
-            card._render_version = key
-            card.present()
-
     def refresh_once(self) -> None:
-        """Synchronous FULL refresh (tests / notebooks / Resume catch-up): COMPOSE every card from the
-        ONE coherent snapshot, then PRESENT them all together -- the same two-phase coherence as the live
-        tick, just unconditional (ignores per-panel beat and the frame-key gate).  Holds the render
-        barrier first: this GUI-thread compose must own every figure."""
-        if not self._render_barrier():
-            self._render_handoff_failed("Refresh")
-            return
+        """Request one unconditional worker refresh of every current card."""
+
         self._poll_logic_nodes()
         self._refresh_signal_info()
         self._refresh_task_panel()
         self._tick_data = self._data.freeze()
         versions = self._tick_data.versions()
-        # compose EVERY card from the one frozen tick, THEN present them together (tests /
-        # notebooks / Resume catch-up) so a refreshed board is one consistent instant.
-        for card in self.cards:
-            card.compose(self._tick_data)
-            card._render_version = self._panel_frame_key(card, versions)
-        for card in self.cards:
-            card.present()
+        self._enqueue_render_batch(
+            tuple(
+                (card, self._panel_frame_key(card, versions))
+                for card in self.cards
+            ),
+            self._tick_data,
+            force=True,
+        )
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
             editor.refresh_node_now_labels()
@@ -2753,9 +2898,10 @@ class TaskConsole(QtWidgets.QWidget):
         Stopping a node sets its cooperative-cancel event (M5), so a node thread
         blocked in ``camera.acquire`` unwinds and the camera is released -- this is
         what keeps a closed dashboard from leaving a live acquire thread (and a held
-        camera / RPyC connection) behind, which previously wedged the kernel.  True
-        means all render ownership is joined and teardown completed; False keeps the
-        window alive so a later close can retry the unresolved handoff."""
+        camera / RPyC connection) behind, which previously wedged the kernel.
+        Raster work owns no QWidget and is detached on close; True means node,
+        resource and Qt teardown completed, while False keeps the window alive
+        so a later close can retry the unresolved external owner."""
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
             raise ValueError("shutdown timeout must be positive")
         if QtCore.QThread.currentThread() is not self.thread():
@@ -2778,8 +2924,10 @@ class TaskConsole(QtWidgets.QWidget):
             if not self.stop_all_nodes(timeout=max(0.0, deadline - time.monotonic())):
                 self._shutdown_state = "BLOCKED_NODE_OWNERSHIP"
                 return False
-        # Rendering is synchronous on the GUI thread: no worker thread to join, so figure
-        # ownership is already resolved the moment the nodes have stopped.
+        # Stop publication before tearing down Qt.  An already-started compose
+        # may finish in the background, but its result has no QWidget reference
+        # and the closing gate discards it.
+        self._shutdown_render_lane()
         if not getattr(self, "_on_close_done", False):
             self._shutdown_state = "CLOSING_RESOURCES"
             on_close = getattr(self, "_on_close", None)
@@ -2803,8 +2951,6 @@ class TaskConsole(QtWidgets.QWidget):
             if deferred_task_card is not None:
                 if not self._remove_panel(
                     deferred_task_card,
-                    timeout=0.0,
-                    render_already_stopped=True,
                     allow_task_owned=True,
                 ):
                     raise RuntimeError("deferred task panel teardown was not acknowledged")
@@ -2844,9 +2990,7 @@ class TaskConsole(QtWidgets.QWidget):
 
     def __exit__(self, *exc):
         if not self.shutdown():
-            raise RuntimeError(
-                "TaskConsole shutdown is blocked because the render worker still owns a Figure"
-            )
+            raise RuntimeError("TaskConsole shutdown did not complete")
         return False
 
 def show_task_console(

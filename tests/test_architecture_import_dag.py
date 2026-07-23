@@ -140,8 +140,7 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
     (Path("zlc_frontend/qt_widgets/signal_expr_widget.py"), "SignalExprWidget.values_dict"),
     # The pulse-slot composite moved into qt_widgets (S5-shell(p)); its normalisation
     # points came with it, so the named entries follow the code.
-    (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget._render_program"),
-    (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget.rebuild"),
+    (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget.reconcile"),
     (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget.values_dict"),
     # The panel record sank into zlc_data (S5-shell(t)).  Its one normalisation point reads
     # the ``value = ...`` expression a HUMAN typed into the Setting, so the named entry

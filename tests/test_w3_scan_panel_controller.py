@@ -207,6 +207,14 @@ def _reach_committed_reference(controller, handle, executor):
     controller.owner_cycle()  # accepts ref, schedules final projection
 
 
+def _reach_active_run(controller, executor):
+    controller.start()
+    executor.run_next()  # application.prepare
+    controller.owner_cycle()
+    executor.run_next()  # prepared.start
+    controller.owner_cycle()
+
+
 def test_application_reconfigure_resets_unscoped_curve_display_state() -> None:
     controller, _application, _handle, _executor, _wakes = _controller()
     changed = curve_display_with_x_view(CurveDisplayState(), (1.0, 2.0))
@@ -216,6 +224,46 @@ def test_application_reconfigure_resets_unscoped_curve_display_state() -> None:
     replacement_handle = _FakeHandle("replacement-run", _ref("b"))
     controller.reconfigure(_Application(replacement_handle))
     assert controller.progressive_curve_display == CurveDisplayState()
+
+
+def test_live_runtime_poll_never_builds_a_full_panel_model() -> None:
+    controller, _application, handle, executor, _wakes = _controller()
+    _reach_active_run(controller, executor)
+    original_model = controller.view_model
+
+    def forbidden_full_projection():
+        raise AssertionError("live runtime poll rebuilt the full panel model")
+
+    controller._build_view_model = forbidden_full_projection
+    assert controller.poll_runtime_change() is None
+    assert controller.view_model is original_model
+
+    handle.current = _snapshot(
+        handle.run_id,
+        RunState.RUNNING,
+        phase="cleanup",
+    )
+    update = controller.poll_runtime_change()
+    assert update is not None
+    assert update.status == "RUNNING / cleanup · FINAL-ONLY"
+    assert update.can_stop
+    assert not update.terminal_boundary
+    assert controller.view_model is original_model
+
+
+def test_terminal_runtime_poll_publishes_one_real_boundary() -> None:
+    controller, _application, handle, executor, _wakes = _controller()
+    _reach_active_run(controller, executor)
+    handle.finish(RunState.SUCCEEDED, final_committed=True)
+
+    update = controller.poll_runtime_change()
+
+    assert update is not None and update.terminal_boundary
+    assert update.status == "FINAL COMMITTED · RETRIEVING RESULT"
+    assert not update.can_stop
+    assert not controller.needs_periodic_poll
+    assert controller.view_model.status == update.status
+    assert len(executor.pending) == 1
 
 
 def test_final_only_controller_reaps_terminal_before_projecting() -> None:

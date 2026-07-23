@@ -17,6 +17,7 @@ from zlc_pulse import (
 from zlc_workbench.pulse import PulseEditorSession
 from zlc_workbench.pulse_editor.controller import (
     PulseEditorController,
+    PulseOwnerUpdate,
     PulseRuntimeUpdate,
 )
 
@@ -119,7 +120,43 @@ def test_owner_wake_without_new_fact_is_silent_and_runtime_poll_stays_narrow():
     controller._scan_workspace_snapshot = scan_workspace_snapshot
     controller._pulse = None
     controller.request_close()
-    controller.pump(force=True)
+    controller.pump()
+
+
+def test_preview_completion_publishes_only_preview_surface():
+    controller = _controller()
+    snapshot = controller.snapshot
+    editor_projection = controller.editor_projection
+    try:
+        controller.request_preview()
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            with controller._lock:
+                if controller._results:
+                    break
+            time.sleep(0.005)
+        else:
+            raise AssertionError("preview worker did not complete")
+
+        controller.snapshot = lambda: (_ for _ in ()).throw(
+            AssertionError("worker completion must not build a full snapshot")
+        )
+        controller.editor_projection = lambda: (_ for _ in ()).throw(
+            AssertionError("Preview completion must not project the editor")
+        )
+        publication = controller.pump()
+        assert isinstance(publication, PulseOwnerUpdate)
+        assert publication.preview is not None
+        assert publication.editor is None
+        assert publication.editor_delta is None
+        assert publication.file is None
+        assert publication.runtime is None
+        assert publication.scan_progress is None
+    finally:
+        controller.snapshot = snapshot
+        controller.editor_projection = editor_projection
+        controller.request_close()
+        _pump_until(controller, lambda value: value.close_complete)
 
 
 def test_preview_worker_uses_document_identity_and_latest_presentation_revision():

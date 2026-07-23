@@ -1399,8 +1399,7 @@ Blocking I/O lane 的普通 command queue 有界并使用公平调度：同一 o
 
 ```text
 ResourceClaim:
-  ResourceKey
-  mode = EXCLUSIVE | OBSERVE
+  exact ResourceKey
 ```
 
 Run启动前一次解析全部claims并原子`acquire_all`；运行中禁止新增claim。ResourceArbiter的职责只有**当前进程内互斥与owner生命周期**：
@@ -1410,7 +1409,7 @@ Acquired
 ResourceBusy(conflicting_run)
 ```
 
-它不保存跨进程设备历史、不解释上一次cleanup结果、不执行SAFE、不自动停止其它Run。Workbench可请求停止冲突owner，但必须等待其RunHandle确认真实termination后再重试。同一ResourceKey上的多个OBSERVE可共存；EXCLUSIVE与任何其它claim冲突。父资源EXCLUSIVE与子资源claim冲突；`acquire_all`对完整集合一次判定并提交，不依赖调用方排序规避死锁。
+它不保存跨进程设备历史、不解释上一次cleanup结果、不执行SAFE、不自动停止其它Run。Workbench可请求停止冲突owner，但必须等待其RunHandle确认真实termination后再重试。当前合同只有一种含义：一个Run在存活期间独占它声明的exact ResourceKey；相同key冲突，`acquire_all`对完整集合一次判定并提交。只读界面复用领域已经发布的immutable sample/data tap，不另开driver session，也不进入资源claim。
 
 真实adapter/server connection的跨进程物理排他由具体backend/composition使用SDK exclusive-open、server-side owner token或本机interprocess lock证明；无法证明时只能开放一个真实控制入口。这个physical-owner proof与ResourceArbiter是两层不同事实，generic runtime不为其再造平行lease或持久设备状态机。physical-owner失效时当前Run失败并关闭当前binding；后续连接必须重新取得proof、执行live identity与当前SAFE初始化。
 
@@ -1420,7 +1419,6 @@ claims在bind时声明完整superset，并一直持有到本Run的全部worker�
 
 capability probe一次返回完整frozen snapshot，camera/sequencer descriptor只能从该snapshot纯函数投影；probe结束后不存在仍可读取raw connection的裸callback。active Run内binding失效后不透明重连；关闭旧runtime后可以在同一application process建立全新runtime，且必须重新live握手。
 
-OBSERVE应使用独立只读capability Protocol，而不是把控制对象运行时阉割成read-only wrapper。OBSERVE也不等于允许第二个session并发读同一driver：camera等单owner设备的monitor通过已有CaptureSession broker tap观察immutable samples；只有硬件/adapter明确提供并发只读能力时才创建OBSERVE claim。
 ## 10. Task、Measurement、StreamProcessor 与 Analysis
 
 ### 10.1 Definition 原则
@@ -2135,7 +2133,7 @@ LiveRasterFrame:
 
 Qt终态只有两种不冒充彼此的画面：`QtRasterBoard`是typed语义交互面，`FrozenRasterView`是报告/encoded整板的像素浏览面。后者可以做纯像素zoom/pan，但没有数据坐标、selector、Fit或ROI；需要这些能力的Edit、live viewer和panel card必须进入前者，不能因为已有PNG就降级。`SinglePanelHost`只是单panel的identity/binding facade，不是第二个board；它转发完整typed DTO并由两个以上window复用。
 
-TaskConsole终态不保留`plot_bridge*.py`职责袋。`app.py`只装配catalog/run/data/render/window；`state.py`拥有workspace codec；`panel_types.py`拥有closed产品菜单；非Qt `panel_controller.py`唯一拥有revisioned source binding、typed display state、`PanelComposer`与analysis/control request；`panel_card.py`和`panel_editor.py`只是消费同一`FormSpec + FluentRevisionedFormEditor`的Qt表面；`window.py`组织tabs/cards。现有`BoardController/BoardPublishPort`承担worker compose、latest-only和coherent present，不新增RenderCoordinator。迁移按IMAGE→CURVE/monitor→HISTOGRAM+current fit→SITES/GRID逐kind闭合，每闭一支立即删除对应`PANEL_PARAMS`、`ParamDecl`反向投影、平行`curve_fitting/plot_region.Selection`和旧bridge分支；在真实payload/renderer未闭合前该kind不得标addable。`board.py`与`matplotlib_render.py`只按已有职责机械拆文件（frozen presenter、owner wake、image/numeric gesture、dataset/pulse/export renderer），不以mixins、registry或转发class隐藏god object。
+TaskConsole终态不保留`plot_bridge*.py`职责袋。`app.py`只装配catalog/run/data/render/window；`state.py`拥有workspace codec；`panel_types.py`拥有closed产品菜单；非Qt `panel_controller.py`唯一拥有revisioned source binding、typed display state与analysis/control request，并只产生不可变render request；render lane唯一拥有`PanelComposer/Agg`；`panel_card.py`和`panel_editor.py`只是消费同一`FormSpec + FluentRevisionedFormEditor`及已接受front的Qt表面；`window.py`组织tabs/cards。现有`BoardController/BoardPublishPort`承担worker compose、latest-only和coherent present，不新增RenderCoordinator。迁移按IMAGE→CURVE/monitor→HISTOGRAM+current fit→SITES/GRID逐kind闭合，每闭一支立即删除对应`PANEL_PARAMS`、`ParamDecl`反向投影、平行`curve_fitting/plot_region.Selection`和旧bridge分支；在真实payload/renderer未闭合前该kind不得标addable。`board.py`与`matplotlib_render.py`只按已有职责机械拆文件（frozen presenter、owner wake、image/numeric gesture、dataset/pulse/export renderer），不以mixins、registry或转发class隐藏god object。
 
 Overlay 的鼠标点先用同一 revision 的 ViewportTransform 转回数据坐标，再产生 Selection Command，经 workbench 转成 ControlTopic 或 analysis candidate。zoom/pan 改 ViewSpec/document revision并请求新 LiveRasterFrame；旧 frame 或旧 transform 的事件一律丢弃。非线性轴必须由 transform 显式支持，不能拿线性比例近似。view-evaluation array worker 不访问 Figure/QWidget；WORKER_RASTER_LIVE 的 render worker 可访问且永久独占自己的 Figure，GUI 不访问该 worker state。导出从 FigureDocument + frozen data revision 在 headless renderer 重画，不把屏幕 texture 当权威数据。
 
@@ -2162,7 +2160,7 @@ Plot card -> Analyze -> Fit
 
 完整Monitor/Logic TaskConsole中的落实同样只有这一条路径：card只用自己声明的数据名去匹配Task row的`declared_outputs`；必须恰好匹配一个row，且该row最近一次Run已经`SUCCEEDED`并从`RunHandle.result()`取得真实`ScanArtifactRef`，按钮才可用。两个row声明同名输出时视为歧义并禁用，不能按row顺序、最近时间或当前显示值猜来源。Run start先撤销旧result，terminal snapshot与owner thread退出之间继续非阻塞轮询，直到result已取得才把row转为done；失败、取消、Load、移除row或重绑card都立即撤销入口。TaskConsole不把FINAL artifact重新发布成mutable signal，也不从`ConsoleTickSnapshot`、plot raster或selector反推artifact。旧`AnalysisControls/FitRequest/FitProcessor/region_signal`链整段不存在；以后ROI按独立typed `Selection -> ControlTopic`闭包实现，不能借Fit入口复活旧Hub分析节点。
 
-TaskConsole的Qt timer也不是snapshot生产者：`ConsoleDataPlane.freeze()`只有producer revision或membership真实变化时才构造新的immutable board front；无变化必须返回同一对象。卡片只消费这个front并按自己读取的signal revision决定是否compose，不能因为timer tick、Analysis按钮状态同步或row状态轮询制造全板数据快照。
+TaskConsole的Qt timer也不是snapshot生产者：`ConsoleDataPlane.freeze()`只有producer revision或membership真实变化时才构造新的immutable board front；无变化必须返回同一对象。卡片只消费这个front并按自己读取的signal revision决定是否compose，不能因为timer tick、Analysis按钮状态同步或row状态轮询制造全板数据快照。每个card只在Qt owner上冻结一个窄、不可变render request；唯一串行worker持有该panel的`PanelComposer/Agg`，忙时按panel替换为latest pending request，Qt只接受匹配request revision的结果并present。Setting/Edit文本留在稳定widget中，`editingFinished`/Apply才提交；一次提交只进入这一条render request路径，Edit的frozen pane复制已接受front，不再另建composer或第二次evaluate/rasterize。移除card、source identity变化和console shutdown均把composer释放排到同一worker，不能从Qt线程直接close worker-owned Figure。
 
 这不是把formal能力降格为GUI：当前真实consumer就是人对已提交ScanArtifact做交互分析与显式保存，artifact边界已经权威且可复现。自动/headless preset或下游consumer出现时按§10.5/§11.8另建以FINAL artifact为输入的flat analysis Run；不能为了保持“Add Analysis”这个按钮文字而预建DatasetInputSlot、generic Analysis registry或修改Scan的单FinalCommit语义。
 
@@ -3561,7 +3559,7 @@ F0 只有 contract/unit tests，不作为长期“基础设施里程碑”单独
 
 1. 建立最小 Workbench composition、WorkspaceModel、BoardController、PanelHost 与 RunHandle/status binding；不复制 TaskConsole 业务规则。
 2. 交付 GUI_ARTIST、WORKER_RASTER_LIVE/BoardFrame 和 headless export surface 的接口与真实性能测试。
-3. 建立 `LegacyPanelHost/CatalogRouter`、`LegacyRuntimeFence` 与 `SerializedLegacyAggBridge` 三个窄桥；旧 panel 可逐项隐藏/替换，旧 LogicNode 的所有 start/stop 先登记`LegacyRunFootprint(claims, reference_keys)`，Figure handoff timeout fail-closed。`claims`只描述本run真实host-side控制/读取语义并交给ResourceArbiter；`reference_keys`描述raw connection、接线或binding/lifecycle依赖，只供InstallationRuntime shutdown查找并等待相关handle terminal，绝不自动升级成OBSERVE/EXCLUSIVE claim。VirtualCamera读取其虚拟trigger wire是adapter内部接线事实，不等于CameraMeasurement对sequencer申请OBSERVE。全部referenced devices都必须出现在reference_keys，任何真实读写仍必须出现在claims；缺任一集合或无法证明时，同一ResourceKey的legacy/new mode保守互斥。这样“只引用”不会跨runtime悬挂raw adapter，也不会因虚拟接线错误阻塞另一个合法EXCLUSIVE run。迁移期 PulseGUI 的prepare/fire/abort/safe、notebook/session的camera/sequencer drive verb也必须经同一个LegacyRuntimeFence/installation authority，不能继续持有raw device旁路；无法机械约束的真实入口在迁走前禁用。
+3. 建立 `LegacyPanelHost/CatalogRouter`、`LegacyRuntimeFence` 与 `SerializedLegacyAggBridge` 三个窄桥；旧 panel 可逐项隐藏/替换，旧 LogicNode 的所有 start/stop先登记其真实exact device claims与非控制reference keys。claims只描述本run真实host-side控制/读取语义并交给ResourceArbiter；reference keys只供InstallationRuntime shutdown查找并等待相关handle terminal，不能升级成第二种claim mode。VirtualCamera读取虚拟trigger wire是adapter内部接线事实，不产生sequencer claim。全部真实读写必须列入exact claims；无法证明时同一ResourceKey的legacy/new mode互斥。迁移期 PulseGUI 的prepare/fire/abort/safe、notebook/session的camera/sequencer drive verb也必须经同一个installation authority，不能继续持有raw device旁路；无法机械约束的真实入口在迁走前禁用。
    config/device/virtual-real改变只由LegacyRuntimeFence/InstallationRuntime停止接受新run、等待当前handle真实terminal并关闭本次live connection，再发immutable `ReconnectRequired`/shutdown状态供UI显示；TaskConsole/PulseGUI只在Qt owner thread queued reconcile界面，QWidget hook、panel registry和GUI teardown既不执行硬件stop/close，也不能确认或veto shutdown。GUI未启动、已销毁或事件循环卡住不得改变硬件关闭结果。关闭失败只作为本次连接的显式诊断返回，不能被推导成未来连接的权威事实；后续连接重新执行live identity握手、当前硬件SAFE初始化与能力探测。
 
    当前若存在`Zou_lab_control.neutral_atom._gui -> zlc_workbench` launcher反向import，只允许作为import-ratchet中的这一条S0.5临时shim；notebook facade 当前直接使用的 `_triggered_camera/LegacyNeutralAtomRuntime` 等硬件 composition submodule 也必须迁到两种应用面共同依赖的非 GUI composition owner，不能把 `notebook -> zlc_workbench` 变成永久边。迁移完成前 `zlc_workbench.__init__` 必须保持 lazy，确保 headless notebook import 不连带加载 `zlc_frontend`/renderer；这只是隔离，不是最终所有权。notebook/workbench composition入口接管launcher后，必须在**S0.5完成前**删除上述反向/错误方向边和allowlist。`LegacyRuntimeFence`本体可按最后legacy consumer保留到S5/Z0，但 neutral/notebook 到 workbench 的 import 不能随它存活。

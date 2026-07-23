@@ -305,19 +305,6 @@ def _encoded_figure(
     )
 
 
-def _render_figure(
-    loader,
-    cancelled: threading.Event | None = None,
-) -> EncodedRasterDocument:
-    """Retain the exact encoded fallback used by current fit and figure views."""
-
-    _require_not_cancelled(cancelled)
-    figure = loader()
-    if not isinstance(figure, DataFigure):
-        raise TypeError("figure loader must return DataFigure")
-    return _encoded_figure(figure, cancelled)
-
-
 @dataclass(frozen=True, slots=True)
 class _TypedGridOverview:
     intent: ViewIntent

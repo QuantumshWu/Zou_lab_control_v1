@@ -75,7 +75,7 @@ def _read_pulse_template(path) -> PulseTemplateRows:
     """
 
     import hashlib
-    import json
+    from pathlib import Path
 
     from zlc_neutral_atom.timing.pulse_table import (
         PROBE_TEMPLATE_PATH,
@@ -83,6 +83,7 @@ def _read_pulse_template(path) -> PulseTemplateRows:
         scan_column_spec,
         single_imaging_template,
     )
+    from zlc_storage.paths import PROJECT_ROOT, project_path
 
     state = resolve_fireable_template(path, default_name=PROBE_TEMPLATE_PATH,
                                       default_factory=single_imaging_template)
@@ -101,9 +102,31 @@ def _read_pulse_template(path) -> PulseTemplateRows:
     if not code.strip() and getattr(state, "scan_table", None):
         code = ("scan_table = np.array("
                 + repr([list(row) for row in state.scan_table]) + ", dtype=float)")
-    payload = state.to_dict()
+    # ``program_id`` is the stable identity of the source document, not a digest
+    # of its current contents.  A content digest changes precisely when a slot is
+    # inserted/moved/edited and would force the frontend to throw away every
+    # unaffected ``(program_id, slot_id)`` row.  Project-relative identity also
+    # survives moving the checkout; external files retain their canonical path.
+    source_text = str(path or "").strip() or PROBE_TEMPLATE_PATH
+    project_root = PROJECT_ROOT.resolve(strict=False)
+    candidate = Path(source_text)
+    source_path = candidate if candidate.is_file() else None
+    if source_path is None:
+        for base in (Path("pulses"), project_path("pulses")):
+            shipped = base / candidate.name
+            if shipped.is_file():
+                source_path = shipped
+                break
+    if source_path is None:
+        source_key = "builtin:single_imaging_template"
+    else:
+        source_path = source_path.resolve(strict=False)
+        try:
+            source_key = "project:" + source_path.relative_to(project_root).as_posix()
+        except ValueError:
+            source_key = "external:" + source_path.as_posix()
     program_id = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        source_key.encode("utf-8")
     ).hexdigest()
     api_columns = tuple(
         scan_column_spec(coordinate, "dac" if kind == "dac" else "duration",

@@ -5,8 +5,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from types import MappingProxyType
-from typing import Callable, Mapping
+from typing import Callable
 
 from zlc_storage import canonical_text as _canonical_text
 
@@ -20,7 +19,7 @@ def _canonical_segment(value: str, field: str) -> str:
 
 @dataclass(frozen=True, order=True)
 class ResourceKey:
-    """Canonical hierarchical identity owned by the resource provider."""
+    """Canonical exact identity owned by the resource provider."""
 
     segments: tuple[str, ...]
 
@@ -42,15 +41,6 @@ class ResourceKey:
     def parse(cls, value: str) -> "ResourceKey":
         value = _canonical_text(value, "resource key")
         return cls(tuple(value.split("/")))
-
-    def child(self, *segments: str) -> "ResourceKey":
-        return ResourceKey(self.segments + tuple(segments))
-
-    def overlaps(self, other: "ResourceKey") -> bool:
-        if not isinstance(other, ResourceKey):
-            return False
-        common = min(len(self.segments), len(other.segments))
-        return self.segments[:common] == other.segments[:common]
 
     def __str__(self) -> str:
         return "/".join(self.segments)
@@ -146,21 +136,13 @@ def device_binding_stamp_from_tree(tree: object) -> DeviceBindingStamp:
     )
 
 
-class ClaimMode(str, Enum):
-    EXCLUSIVE = "EXCLUSIVE"
-    OBSERVE = "OBSERVE"
-
-
 @dataclass(frozen=True, order=True)
 class ResourceClaim:
     key: ResourceKey
-    mode: ClaimMode = ClaimMode.EXCLUSIVE
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, ResourceKey):
             raise TypeError("ResourceClaim.key must be ResourceKey")
-        if not isinstance(self.mode, ClaimMode):
-            raise TypeError("ResourceClaim.mode must be ClaimMode")
 
 
 @dataclass(frozen=True)
@@ -170,56 +152,6 @@ class ResourceBusy:
     conflicting_claim: ResourceClaim
 
 
-@dataclass(frozen=True)
-class _ActiveLease:
-    run_id: str
-    claims: tuple[ResourceClaim, ...]
-
-
-_TERMINAL_PUBLICATION_TOKEN = object()
-
-
-class TerminalPublication:
-    """Runtime-owned terminal transition coupled to resource release."""
-
-    __slots__ = ("_publish", "_after", "_published")
-
-    def __init__(
-        self,
-        token: object,
-        publish: Callable[[], None],
-        after: Callable[[], None],
-    ) -> None:
-        if token is not _TERMINAL_PUBLICATION_TOKEN:
-            raise PermissionError("TerminalPublication is runtime-owned")
-        object.__setattr__(self, "_publish", publish)
-        object.__setattr__(self, "_after", after)
-        object.__setattr__(self, "_published", False)
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("TerminalPublication is immutable")
-
-    def _publish_under_resource_lock(self, token: object) -> None:
-        if token is not _TERMINAL_PUBLICATION_TOKEN:
-            raise PermissionError("invalid terminal publication authority")
-        if self._published:
-            raise RuntimeError("terminal publication may run only once")
-        self._publish()
-        object.__setattr__(self, "_published", True)
-
-    def _after_resource_release(self, token: object) -> None:
-        if token is not _TERMINAL_PUBLICATION_TOKEN or not self._published:
-            raise PermissionError("terminal publication is not committed")
-        self._after()
-
-
-def _mint_terminal_publication(
-    publish: Callable[[], None],
-    after: Callable[[], None],
-) -> TerminalPublication:
-    return TerminalPublication(_TERMINAL_PUBLICATION_TOKEN, publish, after)
-
-
 class ResourceLease:
     """Unforgeable ownership capability for one admitted in-process Run."""
 
@@ -227,10 +159,8 @@ class ResourceLease:
         "_arbiter",
         "_capability",
         "_run_id",
-        "_claims",
         "_terminal_lock",
         "_released",
-        "_disposition",
     )
 
     def __init__(
@@ -238,52 +168,34 @@ class ResourceLease:
         arbiter: "ResourceArbiter",
         capability: object,
         run_id: str,
-        claims: tuple[ResourceClaim, ...],
     ) -> None:
         self._arbiter = arbiter
         self._capability = capability
         self._run_id = run_id
-        self._claims = claims
         self._terminal_lock = threading.Lock()
         self._released = False
-        self._disposition: str | None = None
-
-    @property
-    def run_id(self) -> str:
-        return self._run_id
-
-    @property
-    def claims(self) -> tuple[ResourceClaim, ...]:
-        return self._claims
 
     @property
     def released(self) -> bool:
         with self._terminal_lock:
             return self._released
 
-    @property
-    def disposition(self) -> str | None:
-        with self._terminal_lock:
-            return self._disposition
-
     def release_terminal(
         self,
-        publication: TerminalPublication,
-        *,
-        disposition: str,
+        publish: Callable[[], None],
+        after_release: Callable[[], None],
     ) -> bool:
-        if not isinstance(publication, TerminalPublication):
-            raise TypeError("release_terminal requires TerminalPublication")
-        disposition = _canonical_text(disposition, "terminal disposition")
+        if not callable(publish) or not callable(after_release):
+            raise TypeError("terminal callbacks must be callable")
         with self._terminal_lock:
             if self._released:
                 return False
             self._arbiter._release_terminal(
                 self._capability,
                 self._run_id,
-                publication,
+                publish,
+                after_release,
             )
-            self._disposition = disposition
             self._released = True
             return True
 
@@ -292,7 +204,6 @@ class ResourceLease:
             if self._released:
                 return False
             self._arbiter._release_unarmed(self._capability, self._run_id)
-            self._disposition = "UNARMED"
             self._released = True
             return True
 
@@ -305,9 +216,10 @@ class ResourceArbiter:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._condition = threading.Condition(self._lock)
-        self._active: dict[object, _ActiveLease] = {}
-        self._active_by_run: dict[str, object] = {}
+        self._active: dict[
+            str,
+            tuple[object, tuple[ResourceClaim, ...]],
+        ] = {}
         self._closed = False
 
     def shutdown(self) -> None:
@@ -319,7 +231,6 @@ class ResourceArbiter:
                     "cannot shut down ResourceArbiter with active ownership"
                 )
             self._closed = True
-            self._condition.notify_all()
 
     def acquire_all(
         self,
@@ -332,51 +243,43 @@ class ResourceArbiter:
         with self._lock:
             if self._closed:
                 raise RuntimeError("ResourceArbiter is shut down")
-            if run_id in self._active_by_run:
+            if run_id in self._active:
                 raise RuntimeError(f"run {run_id!r} already owns a resource lease")
             for requested in normalized:
-                for active in self._active.values():
-                    for held in active.claims:
-                        if _claims_conflict(requested, held):
-                            return ResourceBusy(requested, active.run_id, held)
-            self._active[capability] = _ActiveLease(run_id, normalized)
-            self._active_by_run[run_id] = capability
-        return ResourceLease(self, capability, run_id, normalized)
-
-    def active_claims(self) -> Mapping[str, tuple[ResourceClaim, ...]]:
-        with self._lock:
-            return MappingProxyType(
-                {active.run_id: active.claims for active in self._active.values()}
-            )
+                for owner, (_token, held_claims) in self._active.items():
+                    for held in held_claims:
+                        if requested.key == held.key:
+                            return ResourceBusy(requested, owner, held)
+            self._active[run_id] = (capability, normalized)
+        return ResourceLease(self, capability, run_id)
 
     def _release_terminal(
         self,
         capability: object,
         run_id: str,
-        publication: TerminalPublication,
+        publish: Callable[[], None],
+        after_release: Callable[[], None],
     ) -> None:
         with self._lock:
             self._require_active(capability, run_id)
-            publication._publish_under_resource_lock(
-                _TERMINAL_PUBLICATION_TOKEN
-            )
-            del self._active[capability]
-            del self._active_by_run[run_id]
-            self._condition.notify_all()
-        publication._after_resource_release(_TERMINAL_PUBLICATION_TOKEN)
+            publish()
+            del self._active[run_id]
+        after_release()
 
     def _release_unarmed(self, capability: object, run_id: str) -> None:
         with self._lock:
             self._require_active(capability, run_id)
-            del self._active[capability]
-            del self._active_by_run[run_id]
-            self._condition.notify_all()
+            del self._active[run_id]
 
-    def _require_active(self, capability: object, run_id: str) -> _ActiveLease:
-        active = self._active.get(capability)
-        if active is None or active.run_id != run_id:
+    def _require_active(
+        self,
+        capability: object,
+        run_id: str,
+    ) -> tuple[ResourceClaim, ...]:
+        active = self._active.get(run_id)
+        if active is None or active[0] is not capability:
             raise RuntimeError("resource lease capability is no longer active")
-        return active
+        return active[1]
 
     @staticmethod
     def _validate_claim_set(
@@ -384,22 +287,11 @@ class ResourceArbiter:
     ) -> tuple[ResourceClaim, ...]:
         if any(not isinstance(claim, ResourceClaim) for claim in claims):
             raise TypeError("claims must contain ResourceClaim values")
-        normalized = tuple(
-            sorted(claims, key=lambda claim: (claim.key, claim.mode.value))
-        )
+        normalized = tuple(sorted(claims, key=lambda claim: claim.key))
         for index, left in enumerate(normalized):
             for right in normalized[index + 1 :]:
-                if left.key.overlaps(right.key):
+                if left.key == right.key:
                     raise ValueError(
-                        "one run cannot request overlapping resources "
-                        f"{left.key} and {right.key}"
+                        f"one run cannot request resource {left.key} twice"
                     )
         return normalized
-
-
-def _claims_conflict(left: ResourceClaim, right: ResourceClaim) -> bool:
-    if not left.key.overlaps(right.key):
-        return False
-    return not (
-        left.mode is ClaimMode.OBSERVE and right.mode is ClaimMode.OBSERVE
-    )

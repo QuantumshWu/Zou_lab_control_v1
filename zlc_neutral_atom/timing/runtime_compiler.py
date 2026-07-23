@@ -40,29 +40,6 @@ DEFAULT_RUNTIME_CLOCK_HZ = _default_clock_hz()
 # from_dict (#G4) so a future schema bump fails fast with a rebuild message instead of mis-decoding.
 _RUNTIME_PROGRAM_VERSION = 4
 
-#: The idle scan-progress reading -- no scan running.  SINGLE SOURCE for the dict shape every
-#: SequencerDevice.scan_progress() returns, so the GUI poll + the virtual/real backends agree.
-SCAN_PROGRESS_IDLE: dict[str, object] = {
-    "scanning": False, "point": 0, "n_points": 0, "sweep": 0, "n_repeats": 0,
-}
-
-#: The ONE deadlock-guard message for "wait forever on a repeat_forever program" -- shared by the
-#: service's wait_done and the virtual backend's real-time override, so the two can never drift.
-WAIT_FOREVER_MESSAGE = ("sequencer wait_done cannot wait forever for a repeat_forever program; "
-                        "pass a timeout or stop the pulse.")
-
-# RPyC-transport array fields.  A large numeric list (the scan_table forward, the compiled
-# scan_points / scan_point_durations on return) crosses the RPyC wire as ONE raw little-endian
-# ndarray buffer instead of a per-number JSON list -- removing the O(N) json.dumps/loads over the
-# tens of thousands of scan numbers (measured ~40 ms round-trip at 20000 points).  The rebuilt value
-# is a NATIVE Python list identical to what json.loads would have produced, so the compiled program
-# is byte-for-byte the same as the all-JSON path (proven by an in-process RPyC-loopback hash check).
-_WIRE_ARRAY_FIELDS_PAYLOAD = ("scan_table",)
-
-_WIRE_ARRAY_FIELDS_PROGRAM = ("scan_points", "scan_point_durations")
-
-
-
 def _channel_delays_list(channel_delays: Mapping[int, int] | None, n_channels: int) -> list[int]:
     """Dense per-channel delay list in FPGA bit order (0 where unset).
 
@@ -223,10 +200,9 @@ class RuntimeBusSegment:
 class RuntimeSequenceProgram:
     """Runtime edge-table program uploaded to a pulse-streamer-like FPGA."""
 
-    # The on-disk/wire identity of this payload -- the CLASS owns it (same pattern as
-    # PulseSequence.schema / PulseTableState.schema): to_dict writes it, from_dict checks it,
-    # and the timing_from_payload dispatcher compares against it, so the string has exactly
-    # one spelling.  (No type annotation: a dataclass must not treat it as a field.)
+    # The on-disk/wire identity of this payload.  ``to_dict`` writes it and
+    # ``from_dict`` checks it.  No type annotation: a dataclass must not treat
+    # it as a field.
     schema = "Zou_lab_control.neutral_atom.RuntimeSequenceProgram"
 
     sequence_id: str
@@ -484,27 +460,6 @@ class RuntimeSequenceProgram:
     @property
     def scan_enabled(self) -> bool:
         return bool(self.scan_points)
-
-def scan_progress_fields(point_total: int, n_points: int, scan_repeats: int) -> dict[str, object]:
-    """Turn a MONOTONIC played-point count into the scan-progress reading.
-
-    ``point_total`` = how many scan points have been played since the scan started (it keeps
-    counting across sweep wraps: sweep s, point p -> s*N + p).  Returns the SINGLE-source dict
-    {scanning, point (0-based in the current sweep), n_points N, sweep (0-based), n_repeats K}.
-    For a finite scan (K>=1) the reading saturates at the last point of sweep K-1 and reports
-    ``scanning=False`` once K full sweeps are done; an infinite scan (K=0) never stops.  Shared
-    by the virtual sequencer (point_total from wall-clock) and the real streamer (point_total =
-    CURSOR + wraps), so both report progress identically (virtual==real)."""
-
-    n = int(n_points)
-    k = max(0, int(scan_repeats))
-    if n <= 0:
-        return dict(SCAN_PROGRESS_IDLE)
-    total = max(0, int(point_total))
-    if k > 0 and total >= k * n:
-        # K full sweeps done: saturate at the last point and stop.
-        return {"scanning": False, "point": n - 1, "n_points": n, "sweep": k - 1, "n_repeats": k}
-    return {"scanning": True, "point": total % n, "n_points": n, "sweep": total // n, "n_repeats": k}
 
 def compile_runtime_program(
     sequence: PulseSequence,
@@ -1019,128 +974,6 @@ def compile_pulse_table_scan_runtime_program(
         channel_delays=channel_delays_list,
         clk_enable=int(clk_enable),
     )
-
-def compile_runtime_program_for_payload(
-    payload: PulseSequence | PulseTableState,
-    *,
-    channels: Sequence[str] | None = None,
-    clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-    port_catalog: PortCatalog | Mapping[str, object] | None = None,
-) -> RuntimeSequenceProgram:
-    """Compile either finite sequence data or GUI pulse-table data."""
-
-    if isinstance(payload, PulseTableState):
-        # Scan path only when there are BOTH bound slots AND at least one scan-table row.
-        # Bound slots with an EMPTY table INTENTIONALLY degrade to a single static program
-        # at the slots' reference values (compile_pulse_table_runtime_program resolves them)
-        # -- a run is never blocked just because the table has not been filled yet.  (A
-        # DIRECT compile_scan call still errors on an empty table, which is the right strict
-        # behavior for that explicit "I am scanning" entry point.)
-        if payload.scan_slots and payload.scan_table:
-            return compile_pulse_table_scan_runtime_program(
-                payload,
-                clock_hz=clock_hz,
-                scan_table=payload.scan_table,
-                repeat_forever=payload.repeat_forever,
-                port_catalog=port_catalog,
-            )
-        return compile_pulse_table_runtime_program(
-            payload,
-            clock_hz=clock_hz,
-            repeat_forever=payload.repeat_forever,
-            port_catalog=port_catalog,
-        )
-    if channels is None:
-        if port_catalog is None:
-            raise ValueError("compiling a PulseSequence requires a PortCatalog")
-        catalog = (
-            port_catalog if isinstance(port_catalog, PortCatalog)
-            else PortCatalog.from_dict(port_catalog)
-        )
-        channels = catalog.raw_lanes
-    return compile_runtime_program(
-        payload, channels=channels, clock_hz=clock_hz, port_catalog=port_catalog)
-
-def timing_payload_to_dict(payload: PulseSequence | PulseTableState, *, time_step_ns: float | None = None) -> dict[str, object]:
-    """Return the JSON-safe timing payload for a sequence or pulse table.
-
-    A ``PulseTableState`` is SNAPPED to the clock-tick grid before serialization, so
-    the pulse transferred to the server/hardware carries the same whole-tick values
-    the GUI displays and the compiler would land on -- there is no place where an
-    off-grid value silently slips through the pulse-transfer API.
-
-    ``time_step_ns`` MUST be the TARGET sequencer's tick (``1e9 / clock_hz``) so the
-    snap lands on the grid the SERVER will compile at -- otherwise a state saved at a
-    different ``time_step_ns`` would be pre-snapped on the wrong grid and the Remote/Virtual
-    result would diverge from a direct local compile at the same clock.  Defaults to the
-    payload's own ``time_step_ns`` only when no target is supplied."""
-
-    if isinstance(payload, PulseTableState):
-        return payload.snapped(time_step_ns=time_step_ns).to_dict()
-    if isinstance(payload, PulseSequence):
-        return payload.to_dict()
-    if isinstance(payload, Mapping):
-        return dict(payload)
-    raise TypeError("timing payload must be a PulseSequence, PulseTableState, or mapping.")
-
-def encode_wire_payload(data: Mapping[str, object], array_fields: Sequence[str]) -> tuple[str, tuple]:
-    """Split only NON-EMPTY ``array_fields`` out of a JSON-safe timing dict into raw ndarray buffers,
-    JSON the rest.
-
-    Returns ``(head_json, blobs)`` where ``blobs`` is a TUPLE of ``(field, raw_bytes, shape, dtype)``
-    -- a tuple (not a dict) so RPyC transfers it BY VALUE (brine serialises tuple/bytes/str/int; a
-    dict would netref).  An empty or absent array field STAYS in the JSON head (as ``[]``), so the
-    decoded payload is byte-for-byte the all-JSON payload -- a no-scan program/table still carries its
-    ``scan_points`` / ``scan_point_durations`` / ``scan_table`` keys and passes the strict exact-field
-    decoder, instead of being silently dropped (only large non-empty arrays take the binary fast path)."""
-    array_field_set = set(array_fields)
-    head: dict[str, object] = {}
-    blobs = []
-    for key, value in data.items():
-        if key in array_field_set and value is not None and hasattr(value, "__len__") and len(value) != 0:
-            arr = np.asarray(value)
-            blobs.append((key, arr.tobytes(), tuple(int(s) for s in arr.shape), arr.dtype.str))
-        else:
-            head[key] = value
-    return json.dumps(head), tuple(blobs)
-
-def decode_wire_payload(head_json: str, blobs: Sequence[tuple]) -> dict:
-    """Inverse of :func:`encode_wire_payload`: JSON-load the head and rebuild each array field from
-    its buffer as a NATIVE Python list -- identical to the all-JSON payload, so downstream compile is
-    unchanged."""
-    out = json.loads(head_json)
-    for field, buf, shape, dtype in (blobs or ()):
-        out[field] = np.frombuffer(buf, dtype=np.dtype(dtype)).reshape(tuple(shape)).tolist()
-    return out
-
-def timing_from_payload(payload) -> PulseSequence | PulseTableState:
-    """Accept local timing objects or their JSON/RPyC-safe dict payload."""
-
-    if isinstance(payload, PulseSequence):
-        return payload
-    if isinstance(payload, PulseTableState):
-        return payload
-    if isinstance(payload, (str, bytes)):
-        return timing_from_payload(json.loads(payload))
-    if isinstance(payload, Mapping):
-        data = dict(payload)
-        schema = data.get("schema", PulseSequence.schema)
-        if schema == PulseTableState.schema:
-            return PulseTableState.from_dict(data)
-        if schema == PulseSequence.schema:
-            return PulseSequence.from_dict(data)
-        raise ValueError(f"unsupported timing payload schema {schema!r}.")
-    if hasattr(payload, "items"):
-        return timing_from_payload(_plain_rpc_payload(payload))
-    raise TypeError("timing payload must be a PulseSequence/PulseTableState or a to_dict() mapping.")
-
-def sequence_from_payload(payload) -> PulseSequence:
-    """Accept a local ``PulseSequence`` or its JSON/RPyC-safe dict payload."""
-
-    timing = timing_from_payload(payload)
-    if not isinstance(timing, PulseSequence):
-        raise TypeError("sequence payload must be a PulseSequence or PulseSequence.to_dict() mapping.")
-    return timing
 
 def _time_to_ticks(value_s: float, clock_hz: float, name: str) -> int:
     raw = float(value_s) * float(clock_hz)
@@ -1864,18 +1697,3 @@ def _pulse_table_has_delays(
         state.delay_steps(channel, slots=slots, time_step_ns=time_step_ns) != 0
         for channel in state.port_catalog.raw_lanes
     )
-
-def _plain_rpc_payload(value):
-    """Recursively convert RPyC netrefs/proxies into local JSON-like objects."""
-
-    if isinstance(value, Mapping) or hasattr(value, "items"):
-        return {str(key): _plain_rpc_payload(item) for key, item in value.items()}
-    if isinstance(value, (str, bytes)):
-        return value
-    if isinstance(value, Sequence):
-        return [_plain_rpc_payload(item) for item in value]
-    try:
-        iterator = iter(value)
-    except TypeError:
-        return value
-    return [_plain_rpc_payload(item) for item in iterator]

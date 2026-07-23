@@ -11,6 +11,7 @@ tests/test_compiled_pulse_artifact.py
 tests/test_console_catalog_bridge.py
 tests/test_console_data_plane.py
 tests/test_task_console_final_fit_entry.py
+tests/test_task_console_render_hot_path.py
 tests/test_console_run_bridge.py
 tests/test_definition_catalog.py
 tests/test_design_charter.py

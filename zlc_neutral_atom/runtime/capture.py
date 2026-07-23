@@ -65,7 +65,6 @@ from .ports import (
     cleanup_device_session,
 )
 from .resources import (
-    ClaimMode,
     DeviceBindingStamp,
     ResourceClaim,
     device_binding_stamp_from_tree,
@@ -1244,7 +1243,7 @@ class BoundCapturePort:
 
     @property
     def resource_claim(self) -> ResourceClaim:
-        return ResourceClaim(self.device.key, ClaimMode.EXCLUSIVE)
+        return ResourceClaim(self.device.key)
 
     @property
     def interrupt_operations(self) -> tuple[SafetyInterrupt, ...]:

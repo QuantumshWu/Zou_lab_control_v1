@@ -63,6 +63,7 @@ from zlc_workbench.scan import (
     FinalScanPresentation,
     PreparedScanPanelRun,
     ScanPanelController,
+    ScanPanelRuntimeUpdate,
     ScanPanelViewModel,
 )
 
@@ -203,6 +204,8 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             tuple[float, float],
         ] | None = None
         self._curve_binding_active = False
+        self._curve_readiness: bool | None = None
+        self._curve_editor_sync_signature: object = None
         self._local_display_diagnostic = ""
         self._reported_final_reference = None
 
@@ -340,7 +343,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         self._wake.bind(self._owner_cycle)
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(40)
-        self._timer.timeout.connect(self._owner_cycle)
+        self._timer.timeout.connect(self._runtime_tick)
         self._reported_runtime_state: tuple[bool, bool] | None = None
         self._start.clicked.connect(self._start_scan)
         self._stop.clicked.connect(self._stop_scan)
@@ -387,6 +390,25 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
     def closed(self) -> bool:
         return self._controller.closed
 
+    @staticmethod
+    def _set_text_if_changed(
+        widget: QtWidgets.QLabel | QtWidgets.QAbstractButton,
+        text: str,
+    ) -> None:
+        if widget.text() != text:
+            widget.setText(text)
+
+    @staticmethod
+    def _set_enabled_if_changed(widget: QtWidgets.QWidget, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if widget.isEnabled() != enabled:
+            widget.setEnabled(enabled)
+
+    @staticmethod
+    def _set_tooltip_if_changed(widget: QtWidgets.QWidget, tooltip: str) -> None:
+        if widget.toolTip() != tooltip:
+            widget.setToolTip(tooltip)
+
     def _visible_curve_matches_current_state(self) -> bool:
         origin = self._provisional_board.visible_curve_origin()
         return (
@@ -426,19 +448,25 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         accepted_base_revision: int | None = None,
         replace_owner: bool = False,
     ) -> None:
+        y_limits = self._visible_curve_y_limits()
         sync_revisioned_form_editors(
             (self._edit_curve_display, self._setting_curve_display),
             revision=self._curve_display.revision,
             semantic_identity=self._curve_display,
             values=curve_display_form_values(self._curve_display),
             runtime_placeholders=runtime_range_placeholders(
-                self._visible_curve_y_limits(),
+                y_limits,
                 "y_min",
                 "y_max",
             ),
             accepted_editor=accepted_editor,
             accepted_base_revision=accepted_base_revision,
             replace_owner=replace_owner,
+        )
+        self._curve_editor_sync_signature = (
+            self._curve_display.revision,
+            self._visible_curve_matches_current_state(),
+            y_limits,
         )
 
     def _apply_curve_display_form(
@@ -573,6 +601,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             self._pending_curve_interaction_origin = None
             self._clear_curve_range_candidate()
         self._curve_binding_active = required
+        self._curve_readiness = None
 
     def _clear_curve_range_candidate(self) -> None:
         self._curve_range_candidate = None
@@ -608,22 +637,27 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
                 > pending.presentation.panel_revision
             ):
                 self._pending_curve_interaction_origin = None
-            self._sync_curve_display_editors()
-        if self._curve_binding_active:
+            y_limits = self._visible_curve_y_limits()
+            editor_signature = (
+                self._curve_display.revision,
+                True,
+                y_limits,
+            )
+            if editor_signature != self._curve_editor_sync_signature:
+                self._sync_curve_display_editors()
+        if self._curve_binding_active and ready != self._curve_readiness:
             self._provisional_board.set_interaction_readiness(
                 image=False,
                 curve=ready,
             )
-        if not ready and self._provisional_board.selectors_enabled:
-            self._provisional_board.set_selectors_enabled(False)
-        elif ready:
-            self._provisional_board.set_selectors_enabled(
-                self._selector_switch.isChecked()
-            )
-        self._selector_switch.setEnabled(ready)
-        self._setting_button.setEnabled(ready)
-        self._edit_curve_display.setEnabled(ready)
-        self._setting_curve_display.setEnabled(ready)
+            self._curve_readiness = ready
+        selector_enabled = ready and self._selector_switch.isChecked()
+        if self._provisional_board.selectors_enabled != selector_enabled:
+            self._provisional_board.set_selectors_enabled(selector_enabled)
+        self._set_enabled_if_changed(self._selector_switch, ready)
+        self._set_enabled_if_changed(self._setting_button, ready)
+        self._set_enabled_if_changed(self._edit_curve_display, ready)
+        self._set_enabled_if_changed(self._setting_curve_display, ready)
         if fault is not None:
             unavailable = (
                 "Curve interaction disabled after callback failure: "
@@ -636,10 +670,10 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
                 else None
             )
         tooltip = "" if unavailable is None else unavailable
-        self._selector_switch.setToolTip(tooltip)
-        self._setting_button.setToolTip(tooltip)
-        self._edit_curve_display.setToolTip(tooltip)
-        self._setting_curve_display.setToolTip(tooltip)
+        self._set_tooltip_if_changed(self._selector_switch, tooltip)
+        self._set_tooltip_if_changed(self._setting_button, tooltip)
+        self._set_tooltip_if_changed(self._edit_curve_display, tooltip)
+        self._set_tooltip_if_changed(self._setting_curve_display, tooltip)
         self._refresh_diagnostics(model)
 
     def _open_display_settings(self) -> None:
@@ -677,7 +711,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             )
             if part
         )
-        self._diagnostics.setText("\n".join(parts))
+        self._set_text_if_changed(self._diagnostics, "\n".join(parts))
 
     def reconfigure(
         self,
@@ -754,16 +788,40 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
     def _owner_cycle(self) -> None:
         model = self._controller.owner_cycle()
         self._apply_model(model)
+        self._sync_runtime_timer()
+        self._finish_close_if_needed(model)
+
+    @QtCore.pyqtSlot()
+    def _runtime_tick(self) -> None:
+        update = self._controller.poll_runtime_change()
+        if update is not None:
+            if update.terminal_boundary:
+                model = self._controller.view_model
+                self._apply_model(model)
+                self._finish_close_if_needed(model)
+            else:
+                self._apply_runtime_update(update)
+        self._sync_runtime_timer()
+
+    def _sync_runtime_timer(self) -> None:
         if self._controller.needs_periodic_poll:
             if not self._timer.isActive():
                 self._timer.start()
         else:
             self._timer.stop()
+
+    def _finish_close_if_needed(self, model: ScanPanelViewModel) -> None:
         if model.closed and not self._allow_close:
             self._timer.stop()
             self._wake.detach()
             self._allow_close = True
             QtCore.QTimer.singleShot(0, self.close)
+
+    def _apply_runtime_update(self, update: ScanPanelRuntimeUpdate) -> None:
+        if update.generation != self._controller.view_model.generation:
+            return
+        self._set_text_if_changed(self._status, update.status)
+        self._set_enabled_if_changed(self._stop, update.can_stop)
 
     def _apply_model(self, model: ScanPanelViewModel) -> None:
         runtime_state = (model.closed, model.can_start and model.worker_idle)
@@ -778,26 +836,32 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             or model.status.startswith("PREPARING")
             or not model.final_only
         )
-        self._mode.setText(
+        self._set_text_if_changed(
+            self._mode,
             (
                 "PROVISIONAL OCCUPANCY CURVE → CANONICAL FINAL"
                 if progressive_mode
                 else self._final_mode_text
-            )
+            ),
         )
-        self._status.setText(model.status)
-        self._artifact.setText(
-            "Artifact: —"
-            if model.artifact_ref is None
-            else f"Artifact: {model.artifact_ref.target_ref}"
+        self._set_text_if_changed(self._status, model.status)
+        self._set_text_if_changed(
+            self._artifact,
+            (
+                "Artifact: —"
+                if model.artifact_ref is None
+                else f"Artifact: {model.artifact_ref.target_ref}"
+            ),
         )
-        self._refresh_diagnostics(model)
-        self._start.setEnabled(model.can_start)
-        self._stop.setEnabled(model.can_stop)
-        if model.display_phase == "PROVISIONAL":
-            self._display_stack.setCurrentWidget(self._provisional_board)
-        else:
-            self._display_stack.setCurrentWidget(self._raster)
+        self._set_enabled_if_changed(self._start, model.can_start)
+        self._set_enabled_if_changed(self._stop, model.can_stop)
+        display_widget = (
+            self._provisional_board
+            if model.display_phase == "PROVISIONAL"
+            else self._raster
+        )
+        if self._display_stack.currentWidget() is not display_widget:
+            self._display_stack.setCurrentWidget(display_widget)
         self._update_projection_label(model)
         presentation = model.presentation
         if presentation is None:
@@ -809,58 +873,49 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
                     self._shown_presentation = None
                     self._rejected_presentation = None
                     self._raster.clear()
-                if model.projection_summary is None:
-                    self._projection.setText(
-                        "Display: FINAL-only; waiting for canonical artifact"
-                        if model.final_only and not model.can_start
-                        else "Display: waiting for scan preparation"
-                    )
-                self._update_curve_controls(model)
+        elif (
+            presentation is not self._shown_presentation
+            and presentation is not self._rejected_presentation
+        ):
+            try:
+                self._raster.present_encoded(
+                    presentation.png_bytes,
+                    image_format="PNG",
+                )
+            except BaseException as error:
+                self._rejected_presentation = presentation
+                self._record_display_failure(
+                    f"Qt rejected the worker-produced PNG raster: {error}"
+                )
             else:
-                self._projection.setText("Display: FINAL artifact retained; raster unavailable")
-                self._update_curve_controls(model)
-            return
-        self._projection.setText(f"Display: {presentation.projection_summary}")
-        if presentation is self._shown_presentation:
-            self._update_curve_controls(model)
-            return
-        if presentation is self._rejected_presentation:
-            self._update_curve_controls(model)
-            return
-        try:
-            self._raster.present_encoded(
-                presentation.png_bytes,
-                image_format="PNG",
-            )
-        except BaseException as error:
-            self._rejected_presentation = presentation
-            self._record_display_failure(
-                f"Qt rejected the worker-produced PNG raster: {error}"
-            )
-            self._update_curve_controls(model)
-            return
-        self._shown_presentation = presentation
-        self._rejected_presentation = None
-        self._local_display_diagnostic = ""
-        self._refresh_diagnostics(model)
+                self._shown_presentation = presentation
+                self._rejected_presentation = None
+                self._local_display_diagnostic = ""
         self._update_curve_controls(model)
 
     def _update_projection_label(self, model: ScanPanelViewModel) -> None:
-        if model.projection_summary is None:
-            return
-        prefix = (
-            "Display (PROVISIONAL): "
-            if model.display_phase == "PROVISIONAL"
-            else "Display: "
-        )
-        text = prefix + model.projection_summary
-        candidate = self._curve_range_candidate
-        if candidate is not None and model.display_phase == "PROVISIONAL":
-            text += (
-                " · DISPLAY ONLY range="
-                f"{candidate[1][0]:.6g}..{candidate[1][1]:.6g}"
+        if model.projection_summary is not None:
+            prefix = (
+                "Display (PROVISIONAL): "
+                if model.display_phase == "PROVISIONAL"
+                else "Display: "
             )
-        self._projection.setText(text)
+            text = prefix + model.projection_summary
+            candidate = self._curve_range_candidate
+            if candidate is not None and model.display_phase == "PROVISIONAL":
+                text += (
+                    " · DISPLAY ONLY range="
+                    f"{candidate[1][0]:.6g}..{candidate[1][1]:.6g}"
+                )
+        elif model.artifact_ref is not None:
+            text = "Display: FINAL artifact retained; raster unavailable"
+        else:
+            text = (
+                "Display: FINAL-only; waiting for canonical artifact"
+                if model.final_only and not model.can_start
+                else "Display: waiting for scan preparation"
+            )
+        self._set_text_if_changed(self._projection, text)
 
     def closeEvent(self, event) -> None:
         if self._allow_close:

@@ -126,6 +126,21 @@ class ScanPanelViewModel:
 
 
 @dataclass(frozen=True, slots=True)
+class ScanPanelRuntimeUpdate:
+    """Narrow owner-thread observation emitted while one Run is live.
+
+    A periodic watcher is allowed to project only the Run fields below.  A
+    terminal transition is a real lifecycle boundary and therefore asks the Qt
+    shell to consume the controller's freshly published full view model once.
+    """
+
+    generation: int
+    status: str
+    can_stop: bool
+    terminal_boundary: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class _WorkToken:
     generation: int
     run_id: RunId | None = None
@@ -135,11 +150,11 @@ class _WorkToken:
 class ScanPanelController:
     """One-Run controller with a worker mailbox and owner-thread state changes.
 
-    ``owner_cycle`` must be called by the GUI owner whenever
-    ``request_owner_wake`` fires and periodically while a Run is active.  The
-    periodic call is only a nonblocking ``RunHandle.snapshot`` poll.  A terminal
-    handle is reaped with ``result``/``wait`` on a worker, never on the GUI
-    thread.
+    ``owner_cycle`` is called for explicit lifecycle edges and worker wakes.
+    While a Run is active, ``poll_runtime_change`` is the only periodic path and
+    observes just the nonblocking ``RunHandle.snapshot`` fields needed by the
+    controls.  A terminal handle is reaped with ``result``/``wait`` on a worker,
+    never on the GUI thread.
     """
 
     def __init__(
@@ -193,6 +208,7 @@ class ScanPanelController:
         self._starting = False
         self._cancel_when_started = False
         self._handle: RunHandle[ScanArtifactRef] | None = None
+        self._last_run_state: RunState | None = None
         self._terminal_work_inflight = False
         self._owner_reaped = True
         self._projection_inflight = False
@@ -237,6 +253,7 @@ class ScanPanelController:
             not self._closed
             and self._handle is not None
             and not self._owner_reaped
+            and not self._terminal_work_inflight
         )
 
     @property
@@ -294,6 +311,7 @@ class ScanPanelController:
         self._generation += 1
         self._application = application
         self._handle = None
+        self._last_run_state = None
         self._owner_reaped = True
         self._artifact_ref = None
         self._presentation = None
@@ -320,6 +338,7 @@ class ScanPanelController:
         self._starting = False
         self._cancel_when_started = False
         self._handle = None
+        self._last_run_state = None
         self._terminal_work_inflight = False
         self._owner_reaped = False
         self._projection_inflight = False
@@ -362,17 +381,60 @@ class ScanPanelController:
             return None
         snapshot = handle.snapshot()
         self._validate_snapshot(handle, snapshot)
+        self._last_run_state = snapshot.state
         if snapshot.state.terminal:
-            self._poll_active_handle()
+            self._poll_active_handle(snapshot)
             return CancelOutcome.ALREADY_TERMINAL
         outcome = handle.cancel("scan panel user requested stop")
         snapshot = handle.snapshot()
+        self._validate_snapshot(handle, snapshot)
+        self._last_run_state = snapshot.state
         self._status = f"{snapshot.state.value} · NOT FINAL"
         self._publish_model()
         return outcome
 
+    def poll_runtime_change(self) -> ScanPanelRuntimeUpdate | None:
+        """Observe only live Run state; never rebuild the whole panel model.
+
+        Worker completions already wake the owner.  This method exists solely
+        for a RunHandle, whose current API has no terminal notification.  An
+        unchanged nonterminal observation performs no Qt-facing projection.
+        """
+
+        self._require_owner()
+        if not self.needs_periodic_poll:
+            return None
+        handle = self._handle
+        assert handle is not None
+        snapshot = handle.snapshot()
+        self._validate_snapshot(handle, snapshot)
+        self._last_run_state = snapshot.state
+
+        previous_status = self._status
+        previous_can_stop = self._view_model.can_stop
+        if snapshot.state.terminal:
+            self._poll_active_handle(snapshot)
+            self._publish_model()
+            return ScanPanelRuntimeUpdate(
+                generation=self._generation,
+                status=self._status,
+                can_stop=self._view_model.can_stop,
+                terminal_boundary=True,
+            )
+
+        status = self._running_status(snapshot)
+        can_stop = True
+        if status == previous_status and can_stop == previous_can_stop:
+            return None
+        self._status = status
+        return ScanPanelRuntimeUpdate(
+            generation=self._generation,
+            status=status,
+            can_stop=can_stop,
+        )
+
     def owner_cycle(self) -> ScanPanelViewModel:
-        """Drain worker completions and poll the active Run without blocking."""
+        """Project one explicit lifecycle/worker-completion boundary."""
 
         self._require_owner()
         if self._closed:
@@ -419,6 +481,7 @@ class ScanPanelController:
         handle = self._handle
         terminal_inflight = self._terminal_work_inflight
         self._handle = None
+        self._last_run_state = None
         if handle is not None and not self._owner_reaped and not terminal_inflight:
             try:
                 handle.cancel("scan panel is closing")
@@ -633,18 +696,22 @@ class ScanPanelController:
         self._handle = handle
         snapshot = handle.snapshot()
         self._validate_snapshot(handle, snapshot)
+        self._last_run_state = snapshot.state
         if self._cancel_when_started:
             handle.cancel("scan panel stop requested before admission returned")
             snapshot = handle.snapshot()
             self._validate_snapshot(handle, snapshot)
+            self._last_run_state = snapshot.state
         self._status = self._running_status(snapshot)
 
-    def _poll_active_handle(self) -> None:
+    def _poll_active_handle(self, snapshot: RunSnapshot | None = None) -> None:
         handle = self._handle
         if handle is None or self._owner_reaped:
             return
-        snapshot = handle.snapshot()
-        self._validate_snapshot(handle, snapshot)
+        if snapshot is None:
+            snapshot = handle.snapshot()
+            self._validate_snapshot(handle, snapshot)
+        self._last_run_state = snapshot.state
         if not snapshot.state.terminal:
             self._status = self._running_status(snapshot)
             return
@@ -901,7 +968,8 @@ class ScanPanelController:
         handle = self._handle
         if handle is None or self._owner_reaped:
             return False
-        return not handle.snapshot().state.terminal
+        state = self._last_run_state
+        return state is not None and not state.terminal
 
     def _build_view_model(self) -> ScanPanelViewModel:
         with self._lock:
@@ -980,5 +1048,6 @@ __all__ = [
     "PreparedScanPanelRun",
     "ScanPanelApplication",
     "ScanPanelController",
+    "ScanPanelRuntimeUpdate",
     "ScanPanelViewModel",
 ]

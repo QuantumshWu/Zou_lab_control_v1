@@ -1,8 +1,8 @@
 """The panel Edit tab: a snapshot of the card plus its full parameter surface.
 
-Qt x matplotlib, so its home is the task console's plot_bridge zone: the editor rebuilds
-figures, owns preview canvases and reads the card's live plotter.  It empties into
-qt_widgets with the rest of the zone at render purification.
+Qt presentation belongs in the task console's plot_bridge zone: the editor owns
+only a frozen raster view and copies the card's accepted immutable front.  It
+never evaluates data or owns a Matplotlib composer.
 
 Every import names a TRUE owner -- nothing here touches the legacy tree.
 """
@@ -12,7 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
-import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 import zlc_frontend.qt_widgets as _qt_widgets
@@ -129,9 +128,10 @@ class PanelEditor(QtWidgets.QWidget):
         # the rows never lie.
         self._param_kind_built = card._param_kind() if card is not None else None
         self._board = None
-        self._composer = None
         self._displayed_figure = None
         self._displayed_display = None
+        self._follow_next_front = False
+        card.front_presented.connect(self._on_card_front_presented)
         # A plot panel's Edit never carries a measurement form or Start/Stop: a plot is a
         # pure VIEW, and the node that produces its data lives on the Logic tab.
         self.meas_panel = None
@@ -182,7 +182,7 @@ class PanelEditor(QtWidgets.QWidget):
         self.title_edit = FluentLineEdit(card.config.title)
         self.title_edit.setPlaceholderText("panel title...")
         self.title_edit.setToolTip("Rename this panel (also the default save name).")
-        self.title_edit.textChanged.connect(self._edit_title)
+        self.title_edit.editingFinished.connect(self._commit_title)
         col.addWidget(FluentSettingRow("title", self.title_edit, label_width=label_w))
 
         # ---- Acquisition: the editable parameters of the SOURCE behind this panel,
@@ -384,73 +384,63 @@ class PanelEditor(QtWidgets.QWidget):
         self.rebuild()
 
     def rebuild(self) -> None:
-        """Snapshot the bound card's CURRENT data onto this tab's own surface.
+        """Copy the card's accepted immutable front into the frozen view.
 
-        Composed from the SAME frozen value and display state the card drew, through the
-        same composer -- so the Edit tab shows what the Monitor panel shows rather than a
-        second rendering that could disagree with it.  Its own composer, though: this
-        surface may be zoomed and sized differently, and sharing one would make the card
-        inherit the Edit tab's viewport.
+        Refresh is a presentation copy, not a second render.  The live card's
+        worker compose is the only evaluation/rasterization for a semantic
+        commit, so the Edit snapshot cannot disagree with it or double the
+        cost of every parameter change.
         """
 
-        from zlc_frontend.panel_render import PanelComposer, PanelProvenance, PanelRenderError
         from zlc_frontend.qt_widgets import FrozenRasterView
 
         card = self.card
-        value = None if card is None else getattr(card, "_last_value", None)
-        if value is None or getattr(value, "snapshot", None) is None:
+        front = (
+            None
+            if card is None or card.board is None
+            else card.board.front_frame
+        )
+        if front is None:
             self.status.setText("open the panel with data first")
             return
         if self._board is None:
-            self._board = FrozenRasterView("edit-%x" % id(self), empty_text="no snapshot yet",
+            self._board = FrozenRasterView(card.panel_id, empty_text="no snapshot yet",
                                        zoomable=True)
             self.canvas_holder.addWidget(self._board)
-        if self._composer is None:
-            self._composer = PanelComposer("edit-%x" % id(self),
-                                           intent=card.view_intent(),
-                                           label=str(value.name))
-        display = card._display_state()
         try:
-            frame = self._composer.compose(
-                value.snapshot,
-                display=display,
-                provenance=PanelProvenance(value.run_id, value.epoch_id, value.join_digest))
-            figure = card.frozen_data_figure(
-                value=value,
-                composer=self._composer,
-            )
-        except PanelRenderError as error:
-            self.status.setText(str(error))
-            return
+            figure = card.frozen_data_figure()
         except Exception as error:
             self.status.setText("%s: %s" % (type(error).__name__, error))
             return
-        self._board.present(frame)
+        self._board.present(front)
         self._displayed_figure = figure
-        self._displayed_display = display
+        self._displayed_display = card._last_display
         self.status.setText("")
 
-    def teardown(self) -> None:
-        """Release this tab's surface.  Its composer goes with it.
+    def _on_card_front_presented(self) -> None:
+        if not self._follow_next_front:
+            return
+        self._follow_next_front = False
+        self.rebuild()
 
-        The composer carries the colour window this snapshot resolved; keeping it
-        past the surface would let a later snapshot of different data inherit the
-        contrast of data it never showed.
-        """
+    def teardown(self) -> None:
+        """Release this tab's frozen Qt presentation surface."""
 
         if self._board is not None:
             self.canvas_holder.removeWidget(self._board)
             self._board.setParent(None)
             self._board.deleteLater()
         self._board = None
-        self._composer = None
+        if self.card is not None:
+            try:
+                self.card.front_presented.disconnect(self._on_card_front_presented)
+            except (TypeError, RuntimeError):
+                pass
 
     def _edit_param(self, key: str, value) -> None:
-        """A plot-param edit from the Edit tab (declarative display knob OR functional param): apply to
-        the LIVE panel via the card's ONE _set_param (config.params + live re-render -- single source,
-        identical to the Setting popup), reveal the Edit tab's OWN fixed lo/hi row when relim flips to
-        ``fixed``, then re-snapshot this canvas so the change shows in both surfaces (#H3v-4b)."""
+        """Commit one authored parameter to the card's sole render request."""
         if self.card is not None:
+            self._follow_next_front = True
             self.card._set_param(key, value)
         if key == "relim" and getattr(self, "ed_fixed_row", None) is not None:
             self._sync_fixed_lim_enabled(str(value))   # enable lo/hi in fixed WITHOUT moving the page
@@ -465,9 +455,8 @@ class PanelEditor(QtWidgets.QWidget):
             # re-seed THOSE boxes here so picking relim in the chooser fills/empties them to match the
             # pin -- runs even when ed_fixed_row is None, unlike the block above (#2 colour range).
             self._seed_clim_boxes()
-        # The knob is stored on the card; re-composing this snapshot from the same
-        # display state is how it shows up here.  There is no second push path.
-        self.rebuild()
+        # ``front_presented`` copies the accepted immutable raster into this
+        # frozen view.  There is deliberately no Edit-side composer.
 
     def _sync_fixed_lim_enabled(self, relim: str) -> None:
         """The Edit tab's fixed lo/hi row is ALWAYS in the layout -- only its INPUTS enable when
@@ -495,27 +484,27 @@ class PanelEditor(QtWidgets.QWidget):
             return
         lo = _safe_float(self.ed_fixed_lo.text(), 0.0)
         hi = _safe_float(self.ed_fixed_hi.text(), 1.0)
+        self._follow_next_front = True
         self.card.apply_fixed_lims(lo, hi)
-        self.rebuild()
 
     def _edit_unit_cycle(self) -> None:
         if self.card is not None:
-            self.card._on_unit_cycle()            # config.params["unit_index"] + live cycle
-        self.rebuild()
+            self.card._on_unit_cycle()
 
-    def _edit_title(self, text: str) -> None:
-        """Rename the panel from the Edit tab: route through the card's sealed title handler
-        (config.title + live plot title via style.apply_title) and keep the Setting popup's
-        title field in sync, then re-snapshot + refresh the save preview."""
+    def _commit_title(self) -> None:
+        """Commit the Edit tab's local title draft once."""
         if self.card is None:
             return
-        self.card._on_title(str(text))            # config.title + sealed live title
+        text = str(self.title_edit.text())
+        if text == self.card.config.title:
+            return
+        self._follow_next_front = True
         edit = getattr(self.card, "title_edit", None)
-        if edit is not None and edit.text() != text:
+        if edit is not None:
             with _signals_blocked(edit):
-                edit.setText(str(text))
+                edit.setText(text)
+        self.card._commit_title()
         self._update_save_preview()               # default save name follows the title
-        self.rebuild()
 
     def refresh_node_now_labels(self) -> None:
         """Update the 'now: <value>' references beside each Acquisition field to the
@@ -561,9 +550,9 @@ class PanelEditor(QtWidgets.QWidget):
             self._await_fresh_frame(self._node, epoch0)
         else:
             # idle: apply published a fresh frame synchronously, so it is already here
+            self._follow_next_front = True
             self.console.refresh_once()
             self.status.setText("acquisition started with the new parameters")
-            self.rebuild()
 
     def _apply_source_form(self) -> None:
         """Apply the SOURCE node's edited parameter form (#2) to the producing node --
@@ -578,9 +567,9 @@ class PanelEditor(QtWidgets.QWidget):
         if not self.console._apply_source_params(self._source_row, values):
             self.status.setText("locked: a task is running — Stop it first")
             return
+        self._follow_next_front = True
         self.console.refresh_once()
         self.status.setText("source parameters applied")
-        self.rebuild()
 
     def _await_fresh_frame(self, node, epoch0: int, *, _tries: int = 0) -> None:
         """Poll (off the GUI critical path) until the running node has published its
@@ -593,9 +582,9 @@ class PanelEditor(QtWidgets.QWidget):
             return
         epoch = int(getattr(node, "acquisition_epoch", lambda: epoch0 + 1)())
         if epoch > epoch0 or _tries >= 600:    # ~600 * 25 ms = 15 s safety cap
+            self._follow_next_front = True
             self.console.refresh_once()
             self.refresh_node_now_labels()
-            self.rebuild()
             return
         from PyQt5 import QtCore
         QtCore.QTimer.singleShot(25, lambda: self._await_fresh_frame(node, epoch0, _tries=_tries + 1))
@@ -737,11 +726,11 @@ class PanelEditor(QtWidgets.QWidget):
         autoscaled away."""
         if self.xmin is None:
             return
-        applied, cleared = [], []
+        applied, cleared, updates = [], [], {}
         for key, lo_box, hi_box in self._limit_axes():
             lo_text, hi_text = lo_box.text().strip(), hi_box.text().strip()
             if not lo_text and not hi_text:
-                self._edit_param(key, None)          # empty pair = release THIS axis's pin
+                updates[key] = None                  # empty pair = release THIS axis's pin
                 cleared.append(key[5])               # 'x' / 'y'
                 continue
             try:
@@ -749,8 +738,11 @@ class PanelEditor(QtWidgets.QWidget):
             except ValueError as exc:
                 self.status.setText(f"bad limits: {exc}")
                 return
-            self._edit_param(key, (lo, hi))
+            updates[key] = (lo, hi)
             applied.append(key[5])
+        if self.card is not None:
+            self._follow_next_front = True
+            self.card._set_params(updates)
         parts = ([f"{'/'.join(applied)} range applied"] if applied else []) + \
                 ([f"{'/'.join(cleared)} range cleared"] if cleared else [])
         self.status.setText("; ".join(parts) + " (all subplots)")
@@ -763,10 +755,14 @@ class PanelEditor(QtWidgets.QWidget):
         over showing the now-auto range -- the Limits counterpart of :meth:`clear_fit`."""
         if self.xmin is None:
             return
+        updates = {}
         for key, lo_box, hi_box in self._limit_axes():
-            self._edit_param(key, None)
+            updates[key] = None
             with _signals_blocked(lo_box, hi_box):
                 lo_box.setText(""); hi_box.setText("")
+        if self.card is not None:
+            self._follow_next_front = True
+            self.card._set_params(updates)
         self.refresh_limit_hints()
         self.status.setText("view range cleared (auto)")
 
@@ -797,13 +793,10 @@ class PanelEditor(QtWidgets.QWidget):
         except ValueError as exc:
             self.status.setText(f"bad colour range: {exc}")
             return
-        self._edit_param("relim", "fixed")          # make the fixed clim take effect (seeds from view) ...
         if self.card is not None:
-            self.card.apply_fixed_lims(lo, hi)      # ... then overwrite with the typed lo/hi (final state)
-        self.rebuild()                              # this snapshot re-composes from that one source
+            self._follow_next_front = True
+            self.card.apply_fixed_lims(lo, hi)
         self._sync_relim_combo("fixed")
-        # _edit_param("relim","fixed") re-seeded the boxes from the FROZEN current view; re-seed now that
-        # apply_fixed_lims has written the TYPED lo/hi so the boxes show what was actually pinned.
         self._seed_clim_boxes()
         self.status.setText("colour range applied")
 

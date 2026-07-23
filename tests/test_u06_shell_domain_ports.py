@@ -322,6 +322,18 @@ def test_the_template_reader_returns_rows_the_gui_can_draw_without_pulse_types()
         path = Path(tmp) / "template.json"
         path.write_text(json.dumps(state.to_dict(), default=str), encoding="utf-8")
         rows = pulse_template_rows(str(path))
+        first_program_id = rows.program_id
+        # A program is the source document, not one frozen content hash. Slot/code
+        # edits inside that document must leave the outer identity stable so the UI
+        # can reconcile surviving slot ids instead of replacing every row.
+        state.scan_code = "scan_table = np.array([[1.0]])"
+        path.write_text(json.dumps(state.to_dict(), default=str), encoding="utf-8")
+        edited_rows = pulse_template_rows(str(path))
+        copied = Path(tmp) / "other-template.json"
+        copied.write_text(json.dumps(state.to_dict(), default=str), encoding="utf-8")
+        copied_rows = pulse_template_rows(str(copied))
+        assert edited_rows.program_id == first_program_id
+        assert copied_rows.program_id != first_program_id
     assert isinstance(rows, PulseTemplateRows)
     assert isinstance(rows.program, str) and isinstance(rows.program_id, str)
     for row in rows.api_rows:

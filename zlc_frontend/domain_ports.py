@@ -114,8 +114,9 @@ class PulseTemplateRows:
                     hands them to the (pure) template writer.
     ``program``   : the hardware scan program text, or the array literal a stored
                     scan table falls back to.
-    ``program_id``: a digest of the resolved template, so the form can tell a
-                    reload of the SAME program from a different one.
+    ``program_id``: a stable digest of the resolved source-document identity, so
+                    content edits can reconcile surviving slot ids while a
+                    different source cannot inherit their drafts.
     """
 
     api_rows: tuple = ()

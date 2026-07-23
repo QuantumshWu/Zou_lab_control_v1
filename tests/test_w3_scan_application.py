@@ -101,6 +101,7 @@ from zlc_workbench.scan import (
     FinalScanPresentation,
     PreparedScanPanelRun,
     ScanPanelController,
+    ScanPanelRuntimeUpdate,
 )
 
 
@@ -1577,6 +1578,49 @@ def _assert_occupancy_scan_window(exp, request, monkeypatch):
             )
             assert edit_editor is not None and edit_editor.base_revision == 1
             assert setting_editor is not None and setting_editor.base_revision == 1
+
+            # The live Run watcher is deliberately narrower than an owner
+            # boundary.  Real Qt input remains a local draft while repeated
+            # runtime observations update only the status controls; they must
+            # never re-enter the whole-window projection path.
+            draft_field = edit_editor._form.widget_for("y_min")
+            assert isinstance(draft_field, QtWidgets.QLineEdit)
+            draft_field.setFocus()
+            QtTest.QTest.keyClick(
+                draft_field,
+                QtCore.Qt.Key_A,
+                QtCore.Qt.ControlModifier,
+            )
+            QtTest.QTest.keyClicks(draft_field, "123.25")
+            assert edit_editor._dirty
+            draft_text = draft_field.text()
+            original_poll = window._controller.poll_runtime_change
+            original_apply = window._apply_model
+
+            def forbid_full_runtime_projection(_model):
+                raise AssertionError(
+                    "active runtime watcher re-entered full model projection"
+                )
+
+            try:
+                window._controller.poll_runtime_change = lambda: (
+                    ScanPanelRuntimeUpdate(
+                        generation=window._controller.view_model.generation,
+                        status="RUNNING / narrow-watch · PROVISIONAL",
+                        can_stop=True,
+                    )
+                )
+                window._apply_model = forbid_full_runtime_projection
+                for _ in range(4):
+                    window._runtime_tick()
+            finally:
+                window._controller.poll_runtime_change = original_poll
+                window._apply_model = original_apply
+            assert draft_field.text() == draft_text
+            assert edit_editor._dirty
+            edit_editor._request_cancel()
+            assert not edit_editor._dirty
+
             setting.click()
             application.processEvents()
             popup = window.findChild(FluentPopup, "scanDisplaySettingsPopup")

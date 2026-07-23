@@ -242,7 +242,7 @@ def test_run_plan_has_distinct_prepared_executed_and_final_values(tmp_path):
     ).result(2.0)
     assert result == "final"
     assert observations == ["preflight", "execute", "finalize"]
-    assert not arbiter.active_claims()
+    assert not arbiter._active
     close_runtime(runtime, arbiter, item)
 def test_resource_claim_is_held_through_cleanup_until_terminal_publication(tmp_path):
     item = device_fixture("claim")
@@ -257,13 +257,13 @@ def test_resource_claim_is_held_through_cleanup_until_terminal_publication(tmp_p
 
     handle = runtime.start(plan(item, cleanup=cleanup))
     assert cleanup_entered.wait(1.0)
-    assert arbiter.active_claims()
+    assert arbiter._active
     with pytest.raises(RunStartRejected) as caught:
         runtime.start(plan(item))
     assert isinstance(caught.value.outcome, ResourceBusy)
     cleanup_release.set()
     assert handle.result(2.0) == "prepared"
-    assert not arbiter.active_claims()
+    assert not arbiter._active
     close_runtime(runtime, arbiter, item)
 def test_child_code_gets_read_only_cancellation_and_handle_owns_transition(tmp_path):
     item = device_fixture("readonly-cancel")
@@ -506,5 +506,5 @@ def test_owner_thread_start_failure_releases_unarmed_claim(tmp_path, monkeypatch
     monkeypatch.setattr(threading.Thread, "start", fail_owner_start)
     with pytest.raises(RuntimeError, match="owner thread failed to start"):
         runtime.start(plan(item))
-    assert not arbiter.active_claims()
+    assert not arbiter._active
     close_runtime(runtime, arbiter, item)
