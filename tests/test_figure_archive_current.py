@@ -257,6 +257,12 @@ def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
             ),
         )
         pane = viewer.figure_pane
+        board = viewer.findChild(
+            QtRasterBoard,
+            "figureViewerTypedBoard",
+        )
+        assert pane is not None and pane.isVisible()
+        assert board is not None and board.isVisible()
         digest = viewer.archive.payload_digest
         assert not wrapper.grab().isNull()
 

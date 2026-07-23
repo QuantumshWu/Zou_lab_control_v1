@@ -391,6 +391,11 @@ class FigureViewer(QtWidgets.QWidget):
             self._placeholder.deleteLater()
             self._placeholder = None
         self._pane_holder.addWidget(candidate)
+        # The candidate is constructed parentless while its first raster is
+        # rendered.  Reparenting that already-created widget into a visible
+        # layout does not make it visible on every Qt platform, so the
+        # generation commit must explicitly publish the admitted pane.
+        candidate.show()
         self.figure_pane = candidate
         if previous is not None:
             self._retire_pane(previous)
