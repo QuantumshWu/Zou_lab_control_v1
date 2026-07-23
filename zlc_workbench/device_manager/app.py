@@ -175,6 +175,7 @@ def open_device_manager(
     experiment=None,
     *,
     document: InstallationConfigDocument | None = None,
+    config_path: str | Path | None = None,
     repository: str | Path | None = None,
     name: str = "neutral_atom",
     on_initialized=None,
@@ -193,6 +194,8 @@ def open_device_manager(
 
     if experiment is not None and document is not None:
         raise ValueError("a bound Experiment already supplies its installation config")
+    if experiment is not None and config_path is not None:
+        raise ValueError("a bound Experiment has no DeviceManager disk baseline")
     if on_initialized is not None and not callable(on_initialized):
         raise TypeError("on_initialized must be callable or None")
     if experiment is not None:
@@ -208,7 +211,14 @@ def open_device_manager(
         name=name,
     )
     active = authority.state().active_config
-    editor = DeviceConfigEditorSession(document, active_document=active)
+    editor = DeviceConfigEditorSession(
+        document,
+        active_document=active,
+        path=config_path,
+        baseline_digest=(
+            None if config_path is None else document.content_digest
+        ),
+    )
     controller = DeviceManagerController(editor, authority)
     if on_initialized is not None:
         def publish_initialized(state: DeviceAdminState) -> None:
@@ -228,6 +238,7 @@ def open_device_manager(
     body = launch_device_manager_window(
         controller,
         hide_on_close=experiment is not None,
+        shutdown_on_owner_close=experiment is None,
     )
     if experiment is not None and on_initialized is not None:
         from PyQt5 import QtCore

@@ -88,6 +88,7 @@ class _StandaloneTaskConsoleFlow:
     def __init__(self, args) -> None:
         self.args = args
         self.devices = None
+        self.closing_devices = None
         self.console = None
         self.experiment = None
         self.failure: BaseException | None = None
@@ -137,7 +138,30 @@ class _StandaloneTaskConsoleFlow:
         self.experiment = None
         devices, self.devices = self.devices, None
         if devices is not None:
+            self.closing_devices = devices
             devices.request_owner_close()
+
+    def finish_close(
+        self,
+        application,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        """Wait for DeviceManager's asynchronous installation shutdown."""
+
+        self.close()
+        devices = self.closing_devices
+        if devices is None:
+            return
+        deadline = time.monotonic() + float(timeout_seconds)
+        while not devices.permanently_closed and time.monotonic() < deadline:
+            application.processEvents()
+            time.sleep(0.005)
+        if not devices.permanently_closed:
+            raise RuntimeError(
+                "DeviceManager did not finish its bounded installation shutdown"
+            )
+        self.closing_devices = None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -166,7 +190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             _close_window(application, flow.console)
         finally:
-            flow.close()
+            flow.finish_close(application)
 
 
 if __name__ == "__main__":

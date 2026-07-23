@@ -4058,10 +4058,16 @@ def device_manager(
     """Open the standalone config editor before any installation is composed."""
 
     document = _resolve_installation_document(config, seed)
+    config_path = None
+    if isinstance(config, Path):
+        config_path = config.expanduser().resolve()
+    elif isinstance(config, str) and config not in {"virtual", "remote_pulse"}:
+        config_path = Path(config).expanduser().resolve()
     from zlc_workbench.device_manager.app import open_device_manager
 
     return open_device_manager(
         document=document,
+        config_path=config_path,
         repository=repository,
         name=name,
         on_initialized=on_initialized,

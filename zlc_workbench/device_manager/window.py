@@ -106,12 +106,14 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self,
         controller: DeviceManagerController,
         *,
+        shutdown_on_owner_close: bool,
         parent=None,
     ) -> None:
         if not isinstance(controller, DeviceManagerController):
             raise TypeError("controller must be DeviceManagerController")
         super().__init__(parent)
         self._controller = controller
+        self._shutdown_on_owner_close = bool(shutdown_on_owner_close)
         self._window = None
         self._permanently_closed = False
         self._close_after_shutdown = False
@@ -451,8 +453,8 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
             self.loaded_layout.insertWidget(index, card)
         self.loaded_empty.setVisible(not rows)
         self._refresh_chrome()
-        if self._close_after_shutdown and state.closed and self._window is not None:
-            QtCore.QTimer.singleShot(0, self._window.close)
+        if self._close_after_shutdown and state.closed:
+            self._finalize_owner_close()
 
     @QtCore.pyqtSlot(bool, str)
     def _busy_changed(self, busy: bool, label: str) -> None:
@@ -465,6 +467,10 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         mapped = severity if severity in FluentStatusStrip.SEVERITIES else "info"
         self._last_status = (str(text), mapped)
         self.status_strip.show_message(str(text), severity=mapped)
+        if mapped == "error" and self._close_after_shutdown:
+            self._close_after_shutdown = False
+            if self._window is not None:
+                self._window.show()
 
     def _refresh_chrome(self) -> None:
         editor = self._controller.editor
@@ -612,16 +618,14 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
     def _close_from_owner(self) -> None:
         if self._permanently_closed:
             return
-        self._permanently_closed = True
-        self._controller.close()
-        window = self._window
-        self._window = None
-        if window is not None:
-            release_window(window)
-            window.hide()
-            window.deleteLater()
+        if self._shutdown_on_owner_close:
+            self._begin_owned_close()
+            return
+        self._finalize_owner_close()
 
-    def _request_standalone_close(self) -> bool:
+    def _begin_owned_close(self) -> bool:
+        """Start the one async shutdown path used by every owned window."""
+
         if self._permanently_closed:
             return True
         if self._controller.busy:
@@ -638,11 +642,24 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
             )
             self._call(self._controller.shutdown_for_restart)
             return False
-        self._permanently_closed = True
-        self._controller.close()
-        if self._window is not None:
-            release_window(self._window)
+        self._finalize_owner_close()
         return True
+
+    def _finalize_owner_close(self) -> None:
+        if self._permanently_closed:
+            return
+        self._permanently_closed = True
+        self._close_after_shutdown = False
+        self._controller.close()
+        window = self._window
+        self._window = None
+        if window is not None:
+            release_window(window)
+            window.hide()
+            window.deleteLater()
+
+    def _request_standalone_close(self) -> bool:
+        return self._begin_owned_close()
 
     def _attach_window(self, window) -> None:
         self._window = window
@@ -652,11 +669,15 @@ def launch_device_manager_window(
     controller: DeviceManagerController,
     *,
     hide_on_close: bool = False,
+    shutdown_on_owner_close: bool = False,
 ) -> DeviceManagerWindowBody:
     """Launch the DeviceManager through the one shared Fluent sequence."""
 
     ensure_qt_app()
-    body = DeviceManagerWindowBody(controller)
+    body = DeviceManagerWindowBody(
+        controller,
+        shutdown_on_owner_close=shutdown_on_owner_close,
+    )
     initial = screen_fit_window_size(WINDOW_SCREEN_FRACTION)
 
     def wire(window) -> None:

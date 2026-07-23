@@ -19,6 +19,10 @@ from zlc_frontend.qt_widgets import (
     fluent_scale,
     set_fluent_scale,
 )
+from zlc_neutral_atom.installation_config import (
+    InstallationConfigDocument,
+    save_installation_config,
+)
 
 
 def _replace_text(widget, text: str) -> None:
@@ -68,7 +72,11 @@ def test_formal_device_manager_edits_locally_then_initializes_and_closes(
         _replace_text(seed_widget, "13")
 
         QtTest.QTest.mouseClick(body.lifecycle_button, QtCore.Qt.LeftButton)
-        until(application, lambda: body.experiment is not None, timeout=15.0)
+        until(
+            application,
+            lambda: body._controller.state.active_config is not None,
+            timeout=15.0,
+        )
         until(
             application,
             lambda: set(body._loaded_cards)
@@ -94,12 +102,12 @@ def test_formal_device_manager_edits_locally_then_initializes_and_closes(
         assert id(body.form.widget_for("seed")) == stable_identity
 
         wrapper.close()
-        until(application, lambda: not wrapper.isVisible(), timeout=15.0)
-        assert body.experiment is None
+        until(application, lambda: body.permanently_closed, timeout=15.0)
+        assert body._controller.state.active_config is None
     finally:
-        if wrapper.isVisible():
+        if not body.permanently_closed:
             wrapper.close()
-            until(application, lambda: not wrapper.isVisible(), timeout=15.0)
+            until(application, lambda: body.permanently_closed, timeout=15.0)
 
 
 def test_task_console_launcher_initializes_through_device_manager_then_reuses_owner(
@@ -143,7 +151,11 @@ def test_task_console_launcher_initializes_through_device_manager_then_reuses_ow
             timeout=15.0,
         )
         assert flow.failure is None
-        assert devices.experiment is not None
+        assert flow.experiment is not None
+        assert (
+            devices._controller.state.runtime_instance_id
+            == flow.experiment.device_catalog.runtime_instance_id
+        )
         assert not device_wrapper.isVisible()
 
         console_wrapper = flow.console.window()
@@ -159,10 +171,30 @@ def test_task_console_launcher_initializes_through_device_manager_then_reuses_ow
         console_wrapper.close()
         until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
         until(application, lambda: devices.permanently_closed, timeout=15.0)
-        assert devices.experiment is None
+        assert devices._controller.state.active_config is None
     finally:
         if console_wrapper is not None and console_wrapper.isVisible():
             console_wrapper.close()
             until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
         flow.close()
         application.processEvents()
+
+
+def test_saved_config_opens_as_the_exact_editing_baseline(tmp_path):
+    configure_offscreen_fast_path()
+    application = ensure_qt_app()
+    path = tmp_path / "installation.json"
+    document = InstallationConfigDocument.virtual(seed=23)
+    save_installation_config(path, document)
+
+    body = device_manager(path, repository=tmp_path / "workspace")
+    wrapper = body.window()
+    try:
+        assert body._controller.editor.path == path.resolve()
+        assert body._controller.editor.baseline_digest == document.content_digest
+        assert not body._controller.editor.dirty
+        assert body.document_name.text() == path.name
+        assert body.save_button.isEnabled()
+    finally:
+        wrapper.close()
+        until(application, lambda: body.permanently_closed, timeout=15.0)
