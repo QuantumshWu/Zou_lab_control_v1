@@ -727,6 +727,37 @@ def _decimate_image_view(
         y0 + row0 * y_step,
     )
 
+
+_DISTRIBUTION_SAMPLE_TARGET = 200_000
+
+
+def _image_distribution_values(
+    values: np.ndarray,
+    validity: np.ndarray,
+) -> np.ndarray:
+    """Return Main's bounded, even-stride display sample.
+
+    The side band is presentation, not an authoritative reduction.  A dense
+    camera frame therefore uses the established representative sample instead
+    of copying/histogramming every pixel on every live revision.  If a sparse
+    validity mask leaves that stride empty, fall back to all valid pixels so a
+    small ROI cannot render as a blank distribution.
+    """
+
+    flat_values = np.asarray(values).reshape(-1)
+    flat_validity = np.asarray(validity, dtype=bool).reshape(-1)
+    if flat_values.size > _DISTRIBUTION_SAMPLE_TARGET:
+        step = flat_values.size // _DISTRIBUTION_SAMPLE_TARGET + 1
+        sampled = flat_values[::step]
+        sampled_validity = flat_validity[::step]
+        if bool(np.all(sampled_validity)):
+            return sampled
+        if bool(np.any(sampled_validity)):
+            return sampled[sampled_validity]
+    if bool(np.all(flat_validity)):
+        return flat_values
+    return flat_values[flat_validity]
+
 def _compact_engineering(value: float, length: int = 5) -> str:
     if not np.isfinite(value):
         return "nan"
@@ -1060,9 +1091,9 @@ class ImagePanelAggRenderer:
             self._axis.set_xlim(*x_limits)
             self._axis.set_ylim(*y_limits)
 
-            # The side distribution is part of the pixel contract.  It must use
-            # every valid value; display performance comes from the worker-owned
-            # Agg/blit lifecycle, never from silently sampling the data.
+            # The side distribution is display-only.  Main's bounded
+            # representative sample is part of its live-image performance and
+            # visual contract; authoritative data remains untouched.
             bin_count = (
                 max(8, min(max(image.values.size, 1) // 4, 50))
                 if distribution_bins is None
@@ -1086,15 +1117,9 @@ class ImagePanelAggRenderer:
             ):
                 counts, edges = self._distribution_cache_value
             else:
-                # The common camera contract is fully valid and finite.  Its
-                # immutable C-contiguous plane can enter np.histogram directly;
-                # boolean indexing used to copy every one of the 2.3M values
-                # before the same exact calculation.  Exceptional validity
-                # still follows the original finite-mask path byte-for-byte.
-                finite_values = (
-                    values.reshape(-1)
-                    if all_finite_validity
-                    else np.asarray(values[finite_validity])
+                finite_values = _image_distribution_values(
+                    values,
+                    finite_validity,
                 )
                 counts, edges = np.histogram(
                     (

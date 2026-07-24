@@ -164,6 +164,7 @@ CURVE_CONTRACT = ViewContract(
                 SPECTRAL,
                 SCAN_POINT,
                 MONITOR_HISTORY,
+                SITE,
                 SPATIAL_X,
                 SPATIAL_Y,
             ),

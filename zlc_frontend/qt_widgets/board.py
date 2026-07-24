@@ -821,6 +821,8 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._require_owner()
         if not isinstance(gesture, RectangleGesture):
             raise TypeError("gesture must be RectangleGesture")
+        if gesture.normalized_bounds is None:
+            raise ValueError("a cleared image rectangle has no Selection")
         hold = self._selector_hold
         binding = self._image_bindings.get(gesture.panel_id)
         if (
@@ -1872,6 +1874,13 @@ class QtRasterBoard(QtWidgets.QWidget):
             return
         target = self._selector_target(image_binding)
         completed_bounds: NormalizedRectangle | None = None
+        # ``RectangleDrag.fresh`` is the only drag whose initial rectangle is
+        # degenerate.  That fact distinguishes a blank left click (clear Area)
+        # from an unmoved click on a standing rectangle's handle/centre.
+        fresh_drag = (
+            rectangle_drag.initial[0] == rectangle_drag.initial[2]
+            or rectangle_drag.initial[1] == rectangle_drag.initial[3]
+        )
         if target is not None:
             point = _normalized_point(event.localPos(), target[0], clamp=True)
             visible_bounds = rectangle_drag.moved(
@@ -1882,7 +1891,11 @@ class QtRasterBoard(QtWidgets.QWidget):
                 visible_bounds[0] == visible_bounds[2]
                 or visible_bounds[1] == visible_bounds[3]
             ):
-                image_binding.draft_bounds = image_binding.drag_prior_draft
+                image_binding.draft_bounds = (
+                    None
+                    if fresh_drag
+                    else image_binding.drag_prior_draft
+                )
             else:
                 completed_bounds = _image_bounds_for_rectangle_drag(
                     image_binding,
@@ -1899,7 +1912,11 @@ class QtRasterBoard(QtWidgets.QWidget):
         # this completed draft rather than classify it as a partial drag.
         image_binding.rectangle_drag = None
         try:
-            if bounds is not None and hold is not None and callback is not None:
+            if (
+                (bounds is not None or fresh_drag)
+                and hold is not None
+                and callback is not None
+            ):
                 gesture = RectangleGesture(
                     panel_id=hold.panel_id,
                     board_id=hold.board_id,

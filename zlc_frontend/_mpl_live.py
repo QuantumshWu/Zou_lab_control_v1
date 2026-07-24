@@ -117,6 +117,7 @@ from ._mpl_curve import (
 from ._mpl_histogram import (
     _histogram,
     _histogram_projection,
+    _update_histogram_artist,
     _update_histogram_presentation,
 )
 
@@ -140,6 +141,7 @@ class SinglePanelAggRenderer:
         "_latest_text",
         "_owner_thread",
         "_rolling_distribution",
+        "_rolling_trace",
         "_side_axis",
         "_side_count_ceiling",
         "_size",
@@ -155,6 +157,7 @@ class SinglePanelAggRenderer:
         width: int,
         height: int,
         dpi: float = LIVE_PANEL_DPI,
+        rolling_trace: bool = False,
         rolling_distribution: bool = False,
         value_label: str = "Signal",
         title: str | None = None,
@@ -226,6 +229,7 @@ class SinglePanelAggRenderer:
         self._owner_thread = threading.get_ident()
         self._size = (width, height)
         self._rolling_distribution = bool(rolling_distribution)
+        self._rolling_trace = bool(rolling_trace or rolling_distribution)
         self._value_label = str(value_label)
         self._title_override = None if title is None else str(title)
         self._document = document
@@ -417,7 +421,7 @@ class SinglePanelAggRenderer:
         # the same evaluated revision.  No autoscale call follows these pins.
         axis.set_xlim(*x_limits)
         axis.set_ylim(*y_limits)
-        self._update_rolling_distribution(
+        self._update_rolling_trace(
             tuple(pre_series_group),
             y_limits,
         )
@@ -456,12 +460,41 @@ class SinglePanelAggRenderer:
             fit_overlays,
         )
 
-    def _update_rolling_distribution(
+    def _update_rolling_trace(
         self,
         series_group,
         y_limits: tuple[float, float],
     ) -> None:
-        """Move the monitor's stable side histogram and latest readout."""
+        """Move Main's rolling readout and its optional side distribution."""
+
+        if not self._rolling_trace:
+            return
+
+        first = series_group[0].data
+        if not isinstance(first, EvaluatedCurve):
+            raise TypeError("rolling trace requires EvaluatedCurve")
+        values = np.asarray(first.values)
+        validity = np.asarray(first.validity, dtype=bool)
+
+        latest = None
+        if values.size:
+            indices = np.flatnonzero(validity)
+            if indices.size:
+                latest = float(values[int(indices[0])])
+        label = "" if latest is None else f"{latest:.6g}"
+        if self._latest_text is None:
+            self._latest_text = self._axis.text(
+                0.97,
+                0.95,
+                label,
+                transform=self._axis.transAxes,
+                color=PALETTE["readout"],
+                ha="right",
+                va="top",
+                fontsize=small_fontsize(),
+            )
+        else:
+            self._latest_text.set_text(label)
 
         side = self._side_axis
         if side is None:
@@ -469,11 +502,6 @@ class SinglePanelAggRenderer:
         from matplotlib.collections import PolyCollection
         from matplotlib.ticker import MaxNLocator
 
-        first = series_group[0].data
-        if not isinstance(first, EvaluatedCurve):
-            raise TypeError("rolling distribution requires EvaluatedCurve")
-        values = np.asarray(first.values)
-        validity = np.asarray(first.validity, dtype=bool)
         finite = np.asarray(values[validity], dtype=np.float64)
         bin_count = max(3, min(len(first.x_axis.indices) // 4, 50))
         counts, edges = np.histogram(
@@ -547,26 +575,6 @@ class SinglePanelAggRenderer:
             )
         else:
             self._gauss_text.set_text(label)
-
-        latest = None
-        if values.size:
-            indices = np.flatnonzero(validity)
-            if indices.size:
-                latest = float(values[int(indices[0])])
-        label = "" if latest is None else f"{latest:.6g}"
-        if self._latest_text is None:
-            self._latest_text = self._axis.text(
-                0.97,
-                0.95,
-                label,
-                transform=self._axis.transAxes,
-                color=PALETTE["readout"],
-                ha="right",
-                va="top",
-                fontsize=ANNOTATION_FONT_SIZE,
-            )
-        else:
-            self._latest_text.set_text(label)
 
     def render_interactive_histogram(
         self,
@@ -799,13 +807,12 @@ class SinglePanelAggRenderer:
                 self._fit_artists = tuple(fit_artists)
                 self._fit_diagnostic_artists = tuple(diagnostic_artists)
             elif isinstance(first, EvaluatedHistogram):
-                _histogram(
+                self._artists, _counts_group, _edges = _histogram(
                     axis,
                     series_group,
                     bins=histogram_bins,
                     projection=histogram_projection,
                 )
-                self._artists = tuple(axis.patches)
             else:
                 _meter(axis, series_group)
                 self._artists = tuple(axis.texts)
@@ -841,7 +848,11 @@ class SinglePanelAggRenderer:
                     bin_projection.bin_counts,
                     strict=True,
                 ):
-                    artist.set_data(counts, bin_projection.bin_edges)
+                    _update_histogram_artist(
+                        artist,
+                        counts,
+                        bin_projection.bin_edges,
+                    )
             else:
                 assert isinstance(first, EvaluatedMeter)
                 self._artists[0].set_text(_meter_text(series_group))
@@ -862,7 +873,7 @@ class SinglePanelAggRenderer:
         if isinstance(first, EvaluatedCurve):
             axis.set_xlabel(
                 "Shots ago"
-                if self._rolling_distribution
+                if self._rolling_trace
                 else _axis_label(first.x_axis)
             )
             axis.set_ylabel(self._value_label)
@@ -987,12 +998,17 @@ class SinglePanelAggRenderer:
             dynamic,
             layout_key=_agg_layout_key(
                 figure,
-                extra=(self._topology, self._rolling_distribution),
+                extra=(
+                    self._topology,
+                    self._rolling_trace,
+                    self._rolling_distribution,
+                ),
             ),
             chrome_key=_agg_chrome_key(
                 figure,
                 extra=(
                     self._topology,
+                    self._rolling_trace,
                     self._rolling_distribution,
                     self._value_label,
                     self._title_override,

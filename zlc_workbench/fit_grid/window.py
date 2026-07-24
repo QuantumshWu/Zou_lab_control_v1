@@ -467,11 +467,19 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._display.revision,
         ):
             raise RuntimeError("saved-fit area differs from its painted origin")
-        self._area_candidates[gesture.panel_id] = gesture.normalized_bounds
+        if gesture.normalized_bounds is None:
+            self._area_candidates.pop(gesture.panel_id, None)
+        else:
+            self._area_candidates[gesture.panel_id] = gesture.normalized_bounds
         self._board_widget.set_image_rectangle_candidate(
             gesture.normalized_bounds,
             panel_id=gesture.panel_id,
         )
+        if gesture.normalized_bounds is None:
+            self._diagnostic.setText(
+                f"{gesture.panel_id}: DISPLAY ONLY area cleared"
+            )
+            return
         left, top, right, bottom = gesture.normalized_bounds
         self._diagnostic.setText(
             f"{gesture.panel_id}: DISPLAY ONLY area "

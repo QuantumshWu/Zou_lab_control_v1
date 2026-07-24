@@ -990,6 +990,8 @@ values.shape == (R, P)
 
 `data_shape == (1,)` 是长度一数据轴，仍需显式 Select 或 Reduce。
 
+GUI 的 canonical signal dimension 必须忠实显示真实物理 tensor：`R × P × (*data_shape)`，其中 `R` 与 `P=point_layout.storage_size` 各自始终只有一个维度。Logic 行与 signal picker 中该字段都是由当前权威 `DatasetSchema`/value 自动派生的只读结果：不得让用户编辑，不得由 catalog、definition 或 Workbench 手写，不得在维度串内追加 logical point axes/coordinates/PointLayout 等第二种说明；未发布时显示 `—`，已有 value 却缺少 `DatasetSchema` 必须报契约错误，不能退回裸 ndarray shape 猜测。logical point metadata 只供 Grid/facet/axis navigation 的具名控件消费，不能混入 signal dimension。因此 7×7×7 的三维标量扫描在 Logic/picker 中只显示 `1 × 343`；不能显示为 `1 × 7×7×7`，也不能把空 `data_shape == ()` 伪造成 `× (1)`。真实 `data_shape == (1,)` 必须显示长度一数据轴，二维/多维 data shape 也必须逐轴完整显示。声明前与已有值后的 Logic、picker、panel 信息统一调用 `zlc_data.shape_text` 的同一 formatter，任何 Workbench 不得另写 shape/rank 特判。
+
 ### 6.5 Materializer 的原子提交
 
 materialized value 的全部相关状态由实际拥有 mutable storage 的 materializer 直接负责，不建立无人消费的通用 delta 值对象。`DatasetBuilder` 先完成 payload、validity、exact schedule/key、metadata 与 authority 验证，再在 stream 的 Delivery/ack 事务和 builder 自身锁内一次提交 values、written、validity、metadata、ordered event/metadata hash state、counters 与 revision；所有会按输入拒绝的操作必须在 commit point 前完成，commit point 后只消费已经准入的 typed owner 值并以同一 stream 临界区内的 no-fail ack 收尾。前置验证失败不写入、不推进 revision/ack；进程或基础设施故障只能使本次 run 失败，不能产生 sealed artifact。`MonitorDataset` 在自己的锁内一次提交 values、written、validity、metadata、EventRef、head/counters 与 revision，并从同一临界区冻结 head、coverage、EventRefs 与 owned snapshot，不能把不同 revision 的字段拼在一起。
@@ -3370,7 +3372,7 @@ downstream 自发故障不再冒充 source failure：`CameraMonitorRoiState.stat
 | 2D | area + cross + zoom/pan + 双 horizontal clim line | wheel：down 放大、up 缩小；middle drag 双轴 pan；middle double-click 优先 zoom 到 area，否则 home；right click 固定 x/y/z，right double-click 清除 | relim 控 clim；cmap、x/y view pin、color limits | free-running camera 与 finite exact capture 均 `MATCHED`；其它generic 2D launcher仍逐consumer验收 |
 | Sites | area + cross + zoom/pan；有 background frame 才有 clim line | 双轴；旧固定 cross 只有 x/y，没有伪造 occupancy/frame z | background clim；无 frame 时 no-op；cmap、x/y pin、color limits | `MUST_CLOSE` |
 | 1D / Monitor | area + cross + zoom/pan | 只改 x view；固定 cross 显示 x/y | relim 控 y；x pin；无 cmap | camera rolling Monitor 与 progressive SCAN_POINT 均 `MATCHED` |
-| Histogram | area + cross + zoom/pan + 零到多个 vertical threshold line | 只改 x view；threshold drag 与 area 排他，实时更新统计 | relim 控 count-y而非 bin-x；x pin；无 cmap | `MUST_CLOSE` |
+| Histogram | area + cross + zoom/pan + 零到多个 vertical threshold line；Area的x是样本value域，不是任一具名dataset axis，故以窄typed value-range生成`area.data`（原`(R,P,*data_shape)`不变、范围外component标invalid）与value bound signal，禁止伪造Selection绑到sample axis | 只改 x view；threshold drag 与 area 排他，实时更新统计 | relim 控 count-y而非 bin-x；x pin；无 cmap | `MUST_CLOSE` |
 | Grid | 每个 cell 与 focus view 都有该 subkind 的完整 handles；hist cell 另有 threshold；left double-click focus、Esc/unfocus | 随 cell family；thumbnail 与 focus 使用同一交互 owner | image grid 继承 cmap/relim；display state同时作用 thumbnail 与 focus | `MUST_CLOSE` |
 | Pulse | seed/static preview 的 area + cross + zoom/pan | 只改 x；固定 cross x/y | relim no-op；x pin | 不扩大当前 live-addable 范围；在 Pulse 产品纵切复用同一 owner |
 
@@ -3381,6 +3383,7 @@ downstream 自发故障不再冒充 source failure：`CameraMonitorRoiState.stat
 3. plot不提供pointer-motion数据hover。需要读值时由right-click locked Cross在同一front revision的`ViewportTransform`上取值，right-double-click清除；Area与locked Cross均可作为panel派生signal发布，但不反向控制Measurement。
 4. TaskConsole 默认 relim 是 `tight`，选项顺序 `tight / normal / fixed`。普通曲线：`tight = min/max ± 10% span`；`normal` 对全非负数据锚定0且上界约 `1.2*max`，含负数时使用 tight 数值但保留 normal mode；进入 `fixed` 时冻结当前显示范围。Histogram 的 normal/tight 都锚定 count=0但 headroom不同。所有自动范围保留旧 deadband/hysteresis，避免每帧微抖；固定 lo/hi 在非 fixed 时可编辑但不改变 view。
 5. Setting 与 Edit 只是同一个 revisioned display state 的两个表单投影：实时值只更新空字段 placeholder，绝不覆盖用户已输入文本。x pin适用所有有 x view 的种类；y pin只适用 image view family；color limits只适用有 value/clim 轴的2D/Sites/image-grid。Histogram y是 relim data axis，不是 y-view pin。image color limits 与 fixed clim 是同一 authority，禁止另设第二份 clim 状态。
+6. 连续 wheel/pan/clim/threshold 的 gesture candidate只携用户意图的bounds/value，Workbench是display revision唯一写者，并从当前authored state分配严格递增revision；不能在candidate自己的同一bounds上调用“with revision”而因纯函数no-op遗留旧revision。交互重绘必须读取用户真正看见并被hold的`_presented_value/EvaluatedInput`，不能夹带已完成但尚未present的live值。worker answer只有达到当前pending revision才结算该intent；较旧的合法intermediate answer可以在同一个host、同一board/layout/source/input/document/selection lineage内单调推进held front，但不能清除更新的intent，也不能让Setting/Edit的另一host接管。任意front present后无条件清pending、按producer identity忽略exact input revision、或用异常吞掉revision冲突，均为禁止的根因级错误。
 
 复用裁决也在开工前冻结：Fluent widget/container、`FormSpec + FluentParameterForm`、Qt/QSS style token与纯 render token已在 current owner中，必须扩展复用；手势数学与单写者语义从旧实现 **ADAPT** 到 `zlc_frontend.selector`、`QtRasterBoard`、current Figure/View document和 Workbench command seam。禁止迁入整类旧 `PanelCard/PanelEditor/PanelConfig/_PanelBoard`、Matplotlib selectors、旧 RenderLoop，禁止新建第二套 Qt component library、form parser、palette、renderer、mailbox、plot-kind registry或 Workbench-owned Selection truth。interaction capability必须从 current `ViewIntent/ViewContract + evaluated axes` 推导；Setting/Edit 必须投影同一 typed display state。
 

@@ -227,6 +227,11 @@ class PanelCard(FluentGroupBox):
         self._raster_pixel_ratio = 1.0
         self._pending_interaction_origin = None
         self._pending_interaction_host = None
+        # The newest display revision authored by a wheel/pan/rail gesture.
+        # An older worker front may still be useful while a button is held,
+        # but it cannot settle this intent.  Pulse Preview uses the identical
+        # revision-owned answer rule.
+        self._pending_interaction_revision = None
         # Bumped by every display-knob edit.  The renderer reads it to tell a
         # genuinely new display from a repeat of the same one.
         self._display_revision = 0
@@ -403,8 +408,16 @@ class PanelCard(FluentGroupBox):
             self._fit_syncing_panes = False
 
     def _current_fit_selection(self):
+        from zlc_data import Selection
+
         value = self._presented_value
-        if self._source_identity_matches_value(self._area_source_identity, value):
+        if (
+            isinstance(self._area_selection, Selection)
+            and self._source_identity_matches_value(
+                self._area_source_identity,
+                value,
+            )
+        ):
             return self._area_selection
         return None
 
@@ -907,15 +920,32 @@ class PanelCard(FluentGroupBox):
     def _accept_area_range(self, gesture, *, host=None) -> None:
         """Promote a completed curve span into the Figure's Area output."""
 
-        from zlc_frontend.selector import CurveRangeGesture
+        from zlc_frontend.selector import (
+            CurveRangeGesture,
+            HistogramRangeGesture,
+        )
 
-        if not isinstance(gesture, CurveRangeGesture):
+        if not isinstance(
+            gesture,
+            (CurveRangeGesture, HistogramRangeGesture),
+        ):
             return
         if gesture.x_span is None:
             self._set_area_output(None, None)
             return
         board = self.board if host is None else host
         if board is None:
+            return
+        if isinstance(gesture, HistogramRangeGesture):
+            if board.visible_interaction_origin() != gesture.origin:
+                self._set_area_output(None, None)
+                return
+            from .panel_outputs import HistogramValueRangeSelection
+
+            self._set_area_output(
+                HistogramValueRangeSelection(*gesture.x_span),
+                gesture.origin.source_identity,
+            )
             return
         try:
             selection = board.board.selection_for_curve_range_gesture(gesture)
@@ -930,6 +960,9 @@ class PanelCard(FluentGroupBox):
         from zlc_frontend.selector import RectangleGesture
 
         if not isinstance(gesture, RectangleGesture):
+            return
+        if gesture.normalized_bounds is None:
+            self._set_area_output(None, None)
             return
         board = self.board if host is None else host
         if board is None:
@@ -1163,11 +1196,20 @@ class PanelCard(FluentGroupBox):
         """
 
         name = self.config.signal
-        value = (
-            self._candidate_value
-            if self.config.kind == "grid" and self._candidate_value is not None
-            else self._last_value
-        )
+        if self._pending_interaction_origin is not None:
+            # A held pointer gesture edits the exact data front the operator
+            # can still see.  A newer live-camera completion may already be in
+            # ``_last_value`` while its raster is queued or while the held
+            # front deliberately remains painted.  Advancing to that value
+            # here would splice two input identities into one gesture.
+            value = self._presented_value
+        else:
+            value = (
+                self._candidate_value
+                if self.config.kind == "grid"
+                and self._candidate_value is not None
+                else self._last_value
+            )
         if (
             not name
             or value is None
@@ -1263,6 +1305,16 @@ class PanelCard(FluentGroupBox):
             max(1, QtCore.qRound(value * pixel_ratio))
             for value in logical_size
         )
+        rolling_distribution = (
+            self.config.kind == "monitor"
+            and bool(
+                _resolved_panel_param(
+                    "monitor",
+                    self.config.params,
+                    "show_dist",
+                )
+            )
+        )
         source_key = (
             str(self.config.kind),
             str(value.name),
@@ -1271,6 +1323,7 @@ class PanelCard(FluentGroupBox):
             size,
             pixel_ratio,
             view,
+            rolling_distribution,
             (
                 None
                 if site_map_view is None
@@ -1330,6 +1383,7 @@ class PanelCard(FluentGroupBox):
             focus,
             fit_result,
             fit_result_identity,
+            rolling_distribution=rolling_distribution,
         )
 
     def _signal_axis_label(self, signal_key: str) -> str:
@@ -1365,22 +1419,20 @@ class PanelCard(FluentGroupBox):
             return False
         self._render_version = request.frame_key
         if error is not None:
-            origin, self._pending_interaction_origin = (
-                self._pending_interaction_origin,
-                None,
+            self._settle_pending_interaction_through(
+                request.display.revision,
+                failed=True,
             )
-            interaction_host, self._pending_interaction_host = (
-                self._pending_interaction_host,
-                None,
-            )
-            if origin is not None and interaction_host is not None:
-                interaction_host.discard_pending_interaction(origin)
             self.set_status(error, error=True)
             return True
         if request.faceted:
             from zlc_frontend.panel_render import FacetedPanelResult
 
             if not isinstance(faceted_result, FacetedPanelResult):
+                self._settle_pending_interaction_through(
+                    request.display.revision,
+                    failed=True,
+                )
                 self.set_status(
                     "render worker returned no complete faceted front",
                     error=True,
@@ -1390,6 +1442,10 @@ class PanelCard(FluentGroupBox):
             self._pending_frame = None
             pending_figure = faceted_result.figure
             if figure is not pending_figure:
+                self._settle_pending_interaction_through(
+                    request.display.revision,
+                    failed=True,
+                )
                 self.set_status(
                     "faceted worker result lost its exact DataFigure",
                     error=True,
@@ -1408,6 +1464,10 @@ class PanelCard(FluentGroupBox):
         elif frame is None or (
             self.config.kind != "sites" and figure is None
         ):
+            self._settle_pending_interaction_through(
+                request.display.revision,
+                failed=True,
+            )
             self.set_status("render worker returned no complete front", error=True)
             return True
         else:
@@ -1418,6 +1478,10 @@ class PanelCard(FluentGroupBox):
                 from zlc_frontend import DataFigure
 
                 if not isinstance(figure, DataFigure):
+                    self._settle_pending_interaction_through(
+                        request.display.revision,
+                        failed=True,
+                    )
                     self.set_status(
                         "render worker returned no exact DataFigure",
                         error=True,
@@ -1444,6 +1508,65 @@ class PanelCard(FluentGroupBox):
         self._refresh_repeat_mode_control()
         self.set_status("ok", error=False)
         return True
+
+    def _settle_pending_interaction_through(
+        self,
+        presentation_revision: int,
+        *,
+        failed: bool,
+    ) -> None:
+        """Settle only the display intent reached by this worker answer.
+
+        Live data and intermediate viewport answers may be presented while a
+        newer pointer motion is already queued.  They remain valid fronts, but
+        cannot release the board's newest pending interaction.
+        """
+
+        pending_revision = self._pending_interaction_revision
+        if (
+            pending_revision is None
+            or int(presentation_revision) < pending_revision
+        ):
+            return
+        origin = self._pending_interaction_origin
+        host = self._pending_interaction_host
+        if failed and origin is not None and host is not None:
+            host.discard_pending_interaction(origin)
+        self._pending_interaction_origin = None
+        self._pending_interaction_host = None
+        self._pending_interaction_revision = None
+
+    def _continues_pending_interaction(self, host, origin) -> bool:
+        """Whether ``origin`` is a newer front of this host's same gesture.
+
+        An intermediate worker answer advances the held front's sequence and
+        presentation revision.  Exact origin equality would therefore reject
+        the next motion of the same drag.  Host identity plus monotonic exact
+        presentation lineage admits that advance while preventing the Edit
+        tab's second host from taking over another host's pending command.
+        """
+
+        pending = self._pending_interaction_origin
+        if pending is None or host is not self._pending_interaction_host:
+            return False
+        return (
+            origin.panel_id == pending.panel_id
+            and origin.board_id == pending.board_id
+            and origin.layout_generation == pending.layout_generation
+            and origin.source_identity == pending.source_identity
+            and origin.input_identity == pending.input_identity
+            and origin.sequence >= pending.sequence
+            and origin.presentation.panel_id
+            == pending.presentation.panel_id
+            and origin.presentation.document_id
+            == pending.presentation.document_id
+            and origin.presentation.document_revision
+            >= pending.presentation.document_revision
+            and origin.presentation.selection_revision
+            == pending.presentation.selection_revision
+            and origin.presentation.panel_revision
+            >= pending.presentation.panel_revision
+        )
 
     def view_intent(self):
         """Which view this panel's kind asks its data for.
@@ -1750,8 +1873,10 @@ class PanelCard(FluentGroupBox):
             self._presented_title = pending_title
             self._presented_value_label = pending_value_label
             self._presented_value = pending_value
-            self._pending_interaction_origin = None
-            self._pending_interaction_host = None
+            self._settle_pending_interaction_through(
+                pending_display.revision,
+                failed=False,
+            )
             if geometry_changes:
                 # Promote raster and geometry as one visible fact.  Until this
                 # exact-size answer arrived, the old raster stayed at its old
@@ -2951,15 +3076,17 @@ class PanelCard(FluentGroupBox):
             if self._display_revision != commit.origin.presentation.panel_revision:
                 host.discard_pending_interaction(commit.origin)
                 return
-        elif pending_origin != commit.origin:
+        elif not self._continues_pending_interaction(host, commit.origin):
             host.discard_pending_interaction(commit.origin)
             return
         if revision <= self._display_revision:
+            host.discard_pending_interaction(commit.origin)
             return
         self._view_pin = pin
         self._display_revision = revision
         self._pending_interaction_origin = commit.origin
         self._pending_interaction_host = host
+        self._pending_interaction_revision = revision
         # The commit changes only the card-owned display state.  The worker
         # answers it from the already accepted immutable data revision; Qt
         # never composes or waits for that answer.
@@ -2980,7 +3107,20 @@ class PanelCard(FluentGroupBox):
         if commit.origin != host.visible_interaction_origin():
             host.discard_pending_interaction(commit.origin)
             return
-        if self._display_revision != commit.origin.presentation.panel_revision:
+        if (
+            (
+                self._pending_interaction_origin is None
+                and self._display_revision
+                != commit.origin.presentation.panel_revision
+            )
+            or (
+                self._pending_interaction_origin is not None
+                and not self._continues_pending_interaction(
+                    host,
+                    commit.origin,
+                )
+            )
+        ):
             host.discard_pending_interaction(commit.origin)
             return
 
@@ -2990,6 +3130,7 @@ class PanelCard(FluentGroupBox):
         self._display_revision = old_revision + 1
         self._pending_interaction_origin = commit.origin
         self._pending_interaction_host = host
+        self._pending_interaction_revision = self._display_revision
         self._request_current_render()
         self.changed.emit()
 
@@ -3016,7 +3157,20 @@ class PanelCard(FluentGroupBox):
         if commit.origin != host.visible_interaction_origin():
             host.discard_pending_interaction(commit.origin)
             return
-        if self._display_revision != commit.origin.presentation.panel_revision:
+        if (
+            (
+                self._pending_interaction_origin is None
+                and self._display_revision
+                != commit.origin.presentation.panel_revision
+            )
+            or (
+                self._pending_interaction_origin is not None
+                and not self._continues_pending_interaction(
+                    host,
+                    commit.origin,
+                )
+            )
+        ):
             host.discard_pending_interaction(commit.origin)
             return
 
@@ -3057,6 +3211,7 @@ class PanelCard(FluentGroupBox):
             self._display_revision = candidate.revision
         self._pending_interaction_origin = commit.origin
         self._pending_interaction_host = host
+        self._pending_interaction_revision = self._display_revision
         self._request_current_render()
         self.changed.emit()
 
@@ -3361,6 +3516,16 @@ class PanelCard(FluentGroupBox):
         """
 
         board = self.board
+        if (
+            self._pending_interaction_origin is not None
+            and self._pending_interaction_host is not None
+        ):
+            self._pending_interaction_host.discard_pending_interaction(
+                self._pending_interaction_origin
+            )
+        self._pending_interaction_origin = None
+        self._pending_interaction_host = None
+        self._pending_interaction_revision = None
         self.board = None
         self._pending_frame = None
         self._pending_faceted_result = None

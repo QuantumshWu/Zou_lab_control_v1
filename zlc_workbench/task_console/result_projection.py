@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from zlc_data import (
+    COMPONENT,
     MONITOR_HISTORY,
     READOUT_EVENT,
     REPEAT,
@@ -491,6 +492,194 @@ def _calibration_site_map_projection(
     return ProjectedFinalSignal(snapshot, identity, view)
 
 
+def _calibration_diagnostic_snapshot(
+    reference: CalibrationArtifactRef,
+    output_name: str,
+    values,
+    data_axes: tuple[AxisSpec, ...],
+    *,
+    value_unit: str | None,
+    validity_axis_ids: tuple[AxisId, ...] = (),
+    validity_mask,
+) -> OwnedSnapshot:
+    """Materialise one immutable diagnostic from an already-FINAL report."""
+
+    array = np.asarray(values, dtype="<f8")
+    axes = tuple(data_axes)
+    expected = tuple(axis.size for axis in axes)
+    if array.shape != expected:
+        raise ValueError(
+            f"{output_name} values have shape {array.shape}, expected {expected}"
+        )
+    repeat_axis = AxisSpec(
+        AxisId("calibration.repeat"),
+        "repeat",
+        REPEAT,
+        1,
+        (0,),
+    )
+    if axes:
+        axis_ids = tuple(validity_axis_ids)
+        if not axis_ids:
+            raise ValueError(
+                f"{output_name} must declare the axes its validity follows"
+            )
+        validity_contract = ValidityContract.components(*axis_ids)
+    else:
+        axis_ids = ()
+        validity_contract = ValidityContract.value()
+    schema = DatasetSchema(
+        repeat_axis,
+        (),
+        PointLayout.rect_c(()),
+        ValueSchema(axes, validity_contract, np.dtype("<f8"), value_unit),
+    )
+    if axis_ids:
+        axis_by_id = {axis.axis_id: axis for axis in axes}
+        mask_shape = tuple(axis_by_id[axis_id].size for axis_id in axis_ids)
+        mask = np.asarray(validity_mask, dtype=np.bool_)
+        if mask.shape != mask_shape:
+            raise ValueError(
+                f"{output_name} validity has shape {mask.shape}, "
+                f"expected {mask_shape}"
+            )
+        validity = ComponentValidity(
+            axis_ids,
+            mask.reshape((1, 1, *mask_shape)),
+        )
+    else:
+        mask = np.asarray(validity_mask, dtype=np.bool_)
+        if mask.shape != ():
+            raise ValueError(f"{output_name} scalar validity must be scalar")
+        validity = CellValidity(mask.reshape((1, 1)))
+
+    physical = array.reshape(schema.physical_shape)
+    expanded_validity = np.asarray(
+        expand_dataset_validity(validity, schema),
+        dtype=np.bool_,
+    )
+    canonical = np.zeros(schema.physical_shape, dtype="<f8")
+    np.copyto(canonical, physical, where=expanded_validity)
+    identity = canonical_digest(
+        {
+            "owner": "zlc-workbench.task-console.calibration-diagnostic.v1",
+            "calibration": calibration_artifact_ref_to_tree(reference),
+            "output_name": output_name,
+        }
+    )
+    block = DataBlock(
+        BlockId(f"calibration-{output_name.replace('_', '-')}-{identity[:20]}"),
+        DatasetRevision(0),
+        canonical,
+        validity,
+        schema,
+    )
+    generation = StreamGenerationId(f"calibration-diagnostic-{identity}")
+    return OwnedSnapshot(block.ref(generation), block)
+
+
+def _calibration_diagnostic_projections(
+    computation,
+    reference: CalibrationArtifactRef,
+    names: set[str],
+) -> dict[str, ProjectedFinalSignal]:
+    """Expose report-owned diagnostics without fitting or mutating calibration."""
+
+    from zlc_neutral_atom.readout.analysis import CalibrationComputation
+
+    if not isinstance(computation, CalibrationComputation):
+        raise TypeError("calibration loader must return CalibrationComputation")
+    artifact = computation.artifact
+    report = computation.report
+    model = artifact.select_model()
+    model_report = report.model(model.kind)
+    site_axis = artifact.site_map.site_axis
+    model_valid = np.asarray(model.usable_sites.mask, dtype=np.bool_)
+    site_map_valid = np.asarray(artifact.site_map.validity.mask, dtype=np.bool_)
+    site_fidelity = np.asarray(
+        [item.fidelity for item in model_report.site_fidelity],
+        dtype="<f8",
+    )
+    thresholds = np.asarray(model_report.thresholds, dtype="<f8")
+    centers = np.asarray(artifact.site_map.coordinates_xy, dtype="<f8")
+    if site_fidelity.shape != (site_axis.size,):
+        raise ValueError("calibration fidelity does not follow its SITE axis")
+    if thresholds.shape != (site_axis.size,):
+        raise ValueError("calibration thresholds do not follow their SITE axis")
+    if centers.shape != (site_axis.size, 2):
+        raise ValueError("calibration centres must have shape (sites, 2)")
+
+    output: dict[str, ProjectedFinalSignal] = {}
+    join_digest = reference.manifest_digest
+    if "fidelity_site" in names:
+        output["fidelity_site"] = ProjectedFinalSignal(
+            _calibration_diagnostic_snapshot(
+                reference,
+                "fidelity_site",
+                site_fidelity,
+                (site_axis,),
+                value_unit="fidelity",
+                validity_axis_ids=(site_axis.axis_id,),
+                validity_mask=model_valid & np.isfinite(site_fidelity),
+            ),
+            join_digest,
+        )
+    if "fidelity_threshold" in names:
+        output["fidelity_threshold"] = ProjectedFinalSignal(
+            _calibration_diagnostic_snapshot(
+                reference,
+                "fidelity_threshold",
+                thresholds,
+                (site_axis,),
+                value_unit=artifact.frame_contract.frame_schema.value_unit,
+                validity_axis_ids=(site_axis.axis_id,),
+                validity_mask=model_valid & np.isfinite(thresholds),
+            ),
+            join_digest,
+        )
+    if "fidelity_centers" in names:
+        coordinate_axis = AxisSpec(
+            AxisId(f"{site_axis.axis_id.value}.coordinate"),
+            "coordinate",
+            COMPONENT,
+            2,
+            ("x", "y"),
+        )
+        output["fidelity_centers"] = ProjectedFinalSignal(
+            _calibration_diagnostic_snapshot(
+                reference,
+                "fidelity_centers",
+                centers,
+                (site_axis, coordinate_axis),
+                value_unit="px",
+                validity_axis_ids=(site_axis.axis_id,),
+                validity_mask=(
+                    site_map_valid & np.all(np.isfinite(centers), axis=1)
+                ),
+            ),
+            join_digest,
+        )
+    for output_name, value in (
+        ("aggregate_fidelity", model_report.aggregate_fidelity),
+        ("global_fidelity", model_report.global_fidelity),
+    ):
+        if output_name not in names:
+            continue
+        numeric = float(value)
+        output[output_name] = ProjectedFinalSignal(
+            _calibration_diagnostic_snapshot(
+                reference,
+                output_name,
+                np.asarray(numeric, dtype="<f8"),
+                (),
+                value_unit="fidelity",
+                validity_mask=np.asarray(np.isfinite(numeric)),
+            ),
+            join_digest,
+        )
+    return output
+
+
 def _occupancy_summary_site_map_view(experiment, result):
     """Join exact singleton site state to its labelled calibration background."""
 
@@ -626,18 +815,24 @@ def _declared(node) -> set[str]:
 def project_final_signals(experiment, node, result) -> dict[str, ProjectedFinalSignal]:
     """Return only data-bearing outputs truthfully present in ``result``.
 
-    Artifact-only results are exposed only when a truthful typed presentation
-    exists.  In particular calibration owns a reference image plus site
-    geometry; it is never retyped as an occupancy array.
+    Artifact-only results are exposed only when a truthful typed projection
+    exists.  Calibration remains one artifact/report authority: its reference
+    image, site geometry, and read-only diagnostics are projections of that
+    FINAL value, never a second analysis or mutable session calibration.
     """
 
     names = _declared(node)
     projected: dict[str, ProjectedFinalSignal] = {}
 
-    if isinstance(result, CalibrationArtifactRef) and "calibration" in names:
-        projected["calibration"] = _calibration_site_map_projection(
-            experiment.readout.load_calibration_computation(result),
-            result,
+    if isinstance(result, CalibrationArtifactRef):
+        computation = experiment.readout.load_calibration_computation(result)
+        if "calibration" in names:
+            projected["calibration"] = _calibration_site_map_projection(
+                computation,
+                result,
+            )
+        projected.update(
+            _calibration_diagnostic_projections(computation, result, names)
         )
         return projected
 

@@ -23,8 +23,8 @@ __all__ = ["LogicNodeRow"]
 class LogicNodeRow(FluentFrame):
     """One LOGIC NODE's CARD on the Logic tab: a status dot + name + (kind) + status on
     the top line with Start / Stop / Edit / Remove, and a second line listing the
-    signals it PUBLISHES with their array shape (``occupied [per-site (N,)], rate
-    [scalar]``).  The dot follows the run state (grey=stopped / green=running /
+    signals it PUBLISHES with their schema-derived physical tensor dimensions
+    (``R × P × (*data_shape)``).  The dot follows the run state (grey=stopped / green=running /
     red=error), confocal's tab-icon colour map applied to a card.  Start / Stop act
     here directly; the full param form is in the node's Edit tab
     (:class:`LogicNodeEditor`)."""
@@ -109,12 +109,12 @@ class LogicNodeRow(FluentFrame):
         """Show the node's outputs as a SHORT table -- ONE signal per line, ``name`` + ``shape`` only::
 
             publishes:
-              occupied   (35,)
-              rate       scalar
+              occupied   1 × 1 × (35)
+              rate       1 × 1
 
         The per-signal MEANING goes in the label's tooltip (hover), NOT inline -- so the card never
         grows wider than its column and the Logic list needs no horizontal scroll (#2).  ``rows`` is
-        ``[(name, shape, description)]`` (shapes AUTO-EXTRACTED via ``shape_text.describe_shape``; meanings
+        ``[(name, shape, description)]`` (dimensions AUTO-EXTRACTED from the authoritative signal schema; meanings
         from the node's ``output_specs``); a pending shape (``—``) just means no value yet."""
         rows = list(rows)
         if rows:

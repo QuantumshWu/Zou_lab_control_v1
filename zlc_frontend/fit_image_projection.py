@@ -12,7 +12,9 @@ from zlc_data import (
     FitBatchStatus,
     FitResultBatch,
     IndexSelection,
+    REPEAT,
     Selection,
+    SITE,
     resolve_selection_indices,
     validate_fit_result_source_binding,
 )
@@ -142,10 +144,20 @@ class RadialGaussianImageFitPanel:
 def address_label(
     items: tuple[AxisAddress, ...] | tuple[AxisResolution, ...],
 ) -> str:
-    return ", ".join(
-        f"{item.axis_id.value}={coordinate_label(item.coordinate)}"
-        for item in items
-    )
+    labels = []
+    for item in items:
+        coordinate = coordinate_label(item.coordinate)
+        if isinstance(item, AxisAddress):
+            if item.axis_role == SITE:
+                labels.append(f"site {item.index}")
+                continue
+            if item.axis_role == REPEAT:
+                labels.append(f"repeat {item.index}")
+                continue
+            labels.append(f"{item.axis_name}={coordinate}")
+            continue
+        labels.append(f"{item.axis_id.value}={coordinate}")
+    return ", ".join(labels)
 
 
 def reduction_label(reductions) -> str:

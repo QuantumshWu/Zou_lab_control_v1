@@ -442,10 +442,16 @@ def _commit_viewport(
 ) -> bool:
     current = binding.viewport
     authored = binding.pending_viewport or current
-    if candidate == authored:
-        return False
     if candidate.axes != current.axes:
         raise ValueError("viewport commit cannot change image axes")
+    # A gesture candidate carries desired BOUNDS; this owner assigns its
+    # revision.  Live pan deliberately keeps calculating those bounds from the
+    # press-time transform, so an intervening worker answer can make the
+    # candidate's inherited revision older than the currently authored view.
+    # Equality must therefore be about the authored bounds, not the candidate
+    # dataclass (whose stale revision is not a second piece of intent).
+    if candidate.visible_bounds == authored.visible_bounds:
+        return False
     # Compare with the latest authored view, not merely the still-painted
     # worker answer.  Otherwise wheel-in followed immediately by wheel-out
     # would be mistaken for a no-op when it reaches the painted home bounds,
@@ -455,11 +461,13 @@ def _commit_viewport(
         authored.viewport_revision,
         binding.revision_floor,
     )
-    if candidate.viewport_revision <= base_revision:
-        candidate = candidate.with_visible_bounds(
-            candidate.visible_bounds,
-            viewport_revision=base_revision + 1,
-        )
+    # Rebase from ``authored``.  Calling ``candidate.with_visible_bounds`` with
+    # candidate's own bounds is a no-op by contract and used to leave its stale
+    # revision unchanged after a render answer landed mid-gesture.
+    candidate = authored.with_visible_bounds(
+        candidate.visible_bounds,
+        viewport_revision=base_revision + 1,
+    )
     if candidate.viewport_revision <= current.viewport_revision:
         raise ValueError("viewport commit revision must increase")
     if front is None:

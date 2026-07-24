@@ -32,14 +32,20 @@ from .render import (
 
 @dataclass(frozen=True, slots=True)
 class RectangleGesture:
-    """One immutable rectangle tied to the exact front on which it was drawn."""
+    """Set or clear one rectangle on the exact front where it was drawn.
+
+    ``None`` is the image-family equivalent of the numeric range gestures'
+    cleared span: a fresh left click that never forms a non-degenerate box.
+    Existing-box move/resize gestures retain their non-degenerate initial
+    rectangle, so an unmoved handle click is not misclassified as a clear.
+    """
 
     panel_id: str
     board_id: str
     layout_generation: int
     sequence: int
     source_identity: SourceIdentity
-    normalized_bounds: NormalizedRectangle
+    normalized_bounds: NormalizedRectangle | None
     viewport_revision: int
 
     def __post_init__(self) -> None:
@@ -53,11 +59,12 @@ class RectangleGesture:
             )
         if not isinstance(self.source_identity, SourceIdentity):
             raise TypeError("source_identity must be zlc_frontend.render.SourceIdentity")
-        object.__setattr__(
-            self,
-            "normalized_bounds",
-            validate_normalized_rectangle(self.normalized_bounds),
-        )
+        if self.normalized_bounds is not None:
+            object.__setattr__(
+                self,
+                "normalized_bounds",
+                validate_normalized_rectangle(self.normalized_bounds),
+            )
 
 
 @dataclass(frozen=True, slots=True)

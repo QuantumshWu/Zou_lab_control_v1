@@ -35,74 +35,66 @@ __all__ = [
     "contract_shape_label",
     "describe_shape",
     "format_dims",
-    "grid_for_points",
     "measurement_slug",
     "slot_label",
 ]
 
 
-def grid_for_points(grid, points) -> tuple:
-    """Validate an optional display grid against logical point geometry.
-
-    ``SignalSchema.point_shape`` is authoritative and the physical P axis is its
-    product.  A separate ``grid`` is only a presentation alias and is accepted
-    when it has the same point count; it never reshapes ``data_shape``.
-    """
-    pts = tuple(int(n) for n in (points or ()))
-    g = tuple(int(n) for n in (grid or ()))
-    if pts and g and int(np.prod(g)) == int(np.prod(pts)):
-        return g
-    return ()
-
-
 def format_dims(dims) -> str:
     """The ONE spelling of a dims tuple for the GUI: axes joined by the ``×`` glyph
-    (``40×20``), and ``"1"`` for an empty/scalar shape.  EVERY surface that turns a
-    signal's shape into a display string routes through here, so ``(40, 20)`` (numpy-tuple
-    spelling) can never appear beside ``40×20`` again -- the single source :func:`describe_shape`
-    and the flow-graph / picker labels all share."""
+    (``40×20``), and ``"1"`` only when the caller needs the multiplicative size of
+    an empty axis domain (for example the mandatory single point of a no-scan
+    dataset).  An empty ``data_shape`` is *not* a length-one data axis;
+    :func:`contract_shape_label` omits that group entirely.  EVERY surface that
+    turns a signal's shape into a display string routes through this module, so
+    ``(40, 20)`` (numpy-tuple spelling) can never appear beside ``40×20`` again."""
     parts = tuple(str(int(n)) for n in (dims or ()))
     return "×".join(parts) if parts else "1"
 
 
-def contract_shape_label(repeat, points_shape, data_shape, grid_shape=None) -> str:
-    """The ONE spelling of the canonical ``repeat × points × (data)`` contract shape.  A ``grid_shape``
-    reshapes ONLY the swept points (never the data), and only when it divides them (:func:`grid_for_points`).
-    Shared by :func:`describe_shape` (value-driven, R = the real block's leading axis) and the console's
-    schema-driven declared path (R = the schema's repeat capacity), so a signal reads IDENTICALLY whether
-    a value is buffered yet -- the grammar literal lives here alone and can never drift between surfaces."""
-    ps = tuple(int(n) for n in (points_shape or ()))
+def contract_shape_label(repeat, point_count, data_shape) -> str:
+    """Spell the physical ``R × P [× (*data_shape)]`` tensor contract.
+
+    ``P`` is one storage dimension, even when :class:`PointLayout` maps it to
+    several logical scan axes.  Logical topology belongs in separate axis
+    metadata; splicing it into this string would make an ``(R, P)`` scalar
+    dataset look like a higher-rank ndarray.  The schema-driven and value-driven
+    paths share this owner so their physical shape can never drift.
+    """
+    p = int(point_count)
+    if p <= 0:
+        raise ValueError("point_count must be positive")
     ds = tuple(int(n) for n in (data_shape or ()))
-    gs = grid_for_points(grid_shape, ps)
-    return f"{int(repeat)} × {format_dims(gs or ps)} × ({format_dims(ds)})"
+    cell_domain = f"{int(repeat)} × {p}"
+    return cell_domain if not ds else f"{cell_domain} × ({format_dims(ds)})"
 
 
-def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None) -> str:
+def describe_shape(value, *, point_count=None, data_shape=None) -> str:
     """A standardized shape string read straight from a published VALUE -- the SINGLE
     way the GUI says what a signal looks like, AUTO-EXTRACTED from real data rather
     than a hand-typed name->format map (which silently drifts from what a node really
     emits).  ``scalar`` for a 0-d / Python number; ``None`` -> ``"—"`` (no value yet).
 
     When the value is a registered signal tensor (its shape matches the declared
-    physical ``(repeat, prod(points_shape), *data_shape)``) it is shown in contract form
-    ``repeat × points × (data)`` -- ALWAYS all three groups (the physical P axis is mandatory, never
-    dropped): a 1-D scan ``5 × 8 × (3)``; a 2-D scan ``5 × (4×5) × (1)`` via ``grid_shape`` reshaping the
-    SWEPT POINTS; a no-scan single-point signal is ``5 × 1 × (...)`` -- a camera/judged frame
-    ``5 × 1 × (96×128)``, per-site occupancy ``5 × 1 × (35)``.  ``grid_shape`` is ONLY a 2-D SCAN's
-    points reshape -- it is NEVER applied to the DATA (the 35 sites read ``(35)``, not ``5×7``: that
-    layout is the sitemap's display concern, #H3v-3).  Otherwise the raw numpy shape (``(35,)`` /
-    ``(96, 128)``)."""
+    physical ``(repeat, P, *data_shape)``) it is shown in contract form
+    ``repeat × P [× (data)]``.  P is always the single physical point-storage
+    axis: a scalar 7×7×7 logical scan is ``1 × 343`` (never a fabricated
+    ``(1)`` and never a fake rank-five tensor), while a per-site 1-D scan is
+    ``5 × 8 × (3)``.  Logical point-axis names and sizes are displayed as
+    metadata rather than being spliced into the ndarray shape.  A no-scan
+    single-point camera reads ``5 × 1 × (96×128)`` and per-site occupancy
+    reads ``5 × 1 × (35)``; the site layout is a presentation concern, not
+    a point-grid alias.  Otherwise the raw numpy shape is shown directly."""
     if value is None:
         return "—"
     shape = tuple(int(n) for n in np.shape(value))
     if shape == ():
         return "scalar"
-    ps = tuple(int(n) for n in (points_shape or ()))
     dsh = tuple(int(n) for n in (data_shape or ()))
-    if ps and dsh and len(shape) == 2 + len(dsh) \
-            and shape[1] == int(np.prod(ps, dtype=np.int64)) \
+    if point_count is not None and len(shape) == 2 + len(dsh) \
+            and shape[1] == int(point_count) \
             and tuple(shape[2:]) == dsh:
-        return contract_shape_label(shape[0], ps, dsh, grid_shape)   # R × P × (data), one grammar
+        return contract_shape_label(shape[0], point_count, dsh)
     # Raw shape (schema unknown): the SAME ``×`` spelling as the contract form and the flow-graph
     # labels -- never the numpy-tuple ``(96, 128)`` that made the same signal read two different ways.
     return f"({format_dims(shape)})"

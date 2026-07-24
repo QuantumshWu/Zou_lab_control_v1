@@ -13,12 +13,13 @@ import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5 import QtCore, QtTest, QtWidgets
+from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 
 from gui_user_flow import (
     capture_offscreen_window,
     click_tab,
     configure_offscreen_fast_path,
+    drag_mouse_move,
     until,
 )
 from zlc_data.console_records import console_signal_key
@@ -178,6 +179,23 @@ def _replace_axis_range(widget, minimum: str, maximum: str, points: str) -> None
     _replace_spin_value(widget.pts_spin, points)
 
 
+def _wheel(widget, position, delta: int) -> None:
+    """Deliver one wheel step through the real Qt widget event path."""
+
+    event = QtGui.QWheelEvent(
+        QtCore.QPointF(position),
+        QtCore.QPointF(widget.mapToGlobal(position)),
+        QtCore.QPoint(),
+        QtCore.QPoint(0, int(delta)),
+        QtCore.Qt.NoButton,
+        QtCore.Qt.NoModifier,
+        QtCore.Qt.ScrollUpdate,
+        False,
+    )
+    widget.wheelEvent(event)
+    assert event.isAccepted()
+
+
 def _add_plot_and_bind(console, add_button, kind: str, signal: str, application):
     """Add one blank plot and wire its Setting popup through visible controls."""
 
@@ -308,6 +326,115 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         QtTest.QTest.mouseMove(board, board.rect().center())
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
         assert card.frozen_figure_output_state()[1:3] == before
+
+        # The product selector is one shared gesture owner, exercised here on
+        # the actual live TaskConsole front rather than a synthetic board.  It
+        # publishes only completed Figure-owned gestures; ordinary motion is
+        # still inert and no pointer-motion data hover exists.
+        QtTest.QTest.mouseClick(
+            console.selectors_switch,
+            QtCore.Qt.LeftButton,
+        )
+        until(application, lambda: board.selectors_enabled)
+        binding = board._image_bindings[card.panel_id]
+        target = board._selector_target(binding)
+        assert target is not None
+        plot = target[0]
+
+        def plot_point(x_fraction: float, y_fraction: float) -> QtCore.QPoint:
+            return QtCore.QPoint(
+                int(round(plot.left() + x_fraction * plot.width())),
+                int(round(plot.top() + y_fraction * plot.height())),
+            )
+
+        QtTest.QTest.mouseClick(
+            board,
+            QtCore.Qt.RightButton,
+            pos=plot_point(0.68, 0.42),
+        )
+        until(
+            application,
+            lambda: card.frozen_figure_output_state()[2] is not None,
+        )
+
+        area_start = plot_point(0.18, 0.20)
+        area_end = plot_point(0.48, 0.58)
+        QtTest.QTest.mousePress(
+            board,
+            QtCore.Qt.LeftButton,
+            pos=area_start,
+        )
+        drag_mouse_move(board, area_end, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseRelease(
+            board,
+            QtCore.Qt.LeftButton,
+            pos=area_end,
+        )
+        until(
+            application,
+            lambda: card.frozen_figure_output_state()[1] is not None,
+        )
+
+        # A fresh, non-dragging click in blank plot space clears Area.  It does
+        # not restore the old rectangle and does not affect the locked Cross.
+        QtTest.QTest.mouseClick(
+            board,
+            QtCore.Qt.LeftButton,
+            pos=plot_point(0.84, 0.84),
+        )
+        until(
+            application,
+            lambda: card.frozen_figure_output_state()[1] is None,
+        )
+        assert card.frozen_figure_output_state()[2] is not None
+
+        # Keep one middle-button gesture alive across a worker answer.  The
+        # second motion must rebase from the newly painted revision while
+        # retaining the exact held input instead of crashing or splicing in a
+        # newer live-camera value.
+        zoom_revision = card._display_revision
+        _wheel(board, plot_point(0.52, 0.52), -120)
+        until(
+            application,
+            lambda: card._display_revision > zoom_revision,
+        )
+        zoom_revision = card._display_revision
+        until(
+            application,
+            lambda: (
+                (origin := board.visible_image_origin()) is not None
+                and origin.presentation.panel_revision >= zoom_revision
+            ),
+            timeout=15.0,
+        )
+        pan_start = plot_point(0.52, 0.52)
+        first_move = plot_point(0.55, 0.52)
+        second_move = plot_point(0.45, 0.52)
+        QtTest.QTest.mousePress(
+            board,
+            QtCore.Qt.MiddleButton,
+            pos=pan_start,
+        )
+        initial_revision = card._display_revision
+        drag_mouse_move(board, first_move, QtCore.Qt.MiddleButton)
+        first_revision = card._display_revision
+        assert first_revision > initial_revision
+        until(
+            application,
+            lambda: (
+                (origin := board.visible_image_origin()) is not None
+                and origin.presentation.panel_revision >= first_revision
+            ),
+            timeout=15.0,
+        )
+        drag_mouse_move(board, second_move, QtCore.Qt.MiddleButton)
+        assert card._display_revision > first_revision
+        QtTest.QTest.mouseRelease(
+            board,
+            QtCore.Qt.MiddleButton,
+            pos=second_move,
+        )
+        assert board.image_selector_fault(card.panel_id) is None
 
         capture_offscreen_window(
             application,
@@ -444,6 +571,62 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             "calibration",
         )
         assert console._data.freeze().value(calibration_final) is not None
+        fidelity_site = console_signal_key(
+            calibration_row.node.title,
+            "fidelity_site",
+        )
+        threshold_site = console_signal_key(
+            calibration_row.node.title,
+            "fidelity_threshold",
+        )
+        centers_site = console_signal_key(
+            calibration_row.node.title,
+            "fidelity_centers",
+        )
+        aggregate_fidelity = console_signal_key(
+            calibration_row.node.title,
+            "aggregate_fidelity",
+        )
+        global_fidelity = console_signal_key(
+            calibration_row.node.title,
+            "global_fidelity",
+        )
+        calibration_front = console._data.freeze()
+        fidelity_value = calibration_front.value(fidelity_site)
+        threshold_value = calibration_front.value(threshold_site)
+        centers_value = calibration_front.value(centers_site)
+        assert fidelity_value is not None
+        assert threshold_value is not None
+        assert centers_value is not None
+        assert calibration_front.value(aggregate_fidelity) is not None
+        assert calibration_front.value(global_fidelity) is not None
+        site_axis = fidelity_value.schema.cell_schema.data_axes[0]
+        assert site_axis.role.value == "site"
+        assert fidelity_value.schema.physical_shape == (1, 1, site_axis.size)
+        assert threshold_value.schema.cell_schema.data_axes == (site_axis,)
+        assert centers_value.schema.physical_shape == (1, 1, site_axis.size, 2)
+        assert "site fidelity" in calibration_row.publishes_label.text()
+        assert (
+            f"1 × 1 × ({site_axis.size})"
+            in calibration_row.publishes_label.text()
+        )
+
+        fidelity_card = _add_plot_and_bind(
+            console,
+            add,
+            "1d",
+            fidelity_site,
+            application,
+        )
+        until(
+            application,
+            lambda: (
+                fidelity_card.board is not None
+                and fidelity_card.board.front_frame is not None
+            ),
+            timeout=15.0,
+        )
+        assert fidelity_card._signal_axis_label(fidelity_site) == "Readout fidelity"
 
         _choose_combo_text(console.kind_combo, "Task: Optimize MOT field", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
@@ -488,7 +671,23 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         assert saw_mot_panel
         assert not console._task_locked
         mot_final = console_signal_key(mot_row.node.title, "mot_field")
-        assert console._data.freeze().value(mot_final) is not None
+        mot_value = console._data.freeze().value(mot_final)
+        assert mot_value is not None
+        mot_schema = mot_value.schema
+        assert tuple(axis.role.value for axis in mot_schema.point_axes) == (
+            "scan-point",
+            "scan-point",
+            "scan-point",
+        )
+        assert mot_schema.cell_schema.data_axes == ()
+        assert mot_schema.physical_shape == (
+            1,
+            mot_schema.point_layout.storage_size,
+        )
+        mot_shape = f"1 × {mot_schema.point_layout.storage_size}"
+        assert mot_shape in mot_row.publishes_label.text()
+        assert f"{mot_shape} × (1)" not in mot_row.publishes_label.text()
+        assert "points:" not in mot_row.publishes_label.text()
     finally:
         if console_wrapper is not None and console_wrapper.isVisible():
             console_wrapper.close()
@@ -847,6 +1046,162 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
                 and pulse_body.active_snapshot.state.terminal,
                 timeout=15.0,
             )
+        if console_wrapper is not None and console_wrapper.isVisible():
+            console_wrapper.close()
+            until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+        flow.finish_close(application, timeout_seconds=15.0)
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+
+
+def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
+    tmp_path,
+) -> None:
+    """The last current-visible Main definition runs through formal Qt controls."""
+
+    configure_offscreen_fast_path()
+    application = ensure_qt_app()
+    from task_console import _StandaloneTaskConsoleFlow, _build_parser
+    from zlc_neutral_atom.timing.release_recapture import (
+        TriggeredReleaseRecaptureResult,
+    )
+
+    args = _build_parser().parse_args(
+        [
+            "--repository",
+            str(tmp_path / "workspace"),
+            "--name",
+            "grey-molasses-user-flow",
+            "--seed",
+            "47",
+        ]
+    )
+    flow = _StandaloneTaskConsoleFlow(args)
+    devices = flow.open()
+    console_wrapper = None
+    try:
+        QtTest.QTest.mouseClick(devices.lifecycle_button, QtCore.Qt.LeftButton)
+        until(
+            application,
+            lambda: flow.console is not None or flow.failure is not None,
+            timeout=15.0,
+        )
+        assert flow.failure is None
+        console = flow.console
+        console_wrapper = console.window()
+        add = next(
+            button
+            for button in console.findChildren(QtWidgets.QPushButton)
+            if button.text() == "Add Panel"
+        )
+
+        # Grey uses the exact artifact emitted by the ordinary Calibration Task;
+        # no hidden session calibration is allowed.
+        _choose_combo_text(console.kind_combo, "Task: Calibrate readout", application)
+        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
+        calibration_row = console.logic_nodes[-1]
+        calibration_editor = console._logic_editors[id(calibration_row)]
+        calibration_widgets = calibration_editor.form._widgets
+        _replace_path_value(
+            calibration_widgets["folder"],
+            str(tmp_path / "calibration-output"),
+        )
+        _replace_spin_value(calibration_widgets["threshold_frames"], "10")
+        QtTest.QTest.mouseClick(
+            calibration_editor.form.start_button,
+            QtCore.Qt.LeftButton,
+        )
+        calibration_signal = console_signal_key(
+            calibration_row.node.title,
+            "calibration",
+        )
+        until(
+            application,
+            lambda: (
+                console._data.freeze().value(calibration_signal) is not None
+                and not console._task_locked
+            ),
+            timeout=25.0,
+        )
+
+        _choose_combo_text(
+            console.kind_combo,
+            "Measurement: Grey molasses detuning",
+            application,
+        )
+        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
+        grey_row = console.logic_nodes[-1]
+        grey_editor = console._logic_editors[id(grey_row)]
+        grey_widgets = grey_editor.form._widgets
+        assert set(grey_widgets) == {
+            "pulse",
+            "detuning",
+            "t_off",
+            "shots",
+            "per_site",
+            "rf_role",
+            "calibration",
+        }
+        detuning_decl = next(
+            field for field in grey_editor.spec.params if field.key == "detuning"
+        )
+        assert (detuning_decl.label, detuning_decl.unit) == (
+            "Two-photon detuning",
+            "Γ",
+        )
+        assert _signal_leaf_keys(grey_widgets["calibration"]) == {
+            calibration_signal
+        }
+        _replace_axis_range(grey_widgets["detuning"], "-0.2", "0.2", "3")
+        _replace_spin_value(grey_widgets["shots"], "1")
+        _choose_combo_text(grey_widgets["rf_role"], "rf", application)
+        _choose_signal_leaf(
+            grey_widgets["calibration"],
+            calibration_signal,
+            application,
+        )
+
+        cards_before = tuple(console.cards)
+        QtTest.QTest.mouseClick(
+            grey_editor.form.start_button,
+            QtCore.Qt.LeftButton,
+        )
+        grey_node = console._logic_nodes[id(grey_row)]
+        recapture_signal = console_signal_key(grey_row.node.title, "recapture")
+        until(
+            application,
+            lambda: (
+                grey_node.final_result_resolved
+                and console._data.freeze().value(recapture_signal) is not None
+            ),
+            timeout=25.0,
+        )
+        assert tuple(console.cards) == cards_before
+        result = grey_node.final_result
+        assert isinstance(result, TriggeredReleaseRecaptureResult)
+        assert result.rf_terminal is not None
+        assert result.rf_terminal.advanced_points == 3
+        recapture = console._data.freeze().value(recapture_signal)
+        axis = recapture.snapshot.block.schema.point_axes[0]
+        assert (axis.name, axis.unit, axis.coordinates) == (
+            "Two-photon detuning",
+            "Γ",
+            (-0.2, 0.0, 0.2),
+        )
+
+        card = _add_plot_and_bind(
+            console,
+            add,
+            "1d",
+            recapture_signal,
+            application,
+        )
+        until(
+            application,
+            lambda: card.board is not None and card.board.front_frame is not None,
+            timeout=15.0,
+        )
+        assert card._signal_axis_label(recapture_signal) == "Recapture rate"
+    finally:
         if console_wrapper is not None and console_wrapper.isVisible():
             console_wrapper.close()
             until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)

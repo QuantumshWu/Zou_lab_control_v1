@@ -156,22 +156,14 @@ def _live_grid_axes(
     return tuple(axes), rows, columns, font_scale
 
 def _live_grid_cell_title(cell, series_group) -> str:
-    """Return main's compact facet identifier, never a repeated panel title."""
+    """Return Main's role-authored facet identifier."""
 
-    from .fit_grid import coordinate_label
+    from .fit_image_projection import address_label
 
     addresses = tuple(cell.facet_address)
     if len(series_group) == 1:
         addresses = (*addresses, *series_group[0].batch_address)
-    labels = []
-    for address in addresses:
-        coordinate = coordinate_label(address.coordinate)
-        if isinstance(address.coordinate, str):
-            labels.append(coordinate)
-            continue
-        axis_name = address.axis_id.value.rsplit(".", 1)[-1]
-        labels.append(f"{axis_name}={coordinate}")
-    return ", ".join(labels)
+    return address_label(addresses)
 
 __all__ = [
 ]

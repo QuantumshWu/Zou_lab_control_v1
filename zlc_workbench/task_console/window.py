@@ -1050,7 +1050,6 @@ class TaskConsole(QtWidgets.QWidget):
         Measurement and processor nodes publish to the data plane under their prefix.
         Task outputs are FINAL artifact declarations and are rendered by the spec-only
         branch in :meth:`_update_row_publishes`, never fabricated as live signals."""
-        from zlc_data.shape_text import describe_shape
         declarations = tuple(
             getattr(getattr(node, "spec", None), "declared_outputs", ()) or ()
         )
@@ -1058,8 +1057,9 @@ class TaskConsole(QtWidgets.QWidget):
         rows: list[tuple[str, str, str]] = []
         for full, declaration in zip(published, declarations):
             short = str(declaration.short or declaration.name)
-            # Same schema-driven formatter as the task branch: a live signal and a task
-            # output of the same logical shape render byte-identically -- no drift possible.
+            # Logic rows and signal pickers share this one schema-driven owner.
+            # The field is a read-only physical tensor contract, not an axis-summary
+            # editor and not catalog-authored display text.
             shape = self._describe_from_schema(
                 self._signal_values(full),
                 self._signal_schema(full),
@@ -1341,36 +1341,31 @@ class TaskConsole(QtWidgets.QWidget):
 
     @staticmethod
     def _schema_structure(schema) -> dict[str, object]:
-        """Project the authoritative ``DatasetSchema`` into display shape groups."""
+        """Project the authoritative physical tensor dimensions for display."""
 
         from zlc_data import DatasetSchema
 
         if not isinstance(schema, DatasetSchema):
             raise TypeError("TaskConsole signals require zlc_data.DatasetSchema")
-        logical_points = tuple(schema.point_layout.logical_shape)
-        dense = schema.point_layout.storage_size == math.prod(logical_points)
-        points = (
-            logical_points
-            if logical_points and dense
-            else (schema.point_layout.storage_size,)
-        )
-        grid = logical_points if dense and len(logical_points) == 2 else ()
         return {
-            "points_shape": points,
+            "point_count": int(schema.point_layout.storage_size),
             "data_shape": tuple(schema.cell_schema.data_shape),
-            "grid_shape": grid,
             "ring": int(schema.repeat_axis.size),
         }
 
     def _describe_from_schema(self, value, schema) -> str:
-        """Render one current ``DatasetSchema`` in canonical ``R × P × (data)`` form."""
+        """Render ``R × P...`` plus only the data axes the schema declares."""
 
-        from zlc_data.shape_text import contract_shape_label, describe_shape
+        from zlc_data.shape_text import contract_shape_label
 
         if schema is None:
-            return describe_shape(value)
+            if value is None:
+                return "—"
+            raise TypeError(
+                "published TaskConsole signal values require DatasetSchema"
+            )
         st = self._schema_structure(schema)
-        ps, ds, gs = st["points_shape"], st["data_shape"], st["grid_shape"]
+        point_count, ds = st["point_count"], st["data_shape"]
         if value is not None:
             actual_shape = tuple(int(size) for size in np.shape(value))
             expected_shape = tuple(schema.physical_shape)
@@ -1379,7 +1374,7 @@ class TaskConsole(QtWidgets.QWidget):
                     "signal value shape does not match DatasetSchema: "
                     f"{actual_shape} != {expected_shape}"
                 )
-        return contract_shape_label(int(st["ring"] or 1), ps, ds, gs)
+        return contract_shape_label(int(st["ring"] or 1), point_count, ds)
 
     @staticmethod
     def _card_signal_binding(card: "PanelCard") -> str:

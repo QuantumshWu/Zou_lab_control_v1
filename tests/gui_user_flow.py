@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import time
 
-from PyQt5 import QtCore, QtTest, QtWidgets
+from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 
 
 _FAST_PLATFORM = "offscreen"
@@ -67,6 +67,19 @@ def click_tab(body, page) -> None:
         QtCore.Qt.LeftButton,
         pos=bar.tabRect(index).center(),
     )
+
+
+def drag_mouse_move(widget, position, button) -> None:
+    """Deliver one real Qt mouse-move while ``button`` remains held."""
+
+    event = QtGui.QMouseEvent(
+        QtCore.QEvent.MouseMove,
+        QtCore.QPointF(position),
+        QtCore.Qt.NoButton,
+        button,
+        QtCore.Qt.NoModifier,
+    )
+    QtWidgets.QApplication.sendEvent(widget, event)
 
 
 def require_offscreen_platform(
@@ -149,6 +162,7 @@ __all__ = [
     "capture_offscreen_window",
     "click_tab",
     "configure_offscreen_fast_path",
+    "drag_mouse_move",
     "require_offscreen_platform",
     "until",
 ]

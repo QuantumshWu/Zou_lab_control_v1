@@ -425,8 +425,8 @@ class ConsoleCatalogView:
                         "frame",
                         "Counts",
                         "counts",
-                        "live or finite camera dataset preserving "
-                        "(R, P, *data_shape)",
+                        "live or finite camera dataset preserving every "
+                        "declared axis",
                     ),
                 ),
                 build_request=build_camera,
@@ -523,6 +523,47 @@ class ConsoleCatalogView:
                         "Calibration",
                         "",
                         "FINAL calibration artifact",
+                    ),
+                    ConsoleSignalDecl(
+                        "fidelity_site",
+                        "site fidelity",
+                        "Readout fidelity",
+                        "fidelity",
+                        (
+                            "held-out balanced fidelity for each canonical site "
+                            "from the FINAL calibration's default model"
+                        ),
+                    ),
+                    ConsoleSignalDecl(
+                        "fidelity_threshold",
+                        "site threshold",
+                        "Readout threshold",
+                        "counts",
+                        (
+                            "trained per-site threshold from the FINAL calibration "
+                            "report's default model"
+                        ),
+                    ),
+                    ConsoleSignalDecl(
+                        "fidelity_centers",
+                        "site centres",
+                        "Site centre",
+                        "px",
+                        "calibrated x/y centre for each canonical site",
+                    ),
+                    ConsoleSignalDecl(
+                        "aggregate_fidelity",
+                        "aggregate fidelity",
+                        "Aggregate fidelity",
+                        "fidelity",
+                        "held-out balanced fidelity using per-site thresholds",
+                    ),
+                    ConsoleSignalDecl(
+                        "global_fidelity",
+                        "global fidelity",
+                        "Global fidelity",
+                        "fidelity",
+                        "held-out balanced fidelity using one shared threshold",
                     ),
                 ),
                 build_request=build_calibration_task_intent,

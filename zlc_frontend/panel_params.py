@@ -43,6 +43,16 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
             display=True,
         ),
     ),
+    "monitor": (
+        ParamDecl(
+            key="show_dist",
+            label="side distribution",
+            kind="bool",
+            default=True,
+            display=True,
+            tooltip="Show the side distribution histogram beside the rolling trace",
+        ),
+    ),
     "hist": (
         ParamDecl(
             key="bins",

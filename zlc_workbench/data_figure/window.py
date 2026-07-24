@@ -1574,7 +1574,10 @@ class DataFigureWindow(FrozenRasterWindow):
         ):
             raise RuntimeError("IMAGE rectangle origin is stale")
         selection = None
-        if self._fit_available_for_intent(ViewIntent.IMAGE):
+        if (
+            gesture.normalized_bounds is not None
+            and self._fit_available_for_intent(ViewIntent.IMAGE)
+        ):
             # Resolve authority while QtRasterBoard still holds the exact front
             # on which this gesture was completed.  Painting the candidate first
             # would release that proof and make a later conversion racy.
@@ -1583,6 +1586,12 @@ class DataFigureWindow(FrozenRasterWindow):
             gesture.normalized_bounds,
             panel_id=_TYPED_PANEL_ID,
         )
+        if gesture.normalized_bounds is None:
+            if self._fit_available_for_intent(ViewIntent.IMAGE):
+                self._accept_fit_selection_candidate(origin, None)
+            else:
+                self._diagnostic.setText("")
+            return
         if selection is not None:
             self._accept_fit_selection_candidate(origin, selection)
             return

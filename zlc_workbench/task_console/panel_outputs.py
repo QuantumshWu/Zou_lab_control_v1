@@ -49,6 +49,7 @@ from zlc_data import (
     apply_transform,
     commit_transform,
     dataset_revision_ref_to_tree,
+    expand_dataset_validity,
     selection_to_tree,
     fit_spec_to_tree,
 )
@@ -68,6 +69,7 @@ __all__ = [
     "CROSS_Y_OUTPUT",
     "FIT_OUTPUT_PREFIX",
     "FitParameterMetadata",
+    "HistogramValueRangeSelection",
     "SelectorAxisMetadata",
     "area_range_output_name",
     "materialize_area_outputs",
@@ -114,6 +116,30 @@ class FitParameterMetadata:
             if not value:
                 raise ValueError(f"{field} must not be empty")
             object.__setattr__(self, field, value)
+
+
+@dataclass(frozen=True, slots=True)
+class HistogramValueRangeSelection:
+    """A Figure Area over histogram values, not over a named source axis.
+
+    Histogram x coordinates are physical sample values.  Pretending they are
+    one of the dataset's sample axes would select the wrong dimension.  This
+    narrow Figure-output intent therefore remains separate from
+    :class:`zlc_data.Selection` and is consumed only by the Area materializer.
+    """
+
+    lower: float
+    upper: float
+
+    def __post_init__(self) -> None:
+        lower = float(self.lower)
+        upper = float(self.upper)
+        if not math.isfinite(lower) or not math.isfinite(upper):
+            raise ValueError("histogram Area bounds must be finite")
+        if lower > upper:
+            raise ValueError("histogram Area lower bound exceeds upper bound")
+        object.__setattr__(self, "lower", lower)
+        object.__setattr__(self, "upper", upper)
 
 
 def _panel_identity(panel_id: str, output_name: str) -> tuple[str, str, str]:
@@ -684,12 +710,103 @@ def _site_map_area_outputs(
 def materialize_area_outputs(
     panel_id: str,
     source: ConsoleSignalValue,
-    selection: Selection,
+    selection: Selection | HistogramValueRangeSelection,
 ) -> dict[str, ConsoleSignalValue]:
     """Return selected data plus one typed bound vector per selected axis."""
 
     if not isinstance(source, ConsoleSignalValue):
         raise TypeError("Area source must be ConsoleSignalValue")
+    if isinstance(selection, HistogramValueRangeSelection):
+        snapshot = source.snapshot
+        if not isinstance(snapshot, OwnedSnapshot):
+            raise TypeError("Histogram Area source does not own a dataset snapshot")
+        schema = snapshot.block.schema
+        values = snapshot.block.values
+        if values.dtype.kind not in "biuf":
+            raise TypeError("Histogram Area requires real numeric source values")
+        physical_validity = expand_dataset_validity(
+            snapshot.block.validity,
+            schema,
+        )
+        selected_validity = (
+            np.asarray(physical_validity, dtype=np.bool_)
+            & np.isfinite(values)
+            & (values >= selection.lower)
+            & (values <= selection.upper)
+        )
+        data_axes = tuple(schema.cell_schema.data_axes)
+        if data_axes:
+            validity_contract = ValidityContract.components(
+                *(axis.axis_id for axis in data_axes)
+            )
+            validity = ComponentValidity(
+                tuple(axis.axis_id for axis in data_axes),
+                selected_validity,
+            )
+        else:
+            validity_contract = ValidityContract.value()
+            validity = CellValidity(selected_validity)
+        output_schema = DatasetSchema(
+            schema.repeat_axis,
+            schema.point_axes,
+            schema.point_layout,
+            ValueSchema(
+                data_axes,
+                validity_contract,
+                schema.cell_schema.dtype,
+                schema.cell_schema.value_unit,
+            ),
+        )
+        semantic_identity = {
+            "histogram_value_range": [selection.lower, selection.upper],
+        }
+        ref = _derived_ref(
+            panel_id,
+            AREA_DATA_OUTPUT,
+            snapshot.ref,
+            output_schema,
+            semantic_identity,
+        )
+        selected = OwnedSnapshot(
+            ref,
+            DataBlock(
+                ref.block_id,
+                ref.revision,
+                values,
+                validity,
+                output_schema,
+            ),
+        )
+        data_key = panel_signal_key(panel_id, AREA_DATA_OUTPUT)
+        outputs = {
+            data_key: _signal_value(
+                panel_id,
+                AREA_DATA_OUTPUT,
+                selected,
+                source,
+                coverage=source.coverage,
+            )
+        }
+        value_axis = AxisSpec(
+            AxisId(f"histogram-value-{schema.fingerprint[:24]}"),
+            "value",
+            COMPONENT,
+            1,
+            ("value",),
+            unit=schema.cell_schema.value_unit,
+        )
+        range_key, range_value = _area_range_output(
+            panel_id,
+            source,
+            snapshot.ref,
+            value_axis,
+            (selection.lower, selection.upper),
+            ("lower", "upper"),
+            semantic_identity,
+            unit=schema.cell_schema.value_unit,
+        )
+        outputs[range_key] = range_value
+        return outputs
     from zlc_frontend.site_map_render import (
         CalibrationSiteMapView,
         OccupancyCellView,

@@ -502,12 +502,17 @@ class FigureDocument:
 @dataclass(frozen=True)
 class AxisAddress:
     axis_id: AxisId
+    axis_name: str
+    axis_role: AxisRoleId
     index: int
     coordinate: Any
 
     def __post_init__(self) -> None:
         if not isinstance(self.axis_id, AxisId):
             raise TypeError("address axis_id must be AxisId")
+        object.__setattr__(self, "axis_name", _text(self.axis_name, "address axis name"))
+        if not isinstance(self.axis_role, AxisRoleId):
+            raise TypeError("address axis_role must be AxisRoleId")
         object.__setattr__(self, "index", _nonnegative(self.index, "address index"))
 
 

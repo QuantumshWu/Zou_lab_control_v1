@@ -129,8 +129,42 @@ def _histogram(
     )
     counts_group = bin_projection.bin_counts
     edges = bin_projection.bin_edges
-    _draw_histogram_projection(axis, series_group, counts_group, edges)
-    return counts_group, edges
+    artists = _draw_histogram_projection(
+        axis,
+        series_group,
+        counts_group,
+        edges,
+    )
+    return artists, counts_group, edges
+
+
+def _histogram_vertices(edges, counts) -> np.ndarray:
+    """Return Main's exact four-corner filled-bar geometry."""
+
+    edges = np.asarray(edges, dtype=np.float64)
+    counts = np.asarray(counts, dtype=np.float64)
+    if edges.ndim != 1 or counts.ndim != 1:
+        raise ValueError("histogram edges and counts must be one-dimensional")
+    if edges.size != counts.size + 1:
+        raise ValueError("histogram counts do not align with bin edges")
+    vertices = np.empty((counts.size, 4, 2), dtype=np.float64)
+    left = edges[:-1]
+    right = edges[1:]
+    vertices[:, 0, 0] = left
+    vertices[:, 0, 1] = 0.0
+    vertices[:, 1, 0] = left
+    vertices[:, 1, 1] = counts
+    vertices[:, 2, 0] = right
+    vertices[:, 2, 1] = counts
+    vertices[:, 3, 0] = right
+    vertices[:, 3, 1] = 0.0
+    return vertices
+
+
+def _update_histogram_artist(artist, counts, edges) -> None:
+    """Update one persistent PolyCollection through the same geometry owner."""
+
+    artist.set_verts(_histogram_vertices(edges, counts))
 
 def _draw_histogram_projection(
     axis,
@@ -139,8 +173,10 @@ def _draw_histogram_projection(
     edges,
     *,
     fill_alpha: float = HIST_FILL_ALPHA,
-) -> None:
+) -> tuple[object, ...]:
     """Draw one panel from already-frozen shared histogram geometry."""
+
+    from matplotlib.collections import PolyCollection
 
     multiple_series = len(series_group) > 1
     all_boolean = all(
@@ -148,17 +184,16 @@ def _draw_histogram_projection(
         and np.issubdtype(series.data.samples.dtype, np.bool_)
         for series in series_group
     )
+    artists = []
     for index, (series, counts) in enumerate(
         zip(series_group, counts_group, strict=True)
     ):
         data = series.data
         assert isinstance(data, EvaluatedHistogram)
         label = _series_label(series, include_reductions=multiple_series)
-        axis.stairs(
-            counts,
-            edges,
-            fill=True,
-            color=(
+        artist = PolyCollection(
+            _histogram_vertices(edges, counts),
+            facecolors=(
                 PALETTE["hist_fill"]
                 if index == 0
                 else LINE_CYCLE[index % len(LINE_CYCLE)]
@@ -166,8 +201,11 @@ def _draw_histogram_projection(
             alpha=float(fill_alpha),
             label=label,
         )
+        axis.add_collection(artist)
+        artists.append(artist)
     if all_boolean:
         axis.set_xticks((0, 1), ("false", "true"))
+    return tuple(artists)
 
 def _update_histogram_presentation(
     axis,

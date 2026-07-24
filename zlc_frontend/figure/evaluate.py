@@ -860,7 +860,13 @@ def _meter(
 
 
 def _address(axis: AxisSpec, index: int) -> AxisAddress:
-    return AxisAddress(axis.axis_id, index, _axis_coordinate(axis, index))
+    return AxisAddress(
+        axis.axis_id,
+        axis.name,
+        axis.role,
+        index,
+        _axis_coordinate(axis, index),
+    )
 
 
 def _combinations(axes: tuple[AxisSpec, ...], allowed):

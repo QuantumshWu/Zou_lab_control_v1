@@ -17,7 +17,6 @@ from PyQt5 import QtCore, QtWidgets
 
 from ..data_figure import FigurePanelRegion
 from ..render import BoardFrame
-from .fluent import FluentButton, scaled_px
 from .frozen_raster import FrozenRasterView
 from .panel_host import SinglePanelHost
 
@@ -64,15 +63,10 @@ class FacetedPanelHost(QtWidgets.QWidget):
         self._stack.addWidget(self._focus)
         self._stack.setCurrentWidget(self._overview)
 
-        self._overview_button = FluentButton("Overview", self)
-        self._overview_button.setObjectName("facetedPanelOverviewButton")
-        self._overview_button.setToolTip("Return to the complete coherent grid")
-        self._overview_button.clicked.connect(self.overviewRequested.emit)
-        self._overview_button.hide()
-
         self._overview.normalizedDoubleClicked.connect(
             self._resolve_overview_hit
         )
+        self._focus.board.installEventFilter(self)
         self._focus.rangeSelected.connect(self.rangeSelected.emit)
         self._focus.viewCommitted.connect(self.viewCommitted.emit)
         self._focus.thresholdsCommitted.connect(
@@ -148,7 +142,6 @@ class FacetedPanelHost(QtWidgets.QWidget):
             if logical_size is not None:
                 self.set_logical_size(logical_size)
             self._stack.setCurrentWidget(self._overview)
-            self._overview_button.hide()
         finally:
             if geometry_changes:
                 self.setUpdatesEnabled(True)
@@ -167,9 +160,7 @@ class FacetedPanelHost(QtWidgets.QWidget):
             self.setFixedSize(*logical_size)
         self._focus.set_selectors_enabled(self._selectors_on)
         self._stack.setCurrentWidget(self._focus)
-        self._place_overview_button()
-        self._overview_button.show()
-        self._overview_button.raise_()
+        self._focus.board.setFocus(QtCore.Qt.OtherFocusReason)
 
     def set_logical_size(self, logical_size: tuple[int, int]) -> None:
         """Give overview and focused-cell views the same authored plot extent."""
@@ -195,20 +186,21 @@ class FacetedPanelHost(QtWidgets.QWidget):
         self._overview.clear()
         self._focus.clear()
         self._stack.setCurrentWidget(self._overview)
-        self._overview_button.hide()
 
-    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
-        super().resizeEvent(event)
-        self._place_overview_button()
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt API
+        """Match Main's focused-grid return gestures without extra chrome."""
 
-    def _place_overview_button(self) -> None:
-        hint = self._overview_button.sizeHint()
-        self._overview_button.resize(hint)
-        inset = scaled_px(8, minimum=5)
-        self._overview_button.move(
-            max(inset, self.width() - hint.width() - inset),
-            inset,
-        )
+        if watched is self._focus.board and not self.showing_overview:
+            if (
+                event.type() == QtCore.QEvent.MouseButtonDblClick
+                and event.button() == QtCore.Qt.LeftButton
+            ) or (
+                event.type() == QtCore.QEvent.KeyPress
+                and event.key() == QtCore.Qt.Key_Escape
+            ):
+                self.overviewRequested.emit()
+                return True
+        return super().eventFilter(watched, event)
 
     @QtCore.pyqtSlot(float, float)
     def _resolve_overview_hit(self, x: float, y: float) -> None:

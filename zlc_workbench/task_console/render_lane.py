@@ -37,6 +37,7 @@ class PanelRenderRequest:
     focus: object
     fit_result: object | None = None
     fit_result_identity: str | None = None
+    rolling_distribution: bool = False
 
 
 class ConsoleRenderLane:
@@ -156,7 +157,8 @@ class ConsoleRenderLane:
                         label=request.label,
                         value_label=request.value_label,
                         view=request.view,
-                        rolling_distribution=request.kind == "monitor",
+                        rolling_trace=request.kind == "monitor",
+                        rolling_distribution=request.rolling_distribution,
                     )
                 self._worker_composers[request.panel_id] = (
                     request.source_key,

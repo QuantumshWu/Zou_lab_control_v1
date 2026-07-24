@@ -19,13 +19,13 @@ RELIM_PARAM = ParamDecl(
     key="relim",
     label="relim",
     kind="choice",
-    default="normal",
+    default="tight",
     choices=RELIM_MODES,
     display=True,
     tooltip=(
         "Relim mode:\n"
         "  tight  = autoscale hugs the data\n"
-        "  normal = autoscale, holding the window until data leaves it\n"
+        "  normal = autoscale with the matplotlib default margin\n"
         "  fixed  = pin the value range to the lo/hi controls"
     ),
 )

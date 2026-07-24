@@ -387,6 +387,11 @@ class CaptureWorkbenchWindow(QtWidgets.QWidget):
             raise RuntimeError("finite image area differs from its painted origin")
         self._rectangle_candidate = gesture.normalized_bounds
         self._board_widget.set_image_rectangle_candidate(gesture.normalized_bounds)
+        if gesture.normalized_bounds is None:
+            self._interaction_status.setText(
+                "Area: DISPLAY ONLY · no selection"
+            )
+            return
         left, top, right, bottom = gesture.normalized_bounds
         self._interaction_status.setText(
             "Area: DISPLAY ONLY · full-raster "

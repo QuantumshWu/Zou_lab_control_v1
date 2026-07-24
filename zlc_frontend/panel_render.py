@@ -229,6 +229,7 @@ class PanelComposer:
         label: str = "",
         value_label: str = "Signal",
         view: ViewSpec | None = None,
+        rolling_trace: bool = False,
         rolling_distribution: bool = False,
     ) -> None:
         from .figure import dataset_contract_for
@@ -255,6 +256,7 @@ class PanelComposer:
         self._label = str(label or panel_id)
         self._value_label = str(value_label or "Signal")
         self._rolling_distribution = bool(rolling_distribution)
+        self._rolling_trace = bool(rolling_trace or rolling_distribution)
         self._dataset_id = DatasetId(self._panel_id)
         self._document: FigureDocument | None = None
         self._document_fingerprint = None
@@ -766,6 +768,7 @@ class PanelComposer:
             self._renderer = SinglePanelAggRenderer(
                 self._document, width=self._size[0], height=self._size[1],
                 dpi=self._live_dpi(),
+                rolling_trace=self._rolling_trace,
                 rolling_distribution=self._rolling_distribution,
                 value_label=self._value_label,
                 title=self._label,
