@@ -54,7 +54,8 @@ class MeasurementPanel(QtWidgets.QWidget):
     stop_requested = QtCore.pyqtSignal()
 
     def __init__(self, measurements: Sequence[object], parent=None, *, single: bool = False,
-                 controls: bool = True, signals_provider=None, sources_provider=None, formats_provider=None,
+                 controls: bool = True, signals_provider=None, signal_providers=None,
+                 sources_provider=None, formats_provider=None,
                  short_names_provider=None, acquisition_params: Sequence[object] = ()):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
@@ -69,6 +70,11 @@ class MeasurementPanel(QtWidgets.QWidget):
         # signal picker the plot panels use: names_provider gives live signal names, and the
         # sources/formats providers give the producing node + shape for the grouping.
         self._signals_provider = signals_provider
+        # A form may contain more than one semantically different signal
+        # input (for example Camera frame + Calibration artifact).  They share
+        # one tree-picker implementation, but each field must receive only the
+        # producer/output kinds its request contract accepts.
+        self._signal_providers = dict(signal_providers or {})
         self._sources_provider = sources_provider
         self._formats_provider = formats_provider
         # The short-name map (full hub name -> short name) the signal picker uses as its ``labels`` so a
@@ -175,14 +181,17 @@ class MeasurementPanel(QtWidgets.QWidget):
         header spans the full width -- no outer row label (its header IS the label)."""
         self.form.addWidget(widget)
 
-    def _param_context(self) -> ParamWidgetContext:
+    def _param_context(self, key: str) -> ParamWidgetContext:
         """The bundle every PARAM_WIDGETS handler builds against: re-validation on edit
         + the signal providers + factories for the two composite widgets that live in
         this module.  ``instant_apply`` stays None -- the measurement form reads back on
         Start (``collect_values``), it does NOT push each edit into a live config."""
         return ParamWidgetContext(
             on_change=self._refresh_start_enabled,
-            signals_provider=self._signals_provider,
+            signals_provider=self._signal_providers.get(
+                str(key),
+                self._signals_provider,
+            ),
             sources_provider=self._sources_provider,
             formats_provider=self._formats_provider,
             labels_provider=self._short_names_provider,
@@ -219,7 +228,6 @@ class MeasurementPanel(QtWidgets.QWidget):
             d.row_label() for d in decls if d.kind not in SPAN_KINDS      # single source: label + (unit) [+ *]
         ]
         self._form_label_w = setting_label_width(scalar_labels or [""], minimum=72)
-        ctx = self._param_context()
         for decl in decls:
             kind = decl.kind
             # Show the READABLE label ("Pulse template" / "Signal (y)" / "Output name"), not the
@@ -229,7 +237,7 @@ class MeasurementPanel(QtWidgets.QWidget):
             handler = PARAM_WIDGETS[kind]
             # build the widget seeded from the decl's default (a saved value is applied later by
             # seed_values); the handler wires ctx.on_change (re-validate) onto its change signals.
-            widget = handler.build(decl, decl.default, ctx)
+            widget = handler.build(decl, decl.default, self._param_context(decl.key))
             if kind in SPAN_KINDS:
                 self._add_span(widget)              # FULL-WIDTH span (label is the widget's header, #H3b)
             else:
@@ -313,17 +321,20 @@ class MeasurementPanel(QtWidgets.QWidget):
         yet); after a measurement publishes one, returning to this tab shows it -- without
         rebuilding the form, just refilling the existing combos -- so the current selection
         round-trips."""
-        names: list[str] = []
-        if callable(self._signals_provider):
-            try: names = [str(n) for n in self._signals_provider()]
-            except Exception: names = []
         sources = self._sources_provider() if callable(self._sources_provider) else {}
         formats = self._formats_provider() if callable(self._formats_provider) else {}
         labels = coerce_short_labels(self._short_names_provider)
         for key, widget in list(self._widgets.items()):
             kind = self._decls[key].kind
+            provider = self._signal_providers.get(key, self._signals_provider)
+            names: list[str] = []
+            if callable(provider):
+                try:
+                    names = [str(name) for name in provider()]
+                except Exception:
+                    names = []
             providers = RefreshProviders(signals=names, sources=sources, formats=formats,
-                                         labels=labels)
+                                          labels=labels)
             self._handlers[key].refresh(widget, providers)
         self._refresh_start_enabled()
 

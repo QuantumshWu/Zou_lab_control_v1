@@ -1275,7 +1275,15 @@ class PanelCard(FluentGroupBox):
                 None
                 if site_map_view is None
                 else (
-                    site_map_view.view_identity,
+                    # Composer ownership is structural.  A live occupancy
+                    # cell gets a new view_identity for every exact Camera
+                    # revision; putting that value here recreated the Agg
+                    # renderer on every shot and reset its BoardFrame sequence
+                    # to one.  The per-shot identity already belongs to
+                    # frame_key/signature/provenance below.  Presentation kind
+                    # plus the admitted calibration identify the stable site
+                    # geometry a SiteMapComposer may safely reuse.
+                    site_map_view.presentation_kind,
                     site_map_view.calibration_identity,
                 )
             ),

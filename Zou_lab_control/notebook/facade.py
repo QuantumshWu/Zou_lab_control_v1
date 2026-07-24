@@ -117,8 +117,8 @@ from zlc_neutral_atom.readout.coupled_measurements import (
     ReadoutDurationFidelityRequest,
     TemperatureReleaseRecaptureRequest,
     bind_grey_molasses_detuning,
+    bind_readout_duration_fidelity,
     bind_temperature_release_recapture,
-    reject_readout_duration_fidelity,
 )
 from zlc_neutral_atom.readout.occupancy_reference import OccupancyArtifactRef
 from zlc_neutral_atom.readout.contracts import (
@@ -155,6 +155,10 @@ from zlc_neutral_atom.release_recapture_application import (
     PreparedTemperatureReleaseRecapture,
     prepare_grey_molasses_detuning,
     prepare_temperature_release_recapture,
+)
+from zlc_neutral_atom.readout_duration_application import (
+    PreparedReadoutDurationFidelity,
+    prepare_readout_duration_fidelity,
 )
 from zlc_neutral_atom.runtime.streams import StreamId
 from zlc_neutral_atom.runtime.pipeline import MinimalPipelineSpec
@@ -882,7 +886,7 @@ class ReadoutFacade:
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
     ) -> ReadoutDurationFidelityRequest:
-        """Freeze valid intent even when this installation lacks its Port."""
+        """Freeze one camera-rearmed API-slot duration sweep."""
 
         if not isinstance(calibration_ref, CalibrationArtifactRef):
             raise TypeError("calibration_ref must be CalibrationArtifactRef")
@@ -915,8 +919,23 @@ class ReadoutFacade:
         self,
         request: ReadoutDurationFidelityRequest,
     ) -> RunHandle:
-        reject_readout_duration_fidelity(request)
-        raise AssertionError("capability rejection did not raise")
+        with _service_guard(self._token) as services:
+            return _prepare_readout_duration_fidelity_for_services(
+                services,
+                request,
+            ).start()
+
+    def readout_duration_fidelity(
+        self,
+        request: ReadoutDurationFidelityRequest,
+    ):
+        with _service_guard(self._token) as services:
+            handle = _prepare_readout_duration_fidelity_for_services(
+                services,
+                request,
+            ).start()
+            runtime = services.runtime
+        return runtime.wait(handle)
 
     def grey_molasses_detuning_request(
         self,
@@ -3415,6 +3434,44 @@ def _prepare_temperature_release_recapture_for_workbench(
         raise TypeError("experiment must be Experiment")
     with _service_guard(experiment._authority_token) as services:
         return _prepare_temperature_release_recapture_for_services(
+            services,
+            request,
+        )
+
+
+def _prepare_readout_duration_fidelity_for_services(
+    services: _ExperimentServices,
+    request: ReadoutDurationFidelityRequest,
+) -> PreparedReadoutDurationFidelity:
+    if not isinstance(request, ReadoutDurationFidelityRequest):
+        raise TypeError("request must be ReadoutDurationFidelityRequest")
+    calibration = _calibration_repository(services).admit(
+        request.calibration_ref,
+        services.capture_repository,
+    )
+    bound = bind_readout_duration_fidelity(
+        request,
+        calibration,
+        pulse_port=services.runtime.pulse_port(request.sequencer_ref),
+        camera_port=services.runtime.camera_port(request.camera_ref),
+    )
+    return prepare_readout_duration_fidelity(
+        bound,
+        calibration,
+        start_run=services.runtime.start,
+    )
+
+
+def _prepare_readout_duration_fidelity_for_workbench(
+    experiment: Experiment,
+    request: ReadoutDurationFidelityRequest,
+) -> PreparedReadoutDurationFidelity:
+    """Private friend seam for the TaskConsole Measurement presenter."""
+
+    if not isinstance(experiment, Experiment):
+        raise TypeError("experiment must be Experiment")
+    with _service_guard(experiment._authority_token) as services:
+        return _prepare_readout_duration_fidelity_for_services(
             services,
             request,
         )

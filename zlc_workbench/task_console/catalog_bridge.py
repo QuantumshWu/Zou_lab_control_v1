@@ -59,7 +59,11 @@ from .calibration_task import (
     calibration_task_params,
 )
 from .mot_field_task import build_mot_field_intent, mot_field_params
-from .occupancy_binding import OccupancyBindingIntent
+from .occupancy_binding import (
+    OccupancyBindingIntent,
+    occupancy_readout_method_labels,
+    parse_occupancy_readout_method,
+)
 from .pulse_scan_binding import PulseScanBindingIntent
 from .coupled_measurement_presenter import (
     build_grey_molasses_detuning_intent,
@@ -70,8 +74,7 @@ from .coupled_measurement_presenter import (
     temperature_release_recapture_params,
 )
 
-SCAN_INTENT_DEFAULT_CAMERA_ROLE = "camera"
-SCAN_INTENT_DEFAULT_SEQUENCER_ROLE = "sequencer"
+DEFAULT_CAMERA_ROLE = "camera"
 CAMERA_MEASUREMENT_ROLES = ("camera", "mot_camera")
 
 
@@ -199,37 +202,6 @@ def _role_form_field(
     )
 
 
-def _scan_binding_form(
-    camera_roles: tuple[str, ...],
-    sequencer_roles: tuple[str, ...],
-) -> FormSpec:
-    return FormSpec(
-        (
-            _role_form_field(
-                camera_roles,
-                key="camera_role",
-                label="Camera role",
-                domain="camera",
-                preferred=SCAN_INTENT_DEFAULT_CAMERA_ROLE,
-            ),
-            _role_form_field(
-                sequencer_roles,
-                key="sequencer_role",
-                label="Sequencer role",
-                domain="sequencer",
-                preferred=SCAN_INTENT_DEFAULT_SEQUENCER_ROLE,
-            ),
-            FormFieldProps(
-                "trigger_channel",
-                "text",
-                "Trigger channel",
-                default=None,
-                description="Optional explicit camera-trigger channel",
-            ),
-        )
-    )
-
-
 def _short_title(key: DefinitionKey) -> str:
     """A menu-length label derived from the definition's STABLE id.
 
@@ -275,7 +247,7 @@ def _camera_params(
                         key="camera_role",
                         label="Camera",
                         domain="camera",
-                        preferred=SCAN_INTENT_DEFAULT_CAMERA_ROLE,
+                        preferred=DEFAULT_CAMERA_ROLE,
                     ),
                 )
             )
@@ -354,18 +326,6 @@ def _pulse_scan_params() -> tuple[ParamDecl, ...]:
 def _occupancy_params() -> tuple[ParamDecl, ...]:
     return (
         ParamDecl(
-            "camera_frame",
-            "Camera frame",
-            "signal",
-            required=True,
-            tooltip=(
-                "Frame output of an already-running live Camera Measurement "
-                "(repeat = 0). "
-                "Occupancy reacts to each newly published immutable revision; "
-                "it never starts or reconfigures the Camera"
-            ),
-        ),
-        ParamDecl(
             "calibration",
             "Calibration",
             "signal",
@@ -374,6 +334,29 @@ def _occupancy_params() -> tuple[ParamDecl, ...]:
                 "FINAL calibration output of a successful Calibrate readout "
                 "Task row in this TaskConsole; it is admitted once when the "
                 "Processor starts"
+            ),
+        ),
+        ParamDecl(
+            "camera_frame",
+            "Frame source",
+            "signal",
+            required=True,
+            tooltip=(
+                "Current-frame output of an already-running Camera Measurement. "
+                "Live and finite Camera runs both publish this typed view; "
+                "Occupancy never guesses a current cell from a full dataset, "
+                "starts, or reconfigures the Camera"
+            ),
+        ),
+        ParamDecl(
+            "readout_method",
+            "Readout method",
+            "choice",
+            default="box",
+            required=True,
+            choices=occupancy_readout_method_labels(),
+            tooltip=(
+                "Select one model already stored in the admitted calibration"
             ),
         ),
     )
@@ -458,16 +441,13 @@ class ConsoleCatalogView:
                     "cell; publishes calibrated survival without dropping the "
                     "repeat or scan axes"
                 ),
-                params=temperature_release_recapture_params(
-                    self.camera_roles(),
-                    self.sequencer_roles(),
-                ),
+                params=temperature_release_recapture_params(),
                 declared_outputs=(
                     ConsoleSignalDecl(
                         "survival",
                         "survival",
                         "Survival",
-                        "survival",
+                        "",
                         "release-recapture survival",
                     ),
                 ),
@@ -479,14 +459,11 @@ class ConsoleCatalogView:
                 kind="measurement",
                 title=item.title,
                 description=(
-                    "Visible current Measurement intent; Start rejects until "
-                    "the camera Port can configure and read back exposure before "
-                    "each exact API-slot point group"
+                    "Coupled API-slot measurement: each point applies and reads "
+                    "back the camera integration time, then hardware-timed "
+                    "shots publish one calibrated Otsu fidelity value"
                 ),
-                params=readout_duration_fidelity_params(
-                    self.camera_roles(),
-                    self.sequencer_roles(),
-                ),
+                params=readout_duration_fidelity_params(),
                 declared_outputs=(
                     ConsoleSignalDecl(
                         "fidelity",
@@ -509,22 +486,17 @@ class ConsoleCatalogView:
                     "clock; Start names the missing capability when no "
                     "synchronized RF Port is installed"
                 ),
-                params=grey_molasses_detuning_params(
-                    self.camera_roles(),
-                    self.sequencer_roles(),
-                    self.rf_roles(),
-                ),
+                params=grey_molasses_detuning_params(self.rf_roles()),
                 declared_outputs=(
                     ConsoleSignalDecl(
-                        "survival",
-                        "survival",
-                        "Survival",
-                        "survival",
-                        "grey-molasses survival",
+                        "recapture",
+                        "recapture",
+                        "Recapture rate",
+                        "",
+                        "grey-molasses recapture rate",
                     ),
                 ),
                 build_request=build_grey_molasses_detuning_intent,
-                default_panel=("survival", "1d"),
             )
         kind = _GROUP_TO_KIND.get(item.group)
         if kind is None:
@@ -697,10 +669,6 @@ class ConsoleCatalogView:
                     ),
                 ),
                 build_request=build_scan,
-                # The exact y may be scalar, site-valued, or a full spatial
-                # frame.  Its first real FINAL schema, not this catalog row,
-                # chooses the initial Figure intent.
-                default_panel=("scan", "auto"),
             )
         if item.key == OCCUPANCY_STREAM_PROCESSOR_KEY:
 
@@ -718,12 +686,15 @@ class ConsoleCatalogView:
                 return OccupancyBindingIntent(
                     camera_frame.strip(),
                     calibration.strip(),
+                    parse_occupancy_readout_method(
+                        values.get("readout_method", "box")
+                    ),
                 )
 
             return ConsoleNodeSpec(
                 key=item.key,
                 kind=kind,
-                title=_short_title(item.key),
+                title="Judge occupancy",
                 description=item.title,
                 params=_occupancy_params(),
                 declared_outputs=(
@@ -740,6 +711,13 @@ class ConsoleCatalogView:
                         "Counts",
                         "counts",
                         "site counts",
+                    ),
+                    ConsoleSignalDecl(
+                        "rate",
+                        "rate",
+                        "Loading rate",
+                        "",
+                        "valid-site occupancy fraction for each repeat/point cell",
                     ),
                 ),
                 build_request=build_occupancy,

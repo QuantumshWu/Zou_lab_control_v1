@@ -203,10 +203,29 @@ class ConsoleRunNode:
 
     @property
     def running(self) -> bool:
+        # A start is already this node's accepted lifecycle generation before
+        # the owner-thread completion installs its RunHandle.  Live view ports
+        # may publish their first immutable revision in that narrow interval;
+        # treating the producer as stopped makes a real same-node publication
+        # impossible to bind reactively until an unrelated GUI poll occurs.
+        if self._start_pending:
+            return True
         snapshot = self._snapshot
         if self._handle is None:
             return False
         return snapshot is None or not snapshot.state.terminal
+
+    @property
+    def lifecycle_generation(self) -> int:
+        """Owner generation that identifies the currently accepted start.
+
+        This is deliberately distinct from a dataset stream generation.  It
+        lets a downstream reactive node pin the source Run even while its first
+        frame has arrived just before the corresponding RunHandle completion is
+        drained on the Qt owner thread.
+        """
+
+        return self._owner.generation
 
     @property
     def worker_idle(self) -> bool:

@@ -616,6 +616,64 @@ class CaptureCapabilitySnapshot:
 
 
 @dataclass(frozen=True)
+class ConfigureCameraExposureCommand:
+    """Apply/read back one exposure under a cleanup-closeable lease."""
+
+    session_id: str
+    exposure_seconds: float
+    baseline_settings_fingerprint: str
+
+    def __post_init__(self) -> None:
+        _canonical_text(self.session_id, "session_id")
+        object.__setattr__(
+            self,
+            "exposure_seconds",
+            _positive_finite(self.exposure_seconds, "exposure_seconds"),
+        )
+        _sha256(
+            self.baseline_settings_fingerprint,
+            "baseline_settings_fingerprint",
+        )
+
+
+@dataclass(frozen=True)
+class CameraExposureConfiguredAck:
+    session_id: str
+    binding_instance_id: str
+    requested_exposure_seconds: float
+    applied_exposure_seconds: float
+    required_external_trigger_interval_seconds: float
+    settings_fingerprint: str
+    capability_fingerprint: str
+
+    def __post_init__(self) -> None:
+        for name in ("session_id", "binding_instance_id"):
+            _canonical_text(getattr(self, name), name)
+        for name in (
+            "requested_exposure_seconds",
+            "applied_exposure_seconds",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _positive_finite(getattr(self, name), name),
+            )
+        interval = float(self.required_external_trigger_interval_seconds)
+        if not math.isfinite(interval) or interval < 0.0:
+            raise ValueError(
+                "required_external_trigger_interval_seconds must be finite "
+                "and non-negative"
+            )
+        object.__setattr__(
+            self,
+            "required_external_trigger_interval_seconds",
+            interval,
+        )
+        _sha256(self.settings_fingerprint, "settings_fingerprint")
+        _sha256(self.capability_fingerprint, "capability_fingerprint")
+
+
+@dataclass(frozen=True)
 class CameraCaptureProvenance:
     """Owner-derived physical facts for one raw camera capture binding.
 
@@ -1927,6 +1985,8 @@ class CaptureSession:
 
 __all__ = [
     "BoundCapturePort",
+    "CameraExposureConfiguredAck",
+    "ConfigureCameraExposureCommand",
     "CaptureCapabilitySnapshot",
     "CaptureCompletion",
     "CapturePayloadContract",

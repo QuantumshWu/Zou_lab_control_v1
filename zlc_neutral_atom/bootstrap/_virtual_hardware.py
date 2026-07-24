@@ -1176,6 +1176,19 @@ class VirtualCamera:
             readout_mode="target-virtual:mode=EXTERNAL_TRIGGERED",
         )
 
+    def configure_exposure_seconds(self, exposure_seconds: float) -> None:
+        """Apply the same exposure setting a real camera adapter must read back."""
+
+        value = _positive(exposure_seconds, "exposure_seconds")
+        with self._condition:
+            if self._armed or (
+                self._worker is not None and self._worker.is_alive()
+            ):
+                raise RuntimeError(
+                    "virtual camera exposure cannot change while armed"
+                )
+            self.exposure = value
+
     def arm(
         self,
         frames: int | None,

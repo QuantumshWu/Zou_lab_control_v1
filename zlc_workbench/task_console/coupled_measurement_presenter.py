@@ -19,14 +19,7 @@ from zlc_neutral_atom.pulse_programs import (
     DEFAULT_PROBE_PULSE_PATH,
     DEFAULT_RELEASE_RECAPTURE_PULSE_PATH,
 )
-from zlc_neutral_atom.readout.calibration import ReadoutModelKind
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
-
-
-_MODEL_CHOICES = (
-    "auto",
-    *(kind.value for kind in ReadoutModelKind),
-)
 
 
 def _preferred(roles: tuple[str, ...], *candidates: str) -> str:
@@ -38,62 +31,22 @@ def _preferred(roles: tuple[str, ...], *candidates: str) -> str:
     return roles[0]
 
 
-def _common_params(
-    camera_roles: tuple[str, ...],
-    sequencer_roles: tuple[str, ...],
-) -> tuple[ParamDecl, ...]:
-    cameras = tuple(camera_roles)
-    sequencers = tuple(sequencer_roles)
-    return (
-        ParamDecl(
-            "calibration",
-            "Calibration",
-            "signal",
-            required=True,
-            tooltip=(
-                "FINAL calibration output of a successful Calibrate readout "
-                "Task; the artifact reference is frozen into this request"
-            ),
-        ),
-        ParamDecl(
-            "model_kind",
-            "Readout model",
-            "choice",
-            default="auto",
-            choices=_MODEL_CHOICES,
-            tooltip="Auto uses the calibration artifact's declared default model",
-        ),
-        ParamDecl(
-            "camera_role",
-            "Camera role",
-            "choice",
-            default=_preferred(cameras, "camera", "readout"),
-            required=True,
-            choices=cameras,
-        ),
-        ParamDecl(
-            "sequencer_role",
-            "Sequencer role",
-            "choice",
-            default=_preferred(sequencers, "sequencer"),
-            required=True,
-            choices=sequencers,
-        ),
-        ParamDecl(
-            "trigger_channel",
-            "Trigger channel",
-            "text",
-            default=None,
-            required=False,
-            tooltip="Leave blank to use the camera capability's declared trigger",
+def _calibration_param() -> ParamDecl:
+    """The one explicit dependency Main could previously take from session state."""
+
+    return ParamDecl(
+        "calibration",
+        "Calibration",
+        "signal",
+        required=True,
+        tooltip=(
+            "FINAL calibration output of a successful Calibrate readout "
+            "Task; the artifact reference is frozen into this request"
         ),
     )
 
 
-def temperature_release_recapture_params(
-    camera_roles: tuple[str, ...],
-    sequencer_roles: tuple[str, ...],
-) -> tuple[ParamDecl, ...]:
+def temperature_release_recapture_params() -> tuple[ParamDecl, ...]:
     return (
         ParamDecl(
             "pulse",
@@ -139,14 +92,11 @@ def temperature_release_recapture_params(
             "bool",
             default=False,
         ),
-        *_common_params(camera_roles, sequencer_roles),
+        _calibration_param(),
     )
 
 
-def readout_duration_fidelity_params(
-    camera_roles: tuple[str, ...],
-    sequencer_roles: tuple[str, ...],
-) -> tuple[ParamDecl, ...]:
+def readout_duration_fidelity_params() -> tuple[ParamDecl, ...]:
     return (
         ParamDecl(
             "pulse",
@@ -188,13 +138,11 @@ def readout_duration_fidelity_params(
             required=False,
             optional=True,
         ),
-        *_common_params(camera_roles, sequencer_roles),
+        _calibration_param(),
     )
 
 
 def grey_molasses_detuning_params(
-    camera_roles: tuple[str, ...],
-    sequencer_roles: tuple[str, ...],
     rf_roles: tuple[str, ...],
 ) -> tuple[ParamDecl, ...]:
     rf = tuple(rf_roles)
@@ -215,7 +163,7 @@ def grey_molasses_detuning_params(
             "Two-photon detuning",
             "axis_range",
             default=(-0.4, 0.4, 21),
-            unit="Gamma",
+            unit="Γ",
             lo=-50.0,
             hi=50.0,
             required=True,
@@ -261,7 +209,7 @@ def grey_molasses_detuning_params(
                 else ""
             ),
         ),
-        *_common_params(camera_roles, sequencer_roles),
+        _calibration_param(),
     )
 
 
@@ -293,11 +241,6 @@ def _axis(
     return tuple(float(item) * scale for item in values)
 
 
-def _model(values: Mapping[str, object]) -> ReadoutModelKind | None:
-    value = values.get("model_kind", "auto")
-    return None if value in (None, "", "auto") else ReadoutModelKind(str(value))
-
-
 def _calibration(reference: CalibrationArtifactRef) -> CalibrationArtifactRef:
     if not isinstance(reference, CalibrationArtifactRef):
         raise TypeError("calibration_ref must be CalibrationArtifactRef")
@@ -319,11 +262,7 @@ class TemperatureReleaseRecaptureIntent:
     trap_off_seconds: tuple[float, ...]
     shots: int
     calibration_signal: str
-    model_kind: ReadoutModelKind | None
     per_site: bool
-    camera_role: str
-    sequencer_role: str
-    trigger_channel: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,11 +271,7 @@ class ReadoutDurationFidelityIntent:
     duration_seconds: tuple[float, ...]
     shots: int
     calibration_signal: str
-    model_kind: ReadoutModelKind | None
     site: int | None
-    camera_role: str
-    sequencer_role: str
-    trigger_channel: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,16 +282,7 @@ class GreyMolassesDetuningIntent:
     shots: int
     rf_role: str
     calibration_signal: str
-    model_kind: ReadoutModelKind | None
     per_site: bool
-    camera_role: str
-    sequencer_role: str
-    trigger_channel: str | None
-
-
-def _trigger(values: Mapping[str, object]) -> str | None:
-    value = values.get("trigger_channel")
-    return None if value in (None, "") else str(value)
 
 
 def build_temperature_release_recapture_intent(
@@ -367,11 +293,7 @@ def build_temperature_release_recapture_intent(
         _axis(values.get("t_off"), "t_off", scale=1e-6),
         int(values.get("shots", 16)),
         _selected_signal(values),
-        _model(values),
         bool(values.get("per_site", False)),
-        str(values["camera_role"]),
-        str(values["sequencer_role"]),
-        _trigger(values),
     )
 
 
@@ -384,11 +306,7 @@ def build_readout_duration_fidelity_intent(
         _axis(values.get("duration"), "duration", scale=1e-6),
         int(values.get("shots", 60)),
         _selected_signal(values),
-        _model(values),
         None if site in (None, "") else int(site),
-        str(values["camera_role"]),
-        str(values["sequencer_role"]),
-        _trigger(values),
     )
 
 
@@ -402,11 +320,7 @@ def build_grey_molasses_detuning_intent(
         int(values.get("shots", 16)),
         str(values["rf_role"]),
         _selected_signal(values),
-        _model(values),
         bool(values.get("per_site", False)),
-        str(values["camera_role"]),
-        str(values["sequencer_role"]),
-        _trigger(values),
     )
 
 
@@ -423,11 +337,24 @@ def freeze_temperature_release_recapture_request(
         trap_off_seconds=intent.trap_off_seconds,
         shots=intent.shots,
         calibration_ref=_calibration(calibration_ref),
-        model_kind=intent.model_kind,
         per_site=intent.per_site,
-        camera_role=intent.camera_role,
-        sequencer_role=intent.sequencer_role,
-        trigger_channel=intent.trigger_channel,
+    )
+
+
+def freeze_readout_duration_fidelity_request(
+    experiment,
+    intent: ReadoutDurationFidelityIntent,
+    *,
+    calibration_ref: CalibrationArtifactRef,
+):
+    if not isinstance(intent, ReadoutDurationFidelityIntent):
+        raise TypeError("intent must be ReadoutDurationFidelityIntent")
+    return experiment.readout.readout_duration_fidelity_request(
+        intent.pulse,
+        duration_seconds=intent.duration_seconds,
+        shots=intent.shots,
+        calibration_ref=_calibration(calibration_ref),
+        site=intent.site,
     )
 
 
@@ -446,11 +373,7 @@ def freeze_grey_molasses_detuning_request(
         shots=intent.shots,
         rf_role=intent.rf_role,
         calibration_ref=_calibration(calibration_ref),
-        model_kind=intent.model_kind,
         per_site=intent.per_site,
-        camera_role=intent.camera_role,
-        sequencer_role=intent.sequencer_role,
-        trigger_channel=intent.trigger_channel,
     )
 
 
@@ -462,6 +385,7 @@ __all__ = [
     "build_readout_duration_fidelity_intent",
     "build_temperature_release_recapture_intent",
     "freeze_grey_molasses_detuning_request",
+    "freeze_readout_duration_fidelity_request",
     "freeze_temperature_release_recapture_request",
     "grey_molasses_detuning_params",
     "readout_duration_fidelity_params",

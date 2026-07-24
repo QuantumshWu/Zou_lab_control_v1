@@ -40,7 +40,7 @@ class LogicNodeEditor(QtWidgets.QWidget):
         spec,
         parent=None,
         *,
-        signal_names_provider=None,
+        signal_names_providers=None,
     ):
         super().__init__(parent)
         self.row = row
@@ -71,11 +71,8 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # editor renders exactly that form.  Deadlines remain internal Port/Run
         # mechanics, never generic Measurement inputs invented by the UI.
         acquisition = ()
-        names_provider = (
-            signal_names_provider
-            if callable(signal_names_provider)
-            else getattr(console, "_signal_names", None)
-        )
+        names_provider = getattr(console, "_signal_names", None)
+        field_providers = dict(signal_names_providers or {})
         if row.node.kind == "processor" and callable(names_provider):
             # A reactive processor's source picker must not offer the node's OWN outputs -- picking
             # one is the self-feedback loop Processor.__init__ rejects loud at Start; hide it here
@@ -85,8 +82,22 @@ class LogicNodeEditor(QtWidgets.QWidget):
             def names_provider(_base=names_provider, _console=console, _row=row):
                 own = {str(k) for k in _console._declared_signal_keys(_row)}
                 return [n for n in _base() if str(n) not in own]
+            for key, provider in tuple(field_providers.items()):
+                if not callable(provider):
+                    continue
+
+                def without_own(
+                    _base=provider,
+                    _console=console,
+                    _row=row,
+                ):
+                    own = {str(k) for k in _console._declared_signal_keys(_row)}
+                    return [name for name in _base() if str(name) not in own]
+
+                field_providers[key] = without_own
         self.form = MeasurementPanel([spec] if spec is not None else [], single=True,
                                      signals_provider=names_provider,
+                                     signal_providers=field_providers,
                                      sources_provider=getattr(console, "_signal_providers", None),
                                      formats_provider=getattr(console, "_signal_formats", None),
                                      short_names_provider=getattr(console, "_signal_short_names", None),

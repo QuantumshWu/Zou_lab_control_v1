@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Integral
 
 import numpy as np
@@ -47,6 +47,7 @@ from zlc_neutral_atom.readout.contracts import (
 )
 from zlc_neutral_atom.runtime.capture import (
     BoundCapturePort,
+    CameraExposureConfiguredAck,
     CaptureCapabilitySnapshot,
     CapturePreparedAck,
     CaptureStartedAck,
@@ -54,6 +55,7 @@ from zlc_neutral_atom.runtime.capture import (
     CaptureTerminalAck,
     CapturedPayloadAck,
     CompleteCaptureCommand,
+    ConfigureCameraExposureCommand,
     PrepareCaptureCommand,
     ReadCaptureCommand,
     StartCaptureCommand,
@@ -202,6 +204,12 @@ class _EndpointSession:
 
 
 @dataclass
+class _ExposureLease:
+    session_id: str
+    baseline_working_point: _AppliedCameraWorkingPoint
+
+
+@dataclass
 class _TerminalAttempt:
     """The one physical terminalization attempt owned by a capture session."""
 
@@ -322,6 +330,7 @@ class CameraCaptureEndpoint:
         self._command_operation_token: object | None = None
         self._physical_operations_inflight = 0
         self._session: _EndpointSession | None = None
+        self._exposure_lease: _ExposureLease | None = None
 
     def payload_contract(self, binding: BoundDevice) -> CameraSampleContract:
         with self._lock:
@@ -340,6 +349,8 @@ class CameraCaptureEndpoint:
         with self._lock:
             if self._session is not None and not self._session.closed:
                 raise RuntimeError("cannot probe camera capability during a capture session")
+            if self._exposure_lease is not None:
+                raise RuntimeError("cannot probe camera capability during an exposure lease")
             if self._physical_operations_inflight:
                 raise RuntimeError(
                     "cannot probe camera capability while a physical operation is in flight"
@@ -391,6 +402,8 @@ class CameraCaptureEndpoint:
         )
 
     def execute_command(self, binding: BoundDevice, command: object) -> object:
+        if isinstance(command, ConfigureCameraExposureCommand):
+            return self._configure_exposure(binding, command)
         if isinstance(command, PrepareCaptureCommand):
             return self._prepare(binding, command)
         if isinstance(command, StartCaptureCommand):
@@ -400,6 +413,100 @@ class CameraCaptureEndpoint:
         if isinstance(command, CompleteCaptureCommand):
             return self._complete(binding, command)
         raise TypeError(f"camera endpoint rejects command {type(command).__name__}")
+
+    def _configure_exposure(
+        self,
+        binding: BoundDevice,
+        command: ConfigureCameraExposureCommand,
+    ) -> CameraExposureConfiguredAck:
+        with self._lock:
+            self._validate_binding(binding)
+            if self._physical_operations_inflight:
+                raise RuntimeError("camera still owns an in-flight physical operation")
+            if self._session is not None and not self._session.closed:
+                raise RuntimeError("camera exposure cannot change during an active arm")
+            lease = self._exposure_lease
+            if lease is None:
+                baseline = self._working_point
+                if baseline is None:
+                    raise RuntimeError("camera working point has not been probed")
+                lease = _ExposureLease(command.session_id, baseline)
+                self._exposure_lease = lease
+            elif lease.session_id != command.session_id:
+                raise RuntimeError("camera already owns another exposure lease")
+            baseline = lease.baseline_working_point
+            if command.baseline_settings_fingerprint != baseline.settings_fingerprint:
+                raise ValueError("camera exposure baseline fingerprint differs")
+            configure = getattr(self._camera, "configure_exposure_seconds", None)
+            token = self._begin_command_operation()
+        try:
+            if not callable(configure):
+                raise RuntimeError(
+                    "camera adapter does not implement exposure configure/readback"
+                )
+            configure(command.exposure_seconds)
+            observed = self._read_working_point(binding)
+            if not np.isclose(
+                observed.physical_facts.exposure_seconds,
+                command.exposure_seconds,
+                rtol=1e-10,
+                atol=1e-12,
+            ):
+                raise RuntimeError(
+                    "camera applied exposure differs from the requested duration"
+                )
+            if observed.payload_contract != baseline.payload_contract:
+                raise RuntimeError(
+                    "camera exposure change altered the frame payload contract"
+                )
+            expected_facts = replace(
+                baseline.physical_facts,
+                exposure_seconds=observed.physical_facts.exposure_seconds,
+                required_external_trigger_interval_seconds=(
+                    observed.physical_facts
+                    .required_external_trigger_interval_seconds
+                ),
+                opaque_frame_settings_fingerprint=(
+                    observed.settings_fingerprint
+                ),
+            )
+            if observed.physical_facts != expected_facts:
+                raise RuntimeError(
+                    "camera exposure command altered another physical working-point fact"
+                )
+            evidence = replace(
+                self._capability_snapshot().camera_capability_evidence,
+                physical_facts=observed.physical_facts,
+            )
+            capability = self._make_capability_snapshot(
+                binding.binding_stamp,
+                observed.payload_contract,
+                evidence,
+            )
+            with self._lock:
+                if self._exposure_lease is not lease:
+                    raise RuntimeError("camera exposure lease was superseded")
+                self._working_point = observed
+                self._capability = capability
+            required_interval = (
+                observed.physical_facts
+                .required_external_trigger_interval_seconds
+            )
+            if required_interval is None:
+                raise RuntimeError(
+                    "camera exposure readback lacks an external-trigger interval"
+                )
+            return CameraExposureConfiguredAck(
+                command.session_id,
+                binding.binding_instance_id,
+                command.exposure_seconds,
+                observed.physical_facts.exposure_seconds,
+                required_interval,
+                observed.settings_fingerprint,
+                capability.capability_fingerprint,
+            )
+        finally:
+            self._end_command_operation(token)
 
     def _prepare(
         self,
@@ -677,6 +784,9 @@ class CameraCaptureEndpoint:
     ) -> SessionClosedAck:
         with self._condition:
             self._validate_binding(binding)
+            lease = self._exposure_lease
+            if lease is not None and lease.session_id == command.session_id:
+                return self._close_exposure_lease(binding, command, lease)
             session = self._session
             if session is None:
                 raise RuntimeError("camera cleanup session id is unknown")
@@ -729,6 +839,62 @@ class CameraCaptureEndpoint:
                     }
                 ),
             )
+
+    def _close_exposure_lease(
+        self,
+        binding: BoundDevice,
+        command: SessionCloseCommand,
+        lease: _ExposureLease,
+    ) -> SessionClosedAck:
+        """Restore the leased baseline through the existing cleanup lane."""
+
+        if self._session is not None and not self._session.closed:
+            raise RuntimeError(
+                "camera exposure lease cannot close before its capture session"
+            )
+        deadline = time.monotonic() + command.timeout_seconds
+        while self._physical_operations_inflight:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise TimeoutError(
+                    "camera exposure lease did not reach an idle adapter"
+                )
+            self._condition.wait(remaining)
+        configure = getattr(self._camera, "configure_exposure_seconds", None)
+        baseline = lease.baseline_working_point
+        if callable(configure):
+            configure(baseline.physical_facts.exposure_seconds)
+        observed = self._read_working_point(binding)
+        if observed != baseline:
+            raise RuntimeError(
+                "camera did not restore the leased physical working point"
+            )
+        evidence = replace(
+            self._capability_snapshot().camera_capability_evidence,
+            physical_facts=baseline.physical_facts,
+        )
+        capability = self._make_capability_snapshot(
+            binding.binding_stamp,
+            baseline.payload_contract,
+            evidence,
+        )
+        self._working_point = baseline
+        self._capability = capability
+        self._exposure_lease = None
+        return SessionClosedAck(
+            command.session_id,
+            binding.binding_instance_id,
+            True,
+            True,
+            True,
+            canonical_digest(
+                {
+                    "session_id": command.session_id,
+                    "operation": "restore-camera-exposure",
+                    "settings_fingerprint": baseline.settings_fingerprint,
+                }
+            ),
+        )
 
     def interrupt(self) -> str:
         with self._condition:

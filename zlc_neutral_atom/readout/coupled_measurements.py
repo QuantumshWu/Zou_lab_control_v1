@@ -1,15 +1,16 @@
 """Coupled readout Measurements with explicit autonomous-hardware boundaries.
 
-The old implementation put a host-stepped scan loop, camera acquisition and a
-point reducer in one ``ScannedMeasurementNode``.  This module keeps the useful
+The old implementation put scan control, camera acquisition and a point reducer
+in one ``ScannedMeasurementNode``.  This module keeps the useful
 physics while making the ownership explicit:
 
 * release-recapture acquisition is one autonomous SCAN_SLOT camera Measurement;
 * its adjacent event-0/event-1 frames are reduced by one fixed 2:1
   StreamReducer in the same exact Run;
-* readout-duration and grey-molasses requests exist as typed intents, but their
-  current hardware capability gaps are rejected instead of silently changing
-  the physical experiment or reaching around a Device Port.
+* readout-duration uses the explicitly segmented API boundary: the camera is
+  configured and read back once per point, while every shot remains a frozen
+  hardware-timed pulse;
+* grey-molasses remains capability-gated by its synchronized RF Port.
 
 No public request contains a timeout.
 """
@@ -51,9 +52,14 @@ from zlc_neutral_atom.readout.physical_context import (
 from zlc_neutral_atom.runtime.capture import BoundCapturePort
 from zlc_neutral_atom.runtime.pipeline import BoundMeasurement
 from zlc_neutral_atom.rf import BoundRfTablePort, RfDetuningTable
-from zlc_neutral_atom.scan import AutonomousScanSlotProgram
+from zlc_neutral_atom.scan import (
+    ApiSegmentTable,
+    ApiSlotSegmentedProgram,
+    AutonomousScanSlotProgram,
+)
 from zlc_neutral_atom.timing.lineage import PulseCaptureBinding
 from zlc_neutral_atom.timing.pulse import BoundPulsePort
+from zlc_neutral_atom.timing.pulse import FinitePulseExecutionRequest
 from zlc_pulse import (
     FIELD_DURATION,
     TIME_UNIT_TO_NS,
@@ -63,9 +69,11 @@ from zlc_pulse import (
     RepeatRegion,
     bind_pulse_document_target,
     build_pulse_playback,
+    compile_pulse_artifact,
     expand_autonomous_scan_repeats,
     freeze_scan_table,
     replace_pulse_field,
+    resolve_api_parameters,
     require_autonomous_scan_resident_capacity,
 )
 from zlc_storage import canonical_digest, canonical_text, positive_integer
@@ -86,14 +94,14 @@ GREY_MOLASSES_DETUNING_KEY = DefinitionKey(
 
 TEMPERATURE_RELEASE_RECAPTURE_DEFINITION = MeasurementDefinition(
     TEMPERATURE_RELEASE_RECAPTURE_KEY,
-    "Temperature (release-recapture)",
+    "Temperature",
     "zlc.temperature-release-recapture-request",
     "zlc.temperature-release-recapture-binding",
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
 )
 READOUT_DURATION_FIDELITY_DEFINITION = MeasurementDefinition(
     READOUT_DURATION_FIDELITY_KEY,
-    "Fidelity vs readout duration",
+    "Fidelity vs duration",
     "zlc.readout-duration-fidelity-request",
     "zlc.readout-duration-fidelity-binding",
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
@@ -534,6 +542,256 @@ def build_temperature_release_recapture_program(
     return AutonomousScanSlotProgram(document)
 
 
+def _readout_duration_point_groups(
+    program: ApiSlotSegmentedProgram,
+) -> tuple[PulseDocument, ...]:
+    """Resolve owner-frozen rows while retaining the hardware shot repeat.
+
+    Generic API scans expand repeat into host-visible dataset cells.  This
+    coupled Measurement instead arms one point group and lets the sequencer
+    execute its whole-document RepeatRegion under one FIRE.
+    """
+
+    return tuple(
+        resolve_api_parameters(
+            program.document,
+            dict(zip(program.table.columns, row, strict=True)),
+        )
+        for row in program.table.rows
+    )
+
+
+@dataclass(frozen=True)
+class BoundReadoutDurationFidelity:
+    """Target-bound point pulses for the admitted API-slot exposure sweep."""
+
+    request: ReadoutDurationFidelityRequest
+    program: ApiSlotSegmentedProgram
+    pulse_port: BoundPulsePort
+    camera_port: BoundCapturePort
+    trigger_channel: str
+    point_requests: tuple[FinitePulseExecutionRequest, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, ReadoutDurationFidelityRequest):
+            raise TypeError("request has another type")
+        if not isinstance(self.program, ApiSlotSegmentedProgram):
+            raise TypeError("program must be ApiSlotSegmentedProgram")
+        if not isinstance(self.pulse_port, BoundPulsePort):
+            raise TypeError("pulse_port must be BoundPulsePort")
+        if not isinstance(self.camera_port, BoundCapturePort):
+            raise TypeError("camera_port must be BoundCapturePort")
+        requests = tuple(self.point_requests)
+        if (
+            self.program.repeat_count != self.request.shots
+            or self.program.point_count != len(self.request.duration_seconds)
+        ):
+            raise ValueError("API program cardinality differs from the request")
+        if len(requests) != self.program.point_count or any(
+            not isinstance(value, FinitePulseExecutionRequest)
+            for value in requests
+        ):
+            raise ValueError("point_requests must cover every duration in order")
+        group_documents = _readout_duration_point_groups(self.program)
+        if tuple(value.document for value in requests) != group_documents:
+            raise ValueError("point requests differ from the frozen API program")
+        object.__setattr__(self, "point_requests", requests)
+
+
+def _validate_readout_duration_calibration(
+    request: ReadoutDurationFidelityRequest,
+    calibration: ResolvedCalibration,
+    camera_port: BoundCapturePort,
+) -> None:
+    if calibration.reference != request.calibration_ref:
+        raise ValueError("resolved calibration differs from the request")
+    frame = calibration.artifact.frame_contract
+    facts = camera_port.capability.camera_physical_facts
+    payload = camera_port.capability.payload_contract
+    if frame.binding.value != request.camera_ref.role:
+        raise ValueError("calibration belongs to another camera role")
+    observed = (
+        facts.camera_identity,
+        facts.sensor_identity,
+        facts.optical_path,
+        facts.sensor_shape_yx,
+        facts.roi_origin_yx,
+        facts.roi_shape_yx,
+        facts.binning_yx,
+        facts.spatial_y_axis_id,
+        facts.spatial_x_axis_id,
+        facts.coordinate_frame,
+        facts.dtype,
+        facts.count_unit,
+        facts.exposure_seconds,
+        facts.gain,
+        facts.readout_mode,
+        facts.opaque_frame_settings_fingerprint,
+        payload.value_schema,
+    )
+    expected = (
+        frame.camera_identity,
+        frame.sensor_identity,
+        frame.optical_path,
+        frame.sensor_shape_yx,
+        frame.roi_origin_yx,
+        frame.roi_shape_yx,
+        frame.binning_yx,
+        frame.spatial_y_axis_id,
+        frame.spatial_x_axis_id,
+        frame.coordinate_frame,
+        frame.dtype,
+        frame.count_unit,
+        frame.exposure_seconds,
+        frame.gain,
+        frame.readout_mode,
+        frame.opaque_frame_settings_fingerprint,
+        frame.frame_schema,
+    )
+    if observed != expected:
+        raise ValueError(
+            "readout-duration camera working point differs from its calibration"
+        )
+    model = calibration.artifact.select_model(request.model_kind)
+    if request.site is not None:
+        if request.site >= model.feature.site_axis.size:
+            raise ValueError("selected site is outside the calibration site axis")
+        if not bool(model.usable_sites.mask[request.site]):
+            raise ValueError("selected site is invalid in the calibration model")
+
+
+def bind_readout_duration_fidelity(
+    request: ReadoutDurationFidelityRequest,
+    calibration: ResolvedCalibration,
+    *,
+    pulse_port: BoundPulsePort,
+    camera_port: BoundCapturePort,
+) -> BoundReadoutDurationFidelity:
+    """Bind one camera-rearmed API duration sweep without touching hardware."""
+
+    if not isinstance(request, ReadoutDurationFidelityRequest):
+        raise TypeError("request must be ReadoutDurationFidelityRequest")
+    if type(calibration) is not ResolvedCalibration:
+        raise TypeError("calibration must be an admitted ResolvedCalibration")
+    if not isinstance(pulse_port, BoundPulsePort):
+        raise TypeError("pulse_port must be BoundPulsePort")
+    if not isinstance(camera_port, BoundCapturePort):
+        raise TypeError("camera_port must be BoundCapturePort")
+    _validate_readout_duration_calibration(request, calibration, camera_port)
+
+    document = bind_pulse_document_target(
+        request.pulse_document,
+        pulse_port.capability.target,
+    )
+    if document.scan_parameters or document.scan_table is not None:
+        raise ValueError(
+            "readout-duration template uses one API duration, not SCAN_SLOT"
+        )
+    if document.repeat is not None:
+        raise ValueError("readout-duration template must describe one shot")
+    if len(document.api_parameters) != 1:
+        raise ValueError(
+            "readout-duration template must declare exactly one API parameter"
+        )
+    parameter = document.api_parameters[0]
+    if parameter.field.kind != FIELD_DURATION:
+        raise ValueError("readout-duration API parameter must bind a period duration")
+    period = document.period_by_id[parameter.field.period_id]
+    probe_ports = tuple(
+        port
+        for port in document.target.ports
+        if port.kind == "digital" and port.label.casefold() == "probe"
+    )
+    if len(probe_ports) != 1 or len(probe_ports[0].lanes) != 1:
+        raise ValueError(
+            "readout-duration target must declare one single-lane probe port"
+        )
+    probe_lane = document.target.raw_lanes.index(probe_ports[0].lanes[0])
+    if period.states[probe_lane] != 1:
+        raise ValueError(
+            "readout-duration API period must be the probe-light window"
+        )
+
+    facts = camera_port.capability.camera_physical_facts
+    if request.trigger_channel is None:
+        if len(facts.capture_trigger_channels) != 1:
+            raise ValueError(
+                "readout-duration capture requires one camera trigger channel"
+            )
+        trigger_channel = facts.capture_trigger_channels[0]
+    else:
+        trigger_channel = request.trigger_channel
+    facts.require_single_capture_trigger_channel(trigger_channel)
+    try:
+        trigger_lane = document.target.raw_lanes.index(trigger_channel)
+    except ValueError as exc:
+        raise ValueError(
+            "camera trigger channel is absent from the bound pulse target"
+        ) from exc
+    period_index = document.periods.index(period)
+    previous_trigger_state = (
+        0
+        if period_index == 0
+        else document.periods[period_index - 1].states[trigger_lane]
+    )
+    if period.states[trigger_lane] != 1 or previous_trigger_state != 0:
+        raise ValueError(
+            "readout-duration API period must begin with the camera trigger edge"
+        )
+
+    periods = document.periods
+    execution_document = (
+        document
+        if request.shots == 1
+        else replace(
+            document,
+            repeat=RepeatRegion(
+                periods[0].period_id,
+                periods[-1].period_id,
+                request.shots,
+            ),
+        )
+    )
+    scale = 1e9 / TIME_UNIT_TO_NS[parameter.unit]
+    program = ApiSlotSegmentedProgram(
+        execution_document,
+        ApiSegmentTable(
+            (parameter.parameter_id,),
+            tuple((seconds * scale,) for seconds in request.duration_seconds),
+        ),
+        "camera integration time must be configured and read back at each API point",
+    )
+    point_requests = []
+    for point_document in _readout_duration_point_groups(program):
+        artifact = compile_pulse_artifact(
+            point_document,
+            clock_hz=pulse_port.capability.clock_hz,
+            execution_form=PulseExecutionForm.STATIC_ONCE,
+            trigger_channels=(trigger_channel,),
+            live_target=pulse_port.capability.target,
+        )
+        schedules = tuple(
+            value
+            for value in artifact.trigger_schedules
+            if value.channel == trigger_channel
+        )
+        if len(schedules) != 1 or schedules[0].total != request.shots:
+            raise ValueError(
+                "each readout-duration point must emit exactly one camera trigger per shot"
+            )
+        point_requests.append(
+            FinitePulseExecutionRequest(point_document, artifact)
+        )
+    return BoundReadoutDurationFidelity(
+        request,
+        program,
+        pulse_port,
+        camera_port,
+        trigger_channel,
+        tuple(point_requests),
+    )
+
+
 def _build_grey_molasses_detuning_program(
     request: GreyMolassesDetuningRequest,
     calibration: ResolvedCalibration,
@@ -558,7 +816,7 @@ def _build_grey_molasses_detuning_program(
         SCAN_POINT,
         len(request.detuning_gamma),
         request.detuning_gamma,
-        "Gamma",
+        "Γ",
     )
     return _GreyMolassesDetuningProgram(
         document,
@@ -668,7 +926,19 @@ def bind_temperature_release_recapture(
             tuple(range(request.shots)),
         ),
         readout_event_axis_id=AxisId("temperature.readout_event"),
-        scan_axes=point_table.point_axes,
+        # The scan table's physical rows remain in the pulse parameter's
+        # authoring unit.  The Measurement contract exposes the operator-facing
+        # physical quantity in SI, matching Main's ``Trap-off time (s)`` output.
+        scan_axes=(
+            AxisSpec(
+                AxisId("temperature.t_off"),
+                "Trap-off time",
+                SCAN_POINT,
+                len(request.trap_off_seconds),
+                request.trap_off_seconds,
+                "s",
+            ),
+        ),
         point_layout=point_table.point_layout,
         definition=TEMPERATURE_RELEASE_RECAPTURE_DEFINITION,
         calibration=calibration,
@@ -810,26 +1080,11 @@ class AutonomousMeasurementUnavailable(RuntimeError):
     """The typed request is valid but the installed synchronous capability is absent."""
 
 
-READOUT_DURATION_CAPABILITY_GAP = (
-    "readout-duration fidelity changes both the pulse readout window and the "
-    "qCMOS integration time at each point; the current API-slot executor can "
-    "change only the finite FPGA segment while one camera arm keeps a single "
-    "frozen settings fingerprint. The camera adapter/Port has no exposure "
-    "configuration command and no exact point-group rearm contract"
-)
 GREY_MOLASSES_CAPABILITY_GAP = (
     "grey-molasses detuning requires an RF Port that can preload and advance the "
     "complete two-photon-detuning table from the same hardware scan clock; the "
     "selected installation exposes no such RF Port"
 )
-
-
-def reject_readout_duration_fidelity(
-    request: ReadoutDurationFidelityRequest,
-) -> None:
-    if not isinstance(request, ReadoutDurationFidelityRequest):
-        raise TypeError("request must be ReadoutDurationFidelityRequest")
-    raise AutonomousMeasurementUnavailable(READOUT_DURATION_CAPABILITY_GAP)
 
 
 def reject_grey_molasses_detuning(
@@ -843,13 +1098,13 @@ def reject_grey_molasses_detuning(
 __all__ = [
     "AutonomousMeasurementUnavailable",
     "BoundGreyMolassesDetuning",
+    "BoundReadoutDurationFidelity",
     "BoundTemperatureReleaseRecapture",
     "COUPLED_MEASUREMENT_DEFINITIONS",
     "GREY_MOLASSES_CAPABILITY_GAP",
     "GREY_MOLASSES_DETUNING_DEFINITION",
     "GREY_MOLASSES_DETUNING_KEY",
     "GreyMolassesDetuningRequest",
-    "READOUT_DURATION_CAPABILITY_GAP",
     "READOUT_DURATION_FIDELITY_DEFINITION",
     "READOUT_DURATION_FIDELITY_KEY",
     "ReadoutDurationFidelityRequest",
@@ -857,8 +1112,8 @@ __all__ = [
     "TEMPERATURE_RELEASE_RECAPTURE_KEY",
     "TemperatureReleaseRecaptureRequest",
     "bind_grey_molasses_detuning",
+    "bind_readout_duration_fidelity",
     "bind_temperature_release_recapture",
     "build_temperature_release_recapture_program",
     "reject_grey_molasses_detuning",
-    "reject_readout_duration_fidelity",
 ]

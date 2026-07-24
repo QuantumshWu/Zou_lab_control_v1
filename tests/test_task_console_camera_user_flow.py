@@ -170,6 +170,30 @@ def _replace_path_value(path_widget, text: str) -> None:
     QtTest.QTest.keyClick(edit, QtCore.Qt.Key_Return)
 
 
+def _replace_axis_range(widget, minimum: str, maximum: str, points: str) -> None:
+    """Edit the three visible controls of one swept axis as an operator would."""
+
+    _replace_spin_value(widget.min_spin, minimum)
+    _replace_spin_value(widget.max_spin, maximum)
+    _replace_spin_value(widget.pts_spin, points)
+
+
+def _add_plot_and_bind(console, add_button, kind: str, signal: str, application):
+    """Add one blank plot and wire its Setting popup through visible controls."""
+
+    before = len(console.cards)
+    _choose_combo_data(console.kind_combo, kind, application)
+    QtTest.QTest.mouseClick(add_button, QtCore.Qt.LeftButton)
+    assert len(console.cards) == before + 1
+    card = console.cards[-1]
+    click_tab(console, console.tabs.widget(0))
+    QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
+    until(application, lambda: card.settings_popup.isVisible())
+    _choose_signal_leaf(card.signal_combo, signal, application)
+    assert card.config.signal == signal
+    return card
+
+
 def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> None:
     """The actual standalone entry's camera chain is live and dimensioned."""
 
@@ -473,6 +497,363 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
 
+def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
+    tmp_path,
+) -> None:
+    """The remaining Main readout chain runs only through formal Qt controls."""
+
+    configure_offscreen_fast_path()
+    application = ensure_qt_app()
+    from task_console import _StandaloneTaskConsoleFlow, _build_parser
+    from zlc_neutral_atom.runtime.run import RunState
+    from zlc_pulse import load_pulse_document
+
+    args = _build_parser().parse_args(
+        [
+            "--repository",
+            str(tmp_path / "workspace"),
+            "--name",
+            "readout-user-flow",
+            "--seed",
+            "43",
+        ]
+    )
+    flow = _StandaloneTaskConsoleFlow(args)
+    devices = flow.open()
+    console_wrapper = None
+    pulse_body = None
+    try:
+        QtTest.QTest.mouseClick(devices.lifecycle_button, QtCore.Qt.LeftButton)
+        until(
+            application,
+            lambda: flow.console is not None or flow.failure is not None,
+            timeout=15.0,
+        )
+        assert flow.failure is None
+        console = flow.console
+        console_wrapper = console.window()
+        add = next(
+            button
+            for button in console.findChildren(QtWidgets.QPushButton)
+            if button.text() == "Add Panel"
+        )
+
+        # First create the exact CalibrationArtifactRef all authoritative
+        # classifiers below must select.  This is the only logic layer in this
+        # flow that opens its declared run-scoped diagnostic panel.
+        _choose_combo_text(console.kind_combo, "Task: Calibrate readout", application)
+        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
+        calibration_row = console.logic_nodes[-1]
+        calibration_editor = console._logic_editors[id(calibration_row)]
+        calibration_widgets = calibration_editor.form._widgets
+        _replace_path_value(
+            calibration_widgets["folder"],
+            str(tmp_path / "calibration-output"),
+        )
+        _replace_spin_value(calibration_widgets["threshold_frames"], "10")
+        QtTest.QTest.mouseClick(
+            calibration_editor.form.start_button,
+            QtCore.Qt.LeftButton,
+        )
+        calibration_signal = console_signal_key(
+            calibration_row.node.title,
+            "calibration",
+        )
+        until(
+            application,
+            lambda: (
+                console._data.freeze().value(calibration_signal) is not None
+                and not console._task_locked
+            ),
+            timeout=25.0,
+        )
+
+        # Temperature takes only the explicit calibration signal in addition
+        # to Main's visible physics parameters.  A Measurement never auto-opens
+        # a panel; the operator creates and wires the 1-D view afterwards.
+        _choose_combo_text(console.kind_combo, "Measurement: Temperature", application)
+        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
+        temperature_row = console.logic_nodes[-1]
+        temperature_editor = console._logic_editors[id(temperature_row)]
+        temperature_widgets = temperature_editor.form._widgets
+        assert set(temperature_widgets) == {
+            "pulse",
+            "t_off",
+            "shots",
+            "per_site",
+            "calibration",
+        }
+        assert _signal_leaf_keys(temperature_widgets["calibration"]) == {
+            calibration_signal
+        }
+        _replace_axis_range(temperature_widgets["t_off"], "20", "40", "2")
+        _replace_spin_value(temperature_widgets["shots"], "1")
+        _choose_signal_leaf(
+            temperature_widgets["calibration"],
+            calibration_signal,
+            application,
+        )
+        cards_before = tuple(console.cards)
+        QtTest.QTest.mouseClick(
+            temperature_editor.form.start_button,
+            QtCore.Qt.LeftButton,
+        )
+        temperature_signal = console_signal_key(
+            temperature_row.node.title,
+            "survival",
+        )
+        until(
+            application,
+            lambda: console._data.freeze().value(temperature_signal) is not None,
+            timeout=25.0,
+        )
+        assert tuple(console.cards) == cards_before
+        temperature_value = console._data.freeze().value(temperature_signal)
+        temperature_axis = temperature_value.snapshot.block.schema.point_axes[0]
+        assert (temperature_axis.name, temperature_axis.unit) == (
+            "Trap-off time",
+            "s",
+        )
+        temperature_card = _add_plot_and_bind(
+            console,
+            add,
+            "1d",
+            temperature_signal,
+            application,
+        )
+        until(
+            application,
+            lambda: temperature_card.board is not None
+            and temperature_card.board.front_frame is not None,
+            timeout=15.0,
+        )
+
+        # Readout-duration fidelity uses the same exact Calibration output.  It
+        # performs its supported camera API update only between duration points;
+        # every point's shots remain one hardware-timed FPGA run.
+        _choose_combo_text(
+            console.kind_combo,
+            "Measurement: Fidelity vs duration",
+            application,
+        )
+        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
+        fidelity_row = console.logic_nodes[-1]
+        fidelity_editor = console._logic_editors[id(fidelity_row)]
+        fidelity_widgets = fidelity_editor.form._widgets
+        assert set(fidelity_widgets) == {
+            "pulse",
+            "duration",
+            "shots",
+            "site",
+            "calibration",
+        }
+        assert _signal_leaf_keys(fidelity_widgets["calibration"]) == {
+            calibration_signal
+        }
+        _replace_axis_range(fidelity_widgets["duration"], "2", "4", "2")
+        _replace_spin_value(fidelity_widgets["shots"], "2")
+        _choose_signal_leaf(
+            fidelity_widgets["calibration"],
+            calibration_signal,
+            application,
+        )
+        cards_before = tuple(console.cards)
+        QtTest.QTest.mouseClick(
+            fidelity_editor.form.start_button,
+            QtCore.Qt.LeftButton,
+        )
+        fidelity_signal = console_signal_key(fidelity_row.node.title, "fidelity")
+        until(
+            application,
+            lambda: console._data.freeze().value(fidelity_signal) is not None,
+            timeout=25.0,
+        )
+        assert tuple(console.cards) == cards_before
+        fidelity_card = _add_plot_and_bind(
+            console,
+            add,
+            "1d",
+            fidelity_signal,
+            application,
+        )
+        until(
+            application,
+            lambda: fidelity_card.board is not None
+            and fidelity_card.board.front_frame is not None,
+            timeout=15.0,
+        )
+
+        # The science Camera is externally triggered.  Use the real Pulse GUI
+        # On-Pulse control to provide its continuous hardware schedule; neither
+        # the Camera Measurement nor Occupancy owns or fakes that producer.
+        pulse_body = flow.experiment.pulse_gui(
+            document=load_pulse_document("pulses/probe_template.json")
+        )
+        QtTest.QTest.mouseClick(
+            pulse_body.schedule_view.fire_button,
+            QtCore.Qt.LeftButton,
+        )
+        until(
+            application,
+            lambda: pulse_body.active_snapshot is not None
+            and pulse_body.active_snapshot.state is RunState.RUNNING,
+            timeout=15.0,
+        )
+
+        _choose_combo_text(console.kind_combo, "Measurement: Camera", application)
+        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
+        camera_row = console.logic_nodes[-1]
+        camera_editor = console._logic_editors[id(camera_row)]
+        camera_widgets = camera_editor.form._widgets
+        _choose_combo_data(camera_widgets["camera_role"], "camera", application)
+        _replace_spin_value(camera_widgets["repeat"], "0")
+        cards_before = tuple(console.cards)
+        QtTest.QTest.mouseClick(camera_editor.form.start_button, QtCore.Qt.LeftButton)
+        camera_signal = console_signal_key(camera_row.node.title, "frame")
+        until(
+            application,
+            lambda: console._data.freeze().value(camera_signal) is not None,
+            timeout=20.0,
+        )
+        first_camera = console._data.freeze().value(camera_signal)
+        until(
+            application,
+            lambda: (
+                (value := console._data.freeze().value(camera_signal)) is not None
+                and value.snapshot.ref != first_camera.snapshot.ref
+            ),
+            timeout=10.0,
+        )
+        assert tuple(console.cards) == cards_before
+
+        _choose_combo_text(
+            console.kind_combo,
+            "Processor: Judge occupancy",
+            application,
+        )
+        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
+        occupancy_row = console.logic_nodes[-1]
+        occupancy_editor = console._logic_editors[id(occupancy_row)]
+        occupancy_widgets = occupancy_editor.form._widgets
+        assert set(occupancy_widgets) == {
+            "camera_frame",
+            "calibration",
+            "readout_method",
+        }
+        assert _signal_leaf_keys(occupancy_widgets["camera_frame"]) == {
+            camera_signal
+        }
+        assert _signal_leaf_keys(occupancy_widgets["calibration"]) == {
+            calibration_signal
+        }
+        _choose_signal_leaf(
+            occupancy_widgets["camera_frame"],
+            camera_signal,
+            application,
+        )
+        _choose_signal_leaf(
+            occupancy_widgets["calibration"],
+            calibration_signal,
+            application,
+        )
+        _choose_combo_text(
+            occupancy_widgets["readout_method"],
+            "box",
+            application,
+        )
+        cards_before = tuple(console.cards)
+        QtTest.QTest.mouseClick(
+            occupancy_editor.form.start_button,
+            QtCore.Qt.LeftButton,
+        )
+        occupied_signal = console_signal_key(occupancy_row.node.title, "occupied")
+        rate_signal = console_signal_key(occupancy_row.node.title, "rate")
+        until(
+            application,
+            lambda: (
+                console._data.freeze().value(occupied_signal) is not None
+                and console._data.freeze().value(rate_signal) is not None
+            ),
+            timeout=20.0,
+        )
+        assert tuple(console.cards) == cards_before
+        first_occupied = console._data.freeze().value(occupied_signal)
+        first_rate = console._data.freeze().value(rate_signal)
+        until(
+            application,
+            lambda: (
+                (occupied := console._data.freeze().value(occupied_signal))
+                is not None
+                and occupied.snapshot.ref != first_occupied.snapshot.ref
+                and (rate := console._data.freeze().value(rate_signal)) is not None
+                and rate.snapshot.ref != first_rate.snapshot.ref
+            ),
+            timeout=10.0,
+        )
+
+        sites_card = _add_plot_and_bind(
+            console,
+            add,
+            "sites",
+            occupied_signal,
+            application,
+        )
+        rate_card = _add_plot_and_bind(
+            console,
+            add,
+            "monitor",
+            rate_signal,
+            application,
+        )
+        until(
+            application,
+            lambda: (
+                sites_card.board is not None
+                and sites_card.board.front_frame is not None
+                and rate_card.board is not None
+                and rate_card.board.front_frame is not None
+            ),
+            timeout=20.0,
+        )
+        first_sites_front = sites_card.board.front_frame
+        first_rate_front = rate_card.board.front_frame
+        until(
+            application,
+            lambda: (
+                sites_card.board.front_frame is not None
+                and sites_card.board.front_frame.sequence
+                > first_sites_front.sequence
+                and rate_card.board.front_frame is not None
+                and rate_card.board.front_frame.sequence
+                > first_rate_front.sequence
+            ),
+            timeout=10.0,
+        )
+        assert not sites_card.board.board.hasMouseTracking()
+        assert not rate_card.board.board.hasMouseTracking()
+    finally:
+        if (
+            pulse_body is not None
+            and pulse_body.active_snapshot is not None
+            and not pulse_body.active_snapshot.state.terminal
+        ):
+            QtTest.QTest.mouseClick(
+                pulse_body.schedule_view.safe_button,
+                QtCore.Qt.LeftButton,
+            )
+            until(
+                application,
+                lambda: pulse_body.active_snapshot is not None
+                and pulse_body.active_snapshot.state.terminal,
+                timeout=15.0,
+            )
+        if console_wrapper is not None and console_wrapper.isVisible():
+            console_wrapper.close()
+            until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+        flow.finish_close(application, timeout_seconds=15.0)
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+
+
 def test_pulse_scan_exposes_its_table_and_runs_from_one_camera_definition(
     tmp_path,
 ) -> None:
@@ -546,33 +927,40 @@ def test_pulse_scan_exposes_its_table_and_runs_from_one_camera_definition(
 
         QtTest.QTest.mouseClick(scan_editor.form.start_button, QtCore.Qt.LeftButton)
         scan_signal = console_signal_key(scan_row.node.title, "scan")
-        # FINAL-only outputs do not manufacture an empty viewer at Start.
+        # A Measurement never manufactures a viewer, either at Start or when
+        # its FINAL result arrives.  Plot ownership remains an explicit Monitor
+        # action; only Tasks open their declared run-scoped panels.
         assert not any(card.config.signal == scan_signal for card in console.cards)
-        saw_declared_panel = False
         deadline = time.monotonic() + 25.0
         while time.monotonic() < deadline:
             application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-            saw_declared_panel = saw_declared_panel or any(
-                card.config.signal == scan_signal
-                for card in console.cards
-            )
             if console._data.freeze().value(scan_signal) is not None:
                 break
             time.sleep(0.005)
-        assert saw_declared_panel
         value = console._data.freeze().value(scan_signal)
         if value is None:
             raise AssertionError(scan_row.status_label.text())
-        scan_card = next(
-            card for card in console.cards if card.config.signal == scan_signal
-        )
+        assert not any(card.config.signal == scan_signal for card in console.cards)
         data_roles = {
             axis.role for axis in value.snapshot.block.schema.cell_schema.data_axes
         }
         from zlc_data import SPATIAL_X, SPATIAL_Y
 
-        assert scan_card.config.kind == (
+        plot_kind = (
             "2d" if {SPATIAL_X, SPATIAL_Y}.issubset(data_roles) else "1d"
+        )
+        scan_card = _add_plot_and_bind(
+            console,
+            add,
+            plot_kind,
+            scan_signal,
+            application,
+        )
+        until(
+            application,
+            lambda: scan_card.board is not None
+            and scan_card.board.front_frame is not None,
+            timeout=15.0,
         )
         assert value.snapshot.block.schema.repeat_axis.size >= 1
         assert value.snapshot.block.schema.point_layout.storage_size >= 1

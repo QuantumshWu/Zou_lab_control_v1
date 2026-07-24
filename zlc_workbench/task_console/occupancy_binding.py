@@ -10,21 +10,54 @@ import uuid
 from zlc_data import dataset_revision_ref_to_tree
 from zlc_data.console_records import console_signal_key
 from zlc_neutral_atom.catalog import DefinitionKey
-from zlc_neutral_atom.readout.calibration import ResolvedCalibration
+from zlc_neutral_atom.readout.calibration import (
+    ReadoutModelKind,
+    ResolvedCalibration,
+)
 from zlc_neutral_atom.readout.calibration_reference import (
     calibration_artifact_ref_to_tree,
 )
-from zlc_neutral_atom.readout.occupancy import apply_occupancy_snapshot
+from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
 from zlc_storage import canonical_digest, canonical_text
 
 from .data_plane import ConsoleDataPlane, ConsoleSignalValue
+from .result_projection import project_reactive_occupancy
 
 __all__ = [
     "ConsoleProducerBinding",
     "OccupancyBindingIntent",
     "ReactiveOccupancyNode",
+    "occupancy_readout_method_labels",
+    "parse_occupancy_readout_method",
 ]
+
+
+_OCCUPANCY_READOUT_METHODS = (
+    ("box", ReadoutModelKind.BOX),
+    ("per-site PSF", ReadoutModelKind.PER_SITE_PSF),
+    ("uniform PSF", ReadoutModelKind.UNIFORM_PSF),
+)
+if {
+    kind for _label, kind in _OCCUPANCY_READOUT_METHODS if kind is not None
+} != set(ReadoutModelKind):
+    raise RuntimeError("occupancy readout method labels do not cover ReadoutModelKind")
+
+
+def occupancy_readout_method_labels() -> tuple[str, ...]:
+    """Main-compatible visible labels for the closed calibration model enum."""
+
+    return tuple(label for label, _kind in _OCCUPANCY_READOUT_METHODS)
+
+
+def parse_occupancy_readout_method(value: object) -> ReadoutModelKind | None:
+    """Map one visible form label to the calibration owner's model kind."""
+
+    label = "box" if value in (None, "") else str(value)
+    for candidate, kind in _OCCUPANCY_READOUT_METHODS:
+        if label == candidate:
+            return kind
+    raise ValueError(f"unknown occupancy Readout method {label!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +66,7 @@ class OccupancyBindingIntent:
 
     camera_frame_signal: str
     calibration_signal: str
+    model_kind: ReadoutModelKind | None = None
 
     def __post_init__(self) -> None:
         canonical_text(self.camera_frame_signal, "camera_frame_signal")
@@ -41,6 +75,11 @@ class OccupancyBindingIntent:
             raise ValueError(
                 "occupancy source and calibration must be distinct console outputs"
             )
+        if self.model_kind is not None and not isinstance(
+            self.model_kind,
+            ReadoutModelKind,
+        ):
+            raise TypeError("model_kind must be ReadoutModelKind or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,8 +121,11 @@ class ReactiveOccupancyNode:
 
     The node owns no device and never starts the selected producer.  Its sole
     worker admits the frozen calibration once, then classifies each new
-    immutable camera front.  Counts and occupied are admitted to the console
-    data plane together and retain the camera revision/run/epoch lineage.
+    immutable camera front.  Counts, occupied, and the validity-aware loading
+    rate are admitted to the console data plane together and retain the camera
+    revision/run/epoch lineage.  The occupied value also carries the typed
+    same-shot SiteMap presentation; no geometry or judged-frame side signal is
+    manufactured.
     """
 
     def __init__(
@@ -106,9 +148,23 @@ class ReactiveOccupancyNode:
             raise TypeError("initial_source must be ConsoleSignalValue")
         if initial_source.name != intent.camera_frame_signal:
             raise ValueError("initial Camera value differs from the selected signal")
+        if not isinstance(initial_source.coverage, MonitorCoverage):
+            raise ValueError(
+                "reactive occupancy requires Camera's typed current-frame view; "
+                "it cannot guess a current cell from a formal finite dataset"
+            )
+        source_generation = getattr(source_node, "lifecycle_generation", None)
+        if (
+            isinstance(source_generation, bool)
+            or not isinstance(source_generation, int)
+            or source_generation <= 0
+        ):
+            raise ValueError(
+                "initial Camera value has no accepted source lifecycle generation"
+            )
         source_handle = getattr(source_node, "handle", None)
         source_run_id = getattr(getattr(source_handle, "run_id", None), "value", None)
-        if source_run_id != initial_source.run_id:
+        if source_run_id is not None and source_run_id != initial_source.run_id:
             raise ValueError(
                 "initial Camera value does not belong to the selected producer instance"
             )
@@ -123,7 +179,7 @@ class ReactiveOccupancyNode:
         self._values = dict(values)
         self._request = intent
         self._source_node = source_node
-        self._source_handle = source_handle
+        self._source_lifecycle_generation = source_generation
         self._initial_source: ConsoleSignalValue | None = initial_source
         self._source_run_id = initial_source.run_id
         self._source_epoch_id = initial_source.epoch_id
@@ -256,12 +312,12 @@ class ReactiveOccupancyNode:
             try:
                 if source is None:
                     raise RuntimeError("occupancy transform lost its source revision")
-                counts, occupied = work.result()
+                counts, occupied, rate, presentation = work.result()
                 calibration = self._calibration
                 if type(calibration) is not ResolvedCalibration:
                     raise RuntimeError("occupancy calibration was not admitted")
                 reference = calibration.reference
-                model = calibration.artifact.select_model()
+                model = calibration.artifact.select_model(self._request.model_kind)
                 join_digest = canonical_digest(
                     {
                         "owner": "zlc-workbench.reactive-occupancy-join",
@@ -277,9 +333,9 @@ class ReactiveOccupancyNode:
                     output.name: self.signal_key(output.name)
                     for output in self._spec.declared_outputs
                 }
-                if set(declared) != {"counts", "occupied"}:
+                if set(declared) != {"counts", "occupied", "rate"}:
                     raise RuntimeError(
-                        "occupancy catalog must declare counts and occupied"
+                        "occupancy catalog must declare counts, occupied, and rate"
                     )
                 self._data_plane.publish_processor(
                     self,
@@ -301,6 +357,16 @@ class ReactiveOccupancyNode:
                             run_id=source.run_id,
                             epoch_id=source.epoch_id,
                             join_digest=join_digest,
+                            presentation=presentation,
+                        ),
+                        declared["rate"]: ConsoleSignalValue(
+                            name=declared["rate"],
+                            source=self.name,
+                            snapshot=rate,
+                            coverage=source.coverage,
+                            run_id=source.run_id,
+                            epoch_id=source.epoch_id,
+                            join_digest=join_digest,
                         ),
                     },
                 )
@@ -318,10 +384,20 @@ class ReactiveOccupancyNode:
             return self._snapshot()
 
         if (
-            getattr(self._source_node, "handle", None) is not self._source_handle
+            getattr(self._source_node, "lifecycle_generation", None)
+            != self._source_lifecycle_generation
             or not bool(getattr(self._source_node, "running", False))
         ):
             self._fail(RuntimeError("selected Camera producer instance has stopped"))
+            return self._snapshot()
+        source_handle = getattr(self._source_node, "handle", None)
+        handle_run_id = getattr(getattr(source_handle, "run_id", None), "value", None)
+        if handle_run_id is not None and handle_run_id != self._source_run_id:
+            self._fail(
+                RuntimeError(
+                    "selected Camera RunHandle differs from the bound frame lineage"
+                )
+            )
             return self._snapshot()
         source, self._initial_source = (
             self._initial_source,
@@ -353,9 +429,13 @@ class ReactiveOccupancyNode:
             calibration = self._calibration
             self._work_source = source
             self._work_future = self._submit(
-                lambda: apply_occupancy_snapshot(
+                lambda: project_reactive_occupancy(
                     source.snapshot,
                     calibration,
+                    coverage=source.coverage,
+                    model_kind=self._request.model_kind,
+                    run_id=source.run_id,
+                    epoch_id=source.epoch_id,
                 )
             )
             self._phase = (

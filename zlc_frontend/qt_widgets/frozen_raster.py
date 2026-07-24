@@ -30,6 +30,11 @@ class FrozenRasterView(QtWidgets.QWidget):
         zoomable: bool = False,
     ) -> None:
         super().__init__(parent)
+        # Plot pointer motion has no standalone meaning.  Qt still delivers
+        # move events while a pressed button owns a drag without mouse
+        # tracking, so disabling it preserves pan while making ordinary moves
+        # inert by construction.
+        self.setMouseTracking(False)
         self._panel_id = canonical_text(panel_id, "panel_id")
         self._empty_text = str(empty_text)
         self._front: tuple[bytes, QtGui.QImage] | None = None
@@ -262,6 +267,12 @@ class FrozenRasterView(QtWidgets.QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        # Current button state is authoritative.  A retained press origin must
+        # never turn a no-button move into an implicit plot interaction when a
+        # release was delivered elsewhere or the window lost capture.
+        if event.buttons() == QtCore.Qt.NoButton:
+            super().mouseMoveEvent(event)
+            return
         target = None if self._pan_from is None else self._target_rect()
         if target is None:
             super().mouseMoveEvent(event)

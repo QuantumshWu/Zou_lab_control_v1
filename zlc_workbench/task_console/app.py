@@ -47,6 +47,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         _prepare_capture_for_workbench,
         _prepare_camera_measurement_for_workbench,
         _prepare_grey_molasses_detuning_for_workbench,
+        _prepare_readout_duration_fidelity_for_workbench,
         _prepare_temperature_release_recapture_for_workbench,
     )
     from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_KEY
@@ -60,9 +61,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     )
     from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
     from zlc_neutral_atom.readout.coupled_measurements import (
-        AutonomousMeasurementUnavailable,
         GREY_MOLASSES_DETUNING_KEY,
-        READOUT_DURATION_CAPABILITY_GAP,
         READOUT_DURATION_FIDELITY_KEY,
         TEMPERATURE_RELEASE_RECAPTURE_KEY,
     )
@@ -97,6 +96,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         ReadoutDurationFidelityIntent,
         TemperatureReleaseRecaptureIntent,
         freeze_grey_molasses_detuning_request,
+        freeze_readout_duration_fidelity_request,
         freeze_temperature_release_recapture_request,
     )
     from .result_projection import project_final_signals
@@ -337,22 +337,40 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                     "readout-duration form did not produce its typed intent"
                 )
 
-            def reject_duration(current_intent):
+            calibration_ref = resolve_calibration_reference(
+                intent.calibration_signal,
+                measurement_name="Fidelity vs duration",
+            )
+
+            def prepare_duration(current_intent):
                 if current_intent != intent:
                     raise RuntimeError(
                         "readout-duration intent changed after construction"
                     )
-                raise AutonomousMeasurementUnavailable(
-                    READOUT_DURATION_CAPABILITY_GAP
+                request = freeze_readout_duration_fidelity_request(
+                    experiment,
+                    current_intent,
+                    calibration_ref=calibration_ref,
+                )
+                return _prepare_readout_duration_fidelity_for_workbench(
+                    experiment,
+                    request,
                 )
 
             node = ConsoleRunNode(
                 spec,
                 values,
-                prepare=reject_duration,
+                prepare=prepare_duration,
                 request_owner_wake=request_owner_wake,
             )
             node.bind_starter(lambda prepared: prepared.start())
+            node.bind_final_projector(
+                lambda result, current=node: project_final_signals(
+                    experiment,
+                    current,
+                    result,
+                )
+            )
             return node
         if spec.key == GREY_MOLASSES_DETUNING_KEY:
             intent = spec.build_request(values)
@@ -413,12 +431,10 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 source.definition_key != CAMERA_MEASUREMENT_KEY
                 or source.output_name != "frame"
                 or not isinstance(source.request, CameraMeasurementRequest)
-                or source.request.repeat != 0
             ):
                 raise ValueError(
                     "occupancy Camera source must select the frame output of "
-                    "a live Camera Measurement row (repeat = 0) in this "
-                    "TaskConsole"
+                    "a Camera Measurement row in this TaskConsole"
                 )
             if not source.running:
                 raise RuntimeError(
@@ -470,6 +486,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                         "selected Camera role differs from the admitted "
                         "calibration readout binding"
                     )
+                resolved.artifact.select_model(intent.model_kind)
                 return resolved
 
             return ReactiveOccupancyNode(

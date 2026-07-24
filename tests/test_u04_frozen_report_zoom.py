@@ -158,6 +158,17 @@ def test_dragging_pans_only_while_magnified(app):
                 QtCore.Qt.NoModifier,
             )
         )
+        assert not board.hasMouseTracking()
+        board.mouseMoveEvent(
+            QtGui.QMouseEvent(
+                QtCore.QEvent.MouseMove,
+                QtCore.QPointF(start + QtCore.QPoint(30, 0)),
+                QtCore.Qt.NoButton,
+                QtCore.Qt.NoButton,
+                QtCore.Qt.NoModifier,
+            )
+        )
+        assert board.view_center == before
         board.mouseMoveEvent(
             QtGui.QMouseEvent(
                 QtCore.QEvent.MouseMove,

@@ -896,6 +896,56 @@ class TaskConsole(QtWidgets.QWidget):
             if self._pulse_scan_source_kind(name, set()) is not None
         ]
 
+    def _declared_output_names(self, definition_key, output_name: str) -> list[str]:
+        """Exact signals owned by one catalog definition/output pair."""
+
+        accepted: list[str] = []
+        for name in self._signal_names():
+            try:
+                _row, spec, output = self._console_producer_match(name)
+            except LookupError:
+                continue
+            if spec.key == definition_key and str(output.name) == str(output_name):
+                accepted.append(name)
+        return accepted
+
+    def _signal_input_names(self, definition_key, parameter_key: str) -> list[str]:
+        """Project one request field's declared producer contract into its picker."""
+
+        from zlc_neutral_atom.acquisition.camera import CAMERA_MEASUREMENT_KEY
+        from zlc_neutral_atom.readout.coupled_measurements import (
+            GREY_MOLASSES_DETUNING_KEY,
+            READOUT_DURATION_FIDELITY_KEY,
+            TEMPERATURE_RELEASE_RECAPTURE_KEY,
+        )
+        from zlc_neutral_atom.readout.occupancy import (
+            OCCUPANCY_STREAM_PROCESSOR_KEY,
+        )
+        from zlc_neutral_atom.readout.sitemap import SITEMAP_CALIBRATION_TASK_KEY
+        from zlc_neutral_atom.scan import PULSE_SCAN_MEASUREMENT_KEY
+
+        key = str(parameter_key)
+        if definition_key == PULSE_SCAN_MEASUREMENT_KEY and key == "y_signal":
+            return self._pulse_scan_source_names()
+        if definition_key == OCCUPANCY_STREAM_PROCESSOR_KEY:
+            if key == "camera_frame":
+                return self._declared_output_names(CAMERA_MEASUREMENT_KEY, "frame")
+            if key == "calibration":
+                return self._declared_output_names(
+                    SITEMAP_CALIBRATION_TASK_KEY,
+                    "calibration",
+                )
+        if definition_key in {
+            TEMPERATURE_RELEASE_RECAPTURE_KEY,
+            READOUT_DURATION_FIDELITY_KEY,
+            GREY_MOLASSES_DETUNING_KEY,
+        } and key == "calibration":
+            return self._declared_output_names(
+                SITEMAP_CALIBRATION_TASK_KEY,
+                "calibration",
+            )
+        return self._signal_names()
+
     def _signal_formats(self) -> dict:
         """Describe every value present in the current immutable data front.
 
@@ -1792,17 +1842,22 @@ class TaskConsole(QtWidgets.QWidget):
             self.tabs.setCurrentWidget(existing)
             return
         spec = self._spec_for_logic(row.node)
-        signal_names_provider = None
+        signal_names_providers = {}
         if spec is not None:
-            from zlc_neutral_atom.scan import PULSE_SCAN_MEASUREMENT_KEY
-
-            if spec.key == PULSE_SCAN_MEASUREMENT_KEY:
-                signal_names_provider = self._pulse_scan_source_names
+            signal_names_providers = {
+                parameter.key: (
+                    lambda definition_key=spec.key, parameter_key=parameter.key: (
+                        self._signal_input_names(definition_key, parameter_key)
+                    )
+                )
+                for parameter in tuple(spec.params)
+                if str(parameter.kind) == "signal"
+            }
         editor = LogicNodeEditor(
             row,
             self,
             spec,
-            signal_names_provider=signal_names_provider,
+            signal_names_providers=signal_names_providers,
         )
         # reflect the live run state on the form (a Started node reopened keeps Stop enabled)
         node = self._logic_nodes.get(id(row))
