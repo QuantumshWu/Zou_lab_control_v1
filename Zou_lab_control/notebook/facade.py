@@ -140,7 +140,7 @@ from zlc_neutral_atom.scan import (
 )
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_neutral_atom.scan.application import (
-    PreparedOccupancyScan,
+    PreparedExactScan,
     compile_api_direct_scan_artifact_plan,
     compile_api_occupancy_scan_artifact_plan,
     compile_direct_scan_artifact_plan,
@@ -1285,10 +1285,16 @@ class ReadoutFacade:
                 trigger_channel=trigger_channel,
             )
 
-    def _start_mot_field_scan(self, request: MotFieldRequest) -> RunHandle:
-        """Workbench-only first stage: start the request's exact scan Run."""
+    def _prepare_mot_field_scan_for_workbench(
+        self,
+        request: MotFieldRequest,
+    ) -> PreparedExactScan:
+        """Freeze the exact MOT scan and its typed provisional dataset seam."""
 
-        return _start_scan(self._token, _mot_field_scan_request(request))
+        return _prepare_direct_scan_for_workbench(
+            self._token,
+            _mot_field_scan_request(request),
+        )
 
     def _sitemap_profile(
         self,
@@ -3654,6 +3660,23 @@ def _compile_direct_scan_for_services(
     services: _ExperimentServices,
     request: ScanRequest,
 ):
+    program, binding, _raw_schema, output_contract = (
+        _bind_direct_scan_for_services(services, request)
+    )
+    return _compile_bound_direct_scan_for_services(
+        services,
+        request,
+        program=program,
+        binding=binding,
+        output_contract=output_contract,
+        preview=None,
+    )
+
+
+def _bind_direct_scan_for_services(
+    services: _ExperimentServices,
+    request: ScanRequest,
+):
     if isinstance(request.program, AutonomousScanSlotProgram):
         program, point_table, binding = _bind_autonomous_scan_camera(
             services,
@@ -3669,6 +3692,18 @@ def _compile_direct_scan_for_services(
         point_table,
         request.output_transform_spec,
     )
+    return program, binding, raw_schema, output_contract
+
+
+def _compile_bound_direct_scan_for_services(
+    services: _ExperimentServices,
+    request: ScanRequest,
+    *,
+    program,
+    binding,
+    output_contract,
+    preview,
+):
     if isinstance(program, AutonomousScanSlotProgram):
         triggered, descriptor = bind_finite_capture_spec(
             binding=binding,
@@ -3685,6 +3720,7 @@ def _compile_direct_scan_for_services(
             services.scan_repository,
             program=program,
             output_contract=output_contract,
+            preview=preview,
         )
         descriptor = replace(
             descriptor,
@@ -3693,6 +3729,10 @@ def _compile_direct_scan_for_services(
         )
         return plan, descriptor
 
+    if preview is not None:
+        raise ValueError(
+            "API segmented direct scan is FINAL-only; preview is unsupported"
+        )
     compiled_digest = _compiled_scan_artifacts_digest(binding.compiled_artifacts)
     capture = MinimalPipelineSpec(
         f"API segmented scan {program.document.name}",
@@ -3831,10 +3871,42 @@ def _compile_occupancy_scan_for_services(
     )
 
 
+def _prepare_direct_scan_for_workbench(
+    token: object,
+    request: ScanRequest,
+) -> PreparedExactScan:
+    """Private friend seam for one typed direct-scan provisional view."""
+
+    if not isinstance(request, ScanRequest):
+        raise TypeError("request must be ScanRequest")
+    with _service_guard(token) as services:
+        program, binding, source_schema, output_contract = (
+            _bind_direct_scan_for_services(services, request)
+        )
+
+    def start(preview):
+        with _service_guard(token) as services:
+            plan, _descriptor = _compile_bound_direct_scan_for_services(
+                services,
+                request,
+                program=program,
+                binding=binding,
+                output_contract=output_contract,
+                preview=preview,
+            )
+            return services.runtime.start(plan)
+
+    return PreparedExactScan(
+        source_schema=source_schema,
+        output_contract=output_contract,
+        start=start,
+    )
+
+
 def _prepare_occupancy_scan_for_workbench(
     experiment: Experiment,
     request: OccupancyScanRequest,
-) -> PreparedOccupancyScan:
+) -> PreparedExactScan:
     """Private friend seam for the typed occupancy progressive panel."""
 
     if not isinstance(experiment, Experiment):
@@ -3876,7 +3948,7 @@ def _prepare_occupancy_scan_for_workbench(
                 )
             return services.runtime.start(plan)
 
-    return PreparedOccupancyScan(
+    return PreparedExactScan(
         source_schema=source_schema,
         output_contract=output_contract,
         start=start,

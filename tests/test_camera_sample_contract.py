@@ -13,6 +13,7 @@ from zlc_data import (
     CoordinateFrameId,
     DatasetSchema,
     PointLayout,
+    READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
     SPATIAL_X,
@@ -60,6 +61,10 @@ from zlc_neutral_atom.runtime.streams import (
     ProducerFlowControl,
     StreamId,
 )
+from zlc_neutral_atom.bootstrap._camera_endpoint import (
+    CameraCaptureBindingRequest,
+    _source_group_sizes,
+)
 from zlc_storage import decode, encode
 
 
@@ -103,6 +108,73 @@ def _schemas() -> tuple[ValueSchema, DatasetSchema]:
     return value_schema, dataset_schema
 
 
+def test_camera_source_groups_come_only_from_the_frozen_cell_schedule() -> None:
+    value_schema, _ = _schemas()
+    repeat = _axis("repeat.grouping", REPEAT, 2)
+    scan = _axis("scan.grouping", SCAN_POINT, 3)
+
+    scalar_layout = PointLayout.rect_c((scan.size,))
+    scalar_schema = DatasetSchema(repeat, (scan,), scalar_layout, value_schema)
+    scalar_cells = tuple(
+        DatasetCellAddress(r, p)
+        for r in range(repeat.size)
+        for p in range(scan.size)
+    )
+    scalar_request = CameraCaptureBindingRequest(
+        "camera",
+        repeat,
+        (scan,),
+        scalar_layout,
+        DatasetCellSchedule.from_cells(scalar_schema, scalar_cells),
+        CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+        0,
+    )
+    assert _source_group_sizes(scalar_request, scalar_schema) == (1,) * 6
+
+    event = _axis("event.grouping", READOUT_EVENT, 2)
+    layout = PointLayout.rect_c((scan.size, event.size))
+    schema = DatasetSchema(repeat, (scan, event), layout, value_schema)
+
+    def address(r: int, p: int, e: int) -> DatasetCellAddress:
+        return DatasetCellAddress(r, layout.storage_index((p, e)))
+
+    cells = tuple(
+        address(r, p, e)
+        for r in range(repeat.size)
+        for p in range(scan.size)
+        for e in range(event.size)
+    )
+    request = CameraCaptureBindingRequest(
+        "camera",
+        repeat,
+        (scan, event),
+        layout,
+        DatasetCellSchedule.from_cells(schema, cells),
+        CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+        0,
+    )
+    assert _source_group_sizes(request, schema) == (2,) * 6
+
+    split = (
+        address(0, 0, 0),
+        address(0, 1, 0),
+        address(0, 0, 1),
+        address(0, 1, 1),
+        *(address(r, p, e) for r, p, e in (
+            (0, 2, 0), (0, 2, 1),
+            (1, 0, 0), (1, 0, 1),
+            (1, 1, 0), (1, 1, 1),
+            (1, 2, 0), (1, 2, 1),
+        )),
+    )
+    split_request = replace(
+        request,
+        cell_schedule=DatasetCellSchedule.from_cells(schema, split),
+    )
+    with pytest.raises(ValueError, match="incomplete READOUT_EVENT group"):
+        _source_group_sizes(split_request, schema)
+
+
 def _metadata(**changes) -> CameraFrameMetadata:
     values = dict(
         source_ordinal=0,
@@ -131,6 +203,7 @@ def test_camera_capture_spec_has_one_current_canonical_encoding():
     spec = CameraCaptureSpec(
         CameraAcquisitionMode.EXTERNAL_TRIGGERED,
         4,
+        (1, 1, 1, 1),
         "a" * 64,
     )
     frozen = freeze_camera_capture_spec(spec)
@@ -277,6 +350,7 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         CameraCaptureSpec(
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             len(cells),
+            (1,) * len(cells),
             evidence.settings_fingerprint,
         )
     )

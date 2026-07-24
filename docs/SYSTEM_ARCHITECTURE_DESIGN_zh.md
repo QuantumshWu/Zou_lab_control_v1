@@ -3614,31 +3614,60 @@ item，树形 signal picker 递归量 producer 与 leaf（含缩进、shape/stat
 右边缘并向左扩展，只有物理屏幕边界可以钳制；纵向仍固定在 field 下方并以滚动吸收溢出。该合同
 由 `FluentComboBox/FluentTreeComboBox` 单一拥有，TaskConsole 不得按某个 signal 名单局部改 popup geometry。
 
-**2026-07-23 TaskConsole 产品闭合 checkpoint：** 六种 addable plot 都通过
+**2026-07-23 TaskConsole 产品闭合 checkpoint（OPEN，禁止据此宣称完成）：** 六种 addable plot 的目标链是
 `PanelConfig.size -> panel_display_size -> FigureSpec/Divider -> worker-owned Agg RGBA ->
 SinglePanelHost|FacetedPanelHost -> QtRasterBoard` 一条链；同一个 logical size 同时钉住
 worker 的 FigureSpec/Divider、实际 host 与外层 card，九档 panel size 与分数 DPR 改变的只是请求的
 logical/physical raster 尺寸，不重建稳定 widget，不建立 size-specific renderer、Qt 缩放副本或
 selector。Pulse preview 与普通 panel 因此共享同一个固定 data box/margin 原理、同一个 immutable
-front/viewport contract 和同一个 rectangle/handle owner。`2d/sites/1d/monitor/hist/grid` 的
-deterministic clean raster 已与
-`main@6c337d49c7086fa0ff21f879cd159bdf0e753f51` 在 `480×357 RGBA` 下逐像素相等；Grid 只把
-main 当作可见 bars/fit/chrome oracle，current 仍以具名 facet、稀疏 logical address 和 exact
-provenance 建立 coherent overview，double-click 后进入同一个 `SinglePanelHost` 的 typed focus。
+front/viewport contract 和同一个 rectangle/handle owner。**当前只有 Pulse plot/preview 已经经过操作者
+逐项纠正并可作为复用样板；不得把它外推为其它 plot kind 已完成。** `2d/sites/1d/monitor/hist/grid`
+仍须分别以 `main@6c337d49c7086fa0ff21f879cd159bdf0e753f51` 的正式界面做可见像素与真实交互验收；不得用
+“相似”的自制画面、仅 clean raster 的离线比较或不同 composition root 的截图代替。Grid 只把 main
+当作可见 bars/fit/chrome oracle，current 仍应以具名 facet、稀疏 logical address 和 exact provenance
+建立 coherent overview，double-click 后进入同一个 `SinglePanelHost` 的 typed focus。
 当 MOT 结果的 Bx/By/Bz 都是同 role 时，operator 选择的 facet 先固定；其余显示槽只消费
 `suggest_view` 返回的 typed alternatives，并以稳定 AxisId 补齐可见 x 或 x+y，UI 同时明示
 auto display axis 与完整 facet tuple。它不按 shape 猜轴，也不把显示选择写回权威 scan/fit。
 同一稳定host若从Histogram/Curve/Image一种payload family切到另一种，只原位解绑旧gesture family并
-绑定新family；不能保留错误selector，也不能为此删除重建QWidget。
+绑定新family；不能保留错误selector，也不能为此删除重建QWidget。所有正式 plot 的普通 pointer move
+必须是零语义：不采样、不发布、不改标题、不请求render；只允许已按下的 Area/locked Cross/zoom/pan/
+clim 手势及其完成事件进入唯一 interaction owner，产品中不存在数据 hover 或 disabled 兼容分支。
 
-正式 `ensure_qt_app()` fast-path 使用真实 Qt click/type/drag 跑通：Camera monitor 连续发布不同
-revision 的 2D frame；Area、锁定 Cross 与 Fit 都只由 Figure 在明确手势/提交后发布派生 signal，
-不重配 Measurement、不建立 ROI processor，也不打开第二个 DataFigure 窗口；finite Camera capture
-可完成并绑定 2D；Calibrate readout 产生 calibration Sites；Occupancy processor 绑定一个已经运行且
-已经发布 frame 的 live Camera 与 FINAL calibration，并原子发布 `counts/occupied`；Temperature
-release-recapture、Optimize MOT field 与 Pulse scan 均成功，后者保留 template、SCAN_SLOT/API
-program 与可编辑 scan table。Readout-duration 在冻结硬件未声明所需 exposure/rearm 时必须在 Start
-明确返回 capability rejection；Grey-molasses 只在 installation 真正发布同步 RF table Port 时运行。
+本轮已经闭合的性能与数据边界不得再回退：普通无按键 `mouseMove` 在唯一 `QtRasterBoard` 入口即退出，
+且 plot 不开启 mouse tracking；2D wheel 在 worker 尚未返回时继续以最新 pending viewport 累积，不吞后续
+滚轮输入，并只在 Divider 已定义的 data box 内即时重映射旧像素，title/tick/xlabel/ylabel/margin/
+distribution/colorbar 均保持原 Agg chrome，随后由 worker 的最新完整 raster 原子替换。稳定 live frame
+继续使用 worker-local Agg blit；viewport 改变因真实改变 limits/ticks 而完整重画，这与 main 的 blit
+失效条件一致，不得用 GUI 线程 Matplotlib draw、降低输入频率或丢 wheel event 冒充优化。panel size 在
+匹配新 logical/DPR raster 到达前保持旧 card/host/raster 几何，present 时在一次禁画区间内同时提交新
+front 与新 geometry，禁止先 stretch 旧图再跳变。
+
+Exact task preview 只按 caller-owned `DatasetRevision` cursor 冻结新增的 address-aware cell delta；每个
+qCMOS cell 只复制、投影一次，不能随 revision 反复 materialize 全部历史帧。MOT live grid 直接消费冻结
+schedule 的 `DatasetCellAddress`，物理采集次序可以与 logical storage 次序不同；ROI disc/ring 几何每次
+run 只冻结一次，运行中只保留 scalar grid 而不保留第二份历史相机帧。worker 收到 cell delta 时只原位
+更新该 grid 并标记 dirty；只有 TaskConsole 的显示 tick 真正跨线程读取时才冻结一份 immutable snapshot，
+禁止每个 cell 都复制整张累计 grid。这里不设置点数、字节数或其它内存预算，规模由实验定义本身决定。
+GUI close 只撤销读取权，不等待投影线程 join。
+SiteMap Area 与普通 image 复用同一个 completed rectangle/viewport owner；其二维范围按校准
+`centers_xy` 选择 SITE，而不是写回 Camera Measurement ROI。统一只发布 `area.data` 与两条
+`area.range.<AxisId>`：Occupancy 的 data 是 selected `occupied[SITE]`，Calibration 的 data 是 selected
+`centers[SITE, coordinate(x,y)]`；两者原样子集化 SITE validity，并把 background + site-state 两个
+exact input ref 写入派生 lineage。Cross 仍只有显式 right-click lock 才发布坐标，普通移动永远不发布。
+
+正式 `ensure_qt_app()` fast-path 必须使用真实 Qt click/type/drag 逐项闭合，但当前不能宣称已经跑通。
+当前已在正式 composition root 的 fast-path 分别看到 live Camera 连续 2D revision、finite Camera、
+Calibration 的 run-scoped 2D→FINAL Sites、MOT 的 run-scoped Bx/By/Bz grid→FINAL result，并验证普通
+pointer move 对 front/revision/status/title/Area/Cross/Fit 与发布集合均为零变化；这只关闭对应纵切，不能
+外推成全部产品验收。已知未闭合事实包括：六种 plot 对 main 的最终逐像素/手感复核、DeviceManager 的
+可见尺度、Calibration→Occupancy→Sites 的完整操作者链、SiteMap Area 的正式 Qt 手势链以及尚未逐项
+运行的其它 Measurement/Processor。Area、锁定 Cross 与 Fit 的终态合同仍是只由 Figure 在明确手势/提交后发布派生 signal，
+不重配 Measurement、不建立 ROI processor，也不打开第二个 DataFigure 窗口。Pulse scan 必须保留
+template、SCAN_SLOT/API program 与可编辑 scan table。Readout-duration 在冻结硬件未声明所需
+exposure/rearm 时必须在 Start 明确返回 capability rejection；Grey-molasses 只在 installation 真正发布
+同步 RF table Port 时运行。只有同一正式composition root中逐项完成上述人类流程并检查可见结果，才可把
+本段改为CLOSED；单元测试、直接handler调用或离屏静态raster不能替代该证据。
 current virtual installation 已兑现该 Port：host 在 FIRE 前一次性冻结并预装完整 detuning table，随后
 RF table 的时序真相只来自同一个 completed compiled sequencer playback 的物理 `point_index`，顺序固定为
 R-major/P-fast；virtual camera 只按该点做无副作用 lookup，不得回调或推进 RF 状态；

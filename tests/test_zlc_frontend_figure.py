@@ -756,6 +756,94 @@ def test_image_evaluator_preserves_axis_frames_and_value_unit() -> None:
     assert image.value_unit == "photoelectron"
 
 
+def test_explicit_image_bindings_render_numeric_scan_axes_without_relabeling() -> None:
+    from zlc_frontend.image_display import ImageDisplayState
+    from zlc_frontend.panel_render import (
+        FacetedPanelFocus,
+        PanelComposer,
+        PanelProvenance,
+    )
+
+    repeat = axis("scan-image-repeat", REPEAT, 1)
+    bx = axis(
+        "scan-image.bx",
+        SCAN_POINT,
+        3,
+        coordinates=(-12, 0, 12),
+    )
+    by = axis(
+        "scan-image.by",
+        SCAN_POINT,
+        2,
+        coordinates=(-6, 6),
+    )
+    bz = axis(
+        "scan-image.bz",
+        SCAN_POINT,
+        2,
+        coordinates=(-3, 3),
+    )
+    block = make_block(
+        np.arange(12, dtype=np.float64).reshape(1, 12),
+        repeat_axis=repeat,
+        point_axes=(bx, by, bz),
+        point_layout=PointLayout.rect_c((bx.size, by.size, bz.size)),
+        value_unit="counts",
+    )
+    suggestion = suggest_view(
+        block.schema,
+        ViewIntent.IMAGE,
+        preferences=ViewPreferences(
+            image_x_axis_id=bx.axis_id,
+            image_y_axis_id=by.axis_id,
+            facet_axis_ids=(bz.axis_id,),
+        ),
+    )
+    assert suggestion.status is SuggestionStatus.RESOLVED
+
+    snapshot = OwnedSnapshot(
+        block.ref(StreamGenerationId("scan-image-generation")),
+        block,
+    )
+    provenance = PanelProvenance(
+        "scan-image-run",
+        "scan-image-epoch",
+        "a" * 64,
+    )
+    composer = PanelComposer(
+        "scan-image",
+        intent=ViewIntent.IMAGE,
+        size=(320, 240),
+        size_name="1x2",
+        view=suggestion.spec,
+    )
+    try:
+        overview = composer.compose_faceted(
+            snapshot,
+            display=ImageDisplayState(),
+            provenance=provenance,
+        )
+        assert overview.overview_png is not None
+        assert len(overview.regions) == bz.size
+        focused = composer.compose_faceted(
+            snapshot,
+            display=ImageDisplayState(),
+            provenance=provenance,
+            focus=FacetedPanelFocus(
+                0,
+                overview.regions[0].focus_selection,
+            ),
+        )
+    finally:
+        composer.close()
+    payload = focused.frame.panels[0].display_payload
+    assert payload.viewport.x_axis.axis_id == bx.axis_id
+    assert payload.viewport.y_axis.axis_id == by.axis_id
+    assert payload.viewport.x_axis.role == SCAN_POINT
+    assert payload.viewport.y_axis.role == SCAN_POINT
+    assert payload.viewport.data_extent == (-18.0, 18.0, 12.0, -12.0)
+
+
 def test_explicit_sparse_image_preserves_hole_as_invalid():
     repeat = axis("repeat", REPEAT, 1)
     x = axis("x", SPATIAL_X, 2)

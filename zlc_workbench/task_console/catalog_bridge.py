@@ -72,6 +72,7 @@ from .coupled_measurement_presenter import (
 
 SCAN_INTENT_DEFAULT_CAMERA_ROLE = "camera"
 SCAN_INTENT_DEFAULT_SEQUENCER_ROLE = "sequencer"
+CAMERA_MEASUREMENT_ROLES = ("camera", "mot_camera")
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +100,7 @@ class ConsoleSignalDecl:
     axis_label: str
     unit: str
     description: str = ""
+    run_scoped: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,7 +114,7 @@ class ConsoleNodeSpec:
     params: tuple[ParamDecl, ...]
     declared_outputs: tuple[ConsoleSignalDecl, ...]
     build_request: Callable[[Mapping[str, object]], object]
-    default_panel: tuple[str, str] | None = None
+    default_panel: tuple[str, str] | tuple[str, str, Mapping[str, object]] | None = None
 
     @property
     def name(self) -> str:
@@ -536,6 +538,14 @@ class ConsoleCatalogView:
                 params=calibration_task_params(self.sitemap_camera_roles()),
                 declared_outputs=(
                     ConsoleSignalDecl(
+                        "frame",
+                        "reference frame",
+                        "Counts",
+                        "counts",
+                        "exact capture frame while calibration is running",
+                        run_scoped=True,
+                    ),
+                    ConsoleSignalDecl(
                         "calibration",
                         "calibration",
                         "Calibration",
@@ -544,7 +554,7 @@ class ConsoleCatalogView:
                     ),
                 ),
                 build_request=build_calibration_task_intent,
-                default_panel=("calibration", "sites"),
+                default_panel=("frame", "2d"),
             )
         if item.key == MOT_FIELD_TASK_KEY:
             return ConsoleNodeSpec(
@@ -557,6 +567,14 @@ class ConsoleCatalogView:
                 ),
                 params=mot_field_params(self.camera_roles()),
                 declared_outputs=(
+                    ConsoleSignalDecl(
+                        "grid",
+                        "MOT intensity grid",
+                        "Counts",
+                        "counts",
+                        "provisional Bx/By/Bz intensity while the scan runs",
+                        run_scoped=True,
+                    ),
                     ConsoleSignalDecl(
                         "mot_field",
                         "MOT field",
@@ -573,7 +591,14 @@ class ConsoleCatalogView:
                     ),
                 ),
                 build_request=build_mot_field_intent,
-                default_panel=("mot_field", "grid"),
+                default_panel=(
+                    "grid",
+                    "grid",
+                    {
+                        "default_grid_intent": "IMAGE",
+                        "default_grid_facet_axis": "scan.parameter.da_z",
+                    },
+                ),
             )
         if item.key == PULSE_SCAN_MEASUREMENT_KEY:
 
@@ -761,7 +786,10 @@ class ConsoleCatalogView:
         return self._by_name.get(str(name))
 
     def camera_roles(self) -> tuple[str, ...]:
-        return tuple(self._experiment.device_catalog.roles("camera"))
+        installed = set(self._experiment.device_catalog.roles("camera"))
+        return tuple(
+            role for role in CAMERA_MEASUREMENT_ROLES if role in installed
+        )
 
     def sitemap_camera_roles(self) -> tuple[str, ...]:
         return tuple(self._experiment.readout.sitemap_camera_roles())

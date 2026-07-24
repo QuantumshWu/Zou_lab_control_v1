@@ -202,7 +202,10 @@ class _PreparedExactCapture:
         *,
         block_id: BlockId,
         factory: Callable[[CapturePreviewSpec], CapturePreviewPort],
+        source_ordinals: tuple[int, ...] | None = None,
     ) -> RunHandle:
+        """Start once, optionally publishing only named physical frame ordinals."""
+
         if not isinstance(block_id, BlockId):
             raise TypeError("block_id must be BlockId")
         if not callable(factory):
@@ -212,6 +215,7 @@ class _PreparedExactCapture:
         preview_spec = CapturePreviewSpec(
             block_id,
             self._preview_edge,
+            source_ordinals,
         )
         preview = factory(preview_spec)
         plan = compile_capture_artifact_pipeline(

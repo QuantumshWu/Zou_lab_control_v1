@@ -25,6 +25,9 @@ from zlc_data import (
     SPATIAL_X,
     SPATIAL_Y,
     AxisSpec,
+    DatasetSchema,
+    ValidityContract,
+    ValueSchema,
     expand_dataset_validity,
     immutable_array,
 )
@@ -205,6 +208,113 @@ class MotFieldResult:
         return self.best_field[2]
 
 
+class MotRoiProjector:
+    """Reusable Main-compatible ROI geometry for one camera frame shape."""
+
+    __slots__ = (
+        "_frame_shape",
+        "_cx",
+        "_cy",
+        "_radius",
+        "_y_slice",
+        "_x_slice",
+        "_disc",
+        "_ring",
+    )
+
+    def __init__(
+        self,
+        frame_shape: tuple[int, int],
+        cx: float,
+        cy: float,
+        radius: float,
+    ) -> None:
+        shape = tuple(frame_shape)
+        if (
+            len(shape) != 2
+            or any(
+                isinstance(size, bool)
+                or not isinstance(size, Integral)
+                or size <= 0
+                for size in shape
+            )
+        ):
+            raise ValueError("frame_shape must contain positive (height, width)")
+        height, width = (int(shape[0]), int(shape[1]))
+        cx = finite_real(cx, "roi centre x")
+        cy = finite_real(cy, "roi centre y")
+        radius = positive_real(radius, "roi radius")
+        extent = 2.0 * radius
+        x0 = min(width, max(0, int(math.floor(cx - extent))))
+        x1 = min(width, max(0, int(math.ceil(cx + extent)) + 1))
+        y0 = min(height, max(0, int(math.floor(cy - extent))))
+        y1 = min(height, max(0, int(math.ceil(cy + extent)) + 1))
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        radius_squared = (xx - cx) ** 2 + (yy - cy) ** 2
+        disc = np.asarray(radius_squared <= radius**2, dtype=bool)
+        ring = np.asarray(
+            (radius_squared > radius**2)
+            & (radius_squared <= extent**2),
+            dtype=bool,
+        )
+        disc.setflags(write=False)
+        ring.setflags(write=False)
+        self._frame_shape = (height, width)
+        self._cx = cx
+        self._cy = cy
+        self._radius = radius
+        self._y_slice = slice(y0, y1)
+        self._x_slice = slice(x0, x1)
+        self._disc = disc
+        self._ring = ring
+
+    @property
+    def frame_shape(self) -> tuple[int, int]:
+        return self._frame_shape
+
+    def intensity(
+        self,
+        frame: np.ndarray,
+        *,
+        validity: np.ndarray | None = None,
+    ) -> float:
+        """Apply the frozen disc/annulus geometry to one frame."""
+
+        source = np.asarray(frame)
+        if source.shape != self._frame_shape:
+            raise ValueError(
+                f"MOT ROI expects frame shape {self._frame_shape}; got {source.shape}"
+            )
+        region = np.asarray(
+            source[self._y_slice, self._x_slice],
+            dtype=float,
+        )
+        if validity is not None:
+            valid = np.asarray(validity, dtype=bool)
+            if valid.shape != self._frame_shape:
+                raise ValueError("ROI validity shape differs from the frame")
+            region_valid = (
+                valid[self._y_slice, self._x_slice] & np.isfinite(region)
+            )
+        else:
+            region_valid = np.isfinite(region)
+        disc_valid = self._disc & region_valid
+        height, width = self._frame_shape
+        if not disc_valid.any():
+            raise ValueError(
+                f"MOT ROI (cx={self._cx}, cy={self._cy}, r={self._radius}) "
+                f"has no valid pixels in the {height}x{width} frame"
+            )
+        if self._ring.any():
+            ring_valid = self._ring & region_valid
+            if not ring_valid.any():
+                raise ValueError("MOT background annulus has no valid pixels")
+            background = float(np.mean(region[ring_valid]))
+        else:
+            background = 0.0
+        return float(np.mean(region[disc_valid]) - background)
+
+
 def mot_roi_intensity(
     frame: np.ndarray,
     cx: float,
@@ -213,48 +323,111 @@ def mot_roi_intensity(
     *,
     validity: np.ndarray | None = None,
 ) -> float:
-    """Mean circular-ROI counts minus the surrounding annulus mean.
+    """Mean circular-ROI counts minus annulus mean using Main's rule."""
 
-    This is the physical rule from ``main``.  Current component validity is
-    consumed explicitly: invalid pixels do not enter either mean, and a missing
-    ROI/background support fails instead of manufacturing a scalar.
-    """
-
-    data = np.asarray(frame, dtype=float)
+    data = np.asarray(frame)
     if data.ndim != 2:
         raise ValueError(
             f"mot_roi_intensity takes one (H, W) frame; got shape {data.shape}"
         )
-    cx = finite_real(cx, "roi centre x")
-    cy = finite_real(cy, "roi centre y")
-    radius = positive_real(radius, "roi radius")
-    if validity is None:
-        valid = np.ones(data.shape, dtype=bool)
-    else:
-        valid = np.asarray(validity, dtype=bool)
-        if valid.shape != data.shape:
-            raise ValueError("ROI validity shape differs from the frame")
-    valid = valid & np.isfinite(data)
+    return MotRoiProjector(data.shape, cx, cy, radius).intensity(
+        data,
+        validity=validity,
+    )
 
-    height, width = data.shape
-    yy, xx = np.mgrid[0:height, 0:width]
-    radius_squared = (xx - cx) ** 2 + (yy - cy) ** 2
-    disc = radius_squared <= radius**2
-    ring = (radius_squared > radius**2) & (radius_squared <= (2.0 * radius) ** 2)
-    disc_valid = disc & valid
-    if not disc_valid.any():
+
+def build_mot_intensity_projector(
+    request: MotFieldRequest,
+    source_schema: DatasetSchema,
+) -> MotRoiProjector:
+    """Freeze one ROI geometry shared by live and FINAL MOT projection."""
+
+    _validate_mot_source_schema(request, source_schema)
+    height, width = source_schema.cell_schema.data_shape
+    return MotRoiProjector(
+        (height, width),
+        width / 2.0 if request.roi_cx is None else request.roi_cx,
+        height / 2.0 if request.roi_cy is None else request.roi_cy,
+        request.roi_radius,
+    )
+
+
+def mot_intensity_schema(
+    request: MotFieldRequest,
+    source_schema: DatasetSchema,
+) -> DatasetSchema:
+    """Return the scalar Bx/By/Bz schema shared by live and FINAL analysis."""
+
+    _validate_mot_source_schema(request, source_schema)
+    return DatasetSchema(
+        source_schema.repeat_axis,
+        source_schema.point_axes,
+        source_schema.point_layout,
+        ValueSchema(
+            (),
+            ValidityContract.value(),
+            np.dtype("<f8"),
+            source_schema.cell_schema.value_unit,
+        ),
+    )
+
+
+def _validate_mot_source_schema(
+    request: MotFieldRequest,
+    schema: DatasetSchema,
+) -> None:
+    if not isinstance(request, MotFieldRequest):
+        raise TypeError("request must be MotFieldRequest")
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    table = request.program.point_table
+    if schema.point_axes != table.point_axes:
+        raise ValueError("MOT scan axes differ from the frozen MOT program")
+    if schema.point_layout != table.point_layout:
+        raise ValueError("MOT point layout differs from the frozen MOT program")
+    if schema.repeat_axis.size != 1:
         raise ValueError(
-            f"MOT ROI (cx={cx}, cy={cy}, r={radius}) has no valid pixels "
-            f"in the {height}x{width} frame"
+            "MOT optimization requires exactly one repeat; it never auto-reduces repeat"
         )
-    if ring.any():
-        ring_valid = ring & valid
-        if not ring_valid.any():
-            raise ValueError("MOT background annulus has no valid pixels")
-        background = float(np.mean(data[ring_valid]))
-    else:
-        background = 0.0
-    return float(np.mean(data[disc_valid]) - background)
+    data_axes = schema.cell_schema.data_axes
+    if tuple(axis.role for axis in data_axes) != (SPATIAL_Y, SPATIAL_X):
+        raise ValueError("MOT scan output must preserve one spatial-y/x camera frame")
+    if schema.point_layout.storage_size != math.prod(schema.point_layout.logical_shape):
+        raise ValueError("MOT scan requires the complete Cartesian coil grid")
+
+
+def _mot_storage_intensities(
+    request: MotFieldRequest,
+    values: np.ndarray,
+    validity,
+    schema: DatasetSchema,
+    *,
+    written_cells: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    _validate_mot_source_schema(request, schema)
+    if (
+        isinstance(written_cells, bool)
+        or not isinstance(written_cells, Integral)
+        or written_cells < 0
+        or written_cells > schema.point_layout.storage_size
+    ):
+        raise ValueError("written_cells differs from the MOT point layout")
+    array = np.asarray(values)
+    expanded_validity = expand_dataset_validity(validity, schema)
+    if array.shape != schema.physical_shape or expanded_validity.shape != array.shape:
+        raise ValueError("MOT values/validity differ from their schema")
+    projector = build_mot_intensity_projector(request, schema)
+    intensities = np.zeros(schema.point_layout.storage_size, dtype=np.float64)
+    present = np.zeros(schema.point_layout.storage_size, dtype=bool)
+    for storage_index in range(int(written_cells)):
+        frame = array[0, storage_index]
+        frame_validity = expanded_validity[0, storage_index]
+        intensities[storage_index] = projector.intensity(
+            frame,
+            validity=frame_validity,
+        )
+        present[storage_index] = True
+    return intensities, present
 
 
 def refine_mot_optimum(
@@ -302,39 +475,20 @@ def analyze_mot_scan(
         raise TypeError("materialized must be MaterializedScanData")
     schema = materialized.schema
     table = request.program.point_table
-    if schema.point_axes != table.point_axes:
-        raise ValueError("FINAL scan axes differ from the frozen MOT program")
-    if schema.point_layout != table.point_layout:
-        raise ValueError("FINAL scan point layout differs from the frozen MOT program")
-    if schema.repeat_axis.size != 1:
-        raise ValueError(
-            "MOT optimization requires exactly one repeat; it never auto-reduces repeat"
-        )
-    data_axes = schema.cell_schema.data_axes
-    if tuple(axis.role for axis in data_axes) != (SPATIAL_Y, SPATIAL_X):
-        raise ValueError("MOT scan output must preserve one spatial-y/x camera frame")
-    if schema.point_layout.storage_size != math.prod(schema.point_layout.logical_shape):
-        raise ValueError("MOT scan requires the complete Cartesian coil grid")
-
-    values = np.asarray(materialized.values)
-    validity = expand_dataset_validity(materialized.validity, schema)
-    expected_shape = schema.physical_shape
-    if values.shape != expected_shape or validity.shape != expected_shape:
-        raise ValueError("materialized MOT values/validity differ from their schema")
+    storage_values, present = _mot_storage_intensities(
+        request,
+        materialized.values,
+        materialized.validity,
+        schema,
+        written_cells=schema.point_layout.storage_size,
+    )
+    if not present.all():
+        raise RuntimeError("FINAL MOT scan is missing intensity cells")
     logical = np.empty(schema.point_layout.logical_shape, dtype=np.float64)
     for storage_index in range(schema.point_layout.storage_size):
-        frame = values[0, storage_index]
-        frame_validity = validity[0, storage_index]
-        height, width = frame.shape
-        cx = width / 2.0 if request.roi_cx is None else request.roi_cx
-        cy = height / 2.0 if request.roi_cy is None else request.roi_cy
-        logical[schema.point_layout.multi_index(storage_index)] = mot_roi_intensity(
-            frame,
-            cx,
-            cy,
-            request.roi_radius,
-            validity=frame_validity,
-        )
+        logical[schema.point_layout.multi_index(storage_index)] = storage_values[
+            storage_index
+        ]
 
     axes = tuple(
         tuple(axis.coordinates or tuple(range(axis.size)))
@@ -358,8 +512,11 @@ __all__ = [
     "MOT_SCAN_PARAMETER_IDS",
     "MotFieldRequest",
     "MotFieldResult",
+    "MotRoiProjector",
     "analyze_mot_scan",
+    "build_mot_intensity_projector",
     "build_mot_scan_program",
+    "mot_intensity_schema",
     "mot_roi_intensity",
     "refine_mot_optimum",
 ]

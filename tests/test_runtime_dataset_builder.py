@@ -16,6 +16,7 @@ from zlc_data import (
     AxisSpec,
     BlockId,
     ComponentValidity,
+    DatasetRevision,
     DatasetSchema,
     MONITOR_HISTORY,
     PointLayout,
@@ -36,6 +37,7 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetCellSchedule,
     DatasetCellKeyContract,
     DatasetCoverage,
+    DatasetPreviewDelta,
     DatasetPreviewSnapshot,
     FrozenDatasetEdge,
     MissingDatasetCells,
@@ -56,6 +58,8 @@ from zlc_neutral_atom.runtime.streams import (
     TraceBinding,
     ProducerFlowControl,
 )
+from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewSpec
+from zlc_workbench.exact_live_slot import ExactDatasetLiveSlot
 
 
 FINGERPRINT = "3" * 64
@@ -445,6 +449,112 @@ def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
     assert tuple(final.block.values[0, point, 0, 0] for point in range(3)) == (10, 20, 30)
     reservation.release()
     assert stream.retained_events == 0
+
+
+def test_exact_preview_delta_copies_only_new_cells_in_frozen_order():
+    schema = dataset_schema(points=2, component_validity=True)
+    stream, producer = source(schema, events=2)
+    reservation = stream.reserve(
+        total_events=2,
+        max_inflight_events=2,
+        trace_binding=TRACE_BINDING,
+    )
+    cursor = reservation.activate()
+    schedule = DatasetCellSchedule.from_cells(
+        schema,
+        (DatasetCellAddress(0, 1), DatasetCellAddress(0, 0)),
+    )
+    builder = DatasetBuilder(
+        BlockId("delta-camera"),
+        reservation,
+        FrozenDatasetEdge(schema, event_adapter(stream), schedule),
+    )
+    reader = builder.open_preview_reader()
+    mask = np.asarray(
+        ((True, False, True), (False, True, False)),
+        dtype=bool,
+    )
+    validity = ComponentValidity(
+        tuple(axis.axis_id for axis in schema.cell_schema.data_axes),
+        mask,
+    )
+
+    emit(producer, value(11, component_validity=validity), schedule.cell_at(0), 0)
+    builder.consume(cursor.next())
+    first = reader.freeze_delta(DatasetRevision(0))
+
+    assert isinstance(first, DatasetPreviewDelta)
+    assert first.after == DatasetRevision(0)
+    assert first.ref.revision == DatasetRevision(1)
+    assert tuple(cell.ordinal for cell in first.cells) == (0,)
+    assert tuple(cell.address for cell in first.cells) == (DatasetCellAddress(0, 1),)
+    assert np.all(first.cells[0].value.values == 11)
+    assert np.array_equal(first.cells[0].value.validity.mask, mask)
+    assert first.cells[0].metadata is None
+    with pytest.raises(ValueError):
+        first.cells[0].value.values.setflags(write=True)
+
+    emit(producer, value(22, component_validity=validity), schedule.cell_at(1), 1)
+    builder.consume(cursor.next())
+    second = reader.freeze_delta(first.ref.revision)
+
+    assert second.after == DatasetRevision(1)
+    assert second.ref.revision == DatasetRevision(2)
+    assert tuple(cell.ordinal for cell in second.cells) == (1,)
+    assert tuple(cell.address for cell in second.cells) == (DatasetCellAddress(0, 0),)
+    assert np.all(second.cells[0].value.values == 22)
+    assert reader.freeze_delta(second.ref.revision).cells == ()
+
+    builder.seal(producer.finish())
+    reservation.release()
+
+
+def test_exact_live_slot_terminal_validation_does_not_materialize_frames(monkeypatch):
+    schema = dataset_schema(points=2)
+    stream, producer = source(schema, events=2)
+    reservation = stream.reserve(
+        total_events=2,
+        max_inflight_events=2,
+        trace_binding=TRACE_BINDING,
+    )
+    cursor = reservation.activate()
+    builder = DatasetBuilder(
+        BlockId("delta-live-slot"),
+        reservation,
+        dataset_edge(stream, schema),
+    )
+    slot = ExactDatasetLiveSlot(ExactDatasetPreviewSpec(schema.fingerprint))
+    slot.bind(
+        builder.open_preview_reader(),
+        run_id="run",
+        causation_domain_id=stream.generation.value,
+    )
+
+    emit(producer, value(10), DatasetCellAddress(0, 0), 0)
+    builder.consume(cursor.next())
+    first = slot.wait_and_freeze_delta(DatasetRevision(0), timeout=0)
+    assert first is not None
+    assert first[2].ref.revision == DatasetRevision(1)
+
+    emit(producer, value(20), DatasetCellAddress(0, 1), 1)
+    builder.consume(cursor.next())
+    builder.seal(producer.finish())
+
+    def forbidden_materialize(*_args, **_kwargs):
+        raise AssertionError("terminal validation copied the cumulative dataset")
+
+    monkeypatch.setattr(builder, "materialize", forbidden_materialize)
+    slot.source_terminal()
+    assert slot.terminal
+    second = slot.wait_and_freeze_delta(first[2].ref.revision, timeout=None)
+    assert second is not None
+    assert tuple(cell.address for cell in second[2].cells) == (
+        DatasetCellAddress(0, 1),
+    )
+    assert slot.wait_and_freeze_delta(second[2].ref.revision, timeout=None) is None
+
+    slot.close()
+    reservation.release()
 
 
 def test_bound_builder_owns_reservation_completion():
@@ -1082,6 +1192,7 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
             adapter=CameraSampleAdapter(contract),
         ),
     )
+    reader = builder.open_preview_reader()
     metadata = FrameMetadata(physical_ordinal=0, frame_stamp=101)
     sample = CameraSample(Value(value(5).values, VALID, schema.cell_schema), metadata)
     producer.emit(
@@ -1092,6 +1203,8 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
     )
     builder.consume(cursor.next())
     assert builder.materialize().cell_metadata == (metadata,)
+    delta = reader.freeze_delta(DatasetRevision(0))
+    assert tuple(cell.metadata for cell in delta.cells) == (metadata,)
     artifact = builder.seal(producer.finish())
     assert artifact.block.values[0, 0, 0, 0] == 5
     assert artifact.event_metadata == (metadata,)

@@ -79,8 +79,8 @@ _ResultAdapter = Callable[
 ]
 
 
-class PreparedOccupancyScan:
-    """One-shot command exposing only the typed progressive preview seam."""
+class PreparedExactScan:
+    """One-shot exact scan command exposing one typed provisional dataset seam."""
 
     __slots__ = (
         "_lock",
@@ -133,7 +133,7 @@ class PreparedOccupancyScan:
     def _claim_start(self) -> None:
         with self._lock:
             if self._started:
-                raise RuntimeError("PreparedOccupancyScan is one-shot")
+                raise RuntimeError("PreparedExactScan is one-shot")
             self._started = True
 
 
@@ -355,8 +355,32 @@ def compile_direct_scan_artifact_plan(
     *,
     program: AutonomousScanSlotProgram,
     output_contract: ScanOutputContract,
+    preview: ExactDatasetPreviewPort | None = None,
 ) -> RunPlan:
-    """Compile direct camera y into one canonical FINAL scan Run."""
+    """Compile direct camera y with an optional exact provisional view."""
+
+    try:
+        return _compile_direct_scan_artifact_plan(
+            spec,
+            repository,
+            program=program,
+            output_contract=output_contract,
+            preview=preview,
+        )
+    except BaseException as error:
+        _notify_preview_failure(preview, error)
+        raise
+
+
+def _compile_direct_scan_artifact_plan(
+    spec: TriggeredCaptureSpec,
+    repository: ScanRepository,
+    *,
+    program: AutonomousScanSlotProgram,
+    output_contract: ScanOutputContract,
+    preview: ExactDatasetPreviewPort | None,
+) -> RunPlan:
+    """Validated direct-scan compiler implementation."""
 
     if not isinstance(spec, TriggeredCaptureSpec):
         raise TypeError("spec must be TriggeredCaptureSpec")
@@ -383,7 +407,7 @@ def compile_direct_scan_artifact_plan(
             ),
         )
 
-    base = compile_triggered_pipeline(spec)
+    base = compile_triggered_pipeline(spec, exact_preview=preview)
     return _compile_scan_artifact_plan(
         base,
         repository,
@@ -642,5 +666,5 @@ __all__ = [
     "compile_api_occupancy_scan_artifact_plan",
     "compile_direct_scan_artifact_plan",
     "compile_occupancy_scan_artifact_plan",
-    "PreparedOccupancyScan",
+    "PreparedExactScan",
 ]

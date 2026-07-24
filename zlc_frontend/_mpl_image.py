@@ -147,7 +147,7 @@ def _draw_projected_image(
     colormap: str,
     color_limits: tuple[float, float],
     visible_bounds=(0.0, 0.0, 1.0, 1.0),
-    regular_pixel_contract: bool,
+    regular_axis_contract: bool,
     center: tuple[float, float] | None,
     radius: float | None,
     diagnostic: str | None,
@@ -163,15 +163,15 @@ def _draw_projected_image(
     if data.values.dtype.kind == "f":
         invalid = np.logical_or(invalid, ~np.isfinite(data.values))
     values = np.ma.array(data.values, mask=invalid)
-    if not isinstance(regular_pixel_contract, bool):
-        raise TypeError("regular_pixel_contract must be bool")
-    if regular_pixel_contract:
+    if not isinstance(regular_axis_contract, bool):
+        raise TypeError("regular_axis_contract must be bool")
+    if regular_axis_contract:
         # Typed IMAGE and saved-fit panels have already crossed the strict
-        # regular-pixel viewport boundary.  Revalidate that declared contract
+        # regular numeric-axis viewport boundary.  Revalidate that contract
         # here before projection; never infer it from shape.
         image_viewport_for_evaluated_image(data)
         if x_labels is not None or y_labels is not None:
-            raise ValueError("projected IMAGE export requires numeric pixel axes")
+            raise ValueError("projected IMAGE export requires numeric axes")
         image_artist = axis.imshow(
             values,
             origin="upper",
@@ -298,7 +298,7 @@ def _image(
             data,
             colormap="gray",
             color_limits=radial_color_limits,
-            regular_pixel_contract=False,
+            regular_axis_contract=False,
             center=center,
             radius=radius,
             diagnostic=diagnostic,
@@ -393,7 +393,7 @@ def _radial_projected_image(
         colormap=display.colormap.value,
         color_limits=color_limits,
         visible_bounds=viewport.visible_bounds,
-        regular_pixel_contract=True,
+        regular_axis_contract=True,
         center=overlay.center_xy,
         radius=overlay.one_over_e_radius,
         diagnostic=(
@@ -560,7 +560,7 @@ def save_image_panel_png(
                 colormap=display.colormap.value,
                 color_limits=payload.color_limits,
                 visible_bounds=payload.viewport.visible_bounds,
-                regular_pixel_contract=True,
+                regular_axis_contract=True,
                 center=center,
                 radius=radius,
                 diagnostic=diagnostic,

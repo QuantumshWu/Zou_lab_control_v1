@@ -1,4 +1,4 @@
-"""Headless coordinate transforms for one regular two-axis pixel image.
+"""Headless coordinate transforms for one regular numeric two-axis raster.
 
 The transform is immutable and contains the committed visible window.  Every
 pointer and rectangle is first expressed in that visible window, then mapped
@@ -8,7 +8,7 @@ therefore share one exact mapping without sharing a Figure, artist, or widget.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 import math
 from numbers import Real
 from typing import TypeAlias
@@ -16,7 +16,7 @@ from typing import TypeAlias
 import numpy as np
 
 from zlc_data import (
-    AxisRoleId,
+    AxisId,
     AxisSpec,
     CoordinateFrameId,
     CoordinateRangeSelection,
@@ -41,7 +41,7 @@ CoordinateView: TypeAlias = tuple[float, float]
 # Viewports are display geometry, not measurement coordinates.  A fixed
 # binary grid makes their equality stable across the public
 # normalized -> coordinate-view -> normalized bridge while remaining far
-# below one source pixel for the admitted camera rasters.  Forty fractional
+# below one source cell for the admitted rasters.  Forty fractional
 # bits are deterministic and exactly representable by binary64.
 _VIEWPORT_FRACTION_BITS = 40
 _VIEWPORT_TICKS = 1 << _VIEWPORT_FRACTION_BITS
@@ -102,10 +102,8 @@ def _coordinate_view(value: object, name: str) -> CoordinateView:
 
 
 def _axis_step(axis: AxisSpec) -> int | float:
-    if axis.unit != "pixel":
-        raise ValueError(f"axis {axis.axis_id} must declare unit='pixel'")
     if axis.coordinates is None:
-        raise ValueError(f"axis {axis.axis_id} requires explicit pixel coordinates")
+        raise ValueError(f"axis {axis.axis_id} requires explicit numeric coordinates")
     first = axis.coordinate_at(0)
     if (
         isinstance(first, bool)
@@ -137,7 +135,7 @@ def _axis_step(axis: AxisSpec) -> int | float:
         if current - previous != step:
             raise ValueError(
                 f"axis {axis.axis_id} coordinates are not exactly regular; "
-                "the pixel viewport refuses an affine approximation"
+                "the IMAGE viewport refuses an affine approximation"
             )
         previous = current
     return step
@@ -325,17 +323,24 @@ def _clamped_interval(start: float, span: float) -> tuple[float, float]:
 
 @dataclass(frozen=True, slots=True)
 class ImageViewportTransform:
-    """Exact map between a committed visible window and a complete pixel raster.
+    """Exact map between a committed visible window and a numeric 2-D raster.
 
-    ``axes`` must contain exactly one named ``SPATIAL_X`` and ``SPATIAL_Y``
-    axis.  ``visible_bounds`` uses complete-raster edge coordinates; the home
-    view is ``(0, 0, 1, 1)``.  Rank, singleton shape, and tuple position never
-    supply an axis role.
+    ``display_axis_ids`` is the explicit ``(IMAGE_X, IMAGE_Y)`` binding when
+    the source axes do not identify their display direction themselves.  A
+    traditional spatial image may omit it because the declared
+    ``SPATIAL_X``/``SPATIAL_Y`` roles are already unambiguous.  The source
+    roles remain untouched: two scan-point axes stay scan-point axes while the
+    Figure binding says which is horizontal and which is vertical.
+
+    ``visible_bounds`` uses complete-raster edge coordinates; the home view is
+    ``(0, 0, 1, 1)``.  Rank, singleton shape, and tuple position never supply
+    an axis role or display direction.
     """
 
     axes: tuple[AxisSpec, AxisSpec]
     viewport_revision: int = 0
     visible_bounds: NormalizedRectangle = (0.0, 0.0, 1.0, 1.0)
+    display_axis_ids: InitVar[tuple[AxisId, AxisId] | None] = None
     _x_edge_coordinates: tuple[float, float] | None = field(
         init=False,
         repr=False,
@@ -347,25 +352,55 @@ class ImageViewportTransform:
         compare=False,
     )
 
-    def __post_init__(self) -> None:
+    def __post_init__(
+        self,
+        display_axis_ids: tuple[AxisId, AxisId] | None,
+    ) -> None:
         axes = tuple(self.axes)
         if len(axes) != 2 or any(not isinstance(axis, AxisSpec) for axis in axes):
             raise ValueError("ImageViewportTransform requires exactly two AxisSpec values")
-        by_role = {axis.role: axis for axis in axes}
-        if len(by_role) != 2 or set(by_role) != {SPATIAL_X, SPATIAL_Y}:
-            raise ValueError(
-                "ImageViewportTransform requires exactly one named SPATIAL_X "
-                "and one named SPATIAL_Y axis"
-            )
-        x_axis, y_axis = by_role[SPATIAL_X], by_role[SPATIAL_Y]
+        if display_axis_ids is None:
+            by_role = {axis.role: axis for axis in axes}
+            if len(by_role) != 2 or set(by_role) != {SPATIAL_X, SPATIAL_Y}:
+                raise ValueError(
+                    "non-spatial IMAGE axes require explicit IMAGE_X/IMAGE_Y bindings"
+                )
+            x_axis, y_axis = by_role[SPATIAL_X], by_role[SPATIAL_Y]
+        else:
+            display_ids = tuple(display_axis_ids)
+            if (
+                len(display_ids) != 2
+                or any(not isinstance(axis_id, AxisId) for axis_id in display_ids)
+                or display_ids[0] == display_ids[1]
+            ):
+                raise ValueError(
+                    "display_axis_ids must contain distinct IMAGE_X and IMAGE_Y AxisId values"
+                )
+            by_id = {axis.axis_id: axis for axis in axes}
+            if len(by_id) != 2 or set(display_ids) != set(by_id):
+                raise ValueError(
+                    "IMAGE_X/IMAGE_Y bindings must identify the two viewport axes"
+                )
+            x_axis, y_axis = by_id[display_ids[0]], by_id[display_ids[1]]
         if x_axis.axis_id == y_axis.axis_id:
             raise ValueError("image axes require distinct AxisId values")
+        if x_axis.role == SPATIAL_Y or y_axis.role == SPATIAL_X:
+            raise ValueError(
+                "spatial IMAGE roles disagree with the explicit IMAGE_X/IMAGE_Y bindings"
+            )
+        spatial_axes = tuple(
+            axis for axis in (x_axis, y_axis) if axis.role in (SPATIAL_X, SPATIAL_Y)
+        )
+        if any(axis.coordinate_frame is None for axis in spatial_axes):
+            raise ValueError("spatial image axes require an explicit coordinate frame")
+        if any(axis.unit != "pixel" for axis in spatial_axes):
+            raise ValueError("spatial image axes must declare unit='pixel'")
         if (
-            x_axis.coordinate_frame is None
-            or y_axis.coordinate_frame is None
-            or x_axis.coordinate_frame != y_axis.coordinate_frame
+            x_axis.role == SPATIAL_X
+            and y_axis.role == SPATIAL_Y
+            and x_axis.coordinate_frame != y_axis.coordinate_frame
         ):
-            raise ValueError("image axes require one shared, explicit coordinate frame")
+            raise ValueError("spatial image axes require one shared coordinate frame")
         x_step = float(_axis_step(x_axis))
         y_step = float(_axis_step(y_axis))
         x_edge_coordinates = (
@@ -412,9 +447,11 @@ class ImageViewportTransform:
         return self.y_axis.size, self.x_axis.size
 
     @property
-    def coordinate_frame(self) -> CoordinateFrameId:
-        assert self.x_axis.coordinate_frame is not None
-        return self.x_axis.coordinate_frame
+    def coordinate_frame(self) -> CoordinateFrameId | None:
+        """Return a shared 2-D frame, or ``None`` for independent numeric axes."""
+
+        frame = self.x_axis.coordinate_frame
+        return frame if frame == self.y_axis.coordinate_frame else None
 
     def _cached_axis_edges(self, axis: AxisSpec) -> tuple[float, float]:
         """Return the affine cell edges validated when this viewport was built.
@@ -696,7 +733,7 @@ class ImageViewportTransform:
         self,
         coordinate_xy: object,
         *,
-        coordinate_frame: CoordinateFrameId,
+        coordinate_frame: CoordinateFrameId | None,
     ) -> tuple[float, float]:
         """Map one physical point through this view without clipping it.
 
@@ -709,9 +746,17 @@ class ImageViewportTransform:
 
         if not isinstance(coordinate_xy, tuple) or len(coordinate_xy) != 2:
             raise TypeError("coordinate_xy must be a two-item tuple")
-        if not isinstance(coordinate_frame, CoordinateFrameId):
-            raise TypeError("coordinate_frame must be CoordinateFrameId")
-        if coordinate_frame != self.coordinate_frame:
+        if coordinate_frame is None:
+            if (
+                self.x_axis.coordinate_frame is not None
+                or self.y_axis.coordinate_frame is not None
+            ):
+                raise ValueError(
+                    "unframed coordinates require two explicitly unframed axes"
+                )
+        elif not isinstance(coordinate_frame, CoordinateFrameId):
+            raise TypeError("coordinate_frame must be CoordinateFrameId or None")
+        elif coordinate_frame != self.coordinate_frame:
             raise ValueError("coordinate belongs to another coordinate frame")
         coordinate_x = _finite_number(coordinate_xy[0], "x coordinate")
         coordinate_y = _finite_number(coordinate_xy[1], "y coordinate")
@@ -889,7 +934,7 @@ class ImageViewportTransform:
         self,
         selection: Selection,
     ) -> NormalizedRectangle:
-        """Resolve a typed rectangle to complete-raster pixel-cell edges."""
+        """Resolve a typed rectangle to complete-raster cell edges."""
 
         if not isinstance(selection, Selection):
             raise TypeError("selection must be zlc_data.Selection")
@@ -899,7 +944,7 @@ class ImageViewportTransform:
             not isinstance(term, (CoordinateRangeSelection, IndexRangeSelection))
             for term in terms.values()
         ):
-            raise ValueError("image selection must be one typed spatial rectangle")
+            raise ValueError("image selection must be one typed IMAGE rectangle")
         x_indices, x_drop = resolve_selection_indices(
             self.x_axis,
             terms[self.x_axis.axis_id],
@@ -916,7 +961,7 @@ class ImageViewportTransform:
             or x_indices.step != 1
             or y_indices.step != 1
         ):
-            raise ValueError("image rectangle must resolve to contiguous pixel cells")
+            raise ValueError("image rectangle must resolve to contiguous raster cells")
         return validate_normalized_rectangle(
             (
                 x_indices.start / self.x_axis.size,
@@ -940,14 +985,21 @@ class ImageViewportTransform:
         x_low, y_low, x_high, y_high = (
             self.coordinate_rectangle_for_normalized_bounds(bounds)
         )
-        return Selection.rectangle(
-            self.x_axis.axis_id,
-            self.y_axis.axis_id,
-            x_low,
-            x_high,
-            y_low,
-            y_high,
-            coordinate_frame=self.coordinate_frame,
+        return Selection(
+            (
+                CoordinateRangeSelection(
+                    self.x_axis.axis_id,
+                    x_low,
+                    x_high,
+                    self.x_axis.coordinate_frame,
+                ),
+                CoordinateRangeSelection(
+                    self.y_axis.axis_id,
+                    y_low,
+                    y_high,
+                    self.y_axis.coordinate_frame,
+                ),
+            )
         )
 
     def snapped_bounds_for_drag(
@@ -1123,15 +1175,7 @@ class ImageViewportTransform:
         return checked
 
 
-def _effective_image_axis(axis: EvaluatedAxis, role: AxisRoleId) -> AxisSpec:
-    if axis.role != role:
-        raise ValueError(
-            "evaluated IMAGE requires x_axis=SPATIAL_X and y_axis=SPATIAL_Y"
-        )
-    if axis.coordinate_frame is None:
-        raise ValueError(
-            f"evaluated IMAGE axis {axis.axis_id} requires an explicit coordinate frame"
-        )
+def _effective_image_axis(axis: EvaluatedAxis) -> AxisSpec:
     if len(set(axis.indices)) != len(axis.indices):
         raise ValueError(
             f"evaluated IMAGE axis {axis.axis_id} contains duplicate source indices"
@@ -1150,20 +1194,25 @@ def _effective_image_axis(axis: EvaluatedAxis, role: AxisRoleId) -> AxisSpec:
 def image_viewport_for_evaluated_image(
     image: EvaluatedImage,
 ) -> ImageViewportTransform:
-    """Build the one exact spatial-pixel viewport admitted by an IMAGE DTO.
+    """Build the exact numeric viewport admitted by an evaluated IMAGE DTO.
 
-    Axis field names and declared roles are authoritative.  The projection
-    never infers roles or a coordinate frame from rank, shape, tuple order, or
+    ``EvaluatedImage.x_axis`` and ``y_axis`` are the evaluator's resolved
+    ``IMAGE_X`` and ``IMAGE_Y`` bindings.  They supply display direction while
+    each declared domain role remains authoritative and unchanged.  The
+    projection never infers either fact from rank, shape, singleton axes, or
     fit metadata.  :class:`AxisSpec` and :class:`ImageViewportTransform` then
-    fail closed on nonnumeric, non-pixel, nonfinite, irregular, or mismatched
-    coordinate metadata.
+    fail closed on nonnumeric, nonfinite, duplicate, or irregular coordinate
+    metadata.
     """
 
     if not isinstance(image, EvaluatedImage):
         raise TypeError("image must be EvaluatedImage")
-    x_axis = _effective_image_axis(image.x_axis, SPATIAL_X)
-    y_axis = _effective_image_axis(image.y_axis, SPATIAL_Y)
-    return ImageViewportTransform((x_axis, y_axis))
+    x_axis = _effective_image_axis(image.x_axis)
+    y_axis = _effective_image_axis(image.y_axis)
+    return ImageViewportTransform(
+        (x_axis, y_axis),
+        display_axis_ids=(x_axis.axis_id, y_axis.axis_id),
+    )
 
 
 __all__ = [

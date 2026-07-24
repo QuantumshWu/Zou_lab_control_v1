@@ -44,6 +44,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     """
 
     from Zou_lab_control.notebook.facade import (
+        _prepare_capture_for_workbench,
         _prepare_camera_measurement_for_workbench,
         _prepare_grey_molasses_detuning_for_workbench,
         _prepare_temperature_release_recapture_for_workbench,
@@ -79,7 +80,8 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     )
     from .catalog_bridge import ConsoleCatalogView
     from .data_plane import ConsoleDataPlane
-    from .mot_field_task import MotFieldTaskIntent, start_mot_field_task
+    from .mot_field_task import MotFieldTaskHandle, MotFieldTaskIntent
+    from zlc_workbench.mot_field_live import MotFieldGridLiveSlot
     from .occupancy_binding import (
         OccupancyBindingIntent,
         ReactiveOccupancyNode,
@@ -519,9 +521,41 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
             )
 
             def start_calibration_sequence(request):
+                if request.sequence is None:
+                    start_capture = experiment.start
+                else:
+                    grouping = (
+                        request.sequence.capture_request.within_point_grouping
+                    )
+                    if grouping is None:
+                        raise RuntimeError(
+                            "live calibration capture lost its frozen event grouping"
+                        )
+                    reference_event = (
+                        request.analysis.layout.reference_event_indices[0]
+                    )
+                    reference_ordinals = tuple(
+                        ordinal
+                        for ordinal, (_repeat, event) in enumerate(grouping)
+                        if event == reference_event
+                    )
+
+                    start_capture = (
+                        lambda capture_request: _start_capture_preview(
+                            _prepare_capture_for_workbench(
+                                experiment,
+                                capture_request,
+                            ),
+                            node,
+                            data_plane,
+                            output_name="frame",
+                            source_ordinals=reference_ordinals,
+                        )
+                    )
+
                 return CalibrationTaskHandle(
                     request,
-                    start_capture=experiment.start,
+                    start_capture=start_capture,
                     build_calibration_request=(
                         lambda source, analysis: (
                             experiment.readout.calibration_request(
@@ -585,14 +619,48 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 prepare=lambda request: request,
                 request_owner_wake=request_owner_wake,
             )
-            node.bind_starter(
-                lambda current: start_mot_field_task(
-                    current,
-                    bind_request=bind_mot_field,
-                    start_scan=experiment.readout._start_mot_field_scan,
-                    materialize_scan=experiment.readout.materialize_scan,
+
+            def start_mot_field(current):
+                request = bind_mot_field(current)
+                prepared = (
+                    experiment.readout._prepare_mot_field_scan_for_workbench(
+                        request
+                    )
                 )
-            )
+                slot = MotFieldGridLiveSlot(
+                    request,
+                    prepared.source_schema,
+                    prepared.output_contract,
+                )
+                attached = False
+                try:
+                    data_plane.attach(node, slot, output_name="grid")
+                    attached = True
+                    slot.set_change_listener(
+                        lambda: data_plane.mark_changed(node)
+                    )
+
+                    def start_exact_scan(bound_request):
+                        if bound_request != request:
+                            raise RuntimeError(
+                                "MOT scan request changed after preparation"
+                            )
+                        return prepared.start(slot.preview_port)
+
+                    return MotFieldTaskHandle(
+                        request,
+                        report_folder=current.folder,
+                        start_scan=start_exact_scan,
+                        materialize_scan=experiment.readout.materialize_scan,
+                    )
+                except BaseException:
+                    if attached:
+                        data_plane.detach_live(node)
+                    else:
+                        slot.close()
+                    raise
+
+            node.bind_starter(start_mot_field)
             node.bind_final_projector(
                 lambda result, current=node: project_final_signals(
                     experiment,
@@ -655,9 +723,6 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
 def _bind_camera_execution(node, data_plane) -> None:
     """Start the one Camera definition as live or finite from its typed request."""
 
-    import uuid
-
-    from zlc_data import BlockId
     from zlc_frontend.figure import DatasetId
     from zlc_neutral_atom.capture_application import PreparedFiniteCameraMeasurement
     from zlc_neutral_atom.monitor_application import PreparedLiveCameraMeasurement
@@ -675,7 +740,7 @@ def _bind_camera_execution(node, data_plane) -> None:
                     dataset_id=dataset_id,
                     retain_on_terminal=True,
                 )
-                data_plane.attach(node, slot)
+                data_plane.attach(node, slot, output_name="frame")
                 slot.set_change_listener(lambda: data_plane.mark_changed(node))
                 return slot
 
@@ -685,28 +750,50 @@ def _bind_camera_execution(node, data_plane) -> None:
                 "Camera execution requires a prepared live or finite Camera "
                 "measurement"
             )
-        try:
-            command.preview_schema
-        except ValueError:
-            return command.start()
-
-        token = uuid.uuid4().hex
-        dataset_id = DatasetId(f"console-capture-{token}")
-        block_id = BlockId(f"console-capture-preview-{token}")
-
-        def factory(preview_spec):
-            slot = LiveDatasetSlot(
-                preview_spec,
-                dataset_id=dataset_id,
-                retain_on_terminal=True,
-            )
-            data_plane.attach(node, slot)
-            slot.set_change_listener(lambda: data_plane.mark_changed(node))
-            return slot
-
-        return command.start_with_preview(
-            block_id=block_id,
-            factory=factory,
-        )
+        return _start_capture_preview(command, node, data_plane)
 
     node.bind_starter(start)
+
+
+def _start_capture_preview(
+    command,
+    node,
+    data_plane,
+    *,
+    output_name: str = "frame",
+    source_ordinals: tuple[int, ...] | None = None,
+):
+    """Start one finite exact capture with the ordinary TaskConsole frame view."""
+
+    import uuid
+
+    from zlc_data import BlockId
+    from zlc_frontend.figure import DatasetId
+    from zlc_workbench.live_slot import LiveDatasetSlot
+
+    try:
+        command.preview_schema
+    except ValueError:
+        return command.start()
+
+    token = uuid.uuid4().hex
+
+    def factory(preview_spec):
+        slot = LiveDatasetSlot(
+            preview_spec,
+            dataset_id=DatasetId(f"console-capture-{token}"),
+            retain_on_terminal=True,
+        )
+        data_plane.attach(
+            node,
+            slot,
+            output_name=output_name,
+        )
+        slot.set_change_listener(lambda: data_plane.mark_changed(node))
+        return slot
+
+    return command.start_with_preview(
+        block_id=BlockId(f"console-capture-preview-{token}"),
+        factory=factory,
+        source_ordinals=source_ordinals,
+    )

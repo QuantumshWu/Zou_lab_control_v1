@@ -537,7 +537,7 @@ def _render_evaluated_figure(
                         colormap=live_image_display.colormap.value,
                         color_limits=live_image_color_limits,
                         visible_bounds=viewport.visible_bounds,
-                        regular_pixel_contract=True,
+                        regular_axis_contract=True,
                         center=center,
                         radius=radius,
                         diagnostic=diagnostic,

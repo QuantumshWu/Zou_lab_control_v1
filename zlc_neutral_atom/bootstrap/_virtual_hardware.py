@@ -13,7 +13,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Iterator, Mapping, Sequence
+from typing import Iterator, Mapping, NoReturn, Sequence
 
 import numpy as np
 
@@ -410,7 +410,8 @@ class VirtualAtomArray:
         *,
         trigger_channels: tuple[str, ...],
         default_exposure: float,
-        trigger_group_sizes: tuple[int, ...] | None = None,
+        trigger_group_sizes: tuple[int, ...],
+        trigger_group_point_indices: tuple[int | None, ...] | None = None,
     ) -> Iterator[np.ndarray]:
         (
             _triggers,
@@ -428,36 +429,19 @@ class VirtualAtomArray:
             trap_channels=self.trap_channels,
             default_exposure=default_exposure,
         )
-        groups = (
-            playback.trigger_group_sizes(trigger_channels)
-            if trigger_group_sizes is None
-            else tuple(
-                _positive_int(size, "trigger group size")
-                for size in trigger_group_sizes
-            )
+        groups = tuple(
+            _positive_int(size, "trigger group size")
+            for size in trigger_group_sizes
         )
         if sum(groups) != frames:
             raise RuntimeError("pulse trigger groups do not exactly cover the camera arm")
         group_points: tuple[int | None, ...]
-        if trigger_group_sizes is None:
-            selected = set(trigger_channels)
-            selected_groups = tuple(
-                group
-                for group in playback.trigger_groups
-                if any(channel in selected for channel, _count in group.channel_counts)
-            )
-            if tuple(
-                sum(
-                    count
-                    for channel, count in group.channel_counts
-                    if channel in selected
-                )
-                for group in selected_groups
-            ) != groups:
+        if trigger_group_point_indices is not None:
+            group_points = tuple(trigger_group_point_indices)
+            if len(group_points) != len(groups):
                 raise RuntimeError(
-                    "virtual source grouping differs from compiled trigger groups"
+                    "pulse point coordinates differ from frozen camera groups"
                 )
-            group_points = tuple(group.point_index for group in selected_groups)
         else:
             group_points = tuple(None for _group in groups)
         group_starts: set[int] = set()
@@ -1008,9 +992,10 @@ class VirtualMotFrameSource:
         *,
         trigger_channels: tuple[str, ...],
         default_exposure: float,
-        trigger_group_sizes: tuple[int, ...] | None = None,
+        trigger_group_sizes: tuple[int, ...],
+        trigger_group_point_indices: tuple[int | None, ...] | None = None,
     ) -> Iterator[np.ndarray]:
-        del default_exposure, trigger_group_sizes
+        del playback, default_exposure
         if len(trigger_channels) != 1:
             raise ValueError(
                 "virtual MOT point association requires exactly one trigger channel"
@@ -1018,16 +1003,32 @@ class VirtualMotFrameSource:
         artifact = self.sequencer.output_artifact
         if artifact is None:
             raise RuntimeError("virtual MOT camera observed FIRE without an artifact")
-        trigger_channel = trigger_channels[0]
-        point_indices: list[int] = []
-        for group in playback.trigger_groups:
-            count = dict(group.channel_counts).get(trigger_channel, 0)
-            point_indices.extend([group.point_index] * count)
-        if len(point_indices) != frames:
+        groups = tuple(
+            _positive_int(size, "trigger group size")
+            for size in trigger_group_sizes
+        )
+        if sum(groups) != frames:
             raise RuntimeError(
-                "compiled trigger groups do not exactly associate MOT frames "
-                "with scan points"
+                "frozen trigger groups do not exactly cover MOT frames"
             )
+        if trigger_group_point_indices is None:
+            raise RuntimeError(
+                "virtual MOT frames require the camera adapter's frozen point association"
+            )
+        group_points = tuple(trigger_group_point_indices)
+        if len(group_points) != len(groups):
+            raise RuntimeError(
+                "frozen MOT point coordinates differ from frozen camera groups"
+            )
+        if any(point_index is None for point_index in group_points):
+            raise RuntimeError(
+                "frozen MOT camera groups are missing scan-point association"
+            )
+        point_indices = tuple(
+            point_index
+            for size, point_index in zip(groups, group_points)
+            for _frame in range(size)
+        )
         for point_index in point_indices:
             yield self._render_levels(
                 self.levels_for_point(artifact, point_index)
@@ -1077,6 +1078,8 @@ class VirtualCamera:
         self._armed_at_monotonic: float | None = None
         self._accepting = False
         self._expected: int | None = 0
+        self._source_group_sizes: tuple[int, ...] | None = None
+        self._source_group_cursor = 0
         self._capacity = self.max_pending_records
         self._produced = 0
         self._worker: threading.Thread | None = None
@@ -1177,6 +1180,7 @@ class VirtualCamera:
         self,
         frames: int | None,
         *,
+        source_group_sizes: tuple[int, ...] | None,
         max_inflight_frames: int | None = None,
         timeout: float | None = None,
         stop: object | None = None,
@@ -1184,6 +1188,23 @@ class VirtualCamera:
         del timeout, stop
         self.ensure_open()
         expected = None if frames is None else _positive_int(frames, "frames")
+        if expected is None:
+            if source_group_sizes is not None:
+                raise ValueError(
+                    "monitor arm cannot declare finite source_group_sizes"
+                )
+            groups = None
+        else:
+            if source_group_sizes is None:
+                raise ValueError("finite arm requires source_group_sizes")
+            groups = tuple(
+                _positive_int(size, "source_group_sizes item")
+                for size in source_group_sizes
+            )
+            if not groups or sum(groups) != expected:
+                raise ValueError(
+                    "source_group_sizes must exactly cover finite arm frames"
+                )
         capacity = (
             (self.max_pending_records if expected is None else expected)
             if max_inflight_frames is None
@@ -1204,6 +1225,8 @@ class VirtualCamera:
             self._armed_at_monotonic = time.monotonic()
             self._accepting = True
             self._expected = expected
+            self._source_group_sizes = groups
+            self._source_group_cursor = 0
             self._capacity = capacity
             self._produced = 0
             self._worker = None
@@ -1299,6 +1322,15 @@ class VirtualCamera:
             self._start_continuous_triggered_live(playback)
             return
         with self._condition:
+            def reject(message: str, cause: BaseException | None = None) -> NoReturn:
+                error = RuntimeError(message)
+                self._worker_error = error
+                self._accepting = False
+                self._condition.notify_all()
+                if cause is not None:
+                    raise error from cause
+                raise error
+
             if not self._armed:
                 return
             if self._expected is None and self.free_running_live:
@@ -1346,6 +1378,64 @@ class VirtualCamera:
                 self._accepting = False
                 self._condition.notify_all()
                 raise error
+            if self._expected is None:
+                fire_group_sizes = (trigger_count,)
+                fire_group_point_indices: tuple[int | None, ...] = (None,)
+            else:
+                groups = self._source_group_sizes
+                if groups is None:
+                    raise RuntimeError("finite camera arm lost its source grouping")
+                selected: list[int] = []
+                selected_count = 0
+                while selected_count < trigger_count:
+                    group_index = self._source_group_cursor + len(selected)
+                    if group_index >= len(groups):
+                        reject(
+                            "finite FIRE exceeds the frozen camera source groups"
+                        )
+                    group_size = groups[group_index]
+                    if selected_count + group_size > trigger_count:
+                        reject(
+                            "finite FIRE splits a frozen camera source group"
+                        )
+                    selected.append(group_size)
+                    selected_count += group_size
+                fire_group_sizes = tuple(selected)
+                selected_channels = set(self.capture_trigger_channels)
+                compiled_group_records = tuple(
+                    group
+                    for group in playback.trigger_groups
+                    if any(
+                        channel in selected_channels
+                        for channel, _count in group.channel_counts
+                    )
+                )
+                if compiled_group_records:
+                    try:
+                        compiled_groups = playback.trigger_group_sizes(
+                            self.capture_trigger_channels
+                        )
+                    except (TypeError, ValueError) as cause:
+                        reject(
+                            "compiled pulse grouping cannot verify the frozen camera request",
+                            cause,
+                        )
+                    if compiled_groups != fire_group_sizes:
+                        reject(
+                            "compiled pulse grouping differs from the frozen camera request"
+                        )
+                    if len(compiled_group_records) != len(fire_group_sizes):
+                        reject(
+                            "compiled pulse points differ from the frozen camera groups"
+                        )
+                    fire_group_point_indices = tuple(
+                        group.point_index for group in compiled_group_records
+                    )
+                else:
+                    fire_group_point_indices = tuple(
+                        None for _group in fire_group_sizes
+                    )
+                self._source_group_cursor += len(fire_group_sizes)
             start_ordinal = self._produced
             self._active_fire_end_ordinal = start_ordinal + trigger_count
             stop = threading.Event()
@@ -1359,13 +1449,8 @@ class VirtualCamera:
                         trigger_count,
                         trigger_channels=self.capture_trigger_channels,
                         default_exposure=self.exposure,
-                        # A passive arm has no exact capture plan from which to
-                        # obtain formal grouping.  One independently-fired pulse
-                        # is one display-only acquisition group.  Finite exact
-                        # capture still requires the compiled grouping below.
-                        trigger_group_sizes=(
-                            (trigger_count,) if self._expected is None else None
-                        ),
+                        trigger_group_sizes=fire_group_sizes,
+                        trigger_group_point_indices=fire_group_point_indices,
                     )
                     frame_iterator = iter(frames)
                     for local_ordinal, offset in enumerate(trigger_offsets):
@@ -1727,6 +1812,8 @@ class VirtualCamera:
             )
             self._armed = False
             self._armed_at_monotonic = None
+            self._source_group_sizes = None
+            self._source_group_cursor = 0
             self._continuous_fire_generation = None
             self._pending.clear()
             self._terminal = terminal

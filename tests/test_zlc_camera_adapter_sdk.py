@@ -63,9 +63,12 @@ class _ReusingRingCamera:
         self,
         frames: int,
         *,
+        source_group_sizes: tuple[int, ...] | None,
         max_inflight_frames: int,
         timeout: float,
     ) -> None:
+        assert source_group_sizes is not None
+        assert sum(source_group_sizes) == frames
         assert max_inflight_frames == 2
         assert timeout > 0
         self.expected = frames
@@ -155,6 +158,7 @@ def _prepare_command(capability) -> PrepareCaptureCommand:
         CameraCaptureSpec(
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             2,
+            (1, 1),
             capability.settings_fingerprint,
         )
     )

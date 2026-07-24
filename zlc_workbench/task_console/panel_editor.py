@@ -275,7 +275,7 @@ class PanelEditor(QtWidgets.QWidget):
         # ---- Processing: the frozen snapshot and its Refresh.
         section("Processing")
         head = QtWidgets.QHBoxLayout()
-        head.addWidget(labeled("frozen snapshot of current data"), 1)
+        head.addWidget(FluentLabel("frozen snapshot of current data"), 1)
         self.refresh_button = FluentButton("Refresh", color=GREY)
         self.refresh_button.setToolTip("Re-snapshot the panel's current data")
         self.refresh_button.clicked.connect(self.rebuild)

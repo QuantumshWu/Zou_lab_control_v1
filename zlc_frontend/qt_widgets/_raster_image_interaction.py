@@ -441,16 +441,20 @@ def _commit_viewport(
     painted_hold: _HeldPanelFront | None,
 ) -> bool:
     current = binding.viewport
-    if candidate == current:
+    authored = binding.pending_viewport or current
+    if candidate == authored:
         return False
     if candidate.axes != current.axes:
         raise ValueError("viewport commit cannot change image axes")
-    base_revision = max(current.viewport_revision, binding.revision_floor)
-    if binding.pending_viewport is not None:
-        base_revision = max(
-            base_revision,
-            binding.pending_viewport.viewport_revision,
-        )
+    # Compare with the latest authored view, not merely the still-painted
+    # worker answer.  Otherwise wheel-in followed immediately by wheel-out
+    # would be mistaken for a no-op when it reaches the painted home bounds,
+    # leaving the earlier zoom pending and making one wheel step appear lost.
+    base_revision = max(
+        current.viewport_revision,
+        authored.viewport_revision,
+        binding.revision_floor,
+    )
     if candidate.viewport_revision <= base_revision:
         candidate = candidate.with_visible_bounds(
             candidate.visible_bounds,
@@ -651,21 +655,20 @@ def _overlay_rect(
 
 
 def _rectangle_fully_visible(
-    binding: _ImagePanelBinding,
+    viewport: ImageViewportTransform,
     bounds: NormalizedRectangle,
 ) -> bool:
     try:
-        binding.viewport.visible_bounds_for_full_bounds(bounds)
+        viewport.visible_bounds_for_full_bounds(bounds)
     except ValueError:
         return False
     return True
 
 
 def _visible_point_for_sample(
-    binding: _ImagePanelBinding,
+    viewport: ImageViewportTransform,
     sample: _ImageSample,
 ) -> tuple[float, float] | None:
-    viewport = binding.viewport
     point = viewport.unbounded_visible_point_for_coordinate(
         (sample.x_coordinate, sample.y_coordinate),
         coordinate_frame=viewport.coordinate_frame,
@@ -705,10 +708,9 @@ def _formatted_sample_value(sample: _ImageSample) -> str:
 
 
 def _selection_endpoint_label(
-    binding: _ImagePanelBinding,
+    viewport: ImageViewportTransform,
     bounds: NormalizedRectangle,
 ) -> str:
-    viewport = binding.viewport
     selected_x_low, selected_y_low, selected_x_high, selected_y_high = (
         viewport.coordinate_rectangle_for_normalized_bounds(bounds)
     )
@@ -790,14 +792,14 @@ def _paint_clim_draft_lines(
 
 def _paint_cross_sample(
     painter: QtGui.QPainter,
-    binding: _ImagePanelBinding,
+    viewport: ImageViewportTransform,
     sample: _ImageSample,
     target: QtCore.QRect,
     *,
     site_map: SiteMapPanelPayload | None,
     color: QtGui.QColor | str | None = None,
 ) -> None:
-    visible = _visible_point_for_sample(binding, sample)
+    visible = _visible_point_for_sample(viewport, sample)
     point = None if visible is None else QtCore.QPointF(
         target.x() + visible[0] * target.width(),
         target.y() + visible[1] * target.height(),
@@ -856,6 +858,7 @@ def _paint_image_overlays(
         if target is None:
             continue
         image_target = target[0]
+        viewport = binding.pending_viewport or binding.viewport
         image_payload = (
             _image_payload(hold)
             if hold is not None and hold.panel_id == binding.panel_id
@@ -878,7 +881,7 @@ def _paint_image_overlays(
         painter.setClipRect(image_target)
         selected_bounds = binding.draft_bounds or binding.applied_bounds
         if selected_bounds is not None:
-            visible = binding.viewport.clipped_visible_bounds_for_full_bounds(
+            visible = viewport.clipped_visible_bounds_for_full_bounds(
                 selected_bounds
             )
             if visible is not None:
@@ -887,7 +890,7 @@ def _paint_image_overlays(
                     painter,
                     handles=(
                         _image_interaction_armed(selector_enabled, binding)
-                        and _rectangle_fully_visible(binding, selected_bounds)
+                        and _rectangle_fully_visible(viewport, selected_bounds)
                     ),
                     rectangle=rectangle,
                     color=selector_color,
@@ -895,7 +898,7 @@ def _paint_image_overlays(
                 if binding.rectangle_drag is None:
                     paint_selector_text(
                         painter,
-                        _selection_endpoint_label(binding, selected_bounds),
+                        _selection_endpoint_label(viewport, selected_bounds),
                         QtCore.QRectF(image_target),
                         selector_pen_color(selector_color),
                         corner="top_left",
@@ -916,7 +919,7 @@ def _paint_image_overlays(
         if binding.cross is not None:
             _paint_cross_sample(
                 painter,
-                binding,
+                viewport,
                 binding.cross,
                 image_target,
                 site_map=site_map,

@@ -37,7 +37,7 @@ from zlc_neutral_atom.camera_operator import (
 )
 
 
-_CAMERA_CAPTURE_SPEC_SCHEMA = "zlc_neutral_atom.camera-capture-spec"
+_CAMERA_CAPTURE_SPEC_SCHEMA = "zlc_neutral_atom.camera-capture-spec.v2"
 CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT = canonical_digest(
     {
         "owner": "zlc_neutral_atom.acquisition.camera",
@@ -69,6 +69,7 @@ class CameraCaptureSpec:
 
     mode: CameraAcquisitionMode
     expected_frames: int
+    source_group_sizes: tuple[int, ...]
     settings_fingerprint: str
 
     def __post_init__(self) -> None:
@@ -83,6 +84,15 @@ class CameraCaptureSpec:
         if frames == 0:
             raise ValueError("expected_frames must be positive")
         object.__setattr__(self, "expected_frames", frames)
+        groups = tuple(
+            _integer(size, "source_group_sizes item", nonnegative=True)
+            for size in self.source_group_sizes
+        )
+        if not groups or any(size == 0 for size in groups):
+            raise ValueError("source_group_sizes must contain positive integers")
+        if sum(groups) != frames:
+            raise ValueError("source_group_sizes must exactly cover expected_frames")
+        object.__setattr__(self, "source_group_sizes", groups)
         _sha256(self.settings_fingerprint, "settings_fingerprint")
 
 
@@ -94,6 +104,7 @@ def freeze_camera_capture_spec(spec: CameraCaptureSpec) -> FrozenCaptureSpec:
             "schema": _CAMERA_CAPTURE_SPEC_SCHEMA,
             "mode": spec.mode.value,
             "expected_frames": spec.expected_frames,
+            "source_group_sizes": list(spec.source_group_sizes),
             "settings_fingerprint": spec.settings_fingerprint,
         }
     )
@@ -116,6 +127,7 @@ def decode_camera_capture_spec(value: FrozenCaptureSpec | bytes) -> CameraCaptur
         "schema",
         "mode",
         "expected_frames",
+        "source_group_sizes",
         "settings_fingerprint",
     }:
         raise ValueError("camera capture spec has an unknown field set")
@@ -128,6 +140,7 @@ def decode_camera_capture_spec(value: FrozenCaptureSpec | bytes) -> CameraCaptur
     return CameraCaptureSpec(
         mode,
         decoded["expected_frames"],
+        tuple(decoded["source_group_sizes"]),
         decoded["settings_fingerprint"],
     )
 

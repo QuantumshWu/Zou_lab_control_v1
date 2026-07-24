@@ -832,6 +832,66 @@ class DatasetPreviewSnapshot:
         return self.snapshot.block
 
 
+@dataclass(frozen=True, slots=True)
+class DatasetPreviewCell:
+    """One immutable exact cell in its frozen commit order."""
+
+    ordinal: int
+    address: DatasetCellAddress
+    value: Value
+    metadata: object | None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.ordinal, bool)
+            or not isinstance(self.ordinal, Integral)
+            or self.ordinal < 0
+        ):
+            raise ValueError("ordinal must be a non-negative integer")
+        object.__setattr__(self, "ordinal", int(self.ordinal))
+        if not isinstance(self.address, DatasetCellAddress):
+            raise TypeError("address must be DatasetCellAddress")
+        if not isinstance(self.value, Value):
+            raise TypeError("value must be Value")
+        if not _is_deeply_immutable(self.metadata):
+            raise TypeError("metadata must be a deeply immutable snapshot")
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetPreviewDelta:
+    """New exact cells committed after one caller-owned revision cursor."""
+
+    after: DatasetRevision
+    ref: DatasetRevisionRef
+    cells: tuple[DatasetPreviewCell, ...]
+    coverage: DatasetCoverage
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.after, DatasetRevision):
+            raise TypeError("after must be DatasetRevision")
+        if not isinstance(self.ref, DatasetRevisionRef):
+            raise TypeError("ref must be DatasetRevisionRef")
+        if not isinstance(self.coverage, DatasetCoverage):
+            raise TypeError("coverage must be DatasetCoverage")
+        cells = tuple(self.cells)
+        if any(not isinstance(cell, DatasetPreviewCell) for cell in cells):
+            raise TypeError("cells must contain DatasetPreviewCell values")
+        start = self.after.value
+        stop = self.ref.revision.value
+        if stop < start:
+            raise ValueError("delta ref cannot precede its revision cursor")
+        if len(cells) != stop - start or any(
+            cell.ordinal != start + offset
+            for offset, cell in enumerate(cells)
+        ):
+            raise ValueError(
+                "delta cells must exactly cover the committed revision interval"
+            )
+        if self.coverage.written_cells != stop:
+            raise ValueError("delta revision differs from exact dataset coverage")
+        object.__setattr__(self, "cells", cells)
+
+
 @dataclass(frozen=True)
 class MonitorDatasetSnapshot:
     """One atomically frozen live view with its aligned event identities."""
@@ -1477,6 +1537,49 @@ class DatasetBuilder(Generic[PayloadT]):
                 cell_metadata=tuple(self._cell_metadata),
             )
 
+    def materialize_delta(self, after: DatasetRevision) -> DatasetPreviewDelta:
+        """Copy only cells committed after ``after`` into immutable values."""
+
+        if not isinstance(after, DatasetRevision):
+            raise TypeError("after must be DatasetRevision")
+        with self._lock:
+            if after.value > self._revision:
+                raise KeyError(
+                    f"dataset revision {after.value} has not been committed"
+                )
+            selected = self._ref_locked(self._revision)
+            cells: list[DatasetPreviewCell] = []
+            contract = self.schema.cell_schema.validity_contract
+            for ordinal in range(after.value, self._revision):
+                address = self._cell_schedule.cell_at(ordinal)
+                cell = (address.repeat_index, address.point_storage_index)
+                validity = (
+                    (Valid() if bool(self._validity[cell]) else Invalid())
+                    if contract.mode is ValidityMode.VALUE
+                    else ComponentValidity(
+                        contract.component_axis_ids,
+                        self._validity[cell],
+                    )
+                )
+                cells.append(
+                    DatasetPreviewCell(
+                        ordinal,
+                        address,
+                        Value(
+                            self._values[cell],
+                            validity,
+                            self.schema.cell_schema,
+                        ),
+                        self._ordered_event_metadata[ordinal],
+                    )
+                )
+            return DatasetPreviewDelta(
+                after,
+                selected,
+                tuple(cells),
+                self._coverage_locked(),
+            )
+
     def seal(self, eos: EndOfStream) -> SealedDatasetArtifact:
         self._source._complete_consumer(self._reservation, eos, self, self._seal_locked)
         preview = self.materialize()
@@ -1643,6 +1746,12 @@ class ExactDatasetPreviewReader:
         return self.__builder.generation
 
     @property
+    def coverage(self) -> DatasetCoverage:
+        builder = self.__builder
+        with builder._lock:
+            return builder._coverage_locked()
+
+    @property
     def terminal(self) -> bool:
         builder = self.__builder
         with builder._lock:
@@ -1690,6 +1799,17 @@ class ExactDatasetPreviewReader:
             if builder._aborted:
                 raise DatasetError("aborted exact dataset cannot be previewed")
             return builder.materialize()
+
+    def freeze_delta(self, after: DatasetRevision) -> DatasetPreviewDelta:
+        """Freeze each newly committed cell once without copying prior cells."""
+
+        if not isinstance(after, DatasetRevision):
+            raise TypeError("after must be DatasetRevision")
+        builder = self.__builder
+        with builder._lock:
+            if builder._aborted:
+                raise DatasetError("aborted exact dataset cannot be previewed")
+            return builder.materialize_delta(after)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -1856,15 +1976,60 @@ class MonitorDataset(Generic[PayloadT]):
             update = self._monitor._next_for(self, timeout)
             return self._ingest(update)
 
-    def ingest_latest(self) -> DatasetRevisionRef:
+    def ingest_latest(
+        self,
+        *,
+        account_skipped_events: bool = True,
+        expected_event_ref: EventRef | None = None,
+    ) -> DatasetRevisionRef:
+        """Ingest newest, optionally admitting an authored sparse source view.
+
+        ``expected_event_ref`` binds the materialized head to the producer's
+        already accepted exact envelope; it is checked before and after the
+        atomic write.  ``account_skipped_events=False`` is legal only for a
+        single-cell append view whose omitted events were explicitly selected
+        out by that same producer.
+        """
+
+        if not isinstance(account_skipped_events, bool):
+            raise TypeError("account_skipped_events must be bool")
+        if expected_event_ref is not None and not isinstance(
+            expected_event_ref,
+            EventRef,
+        ):
+            raise TypeError("expected_event_ref must be EventRef or None")
         with self._consume_lock:
             with self._lock:
                 if self._append_replacement is not None:
                     raise DatasetError(
                         "ordinary monitor ingest cannot consume a staged append replacement"
                     )
+                if not account_skipped_events and (
+                    self._cycle_schedule is not None
+                    or self._append_group_size != 1
+                ):
+                    raise DatasetError(
+                        "intentional source selection requires a scalar append window"
+                    )
             update = self._monitor._latest_for(self)
-            return self._ingest(update)
+            if (
+                expected_event_ref is not None
+                and update.envelope.ref != expected_event_ref
+            ):
+                raise DatasetError(
+                    "monitor tap delivered another event than the selected exact envelope"
+                )
+            revision = self._ingest(
+                update,
+                account_skipped_events=account_skipped_events,
+            )
+            if expected_event_ref is not None:
+                with self._lock:
+                    if self._head != expected_event_ref:
+                        raise DatasetError(
+                            "monitor head differs from the selected exact envelope"
+                        )
+            return revision
 
     def prepare_append_replacement(
         self,
@@ -2022,7 +2187,12 @@ class MonitorDataset(Generic[PayloadT]):
                         self._append_replacement = None
                 raise
 
-    def _ingest(self, update: MonitorUpdate[PayloadT]) -> DatasetRevisionRef:
+    def _ingest(
+        self,
+        update: MonitorUpdate[PayloadT],
+        *,
+        account_skipped_events: bool = True,
+    ) -> DatasetRevisionRef:
         envelope = update.envelope
         value, metadata, _digest = _project_payload(
             self.edge,
@@ -2099,9 +2269,10 @@ class MonitorDataset(Generic[PayloadT]):
                 event_refs = self._event_refs
                 next_slot = self._next_slot
                 count = self._count
-                missed_events = self._missed_events + max(
-                    update.missed,
-                    sequence_gap,
+                missed_events = self._missed_events + (
+                    max(update.missed, sequence_gap)
+                    if account_skipped_events
+                    else 0
                 )
                 cell = (0, next_slot)
             else:
@@ -2318,6 +2489,8 @@ __all__ = [
     "DatasetEventAdapter",
     "DatasetMetadataContract",
     "DatasetError",
+    "DatasetPreviewCell",
+    "DatasetPreviewDelta",
     "DatasetPreviewSnapshot",
     "DatasetSealProvenance",
     "ExactDatasetPreviewReader",

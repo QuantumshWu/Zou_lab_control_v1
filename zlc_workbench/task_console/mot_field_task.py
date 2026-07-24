@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import threading
 import time
-from typing import Callable, Mapping
+from typing import Mapping
 import uuid
 
 import numpy as np
@@ -536,39 +536,10 @@ class MotFieldTaskHandle:
         raise RunFailed(snapshot)
 
 
-def start_mot_field_task(
-    intent: MotFieldTaskIntent,
-    *,
-    bind_request: Callable[[MotFieldTaskIntent], MotFieldRequest],
-    start_scan,
-    materialize_scan,
-) -> MotFieldTaskHandle:
-    """Bind one visible intent at the composition root and start its task.
-
-    Device-role resolution stays in the root-supplied ``bind_request`` callable;
-    the Task Console owns only the visible intent and its report folder.
-    """
-
-    if not isinstance(intent, MotFieldTaskIntent):
-        raise TypeError("intent must be MotFieldTaskIntent")
-    if not callable(bind_request):
-        raise TypeError("bind_request must be callable")
-    request = bind_request(intent)
-    if not isinstance(request, MotFieldRequest):
-        raise TypeError("bind_request must return MotFieldRequest")
-    return MotFieldTaskHandle(
-        request,
-        report_folder=intent.folder,
-        start_scan=start_scan,
-        materialize_scan=materialize_scan,
-    )
-
-
 __all__ = [
     "MotFieldTaskIntent",
     "MotFieldTaskHandle",
     "build_mot_field_intent",
     "mot_field_params",
-    "start_mot_field_task",
     "write_mot_field_report",
 ]

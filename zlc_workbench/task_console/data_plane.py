@@ -44,7 +44,7 @@ class ConsoleSignalValue:
     # on the way to a panel could only be presented with an invented one.
     run_id: object
     epoch_id: object                # causation domain the run belongs to
-    join_digest: str                # payload digest of the event this froze
+    join_digest: str                # exact immutable source/coherence digest
     presentation: object | None = None
 
     # The block is the value; these read off it rather than copying, so a panel
@@ -130,7 +130,7 @@ class ConsoleDataPlane:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._slots: dict[int, tuple[object, object]] = {}   # id(node) -> (node, slot)
+        self._slots: dict[int, tuple[object, object, str | None]] = {}
         self._dirty: set[int] = set()
         self._cache: dict[int, dict[str, ConsoleSignalValue]] = {}
         self._finals: dict[
@@ -149,14 +149,33 @@ class ConsoleDataPlane:
         self._front = ConsoleDataFront(signals=empty, failures=empty)
 
     # ------------------------------------------------------------ membership
-    def attach(self, node, slot) -> None:
+    def attach(
+        self,
+        node,
+        slot,
+        *,
+        output_name: str | None = None,
+    ) -> None:
         if slot is None:
             raise ValueError("a monitor slot is required")
+        if output_name is not None:
+            output_name = str(output_name).strip()
+            if not output_name:
+                raise ValueError("live output_name must not be empty")
+            published = tuple(node.published_signals())
+            if node.signal_key(output_name) not in published:
+                raise ValueError(
+                    f"live route {output_name!r} is not a declared node output"
+                )
         key = id(node)
         with self._lock:
             if self._closed:
                 raise RuntimeError("console data plane is closed")
-            self._slots[key] = (node, slot)
+            if key in self._slots:
+                raise RuntimeError(
+                    "console node already owns a run-scoped live route"
+                )
+            self._slots[key] = (node, slot, output_name)
             # The view factory attaches before the domain binds its materializer.
             # Only the slot's first real revision marks it dirty; trying to freeze
             # here would turn the normal ARMED/no-frame-yet state into a false
@@ -326,7 +345,22 @@ class ConsoleDataPlane:
             self._failures.pop(key, None)
             self._membership_changed = True
         if entry is not None:
-            _node, slot = entry
+            _node, slot, _output_name = entry
+            slot.close()
+
+    def detach_live(self, node) -> None:
+        """Withdraw only one node's run-scoped live route, retaining FINAL data."""
+
+        key = id(node)
+        with self._lock:
+            entry = self._slots.pop(key, None)
+            self._dirty.discard(key)
+            self._cache.pop(key, None)
+            self._failures.pop(key, None)
+            if entry is not None:
+                self._membership_changed = True
+        if entry is not None:
+            _node, slot, _output_name = entry
             slot.close()
 
     def close(self) -> None:
@@ -345,7 +379,7 @@ class ConsoleDataPlane:
             self._panels.clear()
             self._failures.clear()
             self._membership_changed = True
-        for _node, slot in entries:
+        for _node, slot, _output_name in entries:
             slot.close()
 
     def __len__(self) -> int:
@@ -377,19 +411,25 @@ class ConsoleDataPlane:
             # therefore rebuilt on the next owner tick.
             self._membership_changed = False
         for key in dirty:
-            node, slot = slots[key]
+            node, slot, output_name = slots[key]
             title = str(getattr(node, "name", "") or type(node).__name__)
             try:
-                frozen, alignment_failure = self._freeze_one(node, slot, title)
+                result = self._freeze_one(
+                    node,
+                    slot,
+                    title,
+                    output_name=output_name,
+                )
             except Exception as error:
                 failure = f"{type(error).__name__}: {error}"
                 with self._lock:
-                    if self._slots.get(key) == (node, slot):
+                    if self._slots.get(key) == (node, slot, output_name):
                         self._cache.pop(key, None)
                         self._failures[key] = failure
                 continue
+            frozen, alignment_failure = result
             with self._lock:
-                if self._slots.get(key) == (node, slot):
+                if self._slots.get(key) == (node, slot, output_name):
                     self._cache[key] = frozen
                     if alignment_failure is None:
                         self._failures.pop(key, None)
@@ -413,7 +453,7 @@ class ConsoleDataPlane:
                 for panel_id, value in self._panels.items()
             }
             failed = dict(self._failures)
-        for key, (node, _slot) in current.items():
+        for key, (node, _slot, _output_name) in current.items():
             signals.update(cached.get(key, {}))
             failure = failed.get(key)
             if failure is not None:
@@ -438,6 +478,8 @@ class ConsoleDataPlane:
         node,
         slot,
         title: str,
+        *,
+        output_name: str | None = None,
     ) -> tuple[dict[str, ConsoleSignalValue], str | None]:
         """One slot's atomic transaction, projected onto its declared outputs.
 
@@ -446,58 +488,58 @@ class ConsoleDataPlane:
         panel front and never reconfigure this producer.
         """
 
-        from zlc_neutral_atom.monitor_application import CameraMonitorViewSpec
-        from zlc_neutral_atom.runtime.pipeline import (
-            CapturePreviewSpec,
+        from zlc_data import dataset_revision_ref_to_tree
+        from zlc_neutral_atom.runtime.dataset import (
+            DatasetPreviewSnapshot,
+            MonitorDatasetSnapshot,
         )
+        from zlc_storage import canonical_digest
 
-        spec = getattr(slot, "spec", None)
-        if isinstance(spec, CapturePreviewSpec):
-            return self._freeze_capture_preview(node, slot, title)
-        if not isinstance(spec, CameraMonitorViewSpec):
+        run_id, causation, snapshot = slot.freeze_current()
+        if not isinstance(run_id, str) or not run_id:
+            raise TypeError("live dataset run_id must be a non-empty string")
+        if not isinstance(causation, str) or not causation:
             raise TypeError(
-                "console live slot must own a camera monitor or capture preview"
+                "live dataset causation_domain_id must be a non-empty string"
             )
-        run_id, causation, snapshot = slot.freeze_current()
+        if isinstance(snapshot, MonitorDatasetSnapshot):
+            head = snapshot.head
+            if head is None:
+                raise RuntimeError("monitor dataset has no accepted event head")
+            join_digest = head.payload_digest
+        elif isinstance(snapshot, DatasetPreviewSnapshot):
+            join_digest = canonical_digest(
+                {
+                    "owner": "zlc_workbench.console-exact-preview",
+                    "run_id": run_id,
+                    "causation_domain_id": causation,
+                    "revision": dataset_revision_ref_to_tree(snapshot.ref),
+                    "coverage": {
+                        "written_cells": snapshot.coverage.written_cells,
+                        "total_cells": snapshot.coverage.total_cells,
+                    },
+                }
+            )
+        else:
+            raise TypeError(
+                "console live slot must freeze a typed monitor or exact preview snapshot"
+            )
         declared = tuple(node.published_signals())
-        if len(declared) != 1:
-            raise ValueError("Camera measurement must declare exactly one frame output")
-        head = snapshot.head
+        selected = (
+            declared[0]
+            if output_name is None and len(declared) == 1
+            else node.signal_key(str(output_name))
+        )
+        if selected not in declared:
+            raise ValueError("live dataset route is not a declared output")
         return {
-            declared[0]: ConsoleSignalValue(
-                name=declared[0],
+            selected: ConsoleSignalValue(
+                name=selected,
                 source=title,
                 snapshot=snapshot.snapshot,
                 coverage=snapshot.coverage,
                 run_id=run_id,
                 epoch_id=causation,
-                join_digest=str(getattr(head, "payload_digest", "") or ""),
-            )
-        }, getattr(slot, "notification_failure", None)
-
-    def _freeze_capture_preview(
-        self,
-        node,
-        slot,
-        title: str,
-    ) -> tuple[dict[str, ConsoleSignalValue], str | None]:
-        """Freeze the exact capture preview without pretending it has ROI output."""
-
-        run_id, causation, snapshot = slot.freeze_current()
-        declared = tuple(node.published_signals())
-        if len(declared) != 1:
-            raise ValueError("camera capture must declare exactly one preview output")
-        head = snapshot.head
-        return {
-            declared[0]: ConsoleSignalValue(
-                name=declared[0],
-                source=title,
-                snapshot=snapshot.snapshot,
-                coverage=snapshot.coverage,
-                run_id=run_id,
-                epoch_id=causation,
-                join_digest=str(
-                    getattr(head, "payload_digest", "") or ""
-                ),
+                join_digest=join_digest,
             )
         }, getattr(slot, "notification_failure", None)

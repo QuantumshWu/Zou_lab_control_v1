@@ -9,9 +9,11 @@ from zlc_storage import canonical_text
 from zlc_neutral_atom.runtime.pipeline import (
     CapturePreviewPort,
     ExactCaptureTransaction,
+    ExactDatasetPreviewPort,
     MinimalPipelineSpec,
     PipelineResult,
     _admit_capture_preview,
+    _admit_exact_dataset_preview,
     _open_exact_capture_transaction,
     _notify_preview_failure,
     _settle_unbound_preview,
@@ -81,6 +83,7 @@ class TriggeredPipelineResult:
     __slots__ = (
         "_authority",
         "_capture",
+        "_exact_preview",
         "_lineage",
     )
 
@@ -92,6 +95,7 @@ class TriggeredPipelineResult:
         authority: object,
         *,
         capture: PipelineResult,
+        exact_preview: ExactDatasetPreviewPort | None,
         lineage: PulseCaptureLineage,
     ) -> None:
         if authority is not _TRIGGERED_RESULT_TOKEN:
@@ -121,6 +125,7 @@ class TriggeredPipelineResult:
             )
         object.__setattr__(self, "_authority", authority)
         object.__setattr__(self, "_capture", capture)
+        object.__setattr__(self, "_exact_preview", exact_preview)
         object.__setattr__(self, "_lineage", lineage)
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -149,6 +154,7 @@ def compile_triggered_pipeline(
     spec: TriggeredCaptureSpec,
     *,
     preview: CapturePreviewPort | None = None,
+    exact_preview: ExactDatasetPreviewPort | None = None,
 ) -> RunPlan:
     """Compile prepare→camera arm→one FPGA FIRE→drain→terminal into one Run."""
 
@@ -157,9 +163,11 @@ def compile_triggered_pipeline(
     camera_port = spec.capture.measurement.capture_port
     pulse_port = spec.pulse_port
     preview_spec = _admit_capture_preview(spec.capture, preview)
+    exact_preview_spec = _admit_exact_dataset_preview(spec.capture, exact_preview)
     if camera_port.device.key == pulse_port.device.key:
         error = ValueError("camera and sequencer must be distinct physical resources")
         _notify_preview_failure(preview, error)
+        _notify_preview_failure(exact_preview, error)
         raise error
 
     def preflight(
@@ -170,6 +178,8 @@ def compile_triggered_pipeline(
             context,
             preview=preview,
             preview_spec=preview_spec,
+            exact_preview=exact_preview,
+            exact_preview_spec=exact_preview_spec,
         )
         try:
             pulse = pulse_port.open_session(spec.pulse_request)
@@ -191,6 +201,7 @@ def compile_triggered_pipeline(
         return TriggeredPipelineResult(
             _TRIGGERED_RESULT_TOKEN,
             capture=capture_result,
+            exact_preview=capture.exact_preview_port,
             lineage=PulseCaptureLineage(spec.pulse_binding, pulse_terminal),
         )
 
@@ -207,8 +218,18 @@ def compile_triggered_pipeline(
                 )
             except BaseException as error:
                 _notify_preview_failure(preview, error)
+                _notify_preview_failure(exact_preview, error)
                 raise
-            return _settle_unbound_preview(preview, report, primary)
+            settled = _settle_unbound_preview(preview, report, primary)
+            exact_failure = primary
+            if exact_failure is None and report.errors:
+                exact_failure = report.errors[0]
+            if exact_failure is None:
+                exact_failure = RuntimeError(
+                    "exact dataset preview never reached its capture builder"
+                )
+            _notify_preview_failure(exact_preview, exact_failure)
+            return settled
         # On failure/cancel, stop new hardware edges before terminating the
         # camera session.  On success both calls are idempotent terminal checks.
         capture, pulse = prepared
@@ -228,6 +249,12 @@ def compile_triggered_pipeline(
         if result.capture.run_id != context.run_id.value:
             raise ValueError("triggered capture result belongs to another Run")
         context.checkpoint()
+        exact = result._exact_preview
+        if exact is not None:
+            try:
+                exact.source_terminal()
+            except BaseException as error:
+                _notify_preview_failure(exact, error)
         return result
 
     return RunPlan(

@@ -96,9 +96,12 @@ class _Camera:
         self,
         frames: int,
         *,
+        source_group_sizes: tuple[int, ...] | None,
         max_inflight_frames: int,
         timeout: float,
     ) -> None:
+        assert source_group_sizes is not None
+        assert sum(source_group_sizes) == frames
         assert max_inflight_frames == 2
         assert timeout > 0
         self.arm_entered.set()
@@ -193,6 +196,7 @@ def _prepare_command(capability, *, session_id: str = "fixture-session"):
         CameraCaptureSpec(
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             2,
+            (1, 1),
             capability.settings_fingerprint,
         )
     )

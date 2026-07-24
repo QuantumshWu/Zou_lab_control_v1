@@ -319,24 +319,14 @@ __all__ = [
     "window_pad",
 ]
 
-# The salvaged legacy param-form module lives INSIDE this package (it is Qt
-# code, and qt_widgets is the package's one Qt owner).  Imported LAST so its
+# The shared param-form module lives INSIDE this package (it is Qt code, and
+# qt_widgets is the package's one Qt owner).  Imported LAST so its
 # own `from zlc_frontend.qt_widgets import ...` finds every facade name bound.
 # Reachable as an attribute like `fluent`/`board`; deliberately NOT in
-# __all__ - the legacy shim is its only sanctioned outside consumer.
+# __all__ because consumers use the public form widgets instead of its registry.
 from . import param_widgets  # noqa: E402,F401
 
-# The console's background render worker.  Qt-only (no Matplotlib), so qt_widgets is where the
-# placement axiom puts it; bound here like ``param_widgets`` so consumers reach it as an
-# ATTRIBUTE of the package rather than importing the submodule path, which the package's own
-# guard forbids from outside.
-
-# The per-panel Analysis controls (fit + ROI), salvaged out of the console shell.  Pure Qt, so
-# qt_widgets is where the placement axiom puts them; bound as an attribute for the same reason
-# as the two above -- the package's own guard forbids outside consumers from deep-importing a
-# submodule path.
-
-# The two editor widgets salvaged from the console shell.  Imported AFTER ``param_widgets``:
+# The two shared editor widgets are imported AFTER ``param_widgets``:
 # they reach it via ``from . import param_widgets``, which needs the registry importable, and
 # the registry itself reads facade names -- so these must sit at the tail like it does.
 from .measurement_panel import MeasurementPanel  # noqa: E402

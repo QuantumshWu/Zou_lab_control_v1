@@ -40,6 +40,7 @@ from ._raster_front import (
     _advance_held_front,
     _image_payload,
     _hold_matches_frame,
+    _image_viewport_preview_rects,
     _panel_bounds,
     _panel_image_geometry,
     _panel_presentation,
@@ -111,7 +112,12 @@ from .style import BG
 
 
 class QtRasterBoard(QtWidgets.QWidget):
-    """Atomic multi-panel presenter for immutable worker-owned raster fronts."""
+    """Atomic multi-panel presenter for immutable worker-owned raster fronts.
+
+    Ordinary pointer motion has no plot meaning.  Data readout is the explicit
+    right-click Cross gesture; motion is consumed only while a pressed selector,
+    pan, or draggable line already owns the pointer.
+    """
 
     imagePanelLeftDoubleClicked = QtCore.pyqtSignal(str)
     crossSelected = QtCore.pyqtSignal(object)
@@ -125,6 +131,10 @@ class QtRasterBoard(QtWidgets.QWidget):
         empty_text: str = "",
     ) -> None:
         super().__init__(parent)
+        # Product contract: plots do not sample/publish/repaint data merely
+        # because the pointer crossed them.  Pressed gestures still receive
+        # ordinary Qt mouse-move events without mouse tracking.
+        self.setMouseTracking(False)
         self._panel_ids, self._columns = _validated_panel_layout(panel_ids, columns)
         self._active_layout_identity: tuple[str, int] | None = None
         self._staged_layout: tuple[str, int, tuple[str, ...], int] | None = None
@@ -827,11 +837,6 @@ class QtRasterBoard(QtWidgets.QWidget):
             gesture.source_identity,
         ) != hold.gesture_identity:
             raise RuntimeError("rectangle gesture differs from its held panel origin")
-        if isinstance(hold.display_payload, SiteMapPanelPayload):
-            raise RuntimeError(
-                "site-map rectangles are display-only candidates; "
-                "a spatial box cannot be promoted to authoritative SITE selection"
-            )
         viewport = self._require_selector_viewport(binding)
         if viewport.viewport_revision != gesture.viewport_revision:
             raise RuntimeError("rectangle gesture viewport changed before dispatch")
@@ -1310,6 +1315,30 @@ class QtRasterBoard(QtWidgets.QWidget):
                 if image_payload is not None:
                     painter.fillRect(bounds, QtGui.QColor("white"))
             painter.drawImage(QtCore.QRectF(target), image, source)
+            binding = self._image_bindings.get(panel_id)
+            pending_viewport = (
+                None if binding is None else binding.pending_viewport
+            )
+            if image_payload is not None and pending_viewport is not None:
+                preview = _image_viewport_preview_rects(
+                    bounds,
+                    image,
+                    geometry.target,
+                    image_payload.viewport,
+                    pending_viewport,
+                )
+                if image_payload.viewport.visible_bounds != pending_viewport.visible_bounds:
+                    # Only the Divider-authored data box moves immediately.
+                    # Title, labels, ticks, margins, distribution and colorbar
+                    # remain the exact painted Agg chrome until the latest
+                    # high-quality worker answer replaces the complete front.
+                    painter.fillRect(
+                        QtCore.QRectF(geometry.target),
+                        QtGui.QColor("white"),
+                    )
+                    if preview is not None:
+                        preview_source, preview_target = preview
+                        painter.drawImage(preview_target, image, preview_source)
             if (
                 image_payload is not None
                 and geometry.distribution is not None
@@ -1556,6 +1585,12 @@ class QtRasterBoard(QtWidgets.QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        # No hover/data-cursor semantics.  Button state, not retained gesture
+        # bookkeeping, is authoritative: an ordinary move is always inert.
+        # The branches below therefore run only while a mouse button is held.
+        if event.buttons() == QtCore.Qt.NoButton:
+            event.accept()
+            return
         numeric_binding = _active_numeric_binding(
             self._numeric_bindings, self._selector_hold
         )

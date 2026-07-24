@@ -400,7 +400,6 @@ class PanelComposer:
             series,
             display,
             ref,
-            block.schema,
             fit_result=fit_result,
             fit_result_identity=fit_result_identity,
         )
@@ -614,7 +613,6 @@ class PanelComposer:
         series,
         display,
         ref,
-        schema,
         *,
         fit_result=None,
         fit_result_identity: str | None,
@@ -636,7 +634,6 @@ class PanelComposer:
                 data,
                 display,
                 ref,
-                schema,
                 fit_overlay=fit_overlay,
             )
         if self._intent is ViewIntent.CURVE:
@@ -700,7 +697,6 @@ class PanelComposer:
                 series[0].data,
                 display,
                 resolved.ref,
-                resolved.block.schema,
                 fit_overlay=fit_overlay,
             )
 
@@ -803,11 +799,9 @@ class PanelComposer:
         data: EvaluatedImage,
         display: ImageDisplayState,
         ref,
-        schema,
         *,
         fit_overlay=None,
     ):
-        from .image_view import ImageViewportTransform
         from .render import ImagePanelPayload
 
         color_cache_key = (
@@ -840,9 +834,9 @@ class PanelComposer:
         self._image_color_cache_value = (data_range, color_limits)
         home_viewport = self._image_home_viewport
         if home_viewport is None:
-            home_viewport = ImageViewportTransform(
-                self._image_axis_specs(data, schema),
-            )
+            from .image_view import image_viewport_for_evaluated_image
+
+            home_viewport = image_viewport_for_evaluated_image(data)
             self._image_home_viewport = home_viewport
         viewport = image_viewport_for_display_state(display, home_viewport)
         raster, raster_geometry = self._image_agg().render(
@@ -869,24 +863,6 @@ class PanelComposer:
             raster_geometry=raster_geometry,
         )
         return raster, payload
-
-    @staticmethod
-    def _image_axis_specs(data: EvaluatedImage, schema):
-        """The (y, x) declared AxisSpecs behind an evaluated image.
-
-        Matched by axis id rather than by position: a viewport maps pointer
-        coordinates back onto the DECLARED axes, so pairing it with anything but
-        the axes the image was actually drawn from would put a drag rectangle on
-        the wrong pixels.
-        """
-
-        by_id = {axis.axis_id: axis for axis in schema.cell_schema.data_axes}
-        try:
-            return (by_id[data.y_axis.axis_id], by_id[data.x_axis.axis_id])
-        except KeyError as error:
-            raise PanelRenderError(
-                "the evaluated image names an axis its schema does not declare"
-            ) from error
 
     def _curve_front(
         self,

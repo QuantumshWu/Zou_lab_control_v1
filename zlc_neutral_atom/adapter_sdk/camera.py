@@ -173,10 +173,18 @@ class CameraAdapter(Protocol):
         self,
         frames: int | None,
         *,
+        source_group_sizes: tuple[int, ...] | None,
         max_inflight_frames: int,
         timeout: float,
     ) -> None:
-        """Arm with bounded retention; ``None`` means hardware-paced monitor."""
+        """Arm one source-owned capture contract.
+
+        ``frames=None`` and ``source_group_sizes=None`` means a hardware-paced
+        monitor.  A finite capture receives the ordered, frozen frame groups
+        derived from the measurement cell schedule; adapters must validate that
+        the groups exactly cover ``frames``.  Trigger transport may verify this
+        contract but never defines it.
+        """
 
         ...
 

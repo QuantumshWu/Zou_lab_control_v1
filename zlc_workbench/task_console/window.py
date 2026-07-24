@@ -173,6 +173,8 @@ class TaskConsole(QtWidgets.QWidget):
         # stopped.  Live task data belongs to the formal monitor seam; the console
         # never invents an off-hub dataset or a blank transient plot for it.
         self._running_task_row: "LogicNodeRow | None" = None
+        self._running_task_panel: PanelCard | None = None
+        self._transient_panel_ids: set[str] = set()
         self._task_status_text: str | None = None
         self._task_locked = False              # True while a task runs -> all other actions blocked
         self._raster_pixel_ratio = 1.0
@@ -460,7 +462,11 @@ class TaskConsole(QtWidgets.QWidget):
         return TaskConsoleState(
             name=self.name_edit.text().strip() or "task",
             interval_ms=self.state.interval_ms,
-            panels=[card.config for card in self.cards],
+            panels=[
+                card.config
+                for card in self.cards
+                if card.panel_id not in self._transient_panel_ids
+            ],
             logic=[row.node for row in self.logic_nodes],
         )
 
@@ -627,7 +633,8 @@ class TaskConsole(QtWidgets.QWidget):
     # ----------------------------------------------------------------- control
     # ---- producing-node discovery: a panel's data comes from a logic node; its Edit
     # exposes THAT node's acquisition parameters (e.g. a raw-frame panel is
-    # produced by the camera measurement -> exposure / roi).
+    # produced by the camera measurement -> exposure).  Figure Area/Cross/Fit
+    # state never enters the Measurement form.
     def _card_reads(self, card: "PanelCard") -> set:
         """The panel's one typed dataset binding."""
 
@@ -968,6 +975,11 @@ class TaskConsole(QtWidgets.QWidget):
         for row in self.logic_nodes:
             if changed.intersection(self._declared_signal_keys(row)):
                 self._update_row_publishes(row)
+        if self._running_task_row is not None:
+            # A run-scoped panel appears on the first real typed value, not at
+            # Start.  Saved/offline task branches that expose no live route
+            # therefore never manufacture a blank transient viewer.
+            self._ensure_default_result_panel(self._running_task_row)
         for card in self.cards:
             card.reconcile_visible_signal_metadata()
         return changed
@@ -1007,15 +1019,32 @@ class TaskConsole(QtWidgets.QWidget):
         meaning).  Shapes are AUTO-EXTRACTED from the real published VALUES
         (``shape_text.describe_shape``) and the meaning from the node's ``output_specs`` --
         never a hand-typed map.  Running node: live data-plane shapes (measurement /
-        processor).  A task lists its declared FINAL artifact names at every
-        lifecycle state; those names never pretend to be live data-plane signals.
-        A stopped data-plane node keeps the exact schema of any retained view or
-        FINAL value; only an output that has never published is shown as ``—``."""
+        processor).  A task distinguishes a run-scoped ``RUN`` output from a
+        terminal ``FINAL`` output until a typed value exists, then displays that
+        value through the same schema formatter.  A
+        stopped data-plane node likewise keeps the exact schema of any retained
+        view or FINAL value; only an output that has never published is shown as
+        ``—``."""
         if row.node.kind == "task":
             spec = self._spec_for_logic(row.node)
-            outputs = getattr(spec, "declared_outputs", ()) or ()
+            outputs = tuple(getattr(spec, "declared_outputs", ()) or ())
+            keys = tuple(self._declared_signal_keys(row))
             row.set_publishes(
-                [(str(output.short or output.name), "FINAL", "") for output in outputs]
+                [
+                    (
+                        str(output.short or output.name),
+                        (
+                            ("RUN" if output.run_scoped else "FINAL")
+                            if (value := self._tick_data.value(key)) is None
+                            else self._describe_from_schema(
+                                value.values,
+                                value.schema,
+                            )
+                        ),
+                        str(output.description or output.axis_label),
+                    )
+                    for key, output in zip(keys, outputs, strict=True)
+                ]
             )
             return
         node = self._logic_nodes.get(id(row))
@@ -1596,6 +1625,8 @@ class TaskConsole(QtWidgets.QWidget):
     def _remove_panel(
         self,
         card: PanelCard,
+        *,
+        _state_change: bool = True,
     ) -> bool:
         # User removal is blocked while a task owns the console.
         if self._task_locked:
@@ -1621,6 +1652,7 @@ class TaskConsole(QtWidgets.QWidget):
             self._card_signal_bindings.pop(id(card), None)
             self._data.withdraw_panel(card.panel_id)
             self._card_output_names.pop(card.panel_id, None)
+            self._transient_panel_ids.discard(card.panel_id)
             self._signal_topology_changed()
             phases.add("removed")
         if "qt_detached" not in phases:
@@ -1630,7 +1662,8 @@ class TaskConsole(QtWidgets.QWidget):
         if "arranged" not in phases:
             self._arrange()
             self._recompute_tick_interval()    # removing the fastest panel can slow the base
-            self._mark_dirty()
+            if _state_change:
+                self._mark_dirty()
             phases.add("arranged")
         phases.add("detached")
         self._panel_teardown_phases.pop(id(card), None)
@@ -1801,15 +1834,20 @@ class TaskConsole(QtWidgets.QWidget):
         """Open a task's ordinary declared result panel exactly once.
 
         The catalog chooses only an output and an existing plot kind.  This
-        creates no task-specific viewer and does not publish data: the panel
-        waits for the task's normal FINAL projection on the data plane.
+        creates no task-specific viewer and does not publish data.  A
+        run-scoped panel is admitted only after its first typed value exists;
+        a terminal panel may wait for the task's normal FINAL projection.
         """
 
         spec = self._spec_for_logic(row.node)
         default = None if spec is None else getattr(spec, "default_panel", None)
         if default is None:
             return
-        output_name, kind = default
+        if len(default) == 2:
+            output_name, kind = default
+            params = {}
+        else:
+            output_name, kind, params = default
         key = console_signal_key(row.node.title, output_name)
         if any(card.config.signal == key for card in self.cards):
             return
@@ -1825,6 +1863,8 @@ class TaskConsole(QtWidgets.QWidget):
             raise RuntimeError(
                 f"default panel output {output_name!r} is not declared"
             )
+        if declaration.run_scoped and self._tick_data.value(key) is None:
+            return
         card = self._new_panel_card(
             PanelConfig(
                 kind=kind,
@@ -1833,11 +1873,16 @@ class TaskConsole(QtWidgets.QWidget):
                 col=GAP,
                 size="2x2",
                 signal=key,
+                params=params,
             )
         )
         self._attach_card(card)
+        if declaration.run_scoped:
+            self._running_task_panel = card
+            self._transient_panel_ids.add(card.panel_id)
         self._arrange()
-        self._mark_dirty()
+        if not declaration.run_scoped:
+            self._mark_dirty()
 
     @staticmethod
     def _declared_layer(node) -> str:
@@ -1893,8 +1938,20 @@ class TaskConsole(QtWidgets.QWidget):
     def _clear_task_running(self) -> None:
         """Leave task-run mode after either completion or an explicit Stop."""
 
+        row = self._running_task_row
+        panel = self._running_task_panel
+        node = None if row is None else self._logic_nodes.get(id(row))
         self._running_task_row = None
+        self._running_task_panel = None
         self._apply_task_lock(False)
+        if node is not None:
+            self._data.detach_live(node)
+        if panel is not None and panel in self.cards:
+            self._remove_panel(panel, _state_change=False)
+        # Detach is a real ownership boundary.  Promote its immutable result
+        # now so a rerun cannot briefly bind a newly-created transient panel to
+        # the previous generation's retained live value.
+        self._promote_data_front(self._data.freeze())
 
     def _build_logic_node(self, node: LogicNodeConfig, values: dict):
         """Freeze this row into a ConsoleRunNode -- the RUN seam's unit of work.

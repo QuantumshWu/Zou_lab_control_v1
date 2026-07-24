@@ -92,9 +92,12 @@ class _Camera:
         self,
         frames: int,
         *,
+        source_group_sizes: tuple[int, ...] | None,
         max_inflight_frames: int,
         timeout: float,
     ) -> None:
+        assert source_group_sizes is not None
+        assert sum(source_group_sizes) == frames
         assert max_inflight_frames == 2 and timeout > 0
         self.expected = frames
         self.ordinal = 0

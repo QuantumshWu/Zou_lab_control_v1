@@ -348,10 +348,10 @@ def test_evaluated_image_metadata_builds_one_exact_read_only_payload() -> None:
     assert ImagePanelPayload.value_unit.fset is None
 
 
-def test_evaluated_image_viewport_fails_closed_without_spatial_axis_truth() -> None:
+def test_evaluated_image_viewport_preserves_explicit_numeric_axis_truth() -> None:
     from dataclasses import replace
 
-    from zlc_data import CoordinateFrameId, SCAN_POINT
+    from zlc_data import AxisId, CoordinateFrameId, SCAN_POINT
     from zlc_frontend.figure import EvaluatedImage
     from zlc_frontend.image_view import image_viewport_for_evaluated_image
 
@@ -390,15 +390,44 @@ def test_evaluated_image_viewport_fails_closed_without_spatial_axis_truth() -> N
     with pytest.raises(TypeError, match="finite numeric coordinates"):
         image_viewport_for_evaluated_image(nonnumeric)
 
-    unnamed = EvaluatedImage(
-        replace(image.x_axis, role=SCAN_POINT),
+    scan_x = replace(
+        image.x_axis,
+        axis_id=AxisId("scan.bx"),
+        name="Bx",
+        role=SCAN_POINT,
+        unit="code",
+        coordinates=(-12, 0, 12),
+        coordinate_frame=None,
+    )
+    scan_y = replace(
         image.y_axis,
+        axis_id=AxisId("scan.by"),
+        name="By",
+        role=SCAN_POINT,
+        unit="code",
+        coordinates=(-6, 6),
+        coordinate_frame=None,
+    )
+    scan_image = EvaluatedImage(
+        scan_x,
+        scan_y,
         image.values,
         image.validity,
         image.value_unit,
     )
-    with pytest.raises(ValueError, match="x_axis=SPATIAL_X"):
-        image_viewport_for_evaluated_image(unnamed)
+    scan_viewport = image_viewport_for_evaluated_image(scan_image)
+    assert scan_viewport.x_axis.axis_id == scan_x.axis_id
+    assert scan_viewport.y_axis.axis_id == scan_y.axis_id
+    assert scan_viewport.x_axis.role == SCAN_POINT
+    assert scan_viewport.y_axis.role == SCAN_POINT
+    assert scan_viewport.x_axis.coordinates == (-12, 0, 12)
+    assert scan_viewport.y_axis.coordinates == (-6, 6)
+    assert scan_viewport.coordinate_frame is None
+    assert scan_viewport.unbounded_visible_point_for_coordinate(
+        (0, 6),
+        coordinate_frame=None,
+    ) == (0.5, 0.75)
+    assert scan_viewport.data_extent == (-18.0, 18.0, 12.0, -12.0)
 
     mismatched_frame = EvaluatedImage(
         image.x_axis,
@@ -410,7 +439,7 @@ def test_evaluated_image_viewport_fails_closed_without_spatial_axis_truth() -> N
         image.validity,
         image.value_unit,
     )
-    with pytest.raises(ValueError, match="shared, explicit coordinate frame"):
+    with pytest.raises(ValueError, match="shared coordinate frame"):
         image_viewport_for_evaluated_image(mismatched_frame)
 
 

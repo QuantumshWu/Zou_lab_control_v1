@@ -184,6 +184,7 @@ class _EndpointSession:
     session_id: str
     spec_fingerprint: str
     expected_frames: int | None
+    source_group_sizes: tuple[int, ...] | None
     payload_contract: CameraSampleContract
     metadata_hasher: OrderedDatasetMetadataHasher
     max_inflight_frames: int | None = None
@@ -442,6 +443,7 @@ class CameraCaptureEndpoint:
                 command.session_id,
                 command.capture_spec_fingerprint,
                 spec.expected_frames,
+                spec.source_group_sizes,
                 payload_contract,
                 OrderedDatasetMetadataHasher(
                     payload_contract.metadata_contract.fingerprint
@@ -477,6 +479,7 @@ class CameraCaptureEndpoint:
             try:
                 self._camera.arm(
                     expected,
+                    source_group_sizes=session.source_group_sizes,
                     # The camera ring follows the device-qualified maximum
                     # outstanding burst; the exact host stream owns the run.
                     max_inflight_frames=max_inflight,
@@ -1082,6 +1085,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 command.session_id,
                 capability.capability_fingerprint,
                 None,
+                None,
                 payload_contract,
                 OrderedDatasetMetadataHasher(
                     payload_contract.metadata_contract.fingerprint
@@ -1116,6 +1120,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             try:
                 self._camera.arm(
                     None,
+                    source_group_sizes=None,
                     max_inflight_frames=max_inflight,
                     timeout=command.timeout_seconds,
                 )
@@ -1241,6 +1246,55 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             self._end_command_operation(operation_token)
 
 
+def _source_group_sizes(
+    request: CameraCaptureBindingRequest,
+    dataset_schema: DatasetSchema,
+) -> tuple[int, ...]:
+    """Derive the sole frame-group truth from the frozen dataset schedule."""
+
+    request.cell_schedule.validate_schema(dataset_schema)
+    event_positions = tuple(
+        index
+        for index, axis in enumerate(dataset_schema.point_axes)
+        if axis.role == READOUT_EVENT
+    )
+    if not event_positions:
+        return (1,) * len(request.cell_schedule)
+    if len(event_positions) != 1:
+        raise ValueError("camera dataset has multiple READOUT_EVENT axes")
+    event_position = event_positions[0]
+    event_count = dataset_schema.point_axes[event_position].size
+    groups: list[int] = []
+    current_identity: tuple[int, tuple[int, ...]] | None = None
+    expected_event_index = 0
+    for address in request.cell_schedule:
+        multi_index = request.point_layout.multi_index(
+            address.point_storage_index
+        )
+        event_index = multi_index[event_position]
+        identity = (
+            address.repeat_index,
+            multi_index[:event_position] + multi_index[event_position + 1 :],
+        )
+        if identity != current_identity:
+            if current_identity is not None and expected_event_index != event_count:
+                raise ValueError(
+                    "camera cell schedule splits an incomplete READOUT_EVENT group"
+                )
+            current_identity = identity
+            expected_event_index = 0
+        if event_index != expected_event_index:
+            raise ValueError(
+                "camera cell schedule must order each READOUT_EVENT group from zero"
+            )
+        expected_event_index += 1
+        if expected_event_index == event_count:
+            groups.append(event_count)
+    if current_identity is None or expected_event_index != event_count:
+        raise ValueError("camera cell schedule ends inside a READOUT_EVENT group")
+    return tuple(groups)
+
+
 def bind_camera_measurement(
     port: BoundCapturePort,
     request: CameraCaptureBindingRequest,
@@ -1270,10 +1324,12 @@ def bind_camera_measurement(
         payload_contract.value_schema,
     )
     cell_schedule = request.cell_schedule
+    source_group_sizes = _source_group_sizes(request, dataset_schema)
     capture_spec = freeze_camera_capture_spec(
         CameraCaptureSpec(
             request.mode,
             len(cell_schedule),
+            source_group_sizes,
             evidence.settings_fingerprint,
         )
     )

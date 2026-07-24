@@ -48,6 +48,7 @@ from zlc_data import (
     ValueSchema,
     apply_transform,
     commit_transform,
+    dataset_revision_ref_to_tree,
     selection_to_tree,
     fit_spec_to_tree,
 )
@@ -408,6 +409,7 @@ def _signal_value(
     *,
     coverage: object | None,
     presentation: object | None = None,
+    join_digest: str | None = None,
 ) -> ConsoleSignalValue:
     key = panel_signal_key(panel_id, output_name)
     return ConsoleSignalValue(
@@ -417,9 +419,266 @@ def _signal_value(
         coverage=coverage,
         run_id=source.run_id,
         epoch_id=source.epoch_id,
-        join_digest=source.join_digest,
+        join_digest=source.join_digest if join_digest is None else join_digest,
         presentation=presentation,
     )
+
+
+def _area_range_output(
+    panel_id: str,
+    source: ConsoleSignalValue,
+    source_ref: DatasetRevisionRef,
+    axis: AxisSpec,
+    values: tuple[float, ...],
+    labels: tuple[str, ...],
+    semantic_identity: Mapping[str, object],
+    *,
+    unit: str | None,
+    join_digest: str | None = None,
+) -> tuple[str, ConsoleSignalValue]:
+    """Build the one shared typed representation of an Area axis bound."""
+
+    output_name = area_range_output_name(axis.axis_id)
+    _panel, _signal, identity = _panel_identity(panel_id, output_name)
+    bound_axis = AxisSpec(
+        AxisId(f"panel-output-{identity[:24]}-bound"),
+        f"{axis.name} bound",
+        COMPONENT,
+        len(values),
+        labels,
+    )
+    bound = materialize_numeric_snapshot(
+        panel_id,
+        output_name,
+        source_ref,
+        np.asarray(values, dtype="<f8"),
+        unit=unit,
+        data_axes=(bound_axis,),
+        semantic_identity=semantic_identity,
+    )
+    key = panel_signal_key(panel_id, output_name)
+    return key, _signal_value(
+        panel_id,
+        output_name,
+        bound,
+        source,
+        coverage=None,
+        presentation=axis,
+        join_digest=join_digest,
+    )
+
+
+def _site_map_input_tree(view) -> dict[str, object]:
+    """Canonical two-input lineage for one already-joined SiteMap front."""
+
+    def evaluated_input_tree(value) -> dict[str, object]:
+        return {
+            "dataset_id": value.dataset_id.value,
+            "ref": dataset_revision_ref_to_tree(value.ref),
+        }
+
+    return {
+        "background": evaluated_input_tree(view.background_input),
+        "site_state": evaluated_input_tree(view.site_state_input),
+        "calibration_identity": view.calibration_identity,
+        "view_identity": view.view_identity,
+    }
+
+
+def _site_map_data_snapshot(
+    panel_id: str,
+    source_ref: DatasetRevisionRef,
+    site_axis: AxisSpec,
+    values: np.ndarray,
+    validity: np.ndarray,
+    *,
+    data_axes: tuple[AxisSpec, ...],
+    unit: str | None,
+    semantic_identity: Mapping[str, object],
+) -> OwnedSnapshot:
+    """Materialise SiteMap Area data without reducing SITE validity."""
+
+    array = np.asarray(values)
+    mask = np.asarray(validity, dtype=np.bool_)
+    axes = tuple(data_axes)
+    if not axes or axes[0] != site_axis:
+        raise ValueError("SiteMap Area data must begin with its selected SITE axis")
+    if array.shape != tuple(axis.size for axis in axes):
+        raise ValueError("selected SiteMap data differs from its declared axes")
+    if mask.shape != (site_axis.size,):
+        raise ValueError("selected SiteMap validity must align to SITE")
+    output_name = AREA_DATA_OUTPUT
+    _panel, _signal, identity = _panel_identity(panel_id, output_name)
+    schema = DatasetSchema(
+        AxisSpec(
+            AxisId(f"panel-output-{identity[:24]}-repeat"),
+            "repeat",
+            REPEAT,
+            1,
+            (0,),
+        ),
+        (),
+        PointLayout.rect_c(()),
+        ValueSchema(
+            axes,
+            ValidityContract.components(site_axis.axis_id),
+            array.dtype,
+            unit,
+        ),
+    )
+    ref = _derived_ref(
+        panel_id,
+        output_name,
+        source_ref,
+        schema,
+        semantic_identity,
+    )
+    block = DataBlock(
+        ref.block_id,
+        ref.revision,
+        array.reshape(schema.physical_shape),
+        ComponentValidity(
+            (site_axis.axis_id,),
+            mask.reshape(1, 1, site_axis.size),
+        ),
+        schema,
+    )
+    return OwnedSnapshot(ref, block)
+
+
+def _site_map_area_outputs(
+    panel_id: str,
+    source: ConsoleSignalValue,
+    selection: Selection,
+    view,
+) -> dict[str, ConsoleSignalValue]:
+    """Select SiteMap state by calibrated centres, matching Main's semantics."""
+
+    snapshot = source.snapshot
+    if not isinstance(snapshot, OwnedSnapshot):
+        raise TypeError("SiteMap Area source does not own a dataset snapshot")
+    if snapshot.ref != view.site_state_input.ref:
+        raise ValueError("SiteMap Area source differs from its exact site-state input")
+    x_axis = view.home_viewport.x_axis
+    y_axis = view.home_viewport.y_axis
+    terms = {term.axis_id: term for term in selection.terms}
+    if set(terms) != {x_axis.axis_id, y_axis.axis_id}:
+        raise ValueError("SiteMap Area must select its painted x and y axes")
+    x_term = terms[x_axis.axis_id]
+    y_term = terms[y_axis.axis_id]
+    if not isinstance(x_term, CoordinateRangeSelection) or not isinstance(
+        y_term, CoordinateRangeSelection
+    ):
+        raise TypeError("SiteMap Area requires coordinate-range x and y terms")
+    if any(
+        term.coordinate_frame != view.coordinate_frame
+        for term in (x_term, y_term)
+    ):
+        raise ValueError("SiteMap Area coordinate frame differs from its sites")
+    centers = np.asarray(view.centers_xy, dtype="<f8")
+    selected = np.flatnonzero(
+        (centers[:, 0] >= float(x_term.lower))
+        & (centers[:, 0] <= float(x_term.upper))
+        & (centers[:, 1] >= float(y_term.lower))
+        & (centers[:, 1] <= float(y_term.upper))
+    )
+    lineage = _site_map_input_tree(view)
+    selection_tree = selection_to_tree(selection)
+    join_digest = canonical_digest(
+        {
+            "owner": "zlc-workbench.task-console.site-map-area.v1",
+            "inputs": lineage,
+            "selection": selection_tree,
+        }
+    )
+    outputs: dict[str, ConsoleSignalValue] = {}
+
+    for axis, term in ((x_axis, x_term), (y_axis, y_term)):
+        key, value = _area_range_output(
+            panel_id,
+            source,
+            snapshot.ref,
+            axis,
+            (float(term.lower), float(term.upper)),
+            ("lower", "upper"),
+            {
+                "inputs": lineage,
+                "selection": selection_tree,
+                "axis_id": axis.axis_id.value,
+            },
+            unit=axis.unit,
+            join_digest=join_digest,
+        )
+        outputs[key] = value
+
+    # An empty box is still a meaningful completed spatial range.  Dataset axes
+    # are non-empty by contract, so it publishes only the two bounds rather than
+    # inventing a sentinel site or a false valid value.
+    if not selected.size:
+        return outputs
+
+    selected_indices = tuple(int(index) for index in selected)
+    source_site_axis = view.site_axis
+    site_axis = AxisSpec(
+        source_site_axis.axis_id,
+        source_site_axis.name,
+        source_site_axis.role,
+        len(selected_indices),
+        tuple(source_site_axis.coordinate_at(index) for index in selected_indices),
+        source_site_axis.unit,
+        source_site_axis.coordinate_frame,
+    )
+    validity = np.asarray(view.site_validity, dtype=np.bool_)[selected]
+    occupied = view.site_occupancy
+    if occupied is not None:
+        values = np.asarray(occupied, dtype=np.bool_)[selected]
+        data_axes = (site_axis,)
+        unit = None
+        quantity = "occupancy"
+    else:
+        if x_axis.unit != y_axis.unit:
+            raise ValueError(
+                "calibration SiteMap Area cannot combine x/y coordinates with "
+                "different units into one area.data signal"
+            )
+        _panel, _signal, identity = _panel_identity(panel_id, AREA_DATA_OUTPUT)
+        coordinate_axis = AxisSpec(
+            AxisId(f"panel-output-{identity[:24]}-coordinate"),
+            "coordinate",
+            COMPONENT,
+            2,
+            ("x", "y"),
+        )
+        values = np.asarray(centers[selected], dtype="<f8")
+        data_axes = (site_axis, coordinate_axis)
+        unit = x_axis.unit
+        quantity = "calibrated-centers"
+
+    result = _site_map_data_snapshot(
+        panel_id,
+        snapshot.ref,
+        site_axis,
+        values,
+        validity,
+        data_axes=data_axes,
+        unit=unit,
+        semantic_identity={
+            "inputs": lineage,
+            "selection": selection_tree,
+            "quantity": quantity,
+        },
+    )
+    key = panel_signal_key(panel_id, AREA_DATA_OUTPUT)
+    outputs[key] = _signal_value(
+        panel_id,
+        AREA_DATA_OUTPUT,
+        result,
+        source,
+        coverage=None,
+        presentation=view,
+        join_digest=join_digest,
+    )
+    return outputs
 
 
 def materialize_area_outputs(
@@ -431,6 +690,27 @@ def materialize_area_outputs(
 
     if not isinstance(source, ConsoleSignalValue):
         raise TypeError("Area source must be ConsoleSignalValue")
+    from zlc_frontend.site_map_render import (
+        CalibrationSiteMapView,
+        OccupancyCellView,
+        OccupancySummarySiteMapView,
+    )
+
+    presentation = source.presentation
+    if isinstance(
+        presentation,
+        (
+            OccupancyCellView,
+            CalibrationSiteMapView,
+            OccupancySummarySiteMapView,
+        ),
+    ):
+        return _site_map_area_outputs(
+            panel_id,
+            source,
+            selection,
+            presentation,
+        )
     snapshot = source.snapshot
     if not isinstance(snapshot, OwnedSnapshot):
         raise TypeError("Area source signal does not own a dataset snapshot")
@@ -448,36 +728,20 @@ def materialize_area_outputs(
     for term in selection.terms:
         axis = _source_axis(snapshot, term.axis_id)
         values, labels, unit = _term_bounds(snapshot, term)
-        output_name = area_range_output_name(term.axis_id)
-        _panel, _signal, identity = _panel_identity(panel_id, output_name)
-        bound_axis = AxisSpec(
-            AxisId(f"panel-output-{identity[:24]}-bound"),
-            f"{axis.name} bound",
-            COMPONENT,
-            len(values),
-            labels,
-        )
-        bound = materialize_numeric_snapshot(
+        key, value = _area_range_output(
             panel_id,
-            output_name,
+            source,
             snapshot.ref,
-            np.asarray(values, dtype="<f8"),
-            unit=unit,
-            data_axes=(bound_axis,),
-            semantic_identity={
+            axis,
+            values,
+            labels,
+            {
                 "selection": selection_tree,
                 "axis_id": term.axis_id.value,
             },
+            unit=unit,
         )
-        key = panel_signal_key(panel_id, output_name)
-        output[key] = _signal_value(
-            panel_id,
-            output_name,
-            bound,
-            source,
-            coverage=None,
-            presentation=axis,
-        )
+        output[key] = value
     return output
 
 

@@ -12,7 +12,7 @@ import textwrap
 import numpy as np
 import pytest
 
-from zlc_data import AxisId, AxisSpec, PointLayout, REPEAT, SCAN_POINT
+from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, REPEAT, SCAN_POINT
 from zlc_neutral_atom.bootstrap._installation import create_virtual_installation
 from zlc_neutral_atom.bootstrap._triggered_capture import (
     TriggeredCameraLayout,
@@ -375,6 +375,125 @@ def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation
         "produced": 3,
         "pulse_trigger_count": 3,
     }
+
+
+def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest(
+    tmp_path,
+):
+    from Zou_lab_control.notebook import connect
+    from Zou_lab_control.notebook.facade import _prepare_capture_for_workbench
+
+    class RecordingPreview:
+        def __init__(self, spec) -> None:
+            self.spec = spec
+            self.terminal = False
+            self.failure = None
+            self.source_ordinals = []
+            self.head_sequences = []
+            self.missed_events = []
+            self.dataset = None
+
+        def bind(self, dataset, *, run_id: str, causation_domain_id: str) -> None:
+            assert run_id and causation_domain_id
+            self.dataset = dataset
+
+        def updated(self) -> None:
+            snapshot = self.dataset.materialize(None)
+            self.source_ordinals.append(
+                snapshot.cell_metadata[0].source_ordinal
+            )
+            self.head_sequences.append(snapshot.head.sequence)
+            self.missed_events.append(snapshot.coverage.missed_events)
+
+        def fail(self, message: str) -> None:
+            self.failure = message
+            self.terminal = True
+            self.close()
+
+        def source_terminal(self) -> None:
+            self.terminal = True
+
+        def close(self) -> None:
+            dataset, self.dataset = self.dataset, None
+            if dataset is not None:
+                dataset.close()
+
+    experiment = connect(
+        "virtual",
+        repository=tmp_path / "preview-selection",
+        seed=7,
+    )
+    ports = []
+    try:
+        sequence = experiment.readout.sitemap_request(frames=2)
+        grouping = sequence.capture_request.within_point_grouping
+        assert grouping is not None
+        reference_event = sequence.analysis.layout.reference_event_indices[0]
+        selected = tuple(
+            source_ordinal
+            for source_ordinal, (_repeat, event) in enumerate(grouping)
+            if event == reference_event
+        )
+        assert selected == (0, 3)
+
+        def run_preview(source_ordinals, suffix):
+            prepared = _prepare_capture_for_workbench(
+                experiment,
+                sequence.capture_request,
+            )
+
+            def factory(spec):
+                port = RecordingPreview(spec)
+                ports.append(port)
+                return port
+
+            handle = prepared.start_with_preview(
+                block_id=BlockId(f"ordinal-preview-{suffix}"),
+                factory=factory,
+                source_ordinals=source_ordinals,
+            )
+            return ports[-1], handle.result(10.0)
+
+        selected_port, selected_ref = run_preview(selected, "selected")
+        assert selected_port.source_ordinals == [0, 3], selected_port.failure
+        assert selected_port.head_sequences == [0, 3]
+        assert selected_port.missed_events == [0, 0]
+        assert selected_port.failure is None and selected_port.terminal
+        assert tuple(
+            sample.metadata.source_ordinal
+            for _cell, sample in experiment.readout.load_capture(
+                selected_ref
+            ).frame_source.iter_event_order()
+        ) == tuple(range(6))
+
+        all_port, _all_ref = run_preview(None, "all")
+        assert all_port.source_ordinals == list(range(6))
+        assert all_port.head_sequences == list(range(6))
+        assert all_port.missed_events == [0] * 6
+        assert all_port.failure is None and all_port.terminal
+
+        rejected = _prepare_capture_for_workbench(
+            experiment,
+            sequence.capture_request,
+        )
+
+        def rejected_factory(spec):
+            port = RecordingPreview(spec)
+            ports.append(port)
+            return port
+
+        with pytest.raises(ValueError, match="frozen cell schedule"):
+            rejected.start_with_preview(
+                block_id=BlockId("ordinal-preview-out-of-range"),
+                factory=rejected_factory,
+                source_ordinals=(6,),
+            )
+        assert ports[-1].terminal
+        assert "frozen cell schedule" in ports[-1].failure
+    finally:
+        for port in ports:
+            port.close()
+        experiment.close()
 
 
 def test_host_stepped_scan_is_not_reintroduced_as_a_capture_mode():

@@ -24,6 +24,7 @@ from zlc_neutral_atom.bootstrap._sequencer_endpoint import (
 from zlc_neutral_atom.bootstrap._virtual_hardware import (
     VirtualAtomArray,
     VirtualCamera,
+    VirtualMotFrameSource,
     VirtualSequencer,
 )
 from zlc_neutral_atom.readout.sitemap import load_packaged_sitemap_pulse
@@ -62,6 +63,7 @@ from zlc_neutral_atom.timing.pulse import (
 from zlc_pulse import (
     FrozenScanTable,
     PlaybackPulse,
+    PlaybackTriggerGroup,
     PulseExecutionForm,
     PulsePlayback,
     RepeatRegion,
@@ -249,13 +251,147 @@ def _camera_with_one_trigger_source(source, *, timeout: float = 0.05):
         False,
         trigger_channels=("ch11",),
     )
-    camera.arm(1, max_inflight_frames=1)
+    camera.arm(1, source_group_sizes=(1,), max_inflight_frames=1)
     camera._on_fire(playback)
     return camera, sequencer
 
 
 def _frame() -> np.ndarray:
     return np.zeros((2, 2), dtype=np.uint16)
+
+
+def _camera_playback(
+    trigger_count: int,
+    *,
+    groups: tuple[PlaybackTriggerGroup, ...] = (),
+) -> PulsePlayback:
+    pulses = tuple(
+        PlaybackPulse("ch11", index * 2e-6, 1e-6)
+        for index in range(trigger_count)
+    )
+    duration = max(pulse.stop for pulse in pulses)
+    return PulsePlayback(
+        "camera-grouping",
+        pulses,
+        duration,
+        duration,
+        False,
+        trigger_channels=("ch11",),
+        full_point_loop_channels=(("ch11",) if groups else ()),
+        trigger_groups=groups,
+    )
+
+
+def test_virtual_camera_consumes_frozen_groups_across_multiple_fire_calls():
+    observed_groups = []
+
+    def source(
+        _playback,
+        frames,
+        *,
+        trigger_group_sizes,
+        trigger_group_point_indices,
+        **_kwargs,
+    ):
+        observed_groups.append(
+            (trigger_group_sizes, trigger_group_point_indices)
+        )
+        yield from (_frame() for _index in range(frames))
+
+    atoms = object.__new__(VirtualAtomArray)
+    atoms.iter_frames = source
+    sequencer = VirtualSequencer(
+        _api_document().target,
+        clock_hz=DEFAULT_CLOCK_HZ,
+        sleep_scale=0,
+    )
+    camera = VirtualCamera(
+        atoms,
+        sequencer,
+        capture_trigger_channels=("ch11",),
+        exposure=1e-6,
+    )
+    try:
+        camera.arm(2, source_group_sizes=(1, 1), max_inflight_frames=2)
+        for _index in range(2):
+            camera._on_fire(_camera_playback(1))
+            assert len(camera.read_frame_records(1, timeout=0.5, exact=True)) == 1
+        assert observed_groups == [((1,), (None,)), ((1,), (None,))]
+        terminal = camera.finish_record_capture()
+        assert terminal.produced_count == 2
+    finally:
+        camera.close()
+        sequencer.close()
+
+
+def test_virtual_mot_source_consumes_frozen_group_point_association():
+    source = object.__new__(VirtualMotFrameSource)
+    source.sequencer = type("Sequencer", (), {"output_artifact": object()})()
+    source.levels_for_point = lambda _artifact, point: {"point": point}
+    source._render_levels = lambda levels: np.asarray(levels["point"])
+
+    frames = tuple(
+        source.iter_frames(
+            object(),
+            3,
+            trigger_channels=("ch11",),
+            default_exposure=1e-6,
+            trigger_group_sizes=(2, 1),
+            trigger_group_point_indices=(4, 7),
+        )
+    )
+
+    assert tuple(int(frame) for frame in frames) == (4, 4, 7)
+
+    with pytest.raises(RuntimeError, match="missing scan-point association"):
+        tuple(
+            source.iter_frames(
+                object(),
+                1,
+                trigger_channels=("ch11",),
+                default_exposure=1e-6,
+                trigger_group_sizes=(1,),
+                trigger_group_point_indices=(None,),
+            )
+        )
+
+
+def test_virtual_camera_rejects_split_or_mismatched_frozen_groups():
+    def source(_playback, frames, **_kwargs):
+        yield from (_frame() for _index in range(frames))
+
+    atoms = object.__new__(VirtualAtomArray)
+    atoms.iter_frames = source
+    sequencer = VirtualSequencer(
+        _api_document().target,
+        clock_hz=DEFAULT_CLOCK_HZ,
+        sleep_scale=0,
+    )
+    camera = VirtualCamera(
+        atoms,
+        sequencer,
+        capture_trigger_channels=("ch11",),
+        exposure=1e-6,
+    )
+    try:
+        camera.arm(2, source_group_sizes=(2,), max_inflight_frames=2)
+        with pytest.raises(RuntimeError, match="splits a frozen camera source group"):
+            camera._on_fire(_camera_playback(1))
+        camera.finish_record_capture()
+
+        camera.arm(2, source_group_sizes=(2,), max_inflight_frames=2)
+        groups = (
+            PlaybackTriggerGroup(0, 0, (("ch11", 1),)),
+            PlaybackTriggerGroup(1, 0, (("ch11", 1),)),
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="compiled pulse grouping differs from the frozen camera request",
+        ):
+            camera._on_fire(_camera_playback(2, groups=groups))
+    finally:
+        camera.close()
+        sequencer.close()
 
 
 def test_virtual_camera_rejects_source_error_after_expected_final_frame():

@@ -16,6 +16,7 @@ from zlc_data import (
 )
 from zlc_storage import (
     canonical_text as _canonical_text,
+    nonnegative_integer as _nonnegative_integer,
     sha256_text,
 )
 
@@ -106,10 +107,16 @@ class MinimalPipelineSpec:
             raise TypeError("block_id must be BlockId")
 @dataclass(frozen=True)
 class CapturePreviewSpec:
-    """Process-local capacity-one live view attached to an exact capture."""
+    """Process-local capacity-one live view attached to an exact capture.
+
+    ``source_ordinals=None`` publishes every physical event.  A tuple admits
+    only those frozen source ordinals before the preview dataset is ingested;
+    the exact DatasetBuilder remains complete in either case.
+    """
 
     block_id: BlockId
     dataset_edge: FrozenDatasetEdge
+    source_ordinals: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.block_id, BlockId):
@@ -129,6 +136,17 @@ class CapturePreviewSpec:
             raise ValueError(
                 "capture preview requires capacity-one (R=1, MONITOR_HISTORY=1) storage"
             )
+        if self.source_ordinals is None:
+            return
+        ordinals = tuple(
+            _nonnegative_integer(ordinal, "source_ordinals entry")
+            for ordinal in self.source_ordinals
+        )
+        if not ordinals:
+            raise ValueError("source_ordinals cannot be empty")
+        if any(left >= right for left, right in zip(ordinals, ordinals[1:])):
+            raise ValueError("source_ordinals must be strictly increasing")
+        object.__setattr__(self, "source_ordinals", ordinals)
 
     @staticmethod
     def dataset_edge_for_capture(
@@ -435,6 +453,7 @@ class ExactCaptureTransaction:
     contract: CameraCaptureContract
     preview_dataset: MonitorDataset | None = None
     preview_port: CapturePreviewPort | None = None
+    exact_preview_port: ExactDatasetPreviewPort | None = None
 
     def start(self, context: RunContext) -> None:
         self.session.prepare(context)
@@ -445,19 +464,27 @@ class ExactCaptureTransaction:
 
         context.checkpoint()
         self.session.capture_next(context)
-        self.builder.consume(
-            self.cursor.next(
-                timeout=self.port.capability.max_blocking_call_seconds
-            )
+        delivery = self.cursor.next(
+            timeout=self.port.capability.max_blocking_call_seconds
         )
+        envelope = delivery.envelope
+        self.builder.consume(delivery)
         preview = self.preview_dataset
         if preview is not None:
             try:
-                preview.ingest_latest()
                 port = self.preview_port
                 if port is None:
                     raise RuntimeError("capture preview port disappeared")
-                port.updated()
+                source_ordinal = self.contract.payload_contract.source_ordinal(
+                    envelope.payload
+                )
+                selected = port.spec.source_ordinals
+                if selected is None or source_ordinal in selected:
+                    preview.ingest_latest(
+                        account_skipped_events=selected is None,
+                        expected_event_ref=envelope.ref,
+                    )
+                    port.updated()
             except BaseException as error:
                 self._detach_preview(error)
 
@@ -487,7 +514,7 @@ class ExactCaptureTransaction:
         )
 
     def fail(self, error: BaseException) -> None:
-        self._detach_preview(error)
+        self._fail_previews(error)
         try:
             self.session.fail(error)
         except BaseException as failure_error:
@@ -500,7 +527,7 @@ class ExactCaptureTransaction:
     def abort_preflight(self, error: BaseException) -> None:
         """Release software-only authority before any capture command was attempted."""
 
-        self._detach_preview(error)
+        self._fail_previews(error)
         _release_preflight_software(
             self.session,
             self.reservation,
@@ -536,6 +563,12 @@ class ExactCaptureTransaction:
                 dataset.close()
             except BaseException:
                 pass
+    def _fail_previews(self, error: BaseException) -> None:
+        """Fail independent display sinks only when the capture itself failed."""
+
+        self._detach_preview(error)
+        exact, self.exact_preview_port = self.exact_preview_port, None
+        _notify_preview_failure(exact, error)
 
     def _finish_preview_source(self) -> None:
         # bind() transfers dataset lifetime to the Workbench slot.  A normal
@@ -557,12 +590,11 @@ class ExactCaptureTransaction:
         """Publish a normal terminal only after aggregate cleanup succeeded."""
 
         if primary is not None:
-            self._detach_preview(primary)
+            self._fail_previews(primary)
         elif report.errors:
-            self._detach_preview(report.errors[0])
+            self._fail_previews(report.errors[0])
         else:
             self._finish_preview_source()
-
 
 def _capture_preview_spec(
     preview: CapturePreviewPort | None,
@@ -582,6 +614,12 @@ def _capture_preview_spec(
     ):
         raise ValueError(
             "capture preview must share the exact capture cell schema and event adapter"
+        )
+    source_ordinals = spec.source_ordinals
+    schedule_size = len(capture.measurement.capture_contract.cell_schedule)
+    if source_ordinals is not None and source_ordinals[-1] >= schedule_size:
+        raise ValueError(
+            "capture preview source_ordinals exceed the frozen cell schedule"
         )
     return spec
 
@@ -634,15 +672,25 @@ def _open_exact_capture_transaction(
     *,
     preview: CapturePreviewPort | None,
     preview_spec: CapturePreviewSpec | None,
+    exact_preview: ExactDatasetPreviewPort | None = None,
+    exact_preview_spec: ExactDatasetPreviewSpec | None = None,
 ) -> ExactCaptureTransaction:
     """Allocate the single reservation/materializer transaction without touching hardware."""
 
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
     try:
-        return _allocate_exact_capture(spec, context, preview, preview_spec)
+        return _allocate_exact_capture(
+            spec,
+            context,
+            preview,
+            preview_spec,
+            exact_preview,
+            exact_preview_spec,
+        )
     except BaseException as error:
         _notify_preview_failure(preview, error)
+        _notify_preview_failure(exact_preview, error)
         raise
 
 
@@ -651,7 +699,11 @@ def _allocate_exact_capture(
     context: RunContext,
     preview: CapturePreviewPort | None = None,
     preview_spec: CapturePreviewSpec | None = None,
+    exact_preview: ExactDatasetPreviewPort | None = None,
+    exact_preview_spec: ExactDatasetPreviewSpec | None = None,
 ) -> ExactCaptureTransaction:
+    if (exact_preview is None) != (exact_preview_spec is None):
+        raise ValueError("exact_preview and exact_preview_spec must be present together")
     measurement = spec.measurement
     port = measurement.capture_port
     contract = measurement.capture_contract
@@ -672,6 +724,18 @@ def _allocate_exact_capture(
         )
         readiness = builder.exact_readiness()
         session.bind_exact_consumer(readiness)
+        bound_exact_preview = exact_preview
+        if bound_exact_preview is not None:
+            assert exact_preview_spec is not None
+            try:
+                bound_exact_preview.bind(
+                    builder.open_preview_reader(),
+                    run_id=context.run_id.value,
+                    causation_domain_id=session.stream.generation.value,
+                )
+            except BaseException as preview_error:
+                _notify_preview_failure(bound_exact_preview, preview_error)
+                bound_exact_preview = None
         preview_dataset = None
         if preview is not None:
             assert preview_spec is not None
@@ -713,6 +777,7 @@ def _allocate_exact_capture(
             contract,
             preview_dataset,
             preview,
+            bound_exact_preview,
         )
     except BaseException as error:
         _release_preflight_software(session, reservation, builder, error)
@@ -804,6 +869,32 @@ def compile_pipeline(
         interrupt_operations=port.interrupt_operations,
         requires_final_commit=False,
     )
+
+
+def _admit_exact_dataset_preview(
+    spec: MinimalPipelineSpec,
+    preview: ExactDatasetPreviewPort | None,
+) -> ExactDatasetPreviewSpec | None:
+    """Validate an exact-builder preview against the capture dataset."""
+
+    if preview is None:
+        return None
+    try:
+        preview_spec = getattr(preview, "spec", None)
+        if not isinstance(preview_spec, ExactDatasetPreviewSpec):
+            raise TypeError("exact preview.spec must be ExactDatasetPreviewSpec")
+        terminal = getattr(preview, "terminal", None)
+        if not isinstance(terminal, bool):
+            raise TypeError("exact preview.terminal must be bool")
+        if terminal:
+            raise RuntimeError("exact dataset preview is already terminal")
+        source_schema = spec.measurement.capture_contract.dataset_schema
+        if preview_spec.source_schema_fingerprint != source_schema.fingerprint:
+            raise ValueError("exact preview schema differs from capture dataset")
+        return preview_spec
+    except BaseException as error:
+        _notify_preview_failure(preview, error)
+        raise
 
 
 def finalize_pipeline_result(

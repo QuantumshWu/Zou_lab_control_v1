@@ -27,11 +27,8 @@ from zlc_frontend.render import BoardPresenter
 from zlc_frontend.curve_display import CurveDisplayState
 from zlc_frontend.encoded_raster import png_raster_size
 
-from .progressive_scan import (
-    ExactDatasetLiveSlot,
-    ProgressiveScanPreview,
-    ProgressiveScanSpec,
-)
+from .exact_live_slot import ExactDatasetLiveSlot
+from .progressive_scan import ProgressiveScanPreview, ProgressiveScanSpec
 
 
 _PREVIEW_CLOSE_RETRY_SECONDS = 0.1

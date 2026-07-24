@@ -28,7 +28,7 @@ from zlc_neutral_atom.runtime.run import (
 
 CALIBRATION_SOURCE_MODES = ("live", "saved frames")
 CALIBRATION_THRESHOLD_METHODS = tuple(item.value for item in ThresholdMethod)
-DEFAULT_CALIBRATION_FOLDER = "calibrations"
+DEFAULT_CALIBRATION_FOLDER = "_output/calibrations"
 DEFAULT_CALIBRATION_PULSE_PATH = (
     "zlc_neutral_atom/assets/imaging_template.json"
 )
@@ -140,7 +140,7 @@ def calibration_task_params(
     return (
         ParamDecl(
             "source_mode",
-            "Source",
+            "source",
             "choice",
             default="live",
             required=True,
@@ -149,7 +149,7 @@ def calibration_task_params(
         ),
         ParamDecl(
             "folder",
-            "Output folder",
+            "folder",
             "path",
             default=DEFAULT_CALIBRATION_FOLDER,
             required=True,
@@ -162,14 +162,14 @@ def calibration_task_params(
         ),
         ParamDecl(
             "save_frames",
-            "Save live frames",
+            "save frames (live)",
             "bool",
             default=True,
             tooltip="Keep raw live frames so the same acquisition can be recalibrated.",
         ),
         ParamDecl(
             "pulse",
-            "Pulse template",
+            "pulse template",
             "path",
             default=DEFAULT_CALIBRATION_PULSE_PATH,
             required=True,
@@ -180,7 +180,7 @@ def calibration_task_params(
         ),
         ParamDecl(
             "threshold_method",
-            "Threshold",
+            "threshold",
             "choice",
             default="otsu",
             required=True,
@@ -189,7 +189,7 @@ def calibration_task_params(
         ),
         ParamDecl(
             "reference_exposure_s",
-            "Reference exposure",
+            "reference exposure (long)",
             "float",
             default=0.020,
             unit="s",
@@ -201,7 +201,7 @@ def calibration_task_params(
         ),
         ParamDecl(
             "readout_exposure_s",
-            "Readout exposure",
+            "readout exposure (short)",
             "float",
             default=0.005,
             unit="s",
@@ -213,7 +213,7 @@ def calibration_task_params(
         ),
         ParamDecl(
             "threshold_frames",
-            "Reference brackets",
+            "reference brackets",
             "int",
             default=100,
             lo=2,

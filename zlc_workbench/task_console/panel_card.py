@@ -62,6 +62,8 @@ from zlc_data.plot_kind import PLOT_KIND_SPEC_BY_KEY
 
 from .panel_board import card_size as _card_size
 from .panel_types import (
+    DEFAULT_GRID_FACET_AXIS_PARAM,
+    DEFAULT_GRID_INTENT_PARAM,
     HISTOGRAM_CELL_THRESHOLDS_PARAM as _HISTOGRAM_CELL_THRESHOLDS_PARAM,
     HISTOGRAM_THRESHOLDS_PARAM as _HISTOGRAM_THRESHOLDS_PARAM,
     RELIM_PARAM as _RELIM_PARAM,
@@ -813,8 +815,8 @@ class PanelCard(FluentGroupBox):
         GUI thread and arrives here already rasterised.  The host is the ONE
         selector owner (design rule: an interactive window uses the
         QtRasterBoard chain; FrozenRasterView stays a frozen-report presenter), so
-        the console card's selector switch and future gesture wiring go
-        through the same binding as every other one-panel window.
+        the console card's selector switch and completed gestures go through
+        the same binding as every other one-panel window.
         """
 
         from zlc_frontend.qt_widgets import FacetedPanelHost, SinglePanelHost
@@ -935,10 +937,10 @@ class PanelCard(FluentGroupBox):
         try:
             selection = board.board.selection_for_rectangle_gesture(gesture)
         except RuntimeError:
-            # SiteMap boxes are valid display gestures but intentionally have
-            # no authoritative SITE Selection; stale origins are equally
-            # ineligible.  The ROI composition signal is still forwarded by
-            # the caller, which owns its own typed admission and diagnostics.
+            # A stale origin is ineligible.  SiteMap rectangles resolve through
+            # the painted background's named spatial axes here, then the Figure
+            # output owner selects site centres from that exact joined view.
+            # They never become a Measurement ROI.
             self._set_area_output(None, None)
             return
         self._set_area_output(selection, gesture.source_identity)
@@ -1244,6 +1246,8 @@ class PanelCard(FluentGroupBox):
             if self.config.kind == "sites"
             else self._saved_view_spec(schema)
         )
+        if self.config.kind == "grid" and view is None:
+            view = self._catalog_default_grid_view(schema)
         if self.config.kind == "grid" and view is None:
             self.set_status(
                 "choose a named facet axis in Setting",
@@ -2324,6 +2328,29 @@ class PanelCard(FluentGroupBox):
         ):
             return None
         return suggestion.spec
+
+    def _catalog_default_grid_view(self, schema):
+        """Resolve a catalog-declared default through the ordinary Figure contract."""
+
+        from zlc_data import AxisId
+        from zlc_frontend.figure import ViewIntent, dataset_axes, view_spec_to_tree
+
+        raw_intent = self.config.params.get(DEFAULT_GRID_INTENT_PARAM)
+        raw_facet = self.config.params.get(DEFAULT_GRID_FACET_AXIS_PARAM)
+        if raw_intent is None or raw_facet is None:
+            return None
+        try:
+            intent = ViewIntent(str(raw_intent))
+            facet_axis_id = AxisId(str(raw_facet))
+        except (TypeError, ValueError):
+            return None
+        if facet_axis_id not in {axis.axis_id for axis in dataset_axes(schema)}:
+            return None
+        candidate = self._grid_candidate_view(intent, facet_axis_id)
+        if candidate is None:
+            return None
+        self.config.params[_VIEW_SPEC_PARAM] = view_spec_to_tree(candidate)
+        return candidate
 
     def _grid_facet_choices(self, intent):
         from zlc_frontend.figure import dataset_axes
