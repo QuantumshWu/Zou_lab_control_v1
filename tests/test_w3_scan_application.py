@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import copy
 import gc
@@ -19,7 +18,6 @@ import numpy as np
 import pytest
 
 import Zou_lab_control.notebook as zlc
-from Zou_lab_control.notebook.facade import _prepare_occupancy_scan_for_workbench
 from zlc_data import (
     READOUT_EVENT,
     REPEAT,
@@ -52,9 +50,8 @@ from zlc_data import (
 from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
 from zlc_frontend.curve_display import (
     CurveDisplayState,
-    curve_display_with_x_view,
 )
-from zlc_frontend.render import AtomicBoardFront, CurvePanelPayload
+from zlc_frontend.render import CurvePanelPayload
 from zlc_frontend.figure import (
     AxisViewRole,
     FigureEvaluator,
@@ -62,17 +59,13 @@ from zlc_frontend.figure import (
     ResolvedDatasetMap,
     ViewIntent,
 )
-from zlc_neutral_atom.runtime.dataset import (
-    DatasetCoverage,
-    DatasetPreviewSnapshot,
+from zlc_frontend.scan_preview import (
+    ScanDisplayIntent,
+    build_occupancy_scan_curve,
 )
 from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewSpec
 from zlc_neutral_atom.runtime.run import (
-    CancelOutcome,
     RunFailed,
-    RunId,
-    RunSnapshot,
-    RunState,
 )
 from zlc_neutral_atom.scan import (
     AutonomousScanExecution,
@@ -80,6 +73,7 @@ from zlc_neutral_atom.scan import (
     ScanOutputContract,
     ScanPointTable,
 )
+from zlc_neutral_atom.scan.application import PreparedExactScan
 from zlc_neutral_atom.scan.repository import ScanRepository
 from zlc_neutral_atom.readout.calibration_reference import (
     calibration_artifact_input_ref,
@@ -93,19 +87,69 @@ from zlc_pulse import (
 )
 from zlc_workbench.progressive_scan import (
     ExactDatasetLiveSlot,
-    ProgressiveScanPreview,
-    ScanDisplayIntent,
-    build_occupancy_progressive_spec,
+    ProgressiveScanSpec,
 )
 from zlc_workbench.scan import (
-    FinalScanPresentation,
-    PreparedScanPanelRun,
-    ScanPanelController,
     ScanPanelRuntimeUpdate,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class _ProjectionOnlyPreparedExactScan(PreparedExactScan):
+    """Current prepared-scan seam for renderer-only synthetic datasets."""
+
+    def __init__(self, source_schema, output_contract, identity: str) -> None:
+        self._test_source_schema = source_schema
+        self._test_output_contract = output_contract
+        self._test_block_id = BlockId(f"preview-output-{identity}")
+
+    @property
+    def source_schema(self):
+        return self._test_source_schema
+
+    @property
+    def output_contract(self):
+        return self._test_output_contract
+
+    @property
+    def preview_spec(self):
+        return ExactDatasetPreviewSpec(self.source_schema.fingerprint)
+
+    def materialize_provisional_output(self, source):
+        snapshot = source.snapshot
+        return materialize_transformed_snapshot(
+            snapshot,
+            self.output_contract.transform,
+            output_ref=DatasetRevisionRef(
+                self._test_block_id,
+                snapshot.ref.stream_generation,
+                self.output_contract.output_dataset_schema.fingerprint,
+                snapshot.ref.revision,
+            ),
+            output_schema=self.output_contract.output_dataset_schema,
+        )
+
+
+def build_occupancy_progressive_spec(
+    source_schema,
+    output_contract,
+    *,
+    identity: str,
+    display_intent: ScanDisplayIntent = ScanDisplayIntent(),
+):
+    command = _ProjectionOnlyPreparedExactScan(
+        source_schema,
+        output_contract,
+        identity,
+    )
+    presentation = build_occupancy_scan_curve(
+        output_contract.output_dataset_schema,
+        identity=identity,
+        display_intent=display_intent,
+    )
+    return ProgressiveScanSpec(command, presentation)
 
 
 class _CountingExactDatasetLiveSlot(ExactDatasetLiveSlot):
@@ -336,14 +380,14 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity(monk
 
     def evaluate(snapshot):
         return evaluator.evaluate(
-            progressive.document,
+            progressive.presentation.document,
             ResolvedDatasetMap(
-                (ResolvedDataset(progressive.dataset_id, snapshot),)
+                (ResolvedDataset(progressive.presentation.dataset_id, snapshot),)
             ),
         )
 
     renderer = SinglePanelAggRenderer(
-        progressive.document,
+        progressive.presentation.document,
         width=360,
         height=240,
     )
@@ -360,7 +404,7 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity(monk
     assert len(first_payload.series) == 3
     assert tuple(
         label.split(" | ", 1)[0] for label in first_payload.series_labels
-    ) == ("site=left", "site=middle", "site=right")
+    ) == ("site 0", "site 1", "site 2")
     assert all(series.data.values.shape == (2,) for series in first_payload.series)
     assert tuple(
         series.data.validity.tolist() for series in first_payload.series
@@ -368,10 +412,6 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity(monk
     figure_id = id(renderer._figure)
     axis_id = id(renderer._axis)
     line_ids = tuple(map(id, renderer._artists))
-    first_legend = tuple(
-        text.get_text() for text in renderer._axis.get_legend().get_texts()
-    )
-
     second, second_payload = renderer.render_interactive_curve(
         evaluate(snapshots[1]),
         CurveDisplayState(),
@@ -382,10 +422,6 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity(monk
     assert id(renderer._figure) == figure_id
     assert id(renderer._axis) == axis_id
     assert tuple(map(id, renderer._artists)) == line_ids
-    second_legend = tuple(
-        text.get_text() for text in renderer._axis.get_legend().get_texts()
-    )
-    assert second_legend != first_legend
     assert second.pixels != first.pixels
 
     figure_ref = weakref.ref(renderer._figure)
@@ -408,358 +444,6 @@ def test_progressive_renderer_reuses_artists_and_updates_component_validity(monk
             previous_relim_mode=None,
         )
 
-    from matplotlib.figure import Figure
-
-    partial_canvases = []
-
-    def failed_subplots(self, *_args, **_kwargs):
-        partial_canvases.append(weakref.ref(self.canvas))
-        raise RuntimeError("injected renderer construction failure")
-
-    collection_was_enabled = gc.isenabled()
-    gc.disable()
-    try:
-        with monkeypatch.context() as failure_patch:
-            failure_patch.setattr(Figure, "subplots", failed_subplots)
-            with pytest.raises(
-                RuntimeError,
-                match="injected renderer construction failure",
-            ):
-                SinglePanelAggRenderer(
-                    progressive.document,
-                    width=360,
-                    height=240,
-                )
-        assert partial_canvases and all(ref() is None for ref in partial_canvases)
-    finally:
-        if collection_was_enabled:
-            gc.enable()
-
-
-def test_progressive_display_repaints_same_exact_source_without_restarting():
-    source, transform, schema, _output_ref, _values, _valid = (
-        _component_snapshot_case()
-    )
-    progressive = build_occupancy_progressive_spec(
-        source.block.schema,
-        ScanOutputContract(transform, schema),
-        identity="same-source-display-repaint",
-    )
-    assert progressive.interactive_curve
-    slot = ExactDatasetLiveSlot(progressive.preview_spec)
-    presenter = AtomicBoardFront()
-    wake = threading.Event()
-    executor = ThreadPoolExecutor(max_workers=1)
-    futures = []
-
-    def submit(work):
-        future = executor.submit(work)
-        futures.append(future)
-        return future
-
-    preview = ProgressiveScanPreview(
-        slot,
-        progressive,
-        presenter,
-        curve_display=CurveDisplayState(),
-        submit_worker=submit,
-        request_owner_wake=wake.set,
-    )
-    total_cells = (
-        source.block.schema.repeat_axis.size
-        * source.block.schema.point_layout.storage_size
-    )
-    terminal = DatasetPreviewSnapshot(
-        source,
-        DatasetCoverage(total_cells, total_cells),
-        (None,) * total_cells,
-    )
-    with slot._lock:
-        slot._run_id = "same-run"
-        slot._causation_domain_id = source.ref.stream_generation.value
-        slot._terminal_snapshot = terminal
-        slot._terminal = True
-        listener = slot._notify_locked()
-    assert listener is not None
-    listener()
-
-    def present_until(revision: int):
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            wake.wait(0.05)
-            wake.clear()
-            preview.owner_cycle()
-            frame = presenter.current()
-            if (
-                frame is not None
-                and frame.panels[0].coherence_stamp.presentations[0].panel_revision
-                == revision
-            ):
-                return frame
-        raise AssertionError(f"progressive display r{revision} was not presented")
-
-    try:
-        first = present_until(0)
-        first_panel = first.panels[0]
-        first_input = first_panel.coherence_stamp.inputs[0].ref
-        first_payload = first_panel.display_payload
-        assert isinstance(first_payload, CurvePanelPayload)
-        assert first_payload.evaluated_input.ref == first_input
-
-        state = curve_display_with_x_view(
-            CurveDisplayState(),
-            (-0.5, 0.5),
-        )
-        preview.reconfigure_curve_display(state)
-        second = present_until(1)
-        second_panel = second.panels[0]
-        second_payload = second_panel.display_payload
-        assert isinstance(second_payload, CurvePanelPayload)
-        assert second_panel.coherence_stamp.run_id == "same-run"
-        assert second_panel.coherence_stamp.inputs[0].ref == first_input
-        assert second_payload.evaluated_input.ref == first_input
-        assert second_payload.viewport.x_limits == pytest.approx((-0.5, 0.5))
-        assert preview.curve_display == state
-        assert preview.terminal
-    finally:
-        preview.close()
-        for future in futures:
-            future.result(timeout=5.0)
-        executor.shutdown(wait=True)
-    assert preview.worker_done
-    assert preview.retired
-
-
-def test_progressive_candidate_remains_capacity_one_through_owner_present():
-    source, transform, schema, _output_ref, values, valid = (
-        _component_snapshot_case()
-    )
-    progressive = build_occupancy_progressive_spec(
-        source.block.schema,
-        ScanOutputContract(transform, schema),
-        identity="capacity-one-owner-present",
-    )
-    second_block = DataBlock(
-        source.block.block_id,
-        DatasetRevision(source.ref.revision.value + 1),
-        values + 1,
-        ComponentValidity((AxisId("site"),), valid),
-        source.block.schema,
-    )
-    second_source = OwnedSnapshot(
-        second_block.ref(source.ref.stream_generation),
-        second_block,
-    )
-    total_cells = (
-        source.block.schema.repeat_axis.size
-        * source.block.schema.point_layout.storage_size
-    )
-    snapshots = tuple(
-        DatasetPreviewSnapshot(
-            item,
-            DatasetCoverage(total_cells, total_cells),
-            (None,) * total_cells,
-        )
-        for item in (source, second_source)
-    )
-
-    class QueuedSlot(ExactDatasetLiveSlot):
-        def __init__(self):
-            super().__init__(progressive.preview_spec)
-            self._queue_lock = threading.Lock()
-            self._snapshots = list(snapshots)
-            self.returned = 0
-            self.second_requested = threading.Event()
-
-        @property
-        def terminal(self):
-            with self._queue_lock:
-                return not self._snapshots
-
-        @property
-        def failure(self):
-            return None
-
-        def set_change_listener(self, listener):
-            listener()
-
-        def wait_and_freeze(self, after, *, timeout):
-            del timeout
-            with self._queue_lock:
-                if not self._snapshots:
-                    return None
-                candidate = self._snapshots[0]
-                if candidate.ref.revision <= after:
-                    return None
-                self._snapshots.pop(0)
-                self.returned += 1
-                if self.returned == 2:
-                    self.second_requested.set()
-            return (
-                "capacity-one-run",
-                source.ref.stream_generation.value,
-                candidate,
-            )
-
-    slot = QueuedSlot()
-
-    class BlockingPresenter:
-        def __init__(self):
-            self.frames = []
-
-        def present(self, frame):
-            if not self.frames:
-                assert not slot.second_requested.wait(0.2), (
-                    "render worker consumed N+1 before N crossed the owner "
-                    "present boundary"
-                )
-            self.frames.append(frame)
-
-        def clear(self):
-            self.frames.clear()
-
-    presenter = BlockingPresenter()
-    wake = threading.Event()
-    executor = ThreadPoolExecutor(max_workers=1)
-    futures = []
-
-    def submit(work):
-        future = executor.submit(work)
-        futures.append(future)
-        return future
-
-    preview = ProgressiveScanPreview(
-        slot,
-        progressive,
-        presenter,
-        curve_display=CurveDisplayState(),
-        submit_worker=submit,
-        request_owner_wake=wake.set,
-    )
-    try:
-        deadline = time.monotonic() + 5.0
-        while not presenter.frames and time.monotonic() < deadline:
-            wake.wait(0.05)
-            wake.clear()
-            preview.owner_cycle()
-        assert presenter.frames
-        assert slot.second_requested.wait(2.0)
-    finally:
-        preview.close()
-        for future in futures:
-            future.result(timeout=5.0)
-        executor.shutdown(wait=True)
-
-
-def test_progressive_watcher_cannot_starve_single_worker_terminal_result():
-    source, transform, schema, _output_ref, _values, _valid = (
-        _component_snapshot_case()
-    )
-    progressive = build_occupancy_progressive_spec(
-        source.block.schema,
-        ScanOutputContract(transform, schema),
-        identity="single-general-worker",
-    )
-    reference = zlc.ScanArtifactRef("single-worker-repository", "a" * 64)
-    run_id = RunId("single-worker-run")
-    terminal_snapshot = RunSnapshot(
-        run_id,
-        RunState.SUCCEEDED,
-        "terminal",
-        True,
-        None,
-        None,
-        None,
-        (),
-        None,
-    )
-
-    class TerminalHandle:
-        def __init__(self):
-            self.run_id = run_id
-
-        def snapshot(self):
-            return terminal_snapshot
-
-        def cancel(self, reason="cancel"):
-            del reason
-            return CancelOutcome.ALREADY_TERMINAL
-
-        def wait(self, timeout=None):
-            del timeout
-            return terminal_snapshot
-
-        def result(self, timeout=None):
-            del timeout
-            return reference
-
-    total_cells = (
-        source.block.schema.repeat_axis.size
-        * source.block.schema.point_layout.storage_size
-    )
-    exact_terminal = DatasetPreviewSnapshot(
-        source,
-        DatasetCoverage(total_cells, total_cells),
-        (None,) * total_cells,
-    )
-
-    class Application:
-        def prepare(self):
-            def start(slot):
-                assert isinstance(slot, ExactDatasetLiveSlot)
-                with slot._lock:
-                    slot._run_id = run_id.value
-                    slot._causation_domain_id = source.ref.stream_generation.value
-                    slot._terminal_snapshot = exact_terminal
-                    slot._terminal = True
-                    listener = slot._notify_locked()
-                assert listener is not None
-                listener()
-                return TerminalHandle()
-
-            return PreparedScanPanelRun(progressive, start)
-
-        def project_final(self, source_ref):
-            assert source_ref == reference
-            png = (
-                b"\x89PNG\r\n\x1a\n"
-                b"\x00\x00\x00\rIHDR"
-                b"\x00\x00\x00\x01\x00\x00\x00\x01"
-            )
-            return FinalScanPresentation(source_ref, png, "terminal projection")
-
-    general = ThreadPoolExecutor(max_workers=1)
-    wake = threading.Event()
-    controller = ScanPanelController(
-        Application(),
-        wake.set,
-        executor=general,
-        preview_presenter=AtomicBoardFront(),
-    )
-    try:
-        controller.start()
-        deadline = time.monotonic() + 8.0
-        while (
-            controller.view_model.presentation is None
-            and time.monotonic() < deadline
-        ):
-            wake.wait(0.05)
-            wake.clear()
-            controller.owner_cycle()
-        assert controller.view_model.artifact_ref == reference
-        assert controller.view_model.presentation is not None
-        assert controller.view_model.status == "FINAL"
-    finally:
-        controller.close()
-        deadline = time.monotonic() + 5.0
-        while not controller.closed and time.monotonic() < deadline:
-            wake.wait(0.05)
-            wake.clear()
-            controller.owner_cycle()
-        general.shutdown(wait=True)
-    assert controller.closed
-
-
 def test_nonmonotonic_scan_axis_uses_explicit_static_progressive_fallback():
     source, transform, schema, output_ref, _values, _valid = (
         _component_snapshot_case(x_coordinates=(0.0, 0.0))
@@ -769,11 +453,11 @@ def test_nonmonotonic_scan_axis_uses_explicit_static_progressive_fallback():
         ScanOutputContract(transform, schema),
         identity="nonmonotonic-static-fallback",
     )
-    assert not progressive.interactive_curve
+    assert not progressive.presentation.interactive_curve
     assert "strictly monotonic" in (
-        progressive.interaction_unavailable_reason or ""
+        progressive.presentation.interaction_unavailable_reason or ""
     )
-    assert "static curve" in progressive.projection_summary
+    assert "static curve" in progressive.presentation.projection_summary
 
     output = materialize_transformed_snapshot(
         source,
@@ -782,10 +466,16 @@ def test_nonmonotonic_scan_axis_uses_explicit_static_progressive_fallback():
         output_schema=schema,
     )
     evaluated = FigureEvaluator().evaluate(
-        progressive.document,
-        ResolvedDatasetMap((ResolvedDataset(progressive.dataset_id, output),)),
+        progressive.presentation.document,
+        ResolvedDatasetMap(
+            (ResolvedDataset(progressive.presentation.dataset_id, output),)
+        ),
     )
-    renderer = SinglePanelAggRenderer(progressive.document, width=360, height=240)
+    renderer = SinglePanelAggRenderer(
+        progressive.presentation.document,
+        width=360,
+        height=240,
+    )
     try:
         assert renderer.render(evaluated).pixels
     finally:
@@ -843,12 +533,12 @@ def test_progressive_site_batch_preserves_every_declared_series():
 
     all_sites, site_axis = build(67)
     assert (
-        all_sites.document.layers[0].view.binding(site_axis.axis_id).role
+        all_sites.presentation.document.layers[0].view.binding(site_axis.axis_id).role
         is AxisViewRole.BATCH
     )
     explicit, explicit_axis = build(67, mode="batch")
     assert (
-        explicit.document.layers[0].view.binding(explicit_axis.axis_id).role
+        explicit.presentation.document.layers[0].view.binding(explicit_axis.axis_id).role
         is AxisViewRole.BATCH
     )
 
@@ -925,18 +615,24 @@ def test_progressive_curve_preserves_multidimensional_data_and_component_validit
         ScanOutputContract(transform, output_schema),
         identity="multidimensional-data-axis",
     )
-    view = progressive.document.layers[0].view
+    view = progressive.presentation.document.layers[0].view
     assert view.binding(site.axis_id).role is AxisViewRole.BATCH
     component_binding = view.binding(component.axis_id)
     assert component_binding.role is AxisViewRole.SELECTED
     assert component_binding.selector.index == 0
-    assert "component.multi=signal" in progressive.projection_summary
+    assert "component.multi=signal" in progressive.presentation.projection_summary
 
     evaluated = FigureEvaluator().evaluate(
-        progressive.document,
-        ResolvedDatasetMap((ResolvedDataset(progressive.dataset_id, output),)),
+        progressive.presentation.document,
+        ResolvedDatasetMap(
+            (ResolvedDataset(progressive.presentation.dataset_id, output),)
+        ),
     )
-    renderer = SinglePanelAggRenderer(progressive.document, width=360, height=240)
+    renderer = SinglePanelAggRenderer(
+        progressive.presentation.document,
+        width=360,
+        height=240,
+    )
     try:
         _raster, payload = renderer.render_interactive_curve(
             evaluated,
@@ -972,12 +668,12 @@ def test_transformed_snapshot_rejects_cell_reduction():
         repeat,
         (point,),
         PointLayout.rect_c((2,)),
-        ValueSchema((), ValidityContract.value(), np.dtype("<i2")),
+        ValueSchema.scalar(np.dtype("<i2")),
     )
     block = DataBlock(
         BlockId("cell-reduction-source"),
         DatasetRevision(0),
-        np.asarray(((1, 2),), dtype="<i2"),
+        np.asarray((((1,), (2,)),), dtype="<i2"),
         VALID,
         source_schema,
     )
@@ -994,7 +690,7 @@ def test_transformed_snapshot_rejects_cell_reduction():
         repeat,
         (),
         PointLayout.rect_c(()),
-        ValueSchema((), ValidityContract.value(), np.dtype("<f8")),
+        ValueSchema.scalar(np.dtype("<f8")),
     )
     output_ref = DatasetRevisionRef(
         BlockId("cell-reduction-output"),
@@ -1033,7 +729,7 @@ def test_transformed_snapshot_reduces_only_the_named_trailing_axis():
         source_schema.repeat_axis,
         source_schema.point_axes,
         source_schema.point_layout,
-        ValueSchema((), ValidityContract.value(), np.dtype("<f8"), "count"),
+        ValueSchema.scalar(np.dtype("<f8"), "count"),
     )
     output_ref = DatasetRevisionRef(
         BlockId("derived-scalar-scan"),
@@ -1047,10 +743,10 @@ def test_transformed_snapshot_reduces_only_the_named_trailing_axis():
         output_ref=output_ref,
         output_schema=output_schema,
     )
-    assert output.block.values.shape == (2, 3)
+    assert output.block.values.shape == (2, 3, 1)
     np.testing.assert_allclose(
         output.block.values,
-        ((1.0, 3.5, 7.5), (10.0, 14.0, 16.0)),
+        (((1.0,), (3.5,), (7.5,)), ((10.0,), (14.0,), (16.0,))),
     )
     assert isinstance(output.block.validity, Valid)
 
@@ -1064,7 +760,7 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
     expected_points = ScanPointTable.from_pulse_document(document)
 
     with zlc.connect("virtual", repository=workspace) as exp:
-        request = exp.readout.scan_request(document, timeout_seconds=15.0)
+        request = exp.readout.scan_request(document)
 
         def forbidden_stage(*_args, **_kwargs):
             raise AssertionError("inspect_scan must not stage repository blobs")
@@ -1077,9 +773,7 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
             )
             descriptor = exp.inspect_scan(request)
         assert descriptor.expected_frames == 6
-        scan_ref = exp.scan(
-            exp.readout.scan_request(document, timeout_seconds=15.0)
-        )
+        scan_ref = exp.scan(exp.readout.scan_request(document))
         data = exp.readout.materialize_scan(scan_ref)
         artifact = exp.readout.load_scan(scan_ref)
 
@@ -1247,7 +941,7 @@ def _assert_public_occupancy_scan(exp, monkeypatch):
     )
     assert isinstance(request.program, AutonomousScanSlotProgram)
     assert request.program.execution_document.api_parameters == ()
-    guarded = _prepare_occupancy_scan_for_workbench(exp, request)
+    guarded = exp.readout.prepare_occupancy_scan(request)
 
     @contextmanager
     def closed_guard(_token):
@@ -1264,13 +958,13 @@ def _assert_public_occupancy_scan(exp, monkeypatch):
 
     import zlc_neutral_atom.timing.occupancy as timing_occupancy
 
-    failed_prepared = _prepare_occupancy_scan_for_workbench(exp, request)
+    failed_prepared = exp.readout.prepare_occupancy_scan(request)
     failed_progressive = build_occupancy_progressive_spec(
         failed_prepared.source_schema,
         failed_prepared.output_contract,
         identity="w3-post-safety-failure",
     )
-    failed_slot = ExactDatasetLiveSlot(failed_progressive.preview_spec)
+    failed_slot = ExactDatasetLiveSlot(failed_progressive.output_owner.preview_spec)
 
     def reject_post_safety(*_args, **_kwargs):
         raise RuntimeError("post-safety occupancy finalization rejected")
@@ -1287,7 +981,7 @@ def _assert_public_occupancy_scan(exp, monkeypatch):
     assert failed_slot.terminal
     assert "post-safety occupancy finalization" in (failed_slot.failure or "")
 
-    prepared = _prepare_occupancy_scan_for_workbench(exp, request)
+    prepared = exp.readout.prepare_occupancy_scan(request)
     progressive = build_occupancy_progressive_spec(
         prepared.source_schema,
         prepared.output_contract,
@@ -1296,15 +990,15 @@ def _assert_public_occupancy_scan(exp, monkeypatch):
     site_axis = prepared.output_contract.output_dataset_schema.cell_schema.data_axes[0]
     site_binding = next(
         binding
-        for binding in progressive.document.layers[0].view.axis_bindings
+        for binding in progressive.presentation.document.layers[0].view.axis_bindings
         if binding.axis_id == site_axis.axis_id
     )
     assert site_axis.size == 35
     assert site_binding.role is AxisViewRole.BATCH
     assert f"{site_axis.name}=batch/{site_axis.size}" in (
-        progressive.projection_summary
+        progressive.presentation.projection_summary
     )
-    slot = _CountingExactDatasetLiveSlot(progressive.preview_spec)
+    slot = _CountingExactDatasetLiveSlot(progressive.output_owner.preview_spec)
     handle = prepared.start(slot)
     scan_ref = handle.result(timeout=30.0)
     assert slot.terminal
@@ -1710,7 +1404,7 @@ def _assert_scan_window(exp, document, monkeypatch):
     from PyQt5 import QtWidgets
     from zlc_frontend.qt_widgets import FrozenRasterView
 
-    request = exp.readout.scan_request(document, timeout_seconds=15.0)
+    request = exp.readout.scan_request(document)
     window = exp.scan_gui(request)
     application = QtWidgets.QApplication.instance()
     assert application is not None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+from io import BytesIO
 import math
 import threading
 import warnings
@@ -100,7 +101,9 @@ from ._mpl_common import (
     _agg_chrome_key,
     _agg_layout_key,
     _fit_status,
+    _raster_from_drawn_agg,
     _render_dpi,
+    raster_from_agg,
     release_agg_figure,
 )
 
@@ -525,14 +528,13 @@ def _image_panel_fit_annotation(
         raise ValueError("radial fit viewport mapping produced anisotropic geometry")
     return projected_center, projected_diameters[0] / 2.0, None, title
 
-def save_image_panel_png(
+def encode_image_panel_png(
     payload: ImagePanelPayload,
     display: ImageDisplayState,
-    destination,
     *,
     dpi: float = 100.0,
-) -> None:
-    """Save one exact current IMAGE front without re-evaluation or fit authority.
+) -> bytes:
+    """Encode one exact current IMAGE front without re-evaluation or fit authority.
 
     The committed viewport, colormap, effective colour limits, and value unit
     all come from the exact payload/display pair.  An attached immutable radial
@@ -549,6 +551,7 @@ def save_image_panel_png(
     from matplotlib.figure import Figure
 
     figure = None
+    output = BytesIO()
     try:
         with render_style_context():
             figure = Figure(figsize=(5.0, 4.0), dpi=dpi, constrained_layout=True)
@@ -568,12 +571,13 @@ def save_image_panel_png(
             )
             if title is not None:
                 axis.set_title(title)
-            figure.savefig(destination, format="png", dpi=dpi)
+            figure.savefig(output, format="png", dpi=dpi)
     finally:
         if figure is not None:
             release_agg_figure(figure)
         figure = None
         gc.collect()
+    return output.getvalue()
 
 def render_radial_gaussian_image_fit_panels(
     panels: tuple[RadialGaussianImageFitPanel, ...],
@@ -625,17 +629,16 @@ def render_radial_gaussian_image_fit_panels(
             gc.collect()
             raise
 
-def save_radial_gaussian_image_fit_panels(
+def encode_radial_gaussian_image_fit_panels(
     panels: tuple[RadialGaussianImageFitPanel, ...],
     display: ImageDisplayState,
     current_color_limits: tuple[float, float],
-    destination,
     *,
     image_format: str,
     columns: int,
     dpi: float = 100.0,
-) -> None:
-    """Save the exact committed typed page/focus display.
+) -> bytes:
+    """Encode the exact committed typed page/focus display.
 
     Viewport, colormap, shared limits, saved-fit overlay, status, and frozen
     board columns are preserved for PNG/PDF/SVG/JPEG.  A transient rectangle
@@ -648,6 +651,7 @@ def save_radial_gaussian_image_fit_panels(
     if image_format not in {"png", "pdf", "svg", "jpg", "jpeg"}:
         raise ValueError("radial image export format must be png, pdf, svg, jpg, or jpeg")
     figure = None
+    output = BytesIO()
     try:
         figure = render_radial_gaussian_image_fit_panels(
             panels,
@@ -657,12 +661,13 @@ def save_radial_gaussian_image_fit_panels(
             dpi=dpi,
         )
         with render_style_context():
-            figure.savefig(destination, format=image_format, dpi=dpi)
+            figure.savefig(output, format=image_format, dpi=dpi)
     finally:
         if figure is not None:
             release_agg_figure(figure)
         figure = None
         gc.collect()
+    return output.getvalue()
 
 def _decimate_image_view(
     grid: np.ndarray,
@@ -781,11 +786,62 @@ def _normalized_axis_bbox(axis, width: int, height: int):
     )
 
 
+class _ImageAxesBlitCache:
+    """Keep unchanged side bands while redrawing one complete image Axes.
+
+    A viewport changes the image axes limits, ticks and (with equal/box) its
+    physical bbox, but it does not change the distribution or colourbar for
+    the same immutable source revision.  Main mutates that one persistent Axes
+    in place.  The worker equivalent captures the Figure with only that Axes
+    hidden, then restores the owned background and asks Matplotlib to draw the
+    complete Axes -- image, ticks, labels, title and vector overlays -- for
+    every subsequent viewport.  No old image pixels are transformed or
+    previewed by Qt.
+    """
+
+    __slots__ = ("_axis", "_background", "_background_key")
+
+    def __init__(self, axis) -> None:
+        self._axis = axis
+        self._background = None
+        self._background_key = None
+
+    def clear(self) -> None:
+        self._background = None
+        self._background_key = None
+
+    def raster(self, figure, *, background_key, physical_size) -> RasterBuffer:
+        try:
+            if background_key != self._background_key:
+                self.clear()
+                self._background_key = background_key
+            if self._background is None:
+                visible = bool(self._axis.get_visible())
+                try:
+                    self._axis.set_visible(False)
+                    figure.canvas.draw()
+                    self._background = figure.canvas.copy_from_bbox(figure.bbox)
+                finally:
+                    self._axis.set_visible(visible)
+            figure.canvas.restore_region(self._background)
+            self._axis.draw(figure.canvas.get_renderer())
+            return _raster_from_drawn_agg(
+                figure,
+                physical_size=physical_size,
+            )
+        except BaseException:
+            # This is only an optimisation boundary.  A backend that cannot
+            # restore/draw one Axes still returns the ordinary exact raster.
+            self.clear()
+            return raster_from_agg(figure, physical_size=physical_size)
+
+
 class ImagePanelAggRenderer:
     """Worker-affine full-panel image renderer using main's exact visible owner."""
 
     __slots__ = (
         "_axis",
+        "_axes_blit_cache",
         "_bin_count",
         "_blit_cache",
         "_colorbar",
@@ -803,6 +859,8 @@ class ImagePanelAggRenderer:
         "_image_artist",
         "_layout",
         "_limit_lines",
+        "_last_side_key",
+        "_last_viewport_key",
         "_owner_thread",
         "_render_count",
         "_site_map",
@@ -973,6 +1031,7 @@ class ImagePanelAggRenderer:
         self._fit_diagnostic_artist = fit_diagnostic_artist
         self._fit_ring_artist = fit_ring_artist
         self._axis = axis
+        self._axes_blit_cache = _ImageAxesBlitCache(axis)
         self._blit_cache = _AggBlitCache()
         self._distribution = distribution
         self._image_artist = image_artist
@@ -982,6 +1041,8 @@ class ImagePanelAggRenderer:
         self._distribution_cache_value = None
         self._guide_lines = guide_lines
         self._limit_lines = limit_lines
+        self._last_side_key = None
+        self._last_viewport_key = None
         self._colorbar = colorbar
         self._colorbar_state = None
         self._site_artist = site_artist
@@ -1044,9 +1105,28 @@ class ImagePanelAggRenderer:
             else:
                 display_values = np.asarray(values, dtype=np.float64).copy()
                 display_values[~finite_validity] = np.nan
+            colormap_name = str(display.colormap.value)
+            if self._image_artist.get_cmap().name != colormap_name:
+                cmap = matplotlib.colormaps[colormap_name].copy()
+                cmap.set_bad(PALETTE["bad"])
+                self._image_artist.set_cmap(cmap)
+            else:
+                cmap = self._image_artist.get_cmap()
+            if tuple(float(value) for value in self._image_artist.get_clim()) != tuple(
+                float(value) for value in color_limits
+            ):
+                self._image_artist.set_clim(*color_limits)
+            self._axis.set_xlim(*x_limits)
+            self._axis.set_ylim(*y_limits)
+            # ``equal`` + ``adjustable='box'`` makes the actual data box a
+            # function of this viewport.  Resolve that box before decimating:
+            # the worker then samples only to the pixels this exact draw can
+            # show, and the published selector geometry comes from the same
+            # post-draw bbox below.
+            self._axis.apply_aspect()
             display_pixel_shape = (
-                max(1, round(self._layout.image.width * width)),
-                max(1, round(self._layout.image.height * height)),
+                max(1, round(float(self._axis.bbox.width))),
+                max(1, round(float(self._axis.bbox.height))),
             )
             shown, shown_extent = _decimate_image_view(
                 display_values,
@@ -1055,21 +1135,8 @@ class ImagePanelAggRenderer:
                 visible_y_limits,
                 display_pixel_shape,
             )
-            colormap_name = str(display.colormap.value)
-            if self._image_artist.get_cmap().name != colormap_name:
-                cmap = matplotlib.colormaps[colormap_name].copy()
-                cmap.set_bad(PALETTE["bad"])
-                self._image_artist.set_cmap(cmap)
-            else:
-                cmap = self._image_artist.get_cmap()
             self._image_artist.set_data(shown)
             self._image_artist.set_extent(shown_extent)
-            if tuple(float(value) for value in self._image_artist.get_clim()) != tuple(
-                float(value) for value in color_limits
-            ):
-                self._image_artist.set_clim(*color_limits)
-            self._axis.set_xlim(*x_limits)
-            self._axis.set_ylim(*y_limits)
             self._axis.set_xlabel(_axis_label(image.x_axis))
             self._axis.set_ylabel(_axis_label(image.y_axis))
             if title:
@@ -1206,35 +1273,68 @@ class ImagePanelAggRenderer:
                     self._colorbar.formatter = ScalarFormatter()
                     self._colorbar.update_ticks()
                 self._colorbar_state = colorbar_state
-            raster = self._blit_cache.raster(
-                self._figure,
-                (
-                    self._image_artist,
-                    self._distribution_artist,
-                    *self._guide_lines,
-                    *self._limit_lines,
-                    self._site_artist,
-                    self._fit_center_artist,
-                    self._fit_ring_artist,
-                    self._fit_diagnostic_artist,
-                ),
-                layout_key=_agg_layout_key(
-                    self._figure,
-                    extra=(self._site_map,),
-                ),
-                chrome_key=_agg_chrome_key(
-                    self._figure,
-                    extra=(
-                        self._site_map,
-                        str(display.colormap.value),
-                        tuple(float(value) for value in color_limits),
-                        str(value_label),
-                        bool(endpoints_enabled),
-                        self._count_ceiling,
-                    ),
-                ),
-                physical_size=self._size,
+            side_key = (
+                distribution_identity,
+                bin_count,
+                str(display.colormap.value),
+                tuple(float(value) for value in color_limits),
+                None
+                if data_range is None
+                else tuple(float(value) for value in data_range),
+                bool(distribution_guides),
+                str(value_label),
+                bool(endpoints_enabled),
+                self._count_ceiling,
             )
+            viewport_key = (
+                tuple(float(value) for value in x_limits),
+                tuple(float(value) for value in y_limits),
+            )
+            viewport_only = (
+                distribution_identity is not None
+                and side_key == self._last_side_key
+                and viewport_key != self._last_viewport_key
+            )
+            if viewport_only:
+                raster = self._axes_blit_cache.raster(
+                    self._figure,
+                    background_key=side_key,
+                    physical_size=self._size,
+                )
+            else:
+                if side_key != self._last_side_key:
+                    self._axes_blit_cache.clear()
+                raster = self._blit_cache.raster(
+                    self._figure,
+                    (
+                        self._image_artist,
+                        self._distribution_artist,
+                        *self._guide_lines,
+                        *self._limit_lines,
+                        self._site_artist,
+                        self._fit_center_artist,
+                        self._fit_ring_artist,
+                        self._fit_diagnostic_artist,
+                    ),
+                    layout_key=_agg_layout_key(
+                        self._figure,
+                        extra=(self._site_map,),
+                    ),
+                    chrome_key=_agg_chrome_key(
+                        self._figure,
+                        extra=(
+                            self._site_map,
+                            str(display.colormap.value),
+                            tuple(float(value) for value in color_limits),
+                            str(value_label),
+                            bool(endpoints_enabled),
+                            self._count_ceiling,
+                        ),
+                    ),
+                    physical_size=self._size,
+                )
+            self._last_side_key = side_key
+            self._last_viewport_key = viewport_key
             actual_width, actual_height = raster.width, raster.height
             # ``aspect='equal', adjustable='box'`` can shrink the live image
             # axes after limits change.  The drawn Agg bbox is therefore the
@@ -1395,6 +1495,7 @@ class ImagePanelAggRenderer:
         figure, self._figure = self._figure, None
         if figure is None:
             return
+        self._axes_blit_cache.clear()
         self._blit_cache.clear()
         self._distribution_cache_key = None
         self._distribution_cache_value = None
@@ -1408,8 +1509,8 @@ class ImagePanelAggRenderer:
             raise RuntimeError("image-panel Agg renderer is closed")
 
 __all__ = [
-    "save_image_panel_png",
+    "encode_image_panel_png",
+    "encode_radial_gaussian_image_fit_panels",
     "render_radial_gaussian_image_fit_panels",
-    "save_radial_gaussian_image_fit_panels",
     "ImagePanelAggRenderer",
 ]

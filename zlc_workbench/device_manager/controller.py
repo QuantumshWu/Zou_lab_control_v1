@@ -130,12 +130,17 @@ class DeviceManagerController(QtCore.QObject):
         self.document_replaced.emit()
 
     def new_virtual(self) -> None:
-        self.switch_backend("virtual")
+        self._replace_new("virtual")
         self.status_changed.emit("new virtual installation draft", "info")
 
     def new_remote_pulse(self) -> None:
-        self.switch_backend("remote_pulse")
+        self._replace_new("remote_pulse")
         self.status_changed.emit("new remote pulse installation draft", "info")
+
+    def _replace_new(self, backend: str) -> None:
+        self._field_errors.clear()
+        self.editor.replace_new(backend)
+        self.document_replaced.emit()
 
     def load_file(self, path: str | Path) -> None:
         document = load_installation_config(path)
@@ -204,6 +209,10 @@ class DeviceManagerController(QtCore.QObject):
     def close(self) -> None:
         if self._disposed:
             return
+        if self._busy:
+            raise RuntimeError(
+                "cannot close Device manager while a device operation is active"
+            )
         self._disposed = True
         self._admin.dispose()
 

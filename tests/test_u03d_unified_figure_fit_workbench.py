@@ -17,7 +17,7 @@ import pytest
 
 import Zou_lab_control.notebook as zlc
 from Zou_lab_control.workbench import open_figure_workbench
-from Zou_lab_control.workbench._figure import DataFigureWindow
+from zlc_workbench.data_figure.window import DataFigureWindow
 from zlc_data import (
     REPEAT,
     SCAN_POINT,

@@ -1,10 +1,28 @@
 from __future__ import annotations
 
+import fnmatch
 from pathlib import Path
+import subprocess
 
 import pytest
 
 import conftest as migration_gate
+
+
+def _current_test_files() -> set[str]:
+    listing = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+        cwd=migration_gate.REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {
+        relative.replace("\\", "/")
+        for relative in listing.stdout.splitlines()
+        if fnmatch.fnmatch(relative.replace("\\", "/"), "tests/test_*.py")
+        and (migration_gate.REPO_ROOT / relative).is_file()
+    }
 
 
 def _write_manifest(root: Path, text: str) -> Path:
@@ -23,6 +41,14 @@ def test_tracked_manifest_is_canonical_unique_and_contains_gate() -> None:
     assert Path(__file__).resolve() in active
     assert all(path.is_file() for path in active)
     assert all(path.parent == migration_gate.REPO_ROOT / "tests" for path in active)
+
+
+def test_manifest_exactly_covers_the_current_test_files() -> None:
+    active = {
+        path.relative_to(migration_gate.REPO_ROOT).as_posix()
+        for path in migration_gate.load_active_test_paths()
+    }
+    assert active == _current_test_files()
 
 
 @pytest.mark.parametrize(

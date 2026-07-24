@@ -45,9 +45,6 @@ MUTED_LABEL_STYLE = f"color: {GREY}; background: transparent; border: none;"
 # 7.5 pt / 6.5 pt text in the established 210 dpi panel raster.  Feeding those
 # painted heights back into ``QFont.setPixelSize`` made Qt's lines 30/26 px and
 # overflowed the same fixed FigureSpec/Divider bottom margin.
-PLOT_AXIS_LABEL_FONT_PX = 16
-PLOT_TICK_FONT_PX = 14
-PLOT_TICK_LENGTH_PX = 7
 RADIUS = 4
 CARD_TITLE_PX = 32
 CARD_PAD = 10
@@ -77,31 +74,6 @@ WINDOW_TITLEBAR_FLOOR_PX = 28
 WINDOW_MAX_FLOOR_PX = (360, 320)
 WINDOW_SCREEN_FRACTION = 0.90
 
-# PulseTimelineWidget is a Qt/QPainter surface, not a Matplotlib renderer.
-TIMELINE_BACKGROUND = "#FCFCFD"
-TIMELINE_EMPTY_TEXT = "#657080"
-TIMELINE_TITLE_TEXT = "#354052"
-TIMELINE_AXIS_TEXT = "#7A8494"
-TIMELINE_PERIOD_BACKGROUNDS = ("#EDF3FF", "#F4F7FB")
-TIMELINE_PERIOD_TEXT = "#536078"
-TIMELINE_GRID = "#D8DDE6"
-TIMELINE_ROW_TEXT = "#253047"
-TIMELINE_ACTIVE_FILL_RGBA = (72, 128, 232, 34)
-TIMELINE_TRACE = "#2867C7"
-TIMELINE_REPEAT = "#8B5CF6"
-
-RASTER_PLACEHOLDER_BACKGROUND = "#111111"
-RASTER_PLACEHOLDER_TEXT = "#BBBBBB"
-
-def raster_placeholder_stylesheet() -> str:
-    """Return the one Qt placeholder-surface stylesheet."""
-
-    return (
-        f"background: {RASTER_PLACEHOLDER_BACKGROUND}; "
-        f"color: {RASTER_PLACEHOLDER_TEXT};"
-    )
-
-
 __all__ = [
     "ACCENT",
     "API_VIOLET",
@@ -128,29 +100,12 @@ __all__ = [
     "PADDING_H",
     "PADDING_V",
     "PLACEHOLDER",
-    "PLOT_AXIS_LABEL_FONT_PX",
-    "PLOT_TICK_FONT_PX",
-    "PLOT_TICK_LENGTH_PX",
-    "RASTER_PLACEHOLDER_BACKGROUND",
-    "RASTER_PLACEHOLDER_TEXT",
     "RADIUS",
     "RED",
     "STEP_WIDTH",
     "TEXT",
-    "TIMELINE_ACTIVE_FILL_RGBA",
-    "TIMELINE_AXIS_TEXT",
-    "TIMELINE_BACKGROUND",
-    "TIMELINE_EMPTY_TEXT",
-    "TIMELINE_GRID",
-    "TIMELINE_PERIOD_BACKGROUNDS",
-    "TIMELINE_PERIOD_TEXT",
-    "TIMELINE_REPEAT",
-    "TIMELINE_ROW_TEXT",
-    "TIMELINE_TITLE_TEXT",
-    "TIMELINE_TRACE",
     "TITLE_LEFT_INSET",
     "WINDOW_PAD",
     "WINDOW_SCREEN_FRACTION",
     "YELLOW",
-    "raster_placeholder_stylesheet",
 ]

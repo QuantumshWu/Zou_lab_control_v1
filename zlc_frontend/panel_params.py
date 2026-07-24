@@ -10,82 +10,60 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from zlc_data.param_decl import ParamDecl
+from .form import FormFieldProps, FormSpec, choice_value_from_tree
+from .histogram_display import histogram_display_form_spec
+from .image_display import image_display_form_spec
 
-from .render_style import PALETTE
-
-__all__ = ["CMAPS", "PANEL_PARAMS", "panel_param_decls", "resolved_panel_param"]
-
-
-CMAPS = ("inferno", "viridis", "magma", "plasma", "gray", "coolwarm")
+__all__ = ["PANEL_PARAMS", "panel_param_decls", "resolved_panel_param"]
 
 
-PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
+def _canonical_field(spec: FormSpec, key: str) -> FormFieldProps:
+    matches = tuple(field for field in spec.fields if field.key == key)
+    if len(matches) != 1:
+        raise RuntimeError(f"canonical form has no unique field {key!r}")
+    return matches[0]
+
+
+_IMAGE_COLORMAP = _canonical_field(image_display_form_spec(), "colormap")
+_HISTOGRAM_BIN_COUNT = _canonical_field(
+    histogram_display_form_spec(),
+    "bin_count",
+)
+_HISTOGRAM_COUNT_SCALE = _canonical_field(
+    histogram_display_form_spec(),
+    "count_scale",
+)
+_HISTOGRAM_FIT_MODE = _canonical_field(
+    histogram_display_form_spec(),
+    "fit_mode",
+)
+
+
+PANEL_PARAMS: dict[str, tuple[FormFieldProps, ...]] = {
     "2d": (
-        ParamDecl(
-            key="colormap",
-            label="colormap",
-            kind="choice",
-            default=PALETTE["cmap_scan"],
-            choices=CMAPS,
-            tooltip="Image colormap",
-            display=True,
-        ),
+        _IMAGE_COLORMAP,
     ),
     "sites": (
-        ParamDecl(
-            key="colormap",
-            label="colormap",
-            kind="choice",
-            default=PALETTE["cmap_camera"],
-            choices=CMAPS,
-            tooltip="Colormap for the exact same-shot camera underlay",
-            display=True,
-        ),
+        _IMAGE_COLORMAP,
     ),
     "monitor": (
-        ParamDecl(
+        FormFieldProps(
             key="show_dist",
-            label="side distribution",
             kind="bool",
+            label="side distribution",
             default=True,
-            display=True,
-            tooltip="Show the side distribution histogram beside the rolling trace",
+            description="Show the side distribution histogram beside the rolling trace",
         ),
     ),
     "hist": (
-        ParamDecl(
-            key="bins",
-            label="bins",
-            kind="int",
-            default=60,
-            lo=5,
-            hi=500,
-            display=True,
-            tooltip="Histogram bins",
-        ),
-        ParamDecl(
-            key="ylog",
-            label="log count",
-            kind="bool",
-            default=False,
-            display=True,
-            tooltip="Use a logarithmic count axis",
-        ),
-        ParamDecl(
-            key="fit",
-            label="fit",
-            kind="choice",
-            default="double",
-            choices=("none", "single", "double"),
-            display=True,
-            tooltip="Bounded presentation fit drawn over the distribution",
-        ),
+        _HISTOGRAM_BIN_COUNT,
+        _HISTOGRAM_COUNT_SCALE,
+        _HISTOGRAM_FIT_MODE,
     ),
 }
 
 
-def panel_param_decls(param_kind: str) -> tuple[ParamDecl, ...]:
+def panel_param_decls(param_kind: str) -> tuple[FormFieldProps, ...]:
     """Return the exact render-consumed parameter declarations for one kind."""
 
     return PANEL_PARAMS.get(str(param_kind), ())
@@ -103,4 +81,11 @@ def resolved_panel_param(
         declaration = next(item for item in declarations if item.key == key)
     except StopIteration as error:
         raise KeyError(f"panel kind {param_kind!r} has no parameter {key!r}") from error
-    return params[key] if key in params else declaration.default
+    if key not in params:
+        return declaration.default
+    value = params[key]
+    return (
+        choice_value_from_tree(declaration, value)
+        if declaration.kind == "choice"
+        else value
+    )

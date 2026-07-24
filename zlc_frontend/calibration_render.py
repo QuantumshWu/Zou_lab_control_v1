@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
 import gc
 from io import BytesIO
 import math
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 from matplotlib import colormaps
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Circle, Rectangle
-
-from zlc_storage import canonical_text
 
 from .encoded_raster import (
     EncodedRasterDocument,
@@ -36,29 +34,12 @@ from .render_style import (
 
 
 _SCREEN_DPI = 150
-def _array(value, dtype, shape, field_name, *, finite: bool = False):
-    result = np.asarray(value, dtype=dtype)
-    if result.shape != shape:
-        raise ValueError(f"{field_name} must have shape {shape}, got {result.shape}")
-    if finite and not np.all(np.isfinite(result)):
-        raise ValueError(f"{field_name} must be finite")
-    if result.flags.writeable:
-        result = np.array(result, copy=True)
-        result.setflags(write=False)
-    return result
 
 
-def _metric(value: object, field_name: str) -> float:
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.number)):
-        raise TypeError(f"{field_name} must be numeric")
-    result = float(value)
-    if math.isinf(result):
-        raise ValueError(f"{field_name} must be finite or NaN")
-    return result
+@runtime_checkable
+class CalibrationModelView(Protocol):
+    """Structural renderer input; calibration owns every physical value."""
 
-
-@dataclass(frozen=True, eq=False)
-class CalibrationModelView:
     label: str
     is_default: bool
     signals: np.ndarray
@@ -73,69 +54,15 @@ class CalibrationModelView:
     bright_above: np.ndarray
     model_fidelity: np.ndarray
     heldout_fidelity: np.ndarray
+    runtime_model_fidelity_mean: float
     aggregate_fidelity: float
     global_fidelity: float
 
-    def __post_init__(self) -> None:
-        canonical_text(self.label, "model label")
-        if type(self.is_default) is not bool:
-            raise TypeError("is_default must be bool")
-        signals = np.asarray(self.signals, dtype="<f8")
-        if signals.ndim != 2:
-            raise ValueError("model signals must have shape (groups, sites)")
-        shape = signals.shape
-        sites = shape[1]
-        object.__setattr__(self, "signals", _array(signals, "<f8", shape, "signals"))
-        object.__setattr__(
-            self,
-            "signal_validity",
-            _array(self.signal_validity, "bool", shape, "signal_validity"),
-        )
-        edges = np.asarray(self.bin_edges, dtype="<f8")
-        if edges.ndim != 1 or edges.size < 3 or not np.all(np.diff(edges) > 0):
-            raise ValueError("bin_edges must be one strictly increasing axis")
-        object.__setattr__(self, "bin_edges", _array(edges, "<f8", edges.shape, "bin_edges", finite=True))
-        for name, dtype in (
-            ("quick_thresholds", "<f8"),
-            ("formal_thresholds", "<f8"),
-            ("runtime_thresholds", "<f8"),
-            ("feature_validity", "bool"),
-            ("runtime_usable", "bool"),
-            ("bright_above", "bool"),
-            ("model_fidelity", "<f8"),
-            ("heldout_fidelity", "<f8"),
-        ):
-            object.__setattr__(
-                self,
-                name,
-                _array(getattr(self, name), dtype, (sites,), name),
-            )
-        sources = tuple(self.runtime_threshold_sources)
-        if len(sources) != sites or any(
-            source not in ("formal", "quick-fallback") for source in sources
-        ):
-            raise ValueError(
-                "runtime_threshold_sources must identify every site as formal "
-                "or quick-fallback"
-            )
-        if np.any(self.runtime_usable & ~np.isfinite(self.runtime_thresholds)):
-            raise ValueError("runtime-usable sites require finite thresholds")
-        if np.any(self.runtime_usable & ~self.feature_validity):
-            raise ValueError("runtime-usable sites must be feature-valid")
-        object.__setattr__(self, "runtime_threshold_sources", sources)
-        object.__setattr__(
-            self,
-            "aggregate_fidelity",
-            _metric(self.aggregate_fidelity, "aggregate_fidelity"),
-        )
-        object.__setattr__(
-            self,
-            "global_fidelity",
-            _metric(self.global_fidelity, "global_fidelity"),
-        )
 
-@dataclass(frozen=True, eq=False)
-class CalibrationReportView:
+@runtime_checkable
+class CalibrationReportView(Protocol):
+    """Structural presentation contract implemented by the domain projection."""
+
     reference_average: np.ndarray
     reference_average_validity: np.ndarray
     actual_centers_xy: np.ndarray
@@ -150,119 +77,9 @@ class CalibrationReportView:
     label_validity: np.ndarray
     models: tuple[CalibrationModelView, ...]
     psf_kernels: np.ndarray | None = None
-    psf_caption: str | None = None
+    psf_mode: str | None = None
     psf_fit_ok: np.ndarray | None = None
     psf_sigma_xy: np.ndarray | None = None
-
-    def __post_init__(self) -> None:
-        image = np.asarray(self.reference_average, dtype="<f8")
-        if image.ndim != 2:
-            raise ValueError("reference_average must be a two-dimensional image")
-        image = _array(image, "<f8", image.shape, "reference_average", finite=True)
-        validity = _array(
-            self.reference_average_validity,
-            "bool",
-            image.shape,
-            "reference_average_validity",
-        )
-        centers = np.asarray(self.actual_centers_xy, dtype="<f8")
-        if centers.ndim != 2 or centers.shape[1:] != (2,):
-            raise ValueError("actual_centers_xy must have shape (sites, 2)")
-        centers = _array(centers, "<f8", centers.shape, "actual_centers_xy", finite=True)
-        sites = centers.shape[0]
-        raw_grid = tuple(self.grid_shape_yx)
-        if (
-            len(raw_grid) != 2
-            or any(type(item) is not int or item <= 0 for item in raw_grid)
-            or math.prod(raw_grid) != sites
-        ):
-            raise ValueError("grid_shape_yx must be two positive axes covering every site")
-        labels = tuple(self.site_labels)
-        if len(labels) != sites:
-            raise ValueError("site_labels must contain one label per site")
-        for label in labels:
-            canonical_text(label, "site label")
-        positions = tuple(tuple(position) for position in self.site_grid_positions_yx)
-        if (
-            len(positions) != sites
-            or any(
-                len(position) != 2
-                or any(type(index) is not int for index in position)
-                for position in positions
-            )
-            or set(positions)
-            != {
-                (row, column)
-                for row in range(raw_grid[0])
-                for column in range(raw_grid[1])
-            }
-        ):
-            raise ValueError(
-                "site_grid_positions_yx must be a bijection over the declared grid"
-            )
-        expected = self.expected_centers_xy
-        if expected is not None:
-            expected = _array(
-                expected,
-                "<f8",
-                centers.shape,
-                "expected_centers_xy",
-                finite=True,
-            )
-        models = tuple(self.models)
-        if (
-            not models
-            or any(not isinstance(model, CalibrationModelView) for model in models)
-            or len({model.label for model in models}) != len(models)
-            or sum(model.is_default for model in models) != 1
-        ):
-            raise ValueError("models must be unique and name exactly one default")
-        group_shape = models[0].signals.shape
-        if group_shape[1] != sites or any(model.signals.shape != group_shape for model in models):
-            raise ValueError("every model must use the same declared group/site axes")
-        for name in ("occupied_labels", "dark_labels", "label_validity"):
-            object.__setattr__(
-                self,
-                name,
-                _array(getattr(self, name), "bool", group_shape, name),
-            )
-        if np.any(self.occupied_labels & self.dark_labels) or np.any(
-            (self.occupied_labels | self.dark_labels) & ~self.label_validity
-        ):
-            raise ValueError("reference population labels are inconsistent")
-        kernels = self.psf_kernels
-        fit_ok = self.psf_fit_ok
-        sigma = self.psf_sigma_xy
-        if kernels is None:
-            if self.psf_caption is not None or fit_ok is not None or sigma is not None:
-                raise ValueError("PSF fit diagnostics require empirical kernels")
-        else:
-            canonical_text(self.psf_caption, "PSF caption")
-            kernels = np.asarray(kernels, dtype="<f8")
-            if kernels.ndim != 3 or kernels.shape[0] != sites:
-                raise ValueError("psf_kernels must have shape (sites, y, x)")
-            kernels = _array(kernels, "<f8", kernels.shape, "psf_kernels", finite=True)
-            fit_ok = _array(fit_ok, "bool", (sites,), "psf_fit_ok")
-            sigma = _array(sigma, "<f8", (sites, 2), "psf_sigma_xy")
-        object.__setattr__(self, "reference_average", image)
-        object.__setattr__(self, "reference_average_validity", validity)
-        object.__setattr__(self, "actual_centers_xy", centers)
-        object.__setattr__(self, "expected_centers_xy", expected)
-        object.__setattr__(self, "site_validity", _array(self.site_validity, "bool", (sites,), "site_validity"))
-        object.__setattr__(self, "default_boxes_xywh", _array(self.default_boxes_xywh, "<i8", (sites, 4), "default_boxes_xywh"))
-        object.__setattr__(self, "grid_shape_yx", raw_grid)
-        object.__setattr__(self, "site_grid_positions_yx", positions)
-        object.__setattr__(self, "site_labels", labels)
-        object.__setattr__(self, "models", models)
-        object.__setattr__(self, "psf_kernels", kernels)
-        object.__setattr__(self, "psf_fit_ok", fit_ok)
-        object.__setattr__(self, "psf_sigma_xy", sigma)
-
-def _mean_metric(values: np.ndarray) -> float:
-    finite = np.asarray(values, dtype=float)
-    finite = finite[np.isfinite(finite)]
-    return float(np.mean(finite)) if finite.size else float("nan")
-
 
 def _format_metric(value: float) -> str:
     return "N/A" if not math.isfinite(value) else f"{value:.4f}"
@@ -465,7 +282,15 @@ def _build_psf_grid(view: CalibrationReportView, figure: Figure) -> None:
         )
         axis.set_xticks(())
         axis.set_yticks(())
-    figure.suptitle(view.psf_caption, fontsize=8)
+    captions = {
+        "per-site": "Empirical per-site PSF kernels (stored artifact values)",
+        "uniform": "Empirical shared uniform PSF kernel (shown per site)",
+    }
+    try:
+        caption = captions[view.psf_mode]
+    except KeyError as error:
+        raise ValueError("PSF report has an unknown physical feature mode") from error
+    figure.suptitle(caption, fontsize=8)
 
 
 def render_calibration_report(
@@ -514,7 +339,7 @@ def render_calibration_report(
         default = " default" if model.is_default else ""
         model_summaries.append(
             f"{model.label}{default}: model="
-            f"{_format_metric(_mean_metric(model.model_fidelity[model.runtime_usable]))}, "
+            f"{_format_metric(model.runtime_model_fidelity_mean)}, "
             f"held-out={_format_metric(model.aggregate_fidelity)}, "
             f"global={_format_metric(model.global_fidelity)}, "
             f"usable={int(np.count_nonzero(model.runtime_usable))}/{len(view.site_labels)}"

@@ -58,7 +58,7 @@ def _surface_geometry(
     else:
         if not isinstance(size_name, str):
             raise TypeError("size_name must be text or None")
-        from zlc_data.panel_size import panel_size_cells
+        from zlc_frontend.panel_size import panel_size_cells
 
         panel_size_cells(size_name)
         logical_size = tuple(int(value) for value in panel_display_size(size_name))
@@ -385,10 +385,9 @@ def create_data_figure_pane(
 ) -> DataFigureWindow:
     """Build the one DataFigure interaction owner for embedding or launch.
 
-    This is construction only: callers that need a top-level window still go
-    through :func:`open_data_figure_workbench`.  FigureViewer uses the same
-    body as a child, so saved figures cannot grow a second selector, Setting,
-    Fit, or export implementation.
+    This is construction only.  FigureViewer uses the same body as a child, so
+    saved figures cannot grow a second selector, Setting, Fit, or export
+    implementation.  Typed artifact entry points use ``open_figure_workbench``.
     """
 
     if not isinstance(figure, DataFigure):
@@ -430,59 +429,6 @@ def create_data_figure_pane(
         presentation_value_label=presentation_value_label,
         initial_payload=initial_payload,
     )()
-
-def open_data_figure_workbench(
-    figure: DataFigure,
-    *,
-    initial_display: _TypedDisplayState | None = None,
-) -> DataFigureWindow:
-    """Open an already-resolved DataFigure on the shared raster lane."""
-
-    if not isinstance(figure, DataFigure):
-        raise TypeError("figure must be DataFigure")
-    return open_workbench_window(
-        _figure_window_factory(
-            lambda: figure,
-            initial_display=initial_display,
-        )
-    )
-
-
-def open_local_data_figure_fit(
-    figure: DataFigure,
-    *,
-    initial_selection: Selection | None = None,
-    archive_path: str | Path | None = None,
-    archive_metadata: Mapping[str, object] | None = None,
-    initial_display: _TypedDisplayState | None = None,
-    open_fit: bool = True,
-) -> DataFigureWindow:
-    """Open one frozen panel in the sole DataFigure/Fit host.
-
-    Unlike Capture/Scan Fit this path has no neutral artifact authority.  Save
-    therefore publishes a current ``DataFigure`` archive (asking for a path
-    when the caller did not already open one).
-    """
-
-    if not isinstance(figure, DataFigure):
-        raise TypeError("figure must be DataFigure")
-    from .local_fit import local_fit_bindings
-
-    bindings = local_fit_bindings(
-        figure,
-        initial_selection=initial_selection,
-        open_fit=open_fit,
-        archive_path=archive_path,
-        archive_metadata=archive_metadata,
-    )
-    return open_workbench_window(
-        _figure_window_factory(
-            lambda: figure,
-            fit_bindings=bindings,
-            initial_display=initial_display,
-        )
-    )
-
 
 def open_figure_workbench(
     figure_factory,
@@ -563,7 +509,5 @@ def open_figure_workbench(
 
 __all__ = [
     "create_data_figure_pane",
-    "open_data_figure_workbench",
     "open_figure_workbench",
-    "open_local_data_figure_fit",
 ]

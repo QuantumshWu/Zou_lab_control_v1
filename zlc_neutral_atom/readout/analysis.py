@@ -1,4 +1,4 @@
-"""Calibration analysis derived from the validated ``main`` readout physics.
+"""Calibration analysis for the admitted neutral-atom readout model.
 
 The module has two layers only: pure image/statistics functions, and one adapter
 that reads a raw CaptureArtifact through ``CalibrationCaptureLayout``.  Training
@@ -74,7 +74,7 @@ def _validate_site_center_admission(
     centers_xy: np.ndarray,
     request: CalibrationAnalysisRequest,
 ) -> None:
-    """Admit exact-main detector output against independent spatial intent.
+    """Admit exact detector output against independent spatial intent.
 
     The detector's returned coordinates are never snapped, reordered, or
     replaced here.  A request without spatial intent remains valid for a pure
@@ -453,10 +453,10 @@ class CalibrationReport:
         raise KeyError(kind)
 
 
-def _main_reference_thresholds_available(
+def _reference_thresholds_available(
     reports: Sequence[ModelCalibrationReport],
 ) -> bool:
-    """Mirror main's all-method gate for committing labelled thresholds."""
+    """Whether every requested model has labelled threshold evidence."""
 
     ordered = tuple(reports)
     return bool(ordered) and all(
@@ -491,7 +491,7 @@ def calibration_runtime_threshold_sources(
 
     if not isinstance(report, CalibrationReport):
         raise TypeError("report must be CalibrationReport")
-    use_reference_thresholds = _main_reference_thresholds_available(report.models)
+    use_reference_thresholds = _reference_thresholds_available(report.models)
     return tuple(
         tuple(
             "formal" if uses_formal else "quick-fallback"
@@ -513,12 +513,11 @@ def _runtime_model_values(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Derive runtime thresholds and usable sites from diagnostic evidence.
 
-    ``main`` first calibrated every method with a quick Otsu threshold.  It
-    replaced those thresholds with bracket-labelled thresholds only when every
-    requested method produced held-out model evidence; a missing per-site
-    labelled threshold then fell back to that site's quick threshold.  Keep
-    that physical rule here while applying the migration's explicit safety
-    corrections only to sites that actually use a labelled fit.
+    Every method begins with a quick Otsu threshold.  Bracket-labelled
+    thresholds become authoritative only when every requested method produced
+    held-out model evidence; a missing per-site labelled threshold uses that
+    site's quick threshold.  Labelled-fit quality gates apply only to sites
+    that actually select labelled evidence.
     """
 
     formal = report.thresholds
@@ -543,7 +542,7 @@ def _runtime_model_values(
     usable = (
         feature.valid_sites.mask
         & np.isfinite(thresholds)
-        # Threshold selection follows main's all-method commit gate, but an
+        # Threshold selection follows the all-method evidence gate, but an
         # unrelated method's failure must never erase this site's explicit
         # reversed-polarity or chance-level labelled evidence.  Only a site
         # with no finite labelled threshold gets the unconditional quick
@@ -601,7 +600,7 @@ def _validate_calibration_binding(
         dtype="<i8",
     )
     report_by_kind = {item.kind: item for item in report.models}
-    use_reference_thresholds = _main_reference_thresholds_available(report.models)
+    use_reference_thresholds = _reference_thresholds_available(report.models)
     for model in artifact.models:
         model_report = report_by_kind[model.kind]
         expected_thresholds, expected_usable = _runtime_model_values(
@@ -945,7 +944,7 @@ def find_site_centers(
     ordering: GridOrder = GridOrder.ROW_MAJOR,
     refine_half: int = 2,
 ) -> np.ndarray:
-    """Main-authority Gaussian/local-maximum detector with lattice repair."""
+    """Gaussian/local-maximum detector with lattice repair."""
 
     image = np.asarray(image, dtype=float)
     if image.ndim != 2 or 0 in image.shape or not np.isfinite(image).any():
@@ -2023,7 +2022,7 @@ def _calibrate_readout_source(
         )
         reports.append(report)
 
-    use_reference_thresholds = _main_reference_thresholds_available(reports)
+    use_reference_thresholds = _reference_thresholds_available(reports)
     models = []
     for feature, report in zip(ordered_features, reports, strict=True):
         thresholds, usable = _runtime_model_values(

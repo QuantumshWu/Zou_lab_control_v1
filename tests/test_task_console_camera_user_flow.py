@@ -8,7 +8,9 @@ inspect the resulting typed fronts, but never bypass a button to create them.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import time
+from unittest.mock import patch
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -22,7 +24,7 @@ from gui_user_flow import (
     drag_mouse_move,
     until,
 )
-from zlc_data.console_records import console_signal_key
+from zlc_workbench.task_console.console_records import console_signal_key
 from zlc_frontend.qt_widgets import ensure_qt_app
 
 
@@ -179,6 +181,14 @@ def _replace_axis_range(widget, minimum: str, maximum: str, points: str) -> None
     _replace_spin_value(widget.pts_spin, points)
 
 
+def _visible_form_widgets(editor) -> dict[str, QtWidgets.QWidget]:
+    """Resolve the current stable controls through the form owner's public API."""
+
+    form = editor.form._parameter_form
+    assert form is not None
+    return {key: form.widget_for(key) for key in form.spec.keys}
+
+
 def _wheel(widget, position, delta: int) -> None:
     """Deliver one wheel step through the real Qt widget event path."""
 
@@ -260,13 +270,22 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
 
         # Virtual MOT camera is a true free-running source, so this is the
         # deterministic live Camera role for an operator-path acceptance run.
-        role_combo = editor.form._widgets["camera_role"]
+        widgets = _visible_form_widgets(editor)
+        role_combo = widgets["camera_role"]
         _choose_combo_data(role_combo, "mot_camera", application)
+        _replace_spin_value(widgets["frames_per_cycle"], "3")
         QtTest.QTest.mouseClick(editor.form.start_button, QtCore.Qt.LeftButton)
-        signal = console_signal_key(row.node.title, "frame")
+        frame_signals = tuple(
+            console_signal_key(row.node.node_id, f"frame_{index}")
+            for index in range(3)
+        )
+        signal = frame_signals[1]
         until(
             application,
-            lambda: console._data.freeze().value(signal) is not None,
+            lambda: all(
+                console._data.freeze().value(key) is not None
+                for key in frame_signals
+            ),
             timeout=15.0,
         )
         first_value = console._data.freeze().value(signal)
@@ -284,7 +303,11 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         until(
             application,
             lambda: (
-                "frame" in row.publishes_label.text()
+                all(name in row.publishes_label.text() for name in (
+                    "frame_0",
+                    "frame_1",
+                    "frame_2",
+                ))
                 and "—" not in row.publishes_label.text()
             ),
             timeout=3.0,
@@ -458,7 +481,13 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         )
         edit = console._panel_editors[id(card)]
         assert edit.window() is console.window()
-        assert edit._board.isVisible()
+        assert edit._board.isVisible(), (
+            console.tabs.currentWidget() is edit,
+            edit.isVisible(),
+            edit._board.isHidden(),
+            console.tabs.currentIndex(),
+            console.tabs.indexOf(edit),
+        )
         capture_offscreen_window(
             application,
             console,
@@ -528,7 +557,7 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         calibration_row = console.logic_nodes[-1]
         calibration_editor = console._logic_editors[id(calibration_row)]
-        calibration_widgets = calibration_editor.form._widgets
+        calibration_widgets = _visible_form_widgets(calibration_editor)
         assert set(calibration_widgets) == {
             "source_mode",
             "folder",
@@ -551,7 +580,7 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             QtCore.Qt.LeftButton,
         )
 
-        calibration_frame = console_signal_key(calibration_row.node.title, "frame")
+        calibration_frame = console_signal_key(calibration_row.node.node_id, "frame")
         saw_calibration_panel = False
         deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
@@ -567,28 +596,30 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         assert saw_calibration_panel
         assert not console._task_locked
         calibration_final = console_signal_key(
-            calibration_row.node.title,
+            calibration_row.node.node_id,
             "calibration",
         )
-        assert console._data.freeze().value(calibration_final) is not None
+        assert console._data.freeze().value(calibration_final) is not None, (
+            calibration_row.status_label.text()
+        )
         fidelity_site = console_signal_key(
-            calibration_row.node.title,
+            calibration_row.node.node_id,
             "fidelity_site",
         )
         threshold_site = console_signal_key(
-            calibration_row.node.title,
+            calibration_row.node.node_id,
             "fidelity_threshold",
         )
         centers_site = console_signal_key(
-            calibration_row.node.title,
+            calibration_row.node.node_id,
             "fidelity_centers",
         )
         aggregate_fidelity = console_signal_key(
-            calibration_row.node.title,
+            calibration_row.node.node_id,
             "aggregate_fidelity",
         )
         global_fidelity = console_signal_key(
-            calibration_row.node.title,
+            calibration_row.node.node_id,
             "global_fidelity",
         )
         calibration_front = console._data.freeze()
@@ -632,7 +663,7 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         mot_row = console.logic_nodes[-1]
         mot_editor = console._logic_editors[id(mot_row)]
-        mot_widgets = mot_editor.form._widgets
+        mot_widgets = _visible_form_widgets(mot_editor)
         assert set(mot_widgets) == {
             "pulse",
             "center_x",
@@ -655,7 +686,7 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             mot_editor.form.start_button,
             QtCore.Qt.LeftButton,
         )
-        mot_grid = console_signal_key(mot_row.node.title, "grid")
+        mot_grid = console_signal_key(mot_row.node.node_id, "grid")
         saw_mot_panel = False
         deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
@@ -670,7 +701,7 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             time.sleep(0.005)
         assert saw_mot_panel
         assert not console._task_locked
-        mot_final = console_signal_key(mot_row.node.title, "mot_field")
+        mot_final = console_signal_key(mot_row.node.node_id, "mot_field")
         mot_value = console._data.freeze().value(mot_final)
         assert mot_value is not None
         mot_schema = mot_value.schema
@@ -679,14 +710,17 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             "scan-point",
             "scan-point",
         )
-        assert mot_schema.cell_schema.data_axes == ()
+        assert mot_schema.cell_schema.is_scalar
+        assert tuple(
+            axis.size for axis in mot_schema.cell_schema.data_axes
+        ) == (1,)
         assert mot_schema.physical_shape == (
             1,
             mot_schema.point_layout.storage_size,
+            1,
         )
-        mot_shape = f"1 × {mot_schema.point_layout.storage_size}"
+        mot_shape = f"1 × {mot_schema.point_layout.storage_size} × (1)"
         assert mot_shape in mot_row.publishes_label.text()
-        assert f"{mot_shape} × (1)" not in mot_row.publishes_label.text()
         assert "points:" not in mot_row.publishes_label.text()
     finally:
         if console_wrapper is not None and console_wrapper.isVisible():
@@ -705,7 +739,6 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
     application = ensure_qt_app()
     from task_console import _StandaloneTaskConsoleFlow, _build_parser
     from zlc_neutral_atom.runtime.run import RunState
-    from zlc_pulse import load_pulse_document
 
     args = _build_parser().parse_args(
         [
@@ -744,7 +777,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         calibration_row = console.logic_nodes[-1]
         calibration_editor = console._logic_editors[id(calibration_row)]
-        calibration_widgets = calibration_editor.form._widgets
+        calibration_widgets = _visible_form_widgets(calibration_editor)
         _replace_path_value(
             calibration_widgets["folder"],
             str(tmp_path / "calibration-output"),
@@ -755,7 +788,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             QtCore.Qt.LeftButton,
         )
         calibration_signal = console_signal_key(
-            calibration_row.node.title,
+            calibration_row.node.node_id,
             "calibration",
         )
         until(
@@ -774,7 +807,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         temperature_row = console.logic_nodes[-1]
         temperature_editor = console._logic_editors[id(temperature_row)]
-        temperature_widgets = temperature_editor.form._widgets
+        temperature_widgets = _visible_form_widgets(temperature_editor)
         assert set(temperature_widgets) == {
             "pulse",
             "t_off",
@@ -798,7 +831,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             QtCore.Qt.LeftButton,
         )
         temperature_signal = console_signal_key(
-            temperature_row.node.title,
+            temperature_row.node.node_id,
             "survival",
         )
         until(
@@ -838,7 +871,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         fidelity_row = console.logic_nodes[-1]
         fidelity_editor = console._logic_editors[id(fidelity_row)]
-        fidelity_widgets = fidelity_editor.form._widgets
+        fidelity_widgets = _visible_form_widgets(fidelity_editor)
         assert set(fidelity_widgets) == {
             "pulse",
             "duration",
@@ -861,7 +894,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             fidelity_editor.form.start_button,
             QtCore.Qt.LeftButton,
         )
-        fidelity_signal = console_signal_key(fidelity_row.node.title, "fidelity")
+        fidelity_signal = console_signal_key(fidelity_row.node.node_id, "fidelity")
         until(
             application,
             lambda: console._data.freeze().value(fidelity_signal) is not None,
@@ -885,8 +918,21 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         # The science Camera is externally triggered.  Use the real Pulse GUI
         # On-Pulse control to provide its continuous hardware schedule; neither
         # the Camera Measurement nor Occupancy owns or fakes that producer.
-        pulse_body = flow.experiment.pulse_gui(
-            document=load_pulse_document("pulses/probe_template.json")
+        pulse_body = flow.pulse
+        pulse_path = (Path("pulses/probe_template.json")).resolve()
+        with patch.object(
+            QtWidgets.QFileDialog,
+            "getOpenFileName",
+            return_value=(str(pulse_path), "ZLC pulse (*.json)"),
+        ):
+            QtTest.QTest.mouseClick(
+                pulse_body.schedule_view.load_button,
+                QtCore.Qt.LeftButton,
+            )
+        until(
+            application,
+            lambda: pulse_body._controller.current_path == pulse_path,
+            timeout=15.0,
         )
         QtTest.QTest.mouseClick(
             pulse_body.schedule_view.fire_button,
@@ -903,12 +949,12 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         camera_row = console.logic_nodes[-1]
         camera_editor = console._logic_editors[id(camera_row)]
-        camera_widgets = camera_editor.form._widgets
+        camera_widgets = _visible_form_widgets(camera_editor)
         _choose_combo_data(camera_widgets["camera_role"], "camera", application)
         _replace_spin_value(camera_widgets["repeat"], "0")
         cards_before = tuple(console.cards)
         QtTest.QTest.mouseClick(camera_editor.form.start_button, QtCore.Qt.LeftButton)
-        camera_signal = console_signal_key(camera_row.node.title, "frame")
+        camera_signal = console_signal_key(camera_row.node.node_id, "frame_0")
         until(
             application,
             lambda: console._data.freeze().value(camera_signal) is not None,
@@ -933,16 +979,18 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         occupancy_row = console.logic_nodes[-1]
         occupancy_editor = console._logic_editors[id(occupancy_row)]
-        occupancy_widgets = occupancy_editor.form._widgets
+        occupancy_widgets = _visible_form_widgets(occupancy_editor)
         assert set(occupancy_widgets) == {
             "camera_frame",
-            "calibration",
+            "calibration_source",
+            "calibration_task",
+            "calibration_file",
             "readout_method",
         }
         assert _signal_leaf_keys(occupancy_widgets["camera_frame"]) == {
             camera_signal
         }
-        assert _signal_leaf_keys(occupancy_widgets["calibration"]) == {
+        assert _signal_leaf_keys(occupancy_widgets["calibration_task"]) == {
             calibration_signal
         }
         _choose_signal_leaf(
@@ -951,7 +999,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             application,
         )
         _choose_signal_leaf(
-            occupancy_widgets["calibration"],
+            occupancy_widgets["calibration_task"],
             calibration_signal,
             application,
         )
@@ -965,8 +1013,8 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             occupancy_editor.form.start_button,
             QtCore.Qt.LeftButton,
         )
-        occupied_signal = console_signal_key(occupancy_row.node.title, "occupied")
-        rate_signal = console_signal_key(occupancy_row.node.title, "rate")
+        occupied_signal = console_signal_key(occupancy_row.node.node_id, "occupied")
+        rate_signal = console_signal_key(occupancy_row.node.node_id, "rate")
         until(
             application,
             lambda: (
@@ -1100,7 +1148,7 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         calibration_row = console.logic_nodes[-1]
         calibration_editor = console._logic_editors[id(calibration_row)]
-        calibration_widgets = calibration_editor.form._widgets
+        calibration_widgets = _visible_form_widgets(calibration_editor)
         _replace_path_value(
             calibration_widgets["folder"],
             str(tmp_path / "calibration-output"),
@@ -1111,7 +1159,7 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
             QtCore.Qt.LeftButton,
         )
         calibration_signal = console_signal_key(
-            calibration_row.node.title,
+            calibration_row.node.node_id,
             "calibration",
         )
         until(
@@ -1131,7 +1179,7 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         grey_row = console.logic_nodes[-1]
         grey_editor = console._logic_editors[id(grey_row)]
-        grey_widgets = grey_editor.form._widgets
+        grey_widgets = _visible_form_widgets(grey_editor)
         assert set(grey_widgets) == {
             "pulse",
             "detuning",
@@ -1141,8 +1189,10 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
             "rf_role",
             "calibration",
         }
+        grey_spec = console._spec_for_logic(grey_row.node)
+        assert grey_spec is not None
         detuning_decl = next(
-            field for field in grey_editor.spec.params if field.key == "detuning"
+            field for field in grey_spec.form.fields if field.key == "detuning"
         )
         assert (detuning_decl.label, detuning_decl.unit) == (
             "Two-photon detuning",
@@ -1166,7 +1216,7 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
             QtCore.Qt.LeftButton,
         )
         grey_node = console._logic_nodes[id(grey_row)]
-        recapture_signal = console_signal_key(grey_row.node.title, "recapture")
+        recapture_signal = console_signal_key(grey_row.node.node_id, "recapture")
         until(
             application,
             lambda: (
@@ -1253,13 +1303,13 @@ def test_pulse_scan_exposes_its_table_and_runs_from_one_camera_definition(
         _choose_combo_text(console.kind_combo, "Measurement: Camera", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         camera_row = console.logic_nodes[-1]
-        camera_signal = console_signal_key(camera_row.node.title, "frame")
+        camera_signal = console_signal_key(camera_row.node.node_id, "frame_0")
 
         _choose_combo_text(console.kind_combo, "Measurement: Pulse scan", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         scan_row = console.logic_nodes[-1]
         scan_editor = console._logic_editors[id(scan_row)]
-        widgets = scan_editor.form._widgets
+        widgets = _visible_form_widgets(scan_editor)
         assert set(widgets) == {"pulse", "pulse_slots", "y_signal"}
 
         slots = widgets["pulse_slots"]
@@ -1273,7 +1323,7 @@ def test_pulse_scan_exposes_its_table_and_runs_from_one_camera_definition(
         scan_spec = console._spec_for_logic(scan_row.node)
         assert scan_spec is not None
         y_parameter = next(
-            parameter for parameter in scan_spec.params
+            parameter for parameter in scan_spec.form.fields
             if parameter.key == "y_signal"
         )
         assert y_parameter.label == "Exact source (y)"
@@ -1281,7 +1331,7 @@ def test_pulse_scan_exposes_its_table_and_runs_from_one_camera_definition(
         _choose_signal_leaf(widgets["y_signal"], camera_signal, application)
 
         QtTest.QTest.mouseClick(scan_editor.form.start_button, QtCore.Qt.LeftButton)
-        scan_signal = console_signal_key(scan_row.node.title, "scan")
+        scan_signal = console_signal_key(scan_row.node.node_id, "scan")
         # A Measurement never manufactures a viewer, either at Start or when
         # its FINAL result arrives.  Plot ownership remains an explicit Monitor
         # action; only Tasks open their declared run-scoped panels.

@@ -5,39 +5,19 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from Zou_lab_control.notebook.facade import (
-        Experiment,
-        OccupancyScanRequest,
-        ScanRequest,
-    )
+    from zlc_neutral_atom.scan import OccupancyScanRequest, ScanRequest
+
+    from .application import ScanWorkbenchActions
 
     from .window import ScanWorkbenchWindow
 
 
 def open_scan_workbench(
-    experiment: Experiment,
+    actions: ScanWorkbenchActions,
     request: ScanRequest | OccupancyScanRequest,
 ) -> ScanWorkbenchWindow:
-    from PyQt5 import QtCore
-
-    from zlc_frontend.qt_widgets import (
-        WINDOW_SCREEN_FRACTION,
-        center_window_on_primary_screen,
-        ensure_qt_app,
-        retain_window,
-        screen_fit_window_size,
-        set_fluent_scale,
-    )
+    from zlc_workbench.window_runtime import open_workbench_window
 
     from .window import ScanWorkbenchWindow
 
-    application = ensure_qt_app()
-    if QtCore.QThread.currentThread() != application.thread():
-        raise RuntimeError("scan Workbench must be opened on the Qt GUI thread")
-    set_fluent_scale(None)
-    window = ScanWorkbenchWindow(experiment, request)
-    window.resize(screen_fit_window_size(WINDOW_SCREEN_FRACTION))
-    retain_window(window)
-    window.show()
-    center_window_on_primary_screen(window, application)
-    return window
+    return open_workbench_window(lambda: ScanWorkbenchWindow(actions, request))

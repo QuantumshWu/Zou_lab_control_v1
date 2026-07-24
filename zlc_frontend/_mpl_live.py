@@ -538,7 +538,7 @@ class SinglePanelAggRenderer:
         side.set_xlim(0.0, self._side_count_ceiling)
         side.set_ylim(*y_limits)
 
-        from .histogram_fit import fit_histogram
+        from zlc_data import fit_histogram
 
         fit = fit_histogram(edges, counts, "single")
         if self._gauss_artist is None:

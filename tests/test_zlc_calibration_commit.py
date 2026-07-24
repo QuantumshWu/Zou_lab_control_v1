@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 import inspect
 import json
 from pathlib import Path
@@ -21,8 +22,21 @@ from zlc_neutral_atom.readout.calibration import (
     CalibrationAnalysisRequest,
     ResolvedCalibration,
 )
+from zlc_neutral_atom.readout.calibration_application import (
+    CalibrationArtifactRequest,
+    build_calibration_artifact_request,
+    calibration_request_from_computation,
+)
 from zlc_neutral_atom.readout.calibration_repository import (
     compile_calibration_artifact_plan,
+)
+from zlc_neutral_atom.readout.sitemap import (
+    SitemapCalibrationRequest,
+    build_sitemap_calibration_request,
+)
+from zlc_neutral_atom.occupancy_application import (
+    DetectionRequest,
+    build_detection_request,
 )
 
 
@@ -77,6 +91,55 @@ def test_compile_plan_requires_explicit_source_binding_and_deadline():
         "timeout_seconds",
     ):
         assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_public_calibration_and_detection_requests_are_deadline_free():
+    assert tuple(field.name for field in fields(CalibrationArtifactRequest)) == (
+        "source_capture_ref",
+        "readout_binding",
+        "analysis",
+    )
+    assert tuple(field.name for field in fields(SitemapCalibrationRequest)) == (
+        "capture_request",
+        "analysis",
+    )
+    assert tuple(field.name for field in fields(DetectionRequest)) == (
+        "source_capture_ref",
+        "calibration_ref",
+        "readout_binding",
+        "readout_event_axis_id",
+        "model_kind",
+    )
+    for function in (
+        build_calibration_artifact_request,
+        calibration_request_from_computation,
+        build_sitemap_calibration_request,
+        build_detection_request,
+    ):
+        assert "timeout_seconds" not in inspect.signature(function).parameters
+        assert "calibration_timeout_seconds" not in inspect.signature(
+            function
+        ).parameters
+
+    from Zou_lab_control.notebook.facade import ReadoutFacade
+    from Zou_lab_control.workbench import open_calibration_workbench
+    from zlc_workbench.calibration_workbench.app import (
+        open_calibration_workbench as open_calibration_workbench_app,
+    )
+
+    for function in (
+        ReadoutFacade.sitemap_request,
+        ReadoutFacade.sitemap,
+        ReadoutFacade.calibration_request,
+        ReadoutFacade.start_calibration_analysis,
+        ReadoutFacade.calibration_edit_gui,
+        ReadoutFacade.detection_request,
+        open_calibration_workbench,
+        open_calibration_workbench_app,
+    ):
+        parameters = inspect.signature(function).parameters
+        assert "timeout_seconds" not in parameters
+        assert "calibration_timeout_seconds" not in parameters
 
 
 def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_path):

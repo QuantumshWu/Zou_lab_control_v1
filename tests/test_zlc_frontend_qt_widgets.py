@@ -120,7 +120,6 @@ def _raster_board_frame(
         CoherenceStamp,
         PanelFrame,
         PanelPresentationIdentity,
-        PixelFormat,
         RasterBuffer,
         SourceIdentity,
     )
@@ -177,8 +176,6 @@ def _raster_board_frame(
                 RasterBuffer(
                     raster_size[0],
                     raster_size[1],
-                    raster_size[0] * 4,
-                    PixelFormat.RGBA8888,
                     bytes((value, value, value, 255))
                     * raster_size[0]
                     * raster_size[1],
@@ -431,16 +428,6 @@ def test_frontend_and_workbench_roots_remain_headless() -> None:
         "assert qt.FrozenRasterView.__module__ == 'zlc_frontend.qt_widgets.frozen_raster'\n"
     )
     assert qt_result.returncode == 0, qt_result.stderr
-
-    notebook_result = _run_fresh(
-        "import sys\n"
-        "import zlc_frontend.notebook_integration\n"
-        "assert not any(k == 'matplotlib' or k.startswith('matplotlib.') for k in sys.modules)\n"
-        "assert not any(k == 'IPython' or k.startswith('IPython.') for k in sys.modules)\n"
-        "assert not any(k == 'PyQt5' or k.startswith('PyQt5.') for k in sys.modules)\n"
-    )
-    assert notebook_result.returncode == 0, notebook_result.stderr
-
 
 def test_qt_raster_board_promotes_only_a_matching_staged_layout(
     monkeypatch,

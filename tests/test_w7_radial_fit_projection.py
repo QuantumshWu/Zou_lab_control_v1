@@ -175,7 +175,7 @@ def test_radial_fit_panels_preserve_sparse_cells_axes_geometry_and_focus_summary
 
 def test_pooled_image_range_ignores_invalid_and_nonfinite_components():
     from zlc_frontend.figure import EvaluatedImage
-    from zlc_frontend.image_raster import evaluated_image_data_range
+    from zlc_frontend.image_display import evaluated_image_data_range
 
     figure, model, _result = _sparse_radial_figure()
     template = figure.radial_gaussian_image_fit_panels(

@@ -61,7 +61,6 @@ __all__ = [
     "FacetedPanelResult",
     "PanelProvenance",
     "PanelRenderError",
-    "display_state_for_intent",
     "view_for_schema",
 ]
 
@@ -108,9 +107,11 @@ class FacetedPanelResult:
     """One complete faceted compose result.
 
     Exactly one surface is present: immutable PNG + hit regions for overview,
-    or one ordinary ``BoardFrame`` for the selected cell.  ``figure`` is the
-    exact typed value behind that visible surface and crosses the worker
-    boundary only after its evaluation is complete.
+    or one ordinary ``BoardFrame`` for the selected cell.  ``figure`` remains
+    the complete faceted DataFigure authority in both cases; a focused
+    ``BoardFrame`` already carries its exact selected-cell payload.  Keeping
+    the Figure complete prevents display focus from silently replacing Fit
+    batch axes with one scalar cell.
     """
 
     figure: DataFigure
@@ -150,24 +151,6 @@ class FacetedPanelResult:
                 raise ValueError("faceted focus result requires its exact focus")
             if regions:
                 raise ValueError("faceted focus does not carry overview regions")
-
-
-def display_state_for_intent(intent: ViewIntent):
-    """The display-state type an intent's rasterizer consumes.
-
-    One mapping, so a host storing "the panel's display state" and this module
-    reading it cannot disagree about which knobs a kind even has.
-    """
-
-    if intent is ViewIntent.IMAGE:
-        return ImageDisplayState
-    if intent is ViewIntent.CURVE:
-        return CurveDisplayState
-    if intent is ViewIntent.HISTOGRAM:
-        return HistogramDisplayState
-    if intent is ViewIntent.METER:
-        return None
-    raise PanelRenderError(f"no display state for view intent {intent!r}")
 
 
 def view_for_schema(
@@ -241,7 +224,7 @@ class PanelComposer:
         self._panel_id = str(panel_id)
         self._intent = intent
         self._size = (int(size[0]), int(size[1]))
-        from zlc_data.panel_size import panel_size_cells
+        from zlc_frontend.panel_size import panel_size_cells
 
         panel_size_cells(size_name)
         self._size_name = str(size_name)
@@ -532,7 +515,7 @@ class PanelComposer:
             provenance,
         )
         return FacetedPanelResult(
-            focused,
+            source_figure,
             frame=frame,
             focus=focus,
         )

@@ -43,13 +43,18 @@ from zlc_pulse import (
     RepeatRegion,
     ScanParameter,
     bind_pulse_document_target,
+    clear_frozen_scan_table,
     cycle_field_binding,
     insert_period,
     move_period,
     new_period,
+    nominal_scan_reference,
     rename_port_label,
+    reconcile_scan_schema,
     remove_period,
     resolve_scan_point,
+    scan_column_specs,
+    scan_slot_schema,
     replace_field_binding,
     replace_pulse_field,
     replace_pulse_document_target,
@@ -82,13 +87,11 @@ from .scan_workspace import (
     load_scan_array as read_scan_array,
     load_scan_program_source,
     save_scan_array as write_scan_array,
-    scan_column_specs,
-    scan_slot_schema,
 )
 
 
 class PulseRunFacade(Protocol):
-    """The existing application facade shape consumed by the Workbench.
+    """The narrow application command/observation surface used by PulseEditor.
 
     This is structural only: it neither wraps nor owns a second run state.
     """
@@ -118,7 +121,7 @@ class PulseRunFacade(Protocol):
 
 @dataclass(frozen=True)
 class OwnedPulseConnection:
-    """One composed standalone authority, without exposing its Experiment object."""
+    """One composed standalone authority, without exposing its outer owner."""
 
     pulse: PulseRunFacade
     descriptor: PulseTargetDescriptor
@@ -827,14 +830,11 @@ class PulseEditorController:
         high: bool,
     ) -> int | None:
         document = self._editor.document
-        target_port = document.target.by_key[str(port)]
-        lane_index = document.target.raw_lanes.index(target_port.lanes[0])
-        if bool(document.period_by_id[period_id].states[lane_index]) == bool(high):
+        candidate = set_digital_output(document, period_id, port, high)
+        if candidate == document:
             return None
         base_revision = self._editor.revision
-        revision = self.replace_document(
-            set_digital_output(document, period_id, port, high)
-        )
+        revision = self.replace_document(candidate)
         return revision if revision != base_revision else None
 
     def set_analog(
@@ -1312,7 +1312,7 @@ class PulseEditorController:
         self.request_preview()
 
     def set_preview_size(self, size: str) -> None:
-        from zlc_data.panel_size import PANEL_SIZES
+        from zlc_frontend.panel_size import PANEL_SIZES
 
         normalized = str(size)
         if normalized not in PANEL_SIZES:
@@ -1619,12 +1619,7 @@ class PulseEditorController:
         ) and document.scan_parameters:
             if not nominal_reference:
                 raise ValueError("explicit nominal scan reference is required")
-            document = replace(
-                document,
-                scan_parameters=(),
-                scan_table=None,
-                scan_recipe=None,
-            )
+            document = nominal_scan_reference(document)
         supplied = (
             {
                 parameter.parameter_id: document.field_value(parameter.field)[0]
@@ -1871,15 +1866,15 @@ class PulseEditorController:
         self._advance_close()
 
     def retire_borrowed_authority(self) -> None:
-        """Thread-safe retirement requested by the owning Experiment.
+        """Thread-safe retirement requested by the owning application.
 
-        The Experiment runtime owns hardware SAFE during its own shutdown.  This
+        The application runtime owns hardware SAFE during its own shutdown.  This
         path therefore only wakes the controller so its next owner turn detaches
         the borrowed facade, drains local work, and permanently closes.
         """
 
         if self._owned_connection is not None or self._connection_factory is not None:
-            raise RuntimeError("only an Experiment-borrowed Pulse editor may retire here")
+            raise RuntimeError("only an application-borrowed Pulse editor may retire here")
         self._borrowed_authority_retire.set()
         self._notify()
 
@@ -1929,16 +1924,16 @@ class PulseEditorController:
     def poll_runtime_change(self) -> PulseRuntimeUpdate | None:
         """Poll an active Run without manufacturing unchanged GUI snapshots.
 
-        This is the narrow compatibility seam for ``RunHandle``, whose current
-        API is observed rather than pushed.  Idle editors do no work.  Active
+        ``RunHandle`` exposes immutable observations rather than Qt callbacks.
+        Idle editors do no work.  Active
         editors publish only when a runtime fact changes; the 40 ms Qt timer is
         therefore no longer an application-wide snapshot clock.
         """
 
-        # The Experiment owner can retire the borrowed facade from another
-        # thread.  Detach it before even deciding whether the compatibility
+        # The application owner can retire the borrowed facade from another
+        # thread.  Detach it before even deciding whether the observation
         # timer has Run work; otherwise a timer already queued in Qt can call
-        # observe_active() after Experiment.close().
+        # observe_active() after application shutdown.
         changes = self._apply_borrowed_authority_retirement()
         if self._runtime_poll_required():
             changes.include(self._poll_run())
@@ -1960,7 +1955,7 @@ class PulseEditorController:
 
     @property
     def runtime_poll_required(self) -> bool:
-        """Return whether the compatibility RunHandle watcher has work.
+        """Return whether the RunHandle observation watcher has work.
 
         Reading this flag does not poll hardware and does not build a GUI
         snapshot.  The Qt owner uses it to keep its timer stopped while idle.
@@ -2563,11 +2558,7 @@ class PulseEditorController:
         previous: PulseDocument,
         candidate: PulseDocument,
     ) -> PulseDocument:
-        if scan_slot_schema(previous) == scan_slot_schema(candidate):
-            return candidate
-        if candidate.scan_table is None and candidate.scan_recipe is None:
-            return candidate
-        return replace(candidate, scan_table=None, scan_recipe=None)
+        return reconcile_scan_schema(previous, candidate)
 
     def _observe_document_schema_change(
         self,
@@ -2613,9 +2604,10 @@ class PulseEditorController:
 
     def _clear_active_scan_table(self) -> None:
         document = self._editor.document
-        if document.scan_table is None and document.scan_recipe is None:
+        candidate = clear_frozen_scan_table(document)
+        if candidate is document:
             return
-        self.replace_document(replace(document, scan_table=None, scan_recipe=None))
+        self.replace_document(candidate)
 
     def _require_scan_operation_available(self) -> None:
         self._require_authoring_available()

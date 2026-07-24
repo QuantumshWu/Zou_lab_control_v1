@@ -41,29 +41,30 @@ Contract the build enforces (`fpga/build_and_program.bat`, `create_project.tcl`)
 > editing, or switch to `set_property PACKAGE_PIN .. [get_ports {ch[N]}]` + `;# chNN <- name`
 > comments (the order-independent form the inference also supports).
 
-### `streamer_config.json` — the reconfigurable streamer geometry + part (single source)
+### `streamer_config.json` — frozen deployment geometry manifest + build inputs
 
-The one place to edit the **compile-affecting** specifics. The Python host (program
-validation, capacity estimate, AXI runtime defaults) reads this file, so a geometry or
-part change is made **once** here instead of in scattered constants:
+The host reads this file to validate the currently deployed geometry and to
+estimate a future evidence-driven rebuild. It is not a runtime tuning surface:
+editing it cannot change the programmed FPGA, and the server refuses any
+geometry fingerprint mismatch before upload.
 
 | field | meaning |
 |---|---|
 | `fpga_part` | Vivado part string (e.g. `xc7a35tfgg484-2`). Drives the capacity estimate **and**, via `build_and_program.bat`, the synthesis target (`create_project.tcl`'s `set part`). |
-| `clock_hz` | sequencer clock (50 MHz → 20 ns tick); the ns↔tick conversion + delay-µs labels. |
+| `clock_hz` | frozen sequencer clock (50 MHz → 20 ns tick); any other value is rejected because it is not in the existing geometry fingerprint. |
 | `target_pct` | resource-budget target for the estimate (e.g. 90). |
 | `params.max_edges` / `bank_size` / `evt_fifo_depth` | edge-table depth, resident scan ping-pong bank, per-signal delay event-FIFO depth. |
 | `params.channel_count` / `num_slots` / `bus_count` / `bus_width` / widths | the rest of the geometry. |
 
-> **Important:** `params` must match the localparams the **bitstream** was built with
-> (`zlc_pulse_streamer_top.v`). Editing the JSON does **not** re-synthesize — it only
-> re-aligns host validation/estimation. To actually change the geometry, change BOTH the
-> `.v` parameters and this file, then rebuild. `channel_count` is normally **inferred** from
-> `board.xdc`; the value here is only the offline/fallback default.
+> **Important:** the checked-in values describe the approved frozen bitstream.
+> `clock_hz=50_000_000` and `slot_mul_width=25` are hard RTL facts outside the
+> current fingerprint and are therefore rejected if edited. Any hardware change
+> requires separate evidence, review, a complete rebuild/qualification, and an
+> updated deployment record; changing this JSON alone never grants authority.
 
-**Double-click `estimate_resources.bat`** (repo root) after editing to print a LUT/FF/DSP/
-BRAM pass-fail table for the configured part — it tells you whether the part has enough
-resources before you spend a Vivado run.
+**Double-click `estimate_resources.bat`** (repo root) to print the LUT/FF/DSP/
+BRAM report for this manifest. It is an estimator, not permission to alter the
+frozen deployment.
 
 ## How to configure a different board
 
@@ -107,8 +108,6 @@ different Artix-7 retargets the build without editing the `.tcl`.
 
 - `fpga/pulse_streamer/create_project.tcl` (the Vivado build)
 - `fpga/build_and_program.bat` (build + program)
-- `zlc_neutral_atom.timing.board_config.load_board_config` (explicit projection and
-  checked-in topology contract; its default is this in-repository file)
 - `fpga/run_server.bat` / `zlc_pulse.server_app` (server-side target validation and
   package-pin manifest publication)
 
@@ -121,7 +120,8 @@ lane/name/bus projection as a whole.
 `streamer_config.json` (search order: `ZLC_PS_CONFIG` env → cwd → this file):
 
 - `fpga/pulse_streamer/host/image.py` (`load_streamer_config`, capacity estimate CLI)
-- `Zou_lab_control/neutral_atom/devices/fpga_pulse_streamer.py` (validator `DEFAULT_*`)
-- `Zou_lab_control/neutral_atom/devices/axi_session.py` (`DEFAULT_PARAMS`, clock)
+- `zlc_pulse.server_app` and `zlc_neutral_atom.bootstrap._installation`
+  (frozen deployment geometry/clock validation)
+- `zlc_neutral_atom.timing.clock` (20 ns authoring grid projection)
 - `estimate_resources.bat` (repo root, double-click capacity check)
 - `fpga/build_and_program.bat` (synthesis `fpga_part`)

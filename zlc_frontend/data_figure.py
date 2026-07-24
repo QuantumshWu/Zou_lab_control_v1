@@ -4,10 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from io import BytesIO
 import math
 from numbers import Integral
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -46,7 +44,6 @@ from .curve_display import numeric_curve_coordinates
 if TYPE_CHECKING:
     from .fit_curve_projection import CurveFitOverlayPlan
     from .fit_image_projection import RadialGaussianImageFitPanel
-    from .figure_archive import FigureDisplayState
     from .render import RadialGaussianImageFitOverlay
 
 
@@ -594,18 +591,30 @@ class DataFigure:
         *,
         dpi: float = 100.0,
     ) -> bytes:
-        from .matplotlib_render import save_evaluated_figure
+        return self.to_bytes(image_format="png", dpi=dpi)
 
-        output = BytesIO()
-        save_evaluated_figure(
+    def to_bytes(
+        self,
+        *,
+        image_format: str,
+        dpi: float = 100.0,
+    ) -> bytes:
+        """Encode one owned figure payload without choosing a filesystem path."""
+
+        if not isinstance(image_format, str):
+            raise TypeError("image_format must be str")
+        image_format = image_format.strip().lower()
+        if image_format not in {"png", "pdf", "svg", "jpg", "jpeg"}:
+            raise ValueError("image_format must be png, pdf, svg, jpg, or jpeg")
+        from .matplotlib_render import encode_evaluated_figure
+
+        return encode_evaluated_figure(
             self._document,
             self._evaluated,
             dict(self._fit_results),
-            output,
-            image_format="png",
+            image_format=image_format,
             dpi=dpi,
         )
-        return output.getvalue()
 
     def to_png_bytes_with_panel_regions(
         self,
@@ -830,54 +839,6 @@ class DataFigure:
 
     def _repr_png_(self) -> bytes:
         return self.to_png_bytes()
-
-    def save_archive(
-        self,
-        path: str | Path,
-        *,
-        display: FigureDisplayState | None = None,
-        metadata: Mapping[str, object] | None = None,
-    ) -> Path:
-        """Atomically persist this typed figure without changing its authority.
-
-        The optional display value is authored presentation state only.  Source
-        datasets and fit results remain their complete owner-defined values;
-        no evaluated x/y projection is promoted into the archive.
-        """
-
-        from .figure_archive import save_figure_archive
-
-        return save_figure_archive(
-            self,
-            path,
-            display=display,
-            metadata=metadata,
-        )
-
-    def export(
-        self,
-        path: str | Path,
-        *,
-        image_format: str | None = None,
-        dpi: float = 100.0,
-    ) -> Path:
-        target = Path(path)
-        if image_format is None:
-            image_format = target.suffix.lstrip(".") or "png"
-        if not target.suffix:
-            target = target.with_suffix(f".{image_format}")
-        from .matplotlib_render import save_evaluated_figure
-
-        save_evaluated_figure(
-            self._document,
-            self._evaluated,
-            dict(self._fit_results),
-            target,
-            image_format=image_format,
-            dpi=dpi,
-        )
-        return target
-
 
 __all__ = [
     "DataFigure",

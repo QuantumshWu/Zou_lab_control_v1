@@ -5,10 +5,8 @@ from __future__ import annotations
 import hashlib
 import os
 import struct
-import threading
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any
 
 from .canonical import canonical_text, decode, encode
 from . import durability
@@ -31,27 +29,11 @@ def _record_id(value: str) -> str:
     return canonical_text(value, "journal record_id")
 
 
-@contextmanager
-def _interprocess_lock(path: Path) -> Iterator[None]:
-    lock_file = path.open("r+b")
-    try:
-        acquire_file_lock(lock_file, blocking=True)
-        try:
-            yield
-        finally:
-            release_file_lock(lock_file)
-    finally:
-        lock_file.close()
-
-
 class FramedJournal:
-    """One file, canonical payloads, SHA-256 frames, and safe torn-tail repair."""
+    """Factory for the one lifetime-exclusive canonical journal session."""
 
-    def __init__(
-        self,
-        path: str | os.PathLike[str],
-    ) -> None:
-        self._initialize(path, scan=True)
+    def __init__(self, *_args, **_kwargs) -> None:
+        raise TypeError("use FramedJournal.open_exclusive()")
 
     @classmethod
     def open_exclusive(
@@ -61,74 +43,17 @@ class FramedJournal:
         """Create a lifetime-exclusive session with one startup scan."""
 
         journal = cls.__new__(cls)
-        journal._initialize(path, scan=False)
+        journal._initialize(path)
         return FramedJournalSession(journal)
 
     def _initialize(
         self,
         path: str | os.PathLike[str],
-        *,
-        scan: bool,
     ) -> None:
         self.path = Path(path).resolve()
         self.lock_path = self.path.with_name(self.path.name + ".lock")
-        self._thread_lock = threading.Lock()
         durability.durable_mkdir(self.path.parent)
         open_durable_lock_file(self.lock_path).close()
-        if not scan:
-            return
-        existed = self.path.exists()
-        with self._thread_lock, _interprocess_lock(self.lock_path):
-            with self.path.open("a+b") as stream:
-                self._scan(stream, repair_torn_tail=True)
-                if not existed:
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            if not existed:
-                durability.flush_directory(self.path.parent)
-
-    def append(self, record_id: str, value: Any) -> bool:
-        return self.append_checked(record_id, value, lambda _records: None)
-
-    def append_checked(
-        self,
-        record_id: str,
-        value: Any,
-        validate: Callable[[tuple[tuple[str, Any], ...]], None],
-    ) -> bool:
-        """Append after validating the prospective log under the process lock."""
-
-        record_id = _record_id(record_id)
-        if not callable(validate):
-            raise TypeError("validate must be callable")
-        payload = encode({"record_id": record_id, "value": value})
-        frame = _HEADER.pack(_MAGIC, len(payload), hashlib.sha256(payload).digest()) + payload
-        with self._thread_lock, _interprocess_lock(self.lock_path):
-            with self.path.open("r+b") as stream:
-                existing = self._scan(stream, repair_torn_tail=True)
-                previous = existing.get(record_id)
-                if previous is not None:
-                    previous_payload, _previous_value = previous
-                    if previous_payload != payload:
-                        raise ValueError(
-                            f"journal record id {record_id!r} has conflicting content"
-                        )
-                    validate(self._record_values(existing))
-                    return False
-                decoded = self._record_values(existing)
-                candidate_value = decode(payload)["value"]
-                validate(decoded + ((record_id, candidate_value),))
-                stream.seek(0, os.SEEK_END)
-                stream.write(frame)
-                stream.flush()
-                os.fsync(stream.fileno())
-                return True
-
-    def records(self) -> tuple[tuple[str, Any], ...]:
-        with self._thread_lock, _interprocess_lock(self.lock_path):
-            with self.path.open("r+b") as stream:
-                records = self._scan(stream, repair_torn_tail=True)
-        return self._record_values(records)
 
     @staticmethod
     def _record_values(

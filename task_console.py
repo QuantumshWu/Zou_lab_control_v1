@@ -117,10 +117,7 @@ class _StandaloneTaskConsoleFlow:
             return
         console = None
         try:
-            from zlc_workbench.task_console.app import open_task_console
-
-            console = open_task_console(
-                experiment,
+            console = experiment.task_console(
                 state=self.args.state,
                 task=self.args.task,
             )

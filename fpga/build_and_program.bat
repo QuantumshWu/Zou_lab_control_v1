@@ -58,9 +58,6 @@ if errorlevel 1 exit /b 1
 call :zlc_default_paths
 call :zlc_verify_sources
 if errorlevel 1 exit /b 1
-call :zlc_resolve_part
-call :zlc_emit_geom
-call :zlc_print_capacity_estimate
 
 if /I "%MODE%"=="diagnose" (
   call :zlc_run_tcl "diagnose_hw_target.tcl"
@@ -78,6 +75,13 @@ if /I "%MODE%"=="flash" (
 
 if /I "%MODE%"=="program" goto zlc_program
 
+rem Only a real build/check may derive source files from streamer_config.json.
+rem Diagnose/program/flash consume the already-built frozen artifact and must be read-only.
+call :zlc_resolve_part
+call :zlc_emit_geom
+if errorlevel 1 exit /b 1
+call :zlc_print_capacity_estimate
+
 rem Skip the (slow) synth+impl when a bitstream already exists and NONE of the sources that go
 rem into it changed since it was built -- just program the existing .bit.  Only in the default
 rem (build+program) mode, and only when --force-build / --rebuild was NOT given.
@@ -89,7 +93,7 @@ if /I "%MODE%"=="all" if not defined ZLC_FORCE_BUILD if defined ZLC_PREBUILT (
   goto zlc_program
 )
 
-echo ZLC FPGA pulse streamer: build FINAL bitstream (1-tick FIFO prefetch + streaming, JTAG-to-AXI)
+echo ZLC FPGA pulse streamer: build FINAL bitstream (1-tick FIFO prefetch + autonomous scan, JTAG-to-AXI)
 call :zlc_run_tcl "!ZLC_CREATE_TCL!"
 if errorlevel 1 exit /b 1
 call :zlc_save_src_hash
@@ -105,7 +109,7 @@ exit /b %ERRORLEVEL%
 :zlc_help
 echo Build/program the FINAL ZLC FPGA pulse streamer (one clean design, no variants).
 echo Control path: JTAG-to-AXI master -^> AXI BRAM controller -^> edge/scan BRAMs + bus loader.
-echo Engine: 1-tick (20 ns) FIFO prefetch + unbounded 2-bank streaming scan.
+echo Engine: 1-tick (20 ns) FIFO prefetch + 4096-point resident autonomous scan.
 echo.
 echo Usage:
 echo   fpga\build_and_program.bat              Build (only if sources changed) and program
@@ -222,22 +226,32 @@ rem Single source: from streamer_config.json generate (1) the Vivado geometry tc
 rem create_project.tcl sources via ZLC_PS_GEOM_TCL, and (2) regenerate zlc_geometry.vh (the RTL
 rem parameter defaults + LAYOUT_FINGERPRINT the .v `include) IN PLACE, so editing the config changes
 rem the SYNTHESIZED bitstream (IP depths + every RTL geometry param + the connect fingerprint) with
-rem no hand edits.  When this step is skipped the tcl literal defaults + the committed .vh are used.
-rem Pure read/regenerate; never fails the build.
+rem no hand edits.  This routine is called only for a real build/check and fails closed: synthesis
+rem must never proceed with a stale header or a partially generated geometry file.
 where python >nul 2>nul
-if errorlevel 1 goto :zlc_emit_geom_done
+if errorlevel 1 (
+  echo ERROR: Python is required to derive the FPGA geometry for a build.
+  exit /b 1
+)
 pushd "%REPO_ROOT%"
 set "PYTHONPATH=%CD%;%PYTHONPATH%"
 python -m fpga.pulse_streamer.host.image --emit-geometry-vh "%STREAMER_DIR%\zlc_geometry.vh" >nul 2>nul
+if errorlevel 1 goto zlc_emit_geom_fail
 if "%ZLC_PS_GEOM_TCL%"=="" (
   set "ZLC_GEOM_OUT=%ZLC_PS_BUILD_ROOT%\geom.tcl"
-  python -m fpga.pulse_streamer.host.image --emit-geom-tcl "!ZLC_GEOM_OUT!" >nul 2>nul && set "ZLC_PS_GEOM_TCL=!ZLC_GEOM_OUT!"
+  python -m fpga.pulse_streamer.host.image --emit-geom-tcl "!ZLC_GEOM_OUT!" >nul 2>nul
+  if errorlevel 1 goto zlc_emit_geom_fail
+  set "ZLC_PS_GEOM_TCL=!ZLC_GEOM_OUT!"
 )
 popd
 echo ZLC RTL geometry header regenerated from config: %STREAMER_DIR%\zlc_geometry.vh
-:zlc_emit_geom_done
 if not "%ZLC_PS_GEOM_TCL%"=="" echo ZLC geometry tcl: %ZLC_PS_GEOM_TCL% (from streamer_config.json)
 exit /b 0
+
+:zlc_emit_geom_fail
+popd
+echo ERROR: failed to derive FPGA geometry from streamer_config.json.
+exit /b 1
 
 :zlc_compute_src_hash
 rem Hash the files that go into the bitstream (engine + top + build tcl + program tcl + XDC +

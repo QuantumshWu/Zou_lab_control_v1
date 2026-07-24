@@ -1,8 +1,6 @@
 """Coupled readout Measurements with explicit autonomous-hardware boundaries.
 
-The old implementation put scan control, camera acquisition and a point reducer
-in one ``ScannedMeasurementNode``.  This module keeps the useful
-physics while making the ownership explicit:
+Each operation has one explicit hardware and physics owner:
 
 * release-recapture acquisition is one autonomous SCAN_SLOT camera Measurement;
 * its adjacent event-0/event-1 frames are reduced by one fixed 2:1
@@ -18,6 +16,7 @@ No public request contains a timeout.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from decimal import Decimal, localcontext
 from math import isfinite
 from numbers import Integral, Real
 
@@ -76,7 +75,14 @@ from zlc_pulse import (
     resolve_api_parameters,
     require_autonomous_scan_resident_capacity,
 )
-from zlc_storage import canonical_digest, canonical_text, positive_integer
+from zlc_storage import (
+    canonical_digest,
+    canonical_text,
+    finite_real,
+    integer,
+    normalized_text,
+    positive_integer,
+)
 
 
 TEMPERATURE_RELEASE_RECAPTURE_KEY = DefinitionKey(
@@ -91,6 +97,30 @@ GREY_MOLASSES_DETUNING_KEY = DefinitionKey(
     "zlc_neutral_atom.readout",
     "grey-molasses-detuning",
 )
+
+# Public signal vocabularies belong to the Measurement definitions.  Runtime
+# publishers and presentation catalogs both consume these ordered tuples; the
+# shell never chooses or renames a physical output.
+TEMPERATURE_RELEASE_RECAPTURE_OUTPUT_NAMES = ("survival",)
+READOUT_DURATION_FIDELITY_OUTPUT_NAMES = ("fidelity",)
+GREY_MOLASSES_DETUNING_OUTPUT_NAMES = ("recapture",)
+# The default authored sweep is 0..300 us in 25 us steps.  A duration field cannot
+# occupy zero ticks, so move the complete authored axis by one 20 ns target
+# tick; changing only its first endpoint would make the intermediate values
+# leave the clock grid.
+DEFAULT_TEMPERATURE_TRAP_OFF_MICROSECONDS_RANGE = (0.02, 300.02, 13)
+DEFAULT_TEMPERATURE_SHOTS = 16
+DEFAULT_TEMPERATURE_PER_SITE = False
+DEFAULT_READOUT_DURATION_MICROSECONDS_RANGE = (2.0, 20_000.0, 11)
+DEFAULT_READOUT_DURATION_SHOTS = 60
+DEFAULT_READOUT_DURATION_SITE = None
+DEFAULT_GREY_MOLASSES_DETUNING_GAMMA_RANGE = (-0.4, 0.4, 21)
+DEFAULT_GREY_MOLASSES_TRAP_OFF_MICROSECONDS = 20.0
+DEFAULT_GREY_MOLASSES_SHOTS = 16
+DEFAULT_GREY_MOLASSES_PER_SITE = False
+DEFAULT_GREY_MOLASSES_RF_ROLE = "rf"
+MINIMUM_COUPLED_MEASUREMENT_SHOTS = 1
+MINIMUM_READOUT_SITE_INDEX = 0
 
 TEMPERATURE_RELEASE_RECAPTURE_DEFINITION = MeasurementDefinition(
     TEMPERATURE_RELEASE_RECAPTURE_KEY,
@@ -151,6 +181,97 @@ def _numeric_axis(
     return tuple(result)
 
 
+def _finite_signed_axis(values: object, name: str) -> tuple[float, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{name} must be a numeric sequence")
+    try:
+        raw = tuple(values)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be a numeric sequence") from exc
+    if not raw:
+        raise ValueError(f"{name} must contain at least one value")
+    result = []
+    for value in raw:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError(f"{name} values must be real numbers")
+        item = float(value)
+        if not isfinite(item):
+            raise ValueError(f"{name} values must be finite")
+        result.append(item)
+    return tuple(result)
+
+
+def _linear_axis_from_range(
+    value: object,
+    name: str,
+    *,
+    scale: float,
+    positive: bool,
+) -> tuple[float, ...]:
+    """Resolve one authored ``(start, stop, count)`` into physical values."""
+
+    if isinstance(value, (str, bytes)):
+        raise TypeError(f"{name} must be (minimum, maximum, points)")
+    try:
+        start, stop, count = tuple(value)  # type: ignore[misc]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be (minimum, maximum, points)") from exc
+    if isinstance(start, bool) or not isinstance(start, Real):
+        raise TypeError(f"{name} minimum must be a real number")
+    if isinstance(stop, bool) or not isinstance(stop, Real):
+        raise TypeError(f"{name} maximum must be a real number")
+    if isinstance(count, bool) or not isinstance(count, Integral):
+        raise TypeError(f"{name} points must be an integer")
+    points = int(count)
+    if points < 1:
+        raise ValueError(f"{name} points must be positive")
+    start_value = finite_real(start, f"{name} minimum")
+    stop_value = finite_real(stop, f"{name} maximum")
+    factor = finite_real(scale, f"{name} unit scale", positive=True)
+    start_decimal = Decimal(str(start_value))
+    stop_decimal = Decimal(str(stop_value))
+    factor_decimal = Decimal(str(factor))
+    if points == 1:
+        authored_values = (start_decimal,)
+    else:
+        with localcontext() as context:
+            # Keep the authored decimal linear axis intact until the final
+            # public float boundary.  A binary linspace here can invent an
+            # off-grid residue before the pulse compiler sees the value.
+            context.prec = 50
+            interval = stop_decimal - start_decimal
+            denominator = Decimal(points - 1)
+            authored_values = tuple(
+                start_decimal
+                if index == 0
+                else stop_decimal
+                if index == points - 1
+                else start_decimal
+                + interval * Decimal(index) / denominator
+                for index in range(points)
+            )
+    result = tuple(float(item * factor_decimal) for item in authored_values)
+    if positive and any(item <= 0.0 for item in result):
+        raise ValueError(f"{name} values must be positive")
+    return result
+
+
+def _scale_authored_value(value: object, scale: object, name: str) -> float:
+    """Scale a user-authored decimal without inventing a sub-tick residue.
+
+    Qt returns ordinary floats, but their shortest decimal spelling still
+    represents the value the operator authored.  Multiplying those floats
+    directly can turn ``20 us`` into ``1.9999999999999998e-05 s``; the pulse
+    owner must then (correctly) reject that value as off-grid.  Preserve the
+    authored decimal at this unit boundary and leave actual clock-grid
+    validation to the selected PulseDocument.
+    """
+
+    authored = finite_real(value, name)
+    factor = finite_real(scale, f"{name} unit scale", positive=True)
+    return float(Decimal(str(authored)) * Decimal(str(factor)))
+
+
 def _optional_trigger(value: str | None) -> str | None:
     return None if value is None else canonical_text(value, "trigger_channel")
 
@@ -174,6 +295,171 @@ def _model_kind(value: ReadoutModelKind | None) -> ReadoutModelKind | None:
     if value is not None and not isinstance(value, ReadoutModelKind):
         raise TypeError("model_kind must be ReadoutModelKind or None")
     return value
+
+
+@dataclass(frozen=True, slots=True)
+class TemperatureReleaseRecaptureIntent:
+    """Device-independent physical input for a temperature Measurement."""
+
+    pulse: str
+    trap_off_seconds: tuple[float, ...]
+    shots: int
+    per_site: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pulse", normalized_text(self.pulse, "pulse"))
+        object.__setattr__(
+            self,
+            "trap_off_seconds",
+            _numeric_axis(self.trap_off_seconds, "trap_off_seconds", positive=True),
+        )
+        object.__setattr__(self, "shots", positive_integer(self.shots, "shots"))
+        if type(self.per_site) is not bool:
+            raise TypeError("per_site must be bool")
+
+
+@dataclass(frozen=True, slots=True)
+class ReadoutDurationFidelityIntent:
+    """Device-independent physical input for a readout-duration Measurement."""
+
+    pulse: str
+    duration_seconds: tuple[float, ...]
+    shots: int
+    site: int | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pulse", normalized_text(self.pulse, "pulse"))
+        object.__setattr__(
+            self,
+            "duration_seconds",
+            _numeric_axis(self.duration_seconds, "duration_seconds", positive=True),
+        )
+        object.__setattr__(self, "shots", positive_integer(self.shots, "shots"))
+        object.__setattr__(
+            self,
+            "site",
+            integer(
+                self.site,
+                "site",
+                optional=True,
+                minimum=MINIMUM_READOUT_SITE_INDEX,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GreyMolassesDetuningIntent:
+    """Device-independent physical input for a Grey-molasses Measurement."""
+
+    pulse: str
+    detuning_gamma: tuple[float, ...]
+    trap_off_seconds: float
+    shots: int
+    rf_role: str
+    per_site: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pulse", normalized_text(self.pulse, "pulse"))
+        object.__setattr__(
+            self,
+            "detuning_gamma",
+            _finite_signed_axis(self.detuning_gamma, "detuning_gamma"),
+        )
+        object.__setattr__(
+            self,
+            "trap_off_seconds",
+            finite_real(
+                self.trap_off_seconds,
+                "trap_off_seconds",
+                positive=True,
+            ),
+        )
+        object.__setattr__(self, "shots", positive_integer(self.shots, "shots"))
+        object.__setattr__(
+            self,
+            "rf_role",
+            normalized_text(self.rf_role, "rf_role"),
+        )
+        if type(self.per_site) is not bool:
+            raise TypeError("per_site must be bool")
+
+
+def build_temperature_release_recapture_intent(
+    *,
+    pulse: str,
+    trap_off_microseconds: object,
+    shots: object,
+    per_site: object,
+) -> TemperatureReleaseRecaptureIntent:
+    """Convert an authored microsecond range into one physical intent."""
+
+    return TemperatureReleaseRecaptureIntent(
+        pulse,
+        _linear_axis_from_range(
+            trap_off_microseconds,
+            "trap_off",
+            scale=1e-6,
+            positive=True,
+        ),
+        shots,  # type: ignore[arg-type] - validated by the intent owner
+        per_site,
+    )
+
+
+def build_readout_duration_fidelity_intent(
+    *,
+    pulse: str,
+    duration_microseconds: object,
+    shots: object,
+    site: object,
+) -> ReadoutDurationFidelityIntent:
+    """Convert an authored microsecond range into one physical intent."""
+
+    return ReadoutDurationFidelityIntent(
+        pulse,
+        _linear_axis_from_range(
+            duration_microseconds,
+            "duration",
+            scale=1e-6,
+            positive=True,
+        ),
+        shots,  # type: ignore[arg-type] - validated by the intent owner
+        site,  # type: ignore[arg-type] - validated by the intent owner
+    )
+
+
+def build_grey_molasses_detuning_intent(
+    *,
+    pulse: str,
+    detuning_gamma_range: object,
+    trap_off_microseconds: object,
+    shots: object,
+    rf_role: object,
+    per_site: object,
+) -> GreyMolassesDetuningIntent:
+    """Convert authored UI units into one physical Grey-molasses intent."""
+
+    return GreyMolassesDetuningIntent(
+        pulse,
+        _linear_axis_from_range(
+            detuning_gamma_range,
+            "detuning",
+            scale=1.0,
+            positive=False,
+        ),
+        _scale_authored_value(
+            finite_real(
+                trap_off_microseconds,
+                "t_off",
+                positive=True,
+            ),
+            1e-6,
+            "t_off",
+        ),
+        shots,  # type: ignore[arg-type] - validated by the intent owner
+        rf_role,  # type: ignore[arg-type] - validated by the intent owner
+        per_site,
+    )
 
 
 @dataclass(frozen=True)
@@ -359,26 +645,6 @@ class _GreyMolassesDetuningProgram:
         )
 
 
-def _finite_signed_axis(values: object, name: str) -> tuple[float, ...]:
-    if isinstance(values, (str, bytes)):
-        raise TypeError(f"{name} must be a numeric sequence")
-    try:
-        raw = tuple(values)
-    except TypeError as exc:
-        raise TypeError(f"{name} must be a numeric sequence") from exc
-    if not raw:
-        raise ValueError(f"{name} must contain at least one value")
-    result = []
-    for value in raw:
-        if isinstance(value, bool) or not isinstance(value, Real):
-            raise TypeError(f"{name} values must be real numbers")
-        item = float(value)
-        if not isfinite(item):
-            raise ValueError(f"{name} values must be finite")
-        result.append(item)
-    return tuple(result)
-
-
 def _calibrated_probe_seconds(
     document: PulseDocument,
     calibration: CalibrationArtifact,
@@ -507,11 +773,24 @@ def _freeze_release_recapture_rows(
     document = _release_recapture_template(document, calibration)
     parameter = document.scan_parameters[0]
     unit_ns = TIME_UNIT_TO_NS[parameter.unit]
-    frozen, _normalization = freeze_scan_table(
+    frozen, normalization = freeze_scan_table(
         document,
         ("t_off",),
-        tuple((seconds * 1e9 / unit_ns,) for seconds in trap_off_seconds),
+        tuple(
+            (
+                _scale_authored_value(
+                    seconds,
+                    1e9 / unit_ns,
+                    "trap_off_seconds",
+                ),
+            )
+            for seconds in trap_off_seconds
+        ),
     )
+    if normalization.adjusted_cells:
+        raise ValueError(
+            "trap_off values must already lie on the selected pulse clock grid"
+        )
     periods = document.periods
     repeat = (
         None
@@ -757,7 +1036,16 @@ def bind_readout_duration_fidelity(
         execution_document,
         ApiSegmentTable(
             (parameter.parameter_id,),
-            tuple((seconds * scale,) for seconds in request.duration_seconds),
+            tuple(
+                (
+                    _scale_authored_value(
+                        seconds,
+                        scale,
+                        "duration_seconds",
+                    ),
+                )
+                for seconds in request.duration_seconds
+            ),
         ),
         "camera integration time must be configured and read back at each API point",
     )
@@ -928,7 +1216,7 @@ def bind_temperature_release_recapture(
         readout_event_axis_id=AxisId("temperature.readout_event"),
         # The scan table's physical rows remain in the pulse parameter's
         # authoring unit.  The Measurement contract exposes the operator-facing
-        # physical quantity in SI, matching Main's ``Trap-off time (s)`` output.
+        # physical quantity in SI as ``Trap-off time (s)``.
         scan_axes=(
             AxisSpec(
                 AxisId("temperature.t_off"),
@@ -1101,19 +1389,41 @@ __all__ = [
     "BoundReadoutDurationFidelity",
     "BoundTemperatureReleaseRecapture",
     "COUPLED_MEASUREMENT_DEFINITIONS",
+    "DEFAULT_GREY_MOLASSES_DETUNING_GAMMA_RANGE",
+    "DEFAULT_GREY_MOLASSES_PER_SITE",
+    "DEFAULT_GREY_MOLASSES_RF_ROLE",
+    "DEFAULT_GREY_MOLASSES_SHOTS",
+    "DEFAULT_GREY_MOLASSES_TRAP_OFF_MICROSECONDS",
+    "DEFAULT_READOUT_DURATION_MICROSECONDS_RANGE",
+    "DEFAULT_READOUT_DURATION_SHOTS",
+    "DEFAULT_READOUT_DURATION_SITE",
+    "DEFAULT_TEMPERATURE_PER_SITE",
+    "DEFAULT_TEMPERATURE_SHOTS",
+    "DEFAULT_TEMPERATURE_TRAP_OFF_MICROSECONDS_RANGE",
     "GREY_MOLASSES_CAPABILITY_GAP",
     "GREY_MOLASSES_DETUNING_DEFINITION",
     "GREY_MOLASSES_DETUNING_KEY",
+    "GREY_MOLASSES_DETUNING_OUTPUT_NAMES",
     "GreyMolassesDetuningRequest",
+    "GreyMolassesDetuningIntent",
+    "MINIMUM_COUPLED_MEASUREMENT_SHOTS",
+    "MINIMUM_READOUT_SITE_INDEX",
     "READOUT_DURATION_FIDELITY_DEFINITION",
     "READOUT_DURATION_FIDELITY_KEY",
+    "READOUT_DURATION_FIDELITY_OUTPUT_NAMES",
     "ReadoutDurationFidelityRequest",
+    "ReadoutDurationFidelityIntent",
     "TEMPERATURE_RELEASE_RECAPTURE_DEFINITION",
     "TEMPERATURE_RELEASE_RECAPTURE_KEY",
+    "TEMPERATURE_RELEASE_RECAPTURE_OUTPUT_NAMES",
     "TemperatureReleaseRecaptureRequest",
+    "TemperatureReleaseRecaptureIntent",
     "bind_grey_molasses_detuning",
     "bind_readout_duration_fidelity",
     "bind_temperature_release_recapture",
     "build_temperature_release_recapture_program",
+    "build_grey_molasses_detuning_intent",
+    "build_readout_duration_fidelity_intent",
+    "build_temperature_release_recapture_intent",
     "reject_grey_molasses_detuning",
 ]

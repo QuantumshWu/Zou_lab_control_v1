@@ -62,13 +62,14 @@ def dataset_schema(*, explicit: bool = False, component_validity: bool = False) 
     return DatasetSchema(repeat, (detuning,), layout, image_schema(component_validity=component_validity))
 
 
-def test_scalar_is_rank_zero_not_length_one_axis():
-    scalar_schema = ValueSchema((), ValidityContract.value(), np.dtype(np.float64), "count")
-    value = Value(np.array(2.5), VALID, scalar_schema)
+def test_scalar_has_the_canonical_length_one_carrier_axis():
+    scalar_schema = ValueSchema.scalar(np.dtype(np.float64), "count")
+    value = Value(np.array([2.5]), VALID, scalar_schema)
 
-    assert value.values.shape == ()
+    assert scalar_schema.is_scalar
+    assert value.values.shape == (1,)
     with pytest.raises(ValueError, match="shape"):
-        Value(np.array([2.5]), VALID, scalar_schema)
+        Value(np.array(2.5), VALID, scalar_schema)
 
 
 @pytest.mark.parametrize("layout", [PointLayout.rect_c((2, 3)), PointLayout.rect_f((2, 3))])
@@ -354,8 +355,8 @@ def test_value_payload_digest_binds_valid_content_and_normalizes_invalid_fillers
 
 
 def test_schema_fingerprint_normalizes_dtype_endianness():
-    little = ValueSchema((), ValidityContract.value(), np.dtype("<i2"))
-    big = ValueSchema((), ValidityContract.value(), np.dtype(">i2"))
+    little = ValueSchema.scalar(np.dtype("<i2"))
+    big = ValueSchema.scalar(np.dtype(">i2"))
     assert little.fingerprint == big.fingerprint
 
 
@@ -376,7 +377,7 @@ def test_immutable_schema_fingerprints_are_computed_once(monkeypatch):
 
 def test_value_schema_rejects_non_numeric_payload_dtypes():
     with pytest.raises(TypeError, match="numeric"):
-        ValueSchema((), ValidityContract.value(), np.dtype("U4"))
+        ValueSchema.scalar(np.dtype("U4"))
 
 
 def test_axis_coordinates_reject_nonfinite_values():
@@ -409,10 +410,12 @@ def test_numeric_coordinates_have_one_python_and_fingerprint_identity():
     assert left == right
     assert left.fingerprint == right.fingerprint
 
-    with pytest.raises(TypeError, match="boolean"):
+    with pytest.raises(TypeError, match="integer"):
         AxisSpec(AxisId("bool"), "bool", SCAN_POINT, 1, (True,))
-    with pytest.raises(TypeError, match="scalar"):
-        AxisSpec(AxisId("fraction"), "fraction", SCAN_POINT, 1, (Fraction(1, 2),))
+    fractional = AxisSpec(
+        AxisId("fraction"), "fraction", SCAN_POINT, 1, (Fraction(1, 2),)
+    )
+    assert fractional.coordinates == (0.5,)
 
 
 def test_layout_constructor_normalizes_equal_physical_mappings():
@@ -484,8 +487,8 @@ def test_invalid_digest_still_validates_shape_and_dtype():
 
 
 def test_value_canonicalization_accepts_endian_equivalent_input():
-    schema = ValueSchema((), ValidityContract.value(), np.dtype("<i2"))
-    source = np.array(513, dtype=">i2")
+    schema = ValueSchema.scalar(np.dtype("<i2"))
+    source = np.array([513], dtype=">i2")
     canonical = canonical_value_array(source, VALID, schema)
     assert canonical is not None
     assert canonical.dtype == np.dtype("<i2")

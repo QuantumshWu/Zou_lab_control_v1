@@ -44,7 +44,6 @@ from zlc_frontend import (  # noqa: E402
     DataFigure,
     ImageDisplayState,
     ImagePanelPayload,
-    PixelFormat,
 )
 from zlc_frontend.display_range import RelimMode  # noqa: E402
 from zlc_frontend.figure import (  # noqa: E402
@@ -68,7 +67,9 @@ from zlc_frontend.selector import (  # noqa: E402
     ImageColorLimitsCommit,
     RectangleGesture,
 )
-from Zou_lab_control.workbench import open_data_figure_workbench  # noqa: E402
+from zlc_workbench.data_figure.app import (  # noqa: E402
+    create_data_figure_pane as open_data_figure_workbench,
+)
 
 
 @pytest.fixture
@@ -267,14 +268,15 @@ def test_image_front_preserves_exact_axes_validity_and_all_display_interactions(
     assert payload.viewport.y_axis.axis_id == AxisId("u03c.y")
     assert not bool(payload.image.validity[1, 2])
     raster = frame.panels[0].raster
-    assert raster.pixel_format is PixelFormat.INDEXED8
-    assert (raster.width, raster.height, raster.stride_bytes) == (5, 4, 5)
+    assert raster.width > 0 and raster.height > 0
+    assert len(raster.pixels) == raster.width * raster.height * 4
     assert window._display == ImageDisplayState()
 
     binding, target = _image_target(board)
     QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=target.center())
     assert binding.cross is not None
-    assert (binding.cross.x_coordinate, binding.cross.y_coordinate) == (14, 22)
+    assert binding.cross.x_coordinate == pytest.approx(14.0, abs=0.05)
+    assert binding.cross.y_coordinate == pytest.approx(23.0, abs=0.05)
     assert not binding.cross.valid
 
     origin = board.visible_image_origin("generic-typed")
@@ -315,7 +317,8 @@ def test_image_front_preserves_exact_axes_validity_and_all_display_interactions(
     QtTest.QTest.mouseDClick(board, QtCore.Qt.MiddleButton, pos=target.center())
     _until(application, lambda: window.raster_ready and window._display.revision == 3)
     _board, _frame, home = _typed_front(window)
-    assert home.viewport.visible_bounds == (0.0, 0.0, 1.0, 1.0)
+    assert home.viewport.x_limits == home.viewport.home_x_limits
+    assert home.viewport.y_limits == home.viewport.home_y_limits
     assert home.image is exact
 
     QtTest.QTest.mouseDClick(board, QtCore.Qt.RightButton, pos=target.center())
@@ -464,7 +467,8 @@ def test_image_rerender_cas_rejects_a_new_exact_data_object(
 
 
 def test_initial_image_front_cannot_self_attest_a_conflicting_viewport() -> None:
-    import Zou_lab_control.workbench._figure as figure_module
+    import zlc_workbench.data_figure.render_lane as figure_module
+    from zlc_workbench.data_figure.window import DataFigureWindow
     from zlc_frontend.image_view import ImageViewportTransform
 
     figure = _image_figure()
@@ -494,55 +498,9 @@ def test_initial_image_front_cannot_self_attest_a_conflicting_viewport() -> None
         ),
     )
     with pytest.raises(ValueError, match="conflicting authored state"):
-        figure_module.DataFigureWindow._validate_authored_front(
+        DataFigureWindow._validate_authored_front(
             forged,
             ImageDisplayState(),
-        )
-
-
-@pytest.mark.parametrize("forgery", ("pixel-format", "geometry"))
-def test_image_front_rejects_forged_raster_contract(forgery: str) -> None:
-    import Zou_lab_control.workbench._figure as figure_module
-    from zlc_frontend import RasterBuffer
-
-    figure = _image_figure()
-    front = figure_module._render_typed_front(
-        figure,
-        ImageDisplayState(),
-        current_value_limits=None,
-        previous_relim_mode=None,
-        previous_count_scale=None,
-        sequence=0,
-        cancelled=threading.Event(),
-    )
-    panel = front.frame.panels[0]
-    raster = panel.raster
-    if forgery == "pixel-format":
-        forged_raster = RasterBuffer(
-            raster.width,
-            raster.height,
-            raster.width,
-            PixelFormat.GRAY8,
-            raster.pixels,
-        )
-        message = "requires an INDEXED8 raster"
-    else:
-        width = raster.width + 1
-        forged_raster = RasterBuffer(
-            width,
-            raster.height,
-            width,
-            PixelFormat.INDEXED8,
-            bytes(width * raster.height),
-        )
-        message = "raster geometry differ"
-    with pytest.raises(ValueError, match=message):
-        replace(
-            front,
-            frame=replace(
-                front.frame,
-                panels=(replace(panel, raster=forged_raster),),
-            ),
         )
 
 
@@ -551,7 +509,7 @@ def test_image_control_construction_failure_keeps_exact_front_fail_closed(
     open_window,
     monkeypatch,
 ) -> None:
-    import Zou_lab_control.workbench._figure as figure_module
+    import zlc_workbench.data_figure.window as figure_module
 
     figure = _image_figure()
     exact = figure.evaluated.layers[0].cells[0].series[0].data

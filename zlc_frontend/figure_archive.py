@@ -16,11 +16,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-import os
-from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeAlias
-import uuid
 
 import numpy as np
 
@@ -64,7 +61,6 @@ from .meter_display import MeterDisplayState
 
 
 FIGURE_ARCHIVE_SCHEMA = "zlc_frontend.DataFigureArchive"
-_NPZ_FIELDS = ("payload", "schema")
 _DATASET_FIELDS = {"dataset_id", "ref", "schema", "validity", "values"}
 _FIT_RESULT_FIELDS = {"layer_id", "payload"}
 
@@ -434,13 +430,12 @@ def _freeze_metadata_value(value: Any) -> Any:
 
 
 @dataclass(frozen=True, slots=True)
-class LoadedFigureArchive:
-    """One reopened current archive plus its display-only replay state."""
+class FigureArchive:
+    """Decoded current archive value, independent of any repository path."""
 
     figure: DataFigure
     display: FigureDisplayState | None
     metadata: Mapping[str, object]
-    path: Path
     payload_digest: str
 
     def __post_init__(self) -> None:
@@ -459,7 +454,6 @@ class LoadedFigureArchive:
             "metadata",
             _freeze_metadata_value(normalized_metadata),
         )
-        object.__setattr__(self, "path", Path(self.path).resolve())
         object.__setattr__(
             self,
             "payload_digest",
@@ -467,93 +461,41 @@ class LoadedFigureArchive:
         )
 
 
-def _target_path(path: str | os.PathLike[str]) -> Path:
-    target = Path(path)
-    if not target.name:
-        raise ValueError("figure archive path must name a file")
-    if not target.suffix:
-        target = target.with_suffix(".npz")
-    elif target.suffix.lower() != ".npz":
-        raise ValueError("figure archive path must use the .npz suffix")
-    return target
-
-
-def save_figure_archive(
+def encode_figure_archive(
     figure: DataFigure,
-    path: str | os.PathLike[str],
     *,
     display: FigureDisplayState | None = None,
     metadata: Mapping[str, object] | None = None,
-) -> Path:
-    """Atomically replace ``path`` with the sole current archive envelope."""
+) -> bytes:
+    """Encode one exact current archive payload without doing filesystem I/O."""
 
-    target = _target_path(path)
-    payload = encode(
+    return encode(
         _archive_tree(
             figure,
             display=display,
             metadata=metadata,
         )
     )
-    schema_array = np.frombuffer(
-        FIGURE_ARCHIVE_SCHEMA.encode("ascii"),
-        dtype=np.uint8,
-    )
-    payload_array = np.frombuffer(payload, dtype=np.uint8)
-    temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
-    try:
-        with temporary.open("xb") as stream:
-            np.savez_compressed(
-                stream,
-                schema=schema_array,
-                payload=payload_array,
-            )
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-    return target
 
 
-def load_figure_archive(
-    path: str | os.PathLike[str],
-) -> LoadedFigureArchive:
-    """Load only the exact two-field current archive with pickle disabled."""
+def decode_figure_archive(payload: bytes) -> FigureArchive:
+    """Decode the sole current canonical payload without repository concerns."""
 
-    target = _target_path(path)
-    with np.load(target, allow_pickle=False) as archive:
-        if tuple(sorted(archive.files)) != _NPZ_FIELDS:
-            raise ValueError(
-                "figure archive NPZ must contain exactly ['payload', 'schema']"
-            )
-        schema = archive["schema"]
-        encoded_payload = archive["payload"]
-        if schema.dtype != np.dtype(np.uint8) or schema.ndim != 1:
-            raise ValueError("figure archive schema must be a uint8 vector")
-        if encoded_payload.dtype != np.dtype(np.uint8) or encoded_payload.ndim != 1:
-            raise ValueError("figure archive payload must be a uint8 vector")
-        if schema.tobytes(order="C") != FIGURE_ARCHIVE_SCHEMA.encode("ascii"):
-            raise ValueError("unsupported figure archive schema")
-        payload = encoded_payload.tobytes(order="C")
-
+    if not isinstance(payload, bytes):
+        raise TypeError("figure archive payload must be bytes")
     figure, display, metadata = _decode_archive_payload(payload)
-    return LoadedFigureArchive(
+    return FigureArchive(
         figure=figure,
         display=display,
         metadata=metadata,
-        path=target,
         payload_digest=sha256_digest(payload),
     )
 
 
 __all__ = [
     "FIGURE_ARCHIVE_SCHEMA",
+    "FigureArchive",
     "FigureDisplayState",
-    "LoadedFigureArchive",
-    "load_figure_archive",
-    "save_figure_archive",
+    "decode_figure_archive",
+    "encode_figure_archive",
 ]

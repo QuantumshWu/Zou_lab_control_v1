@@ -37,7 +37,7 @@ from zlc_neutral_atom.camera_operator import (
 )
 
 
-_CAMERA_CAPTURE_SPEC_SCHEMA = "zlc_neutral_atom.camera-capture-spec.v2"
+_CAMERA_CAPTURE_SPEC_SCHEMA = "zlc_neutral_atom.camera-capture-spec"
 CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT = canonical_digest(
     {
         "owner": "zlc_neutral_atom.acquisition.camera",
@@ -112,7 +112,7 @@ def freeze_camera_capture_spec(spec: CameraCaptureSpec) -> FrozenCaptureSpec:
 
 
 def decode_camera_capture_spec(value: FrozenCaptureSpec | bytes) -> CameraCaptureSpec:
-    """Decode exactly the current camera spec schema; no runtime legacy reader."""
+    """Decode exactly the current camera spec schema."""
 
     if isinstance(value, FrozenCaptureSpec):
         if value.owner_fingerprint != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT:

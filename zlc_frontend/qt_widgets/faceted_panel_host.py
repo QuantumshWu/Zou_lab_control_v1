@@ -177,6 +177,39 @@ class FacetedPanelHost(QtWidgets.QWidget):
             return None
         return self._focus.visible_interaction_origin()
 
+    def selection_for_rectangle_gesture(self, gesture):
+        """Resolve an Area only against the exact focused cell front."""
+
+        if self._stack.currentWidget() is not self._focus:
+            raise RuntimeError(
+                "faceted overview has no interactive rectangle selection"
+            )
+        return self._focus.selection_for_rectangle_gesture(gesture)
+
+    def selection_for_curve_range_gesture(self, gesture):
+        """Resolve an Area only against the exact focused cell front."""
+
+        if self._stack.currentWidget() is not self._focus:
+            raise RuntimeError(
+                "faceted overview has no interactive curve selection"
+            )
+        return self._focus.selection_for_curve_range_gesture(gesture)
+
+    def area_commit_for_range_gesture(self, gesture):
+        if self._stack.currentWidget() is not self._focus:
+            raise RuntimeError("faceted overview has no interactive Area")
+        return self._focus.area_commit_for_range_gesture(gesture)
+
+    def area_commit_for_rectangle_gesture(self, gesture):
+        if self._stack.currentWidget() is not self._focus:
+            raise RuntimeError("faceted overview has no interactive Area")
+        return self._focus.area_commit_for_rectangle_gesture(gesture)
+
+    def cross_commit_for_gesture(self, gesture):
+        if self._stack.currentWidget() is not self._focus:
+            raise RuntimeError("faceted overview has no interactive Cross")
+        return self._focus.cross_commit_for_gesture(gesture)
+
     def discard_pending_interaction(self, origin) -> bool:
         return self._focus.discard_pending_interaction(origin)
 

@@ -23,8 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_panel_title_is_a_local_draft_until_one_semantic_commit() -> None:
     from PyQt5 import QtCore, QtTest
 
-    from zlc_data.console_records import PanelConfig
-    from zlc_frontend.console_state import TaskConsoleState
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
     from zlc_frontend.qt_widgets import ensure_qt_app
     from zlc_workbench.task_console.window import TaskConsole
 
@@ -72,11 +72,11 @@ def test_panel_title_is_a_local_draft_until_one_semantic_commit() -> None:
         application.processEvents()
 
 
-def test_timer_never_rediscovers_signal_topology_but_binding_commit_does() -> None:
+def test_timer_and_binding_commit_never_rediscover_signal_topology() -> None:
     from PyQt5 import QtCore, QtTest
 
-    from zlc_data.console_records import PanelConfig
-    from zlc_frontend.console_state import TaskConsoleState
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
     from zlc_frontend.qt_widgets import ensure_qt_app
     from zlc_workbench.task_console.window import TaskConsole
 
@@ -154,7 +154,7 @@ def test_timer_never_rediscovers_signal_topology_but_binding_commit_does() -> No
         finally:
             console._data.freeze = data_freeze
         assert card.config.signal == "source_b"
-        assert provider_reads > 0
+        assert provider_reads == 0
         reads_after_commit = provider_reads
 
         for _ in range(4):
@@ -180,8 +180,8 @@ def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
         ValidityContract,
         ValueSchema,
     )
-    from zlc_data.console_records import PanelConfig
-    from zlc_frontend.console_state import TaskConsoleState
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
     from zlc_frontend.figure import (
         AxisViewRole,
         RepeatViewMode,
@@ -210,7 +210,7 @@ def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
         repeat,
         (scan,),
         PointLayout.rect_c((scan.size,)),
-        ValueSchema((), ValidityContract.value(), np.dtype("float64"), "V"),
+        ValueSchema.scalar(np.dtype("float64"), "V"),
     )
 
     application = ensure_qt_app()
@@ -283,8 +283,8 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
         ValidityContract,
         ValueSchema,
     )
-    from zlc_data.console_records import PanelConfig
-    from zlc_frontend.console_state import TaskConsoleState
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
     from zlc_frontend.figure import AxisViewRole, view_spec_from_tree
     from zlc_frontend.qt_widgets import ensure_qt_app
     from zlc_workbench.task_console.data_plane import ConsoleSignalValue
@@ -309,14 +309,14 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
         repeat,
         (scan,),
         PointLayout.rect_c((scan.size,)),
-        ValueSchema((), ValidityContract.value(), np.dtype("float64"), "V"),
+        ValueSchema.scalar(np.dtype("float64"), "V"),
     )
-    values = np.arange(12, dtype=np.float64).reshape(3, 4)
+    values = np.arange(12, dtype=np.float64).reshape(3, 4, 1)
     block = DataBlock(
         BlockId("task-console-grid-block"),
         DatasetRevision(1),
         values,
-        CellValidity(np.ones(values.shape, dtype=np.bool_)),
+        CellValidity(np.ones(values.shape[:2], dtype=np.bool_)),
         schema,
     )
     snapshot = OwnedSnapshot(
@@ -379,8 +379,8 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
         assert len(board._regions) == repeat.size
 
         region = board._regions[0]
-        target = board._overview._target_rect()
-        assert target is not None
+        assert board._overview._front is not None
+        target = board._overview._native_target(board._overview._front[1])
         position = QtCore.QPoint(
             int(target.x() + 0.5 * (region.left + region.right) * target.width()),
             int(target.y() + 0.5 * (region.top + region.bottom) * target.height()),
@@ -393,10 +393,7 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
         wait_until(
             lambda: not board.showing_overview and board.front_frame is not None
         )
-        QtTest.QTest.mouseClick(
-            board._overview_button,
-            QtCore.Qt.LeftButton,
-        )
+        QtTest.QTest.keyClick(board.board, QtCore.Qt.Key_Escape)
         wait_until(lambda: board.showing_overview)
     finally:
         assert console.shutdown()

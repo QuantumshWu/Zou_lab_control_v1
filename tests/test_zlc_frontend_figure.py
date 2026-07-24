@@ -438,7 +438,7 @@ def test_slider_bindings_preserve_contract_order_and_repeat_latest():
         repeat,
         (rolling_point,),
         PointLayout.rect_c((40,)),
-        ValueSchema((), ValidityContract.value(), np.dtype("float64")),
+        ValueSchema.scalar(np.dtype("float64")),
     )
     meter_suggestion = suggest_view(meter_schema, ViewIntent.METER)
     assert meter_suggestion.status is SuggestionStatus.RESOLVED

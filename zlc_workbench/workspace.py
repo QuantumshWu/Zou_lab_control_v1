@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import threading
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable
 import weakref
 
 from zlc_frontend import (
@@ -69,72 +69,6 @@ class BoardModel:
     @property
     def panel_ids(self) -> tuple[str, ...]:
         return tuple(panel.panel_id for panel in self.panels)
-
-    def replace_panels(self, panels: tuple[PanelSlot, ...]) -> "BoardModel":
-        return BoardModel(
-            self.board_id,
-            self.layout_generation + 1,
-            self.surface,
-            tuple(panels),
-        )
-
-
-@dataclass(frozen=True)
-class WorkspaceModel:
-    """Revisioned value; controllers never mutate persisted workspace state in place."""
-
-    workspace_id: str
-    revision: int
-    boards: tuple[BoardModel, ...]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "workspace_id", _text(self.workspace_id, "workspace_id")
-        )
-        object.__setattr__(
-            self,
-            "revision",
-            nonnegative_integer(self.revision, "revision"),
-        )
-        boards = tuple(self.boards)
-        if any(not isinstance(board, BoardModel) for board in boards):
-            raise TypeError("boards must contain BoardModel values")
-        ids = tuple(board.board_id for board in boards)
-        if len(set(ids)) != len(ids):
-            raise ValueError("board ids must be unique within a workspace")
-        object.__setattr__(self, "boards", boards)
-
-    def replace_board(self, board: BoardModel) -> "WorkspaceModel":
-        if not isinstance(board, BoardModel):
-            raise TypeError("board must be BoardModel")
-        found = False
-        updated = []
-        for current in self.boards:
-            if current.board_id == board.board_id:
-                found = True
-                if board.layout_generation <= current.layout_generation:
-                    raise ValueError(
-                        "workspace board replacement requires a newer layout_generation"
-                    )
-                updated.append(board)
-            else:
-                updated.append(current)
-        if not found:
-            updated.append(board)
-        return replace(self, revision=self.revision + 1, boards=tuple(updated))
-
-
-@runtime_checkable
-class PanelHost(Protocol):
-    """Qt-side panel shell; it owns widgets but never acquisition or run lifecycle."""
-
-    @property
-    def panel_id(self) -> str: ...
-
-    def clear(self, reason: str) -> None: ...
-
-    def close(self) -> None: ...
-
 
 @dataclass(frozen=True)
 class PanelSourceBinding:
@@ -212,7 +146,6 @@ class BoardController:
         # presents wholly before a fault or is revoked wholly before present.
         self._present_gate = threading.Lock()
         self._active_model = model
-        self._staged_model: BoardModel | None = None
         self._presenter: BoardPresenter | None = presenter
         self._request_owner_wake = request_owner_wake
         self._pending: BoardFrame | None = None
@@ -228,39 +161,12 @@ class BoardController:
     @property
     def model(self) -> BoardModel:
         with self._lock:
-            return self._staged_model or self._active_model
+            return self._active_model
 
     @property
     def fault(self) -> BaseException | None:
         with self._lock:
             return self._fault
-
-    def reconfigure(self, model: BoardModel) -> None:
-        self._require_owner()
-        if not isinstance(model, BoardModel):
-            raise TypeError("model must be BoardModel")
-        with self._lock:
-            self._ensure_usable()
-            target = self._staged_model or self._active_model
-            if model.board_id != target.board_id:
-                raise ValueError("BoardController cannot change board identity")
-            if model.layout_generation <= target.layout_generation:
-                raise ValueError("reconfigure requires a newer layout_generation")
-            self._staged_model = model
-            self._revoke_source_locked()
-
-    def discard_staged_model(self, model: BoardModel) -> bool:
-        """Rollback only the named unpresented model without clearing the front."""
-
-        self._require_owner()
-        if not isinstance(model, BoardModel):
-            raise TypeError("model must be BoardModel")
-        with self._lock:
-            if self._closed or self._staged_model is not model:
-                return False
-            self._staged_model = None
-            self._revoke_source_locked()
-            return True
 
     def open_publish_port(
         self,
@@ -276,8 +182,7 @@ class BoardController:
         token = object()
         with self._lock:
             self._ensure_usable()
-            target = self._staged_model or self._active_model
-            expected = set(target.panel_ids)
+            expected = set(self._active_model.panel_ids)
             if set(by_panel) != expected:
                 raise ValueError("source bindings must cover every target panel exactly")
             self._revoke_source_locked()
@@ -292,7 +197,6 @@ class BoardController:
         with self._lock:
             if self._closed:
                 return
-            self._staged_model = None
             self._revoke_source_locked()
         self._clear_presenter()
 
@@ -381,9 +285,8 @@ class BoardController:
                 raise RuntimeError("board publish port is revoked")
             if sequence <= self._requested_sequence:
                 raise ValueError("board work sequence must increase")
-            target = self._staged_model or self._active_model
             model_groups: dict[str, list[str]] = {}
-            for panel in target.panels:
+            for panel in self._active_model.panels:
                 model_groups.setdefault(panel.coherence_group, []).append(
                     panel.panel_id
                 )
@@ -448,7 +351,7 @@ class BoardController:
                 or work_token is not self._work_token
             ):
                 return False
-            model = self._staged_model or self._active_model
+            model = self._active_model
             if frame.board_id != model.board_id:
                 raise ValueError("frame belongs to another board")
             if frame.layout_generation != model.layout_generation:
@@ -484,7 +387,6 @@ class BoardController:
                 with self._lock:
                     if token is self._publish_token:
                         self._fault = detached_render_fault(exc)
-                        self._staged_model = None
                         self._revoke_source_locked()
                 raise
         return True
@@ -500,7 +402,6 @@ class BoardController:
                 self._ensure_usable()
                 self._wake_queued = False
                 frame, self._pending = self._pending, None
-                presented_model = self._staged_model or self._active_model
             if frame is None:
                 return False
             try:
@@ -511,17 +412,8 @@ class BoardController:
             except BaseException as exc:
                 with self._lock:
                     self._fault = detached_render_fault(exc)
-                    self._staged_model = None
                     self._revoke_source_locked()
                 raise
-            with self._lock:
-                if (
-                    frame.board_id == presented_model.board_id
-                    and frame.layout_generation == presented_model.layout_generation
-                ):
-                    self._active_model = presented_model
-                    if self._staged_model is presented_model:
-                        self._staged_model = None
             return True
 
     def close(self) -> None:
@@ -536,7 +428,6 @@ class BoardController:
             self._work_token = None
             self._expected_stamps = {}
             self._wake_queued = False
-            self._staged_model = None
             self._closed = True
             presenter = self._presenter
             self._request_owner_wake = None
@@ -566,7 +457,6 @@ class BoardController:
         except BaseException as exc:
             with self._lock:
                 self._fault = detached_render_fault(exc)
-                self._staged_model = None
                 self._revoke_source_locked()
             raise
 
@@ -595,7 +485,5 @@ __all__ = [
     "BoardModel",
     "BoardPublishPort",
     "PanelSourceBinding",
-    "PanelHost",
     "PanelSlot",
-    "WorkspaceModel",
 ]

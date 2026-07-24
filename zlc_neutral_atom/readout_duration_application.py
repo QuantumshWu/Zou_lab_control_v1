@@ -34,6 +34,10 @@ from zlc_neutral_atom.acquisition import (
     CameraSample,
     freeze_camera_capture_spec,
 )
+from zlc_neutral_atom.dataset_output import (
+    FinalDatasetOutput,
+    final_dataset_join_digest,
+)
 from zlc_neutral_atom.readout.analysis import fit_bimodal
 from zlc_neutral_atom.readout.calibration import (
     ReadoutModelKind,
@@ -43,8 +47,12 @@ from zlc_neutral_atom.readout.calibration import (
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
 from zlc_neutral_atom.readout.coupled_measurements import (
     BoundReadoutDurationFidelity,
+    READOUT_DURATION_FIDELITY_OUTPUT_NAMES,
+    ReadoutDurationFidelityRequest,
+    bind_readout_duration_fidelity,
 )
 from zlc_neutral_atom.runtime.capture import (
+    BoundCapturePort,
     CameraExposureConfiguredAck,
     CapturePreparedAck,
     CaptureStartedAck,
@@ -59,7 +67,11 @@ from zlc_neutral_atom.runtime.capture import (
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.run import PostSafetyContext, RunContext, RunHandle, RunPlan
 from zlc_neutral_atom.timing._coordination import run_cleanup_steps
-from zlc_neutral_atom.timing.pulse import PulseSession, PulseTerminalAck
+from zlc_neutral_atom.timing.pulse import (
+    BoundPulsePort,
+    PulseSession,
+    PulseTerminalAck,
+)
 from zlc_storage import canonical_digest, sha256_text
 
 
@@ -110,6 +122,27 @@ class ReadoutDurationFidelityResult:
                 "program": self.program_fingerprint,
             }
         )
+
+
+def readout_duration_fidelity_final_outputs(
+    result: ReadoutDurationFidelityResult,
+) -> dict[str, FinalDatasetOutput]:
+    """Publish the admitted fidelity curve without shell-side wrapping."""
+
+    if not isinstance(result, ReadoutDurationFidelityResult):
+        raise TypeError("result must be ReadoutDurationFidelityResult")
+    output_name = READOUT_DURATION_FIDELITY_OUTPUT_NAMES[0]
+    output = FinalDatasetOutput(
+        output_name,
+        result.snapshot,
+        final_dataset_join_digest(
+            owner="readout-duration-fidelity",
+            output_name=output_name,
+            source_identity=result.identity,
+            snapshot=result.snapshot,
+        ),
+    )
+    return {output.name: output}
 
 
 @dataclass(slots=True)
@@ -236,16 +269,26 @@ def _result_snapshot(
 
 
 def prepare_readout_duration_fidelity(
-    bound: BoundReadoutDurationFidelity,
+    request: ReadoutDurationFidelityRequest,
     calibration: ResolvedCalibration,
     *,
+    pulse_port: BoundPulsePort,
+    camera_port: BoundCapturePort,
     start_run: Callable[[RunPlan], RunHandle],
 ) -> PreparedReadoutDurationFidelity:
-    if not isinstance(bound, BoundReadoutDurationFidelity):
-        raise TypeError("bound must be BoundReadoutDurationFidelity")
+    if not isinstance(request, ReadoutDurationFidelityRequest):
+        raise TypeError("request must be ReadoutDurationFidelityRequest")
     if type(calibration) is not ResolvedCalibration:
         raise TypeError("calibration must be an admitted ResolvedCalibration")
     calibration._require_authority()
+    bound = bind_readout_duration_fidelity(
+        request,
+        calibration,
+        pulse_port=pulse_port,
+        camera_port=camera_port,
+    )
+    if not isinstance(bound, BoundReadoutDurationFidelity):
+        raise RuntimeError("readout-duration binding returned another domain value")
     if calibration.reference != bound.request.calibration_ref:
         raise ValueError("calibration differs from the bound request")
     model = calibration.artifact.select_model(bound.request.model_kind)
@@ -444,4 +487,5 @@ __all__ = [
     "PreparedReadoutDurationFidelity",
     "ReadoutDurationFidelityResult",
     "prepare_readout_duration_fidelity",
+    "readout_duration_fidelity_final_outputs",
 ]

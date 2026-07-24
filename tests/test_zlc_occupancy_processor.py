@@ -169,7 +169,9 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
             validity = artifact.counts.validity
             invalid = ~validity.mask
             result = {
-                "capture_descriptor_shape": list(descriptor.output_shape),
+                "capture_descriptor_shape": list(
+                    descriptor.output_schema.physical_shape
+                ),
                 "counts_shape": list(artifact.counts.values.shape),
                 "occupied_shape": list(artifact.occupied.values.shape),
                 "validity_shape": list(validity.mask.shape),

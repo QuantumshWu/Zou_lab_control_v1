@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from zlc_data.panel_size import PANEL_SIZES
+from zlc_frontend.panel_size import PANEL_SIZES
 from zlc_frontend.qt_widgets import (
     ACCENT,
     FluentButton,

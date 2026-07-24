@@ -44,11 +44,16 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 #: (module path, helper name, env var name, folder) for the two shells that keep a
 #: user-facing folder of saved files.
 #: The tasks entry named ``task_console._task_files_dir`` until S5-shell(w) moved the whole
-#: saved-layout cluster into ``zlc_frontend.console_state``.  The claim is unchanged -- ask
+#: saved-layout cluster into ``zlc_workbench.task_console``.  The claim is unchanged -- ask
 #: the seam, never count your own parents -- so it follows the function rather than being
 #: deleted along with the shell that used to hold it.
 SHELLS = [
-    ("zlc_frontend/console_state.py", "task_files_dir", "TASK_FILES_ENV", "tasks"),
+    (
+        "zlc_workbench/task_console/layout_repository.py",
+        "task_files_dir",
+        "TASK_FILES_ENV",
+        "tasks",
+    ),
     # The formal Pulse editor owns this one filesystem-facing helper; split
     # views/controllers never derive a second project root.
     ("zlc_workbench/pulse_editor/window.py", "_pulse_files_dir", "_PULSE_FILES_ENV", "pulses"),

@@ -14,8 +14,12 @@ from dataclasses import dataclass, replace
 from zlc_data import (
     AxisId,
     BoundFit,
+    FitNumericPolicy,
     FitSpec,
     Selection,
+    bind_fit,
+    fit_model_catalog,
+    suggest_fit_draft,
 )
 
 from ._fit_arguments import format_fit_arguments, parse_fit_arguments
@@ -66,6 +70,90 @@ class FitAuthoringOption:
             raise ValueError("Fit authoring batch sizes differ from its batch axes")
         if not self.axis_summary or not self.authority_summary:
             raise ValueError("Fit authoring summaries must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class FitAuthoringDraft:
+    """One reversible model/arguments draft shared by every Figure surface."""
+
+    selected_model_id: str
+    arguments_by_model: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        selected = str(self.selected_model_id).strip()
+        arguments = tuple(self.arguments_by_model)
+        if not selected:
+            raise ValueError("Fit draft selected_model_id must be non-empty")
+        if not arguments or any(
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not item[0]
+            or not isinstance(item[1], str)
+            for item in arguments
+        ):
+            raise ValueError(
+                "Fit draft arguments must contain model-id/text pairs"
+            )
+        model_ids = tuple(model_id for model_id, _text in arguments)
+        if len(model_ids) != len(set(model_ids)):
+            raise ValueError("Fit draft model ids must be unique")
+        if selected not in model_ids:
+            raise ValueError("Fit draft selected model has no arguments entry")
+        object.__setattr__(self, "selected_model_id", selected)
+        object.__setattr__(self, "arguments_by_model", arguments)
+
+    def arguments_for(self, model_id: str) -> str:
+        identity = str(model_id)
+        for candidate, arguments in self.arguments_by_model:
+            if candidate == identity:
+                return arguments
+        raise KeyError(identity)
+
+
+def reconcile_fit_authoring_draft(
+    options: tuple[FitAuthoringOption, ...],
+    previous: FitAuthoringDraft | None = None,
+    *,
+    selected_model: str | None = None,
+) -> FitAuthoringDraft:
+    """Reconcile one shared draft against the currently prepared models."""
+
+    prepared = tuple(options)
+    if not prepared or any(
+        not isinstance(option, FitAuthoringOption) for option in prepared
+    ):
+        raise ValueError("Fit draft reconciliation requires authoring options")
+    model_ids = tuple(option.spec.model_id for option in prepared)
+    if len(model_ids) != len(set(model_ids)):
+        raise ValueError("Fit authoring options contain duplicate model ids")
+    if previous is not None and not isinstance(previous, FitAuthoringDraft):
+        raise TypeError("previous must be FitAuthoringDraft or None")
+    if selected_model is not None and selected_model not in model_ids:
+        raise ValueError("selected_model is not present in Fit options")
+    previous_arguments = (
+        {} if previous is None else dict(previous.arguments_by_model)
+    )
+    selected = (
+        selected_model
+        if selected_model is not None
+        else previous.selected_model_id
+        if previous is not None and previous.selected_model_id in model_ids
+        else model_ids[0]
+    )
+    return FitAuthoringDraft(
+        selected,
+        tuple(
+            (
+                option.spec.model_id,
+                previous_arguments.get(
+                    option.spec.model_id,
+                    option.argument_text,
+                ),
+            )
+            for option in prepared
+        ),
+    )
 
 
 def fit_projection_metadata(
@@ -193,6 +281,95 @@ def validate_fit_authoring_options(
     return tuple(prepared)
 
 
+def prepare_fit_authoring_options(
+    figure: DataFigure,
+    selection: Selection | None,
+    *,
+    seed_spec: FitSpec | None = None,
+) -> tuple[FitAuthoringOption, ...]:
+    """Prepare every compatible model for one exact authored Figure.
+
+    This is the single Figure-to-Fit authoring seam used by embedded panels and
+    standalone DataFigure windows.  It derives axes only from the authored
+    ViewSpec, preserves an explicit compatible seed, and never consults rank,
+    shape, viewport limits, or display reduction as analysis authority.
+    """
+
+    if not isinstance(figure, DataFigure):
+        raise TypeError("fit preparation requires DataFigure")
+    if selection is not None and not isinstance(selection, Selection):
+        raise TypeError("fit selection must be Selection or None")
+    if seed_spec is not None and not isinstance(seed_spec, FitSpec):
+        raise TypeError("seed_spec must be FitSpec or None")
+    if len(figure.document.layers) != 1 or len(figure.datasets.entries) != 1:
+        raise ValueError("Figure Fit requires exactly one dataset layer")
+    layer = figure.document.layers[0]
+    intent = layer.view.intent
+    if intent not in (ViewIntent.CURVE, ViewIntent.IMAGE):
+        raise ValueError("Fit is available only for curve and image Figures")
+
+    fit_axis_ids, axis_roles = fit_projection_metadata(figure, intent)
+    snapshot = figure.datasets.resolve(layer.dataset_id)
+    schema = snapshot.block.schema
+    seed_matches_schema = bool(
+        seed_spec is not None
+        and seed_spec.input_schema_fingerprint == schema.fingerprint
+    )
+    seed_matches_authority = False
+    if seed_matches_schema and seed_spec is not None:
+        transform = seed_spec.committed_transform
+        if selection is None:
+            # A saved non-Selection transform has no selector representation,
+            # so opening the Figure must retain it exactly.  A single saved
+            # Selection is different: once the author explicitly chooses full
+            # range, ``None`` means remove that Selection rather than silently
+            # keeping yesterday's authority behind an empty selector.
+            operations = () if transform is None else tuple(transform.spec.operations)
+            seed_matches_authority = not (
+                len(operations) == 1
+                and isinstance(operations[0], Selection)
+            )
+        elif transform is not None:
+            seed_matches_authority = tuple(transform.spec.operations) == (selection,)
+
+    options = []
+    for definition in fit_model_catalog():
+        same_seed_model = bool(
+            seed_spec is not None
+            and seed_spec.model_id == definition.model_id
+        )
+        try:
+            if same_seed_model and seed_matches_authority:
+                bound = bind_fit(seed_spec, schema)
+            else:
+                bound = suggest_fit_draft(
+                    schema,
+                    definition.model_id,
+                    fit_axis_ids=fit_axis_ids,
+                    selection=selection,
+                    constraints=(
+                        seed_spec.constraints if same_seed_model else ()
+                    ),
+                    numeric_policy=(
+                        seed_spec.numeric_policy
+                        if same_seed_model
+                        else FitNumericPolicy()
+                    ),
+                )
+        except (TypeError, ValueError):
+            continue
+        options.append(fit_authoring_option(bound))
+    if not options:
+        raise ValueError("the Figure's declared axes admit no Fit model")
+    return validate_fit_authoring_options(
+        tuple(options),
+        fit_axis_ids=fit_axis_ids,
+        axis_roles=axis_roles,
+        selection=selection,
+        allow_prepared_transform=True,
+    )
+
+
 def fit_axis_summary(bound: BoundFit) -> str:
     """Describe the exact named fit/batch-axis split without reducing an axis."""
 
@@ -272,11 +449,14 @@ def fit_spec_from_arguments(
 
 
 __all__ = [
+    "FitAuthoringDraft",
     "FitAuthoringOption",
     "fit_authoring_option",
     "fit_authority_summary",
     "fit_axis_summary",
     "fit_projection_metadata",
+    "prepare_fit_authoring_options",
+    "reconcile_fit_authoring_draft",
     "fit_spec_from_arguments",
     "validate_fit_authoring_options",
 ]

@@ -10,8 +10,9 @@ dataset machinery.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 import numpy as np
 
@@ -24,9 +25,12 @@ from zlc_data import (
     CellValidity,
     ComponentValidity,
     DataBlock,
+    DatasetRevisionRef,
     DatasetSchema,
+    expand_dataset_validity,
     Invalid,
     OwnedSnapshot,
+    Selection,
     StreamGenerationId,
     ValidityContract,
     Value,
@@ -35,7 +39,10 @@ from zlc_data import (
     Valid,
     INVALID,
     VALID,
+    dataset_cell_value,
+    dataset_revision_ref_to_tree,
 )
+from zlc_neutral_atom.camera_measurement import current_camera_monitor_selection
 from zlc_neutral_atom.acquisition.camera import (
     CameraDatasetEventAdapter,
     CameraFrameMetadata,
@@ -45,13 +52,18 @@ from zlc_neutral_atom.acquisition.camera import (
 )
 from zlc_neutral_atom.catalog import DefinitionKey, StreamProcessorDefinition
 from zlc_neutral_atom.capture_reference import CaptureArtifactRef
+from zlc_neutral_atom.dataset_output import LiveDatasetOutput
 from zlc_neutral_atom.processing.stream import (
     BoundStreamProcessor,
     ExactStreamProcessorWorker,
 )
 from zlc_neutral_atom.runtime.cancellation import CancellationToken
 from zlc_neutral_atom.runtime.capture import CaptureProcessorInputBinding
-from zlc_neutral_atom.runtime.dataset import DatasetBuilder, FrozenDatasetEdge
+from zlc_neutral_atom.runtime.dataset import (
+    DatasetBuilder,
+    FrozenDatasetEdge,
+    MonitorCoverage,
+)
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionCursor,
     AcquisitionProducer,
@@ -62,17 +74,20 @@ from zlc_storage import (
     canonical_digest,
     canonical_text,
     positive_real,
+    sha256_text,
 )
 
 from .calibration import (
     ReadoutModel,
     ReadoutModelKind,
     ResolvedCalibration,
+    SiteMap,
     _apply_readout_model,
 )
 from .calibration_reference import (
     CalibrationArtifactRef,
     calibration_artifact_input_ref,
+    calibration_artifact_ref_to_tree,
 )
 from .contracts import FrameContract, ReadoutBindingKey
 from .occupancy_reference import OccupancyArtifactRef
@@ -85,6 +100,8 @@ OCCUPANCY_STREAM_PROCESSOR_KEY = DefinitionKey(
     "zlc_neutral_atom.readout",
     "occupancy-stream",
 )
+OCCUPANCY_LIVE_OUTPUT_NAMES = ("counts", "occupied", "rate")
+OCCUPANCY_EXACT_SOURCE_OUTPUT_NAMES = OCCUPANCY_LIVE_OUTPUT_NAMES[:2]
 _OCCUPANCY_CONFIG_FORMAT = "zlc_neutral_atom.occupancy-stream-config"
 OCCUPANCY_STREAM_PROCESSOR_DEFINITION = StreamProcessorDefinition(
     OCCUPANCY_STREAM_PROCESSOR_KEY,
@@ -96,6 +113,7 @@ OCCUPANCY_STREAM_PROCESSOR_DEFINITIONS = (
 )
 OCCUPANCY_COUNTS_BLOCK_ID = BlockId("occupancy-counts")
 OCCUPANCY_OCCUPIED_BLOCK_ID = BlockId("occupancy-occupied")
+OCCUPANCY_RATE_BLOCK_ID = BlockId("occupancy-rate")
 
 
 def _require_occupancy_output_schemas(
@@ -395,7 +413,7 @@ def _occupancy_generation_for_run(run_id: str) -> StreamGenerationId:
     return StreamGenerationId(
         canonical_digest(
             {
-                "owner": "zlc_neutral_atom.readout.committed-occupancy-run-v1",
+                "owner": "zlc_neutral_atom.readout.committed-occupancy-run",
                 "run_id": run,
             }
         )
@@ -1322,6 +1340,204 @@ def apply_occupancy_snapshot(
     )
 
 
+def occupancy_rate_snapshot(occupied: OwnedSnapshot) -> OwnedSnapshot:
+    """Reduce the declared SITE axis into a validity-aware occupancy rate."""
+
+    if not isinstance(occupied, OwnedSnapshot):
+        raise TypeError("occupied must be an OwnedSnapshot")
+    schema = occupied.block.schema
+    axes = schema.cell_schema.data_axes
+    if len(axes) != 1 or axes[0].role != SITE:
+        raise ValueError("occupancy rate requires exactly one declared SITE axis")
+    validity = np.asarray(
+        expand_dataset_validity(occupied.block.validity, schema),
+        dtype=np.bool_,
+    )
+    values = np.asarray(occupied.block.values, dtype=np.bool_)
+    denominator = np.count_nonzero(validity, axis=2)
+    numerator = np.count_nonzero(values & validity, axis=2)
+    cell_validity = denominator > 0
+    rate_values = np.zeros(cell_validity.shape, dtype="<f8")
+    np.divide(
+        numerator,
+        denominator,
+        out=rate_values,
+        where=cell_validity,
+    )
+    rate_schema = DatasetSchema(
+        schema.repeat_axis,
+        schema.point_axes,
+        schema.point_layout,
+        ValueSchema.scalar(np.dtype("<f8"), None),
+    )
+    block = DataBlock(
+        OCCUPANCY_RATE_BLOCK_ID,
+        occupied.block.revision,
+        rate_values[..., np.newaxis],
+        CellValidity(cell_validity),
+        rate_schema,
+    )
+    return OwnedSnapshot(block.ref(occupied.ref.stream_generation), block)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class OccupancyMonitorCellContext:
+    """One exact monitor cell and the calibration geometry that judges it."""
+
+    background_value: Value
+    background_ref: DatasetRevisionRef
+    occupied_value: Value
+    occupied_ref: DatasetRevisionRef
+    selection: Selection
+    logical_point: tuple[int, ...]
+    site_map: SiteMap
+    calibration_ref: CalibrationArtifactRef
+    model_kind: ReadoutModelKind
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.background_value, Value):
+            raise TypeError("background_value must be Value")
+        if not isinstance(self.background_ref, DatasetRevisionRef):
+            raise TypeError("background_ref must be DatasetRevisionRef")
+        if not isinstance(self.occupied_value, Value):
+            raise TypeError("occupied_value must be Value")
+        if not isinstance(self.occupied_ref, DatasetRevisionRef):
+            raise TypeError("occupied_ref must be DatasetRevisionRef")
+        if self.background_ref.revision != self.occupied_ref.revision:
+            raise ValueError("monitor background and occupancy revisions differ")
+        if not isinstance(self.selection, Selection):
+            raise TypeError("selection must be Selection")
+        logical_point = tuple(self.logical_point)
+        if any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            for index in logical_point
+        ):
+            raise ValueError("logical_point must contain non-negative integers")
+        if not isinstance(self.site_map, SiteMap):
+            raise TypeError("site_map must be SiteMap")
+        if self.occupied_value.schema.data_axes != (self.site_map.site_axis,):
+            raise ValueError("occupied monitor cell differs from calibration SITE axis")
+        if not isinstance(self.calibration_ref, CalibrationArtifactRef):
+            raise TypeError("calibration_ref must be CalibrationArtifactRef")
+        if not isinstance(self.model_kind, ReadoutModelKind):
+            raise TypeError("model_kind must be ReadoutModelKind")
+        object.__setattr__(self, "logical_point", logical_point)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ReactiveOccupancyMonitorEvaluation:
+    """Atomic neutral result for one immutable Camera monitor revision."""
+
+    outputs: Mapping[str, LiveDatasetOutput]
+    cell: OccupancyMonitorCellContext
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outputs, Mapping):
+            raise TypeError("outputs must be a mapping")
+        outputs = dict(self.outputs)
+        if tuple(outputs) != OCCUPANCY_LIVE_OUTPUT_NAMES:
+            raise ValueError(
+                "reactive occupancy outputs must be counts, occupied, and rate"
+            )
+        for name, output in outputs.items():
+            if not isinstance(output, LiveDatasetOutput):
+                raise TypeError(
+                    "reactive occupancy outputs must contain LiveDatasetOutput"
+                )
+            if output.name != name:
+                raise ValueError("reactive occupancy output key differs from its name")
+        if not isinstance(self.cell, OccupancyMonitorCellContext):
+            raise TypeError("cell must be OccupancyMonitorCellContext")
+        snapshots = tuple(output.snapshot for output in outputs.values())
+        revisions = {
+            *(snapshot.ref.revision for snapshot in snapshots),
+            self.cell.background_ref.revision,
+            self.cell.occupied_ref.revision,
+        }
+        if len(revisions) != 1:
+            raise ValueError("reactive occupancy outputs do not share one revision")
+        if len(
+            {
+                snapshot.ref.stream_generation for snapshot in snapshots
+            }
+        ) != 1:
+            raise ValueError("reactive occupancy outputs do not share one generation")
+        if outputs["occupied"].snapshot.ref != self.cell.occupied_ref:
+            raise ValueError("reactive occupancy cell differs from occupied output")
+        if len({output.join_digest for output in outputs.values()}) != 1:
+            raise ValueError("reactive occupancy outputs do not share one join")
+        object.__setattr__(self, "outputs", MappingProxyType(outputs))
+
+
+def evaluate_reactive_occupancy_monitor(
+    source: OwnedSnapshot,
+    calibration: ResolvedCalibration,
+    coverage: MonitorCoverage,
+    *,
+    model_kind: ReadoutModelKind | None = None,
+    source_event_digest: str,
+) -> ReactiveOccupancyMonitorEvaluation:
+    """Classify and select one current Camera monitor revision atomically.
+
+    This is the sole domain seam for TaskConsole-style reactive occupancy.  It
+    performs classification, validity-aware rate reduction, Camera-owned
+    current-cell resolution, and same-revision cell extraction.  It returns no
+    frontend type and performs no rendering.
+    """
+
+    if not isinstance(source, OwnedSnapshot):
+        raise TypeError("source must be OwnedSnapshot")
+    if type(calibration) is not ResolvedCalibration:
+        raise TypeError("calibration must be an admitted ResolvedCalibration")
+    if not isinstance(coverage, MonitorCoverage):
+        raise TypeError("coverage must be MonitorCoverage")
+    source_digest = sha256_text(source_event_digest, "source_event_digest")
+    assert source_digest is not None
+    selected_model = calibration.artifact.select_model(model_kind)
+    counts, occupied = apply_occupancy_snapshot(
+        source,
+        calibration,
+        model_kind=selected_model.kind,
+    )
+    rate = occupancy_rate_snapshot(occupied)
+    point_index, logical_point, selection = current_camera_monitor_selection(
+        source.block.schema,
+        coverage,
+    )
+    reference = calibration.reference
+    cell = OccupancyMonitorCellContext(
+        dataset_cell_value(source.block, 0, point_index),
+        source.ref,
+        dataset_cell_value(occupied.block, 0, point_index),
+        occupied.ref,
+        selection,
+        logical_point,
+        calibration.artifact.site_map,
+        reference,
+        selected_model.kind,
+    )
+    join_digest = canonical_digest(
+        {
+            "owner": "zlc_neutral_atom.reactive-occupancy-monitor",
+            "source_revision": dataset_revision_ref_to_tree(source.ref),
+            "source_event": source_digest,
+            "calibration": calibration_artifact_ref_to_tree(reference),
+            "model_kind": selected_model.kind.value,
+        }
+    )
+    outputs = {
+        name: LiveDatasetOutput(name, snapshot, coverage, join_digest)
+        for name, snapshot in zip(
+            OCCUPANCY_LIVE_OUTPUT_NAMES,
+            (counts, occupied, rate),
+            strict=True,
+        )
+    }
+    return ReactiveOccupancyMonitorEvaluation(outputs, cell)
+
+
 def bind_occupancy_stream_processor(
     spec: OccupancyStreamProcessorSpec,
     capture_input: CaptureProcessorInputBinding,
@@ -1393,18 +1609,25 @@ __all__ = [
     "apply_occupancy_snapshot",
     "OCCUPANCY_COUNTS_BLOCK_ID",
     "OCCUPANCY_OCCUPIED_BLOCK_ID",
+    "OCCUPANCY_RATE_BLOCK_ID",
     "OCCUPANCY_STREAM_PROCESSOR_DEFINITION",
     "OCCUPANCY_STREAM_PROCESSOR_DEFINITIONS",
     "OCCUPANCY_STREAM_PROCESSOR_KEY",
+    "OCCUPANCY_LIVE_OUTPUT_NAMES",
+    "OCCUPANCY_EXACT_SOURCE_OUTPUT_NAMES",
     "BoundOccupancyStreamProcessor",
     "OccupancyArtifact",
     "OccupancyDatasetEventAdapter",
     "OccupancyDatasetMetadata",
+    "OccupancyMonitorCellContext",
     "OccupancySample",
     "OccupancySampleContract",
     "OccupancyStreamProcessorSpec",
+    "ReactiveOccupancyMonitorEvaluation",
     "ResolvedOccupancyStreamSchema",
     "ResolvedOccupancy",
     "bind_occupancy_stream_processor",
+    "evaluate_reactive_occupancy_monitor",
+    "occupancy_rate_snapshot",
     "resolve_occupancy_stream_schema",
 ]

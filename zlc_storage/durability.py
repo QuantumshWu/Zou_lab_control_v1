@@ -126,16 +126,12 @@ def durable_mkdir(directory: str | os.PathLike[str]) -> Path:
 
 
 def durable_makedirs(directory: str | os.PathLike[str]) -> Path:
-    """Create every missing level of one path, durably, one level at a time.
+    """Durably create a caller-owned hierarchy from its first existing parent.
 
-    :func:`durable_mkdir` stays single-level on purpose so a visible child can
-    never look durable while the entry that names it went unflushed.  A caller
-    that owns a whole hierarchy still has to walk it, so this is that walk in
-    one place rather than copied into every workspace owner: collect the
-    missing levels up to the first existing ancestor, then create and flush
-    them from the top down.  Nothing is created above an ancestor that does
-    not exist, which keeps a mistyped root a loud failure instead of a new
-    tree of empty directories.
+    Each missing level is created through :func:`durable_mkdir`, top-down, so
+    every directory entry and its parent receive the same durability evidence
+    as a single-level creation.  This is the composition-root operation for a
+    fresh explicit workspace such as ``~/.zlc/device-manager``.
     """
 
     target = Path(directory).expanduser().resolve()
@@ -147,6 +143,8 @@ def durable_makedirs(directory: str | os.PathLike[str]) -> Path:
         if parent == probe:
             break
         probe = parent
+    if not probe.is_dir():
+        raise NotADirectoryError(probe)
     for level in reversed(missing):
         durable_mkdir(level)
     if not missing:

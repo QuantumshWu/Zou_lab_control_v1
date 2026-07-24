@@ -787,10 +787,10 @@ def _allocate_exact_capture(
 def _require_passive_external_capture(measurement: BoundMeasurement) -> None:
     """Admit an exact camera reader whose trigger owner is outside this Run.
 
-    A Camera Measurement is a pure grabber, just as it was in Main: it arms the
-    selected camera and drains the next exact frame group, while an independently
-    running hardware pulse owns trigger timing.  This compiler therefore claims
-    no sequencer and never prepares or fires one.
+    A Camera Measurement is a pure grabber: it arms the selected camera and
+    drains the next exact frame group, while an independently running hardware
+    pulse owns trigger timing.  This compiler therefore claims no sequencer and
+    never prepares or fires one.
     """
 
     camera_spec = decode_camera_capture_spec(measurement.capture_spec)
@@ -805,7 +805,7 @@ def compile_pipeline(
     *,
     preview: CapturePreviewPort | None = None,
 ) -> RunPlan:
-    """Compile Main's passive finite Camera path into one flat RunPlan.
+    """Compile the passive finite Camera path into one flat RunPlan.
 
     This plan owns only the camera.  Independently running hardware owns the
     trigger timing; explicit pulse-owned capture uses ``TriggeredCaptureSpec``.

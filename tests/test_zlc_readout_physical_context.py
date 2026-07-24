@@ -128,7 +128,7 @@ def _cell_plan(
         _axis("capture.repeat", REPEAT, repeats),
         point_axes,
         dataset_layout,
-        ValueSchema((), ValidityContract.value(), np.dtype("<u2"), "count"),
+        ValueSchema.scalar(np.dtype("<u2"), "count"),
     )
     trigger_lane = artifact.trigger_schedules[0].channel
     return compile_capture_cell_plan(

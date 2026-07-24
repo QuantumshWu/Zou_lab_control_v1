@@ -75,7 +75,6 @@ def _curve_panel(
         CurvePanelPayload,
         PanelFrame,
         PanelPresentationIdentity,
-        PixelFormat,
         RasterBuffer,
     )
 
@@ -121,8 +120,6 @@ def _curve_panel(
     raster = RasterBuffer(
         240,
         120,
-        960,
-        PixelFormat.RGBA8888,
         bytes((20, 30, 40, 255)) * (240 * 120),
     )
     return PanelFrame("curve", "curve", source, stamp, raster, payload)
@@ -151,7 +148,6 @@ def _histogram_panel(
         HistogramPanelPayload,
         PanelFrame,
         PanelPresentationIdentity,
-        PixelFormat,
         RasterBuffer,
     )
 
@@ -209,8 +205,6 @@ def _histogram_panel(
     raster = RasterBuffer(
         240,
         120,
-        960,
-        PixelFormat.RGBA8888,
         bytes((45, 35, 25, 255)) * (240 * 120),
     )
     return PanelFrame(

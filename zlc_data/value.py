@@ -6,7 +6,12 @@ import hashlib
 from dataclasses import dataclass
 
 import numpy as np
-from zlc_storage.canonical import canonical_text, sha256_text
+from zlc_storage.canonical import (
+    canonical_text,
+    integer,
+    nonnegative_integer,
+    sha256_text,
+)
 
 from ._arrays import canonical_dtype, immutable_array
 from .axis import AxisId
@@ -38,8 +43,11 @@ class DatasetRevision:
     value: int
 
     def __post_init__(self) -> None:
-        if isinstance(self.value, bool) or not isinstance(self.value, int) or self.value < 0:
-            raise ValueError("DatasetRevision must be a non-negative integer")
+        object.__setattr__(
+            self,
+            "value",
+            nonnegative_integer(self.value, "DatasetRevision"),
+        )
 
 
 @dataclass(frozen=True, order=True)
@@ -267,6 +275,59 @@ class OwnedSnapshot:
             raise ValueError("snapshot ref schema fingerprint does not match DataBlock")
 
 
+def dataset_cell_value(
+    block: DataBlock,
+    repeat_index: int,
+    point_storage_index: int,
+) -> Value:
+    """Extract one exact physical Dataset cell as its declared ``Value``.
+
+    This is the sole in-memory Dataset-to-Value boundary.  It preserves the
+    cell schema and projects dataset validity without asking a presentation or
+    application shell to interpret validity masks or trailing dimensions.
+    """
+
+    if not isinstance(block, DataBlock):
+        raise TypeError("block must be DataBlock")
+    normalized_repeat = integer(repeat_index, "repeat_index")
+    normalized_point = integer(point_storage_index, "point_storage_index")
+    assert normalized_repeat is not None and normalized_point is not None
+    repeat_index = normalized_repeat
+    point_storage_index = normalized_point
+    for name, index, size in (
+        ("repeat_index", repeat_index, block.schema.repeat_axis.size),
+        (
+            "point_storage_index",
+            point_storage_index,
+            block.schema.point_layout.storage_size,
+        ),
+    ):
+        if not 0 <= index < size:
+            raise IndexError(f"{name} is outside the Dataset")
+
+    validity = block.validity
+    if isinstance(validity, (Valid, Invalid)):
+        cell_validity = validity
+    elif isinstance(validity, CellValidity):
+        cell_validity = (
+            VALID
+            if bool(validity.mask[repeat_index, point_storage_index])
+            else INVALID
+        )
+    elif isinstance(validity, ComponentValidity):
+        cell_validity = ComponentValidity(
+            validity.axis_ids,
+            validity.mask[repeat_index, point_storage_index],
+        )
+    else:  # pragma: no cover - DataBlock validation closes the union
+        raise TypeError("DataBlock validity has an unsupported type")
+    return Value(
+        block.values[repeat_index, point_storage_index],
+        cell_validity,
+        block.schema.cell_schema,
+    )
+
+
 def expand_value_validity(
     validity: Valid | Invalid | ComponentValidity,
     schema: ValueSchema,
@@ -400,6 +461,7 @@ __all__ = [
     "Value",
     "ValuePayloadContract",
     "canonical_value_array",
+    "dataset_cell_value",
     "expand_dataset_validity",
     "expand_value_validity",
 ]

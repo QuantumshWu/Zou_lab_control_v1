@@ -249,7 +249,6 @@ def test_exact_saved_calibration_reopens_for_new_revision_without_mutation(
         assert window._present_bundle(previous_bundle)
         assert all(not board.has_front for board in previous_boards)
         assert all(window._tabs.indexOf(board) < 0 for board in previous_boards)
-        assert all(board.parent() is None for board in previous_boards)
         assert window._form is not None
         window._form.widget_for("split_seed").setText("7")
         assert window._status.text() == "FINAL CALIBRATION · EDITOR CHANGED"

@@ -3,8 +3,8 @@
 The FPGA still owns every edge inside a finite STATIC_ONCE segment.  The host
 is present only at the explicitly-authorized segment boundaries: it waits for
 one segment's camera event and physical pulse terminal before preparing the
-next segment.  This is a concrete two-consumer coordinator, not a workflow
-engine and not a fallback for autonomous SCAN_SLOT execution.
+next segment.  This concrete two-consumer coordinator exists only for the
+explicit API-slot boundary; autonomous SCAN_SLOT owns normal scans.
 """
 
 from __future__ import annotations

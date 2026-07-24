@@ -13,7 +13,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 import math
-import threading
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -1301,37 +1300,9 @@ class BoardPresenter(Protocol):
     def clear(self) -> None: ...
 
 
-class AtomicBoardFront:
-    """Concrete old-or-new front mapping read by a GUI board paint adapter.
-
-    The swap is atomic at the model transaction boundary.  Separate native widgets
-    can still be painted by the OS at different instants and must not advertise
-    pixel-clock simultaneity; they all nevertheless read one immutable BoardFrame.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._current: BoardFrame | None = None
-
-    def present(self, frame: BoardFrame) -> None:
-        if not isinstance(frame, BoardFrame):
-            raise TypeError("frame must be BoardFrame")
-        with self._lock:
-            self._current = frame
-
-    def current(self) -> BoardFrame | None:
-        with self._lock:
-            return self._current
-
-    def clear(self) -> None:
-        with self._lock:
-            self._current = None
-
-
 __all__ = [
     "BoardFrame",
     "BoardPresenter",
-    "AtomicBoardFront",
     "CoherenceStamp",
     "CurveFitOverlay",
     "CurvePanelPayload",

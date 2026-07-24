@@ -52,7 +52,8 @@ from zlc_frontend.figure import (
 from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
 from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import QtRasterBoard
-from Zou_lab_control.workbench import _figure as figure_workbench
+import zlc_workbench.data_figure.app as figure_workbench
+import zlc_workbench.data_figure.projection as figure_projection
 
 
 @pytest.fixture(scope="module")
@@ -235,7 +236,7 @@ def test_sparse_meter_layout_keeps_the_hole_in_its_logical_cell():
         repeat,
         (scan, spectral),
         PointLayout.explicit((2, 2), ((0, 0), (1, 0), (0, 1))),
-        ValueSchema((), ValidityContract.value(), np.dtype(float), "count"),
+        ValueSchema.scalar(np.dtype(float), "count"),
     )
     block = DataBlock(
         BlockId("sparse-meter-block"),
@@ -334,7 +335,7 @@ def test_meter_grid_overview_focus_back_escape_and_atomic_exports(
 ):
     figure = _meter_figure()
     expected_series = figure.evaluated.layers[0].cells[1].series[0]
-    window = figure_workbench.open_data_figure_workbench(figure)
+    window = figure_workbench.create_data_figure_pane(figure)
     try:
         _until(application, lambda: window.raster_ready and window.worker_idle)
         assert window._view_family == "meter-overview"
@@ -419,7 +420,7 @@ def test_close_during_meter_focus_cannot_present_a_late_front(
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(DataFigure, "focused_typed_panel", blocked)
-    window = figure_workbench.open_data_figure_workbench(figure)
+    window = figure_workbench.create_data_figure_pane(figure)
     _until(application, lambda: window.raster_ready and window.worker_idle)
     overview = window._grid_overview
     assert overview is not None
@@ -437,8 +438,8 @@ def test_close_during_meter_focus_cannot_present_a_late_front(
 
 def test_multi_layer_meter_is_not_promoted_to_the_single_layer_explorer():
     figure = _meter_figure(layers=2)
-    assert figure_workbench._classify_single_typed(figure)[0] is None
-    _intent, count, reason = figure_workbench._classify_typed_grid(figure)
+    assert figure_projection._classify_single_typed(figure)[0] is None
+    _intent, count, reason = figure_projection._classify_typed_grid(figure)
     assert count is None
     assert "one layer" in reason
 

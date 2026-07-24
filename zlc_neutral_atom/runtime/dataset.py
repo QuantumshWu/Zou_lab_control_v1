@@ -2320,10 +2320,17 @@ class MonitorDataset(Generic[PayloadT]):
             self._revision += 1
             return self._ref_locked(self._revision)
 
+    def freeze_current(self) -> MonitorDatasetSnapshot:
+        """Freeze the current live revision through the desktop read seam."""
+
+        return self.materialize(None)
+
     def materialize(
         self,
         ref: DatasetRevisionRef | None = None,
     ) -> MonitorDatasetSnapshot:
+        """Freeze the current revision, optionally asserting its exact ref."""
+
         with self._lock:
             selected = self._select_current_ref_locked(ref)
             if self._cycle_schedule is None:

@@ -111,18 +111,7 @@ _DEFAULT_STYLE: dict[str, Any] = {
     "ytick.color": NEW_BLACK,
 }
 
-# Public, READ-ONLY view of the owned style (mutating it raises TypeError).
-DEFAULT_STYLE: Mapping[str, Any] = MappingProxyType(_DEFAULT_STYLE)
 _MATPLOTLIB_COMPOSE_LOCK = threading.RLock()
-
-
-def apply_style(overrides: Mapping[str, Any] | None = None) -> None:
-    """Apply the Confocal_GUIv2-derived publication/notebook style."""
-    style = dict(_DEFAULT_STYLE)
-    if overrides:
-        style.update(dict(overrides))
-    with _MATPLOTLIB_COMPOSE_LOCK:
-        matplotlib.rcParams.update(style)
 
 
 @contextmanager
@@ -204,7 +193,7 @@ def apply_title(target, title: str, *, pad: float | None = None, size: float | N
 
 
 # The lab accent + population palette.  Colours are ART, owned here, never a
-# per-call knob (sealed-API contract).  Read-only view, like DEFAULT_STYLE.
+# per-call knob (sealed-API contract); only read-only projections are exposed.
 _PALETTE: dict[str, Any] = {
     # 1D / monitor multi-curve cycle: the Okabe-Ito COLOUR-BLIND-SAFE qualitative set, ordered so the
     # common 2-5 curve case gets maximally different HUES (blue / orange / green / purple / red ...)
@@ -266,9 +255,6 @@ def colormap_argb_at(colormap: ImageColormap, fraction: float) -> int:
 
 # Current headless FigureDocument/Agg tokens extend the mature plotting system above; they do
 # not establish a second palette or rcParams owner.  Every renderer imports from this module.
-RENDER_TEXT = NEW_BLACK
-RENDER_BACKGROUND = "#FFFFFF"
-RENDER_GRID = _PALETTE["pulse_grid"]
 FIT_FAILURE_COLOR = SITE_INVALID_COLOR
 FIT_CONTOUR_COLOR = "#FFFFFF"
 FIT_CONTOUR_LINEWIDTH = 0.8
@@ -285,7 +271,6 @@ LINE_CYCLE = (
     *_PALETTE["series"],
 )
 SERIES_COLORS = LINE_CYCLE
-RENDER_RCPARAMS: Mapping[str, Any] = MappingProxyType(dict(_DEFAULT_STYLE))
 
 
 @contextmanager
@@ -354,7 +339,6 @@ __all__ = [
     "bimodal_fit_line_specs",
     "CURVE_LINESTYLE",
     "CURVE_MARKER",
-    "DEFAULT_STYLE",
     "DESIGN_DPI",
     "FIT_CONTOUR_COLOR",
     "FIT_CONTOUR_LINEWIDTH",
@@ -382,16 +366,11 @@ __all__ = [
     "PULSE_SCAN_ANNOTATION_COLOR",
     "PULSE_SCAN_ANNOTATION_FONT_SIZE",
     "PULSE_SCAN_REGION_COLOR",
-    "RENDER_BACKGROUND",
-    "RENDER_GRID",
-    "RENDER_RCPARAMS",
-    "RENDER_TEXT",
     "SANS_SERIF",
     "SERIES_COLORS",
     "SITE_OCCUPANCY_STYLE",
     "STOCK_DATA_PX",
     "STOCK_MARGINS_PX",
-    "apply_style",
     "apply_title",
     "axis_label_fontsize",
     "small_fontsize",

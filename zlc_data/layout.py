@@ -5,11 +5,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from numbers import Integral
 from types import MappingProxyType
 from typing import Mapping
 
 import numpy as np
+from zlc_storage.canonical import integer, nonnegative_integer, positive_integer
 
 from ._diagnostic import (
     exact_index_tuple_text,
@@ -65,10 +65,10 @@ class AxisLayout:
     )
 
     def __post_init__(self) -> None:
-        logical_shape = tuple(self.logical_shape)
-        if any(isinstance(size, bool) or not isinstance(size, Integral) or size <= 0 for size in logical_shape):
-            raise ValueError("logical_shape entries must be positive integers")
-        logical_shape = tuple(int(size) for size in logical_shape)
+        logical_shape = tuple(
+            positive_integer(size, "logical_shape entry")
+            for size in self.logical_shape
+        )
         object.__setattr__(self, "logical_shape", logical_shape)
         if not isinstance(self.mode, AxisLayoutMode):
             raise TypeError("mode must be AxisLayoutMode")
@@ -77,11 +77,11 @@ class AxisLayout:
             and sum(size > 1 for size in logical_shape) <= 1
         ):
             object.__setattr__(self, "mode", AxisLayoutMode.RECT_C)
-        if isinstance(self.storage_size, bool) or not isinstance(self.storage_size, Integral):
-            raise TypeError("storage_size must be an integer")
-        object.__setattr__(self, "storage_size", int(self.storage_size))
-        if self.storage_size < 0:
-            raise ValueError("storage_size must be non-negative")
+        object.__setattr__(
+            self,
+            "storage_size",
+            nonnegative_integer(self.storage_size, "storage_size"),
+        )
 
         if self.mode in (AxisLayoutMode.RECT_C, AxisLayoutMode.RECT_F):
             expected = math.prod(logical_shape)
@@ -130,9 +130,7 @@ class AxisLayout:
             raise ValueError("EXPLICIT storage_size must equal mapping length")
         if len(set(mapping)) != len(mapping):
             raise ValueError("EXPLICIT mapping cannot contain duplicate logical points")
-        for multi in mapping:
-            self._validate_multi_index(multi)
-        mapping = tuple(tuple(int(index) for index in multi) for multi in mapping)
+        mapping = tuple(self._validate_multi_index(multi) for multi in mapping)
         rectangular_mode = _rectangular_mode_for_mapping(logical_shape, mapping)
         if rectangular_mode is not None:
             if (
@@ -236,7 +234,7 @@ class AxisLayout:
         )
 
     def multi_index(self, storage_index: int) -> tuple[int, ...]:
-        self._validate_storage_index(storage_index)
+        storage_index = self._validate_storage_index(storage_index)
         if self.mode is AxisLayoutMode.EXPLICIT:
             assert self.storage_to_multi is not None
             return self.storage_to_multi[storage_index]
@@ -253,8 +251,7 @@ class AxisLayout:
         return tuple(int(index) for index in np.unravel_index(storage_index, self.logical_shape, order=order))
 
     def storage_index(self, multi_index: tuple[int, ...]) -> int:
-        multi = tuple(multi_index)
-        self._validate_multi_index(multi)
+        multi = self._validate_multi_index(tuple(multi_index))
         if self.mode is AxisLayoutMode.EXPLICIT:
             assert self._multi_to_storage is not None
             try:
@@ -288,13 +285,11 @@ class AxisLayout:
     def axis_indices(self, position: int) -> np.ndarray:
         """Return physical-row logical indices for one axis without densifying holes."""
 
-        if (
-            isinstance(position, bool)
-            or not isinstance(position, Integral)
-            or not 0 <= position < len(self.logical_shape)
-        ):
+        normalized_position = integer(position, "layout axis position")
+        assert normalized_position is not None
+        position = normalized_position
+        if not 0 <= position < len(self.logical_shape):
             raise IndexError("layout axis position is out of range")
-        position = int(position)
         if self.mode in (AxisLayoutMode.RECT_C, AxisLayoutMode.RECT_F):
             stride = (
                 math.prod(self.logical_shape[position + 1 :])
@@ -359,26 +354,35 @@ class AxisLayout:
             )
         )
 
-    def _validate_storage_index(self, index: int) -> None:
-        if isinstance(index, bool) or not isinstance(index, Integral) or not 0 <= index < self.storage_size:
+    def _validate_storage_index(self, index: int) -> int:
+        normalized = integer(index, "storage index")
+        assert normalized is not None
+        if not 0 <= normalized < self.storage_size:
             raise IndexError(
                 "storage index "
-                f"{exact_integer_text(index)} is outside [0, "
+                f"{exact_integer_text(normalized)} is outside [0, "
                 f"{exact_integer_text(self.storage_size)})"
             )
+        return normalized
 
-    def _validate_multi_index(self, multi: tuple[int, ...]) -> None:
+    def _validate_multi_index(self, multi: tuple[int, ...]) -> tuple[int, ...]:
         if len(multi) != len(self.logical_shape):
             raise ValueError(
                 f"multi-index rank {len(multi)} does not match logical rank {len(self.logical_shape)}"
             )
-        for index, size in zip(multi, self.logical_shape):
-            if isinstance(index, bool) or not isinstance(index, Integral) or not 0 <= index < size:
+        normalized = tuple(
+            integer(index, "multi-index component") for index in multi
+        )
+        assert all(index is not None for index in normalized)
+        resolved = tuple(int(index) for index in normalized)
+        for index, size in zip(resolved, self.logical_shape):
+            if not 0 <= index < size:
                 raise ValueError(
                     "multi-index "
-                    f"{exact_index_tuple_text(multi)} is outside logical "
+                    f"{exact_index_tuple_text(resolved)} is outside logical "
                     f"shape {exact_index_tuple_text(self.logical_shape)}"
                 )
+        return resolved
 
 
 @dataclass(frozen=True, eq=False)

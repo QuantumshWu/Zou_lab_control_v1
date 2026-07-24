@@ -80,6 +80,24 @@ def _u32(value: int) -> bytes:
     return int(value & MASK32).to_bytes(4, "little")
 
 
+def _unsigned(value: int, maximum: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if not 0 <= value <= maximum:
+        raise ValueError(f"{name} must be between 0 and {maximum}")
+    return value
+
+
+def _request_span(word_addr: int, count: int) -> tuple[int, int]:
+    address = _unsigned(word_addr, MASK32, "word_addr")
+    words = _unsigned(count, MAX_FRAME_WORDS, "count")
+    if words == 0:
+        raise ValueError("count must be positive")
+    if address + words - 1 > MASK32:
+        raise ValueError("request address span exceeds the 32-bit word address space")
+    return address, words
+
+
 def _frame(body: bytes) -> bytes:
     """Wrap a CRC span (OP..payload) in SYNC + trailing CRC."""
     return bytes((SYNC0, SYNC1)) + body + _u16(crc16_ccitt(body))
@@ -93,26 +111,36 @@ def encode_write(word_addr: int, values: Sequence[int], *, seq: int = 0) -> byte
     the same base does; there is NO 256-beat / 4 KB burst rule here (the bridge drives the internal
     word port one word at a time), so the old AXI 4 KB scan glitch cannot recur."""
     vals = list(values)
-    body = bytes((OP_WRITE, seq & 0xFF)) + _u32(word_addr) + _u16(len(vals))
+    address, count = _request_span(word_addr, len(vals))
+    sequence = _unsigned(seq, 0xFF, "seq")
+    vals = [_unsigned(value, MASK32, f"values[{index}]") for index, value in enumerate(vals)]
+    body = bytes((OP_WRITE, sequence)) + _u32(address) + _u16(count)
     # One C-level struct.pack of all payload words instead of a per-word ``_u32`` join -- BYTE-
     # IDENTICAL (``_u32(v)`` == little-endian ``v & MASK32``; struct '<I' takes the masked unsigned)
     # but ~10x faster over a full 16507-word image, the last big chunk of the UART frame-build cost.
-    body += struct.pack("<%dI" % len(vals), *(v & MASK32 for v in vals))
+    body += struct.pack("<%dI" % count, *vals)
     return _frame(body)
 
 
 def encode_read(word_addr: int, count: int, *, seq: int = 0) -> bytes:
     """A READ of ``count`` consecutive words starting at ``word_addr`` (CTRL region only: the BRAMs
     are write-only from the host side -- STATUS/CURSOR/LAYOUT_ID live in the CTRL regfile)."""
-    body = bytes((OP_READ, seq & 0xFF)) + _u32(word_addr) + _u16(count)
+    address, words = _request_span(word_addr, count)
+    sequence = _unsigned(seq, 0xFF, "seq")
+    body = bytes((OP_READ, sequence)) + _u32(address) + _u16(words)
     return _frame(body)
 
 
 def encode_reply(seq: int, status: int, words: Sequence[int] = ()) -> bytes:
     """The device's reply frame (unified ACK / READ-reply) -- used by the RTL model + FakeUart."""
     vals = list(words)
-    body = bytes((RESP, seq & 0xFF, status & 0xFF)) + _u16(len(vals))
-    body += b"".join(_u32(v) for v in vals)
+    if len(vals) > MAX_FRAME_WORDS:
+        raise ValueError(f"reply word count exceeds {MAX_FRAME_WORDS}")
+    sequence = _unsigned(seq, 0xFF, "seq")
+    reply_status = _unsigned(status, 0xFF, "status")
+    vals = [_unsigned(value, MASK32, f"words[{index}]") for index, value in enumerate(vals)]
+    body = bytes((RESP, sequence, reply_status)) + _u16(len(vals))
+    body += struct.pack("<%dI" % len(vals), *vals) if vals else b""
     return _frame(body)
 
 
@@ -141,7 +169,8 @@ def decode_reply(frame: bytes) -> tuple[int, int, list[int]]:
 
 def reply_frame_len(count: int) -> int:
     """Total bytes of a reply carrying ``count`` data words (host reader sizing)."""
-    return 2 + 3 + 2 + 4 * count + CRC_LEN
+    words = _unsigned(count, MAX_FRAME_WORDS, "count")
+    return 2 + 3 + 2 + 4 * words + CRC_LEN
 
 
 # --------------------------------------------------------------------------- run coalescing
@@ -150,6 +179,9 @@ def coalesce_runs(pairs: Sequence[tuple[int, int]], *, max_words: int = MAX_FRAM
     globally sorted -- into ``(base, [values])`` runs, capped at ``max_words`` words per run (one
     frame's payload).  The UART analogue of the AXI ``_burst_runs`` coalescer, but stride-1 words with
     NO 256-beat / 4 KB burst rule (the bridge drives the internal word port one word at a time)."""
+    frame_words = _unsigned(max_words, MAX_FRAME_WORDS, "max_words")
+    if frame_words == 0:
+        raise ValueError("max_words must be positive")
     runs: list[tuple[int, list[int]]] = []
     i = 0
     n = len(pairs)
@@ -157,7 +189,7 @@ def coalesce_runs(pairs: Sequence[tuple[int, int]], *, max_words: int = MAX_FRAM
         base, val = pairs[i]
         vals = [val]
         j = i + 1
-        while j < n and len(vals) < max_words and pairs[j][0] == base + len(vals):
+        while j < n and len(vals) < frame_words and pairs[j][0] == base + len(vals):
             vals.append(pairs[j][1])
             j += 1
         runs.append((base, vals))

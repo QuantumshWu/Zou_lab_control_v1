@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
-from numbers import Integral
 from typing import Any
 
 import numpy as np
-from zlc_storage.canonical import canonical_text as _nonempty_text
+from zlc_storage.canonical import (
+    canonical_text as _nonempty_text,
+    finite_real,
+    integer,
+    nonnegative_integer,
+    positive_integer,
+)
 
 from ._diagnostic import exact_integer_text
 
@@ -17,13 +21,11 @@ def _canonical_numeric_coordinate(value: Any, field: str) -> int | float:
     """Give numerically equal coordinates one in-memory and wire identity."""
 
     scalar = value.item() if isinstance(value, np.generic) else value
-    if isinstance(scalar, bool) or not isinstance(scalar, (int, float)):
-        raise TypeError(f"{field} must be a Python or NumPy int/float scalar")
     if isinstance(scalar, int):
-        return int(scalar)
-    numeric = float(scalar)
-    if not math.isfinite(numeric):
-        raise ValueError(f"{field} must be finite")
+        result = integer(scalar, field)
+        assert result is not None
+        return result
+    numeric = finite_real(scalar, field)
     return int(numeric) if numeric.is_integer() else numeric
 
 
@@ -90,21 +92,13 @@ class AxisSpec:
         if not isinstance(self.role, AxisRoleId):
             raise TypeError("role must be AxisRoleId")
         _nonempty_text(self.name, "axis name")
-        if isinstance(self.size, bool) or not isinstance(self.size, Integral) or self.size <= 0:
-            raise ValueError("axis size must be a positive integer")
-        object.__setattr__(self, "size", int(self.size))
+        object.__setattr__(self, "size", positive_integer(self.size, "axis size"))
         if self.coordinates is not None:
             coordinates = []
             for coordinate in self.coordinates:
                 scalar = coordinate.item() if isinstance(coordinate, np.generic) else coordinate
-                if isinstance(scalar, bool):
-                    raise TypeError("axis coordinates cannot be boolean")
-                if isinstance(scalar, (int, float)):
+                if scalar is not None and not isinstance(scalar, str):
                     scalar = _canonical_numeric_coordinate(scalar, "axis coordinate")
-                elif scalar is not None and not isinstance(scalar, str):
-                    raise TypeError(
-                        "axis coordinates must be scalar int/float/str/null values"
-                    )
                 coordinates.append(scalar)
             coordinates = tuple(coordinates)
             if len(coordinates) != self.size:
@@ -118,20 +112,18 @@ class AxisSpec:
             self.coordinate_frame, CoordinateFrameId
         ):
             raise TypeError("coordinate_frame must be CoordinateFrameId or None")
-        if (
-            isinstance(self.index_origin, bool)
-            or not isinstance(self.index_origin, Integral)
-            or self.index_origin < 0
-        ):
-            raise ValueError("index_origin must be a non-negative integer")
-        object.__setattr__(self, "index_origin", int(self.index_origin))
+        object.__setattr__(
+            self,
+            "index_origin",
+            nonnegative_integer(self.index_origin, "index_origin"),
+        )
         if self.coordinates is not None and self.index_origin != 0:
             raise ValueError("index_origin is only valid for an implicit-coordinate axis")
 
     def coordinate_at(self, index: int) -> Any:
-        if isinstance(index, bool) or not isinstance(index, Integral):
-            raise TypeError("axis index must be an integer")
-        index = int(index)
+        normalized = integer(index, "axis index")
+        assert normalized is not None
+        index = normalized
         if not 0 <= index < self.size:
             raise IndexError(
                 f"axis index {exact_integer_text(index)} is outside "

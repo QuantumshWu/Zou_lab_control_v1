@@ -44,7 +44,11 @@ from zlc_frontend.qt_widgets import (
     window_pad,
 )
 from zlc_neutral_atom.runtime.run import RunState
-from zlc_pulse import DestructivePulseTargetEditError, PulseExecutionForm
+from zlc_pulse import (
+    DestructivePulseTargetEditError,
+    PulseExecutionForm,
+    scan_column_specs,
+)
 from zlc_storage.paths import project_path
 
 from ._layout import px
@@ -63,7 +67,6 @@ from .scan_view import (
     format_held_scan_point,
     format_scan_progress,
 )
-from .scan_workspace import scan_column_specs
 from .schedule_view import PulseScheduleView
 from .target_view import PulseTargetView
 
@@ -1227,7 +1230,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._last_preview_notice = update.preview_notice
 
     def _sync_runtime_watchers(self) -> None:
-        """Arm periodic compatibility readers only while they have a consumer."""
+        """Arm periodic Run observations only while they have a consumer."""
 
         if self._controller.runtime_poll_required:
             if not self._timer.isActive():
@@ -1626,7 +1629,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         """Restore the same notebook-owned editor after an X-to-hide action."""
 
         if self._owner_retiring or self._permanently_closed:
-            raise RuntimeError("Pulse editor is closing with its Experiment")
+            raise RuntimeError("Pulse editor is closing with its application")
         window = self._window
         if window is None:
             raise RuntimeError("Pulse editor window is unavailable")
@@ -1635,7 +1638,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         window.activateWindow()
 
     def request_owner_close(self) -> None:
-        """Thread-safe invalidation when the borrowing Experiment closes."""
+        """Thread-safe invalidation when the borrowing application closes."""
 
         if self._owner_retiring or self._permanently_closed:
             return

@@ -5,17 +5,13 @@ from __future__ import annotations
 
 from PyQt5 import QtCore, QtWidgets
 
-from Zou_lab_control.notebook.facade import (
-    Experiment,
-    OccupancyScanRequest,
-    ScanRequest,
-)
 from zlc_frontend.qt_widgets import (
     ElidedLabel,
     FluentButton,
     FluentLabel,
     FluentPopup,
     FluentRevisionedFormEditor,
+    FluentScrollArea,
     FluentSwitch,
     FluentTabWidget,
     GREEN,
@@ -43,9 +39,10 @@ from zlc_frontend.selector import (
     CurveViewportCommit,
     PanelInteractionOrigin,
 )
+from zlc_frontend.scan_preview import SCAN_CURVE_PANEL_ID, ScanDisplayIntent
 from zlc_neutral_atom.scan.reference import ScanArtifactRef
 from zlc_neutral_atom.scan.contracts import AutonomousScanSlotProgram
-from zlc_workbench.progressive_scan import ScanDisplayIntent
+from zlc_neutral_atom.scan import OccupancyScanRequest, ScanRequest
 from zlc_workbench.scan import (
     FinalScanPresentation,
     ScanPanelController,
@@ -53,10 +50,7 @@ from zlc_workbench.scan import (
     ScanPanelViewModel,
 )
 
-from .application import _FrozenScanApplication
-
-
-_SCAN_CURVE_PANEL_ID = "scan-curve"
+from .application import ScanWorkbenchActions, _FrozenScanApplication
 
 
 class ScanWorkbenchWindow(QtWidgets.QWidget):
@@ -67,14 +61,14 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
 
     def __init__(
         self,
-        experiment: Experiment,
+        actions: ScanWorkbenchActions,
         request: ScanRequest | OccupancyScanRequest,
         *,
         display_intent: ScanDisplayIntent = ScanDisplayIntent(),
     ) -> None:
         super().__init__()
-        if not isinstance(experiment, Experiment):
-            raise TypeError("experiment must be Experiment")
+        if not isinstance(actions, ScanWorkbenchActions):
+            raise TypeError("actions must be ScanWorkbenchActions")
         if not isinstance(request, (ScanRequest, OccupancyScanRequest)):
             raise TypeError("request must be a current scan request")
 
@@ -131,8 +125,18 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             scaled_px(320, minimum=240),
             scaled_px(240, minimum=160),
         )
+        self._final_scroll = FluentScrollArea(self)
+        self._final_scroll.setObjectName("scanFinalRasterScroll")
+        self._final_scroll.setWidgetResizable(False)
+        self._final_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAsNeeded
+        )
+        self._final_scroll.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAsNeeded
+        )
+        self._final_scroll.setWidget(self._raster)
         self._provisional_board = QtRasterBoard(
-            (_SCAN_CURVE_PANEL_ID,),
+            (SCAN_CURVE_PANEL_ID,),
             self,
             columns=1,
             empty_text="Waiting for progressive scan data",
@@ -144,8 +148,8 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         )
         self._display_stack = QtWidgets.QStackedWidget(self)
         self._display_stack.addWidget(self._provisional_board)
-        self._display_stack.addWidget(self._raster)
-        self._display_stack.setCurrentWidget(self._raster)
+        self._display_stack.addWidget(self._final_scroll)
+        self._display_stack.setCurrentWidget(self._final_scroll)
         self._diagnostics = FluentLabel("", self)
         self._diagnostics.setObjectName("scanDiagnostics")
         self._diagnostics.setWordWrap(True)
@@ -212,9 +216,9 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         layout.addLayout(controls)
 
         self._wake = QtOwnerWake(self)
-        self._experiment = experiment
+        self._actions = actions
         self._application = _FrozenScanApplication(
-            experiment,
+            actions,
             request,
             display_intent,
         )
@@ -298,7 +302,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         origin = self._provisional_board.visible_curve_origin()
         return (
             origin is not None
-            and origin.panel_id == _SCAN_CURVE_PANEL_ID
+            and origin.panel_id == SCAN_CURVE_PANEL_ID
             and origin.presentation.panel_revision == self._curve_display.revision
         )
 
@@ -435,7 +439,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         if not isinstance(command, (CurveViewportCommit, CurveRangeGesture)):
             raise TypeError("curve interaction callback received an unknown command")
         origin = command.origin
-        if origin.panel_id != _SCAN_CURVE_PANEL_ID:
+        if origin.panel_id != SCAN_CURVE_PANEL_ID:
             raise RuntimeError("curve interaction belongs to another panel")
         if not self._visible_curve_matches_current_state():
             raise RuntimeError("curve interaction provenance is stale")
@@ -477,7 +481,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
             return
         if required:
             self._provisional_board.bind_curve_interaction(
-                _SCAN_CURVE_PANEL_ID,
+                SCAN_CURVE_PANEL_ID,
                 self._accept_curve_interaction,
                 enabled=False,
             )
@@ -609,7 +613,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         if not isinstance(request, (ScanRequest, OccupancyScanRequest)):
             raise TypeError("request must be a current scan request")
         replacement = _FrozenScanApplication(
-            self._experiment,
+            self._actions,
             request,
             display_intent,
         )
@@ -743,7 +747,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
         display_widget = (
             self._provisional_board
             if model.display_phase == "PROVISIONAL"
-            else self._raster
+            else self._final_scroll
         )
         if self._display_stack.currentWidget() is not display_widget:
             self._display_stack.setCurrentWidget(display_widget)
@@ -767,6 +771,7 @@ class ScanWorkbenchWindow(QtWidgets.QWidget):
                     presentation.png_bytes,
                     image_format="PNG",
                 )
+                self._raster.adjustSize()
             except BaseException as error:
                 self._rejected_presentation = presentation
                 self._record_display_failure(

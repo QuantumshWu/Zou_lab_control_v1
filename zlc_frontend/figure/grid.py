@@ -27,8 +27,13 @@ from .model import (
 from .suggest import _suggest_view
 
 
-_GRID_INTENTS = frozenset(
-    (ViewIntent.CURVE, ViewIntent.HISTOGRAM, ViewIntent.IMAGE)
+# Ordered product vocabulary.  The order is presentation policy as well as a
+# validation boundary: Workbench labels these values but must not restate which
+# Figure intents a Grid can contain.
+GRID_INTENTS = (
+    ViewIntent.CURVE,
+    ViewIntent.HISTOGRAM,
+    ViewIntent.IMAGE,
 )
 
 
@@ -42,7 +47,16 @@ def _unresolved(code: str, message: str, axis_id=None) -> ViewSuggestion:
 
 
 def _grid_contract(intent: ViewIntent):
-    """Prefer a single cell over silently creating additional facet axes."""
+    """Allow one explicit Grid facet without auto-inventing another one.
+
+    Ordinary IMAGE/CURVE contracts deliberately give spatial axes no automatic
+    page role: a one-panel plot must ask for an ROI/pixel instead of silently
+    paging an image.  Grid is the explicit page control, so FACET is legal for
+    every role the intent already knows, including those spatial roles.  It is
+    always placed last; the suggestion engine therefore uses an available
+    slider/batch/sample role for every *other* axis and can never manufacture a
+    second facet merely because the schema gained another dimension.
+    """
 
     contract = dataset_contract_for(intent)
     policies = tuple(
@@ -53,11 +67,7 @@ def _grid_contract(intent: ViewIntent):
                 for role in policy.automatic_roles
                 if role is not AxisViewRole.FACET
             )
-            + tuple(
-                role
-                for role in policy.automatic_roles
-                if role is AxisViewRole.FACET
-            ),
+            + (AxisViewRole.FACET,),
         )
         for policy in contract.role_policies
     )
@@ -76,9 +86,27 @@ def _display_selection(view: ViewSpec | None) -> Selection | None:
 
 
 def _display_preferences(
+    schema: DatasetSchema,
+    contract,
     view: ViewSpec | None,
     facet_axis_id: AxisId,
 ) -> dict[str, AxisId | None]:
+    """Reserve the facet, then fill display slots from declared axes.
+
+    The generic suggestion engine normally chooses display axes before it
+    applies explicit FACET/BATCH preferences.  That ordering is right for an
+    ordinary one-panel suggestion, but wrong for Grid authoring: the operator
+    has already said which axis becomes the cells.  Without reserving it here,
+    a sole scan axis is first consumed as ``X`` and the later facet request
+    conflicts with it; adding an unrelated second scan axis then makes the same
+    facet suddenly legal.  Grid choices must not depend on that accident.
+
+    Existing display bindings survive a facet edit when they still satisfy the
+    typed contract.  Empty slots are filled by the contract's role preference,
+    and within one role by :func:`dataset_axes` declaration order.  No ndarray
+    rank, value, singleton heuristic, or AxisId spelling enters the decision.
+    """
+
     role_to_field = {
         AxisViewRole.X: "x_axis_id",
         AxisViewRole.IMAGE_X: "image_x_axis_id",
@@ -87,12 +115,43 @@ def _display_preferences(
     prepared: dict[str, AxisId | None] = {
         field: None for field in role_to_field.values()
     }
-    if view is None:
-        return prepared
-    for binding in view.axis_bindings:
-        field = role_to_field.get(binding.role)
-        if field is not None and binding.axis_id != facet_axis_id:
-            prepared[field] = binding.axis_id
+    axes = dataset_axes(schema)
+    axis_by_id = {axis.axis_id: axis for axis in axes}
+    slot_by_role = {
+        slot.binding_role: slot for slot in contract.display_slots
+    }
+    used = {facet_axis_id}
+    if view is not None:
+        for binding in view.axis_bindings:
+            field = role_to_field.get(binding.role)
+            slot = slot_by_role.get(binding.role)
+            axis = axis_by_id.get(binding.axis_id)
+            if (
+                field is not None
+                and slot is not None
+                and axis is not None
+                and binding.axis_id not in used
+                and axis.role in slot.preferred_axis_roles
+            ):
+                prepared[field] = binding.axis_id
+                used.add(binding.axis_id)
+
+    for slot in contract.display_slots:
+        field = role_to_field[slot.binding_role]
+        if prepared[field] is not None:
+            continue
+        chosen = next(
+            (
+                axis
+                for preferred_role in slot.preferred_axis_roles
+                for axis in axes
+                if axis.axis_id not in used and axis.role == preferred_role
+            ),
+            None,
+        )
+        if chosen is not None:
+            prepared[field] = chosen.axis_id
+            used.add(chosen.axis_id)
     return prepared
 
 
@@ -128,7 +187,7 @@ def resolve_grid_view(
 
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
-    if not isinstance(intent, ViewIntent) or intent not in _GRID_INTENTS:
+    if not isinstance(intent, ViewIntent) or intent not in GRID_INTENTS:
         raise ValueError("Grid cells require CURVE, HISTOGRAM, or IMAGE intent")
     if not isinstance(facet_axis_id, AxisId):
         raise TypeError("facet_axis_id must be AxisId")
@@ -191,7 +250,12 @@ def resolve_grid_view(
             )
         facet_ids = (facet_axis_id,)
 
-    display_preferences = _display_preferences(current_view, facet_axis_id)
+    display_preferences = _display_preferences(
+        schema,
+        contract,
+        current_view,
+        facet_axis_id,
+    )
     preferences = ViewPreferences(
         repeat_mode=resolved_repeat_mode,
         facet_axis_ids=facet_ids,
@@ -207,54 +271,6 @@ def resolve_grid_view(
         preferences,
         contract=contract,
     )
-
-    # Multiple same-role display candidates are a presentation choice, not a
-    # second operator-facing Grid dimension.  Resolve them by declared schema
-    # order, explicitly excluding the authored facet.  This policy is pure and
-    # testable; the Qt shell never compares or sorts AxisId strings.
-    axis_order = {axis.axis_id: index for index, axis in enumerate(axes)}
-    preference_field = {
-        AxisViewRole.X: "x_axis_id",
-        AxisViewRole.IMAGE_X: "image_x_axis_id",
-        AxisViewRole.IMAGE_Y: "image_y_axis_id",
-    }
-    filled_roles: set[AxisViewRole] = set()
-    while suggestion.status is SuggestionStatus.NEEDS_INPUT:
-        if not any(
-            reason.code == "AMBIGUOUS_DISPLAY_AXIS"
-            for reason in suggestion.reasons
-        ):
-            break
-        alternatives = tuple(
-            alternative
-            for alternative in suggestion.alternatives
-            if alternative.axis_id != facet_axis_id
-        )
-        roles = {alternative.binding_role for alternative in alternatives}
-        if len(roles) != 1:
-            break
-        role = next(iter(roles))
-        field = preference_field.get(role)
-        if (
-            field is None
-            or role in filled_roles
-            or getattr(preferences, field) is not None
-            or not alternatives
-        ):
-            break
-        chosen = min(
-            alternatives,
-            key=lambda alternative: axis_order[alternative.axis_id],
-        )
-        preferences = replace(preferences, **{field: chosen.axis_id})
-        filled_roles.add(role)
-        suggestion = _suggest_view(
-            schema,
-            intent,
-            selection,
-            preferences,
-            contract=contract,
-        )
 
     if suggestion.spec is None:
         return suggestion
@@ -299,4 +315,9 @@ def grid_facet_axes(
     )
 
 
-__all__ = ["grid_facet_axes", "grid_facet_axis", "resolve_grid_view"]
+__all__ = [
+    "GRID_INTENTS",
+    "grid_facet_axes",
+    "grid_facet_axis",
+    "resolve_grid_view",
+]

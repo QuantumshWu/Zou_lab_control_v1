@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Protocol
 
 from fpga.pulse_streamer.host.image import (
+    FROZEN_CLOCK_HZ,
     StreamerParams,
     default_clock_hz,
     default_params,
@@ -134,6 +135,10 @@ def build_service_for_session(
     target = manifest.target
     geometry = params or default_params()
     clock = float(default_clock_hz() if clock_hz is None else clock_hz)
+    if clock != FROZEN_CLOCK_HZ:
+        raise ValueError(
+            f"deployment clock must match the frozen RTL ({FROZEN_CLOCK_HZ:g} Hz)"
+        )
     validate_deployed_target(target, geometry)
     if getattr(session, "params", None) != geometry:
         raise ValueError("hardware session geometry differs from server deployment geometry")
@@ -219,6 +224,10 @@ def build_server_runtime(
     target = manifest.target
     geometry = params or default_params()
     clock = float(default_clock_hz() if clock_hz is None else clock_hz)
+    if clock != FROZEN_CLOCK_HZ:
+        raise ValueError(
+            f"deployment clock must match the frozen RTL ({FROZEN_CLOCK_HZ:g} Hz)"
+        )
     session = open_deployed_session(
         backend,
         target=target,

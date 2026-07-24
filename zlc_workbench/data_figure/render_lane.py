@@ -57,6 +57,7 @@ from .projection import (
     _build_typed_front_contract,
     _classify_single_typed,
     _classify_typed_grid,
+    _default_typed_state,
     _figure_summary,
     _payload_intent,
     _grid_state_intent,
@@ -567,13 +568,14 @@ def _export_typed_png(
     if isinstance(payload, ImagePanelPayload):
         def write_staged(path: Path) -> None:
             _require_not_cancelled(cancelled)
-            from zlc_frontend.matplotlib_render import save_image_panel_png
+            from zlc_frontend.matplotlib_render import encode_image_panel_png
 
-            save_image_panel_png(
+            encoded = encode_image_panel_png(
                 payload,
                 state,
-                path,
             )
+            _require_not_cancelled(cancelled)
+            path.write_bytes(encoded)
             _require_not_cancelled(cancelled)
 
         result = stage_and_replace_export(

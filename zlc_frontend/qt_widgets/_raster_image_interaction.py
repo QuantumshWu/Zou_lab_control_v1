@@ -866,11 +866,21 @@ def _paint_image_overlays(
         if target is None:
             continue
         image_target = target[0]
-        viewport = binding.pending_viewport or binding.viewport
         image_payload = (
             _image_payload(hold)
             if hold is not None and hold.panel_id == binding.panel_id
             else _image_payload(target[2])
+        )
+        # Overlay coordinates and the data box are one painted fact.  A
+        # pending viewport is only the newest authored worker intent; using it
+        # here would move Area/Cross over the still-old raster (and over the
+        # old equal-aspect bbox) before that viewport's raster+geometry was
+        # admitted.  Keep every visible overlay on the exact payload under it;
+        # rapid wheel/pan may still accumulate through ``_viewport_for_target``.
+        viewport = (
+            binding.viewport
+            if image_payload is None
+            else image_payload.viewport
         )
         selector_color = (
             None

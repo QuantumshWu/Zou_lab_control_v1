@@ -48,7 +48,7 @@ from zlc_frontend.figure import (
 from zlc_frontend.matplotlib_render import (
     SinglePanelAggRenderer,
 )
-from zlc_frontend.render import CurvePanelPayload, PixelFormat
+from zlc_frontend.render import CurvePanelPayload
 
 
 _SCHEMA = "a" * 64
@@ -173,7 +173,10 @@ def test_curve_axis_accepts_monotonic_irregular_and_singleton(coordinates) -> No
     assert validated is axis.coordinates
     assert validated == coordinates
     low, high = curve_home_x_limits(axis)
-    assert low < min(coordinates) <= max(coordinates) < high
+    if len(coordinates) == 1:
+        assert low < coordinates[0] < high
+    else:
+        assert (low, high) == (min(coordinates), max(coordinates))
 
 
 def test_curve_axis_interaction_fails_closed_for_ambiguous_coordinates() -> None:
@@ -222,13 +225,13 @@ def test_interactive_renderer_returns_exact_bbox_payload_and_shared_axis() -> No
             current_y_limits=None,
             previous_relim_mode=None,
         )
-        assert raster.pixel_format is PixelFormat.RGBA8888
+        assert len(raster.pixels) == raster.width * raster.height * 4
         assert isinstance(payload, CurvePanelPayload)
         assert payload.series[0].data is curve
         assert payload.evaluated_input is evaluated.inputs[0]
         assert payload.viewport.display_revision == 4
         assert payload.viewport.x_axis is axis
-        assert payload.viewport.y_limits == (-1.0, 11.0)
+        assert payload.viewport.y_limits == (0.0, 12.0)
         assert payload.value_unit == "count"
         left, top, right, bottom = payload.viewport.plot_bounds
         assert 0.0 <= left < right <= 1.0
@@ -242,7 +245,7 @@ def test_interactive_renderer_returns_exact_bbox_payload_and_shared_axis() -> No
                 1.0 - y0 / raster.height,
             )
         )
-        assert renderer._axis.get_ylabel() == "Value [count]"
+        assert renderer._axis.get_ylabel() == "Signal"
         assert renderer._artists[0].get_color().lower() == "#808080"
 
         changed_axis = replace(axis, coordinates=(10.0, 20.0, 40.0))
@@ -323,6 +326,6 @@ def test_interactive_renderer_keeps_all_same_axis_series_in_payload() -> None:
         )
         assert tuple(series.data for series in payload.series) == curves
         assert len(payload.series_labels) == 2
-        assert payload.viewport.y_limits == pytest.approx((-1.9, 32.9))
+        assert payload.viewport.y_limits == pytest.approx((0.0, 36.0))
     finally:
         renderer.close()

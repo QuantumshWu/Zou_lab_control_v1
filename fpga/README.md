@@ -4,16 +4,15 @@
 be copied to the Vivado computer with the Python package and run without an
 experiment configuration.
 
-For the full hardware tutorial (the edge-table RTL, the 1-tick FIFO prefetch
-pipeline, the 2-bank streaming scan window, the affine N-slot scan engine, the
-analog-bus DAC engine, resource budgets, and the JTAG-to-AXI build/program
-workflow), see the **FPGA manual** in `docs/fpga_manual/`. For capacity
-invariants and architecture notes, see `docs/MAINTAINER_NOTES.md`.
+For the current frozen-bitstream operating and evidence policy, see
+`docs/REAL_HARDWARE_BRINGUP_zh.md`.  Capacity invariants and implementation
+notes live in `docs/MAINTAINER_NOTES.md`; the authoritative architecture is
+`docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md`.
 
 ## Layout
 
-- `build_and_program.bat`: build/check/diagnose/program the pulse-streamer
-  bitstream (`create_project.tcl` -> `program_fpga.tcl`).
+- `build_and_program.bat`: evidence-driven recovery tool for an established RTL
+  defect or design mismatch; it is not part of normal experiment startup.
 - `run_server.bat`: start the RPyC sequencer server. It opens a persistent
   Vivado `hw_axi` (JTAG-to-AXI) session before accepting GUI or notebook clients.
 - `pulse_streamer/`: HDL (`zlc_edge_streamer.v`, `zlc_pulse_streamer_top.v`),
@@ -38,7 +37,7 @@ Pulse GUI / notebook
 
 The host packs the compiled program into a BRAM image and writes it over
 JTAG-to-AXI (`axi_bram_ctrl`), then drives the CTRL register-file mailbox
-(`COMMAND`/`STATUS` + the streaming-scan `BANK_READY`/`BANK*_CHUNK` handshake).
+(`COMMAND`/`STATUS` + the resident-bank `BANK_READY`/`BANK*_CHUNK` handshake).
 The server compiles against the full hardware channel list inferred from the
 board XDC (62 controllable outputs; missing/hidden GUI channels are zero bits).
 The camera-imaging preset and default trigger inference use `ch11/emCCD/M13`;
@@ -54,11 +53,13 @@ The camera-imaging preset and default trigger inference use `ch11/emCCD/M13`;
 ```
 
 Default clock is 50 MHz (20 ns tick); the minimal pulse width and resolution are
-1 tick. On the 35T part the engine resolves to 4096 edge rows + a 2-bank scan
-window of `bank_size` 2048 (4096 resident points) backed by UNBOUNDED host
-streaming. Capacity is fixed in `fpga.pulse_streamer.host.image.solve_capacity`
-(no per-build override). Configure the build with `ZLC_PS_XDC`,
-`ZLC_PS_VIVADO_BIN`, and `ZLC_PS_CLOCK_HZ`.
+1 tick. The qualified deployment has 4096 edge rows and two 2048-point scan
+banks, so one current autonomous run admits at most 4096 fully resident points.
+The frozen RTL contains a refill-capable mailbox, but the current runtime does
+not publish host refill; larger tables fail before FIRE rather than changing
+timing semantics. The deployed clock is fixed at 50 MHz. `ZLC_PS_XDC` and
+`ZLC_PS_VIVADO_BIN` select deployment/build inputs; neither changes the running
+bitstream.
 
 ## Path Rules
 

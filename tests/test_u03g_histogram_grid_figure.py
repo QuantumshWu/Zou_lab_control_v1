@@ -57,7 +57,8 @@ from zlc_frontend.histogram_display import (
     histogram_display_form_values,
 )
 from zlc_frontend.selector import HistogramRangeGesture
-from Zou_lab_control.workbench import _figure as figure_workbench
+import zlc_workbench.data_figure.app as figure_workbench
+import zlc_workbench.data_figure.projection as figure_projection
 
 
 @pytest.fixture(scope="module")
@@ -255,7 +256,7 @@ def test_sparse_histogram_layout_keeps_its_empty_logical_cell() -> None:
         repeat,
         (row, column),
         PointLayout.explicit((2, 2), ((0, 0), (1, 0), (0, 1))),
-        ValueSchema((), ValidityContract.value(), np.dtype(float), "count"),
+        ValueSchema.scalar(np.dtype(float), "count"),
     )
     block = DataBlock(
         BlockId("u03g-sparse-histogram"),
@@ -315,7 +316,7 @@ def test_histogram_grid_overview_focus_interaction_back_and_exports(
 ) -> None:
     figure = _histogram_grid()
     expected = figure.evaluated.layers[0].cells[1].series[0]
-    window = figure_workbench.open_data_figure_workbench(figure)
+    window = figure_workbench.create_data_figure_pane(figure)
     try:
         _until(application, lambda: window.raster_ready and window.worker_idle)
         overview = window._grid_overview
@@ -438,7 +439,7 @@ def test_escape_during_histogram_rerender_cannot_late_present(
         "render_interactive_histogram",
         blocked,
     )
-    window = figure_workbench.open_data_figure_workbench(figure)
+    window = figure_workbench.create_data_figure_pane(figure)
     try:
         _until(application, lambda: window.raster_ready and window.worker_idle)
         overview = window._grid_overview
@@ -480,7 +481,7 @@ def test_close_during_histogram_focus_cannot_present_a_late_front(
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(DataFigure, "focused_typed_panel", blocked)
-    window = figure_workbench.open_data_figure_workbench(figure)
+    window = figure_workbench.create_data_figure_pane(figure)
     _until(application, lambda: window.raster_ready and window.worker_idle)
     overview = window._grid_overview
     assert overview is not None
@@ -494,10 +495,10 @@ def test_close_during_histogram_focus_cannot_present_a_late_front(
 
 def test_multi_layer_histogram_remains_whole_figure_fallback(application) -> None:
     figure = _histogram_grid(layers=2)
-    intent, count, reason = figure_workbench._classify_typed_grid(figure)
+    intent, count, reason = figure_projection._classify_typed_grid(figure)
     assert intent is count is None
     assert "one layer" in reason
-    window = figure_workbench.open_data_figure_workbench(figure)
+    window = figure_workbench.create_data_figure_pane(figure)
     try:
         _until(application, lambda: window.worker_idle and window.raster_ready)
         assert window._view_family == "encoded"

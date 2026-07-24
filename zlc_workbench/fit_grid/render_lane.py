@@ -454,12 +454,11 @@ def _export_grid_view(
         target = target.with_suffix(f".{image_format}")
 
     def write_staged(temporary: Path) -> None:
-        exported = figure.export(
-            temporary,
-            image_format=image_format,
+        temporary.write_bytes(
+            figure.to_bytes(
+                image_format=image_format,
+            )
         )
-        if Path(exported) != temporary:
-            raise RuntimeError("saved-fit export changed its staged destination")
 
     committed = stage_and_replace_export(
         target,
@@ -505,16 +504,17 @@ def _export_typed_grid_view(
     def write_staged(temporary: Path) -> None:
         _require_not_cancelled(cancelled)
         from zlc_frontend.matplotlib_render import (
-            save_radial_gaussian_image_fit_panels,
+            encode_radial_gaussian_image_fit_panels,
         )
 
-        save_radial_gaussian_image_fit_panels(
-            prepared,
-            display,
-            color_limits,
-            temporary,
-            image_format=image_format,
-            columns=columns,
+        temporary.write_bytes(
+            encode_radial_gaussian_image_fit_panels(
+                prepared,
+                display,
+                color_limits,
+                image_format=image_format,
+                columns=columns,
+            )
         )
         _require_not_cancelled(cancelled)
 

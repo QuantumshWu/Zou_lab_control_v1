@@ -12,7 +12,12 @@ from PyQt5 import QtCore, QtWidgets
 
 from zlc_data import FitSpec
 
-from ..fit_editor import FitAuthoringOption, fit_spec_from_arguments
+from ..fit_editor import (
+    FitAuthoringDraft,
+    FitAuthoringOption,
+    fit_spec_from_arguments,
+    reconcile_fit_authoring_draft,
+)
 from .fluent import (
     FluentButton,
     FluentComboBox,
@@ -27,7 +32,6 @@ class FitAuthoringPane(QtWidgets.QWidget):
 
     fitRequested = QtCore.pyqtSignal(int, object)
     fitRequestRejected = QtCore.pyqtSignal(str)
-    cancelRequested = QtCore.pyqtSignal()
     clearRequested = QtCore.pyqtSignal()
     editorChanged = QtCore.pyqtSignal(int)
 
@@ -82,6 +86,24 @@ class FitAuthoringPane(QtWidgets.QWidget):
     @property
     def arguments_text(self) -> str:
         return self.arguments_edit.text()
+
+    @property
+    def draft_state(self) -> FitAuthoringDraft | None:
+        """Return the complete reversible draft shown by this view."""
+
+        if not self._fit_options:
+            return None
+        self._store_active_draft()
+        selected = self._active_model_id
+        if selected not in self._fit_options:
+            raise RuntimeError("Fit editor has no selected prepared model")
+        return FitAuthoringDraft(
+            selected,
+            tuple(
+                (model_id, self._argument_drafts[model_id])
+                for model_id in self._fit_options
+            ),
+        )
 
     @property
     def axis_summary_text(self) -> str:
@@ -164,6 +186,35 @@ class FitAuthoringPane(QtWidgets.QWidget):
         if notify:
             self._advance_editor_revision()
 
+    def set_draft_state(
+        self,
+        draft: FitAuthoringDraft,
+        *,
+        notify: bool = False,
+    ) -> None:
+        """Present one owner-held draft without creating another authority."""
+
+        if not self._fit_options:
+            raise RuntimeError("Fit options must be installed before its draft")
+        reconciled = reconcile_fit_authoring_draft(
+            tuple(self._fit_options.values()),
+            draft,
+            selected_model=draft.selected_model_id,
+        )
+        self._installing = True
+        self.model_combo.blockSignals(True)
+        try:
+            self._argument_drafts = dict(reconciled.arguments_by_model)
+            self.model_combo.setCurrentIndex(
+                self.model_combo.findData(reconciled.selected_model_id)
+            )
+            self._show_model(reconciled.selected_model_id)
+        finally:
+            self.model_combo.blockSignals(False)
+            self._installing = False
+        if notify:
+            self._advance_editor_revision()
+
     def clear_options(self) -> None:
         """Synchronously clear metadata and drafts; there are no child forms."""
 
@@ -174,6 +225,7 @@ class FitAuthoringPane(QtWidgets.QWidget):
             self._argument_drafts.clear()
             self._active_model_id = None
             self.model_combo.clear()
+            self.model_combo.setToolTip("")
             self.arguments_edit.clear()
             self.arguments_edit.setToolTip("")
         finally:
@@ -191,14 +243,9 @@ class FitAuthoringPane(QtWidgets.QWidget):
         self.model_combo.setEnabled(idle and editor_ready)
         self.arguments_edit.setEnabled(idle and editor_ready)
         self.fit_button.setEnabled(idle and editor_ready)
-        if kind == "fit":
-            self.clear_button.setText("Cancel")
-            self.clear_button.setEnabled(True)
-        else:
-            self.clear_button.setText("Clear")
-            self.clear_button.setEnabled(
-                idle and (editor_ready or self._draft_ready)
-            )
+        self.clear_button.setEnabled(
+            kind == "fit" or (idle and (editor_ready or self._draft_ready))
+        )
 
     @staticmethod
     def _validated_options(
@@ -230,29 +277,19 @@ class FitAuthoringPane(QtWidgets.QWidget):
         selected_model: str | None,
         preserve_drafts: bool,
     ) -> None:
-        previous_model = self._active_model_id
-        previous_drafts = self._argument_drafts if preserve_drafts else {}
+        previous = self.draft_state if preserve_drafts else None
         option_by_model = {option.spec.model_id: option for option in options}
-        drafts = {
-            model_id: previous_drafts.get(
-                model_id,
-                option_by_model[model_id].argument_text,
-            )
-            for model_id in models
-        }
-        wanted_model = (
-            selected_model
-            if selected_model is not None
-            else previous_model
-            if previous_model in option_by_model
-            else models[0]
+        draft = reconcile_fit_authoring_draft(
+            options,
+            previous,
+            selected_model=selected_model,
         )
 
         self._installing = True
         self.model_combo.blockSignals(True)
         try:
             self._fit_options = option_by_model
-            self._argument_drafts = drafts
+            self._argument_drafts = dict(draft.arguments_by_model)
             self.model_combo.clear()
             for option in options:
                 self.model_combo.addItem(
@@ -260,9 +297,9 @@ class FitAuthoringPane(QtWidgets.QWidget):
                     option.spec.model_id,
                 )
             self.model_combo.setCurrentIndex(
-                self.model_combo.findData(wanted_model)
+                self.model_combo.findData(draft.selected_model_id)
             )
-            self._show_model(wanted_model)
+            self._show_model(draft.selected_model_id)
         finally:
             self.model_combo.blockSignals(False)
             self._installing = False
@@ -282,11 +319,13 @@ class FitAuthoringPane(QtWidgets.QWidget):
         self._active_model_id = model_id
         self.arguments_edit.setText(self._argument_drafts[model_id])
         parameters = ", ".join(option.parameter_names)
+        authority = f"{option.axis_summary}\n{option.authority_summary}"
+        self.model_combo.setToolTip(authority)
         self.arguments_edit.setToolTip(
             "Empty uses automatic initialization. "
             "Use name=value to fix a parameter, or "
             "name_initial/name_lower/name_upper for solver constraints.\n"
-            f"Parameters: {parameters}"
+            f"Parameters: {parameters}\n{authority}"
         )
 
     def _model_changed(self, _index: int) -> None:
@@ -312,10 +351,7 @@ class FitAuthoringPane(QtWidgets.QWidget):
         self.editorChanged.emit(self._editor_revision)
 
     def _request_clear(self) -> None:
-        if self._busy_kind == "fit":
-            self.cancelRequested.emit()
-        else:
-            self.clearRequested.emit()
+        self.clearRequested.emit()
 
     def _request_fit(self) -> None:
         try:

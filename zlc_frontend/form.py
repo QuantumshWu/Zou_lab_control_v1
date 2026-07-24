@@ -9,6 +9,7 @@ it never loads Qt.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import math
 import re
 from typing import Literal, TypeAlias
@@ -21,9 +22,22 @@ FormFieldKind: TypeAlias = Literal[
     "number",
     "choice",
     "bool",
+    "axis_range",
+    "path",
+    "signal",
 ]
 _FORM_FIELD_KINDS = frozenset(
-    {"text", "int", "float", "number", "choice", "bool"}
+    {
+        "text",
+        "int",
+        "float",
+        "number",
+        "choice",
+        "bool",
+        "axis_range",
+        "path",
+        "signal",
+    }
 )
 _INT_TEXT = re.compile(r"[+-]?\d+")
 _NUMBER_TEXT = re.compile(
@@ -55,6 +69,39 @@ def _typed_equal(left: object, right: object) -> bool:
     return type(left) is type(right) and bool(left == right)
 
 
+def choice_value_to_tree(field: "FormFieldProps", value: object) -> object:
+    """Encode one exact typed choice as its current JSON scalar."""
+
+    if not isinstance(field, FormFieldProps) or field.kind != "choice":
+        raise TypeError("choice serialization requires a choice FormFieldProps")
+    choice = field.choice_for(value)
+    if choice is None:
+        raise ValueError(f"field {field.key!r} received an undeclared choice")
+    encoded = choice.value.value if isinstance(choice.value, Enum) else choice.value
+    if encoded is None or isinstance(encoded, (dict, list, tuple, set)):
+        raise TypeError(
+            f"choice field {field.key!r} needs an owner scalar serializer"
+        )
+    if isinstance(encoded, float) and not math.isfinite(encoded):
+        raise ValueError(f"choice field {field.key!r} encoded a non-finite float")
+    return encoded
+
+
+def choice_value_from_tree(field: "FormFieldProps", payload: object) -> object:
+    """Decode one current JSON scalar back to the declared typed choice."""
+
+    if not isinstance(field, FormFieldProps) or field.kind != "choice":
+        raise TypeError("choice decoding requires a choice FormFieldProps")
+    matches = tuple(
+        choice
+        for choice in field.choices
+        if _typed_equal(choice_value_to_tree(field, choice.value), payload)
+    )
+    if len(matches) != 1:
+        raise ValueError(f"field {field.key!r} has no unique encoded choice {payload!r}")
+    return matches[0].value
+
+
 def _require_immutable_scalar(value: object, *, where: str) -> None:
     if value is None:
         return
@@ -83,7 +130,7 @@ class FormChoice:
 
 @dataclass(frozen=True, slots=True)
 class FormFieldProps:
-    """Presentation-only properties for one simple scalar field.
+    """Presentation-only properties for one declared form field.
 
     ``minimum`` and ``maximum`` are real owner-declared bounds.  ``None`` means
     unbounded; the Qt layer must not invent a widget limit in its place.
@@ -99,6 +146,11 @@ class FormFieldProps:
     minimum: int | float | None = None
     maximum: int | float | None = None
     choices: tuple[FormChoice, ...] = ()
+    allow_blank: bool | None = None
+    path_mode: Literal["file", "dir"] = "file"
+    file_filter: str = "All files (*)"
+    base_dir: str = ""
+    unavailable_reason: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, str) or not self.key.strip():
@@ -113,6 +165,21 @@ class FormFieldProps:
             raise TypeError(f"field {self.key!r} required must be bool")
         if not isinstance(self.unit, str) or not isinstance(self.description, str):
             raise TypeError(f"field {self.key!r} unit/description must be strings")
+        if not isinstance(self.unavailable_reason, str):
+            raise TypeError(
+                f"field {self.key!r} unavailable_reason must be a string"
+            )
+        if self.allow_blank is not None and not isinstance(self.allow_blank, bool):
+            raise TypeError(f"field {self.key!r} allow_blank must be bool or None")
+        if self.path_mode not in {"file", "dir"}:
+            raise ValueError(f"field {self.key!r} path_mode must be file or dir")
+        if not all(
+            isinstance(value, str)
+            for value in (self.file_filter, self.base_dir)
+        ):
+            raise TypeError(
+                f"field {self.key!r} path metadata must contain strings"
+            )
 
         choices = tuple(self.choices)
         object.__setattr__(self, "choices", choices)
@@ -125,7 +192,24 @@ class FormFieldProps:
 
         if self.kind == "choice":
             if not choices:
-                raise ValueError(f"choice field {self.key!r} needs at least one choice")
+                if not self.required:
+                    raise ValueError(
+                        f"empty choice field {self.key!r} must be required"
+                    )
+                if self.default is not None:
+                    raise ValueError(
+                        f"empty choice field {self.key!r} cannot have a default"
+                    )
+                if not self.unavailable_reason.strip():
+                    raise ValueError(
+                        f"empty choice field {self.key!r} needs an "
+                        "unavailable_reason"
+                    )
+            elif self.unavailable_reason:
+                raise ValueError(
+                    f"available choice field {self.key!r} cannot declare an "
+                    "unavailable_reason"
+                )
             if self.minimum is not None or self.maximum is not None:
                 raise ValueError(f"choice field {self.key!r} cannot declare numeric bounds")
             if self.default is not None and not any(
@@ -134,8 +218,13 @@ class FormFieldProps:
                 raise ValueError(f"field {self.key!r} default is not a typed choice value")
         elif choices:
             raise ValueError(f"non-choice field {self.key!r} cannot declare choices")
+        elif self.unavailable_reason:
+            raise ValueError(
+                f"non-choice field {self.key!r} cannot declare an "
+                "unavailable_reason"
+            )
 
-        if self.kind not in {"int", "float", "number"} and (
+        if self.kind not in {"int", "float", "number", "axis_range"} and (
             self.minimum is not None or self.maximum is not None
         ):
             raise ValueError(f"non-numeric field {self.key!r} cannot declare bounds")
@@ -180,7 +269,67 @@ class FormFieldProps:
         elif self.kind == "bool":
             if not isinstance(self.default, bool):
                 raise TypeError(f"bool field {self.key!r} default must be bool")
-
+        elif self.kind == "axis_range":
+            for name, value in (("minimum", self.minimum), ("maximum", self.maximum)):
+                if value is None:
+                    continue
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise TypeError(
+                        f"axis_range field {self.key!r} {name} must be numeric"
+                    )
+                if not math.isfinite(float(value)):
+                    raise ValueError(
+                        f"axis_range field {self.key!r} {name} must be finite"
+                    )
+            default = self.default
+            if (
+                not isinstance(default, tuple)
+                or len(default) != 3
+                or isinstance(default[0], bool)
+                or isinstance(default[1], bool)
+                or not isinstance(default[0], (int, float))
+                or not isinstance(default[1], (int, float))
+                or not isinstance(default[2], int)
+                or isinstance(default[2], bool)
+            ):
+                raise TypeError(
+                    f"axis_range field {self.key!r} default must be "
+                    "(number, number, int)"
+                )
+            lo, hi, points = default
+            if not math.isfinite(float(lo)) or not math.isfinite(float(hi)):
+                raise ValueError(
+                    f"axis_range field {self.key!r} endpoints must be finite"
+                )
+            if points < 2:
+                raise ValueError(
+                    f"axis_range field {self.key!r} points must be at least 2"
+                )
+            if self.minimum is not None and min(float(lo), float(hi)) < self.minimum:
+                raise ValueError(
+                    f"axis_range field {self.key!r} default is below minimum"
+                )
+            if self.maximum is not None and max(float(lo), float(hi)) > self.maximum:
+                raise ValueError(
+                    f"axis_range field {self.key!r} default is above maximum"
+                )
+        elif self.kind in {"path", "signal"}:
+            if self.default is not None and not isinstance(self.default, str):
+                raise TypeError(
+                    f"{self.kind} field {self.key!r} default must be str or None"
+                )
+        if self.kind not in {"int", "float", "number"} and self.allow_blank is not None:
+            raise ValueError(
+                f"non-scalar field {self.key!r} cannot declare allow_blank"
+            )
+        if self.kind != "path" and (
+            self.path_mode != "file"
+            or self.file_filter != "All files (*)"
+            or self.base_dir
+        ):
+            raise ValueError(
+                f"non-path field {self.key!r} cannot declare path metadata"
+            )
         if self.minimum is not None and self.maximum is not None:
             if self.minimum > self.maximum:
                 raise ValueError(f"field {self.key!r} minimum exceeds maximum")
@@ -192,6 +341,27 @@ class FormFieldProps:
                 raise ValueError(f"field {self.key!r} default is above maximum")
 
         _require_immutable_scalar(self.default, where=f"field {self.key!r} default")
+
+    @property
+    def blank_allowed(self) -> bool:
+        """Whether a scalar editor may hold an explicit blank value."""
+
+        if self.kind not in {"int", "float", "number"}:
+            return False
+        if self.allow_blank is not None:
+            return self.allow_blank
+        return self.default is None and not self.required
+
+    @property
+    def required_choice_unavailable(self) -> bool:
+        """Whether installation discovery found no value for a required choice.
+
+        This is distinct from an operator leaving an available choice blank.  It
+        keeps product vocabulary visible without manufacturing a placeholder
+        value that could be mistaken for a real device role.
+        """
+
+        return self.kind == "choice" and self.required and not self.choices
 
     @property
     def row_label(self) -> str:
@@ -239,65 +409,21 @@ class FormSpec:
 
 
 __all__ = [
+    "choice_value_from_tree",
+    "choice_value_to_tree",
     "FormChoice",
     "FormFieldKind",
     "FormFieldProps",
     "FormSpec",
     "lenient_float",
     "parse_number_text",
-    "python_to_text",
-    "text_to_python",
 ]
 
 
-# --- editable-field codec -------------------------------------------------------------------
-#
-# These sit beside :func:`parse_number_text` and are DELIBERATELY not merged with it, because the
-# two answer different questions and a caller picks one on purpose:
-#
-#   parse_number_text  VALIDATES.  Blank or malformed RAISES, naming the field, and the caller is
-#                      expected to show that message.  It also preserves authored int-vs-float.
-#   lenient_float      DISPLAYS.  A half-typed or emptied box must not throw while the operator is
-#                      still typing, so anything unreadable falls back to the value already in use.
-#
-# Collapsing them would force one of those behaviours onto the other surface: either a live plot
-# limit box that raises mid-keystroke, or a form that silently accepts garbage.  Recorded here
-# rather than resolved, because they are two contracts, not one duplicated.
+def lenient_float(text: object, fallback: float) -> float:
+    """Decode an in-progress display limit, retaining the current value on error."""
 
-
-def lenient_float(text, fallback: float) -> float:
-    """Parse a numeric line-edit, falling back on blank/garbage (the ONE parser the fixed-lim
-    lo/hi inputs share between the Setting popup and the Edit tab)."""
     try:
         return float(str(text).strip())
     except (TypeError, ValueError):
         return float(fallback)
-
-
-def python_to_text(value) -> str:
-    """A Python value as an editable one-line string (confocal python2str): a
-    tuple/list keeps its literal form, scalars use repr.  Round-trips through
-    :func:`text_to_python`."""
-    if value is None:
-        return ""
-    return repr(value)
-
-
-def text_to_python(text: str):
-    """Parse an edited acquisition-parameter field back to a Python value
-    (confocal str2python): literal first, then a plain float, else the string.
-
-    A value whose ``repr`` is not a literal (``range(0, 3)``) therefore comes BACK as that
-    string rather than the object -- the round trip is lossy for non-literals by construction,
-    which is why the form only stores literals."""
-    import ast
-    raw = str(text).strip()
-    if not raw:
-        return None
-    try:
-        return ast.literal_eval(raw)
-    except (ValueError, SyntaxError):
-        try:
-            return float(raw)
-        except ValueError:
-            return raw

@@ -43,9 +43,13 @@ from zlc_frontend.qt_widgets import (
     signals_blocked,
     window_pad,
 )
+from zlc_neutral_atom.installation_plan import (
+    InstallationDevicePlan,
+    installation_device_plan,
+)
 
 from .controller import DeviceAdminState, DeviceManagerController
-from .editor_session import ConfiguredDeviceRow, configured_devices, form_spec
+from .editor_session import form_spec
 
 
 _BACKEND_LABELS = {
@@ -116,6 +120,7 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self._shutdown_on_owner_close = bool(shutdown_on_owner_close)
         self._window = None
         self._permanently_closed = False
+        self._owner_close_pending = False
         self._close_after_shutdown = False
         self._last_status = ("ready", "info")
         self._configured_cards: dict[str, _DeviceSummaryCard] = {}
@@ -360,30 +365,15 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self._sync_configured_rows(self._configured_rows_for_current_draft())
         self._refresh_chrome()
 
-    def _configured_rows_for_current_draft(self) -> tuple[ConfiguredDeviceRow, ...]:
-        editor = self._controller.editor
-        try:
-            return configured_devices(editor.candidate())
-        except (TypeError, ValueError):
-            # A new remote draft intentionally starts with an empty required
-            # host.  Its topology is still known even though it is not yet an
-            # executable InstallationConfigDocument.
-            if editor.backend == "remote_pulse":
-                values = editor.values
-                host = str(values.get("host", "")).strip() or "<host>"
-                port = values.get("port", 18861)
-                timeout = values.get("transport_timeout_seconds", 120.0)
-                return (
-                    ConfiguredDeviceRow(
-                        "sequencer",
-                        "sequencer",
-                        "RemotePulseExecutionClient",
-                        f"{host}:{port}; timeout={timeout} s",
-                    ),
-                )
-            raise
+    def _configured_rows_for_current_draft(
+        self,
+    ) -> tuple[InstallationDevicePlan, ...]:
+        return installation_device_plan(self._controller.editor.backend)
 
-    def _sync_configured_rows(self, rows: tuple[ConfiguredDeviceRow, ...]) -> None:
+    def _sync_configured_rows(
+        self,
+        rows: tuple[InstallationDevicePlan, ...],
+    ) -> None:
         desired = {row.role: row for row in rows}
         for role in tuple(self._configured_cards):
             if role not in desired:
@@ -398,30 +388,42 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
             card.update_content(
                 role=row.role,
                 domain=row.domain,
-                adapter_kind=row.adapter_kind,
-                detail=row.detail,
+                adapter_kind=row.adapter_kind.rsplit(".", 1)[-1],
+                detail=self._configured_detail(row.role),
             )
             self.configured_layout.insertWidget(index, card)
 
     def _update_configured_details_in_place(self) -> None:
+        for role, card in self._configured_cards.items():
+            detail = self._configured_detail(role)
+            card.detail_label.setText(detail)
+            card.detail_label.setToolTip(detail)
+
+    def _configured_detail(self, role: str) -> str:
         editor = self._controller.editor
         values = editor.values
-        if editor.backend == "virtual":
-            card = self._configured_cards.get("trap")
-            if card is not None:
-                seed = values.get("seed")
-                seed_text = "random" if seed is None else str(seed)
-                card.detail_label.setText(f"Private simulator model; seed={seed_text}")
-            return
-        card = self._configured_cards.get("sequencer")
-        if card is None:
-            return
-        host = str(values.get("host", "")).strip() or "<host>"
-        port = values.get("port", 18861)
-        timeout = values.get("transport_timeout_seconds", 120.0)
-        detail = f"{host}:{port}; timeout={timeout} s"
-        card.detail_label.setText(detail)
-        card.detail_label.setToolTip(detail)
+        if editor.backend == "remote_pulse":
+            host = str(values.get("host", "")).strip() or "<host>"
+            port = values.get("port", 18861)
+            timeout = values.get("transport_timeout_seconds", 120.0)
+            return f"{host}:{port}; timeout={timeout} s"
+        seed = values.get("seed")
+        seed_text = "random" if seed is None else str(seed)
+        details = {
+            "sequencer": f"In-process pulse target execution; seed={seed_text}",
+            "rf": "In-process RF-table source driven by the virtual sequencer",
+            "camera": "Externally triggered readout camera",
+            "mot_camera": (
+                "MOT camera; free-running live and externally triggered "
+                "finite acquisition"
+            ),
+        }
+        try:
+            return details[role]
+        except KeyError as error:
+            raise RuntimeError(
+                f"installation plan contains an unknown virtual role {role!r}"
+            ) from error
 
     # ------------------------------------------------------------------
     # runtime observation (event driven; no timer and no control plane)
@@ -461,6 +463,12 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self._refresh_chrome()
         if busy and label:
             self.status_strip.show_message(label, severity="task")
+        elif not busy and self._owner_close_pending:
+            # DeviceManagerController emits busy=False before it installs the
+            # completed lifecycle state.  Resume on the next owner turn so a
+            # just-finished initialize is observed before deciding whether a
+            # shutdown is still required.
+            QtCore.QTimer.singleShot(0, self._resume_owner_close)
 
     @QtCore.pyqtSlot(str, str)
     def _show_status(self, text: str, severity: str) -> None:
@@ -618,10 +626,23 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
     def _close_from_owner(self) -> None:
         if self._permanently_closed:
             return
+        self._owner_close_pending = True
         if self._shutdown_on_owner_close:
             self._begin_owned_close()
             return
+        if self._controller.busy:
+            self.status_strip.show_message(
+                "waiting for the device operation before closing",
+                severity="task",
+            )
+            return
         self._finalize_owner_close()
+
+    @QtCore.pyqtSlot()
+    def _resume_owner_close(self) -> None:
+        if self._permanently_closed or not self._owner_close_pending:
+            return
+        self._close_from_owner()
 
     def _begin_owned_close(self) -> bool:
         """Start the one async shutdown path used by every owned window."""
@@ -649,6 +670,7 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         if self._permanently_closed:
             return
         self._permanently_closed = True
+        self._owner_close_pending = False
         self._close_after_shutdown = False
         self._controller.close()
         window = self._window

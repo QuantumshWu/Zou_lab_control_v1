@@ -63,7 +63,9 @@ from zlc_frontend.qt_widgets import (  # noqa: E402
     ensure_qt_app,
 )
 from zlc_frontend.selector import HistogramRangeGesture  # noqa: E402
-from Zou_lab_control.workbench import open_data_figure_workbench  # noqa: E402
+from zlc_workbench.data_figure.app import (  # noqa: E402
+    create_data_figure_pane as open_data_figure_workbench,
+)
 
 
 @pytest.fixture

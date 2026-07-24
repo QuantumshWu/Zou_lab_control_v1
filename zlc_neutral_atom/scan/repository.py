@@ -224,17 +224,24 @@ class ScanArtifact:
 @dataclass(frozen=True, eq=False, slots=True)
 class MaterializedScanData:
     artifact_ref: ScanArtifactRef
+    program_fingerprint: str
     source_dataset_ref: DatasetRevisionRef
+    output_contract: ScanOutputContract
     snapshot: OwnedSnapshot
     __hash__ = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.artifact_ref, ScanArtifactRef):
             raise TypeError("artifact_ref must be ScanArtifactRef")
+        sha256_text(self.program_fingerprint, "program_fingerprint")
         if not isinstance(self.source_dataset_ref, DatasetRevisionRef):
             raise TypeError("source_dataset_ref must be DatasetRevisionRef")
+        if not isinstance(self.output_contract, ScanOutputContract):
+            raise TypeError("output_contract must be ScanOutputContract")
         if not isinstance(self.snapshot, OwnedSnapshot):
             raise TypeError("snapshot must be OwnedSnapshot")
+        if self.snapshot.block.schema != self.output_contract.output_dataset_schema:
+            raise ValueError("materialized scan Dataset differs from its output contract")
 
     @property
     def schema(self) -> DatasetSchema:
@@ -949,7 +956,9 @@ class ScanRepository:
             snapshot = OwnedSnapshot(index.output_dataset_ref, block)
             return MaterializedScanData(
                 reference,
+                index.pulse_program_blob.digest,
                 index.source_dataset_ref,
+                index.output_contract,
                 snapshot,
             )
 

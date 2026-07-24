@@ -342,7 +342,7 @@ class _FitWorkbenchBindings:
     """Composition-owned capabilities for the optional Figure Fit surface.
 
     The viewer receives only the fixed prepare/execute/result/save/reload
-    capabilities.  It never receives a repository, Experiment, source resolver,
+    capabilities.  It never receives a repository, application root, source resolver,
     or generic analysis registry.  ``prepare`` turns exact named display axes
     plus an optional authority candidate into already-bound data-owned Fit
     requests; ``execute`` is the only materializing operation; ``result``

@@ -10,6 +10,63 @@ from dataclasses import replace
 
 from .authoring import replace_pulse_field
 from .document import FrozenScanTable, PulseDocument
+from .scan_columns import scan_slot_schema
+
+
+def nominal_scan_reference(document: PulseDocument) -> PulseDocument:
+    """Remove scan execution intent while preserving authored nominal fields.
+
+    This is the explicit static-reference form used by preview and static run
+    requests.  It is not equivalent to resolving a table row: no physical field
+    is changed.
+    """
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    if (
+        not document.scan_parameters
+        and document.scan_table is None
+        and document.scan_recipe is None
+    ):
+        return document
+    return replace(
+        document,
+        scan_parameters=(),
+        scan_table=None,
+        scan_recipe=None,
+    )
+
+
+def clear_frozen_scan_table(document: PulseDocument) -> PulseDocument:
+    """Clear a generated/loaded table without removing its slot declarations."""
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    if document.scan_table is None and document.scan_recipe is None:
+        return document
+    return replace(document, scan_table=None, scan_recipe=None)
+
+
+def reconcile_scan_schema(
+    previous: PulseDocument,
+    candidate: PulseDocument,
+) -> PulseDocument:
+    """Discard table/provenance when an authoring edit changes slot meaning.
+
+    A table is valid only for the exact ordered parameter fields, clock quantum,
+    and target ABI captured by :func:`scan_slot_schema`.  Keeping this rule in
+    the pulse owner prevents individual editors from inventing different stale
+    table policies.
+    """
+
+    if not isinstance(previous, PulseDocument) or not isinstance(
+        candidate,
+        PulseDocument,
+    ):
+        raise TypeError("previous and candidate must be PulseDocument")
+    if scan_slot_schema(previous) == scan_slot_schema(candidate):
+        return candidate
+    return clear_frozen_scan_table(candidate)
 
 
 def materialize_scan_sweeps(
@@ -83,4 +140,10 @@ def resolve_scan_point(document: PulseDocument, point_index: int) -> PulseDocume
     )
 
 
-__all__ = ["materialize_scan_sweeps", "resolve_scan_point"]
+__all__ = [
+    "clear_frozen_scan_table",
+    "materialize_scan_sweeps",
+    "nominal_scan_reference",
+    "reconcile_scan_schema",
+    "resolve_scan_point",
+]

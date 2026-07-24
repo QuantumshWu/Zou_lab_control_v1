@@ -3,14 +3,6 @@
 from __future__ import annotations
 
 
-def open_capture_workbench(experiment, request):
-    """Open the finite exact-capture Workbench without owning the Experiment."""
-
-    from zlc_workbench.capture.app import open_capture_workbench as _open
-
-    return _open(experiment, request)
-
-
 def open_calibration_report_workbench(
     computation_loader,
     reference,
@@ -28,9 +20,8 @@ def open_calibration_workbench(
     computation_loader,
     run_starter,
     *,
-    seed=None,
+    request=None,
     reference=None,
-    timeout_seconds=None,
 ):
     """Open formal calibration creation/editing without eager Qt imports."""
 
@@ -38,40 +29,11 @@ def open_calibration_workbench(
         open_calibration_workbench as _open,
     )
 
-    options = {"seed": seed, "reference": reference}
-    if timeout_seconds is not None:
-        options["timeout_seconds"] = timeout_seconds
     return _open(
         computation_loader,
         run_starter,
-        **options,
-    )
-
-
-def open_data_figure_workbench(figure):
-    """Open one already-resolved DataFigure without eager Qt imports."""
-
-    from zlc_workbench.data_figure.app import open_data_figure_workbench as _open
-
-    return _open(figure)
-
-
-def create_data_figure_pane(
-    figure,
-    *,
-    initial_display=None,
-    initial_fit_result_identity=None,
-    embedded=True,
-):
-    """Build the shared DataFigure body for an owning Workbench shell."""
-
-    from zlc_workbench.data_figure.app import create_data_figure_pane as _create
-
-    return _create(
-        figure,
-        initial_display=initial_display,
-        initial_fit_result_identity=initial_fit_result_identity,
-        embedded=embedded,
+        request=request,
+        reference=reference,
     )
 
 
@@ -160,27 +122,186 @@ def open_saved_fit_grid_workbench(
 def open_scan_workbench(experiment, request):
     """Open the current typed autonomous scan panel lazily."""
 
+    from zlc_frontend.figure import ViewIntent
+    from zlc_frontend.scan_preview import describe_scan_figure
+    from zlc_neutral_atom.scan import OccupancyScanRequest, ScanRequest
+    from zlc_workbench.scan import FinalScanPresentation
+    from zlc_workbench.scan_workbench.application import ScanWorkbenchActions
     from zlc_workbench.scan_workbench.app import open_scan_workbench as _open
 
-    return _open(experiment, request)
+    def prepare(frozen_request):
+        if isinstance(frozen_request, ScanRequest):
+            return experiment.readout.prepare_scan(frozen_request)
+        if isinstance(frozen_request, OccupancyScanRequest):
+            return experiment.readout.prepare_occupancy_scan(frozen_request)
+        raise TypeError("request must be a current scan request")
+
+    def project_final(reference, selection, preferences):
+        options = {}
+        if preferences is not None:
+            options.update(
+                intent=ViewIntent.CURVE,
+                selection=selection,
+                preferences=preferences,
+            )
+        figure = experiment.figure(reference, **options)
+        return FinalScanPresentation(
+            reference,
+            figure.to_png_bytes(),
+            describe_scan_figure(figure.document),
+        )
+
+    return _open(ScanWorkbenchActions(prepare, project_final), request)
+
+
+def open_pulse_editor(
+    experiment=None,
+    *,
+    document=None,
+    path=None,
+    remote_endpoint=None,
+    repository=None,
+):
+    """Open PulseGUI from explicit bound or standalone composition inputs."""
+
+    from zlc_workbench.pulse_editor.app import open_pulse_editor as _open
+
+    if experiment is None:
+        from ._composition import (
+            standalone_pulse_connection_factory,
+            standalone_pulse_workspace,
+        )
+
+        workspace = standalone_pulse_workspace(repository)
+        return _open(
+            connection_factory=standalone_pulse_connection_factory(workspace),
+            initial_connection_mode="offline",
+            document=document,
+            path=path,
+            remote_endpoint=remote_endpoint,
+        )
+
+    if remote_endpoint is not None or repository is not None:
+        raise ValueError(
+            "a bound Experiment already owns its Pulse endpoint and workspace"
+        )
+    from ._composition import bound_pulse_mode, _require_experiment
+
+    experiment = _require_experiment(experiment)
+
+    def compose():
+        pulse = experiment.pulse
+        return _open(
+            pulse=pulse,
+            descriptor=pulse.target,
+            initial_connection_mode=bound_pulse_mode(experiment),
+            document=document,
+            path=path,
+        )
+
+    existing_error = None
+    if document is not None or path is not None:
+        existing_error = (
+            "this Experiment already owns a Pulse editor; use its Open control "
+            "instead of replacing unsaved state"
+        )
+    return experiment._open_workbench_handle(
+        "pulse-editor",
+        compose,
+        existing_error=existing_error,
+    )
+
+
+def open_device_manager(
+    experiment=None,
+    *,
+    document=None,
+    config_path=None,
+    repository=None,
+    name="neutral_atom",
+    on_initialized=None,
+):
+    """Open DeviceManager while application composition retains connect/close."""
+
+    from zlc_workbench.device_manager.app import open_device_manager as _open
+    from ._composition import ExperimentDeviceAdmin, _require_experiment
+
+    if on_initialized is not None and not callable(on_initialized):
+        raise TypeError("on_initialized must be callable or None")
+
+    if experiment is not None:
+        experiment = _require_experiment(experiment)
+        if any(
+            value is not None
+            for value in (document, config_path, repository, on_initialized)
+        ):
+            raise ValueError(
+                "a bound DeviceManager takes its config from the Experiment"
+            )
+
+        def compose():
+            return _open(ExperimentDeviceAdmin.bound(experiment))
+
+        return experiment._open_workbench_handle("device-manager", compose)
+
+    admin = ExperimentDeviceAdmin.standalone(
+        repository=repository,
+        name=name,
+    )
+
+    def runtime_changed(state):
+        if on_initialized is None or state.runtime_instance_id is None:
+            return
+        on_initialized(admin.experiment_for_runtime(state.runtime_instance_id))
+
+    try:
+        return _open(
+            admin,
+            document=document,
+            config_path=config_path,
+            on_runtime_changed=runtime_changed,
+        )
+    except BaseException:
+        admin.dispose()
+        raise
 
 
 def open_task_console(experiment, *, state=None, task=None, **kwargs):
     """Open the sole current Monitor/Logic TaskConsole lazily."""
 
     from zlc_workbench.task_console.app import open_task_console as _open
+    from ._composition import _require_experiment, task_console_ports
 
-    return _open(experiment, state=state, task=task, **kwargs)
+    experiment = _require_experiment(experiment)
+
+    def compose():
+        return _open(
+            task_console_ports(experiment),
+            state=state,
+            task=task,
+            **kwargs,
+        )
+
+    existing_error = None
+    if state is not None or task is not None:
+        existing_error = (
+            "this Experiment already owns a TaskConsole; load another layout "
+            "from that window"
+        )
+    return experiment._open_workbench_handle(
+        "task-console",
+        compose,
+        existing_error=existing_error,
+    )
 
 
 __all__ = [
     "open_calibration_workbench",
     "open_calibration_report_workbench",
-    "open_capture_workbench",
-    "create_data_figure_pane",
-    "open_data_figure_workbench",
     "open_figure_workbench",
     "open_occupancy_cell_workbench",
+    "open_device_manager",
+    "open_pulse_editor",
     "open_saved_fit_grid_workbench",
     "open_scan_workbench",
     "open_task_console",

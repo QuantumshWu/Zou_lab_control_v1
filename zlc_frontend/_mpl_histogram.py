@@ -237,9 +237,9 @@ def _update_histogram_presentation(
     if not isinstance(infer_fit_threshold, bool):
         raise TypeError("infer_fit_threshold must be bool")
 
-    from zlc_data.readout_math import confidence_weighted_fidelity
+    from zlc_data import confidence_weighted_fidelity
 
-    from .histogram_fit import fit_histogram
+    from zlc_data import fit_histogram
 
     counts_group = tuple(np.asarray(item, dtype=np.float64) for item in counts_group)
     if not counts_group:

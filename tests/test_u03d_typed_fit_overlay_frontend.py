@@ -486,7 +486,7 @@ def test_transient_selector_fit_stays_on_cached_full_view_and_only_draws_roi():
 
 
 def test_curve_overlay_materialization_checks_cancel_between_batches(monkeypatch):
-    from Zou_lab_control.workbench import _figure as figure_module
+    import zlc_workbench.data_figure.render_lane as figure_module
 
     base, result = _curve_fixture(committed_range=(6, 25))
     state = CurveDisplayState()

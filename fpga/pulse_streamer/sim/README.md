@@ -47,7 +47,7 @@ They were written to settle the "emCCD 2nd pulse = 40 ms" hardware report. The c
 
 
 - **`tb_ramp_scan.v`** — REAL-engine proof of the edge+RAMP DAC scan: a ramp whose STOP endpoint reads scan slot 0 at runtime (`stop_value_select=1`), two STEEP scan points; every tick of both points must equal the Bresenham staircase `v=vstart+floor(k*delta/span)` (RAMP-SCAN-OK).
-- **`tb_t_ff.v` + `replay_t.vh`/`_gen_replay_t.py`** — FULL-CHAIN first-frame regression: real top + real engine + the five real BRAM IPs, fed a T.json-structured image packed by the REAL pack_program through SAFE->upload->LOAD->FIRE twice; every frame of da_bias_y + cooling must be identical (T-FF-OK).  NOTE: the TB passes the streamer_config.json geometry (BANK_SIZE=512) to the top -- the default 2048 would mis-place the register regions exactly like a host/bitstream geometry mismatch.
+- **`tb_t_ff.v` + `replay_t.vh`/`_gen_replay_t.py`** — FULL-CHAIN first-frame regression: real top + real engine + the five real BRAM IPs, fed a T.json-structured image packed by the REAL pack_program through SAFE->upload->LOAD->FIRE twice; every frame of da_bias_y + cooling must be identical (T-FF-OK). The TB and host image both consume the current `streamer_config.json` geometry (`BANK_SIZE=2048`), so register-region offsets stay identical.
 
 ## Running them
 
@@ -72,7 +72,7 @@ IPM=../../build/ps/ps.srcs/sources_1/ip/blk_mem_gen_edge_mask
   REAL host pack_program (durations scaled to a 116-tick frame), through the real
   SAFE->upload->LOAD->FIRE command flow TWICE (consecutive on_pulse).  Asserts every frame of
   da_bias_y and cooling is identical (T-FF-OK).  Regenerate the .vh with python _gen_replay_t.py.
-  NOTE: instantiate the top with the streamer_config.json geometry (e.g. BANK_SIZE=512) -- the
-  default 2048 puts R_BUS_BASE at 36928 while the host packs at 24640 (the loader then copies
-  zeros and ALL DA output is wrong; geometry/layout mismatches are exactly what the CTRL word-63
-  REGISTER_LAYOUT_ID handshake now refuses at runtime).
+  Instantiate the top with the exact `streamer_config.json` geometry
+  (`BANK_SIZE=2048` in the current deployment); a mismatch moves register
+  regions and is exactly what the CTRL word-63 `REGISTER_LAYOUT_ID` handshake
+  refuses at runtime.

@@ -1,15 +1,13 @@
 """MONITOR seam: change-driven latest fronts from independent producers.
 
-Seam 3 of the composition root's rewiring contract (``app.py``).  A run node
+Monitor seam of the composition root (``app.py``).  A run node
 publishes into a ``LiveDatasetSlot``; this module freezes only slots that
 reported a new revision.  Each slot is one producer transaction.  Combining
 their latest immutable fronts into one presentation cycle does *not* assert
 that independent producers observed the same physical shot.
 
-Freeze-latest, not a bus.  The old console read a mutable signal hub whenever it
-felt like it, so two widgets could disagree about which revision of one signal
-they were showing.  Each changed slot materialises its own atomic transaction
-exactly once; unchanged slots reuse their immutable fronts.  The resulting
+Freeze-latest, not a bus.  Each changed slot materialises its own atomic
+transaction exactly once; unchanged slots reuse their immutable fronts.  The resulting
 :class:`ConsoleDataFront` is immutable, so readers agree about every individual
 producer revision without inventing cross-producer causation.
 
@@ -23,37 +21,33 @@ from different runs advance independently.
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import threading
 from types import MappingProxyType
-from typing import Callable, Mapping
+from typing import Mapping
 
 from zlc_data import OwnedSnapshot
+from zlc_frontend.figure_outputs import (
+    FitParameterMetadata,
+    SelectorAxisMetadata,
+)
+from zlc_frontend.site_map_render import SiteMapView
+from zlc_neutral_atom.dataset_output import (
+    FinalDatasetOutput,
+    LiveDatasetOutput,
+)
+from zlc_neutral_atom.runtime.dataset import (
+    DatasetCoverage,
+    MonitorCoverage,
+)
+from zlc_storage import canonical_text, sha256_text
 
 __all__ = [
     "ConsoleDataFront",
     "ConsoleDataPlane",
     "ConsoleSignalValue",
-    "single_output_projection",
 ]
-
-
-SnapshotProjector = Callable[[OwnedSnapshot], Mapping[str, OwnedSnapshot]]
-
-
-def single_output_projection(output_name: str) -> SnapshotProjector:
-    """Return the explicit identity projection for a one-output live route."""
-
-    name = str(output_name)
-    if not name or name.strip() != name:
-        raise ValueError("live output name must be canonical non-empty text")
-
-    def project(snapshot: OwnedSnapshot) -> Mapping[str, OwnedSnapshot]:
-        if not isinstance(snapshot, OwnedSnapshot):
-            raise TypeError("live projection source must be OwnedSnapshot")
-        return {name: snapshot}
-
-    return project
 
 
 @dataclass(frozen=True)
@@ -61,16 +55,45 @@ class ConsoleSignalValue:
     """One signal at one producer-owned immutable revision."""
 
     name: str
-    source: str                     # the node title that produced it
-    snapshot: object                # OwnedSnapshot -- the (ref, block) pair a render needs
-    coverage: object | None         # MonitorCoverage, or None for a scalar-less signal
+    source: str                     # presentation label of the producer
+    snapshot: OwnedSnapshot
+    coverage: DatasetCoverage | MonitorCoverage | None
     # Lineage, carried because only the freeze knows it: a renderer stamps what
     # it drew with the run and event it came from, and a value that lost these
     # on the way to a panel could only be presented with an invented one.
-    run_id: object
-    epoch_id: object                # causation domain the run belongs to
+    run_id: str
+    epoch_id: str                   # causation domain the run belongs to
     join_digest: str                # exact immutable source/coherence digest
-    presentation: object | None = None
+    transient: bool = False         # withdrawn with its live producer
+    presentation: (
+        SiteMapView | SelectorAxisMetadata | FitParameterMetadata | None
+    ) = None
+
+    def __post_init__(self) -> None:
+        name = canonical_text(self.name, "signal name")
+        source = canonical_text(self.source, "signal source")
+        if not isinstance(self.snapshot, OwnedSnapshot):
+            raise TypeError("signal snapshot must be OwnedSnapshot")
+        if self.coverage is not None and not isinstance(
+            self.coverage,
+            (DatasetCoverage, MonitorCoverage),
+        ):
+            raise TypeError("signal coverage has an unknown type")
+        run_id = canonical_text(self.run_id, "signal run_id")
+        epoch_id = canonical_text(self.epoch_id, "signal epoch_id")
+        join_digest = sha256_text(self.join_digest, "signal join_digest")
+        if not isinstance(self.transient, bool):
+            raise TypeError("signal transient flag must be bool")
+        if self.presentation is not None and not isinstance(
+            self.presentation,
+            (*SiteMapView.__args__, SelectorAxisMetadata, FitParameterMetadata),
+        ):
+            raise TypeError("Console signal presentation has an unknown type")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "run_id", run_id)
+        object.__setattr__(self, "epoch_id", epoch_id)
+        object.__setattr__(self, "join_digest", join_digest)
 
     # The block is the value; these read off it rather than copying, so a panel
     # and a legend describing "the same signal" cannot describe different data.
@@ -78,22 +101,21 @@ class ConsoleSignalValue:
     def block(self):
         """The snapshot's DataBlock -- shape/dtype/schema live here."""
 
-        return getattr(self.snapshot, "block", None)
+        return self.snapshot.block
 
     @property
     def schema(self):
-        return getattr(self.block, "schema", None)
+        return self.block.schema
 
     @property
     def values(self):
         """The block's array.  Read-only by ownership: never mutate a frozen block."""
 
-        return getattr(self.block, "values", None)
+        return self.block.values
 
     @property
     def shape(self) -> tuple[int, ...]:
-        values = self.values
-        return tuple(getattr(values, "shape", ()) or ())
+        return tuple(self.values.shape)
 
     @property
     def cell_schema(self):
@@ -104,19 +126,19 @@ class ConsoleSignalValue:
         keeps the console on the same description the producer declared.
         """
 
-        return getattr(self.schema, "cell_schema", None)
+        return self.schema.cell_schema
 
     @property
     def dtype(self):
-        return getattr(self.cell_schema, "dtype", None)
+        return self.cell_schema.dtype
 
     @property
     def unit(self) -> str | None:
-        return getattr(self.cell_schema, "value_unit", None)
+        return self.cell_schema.value_unit
 
     @property
     def axes(self) -> tuple:
-        return tuple(getattr(self.cell_schema, "data_axes", ()) or ())
+        return tuple(self.cell_schema.data_axes)
 
     @property
     def behind(self) -> int:
@@ -128,7 +150,9 @@ class ConsoleSignalValue:
         independently.
         """
 
-        return int(getattr(self.coverage, "missed_events", 0) or 0)
+        if isinstance(self.coverage, MonitorCoverage):
+            return self.coverage.missed_events
+        return 0
 
 
 @dataclass(frozen=True)
@@ -136,13 +160,303 @@ class ConsoleDataFront:
     """Latest immutable value of each producer; no cross-producer join claim."""
 
     signals: Mapping[str, ConsoleSignalValue]
-    failures: Mapping[str, str]     # node title -> why its freeze did not happen
+    failures: Mapping[str, str]     # producer instance_id -> freeze failure
 
     def names(self) -> tuple[str, ...]:
         return tuple(self.signals)
 
     def value(self, name: str) -> ConsoleSignalValue | None:
         return self.signals.get(str(name))
+
+
+def _declared_output_names(declarations) -> set[str]:
+    """Validate only the Workbench vocabulary, never application stage truth."""
+
+    names = tuple(item.name for item in tuple(declarations))
+    if any(
+        not isinstance(name, str) or not name or name.strip() != name
+        for name in names
+    ):
+        raise ValueError("console output names must be canonical non-empty text")
+    if len(set(names)) != len(names):
+        raise ValueError("console output declarations contain duplicate names")
+    return set(names)
+
+
+def _node_instance_id(node: object) -> str:
+    """Return the stable producer identity required by the Workbench seam."""
+
+    return canonical_text(
+        getattr(node, "instance_id", None),
+        "console producer instance_id",
+    )
+
+
+def _node_display_label(node: object) -> str:
+    """Return presentation text without letting it participate in routing."""
+
+    label = (
+        getattr(node, "display_label", None)
+        or getattr(node, "name", None)
+        or type(node).__name__
+    )
+    return canonical_text(str(label), "console producer display label")
+
+
+def _signal_revision_identity(value: ConsoleSignalValue) -> tuple[object, ...]:
+    """Exact source identity used by the monitor-processor lane."""
+
+    if not isinstance(value, ConsoleSignalValue):
+        raise TypeError("monitor processor source must be ConsoleSignalValue")
+    return (
+        value.name,
+        value.run_id,
+        value.epoch_id,
+        value.snapshot.ref,
+        value.join_digest,
+    )
+
+
+def _evaluate_prepared_monitor_application(
+    application: object,
+    source: ConsoleSignalValue,
+) -> object:
+    """Run one domain-owned monitor operation over an admitted revision.
+
+    The data plane knows only the common application seam: an immutable source,
+    typed coverage, and its event digest go into the already-prepared domain
+    command.  It never reconstructs Camera/Occupancy shapes or output schemas.
+    """
+
+    evaluate = getattr(application, "evaluate", None)
+    if not callable(evaluate):
+        raise TypeError(
+            "prepared monitor application must expose evaluate()"
+        )
+    if source.coverage is None:
+        raise ValueError("monitor application source has no typed coverage")
+    return evaluate(
+        source.snapshot,
+        source.coverage,
+        source_event_digest=source.join_digest,
+    )
+
+
+@dataclass(slots=True)
+class _MonitorProcessorEntry:
+    node: object
+    source_name: str
+    prepare_future: Future
+    application: object | None = None
+    work_future: Future | None = None
+    work_source: ConsoleSignalValue | None = None
+    pending_source: ConsoleSignalValue | None = None
+    last_source_identity: tuple[object, ...] | None = None
+    cancel_requested: bool = False
+
+
+class _MonitorProcessorHost:
+    """One shared worker lane for explicit monitor-source revisions.
+
+    This host has no graph, scheduler policy, restart machinery, or domain
+    algorithm.  It serializes the already-prepared monitor Processor operations
+    owned by nodes in one TaskConsole and keeps at most the newest not-yet-run
+    source revision per node.
+    """
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="console-monitor-processor",
+        )
+        self._entries: dict[int, _MonitorProcessorEntry] = {}
+        self._closed = False
+
+    @staticmethod
+    def _require_node_contract(node: object) -> None:
+        for name in (
+            "_prepare_monitor_application",
+            "_validate_monitor_source",
+            "_monitor_application_ready",
+            "_monitor_work_started",
+            "_accept_monitor_result",
+            "_accept_monitor_failure",
+            "_accept_monitor_cancelled",
+            "_request_monitor_owner_wake",
+        ):
+            if not callable(getattr(node, name, None)):
+                raise TypeError(
+                    f"monitor processor node must implement {name}()"
+                )
+
+    def attach(
+        self,
+        node: object,
+        source_name: str,
+        initial_source: ConsoleSignalValue,
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("monitor processor host is closed")
+        self._require_node_contract(node)
+        name = canonical_text(source_name, "monitor processor source name")
+        if not isinstance(initial_source, ConsoleSignalValue):
+            raise TypeError("initial monitor source must be ConsoleSignalValue")
+        if initial_source.name != name:
+            raise ValueError("initial monitor source has another signal name")
+        key = id(node)
+        if key in self._entries:
+            raise RuntimeError("monitor processor node is already attached")
+        node._validate_monitor_source(initial_source)
+        future = self._executor.submit(node._prepare_monitor_application)
+        future.add_done_callback(
+            lambda _future, current=node: self._wake_owner_if_open(current)
+        )
+        self._entries[key] = _MonitorProcessorEntry(
+            node=node,
+            source_name=name,
+            prepare_future=future,
+            pending_source=initial_source,
+            last_source_identity=_signal_revision_identity(initial_source),
+        )
+
+    def cancel(self, node: object) -> bool:
+        """Stop accepting revisions; return whether no worker still owns it."""
+
+        entry = self._entries.get(id(node))
+        if entry is None:
+            return True
+        entry.cancel_requested = True
+        entry.pending_source = None
+        idle = entry.prepare_future.done() and (
+            entry.work_future is None or entry.work_future.done()
+        )
+        if idle:
+            self._retire_cancelled(entry)
+        return idle
+
+    def detach(self, node: object) -> None:
+        entry = self._entries.get(id(node))
+        if entry is None:
+            return
+        entry.cancel_requested = True
+        entry.pending_source = None
+        if entry.prepare_future.done() and (
+            entry.work_future is None or entry.work_future.done()
+        ):
+            self._entries.pop(id(node), None)
+
+    def route(self, signals: Mapping[str, ConsoleSignalValue]) -> None:
+        """Offer each attached node the exact newest accepted source revision."""
+
+        if self._closed:
+            return
+        for entry in tuple(self._entries.values()):
+            if entry.cancel_requested:
+                continue
+            source = signals.get(entry.source_name)
+            if source is None:
+                continue
+            identity = _signal_revision_identity(source)
+            if identity == entry.last_source_identity:
+                continue
+            try:
+                entry.node._validate_monitor_source(source)
+            except Exception as error:
+                self._retire_failed(entry, error)
+                continue
+            entry.last_source_identity = identity
+            entry.pending_source = source
+            self._start_pending(entry)
+
+    def drain(self) -> None:
+        """Admit completed worker results on the TaskConsole owner thread."""
+
+        for entry in tuple(self._entries.values()):
+            if not entry.prepare_future.done():
+                continue
+            if entry.application is None:
+                try:
+                    application = entry.prepare_future.result()
+                    entry.node._monitor_application_ready(application)
+                except Exception as error:
+                    self._retire_failed(entry, error)
+                    continue
+                entry.application = application
+            work = entry.work_future
+            if work is not None and work.done():
+                source = entry.work_source
+                entry.work_future = None
+                entry.work_source = None
+                if entry.cancel_requested:
+                    self._retire_cancelled(entry)
+                    continue
+                try:
+                    if source is None:
+                        raise RuntimeError(
+                            "monitor processor lost its source revision"
+                        )
+                    result = work.result()
+                    entry.node._accept_monitor_result(source, result)
+                except Exception as error:
+                    self._retire_failed(entry, error)
+                    continue
+            if entry.cancel_requested:
+                if entry.work_future is None:
+                    self._retire_cancelled(entry)
+                continue
+            self._start_pending(entry)
+
+    def _start_pending(self, entry: _MonitorProcessorEntry) -> None:
+        if (
+            entry.cancel_requested
+            or entry.application is None
+            or entry.work_future is not None
+            or entry.pending_source is None
+        ):
+            return
+        source, entry.pending_source = entry.pending_source, None
+        entry.node._monitor_work_started(source)
+        future = self._executor.submit(
+            _evaluate_prepared_monitor_application,
+            entry.application,
+            source,
+        )
+        future.add_done_callback(
+            lambda _future, current=entry.node: self._wake_owner_if_open(current)
+        )
+        entry.work_source = source
+        entry.work_future = future
+
+    def _retire_failed(
+        self,
+        entry: _MonitorProcessorEntry,
+        error: Exception,
+    ) -> None:
+        self._entries.pop(id(entry.node), None)
+        entry.node._accept_monitor_failure(error)
+
+    def _retire_cancelled(self, entry: _MonitorProcessorEntry) -> None:
+        self._entries.pop(id(entry.node), None)
+        entry.node._accept_monitor_cancelled()
+
+    def _wake_owner_if_open(self, node: object) -> None:
+        """Never enqueue an owner wake after the data plane has retired."""
+
+        if not self._closed:
+            node._request_monitor_owner_wake()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for entry in tuple(self._entries.values()):
+            entry.cancel_requested = True
+            entry.pending_source = None
+        # Running evaluations consume only immutable inputs and publish only
+        # when drain() admits them.  Once closed there is no consumer, so do
+        # not block the Qt owner waiting for pure work that will be discarded.
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._entries.clear()
 
 
 class ConsoleDataPlane:
@@ -155,7 +469,8 @@ class ConsoleDataPlane:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._slots: dict[int, tuple[object, object, SnapshotProjector]] = {}
+        self._monitor_processors = _MonitorProcessorHost()
+        self._slots: dict[int, tuple[object, object]] = {}
         self._dirty: set[int] = set()
         self._cache: dict[int, dict[str, ConsoleSignalValue]] = {}
         self._finals: dict[
@@ -174,17 +489,14 @@ class ConsoleDataPlane:
         self._front = ConsoleDataFront(signals=empty, failures=empty)
 
     # ------------------------------------------------------------ membership
-    def attach(
-        self,
-        node,
-        slot,
-        *,
-        project_snapshot: SnapshotProjector,
-    ) -> None:
+    def attach(self, node, slot) -> None:
         if slot is None:
             raise ValueError("a monitor slot is required")
-        if not callable(project_snapshot):
-            raise TypeError("live project_snapshot must be callable")
+        if not callable(getattr(slot, "freeze_live_outputs", None)):
+            raise TypeError(
+                "live slot must expose application-owned freeze_live_outputs()"
+            )
+        _node_instance_id(node)
         key = id(node)
         with self._lock:
             if self._closed:
@@ -193,7 +505,7 @@ class ConsoleDataPlane:
                 raise RuntimeError(
                     "console node already owns a run-scoped live route"
                 )
-            self._slots[key] = (node, slot, project_snapshot)
+            self._slots[key] = (node, slot)
             # The view factory attaches before the domain binds its materializer.
             # Only the slot's first real revision marks it dirty; trying to freeze
             # here would turn the normal ARMED/no-frame-yet state into a false
@@ -212,7 +524,37 @@ class ConsoleDataPlane:
             if key in self._slots:
                 self._dirty.add(key)
 
-    def publish_final(self, node, projected: Mapping[str, object]) -> None:
+    def attach_monitor_processor(
+        self,
+        node: object,
+        *,
+        source_name: str,
+        initial_source: ConsoleSignalValue,
+    ) -> None:
+        """Attach one processor to an explicit already-accepted source revision."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("console data plane is closed")
+        self._monitor_processors.attach(node, source_name, initial_source)
+
+    def cancel_monitor_processor(self, node: object) -> bool:
+        """Stop routing new revisions to one processor."""
+
+        return self._monitor_processors.cancel(node)
+
+    def drain_monitor_processors(self) -> None:
+        """Admit completed shared-lane work on the TaskConsole owner thread."""
+
+        self._monitor_processors.drain()
+
+    def publish_final(
+        self,
+        node,
+        projected: Mapping[str, FinalDatasetOutput],
+        *,
+        presentations: Mapping[str, SiteMapView] | None = None,
+    ) -> None:
         """Admit one successful Run's already-materialized FINAL datasets.
 
         ``projected`` is keyed by the catalog's bare output names.  The data
@@ -220,48 +562,68 @@ class ConsoleDataPlane:
         slot; it never invents an output that the node did not declare.
         """
 
-        from .result_projection import ProjectedFinalSignal
-
         if not isinstance(projected, Mapping):
             raise TypeError("projected FINAL signals must be a mapping")
+        _node_instance_id(node)
+        presentations = {} if presentations is None else presentations
+        if not isinstance(presentations, Mapping):
+            raise TypeError("FINAL presentations must be a mapping")
         declarations = tuple(
             getattr(node, "output_declarations", ()) or ()
         )
-        run_scoped = {
-            str(output.name)
-            for output in declarations
-            if bool(getattr(output, "run_scoped", False))
-        }
-        # A task may declare both a provisional RUN value and several FINAL
-        # artifacts.  Every other live producer publishes its complete frozen
-        # vocabulary.  This is an equality contract: accepting only a subset
-        # would make a Camera configured for three events appear to work while
-        # silently omitting frame_1/frame_2 from the data plane.
-        declared = run_scoped or {
-            str(output.name) for output in declarations
-        }
-        unknown = set(map(str, projected)).difference(declared)
-        if unknown:
+        declared = _declared_output_names(declarations)
+        output_names = tuple(projected)
+        if any(
+            not isinstance(name, str) or not name or name.strip() != name
+            for name in output_names
+        ):
+            raise ValueError("FINAL output keys must be canonical text")
+        actual = set(output_names)
+        if not actual:
+            raise ValueError("FINAL output owner must return a non-empty mapping")
+        if not actual.issubset(declared):
             raise ValueError(
-                "FINAL projection contains undeclared outputs: "
-                + ", ".join(sorted(unknown))
+                "FINAL output owner published an output absent from the "
+                "Workbench vocabulary: "
+                f"declared={tuple(sorted(declared))}, "
+                f"unknown={tuple(sorted(actual - declared))}"
             )
-        title = str(getattr(node, "name", "") or type(node).__name__)
+        presentation_names = tuple(presentations)
+        if any(
+            not isinstance(name, str) or not name or name.strip() != name
+            for name in presentation_names
+        ):
+            raise ValueError("FINAL presentation keys must be canonical text")
+        unknown_presentations = set(presentation_names) - actual
+        if unknown_presentations:
+            raise ValueError(
+                "FINAL presentation has no matching domain output: "
+                + ", ".join(sorted(unknown_presentations))
+            )
+        for presentation in presentations.values():
+            if not isinstance(presentation, SiteMapView.__args__):
+                raise TypeError("FINAL presentations must contain SiteMapView values")
+        title = _node_display_label(node)
         handle = getattr(node, "handle", None)
         run_id_value = getattr(handle, "run_id", None)
         run_id = getattr(run_id_value, "value", run_id_value)
         if not isinstance(run_id, str) or not run_id:
             raise ValueError(
-                "a successful FINAL projection must retain its RunHandle RunId"
+                "a successful FINAL publication must retain its RunHandle RunId"
             )
         frozen: dict[str, ConsoleSignalValue] = {}
         for output_name, value in projected.items():
-            if not isinstance(value, ProjectedFinalSignal):
+            if not isinstance(value, FinalDatasetOutput):
                 raise TypeError(
-                    "FINAL projection values must be ProjectedFinalSignal"
+                    "FINAL values must be FinalDatasetOutput"
                 )
-            key = node.signal_key(str(output_name))
-            snapshot = value.snapshot
+            output = value
+            if output.name != str(output_name):
+                raise ValueError(
+                    "FINAL route key differs from the owner-declared output name"
+                )
+            key = node.signal_key(output.name)
+            snapshot = output.snapshot
             frozen[key] = ConsoleSignalValue(
                 name=key,
                 source=title,
@@ -269,46 +631,85 @@ class ConsoleDataPlane:
                 coverage=None,
                 run_id=run_id,
                 epoch_id=snapshot.ref.stream_generation.value,
-                join_digest=value.join_digest,
-                presentation=value.presentation,
+                join_digest=output.join_digest,
+                transient=False,
+                presentation=presentations.get(output.name),
             )
         key = id(node)
         with self._lock:
+            if self._closed:
+                raise RuntimeError("console data plane is closed")
             self._finals[key] = (node, frozen)
             self._membership_changed = True
 
     def publish_processor(
         self,
         node,
-        values: Mapping[str, ConsoleSignalValue],
+        outputs: Mapping[str, LiveDatasetOutput],
+        *,
+        run_id: str,
+        epoch_id: str,
+        presentations: Mapping[str, SiteMapView] | None = None,
     ) -> None:
-        """Atomically replace one reactive Processor's complete output pair.
+        """Namespace one Processor-owned typed output transaction.
 
-        The Processor supplies already-qualified immutable values because it is
-        the owner that knows the exact input lineage.  This data plane validates
-        only catalog ownership and swaps all declared outputs together; it does
-        not schedule, reacquire, or reinterpret the source dataset.
+        The neutral Processor owns bare names, Datasets, coverage, and join
+        identity.  This composition seam validates the frozen RUN declaration,
+        attaches an optional typed frontend presentation, and qualifies names.
         """
 
-        if not isinstance(values, Mapping):
-            raise TypeError("processor values must be a mapping")
-        declared = tuple(node.published_signals())
-        if set(map(str, values)) != set(declared):
+        if not isinstance(outputs, Mapping):
+            raise TypeError("processor outputs must be a mapping")
+        _node_instance_id(node)
+        presentations = {} if presentations is None else presentations
+        if not isinstance(presentations, Mapping):
+            raise TypeError("processor presentations must be a mapping")
+        declarations = tuple(getattr(node, "output_declarations", ()) or ())
+        declared = _declared_output_names(declarations)
+        output_names = tuple(outputs)
+        if any(
+            not isinstance(name, str) or not name or name.strip() != name
+            for name in output_names
+        ):
+            raise ValueError("processor output keys must be canonical text")
+        actual = set(output_names)
+        if not actual:
+            raise ValueError("processor output owner must return a non-empty mapping")
+        if not actual.issubset(declared):
             raise ValueError(
-                "reactive Processor must publish its complete declared output set"
+                "Processor published an output absent from the Workbench vocabulary"
             )
+        presentation_names = tuple(presentations)
+        if any(
+            not isinstance(name, str) or not name or name.strip() != name
+            for name in presentation_names
+        ):
+            raise ValueError("processor presentation keys must be canonical text")
+        if not set(presentation_names).issubset(actual):
+            raise ValueError("processor presentation has no declared output")
+        title = _node_display_label(node)
         frozen: dict[str, ConsoleSignalValue] = {}
-        for name in declared:
-            value = values[name]
-            if not isinstance(value, ConsoleSignalValue):
+        for output_name in outputs:
+            output = outputs[output_name]
+            if not isinstance(output, LiveDatasetOutput):
                 raise TypeError(
-                    "processor values must contain ConsoleSignalValue"
+                    "processor outputs must contain LiveDatasetOutput"
                 )
-            if value.name != name:
-                raise ValueError(
-                    "processor output key differs from ConsoleSignalValue.name"
-                )
-            frozen[name] = value
+            if output.name != output_name:
+                raise ValueError("processor output key differs from its bare name")
+            presentation = presentations.get(output_name)
+            selected = node.signal_key(output_name)
+            frozen[selected] = ConsoleSignalValue(
+                name=selected,
+                source=title,
+                snapshot=output.snapshot,
+                coverage=output.coverage,
+                run_id=run_id,
+                epoch_id=epoch_id,
+                join_digest=output.join_digest,
+                transient=True,
+                presentation=presentation,
+            )
         key = id(node)
         with self._lock:
             if self._closed:
@@ -319,33 +720,51 @@ class ConsoleDataPlane:
     def publish_panel(
         self,
         panel_id: str,
-        values: Mapping[str, ConsoleSignalValue],
+        source: ConsoleSignalValue,
+        values: Mapping[str, object],
     ) -> None:
-        """Atomically replace one Figure panel's complete derived signal set."""
+        """Route one Figure owner's bare outputs into this panel namespace."""
 
-        from zlc_data.console_records import panel_signal_key
+        from .console_records import panel_signal_key
+        from zlc_frontend.figure_outputs import FigureDerivedSignal
+        from zlc_storage import canonical_digest
 
         identity = str(panel_id).strip()
         if not identity:
             raise ValueError("panel_id must not be empty")
         if not isinstance(values, Mapping):
             raise TypeError("panel values must be a mapping")
+        if not isinstance(source, ConsoleSignalValue):
+            raise TypeError("panel source must be ConsoleSignalValue")
         if not values:
             raise ValueError("use withdraw_panel() to remove panel outputs")
-        prefix = f"@panel/{identity}/"
         frozen: dict[str, ConsoleSignalValue] = {}
         for raw_name, value in values.items():
-            name = str(raw_name)
-            if not isinstance(value, ConsoleSignalValue):
-                raise TypeError("panel values must contain ConsoleSignalValue")
-            if name != value.name:
-                raise ValueError("panel output key differs from ConsoleSignalValue.name")
-            if not name.startswith(prefix):
-                raise ValueError("panel output belongs to a different panel")
-            output_name = name[len(prefix) :]
-            if panel_signal_key(identity, output_name) != name:
-                raise ValueError("panel output key is not canonical")
-            frozen[name] = value
+            output_name = str(raw_name)
+            if not isinstance(value, FigureDerivedSignal):
+                raise TypeError("panel values must contain FigureDerivedSignal")
+            if value.source_ref != getattr(source.snapshot, "ref", None):
+                raise ValueError("Figure output belongs to another source revision")
+            name = panel_signal_key(identity, output_name)
+            frozen[name] = ConsoleSignalValue(
+                name=name,
+                source=identity,
+                snapshot=value.snapshot,
+                coverage=(
+                    source.coverage if value.preserve_source_coverage else None
+                ),
+                run_id=source.run_id,
+                epoch_id=source.epoch_id,
+                join_digest=canonical_digest(
+                    {
+                        "owner": "zlc-workbench.task-console.figure-route",
+                        "source_join_digest": source.join_digest,
+                        "derivation_digest": value.derivation_digest,
+                    }
+                ),
+                transient=False,
+                presentation=value.metadata,
+            )
         with self._lock:
             if self._closed:
                 raise RuntimeError("console data plane is closed")
@@ -364,6 +783,7 @@ class ConsoleDataPlane:
 
     def detach(self, node) -> None:
         key = id(node)
+        self._monitor_processors.detach(node)
         with self._lock:
             entry = self._slots.pop(key, None)
             self._dirty.discard(key)
@@ -373,7 +793,7 @@ class ConsoleDataPlane:
             self._failures.pop(key, None)
             self._membership_changed = True
         if entry is not None:
-            _node, slot, _project_snapshot = entry
+            _node, slot = entry
             slot.close()
 
     def detach_live(self, node) -> None:
@@ -388,7 +808,7 @@ class ConsoleDataPlane:
             if entry is not None:
                 self._membership_changed = True
         if entry is not None:
-            _node, slot, _project_snapshot = entry
+            _node, slot = entry
             slot.close()
 
     def close(self) -> None:
@@ -407,8 +827,9 @@ class ConsoleDataPlane:
             self._panels.clear()
             self._failures.clear()
             self._membership_changed = True
-        for _node, slot, _project_snapshot in entries:
+        for _node, slot in entries:
             slot.close()
+        self._monitor_processors.close()
 
     def __len__(self) -> int:
         with self._lock:
@@ -428,6 +849,7 @@ class ConsoleDataPlane:
         manufacture a new aggregate data front merely because time passed.
         """
 
+        self._monitor_processors.drain()
         with self._lock:
             if not self._dirty and not self._membership_changed:
                 return self._front
@@ -439,25 +861,20 @@ class ConsoleDataPlane:
             # therefore rebuilt on the next owner tick.
             self._membership_changed = False
         for key in dirty:
-            node, slot, project_snapshot = slots[key]
-            title = str(getattr(node, "name", "") or type(node).__name__)
+            node, slot = slots[key]
+            title = _node_display_label(node)
             try:
-                result = self._freeze_one(
-                    node,
-                    slot,
-                    title,
-                    project_snapshot=project_snapshot,
-                )
+                result = self._freeze_one(node, slot, title)
             except Exception as error:
                 failure = f"{type(error).__name__}: {error}"
                 with self._lock:
-                    if self._slots.get(key) == (node, slot, project_snapshot):
+                    if self._slots.get(key) == (node, slot):
                         self._cache.pop(key, None)
                         self._failures[key] = failure
                 continue
             frozen, alignment_failure = result
             with self._lock:
-                if self._slots.get(key) == (node, slot, project_snapshot):
+                if self._slots.get(key) == (node, slot):
                     self._cache[key] = frozen
                     if alignment_failure is None:
                         self._failures.pop(key, None)
@@ -481,18 +898,18 @@ class ConsoleDataPlane:
                 for panel_id, value in self._panels.items()
             }
             failed = dict(self._failures)
-        for key, (node, _slot, _project_snapshot) in current.items():
+        for key, (node, _slot) in current.items():
             signals.update(cached.get(key, {}))
             failure = failed.get(key)
             if failure is not None:
-                title = str(getattr(node, "name", "") or type(node).__name__)
-                failures[title] = failure
+                failures[_node_instance_id(node)] = failure
         for _key, (_node, values) in finals.items():
             signals.update(values)
         for _key, (_node, values) in processors.items():
             signals.update(values)
         for _panel_id, values in panels.items():
             signals.update(values)
+        self._monitor_processors.route(signals)
         front = ConsoleDataFront(
             signals=MappingProxyType(signals),
             failures=MappingProxyType(failures),
@@ -506,92 +923,57 @@ class ConsoleDataPlane:
         node,
         slot,
         title: str,
-        *,
-        project_snapshot: SnapshotProjector,
     ) -> tuple[dict[str, ConsoleSignalValue], str | None]:
-        """One slot's atomic transaction, projected onto its declared outputs.
+        """Namespace one application-owned mapping onto declared outputs.
 
-        A camera monitor publishes only its raw dataset.  Figure-owned Area,
-        locked Cross, and Fit branches are derived later from the exact accepted
-        panel front and never reconfigure this producer.
+        Figure-owned Area, locked Cross, and Fit branches are derived later
+        from the exact accepted panel front and never reconfigure this producer.
         """
 
-        from zlc_data import dataset_revision_ref_to_tree
-        from zlc_neutral_atom.runtime.dataset import (
-            DatasetPreviewSnapshot,
-            MonitorDatasetSnapshot,
-        )
-        from zlc_storage import canonical_digest
-
-        run_id, causation, snapshot = slot.freeze_current()
+        run_id, causation, outputs = slot.freeze_live_outputs()
         if not isinstance(run_id, str) or not run_id:
             raise TypeError("live dataset run_id must be a non-empty string")
         if not isinstance(causation, str) or not causation:
             raise TypeError(
                 "live dataset causation_domain_id must be a non-empty string"
             )
-        if isinstance(snapshot, MonitorDatasetSnapshot):
-            head = snapshot.head
-            if head is None:
-                raise RuntimeError("monitor dataset has no accepted event head")
-            join_digest = head.payload_digest
-        elif isinstance(snapshot, DatasetPreviewSnapshot):
-            join_digest = canonical_digest(
-                {
-                    "owner": "zlc_workbench.console-exact-preview",
-                    "run_id": run_id,
-                    "causation_domain_id": causation,
-                    "revision": dataset_revision_ref_to_tree(snapshot.ref),
-                    "coverage": {
-                        "written_cells": snapshot.coverage.written_cells,
-                        "total_cells": snapshot.coverage.total_cells,
-                    },
-                }
-            )
-        else:
-            raise TypeError(
-                "console live slot must freeze a typed monitor or exact preview snapshot"
-            )
-        source_snapshot = snapshot.snapshot
-        projected = project_snapshot(source_snapshot)
-        if not isinstance(projected, Mapping) or not projected:
-            raise ValueError("live projection must return a non-empty mapping")
-        declared = {
-            str(output.name)
-            for output in tuple(getattr(node, "output_declarations", ()) or ())
-        }
-        bare_names = tuple(projected)
+        if not isinstance(outputs, Mapping) or not outputs:
+            raise ValueError("live output owner must return a non-empty mapping")
+        declarations = tuple(
+            getattr(node, "output_declarations", ()) or ()
+        )
+        declared = _declared_output_names(declarations)
+        bare_names = tuple(outputs)
         if any(
             not isinstance(name, str) or not name or name.strip() != name
             for name in bare_names
         ):
-            raise ValueError("live projection output names must be canonical text")
+            raise ValueError("live output names must be canonical text")
         actual = set(bare_names)
-        if actual != declared:
+        if not actual.issubset(declared):
             raise ValueError(
-                "live projection output set differs from its frozen declaration: "
-                f"expected={tuple(sorted(declared))}, actual={tuple(sorted(actual))}"
+                "live output owner published an output absent from the "
+                "Workbench vocabulary: "
+                f"declared={tuple(sorted(declared))}, "
+                f"unknown={tuple(sorted(actual - declared))}"
             )
         frozen: dict[str, ConsoleSignalValue] = {}
         for output_name in bare_names:
-            output_snapshot = projected[output_name]
-            if not isinstance(output_snapshot, OwnedSnapshot):
-                raise TypeError("live projection values must be OwnedSnapshot")
-            if output_snapshot.ref.revision != source_snapshot.ref.revision:
-                raise ValueError("live projection changed its source revision")
-            if (
-                output_snapshot.ref.stream_generation
-                != source_snapshot.ref.stream_generation
-            ):
-                raise ValueError("live projection changed its source generation")
+            output = outputs[output_name]
+            if not isinstance(output, LiveDatasetOutput):
+                raise TypeError("live output values must be LiveDatasetOutput")
+            if output.name != output_name:
+                raise ValueError("live output key differs from its bare name")
+            output_snapshot = output.snapshot
             selected = node.signal_key(output_name)
             frozen[selected] = ConsoleSignalValue(
                 name=selected,
                 source=title,
                 snapshot=output_snapshot,
-                coverage=snapshot.coverage,
+                coverage=output.coverage,
                 run_id=run_id,
                 epoch_id=causation,
-                join_digest=join_digest,
+                join_digest=output.join_digest,
+                transient=True,
             )
         return frozen, getattr(slot, "notification_failure", None)

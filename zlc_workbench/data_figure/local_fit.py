@@ -13,23 +13,23 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from zlc_data import (
-    FitNumericPolicy,
     FitResultBatch,
     FitSpec,
     Selection,
     bind_fit,
     encode_fit_result_batch,
-    fit_model_catalog,
-    suggest_fit_draft,
 )
 from zlc_frontend import (
     DataFigure,
     FitAuthoringOption,
-    LoadedFigureArchive,
-    fit_authoring_option,
-    load_figure_archive,
+    prepare_fit_authoring_options,
 )
 
+from .archive_repository import (
+    LoadedFigureArchive,
+    load_figure_archive,
+    save_figure_archive,
+)
 from .projection import (
     _DEFAULT_FIT_TIMEOUT_SECONDS,
     _FitSaveReceipt,
@@ -99,56 +99,14 @@ def local_fit_bindings(
             Selection,
         ):
             raise TypeError("local Figure Fit selection must be Selection or None")
-        retains_saved_authority = (
-            seed_spec is not None
-            and (
-                (
-                    saved_selection is None
-                    and authority_selection is None
-                )
-                or (
-                    saved_selection is not None
-                    and authority_selection == saved_selection
-                )
-            )
+        options = prepare_fit_authoring_options(
+            figure,
+            authority_selection,
+            seed_spec=seed_spec,
         )
-
-        options = []
-        for definition in fit_model_catalog():
-            try:
-                if (
-                    retains_saved_authority
-                    and seed_spec is not None
-                    and definition.model_id == seed_spec.model_id
-                ):
-                    bound = bind_fit(seed_spec, schema)
-                else:
-                    bound = suggest_fit_draft(
-                        schema,
-                        definition.model_id,
-                        fit_axis_ids=axes,
-                        selection=authority_selection,
-                        constraints=(
-                            seed_spec.constraints
-                            if seed_spec is not None
-                            and definition.model_id == seed_spec.model_id
-                            else ()
-                        ),
-                        numeric_policy=(
-                            seed_spec.numeric_policy
-                            if seed_spec is not None
-                            and definition.model_id == seed_spec.model_id
-                            else FitNumericPolicy()
-                        ),
-                    )
-            except ValueError:
-                continue
-            options.append(fit_authoring_option(bound))
-        if not options:
-            raise ValueError(
-                "the displayed named axes and selection have no compatible Fit model"
-            )
-        return tuple(options)
+        if any(option.spec.fit_axis_ids != axes for option in options):
+            raise RuntimeError("Fit host axes differ from the authored Figure")
+        return options
 
     def execute(spec: FitSpec, cancel_check, deadline_monotonic: float):
         if not isinstance(spec, FitSpec):
@@ -172,13 +130,14 @@ def local_fit_bindings(
         merged = dict(figure.fit_results)
         merged[layer.layer_id] = execution
         fitted = figure.with_fit_results(merged)
-        saved_path = fitted.save_archive(
+        saved_path = save_figure_archive(
+            fitted,
             Path(destination),
             display=display,
             metadata=frozen_metadata,
         )
         reopened = load_figure_archive(saved_path)
-        reopened_result = reopened.figure.fit_results.get(layer.layer_id)
+        reopened_result = reopened.archive.figure.fit_results.get(layer.layer_id)
         if reopened_result is None or (
             encode_fit_result_batch(reopened_result)
             != encode_fit_result_batch(execution)
@@ -186,7 +145,7 @@ def local_fit_bindings(
             raise RuntimeError("saved Figure archive did not reopen the exact Fit result")
         return _FitSaveReceipt(
             reopened,
-            f"figure-archive:{reopened.payload_digest}",
+            f"figure-archive:{reopened.archive.payload_digest}",
             str(reopened.path),
             reopened_result,
         )
@@ -194,7 +153,7 @@ def local_fit_bindings(
     def reload_saved(handle) -> FitResultBatch:
         if not isinstance(handle, LoadedFigureArchive):
             raise TypeError("local Fit reload requires LoadedFigureArchive")
-        reopened_result = handle.figure.fit_results.get(layer.layer_id)
+        reopened_result = handle.archive.figure.fit_results.get(layer.layer_id)
         if reopened_result is None:
             raise ValueError("saved Figure archive lost its fitted layer")
         return reopened_result

@@ -14,98 +14,18 @@ from dataclasses import dataclass, field
 import threading
 
 from zlc_data import (
-    FitNumericPolicy,
     FitResultBatch,
     FitSpec,
     OwnedSnapshot,
-    Selection,
     bind_fit,
-    fit_model_catalog,
-    suggest_fit_draft,
 )
-from zlc_frontend import (
-    DataFigure,
-    FitAuthoringOption,
-    fit_authoring_option,
-    fit_projection_metadata,
-    validate_fit_authoring_options,
-)
-from zlc_frontend.figure import ViewIntent
 from zlc_frontend.qt_widgets import QtOwnerWake
 
 
 __all__ = [
     "PanelFitLane",
     "PanelFitRequest",
-    "fit_options_for_figure",
 ]
-
-
-def fit_options_for_figure(
-    figure: DataFigure,
-    selection: Selection | None,
-    *,
-    seed_spec: FitSpec | None = None,
-) -> tuple[FitAuthoringOption, ...]:
-    """Bind every compatible catalog model to one exact visible Figure.
-
-    Axis roles come from the Figure's authored ViewSpec, never rank or shape.
-    ``selection`` is authoritative input intent; display zoom/relim state is
-    intentionally absent.
-    """
-
-    if not isinstance(figure, DataFigure):
-        raise TypeError("fit preparation requires DataFigure")
-    if selection is not None and not isinstance(selection, Selection):
-        raise TypeError("fit selection must be Selection or None")
-    if seed_spec is not None and not isinstance(seed_spec, FitSpec):
-        raise TypeError("seed_spec must be FitSpec or None")
-    if len(figure.document.layers) != 1 or len(figure.datasets.entries) != 1:
-        raise ValueError("Figure Fit requires exactly one dataset layer")
-    layer = figure.document.layers[0]
-    intent = layer.view.intent
-    if intent not in (ViewIntent.CURVE, ViewIntent.IMAGE):
-        raise ValueError("Fit is available only for curve and image Figures")
-
-    # The frontend owner projects X/Y/FACET/BATCH roles for every Figure host;
-    # TaskConsole does not maintain a second interpretation.
-    fit_axis_ids, axis_roles = fit_projection_metadata(figure, intent)
-    resolved = figure.datasets.resolve(layer.dataset_id)
-    schema = resolved.block.schema
-    options = []
-    for definition in fit_model_catalog():
-        constraints = (
-            seed_spec.constraints
-            if seed_spec is not None and seed_spec.model_id == definition.model_id
-            else ()
-        )
-        numeric_policy = (
-            seed_spec.numeric_policy
-            if seed_spec is not None and seed_spec.model_id == definition.model_id
-            else FitNumericPolicy()
-        )
-        try:
-            bound = suggest_fit_draft(
-                schema,
-                definition.model_id,
-                fit_axis_ids=fit_axis_ids,
-                selection=selection,
-                constraints=constraints,
-                numeric_policy=numeric_policy,
-            )
-        except (TypeError, ValueError):
-            continue
-        options.append(fit_authoring_option(bound))
-    prepared = tuple(options)
-    if not prepared:
-        raise ValueError("the Figure's declared axes admit no fit model")
-    return validate_fit_authoring_options(
-        prepared,
-        fit_axis_ids=fit_axis_ids,
-        axis_roles=axis_roles,
-        selection=selection,
-        allow_prepared_transform=True,
-    )
 
 
 @dataclass(frozen=True, slots=True)

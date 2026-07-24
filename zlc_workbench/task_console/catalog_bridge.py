@@ -1,42 +1,46 @@
-"""CATALOG seam: DefinitionCatalog -> the console skeleton's Add-Panel/Logic vocabulary.
+"""CATALOG seam: DefinitionCatalog -> TaskConsole Add-Panel/Logic vocabulary.
 
-Seam 1 of the composition root's rewiring contract (``app.py``).  The domain
+Catalog seam of the composition root (``app.py``).  The domain
 catalog stays the single source of capability identity
 (:func:`_compose_catalog` -- plain imports, duplicate keys fail at compose);
-this module only PROJECTS it into the
-node vocabulary the ORIGINAL console UI consumes: a kind, a title, a parameter
+this module only projects it into the
+node vocabulary the console consumes: a kind, a title, a parameter
 form, the declared output names, and a ``build_request`` closure that freezes the
-form values into the owning facade's typed request.
+form values into the owning application's typed request.
 
-Headless by construction: no Qt, no matplotlib, no signal hub -- the projection
+Headless by construction: no Qt, no matplotlib, no runtime data plane -- the projection
 is a read-only view plus request construction, and every runtime behaviour
 (start/stop/monitor) lives in the RUN/MONITOR seams, not here.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
+from functools import partial
+from types import MappingProxyType
 from typing import Callable, Mapping
 
-from zlc_data.param_decl import ParamDecl
-from zlc_frontend.form import FormChoice, FormFieldProps, FormSpec
+from zlc_frontend.form import FormSpec
 from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_KEY
 from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_DEFINITIONS
-from zlc_neutral_atom.camera_measurement import camera_frame_output_names
+from zlc_neutral_atom.camera_measurement import CameraMeasurementRequest
 from zlc_neutral_atom.catalog import (
     DefinitionCatalog,
     DefinitionKey,
     MeasurementDefinition,
     StreamProcessorDefinition,
     TaskDefinition,
+    definition_key_from_tree,
+    definition_key_to_tree,
 )
 from zlc_neutral_atom.mot_field import (
+    MOT_FIELD_FINAL_OUTPUT_NAMES,
     MOT_FIELD_TASK_DEFINITIONS,
     MOT_FIELD_TASK_KEY,
 )
-from zlc_neutral_atom.pulse_programs import DEFAULT_PROBE_PULSE_PATH
+from zlc_neutral_atom.mot_field_live import MOT_FIELD_LIVE_OUTPUT_NAMES
 from zlc_neutral_atom.readout.occupancy import (
+    OCCUPANCY_LIVE_OUTPUT_NAMES,
     OCCUPANCY_STREAM_PROCESSOR_DEFINITIONS,
     OCCUPANCY_STREAM_PROCESSOR_KEY,
 )
@@ -45,12 +49,22 @@ from zlc_neutral_atom.readout.coupled_measurements import (
     GREY_MOLASSES_DETUNING_KEY,
     READOUT_DURATION_FIDELITY_KEY,
     TEMPERATURE_RELEASE_RECAPTURE_KEY,
+    GREY_MOLASSES_DETUNING_OUTPUT_NAMES,
+    READOUT_DURATION_FIDELITY_OUTPUT_NAMES,
+    TEMPERATURE_RELEASE_RECAPTURE_OUTPUT_NAMES,
+)
+from zlc_neutral_atom.readout.calibration_projection import (
+    CALIBRATION_FINAL_OUTPUT_NAMES,
+)
+from zlc_neutral_atom.readout.calibration_task import (
+    CALIBRATION_LIVE_OUTPUT_NAMES,
 )
 from zlc_neutral_atom.readout.sitemap import (
     SITEMAP_CALIBRATION_TASK_DEFINITIONS,
     SITEMAP_CALIBRATION_TASK_KEY,
 )
 from zlc_neutral_atom.scan import (
+    PULSE_SCAN_FINAL_OUTPUT_NAMES,
     PULSE_SCAN_MEASUREMENT_KEY,
     SCAN_MEASUREMENT_DEFINITIONS,
 )
@@ -61,25 +75,25 @@ from .calibration_task import (
     calibration_task_params,
 )
 from .mot_field_task import build_mot_field_intent, mot_field_params
-from .occupancy_binding import (
-    OccupancyBindingIntent,
-    occupancy_readout_method_labels,
-    parse_occupancy_readout_method,
+from .camera_measurement_form import (
+    build_camera_measurement_request,
+    camera_measurement_form,
+    camera_measurement_roles,
 )
-from .pulse_scan_binding import PulseScanBindingIntent
-from .coupled_measurement_presenter import (
-    build_grey_molasses_detuning_intent,
-    build_readout_duration_fidelity_intent,
-    build_temperature_release_recapture_intent,
+from .coupled_measurement_forms import (
+    build_grey_molasses_detuning_binding,
+    build_readout_duration_fidelity_binding,
+    build_temperature_release_recapture_binding,
     grey_molasses_detuning_params,
     readout_duration_fidelity_params,
     temperature_release_recapture_params,
 )
-
-DEFAULT_CAMERA_ROLE = "camera"
-CAMERA_MEASUREMENT_ROLES = ("camera", "mot_camera")
-OCCUPANCY_CALIBRATION_SOURCES = ("Task output", "Saved calibration")
-DEFAULT_CALIBRATION_REF_PATH = "_output/calibrations/calibration_ref.json"
+from .occupancy_form import build_occupancy_binding, occupancy_form
+from .pulse_scan_form import (
+    PulseScanFormSpec,
+    build_pulse_scan_binding,
+    pulse_scan_form,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,19 +109,53 @@ _CATALOG_GROUP_BY_DEFINITION = (
     (StreamProcessorDefinition, "Processor"),
 )
 
-__all__ = ["ConsoleCatalogView", "ConsoleNodeSpec", "ConsoleSignalDecl"]
+_MOT_FIELD_GRID_PANEL_PARAMS = MappingProxyType(
+    {
+        "default_grid_intent": "IMAGE",
+        "default_grid_facet_axis": "scan.parameter.da_z",
+    }
+)
+
+__all__ = [
+    "ConsoleCatalogView",
+    "ConsoleDefaultPanel",
+    "ConsoleNodeSpec",
+    "ConsoleSignalDecl",
+]
 
 
 @dataclass(frozen=True)
 class ConsoleSignalDecl:
-    """One output's routing, ready-to-render label, and explanatory text."""
+    """Presentation metadata for one domain-declared output name.
+
+    The declaration lets the Workbench label and offer a signal in pickers.  It
+    deliberately carries no RUN/FINAL routing fact: the concrete
+    ``LiveDatasetOutput`` or ``FinalDatasetOutput`` published by the application
+    is the authority for that boundary.
+    """
 
     name: str
     short: str
     axis_label: str
-    unit: str
     description: str = ""
-    run_scoped: bool = False
+
+
+@dataclass(frozen=True)
+class ConsoleDefaultPanel:
+    """One catalog-selected view admitted only when its typed value exists."""
+
+    output_name: str
+    kind: str
+    params: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        output_name = canonical_text(self.output_name, "default panel output name")
+        kind = canonical_text(self.kind, "default panel kind")
+        if not isinstance(self.params, Mapping):
+            raise TypeError("default panel params must be a mapping")
+        object.__setattr__(self, "output_name", output_name)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "params", MappingProxyType(dict(self.params)))
 
 
 @dataclass(frozen=True)
@@ -118,40 +166,60 @@ class ConsoleNodeSpec:
     kind: str                     # "camera" | "measurement" | "processor" | "task"
     title: str
     description: str
-    params: tuple[ParamDecl, ...]
+    form: FormSpec | PulseScanFormSpec
     declared_outputs: tuple[ConsoleSignalDecl, ...]
     build_request: Callable[[Mapping[str, object]], object]
-    default_panel: tuple[str, str] | tuple[str, str, Mapping[str, object]] | None = None
-    output_factory: (
-        Callable[[Mapping[str, object]], tuple[ConsoleSignalDecl, ...]] | None
-    ) = None
+    default_panels: tuple[ConsoleDefaultPanel, ...] = ()
+    request_output_axis_label: str | None = None
+    request_output_description: str = ""
 
     @property
     def name(self) -> str:
-        """The skeleton addresses specs by title (its historical lookup key)."""
+        """Human-facing catalog label; never a persisted capability identity."""
 
         return self.title
 
+    @property
+    def definition_tree(self) -> dict[str, object]:
+        return definition_key_to_tree(self.key)
+
     def outputs_for(
         self,
-        values: Mapping[str, object],
+        request: object,
     ) -> tuple[ConsoleSignalDecl, ...]:
-        """Resolve this form state to its exact, ordered public outputs.
+        """Project one frozen request to its exact, ordered public outputs.
 
-        Most definitions have a static tuple.  Camera Measurement is different:
-        ``frames_per_cycle`` is part of its request and therefore determines the
-        number of independently bindable ``frame_i`` views.  Keeping that
-        dependency on the catalog seam lets every picker/runtime consumer use
-        one declaration owner without treating a Dataset shape as UI metadata.
+        Static definitions retain their catalog declaration.  The sole dynamic
+        form repeats one presentation template over the exact ``output_names``
+        frozen by its domain request.  There is deliberately no arbitrary
+        projector callback on this composition record: physical output
+        materialization remains an application-owner operation.
         """
 
-        if not isinstance(values, Mapping):
-            raise TypeError("console form values must be a mapping")
-        outputs = (
-            self.declared_outputs
-            if self.output_factory is None
-            else self.output_factory(values)
-        )
+        if self.request_output_axis_label is None:
+            outputs = self.declared_outputs
+        else:
+            if self.declared_outputs:
+                raise ValueError(
+                    "request-declared and static console outputs are mutually exclusive"
+                )
+            if self.key != CAMERA_MEASUREMENT_KEY or not isinstance(
+                request,
+                CameraMeasurementRequest,
+            ):
+                raise TypeError(
+                    "dynamic console outputs are the closed Camera Measurement product"
+                )
+            names = request.output_names
+            outputs = tuple(
+                ConsoleSignalDecl(
+                    name,
+                    name,
+                    self.request_output_axis_label,
+                    self.request_output_description,
+                )
+                for name in names
+            )
         outputs = tuple(outputs)
         if any(not isinstance(output, ConsoleSignalDecl) for output in outputs):
             raise TypeError("console outputs must contain ConsoleSignalDecl values")
@@ -198,311 +266,77 @@ def _catalog_items(catalog: DefinitionCatalog) -> tuple[_CatalogItem, ...]:
     return tuple(items)
 
 
-def _role_form_field(
-    roles: tuple[str, ...],
-    *,
-    key: str,
-    label: str,
-    domain: str,
-    preferred: str | None,
-) -> FormFieldProps:
-    """Present an installation-owned role without copying runtime resolution."""
-
-    values = tuple(roles)
-    if not values:
-        raise ValueError(f"{domain} roles must not be empty")
-    if len(set(values)) != len(values):
-        raise ValueError(f"{domain} roles must be unique")
-    for role in values:
-        canonical_text(role, f"{domain} role")
-    choices = tuple(FormChoice(role, role) for role in values)
-    if preferred is None:
-        return FormFieldProps(
-            key,
-            "choice",
-            label,
-            default=None,
-            required=False,
-            choices=choices,
-            description=(
-                f"{domain} role; leave blank to let the installation resolve it"
-            ),
-        )
-    return FormFieldProps(
-        key,
-        "choice",
-        label,
-        default=preferred if preferred in values else values[0],
-        required=True,
-        choices=choices,
-        description=f"Frozen {domain} role from the current installation",
-    )
-
-
 def _short_title(key: DefinitionKey) -> str:
     """A menu-length label derived from the definition's STABLE id.
 
     A ``Definition.title`` is free prose -- some read as labels ("Pulse scan"),
     one is a full sentence describing what the processor does -- and a menu row
     cannot hold a sentence.  Deriving from ``stable_definition_id`` gives every
-    entry the same shape, and ties the label the operator sees to the same
-    string the saved board persists, so a title reword cannot orphan a layout.
-    The prose title survives as the entry's ``description`` (its tooltip).
+    entry the same shape.  Persistence uses the owner-encoded DefinitionKey;
+    neither this label nor the prose title participates in identity.  The prose
+    title remains the entry's ``description`` (its tooltip).
     """
 
     words = str(key.stable_definition_id).replace("_", "-").split("-")
     return " ".join(words).capitalize()
 
 
-def _params_from_form(form: FormSpec) -> tuple[ParamDecl, ...]:
-    """Project simple scalar presentation fields into the shared Qt vocabulary."""
-
-    return tuple(
-        ParamDecl(
-            key=field.key,
-            label=field.label,
-            kind="choice" if field.choices else str(field.kind),
-            default=field.default,
-            unit=field.unit or "",
-            required=bool(field.required),
-            choices=tuple(str(choice.value) for choice in field.choices),
-            tooltip=field.description or "",
-        )
-        for field in form.fields
-    )
-
-
-def _camera_params(
-    camera_roles: tuple[str, ...],
-) -> tuple[ParamDecl, ...]:
-    return (
-        *_params_from_form(
-            FormSpec(
-                (
-                    _role_form_field(
-                        camera_roles,
-                        key="camera_role",
-                        label="Camera",
-                        domain="camera",
-                        preferred=DEFAULT_CAMERA_ROLE,
-                    ),
-                )
-            )
-        ),
-        ParamDecl(
-            "frames_per_cycle",
-            "Frames per cycle",
-            "int",
-            default=1,
-            lo=1,
-            hi=1_000_000,
-            required=True,
-            optional=False,
-            tooltip=(
-                "Ordered camera frames retained on an explicit READOUT_EVENT axis"
-            ),
-        ),
-        ParamDecl(
-            "repeat",
-            "Repeat",
-            "int",
-            default=0,
-            lo=0,
-            hi=1_000_000,
-            required=True,
-            optional=False,
-            tooltip=(
-                "0 keeps this installed camera live; a positive value performs "
-                "that many exact finite capture cycles"
-            ),
-        ),
-    )
-
-
-def _camera_output_declarations(
-    values: Mapping[str, object],
-) -> tuple[ConsoleSignalDecl, ...]:
-    names = camera_frame_output_names(values.get("frames_per_cycle", 1))
-    return tuple(
-        ConsoleSignalDecl(
-            name,
-            name,
-            "Counts",
-            "counts",
-            (
-                f"camera readout event {event_index}; repeat, point, and "
-                "trailing data axes are preserved"
-            ),
-        )
-        for event_index, name in enumerate(names)
-    )
-
-
-def _pulse_scan_params() -> tuple[ParamDecl, ...]:
-    return (
-        ParamDecl(
-            "pulse",
-            "Pulse template",
-            "path",
-            default=DEFAULT_PROBE_PULSE_PATH,
-            required=True,
-            path_mode="file",
-            base_dir="pulses",
-            file_filter="Pulse program (*.json);;All files (*)",
-            tooltip="Current PulseDocument whose declared scan/API slots are edited below",
-        ),
-        ParamDecl(
-            "pulse_slots",
-            "Slots",
-            "pulse_slots",
-            default={},
-            required=True,
-            depends_on="pulse",
-            tooltip=(
-                "Choose SCAN_SLOT or API_SLOT and author the complete numeric "
-                "scan_table program"
-            ),
-        ),
-        ParamDecl(
-            "y_signal",
-            "Exact source (y)",
-            "signal",
-            required=True,
-            tooltip=(
-                "Current scan-clocked sources are Camera frame, Occupancy "
-                "counts/occupied, or Figure Area data derived from one of "
-                "them. Static/display-only signals are rejected at Start. "
-                "The scan binds a dedicated exact source pipeline and never "
-                "samples a displayed/latest raster."
-            ),
-        ),
-    )
-
-
-def _occupancy_params() -> tuple[ParamDecl, ...]:
-    return (
-        ParamDecl(
-            "calibration_source",
-            "Calibration source",
-            "choice",
-            default="Task output",
-            required=True,
-            choices=OCCUPANCY_CALIBRATION_SOURCES,
-            tooltip="Use an exact TaskConsole output or an explicitly chosen saved pointer.",
-        ),
-        ParamDecl(
-            "calibration_task",
-            "Calibration task",
-            "signal",
-            tooltip=(
-                "FINAL calibration output of a successful Calibrate readout "
-                "Task row; used only when Calibration source is Task output"
-            ),
-        ),
-        ParamDecl(
-            "calibration_file",
-            "Saved calibration",
-            "path",
-            default=DEFAULT_CALIBRATION_REF_PATH,
-            path_mode="file",
-            base_dir="_output/calibrations",
-            file_filter="Calibration pointer (calibration_ref.json);;JSON files (*.json)",
-            tooltip=(
-                "Exact calibration_ref.json produced by a successful calibration; "
-                "used only when Calibration source is Saved calibration"
-            ),
-        ),
-        ParamDecl(
-            "camera_frame",
-            "Frame source",
-            "signal",
-            required=True,
-            tooltip=(
-                "Current-frame output of an already-running Camera Measurement. "
-                "Live and finite Camera runs both publish this typed view; "
-                "Occupancy never guesses a current cell from a full dataset, "
-                "starts, or reconfigures the Camera"
-            ),
-        ),
-        ParamDecl(
-            "readout_method",
-            "Readout method",
-            "choice",
-            default="box",
-            required=True,
-            choices=occupancy_readout_method_labels(),
-            tooltip=(
-                "Select one model already stored in the admitted calibration"
-            ),
-        ),
-    )
-
-
-def _form_values(values: Mapping[str, object], *keys: str) -> dict:
-    picked = {}
-    for key in keys:
-        value = values.get(key)
-        if value not in (None, ""):
-            picked[key] = value
-    return picked
-
-
 class ConsoleCatalogView:
-    """Read-only projection of the composed DefinitionCatalog for ONE experiment.
+    """Read-only projection of the composed catalog and installation facts.
 
     No registration, no package scanning: a new capability enters through the
     explicit tuple in :func:`_compose_catalog`, and an unknown definition type
     is refused here rather than silently dropped.
     """
 
-    def __init__(self, experiment) -> None:
-        self._experiment = experiment
+    def __init__(
+        self,
+        *,
+        installed_camera_roles: tuple[str, ...],
+        sitemap_camera_roles: tuple[str, ...],
+        installed_rf_roles: tuple[str, ...],
+        camera_request_builder,
+    ) -> None:
+        self._installed_camera_roles = tuple(installed_camera_roles)
+        self._sitemap_camera_roles = tuple(sitemap_camera_roles)
+        self._installed_rf_roles = tuple(installed_rf_roles)
+        if not callable(camera_request_builder):
+            raise TypeError("camera_request_builder must be callable")
+        self._camera_request_builder = camera_request_builder
         self._catalog = _compose_catalog()
-        items = tuple(
-            item
-            for item in _catalog_items(self._catalog)
-            if self._supported(item)
-        )
+        items = _catalog_items(self._catalog)
         specs: list[ConsoleNodeSpec] = []
         for item in items:
             specs.append(self._project(item))
-        by_name = {}
+        by_key = {}
         for spec in specs:
-            if spec.name in by_name:
-                raise ValueError(f"duplicate console spec title {spec.name!r}")
-            by_name[spec.name] = spec
+            if spec.key in by_key:
+                raise ValueError(f"duplicate console DefinitionKey {spec.key}")
+            by_key[spec.key] = spec
         self._specs = tuple(specs)
-        self._by_name = by_name
+        self._by_key = by_key
 
     # ------------------------------------------------------------ projection
     def _project(self, item) -> ConsoleNodeSpec:
-        experiment = self._experiment
         if item.key == CAMERA_MEASUREMENT_KEY:
-
-            def build_camera(values: Mapping[str, object]):
-                return experiment.readout.camera_measurement_request(
-                    **_form_values(
-                        values,
-                        "camera_role",
-                        "frames_per_cycle",
-                        "repeat",
-                    ),
-                )
-
             return ConsoleNodeSpec(
                 key=item.key,
                 kind="camera",
                 title=item.title,
                 description=item.title,
-                params=_camera_params(self.camera_roles()),
-                # The static tuple describes the form's default state; every
-                # concrete row resolves the same declaration owner against its
-                # actual ``frames_per_cycle`` value.
-                declared_outputs=_camera_output_declarations(
-                    {"frames_per_cycle": 1}
+                form=camera_measurement_form(self.camera_roles()),
+                # Camera output names are request-owned, so this definition has
+                # no static fallback vocabulary.
+                declared_outputs=(),
+                build_request=partial(
+                    build_camera_measurement_request,
+                    self._camera_request_builder,
                 ),
-                build_request=build_camera,
-                output_factory=_camera_output_declarations,
+                request_output_axis_label="Counts",
+                request_output_description=(
+                    "ordered camera readout event; repeat, point, and trailing "
+                    "data axes are preserved"
+                ),
             )
         if item.key == TEMPERATURE_RELEASE_RECAPTURE_KEY:
             return ConsoleNodeSpec(
@@ -514,17 +348,16 @@ class ConsoleCatalogView:
                     "cell; publishes calibrated survival without dropping the "
                     "repeat or scan axes"
                 ),
-                params=temperature_release_recapture_params(),
+                form=temperature_release_recapture_params(),
                 declared_outputs=(
                     ConsoleSignalDecl(
-                        "survival",
+                        TEMPERATURE_RELEASE_RECAPTURE_OUTPUT_NAMES[0],
                         "survival",
                         "Survival",
-                        "",
                         "release-recapture survival",
                     ),
                 ),
-                build_request=build_temperature_release_recapture_intent,
+                build_request=build_temperature_release_recapture_binding,
             )
         if item.key == READOUT_DURATION_FIDELITY_KEY:
             return ConsoleNodeSpec(
@@ -536,17 +369,16 @@ class ConsoleCatalogView:
                     "back the camera integration time, then hardware-timed "
                     "shots publish one calibrated Otsu fidelity value"
                 ),
-                params=readout_duration_fidelity_params(),
+                form=readout_duration_fidelity_params(),
                 declared_outputs=(
                     ConsoleSignalDecl(
-                        "fidelity",
+                        READOUT_DURATION_FIDELITY_OUTPUT_NAMES[0],
                         "fidelity",
                         "Fidelity",
-                        "",
                         "readout fidelity",
                     ),
                 ),
-                build_request=build_readout_duration_fidelity_intent,
+                build_request=build_readout_duration_fidelity_binding,
             )
         if item.key == GREY_MOLASSES_DETUNING_KEY:
             return ConsoleNodeSpec(
@@ -559,17 +391,16 @@ class ConsoleCatalogView:
                     "clock; Start names the missing capability when no "
                     "synchronized RF Port is installed"
                 ),
-                params=grey_molasses_detuning_params(self.rf_roles()),
+                form=grey_molasses_detuning_params(self.rf_roles()),
                 declared_outputs=(
                     ConsoleSignalDecl(
-                        "recapture",
+                        GREY_MOLASSES_DETUNING_OUTPUT_NAMES[0],
                         "recapture",
                         "Recapture rate",
-                        "",
                         "grey-molasses recapture rate",
                     ),
                 ),
-                build_request=build_grey_molasses_detuning_intent,
+                build_request=build_grey_molasses_detuning_binding,
             )
         kind = _GROUP_TO_KIND.get(item.group)
         if kind is None:
@@ -580,67 +411,62 @@ class ConsoleCatalogView:
                 kind="task",
                 title=_short_title(item.key),
                 description=item.title,
-                params=calibration_task_params(self.sitemap_camera_roles()),
+                form=calibration_task_params(self.sitemap_camera_roles()),
                 declared_outputs=(
                     ConsoleSignalDecl(
-                        "frame",
+                        CALIBRATION_LIVE_OUTPUT_NAMES[0],
                         "reference frame",
                         "Counts",
-                        "counts",
                         "exact capture frame while calibration is running",
-                        run_scoped=True,
                     ),
                     ConsoleSignalDecl(
-                        "calibration",
+                        CALIBRATION_FINAL_OUTPUT_NAMES[0],
                         "calibration",
                         "Calibration",
-                        "",
                         "FINAL calibration artifact",
                     ),
                     ConsoleSignalDecl(
-                        "fidelity_site",
+                        CALIBRATION_FINAL_OUTPUT_NAMES[1],
                         "site fidelity",
                         "Readout fidelity",
-                        "fidelity",
                         (
                             "held-out balanced fidelity for each canonical site "
                             "from the FINAL calibration's default model"
                         ),
                     ),
                     ConsoleSignalDecl(
-                        "fidelity_threshold",
+                        CALIBRATION_FINAL_OUTPUT_NAMES[2],
                         "site threshold",
                         "Readout threshold",
-                        "counts",
                         (
                             "trained per-site threshold from the FINAL calibration "
                             "report's default model"
                         ),
                     ),
                     ConsoleSignalDecl(
-                        "fidelity_centers",
+                        CALIBRATION_FINAL_OUTPUT_NAMES[3],
                         "site centres",
                         "Site centre",
-                        "px",
                         "calibrated x/y centre for each canonical site",
                     ),
                     ConsoleSignalDecl(
-                        "aggregate_fidelity",
+                        CALIBRATION_FINAL_OUTPUT_NAMES[4],
                         "aggregate fidelity",
                         "Aggregate fidelity",
-                        "fidelity",
                         "held-out balanced fidelity using per-site thresholds",
                     ),
                     ConsoleSignalDecl(
-                        "global_fidelity",
+                        CALIBRATION_FINAL_OUTPUT_NAMES[5],
                         "global fidelity",
                         "Global fidelity",
-                        "fidelity",
                         "held-out balanced fidelity using one shared threshold",
                     ),
                 ),
                 build_request=build_calibration_task_intent,
-                default_panel=("frame", "2d"),
+                default_panels=(
+                    ConsoleDefaultPanel(CALIBRATION_LIVE_OUTPUT_NAMES[0], "2d"),
+                    ConsoleDefaultPanel(CALIBRATION_FINAL_OUTPUT_NAMES[0], "sites"),
+                ),
             )
         if item.key == MOT_FIELD_TASK_KEY:
             return ConsoleNodeSpec(
@@ -651,210 +477,84 @@ class ConsoleCatalogView:
                     "Sweep da_x/da_y/da_z in one autonomous hardware scan, "
                     "measure MOT fluorescence, and report the refined optimum"
                 ),
-                params=mot_field_params(self.camera_roles()),
+                form=mot_field_params(self.camera_roles()),
                 declared_outputs=(
                     ConsoleSignalDecl(
-                        "grid",
+                        MOT_FIELD_LIVE_OUTPUT_NAMES[0],
                         "MOT intensity grid",
                         "Counts",
-                        "counts",
                         "provisional Bx/By/Bz intensity while the scan runs",
-                        run_scoped=True,
                     ),
                     ConsoleSignalDecl(
-                        "mot_field",
+                        MOT_FIELD_FINAL_OUTPUT_NAMES[0],
                         "MOT field",
                         "Counts",
-                        "counts",
                         "FINAL optimum + 3-D intensity",
                     ),
                     ConsoleSignalDecl(
-                        "scan",
+                        MOT_FIELD_FINAL_OUTPUT_NAMES[1],
                         "scan",
                         "Signal",
-                        "",
                         "exact source scan artifact",
                     ),
                 ),
                 build_request=build_mot_field_intent,
-                default_panel=(
-                    "grid",
-                    "grid",
-                    {
-                        "default_grid_intent": "IMAGE",
-                        "default_grid_facet_axis": "scan.parameter.da_z",
-                    },
+                default_panels=(
+                    ConsoleDefaultPanel(
+                        MOT_FIELD_LIVE_OUTPUT_NAMES[0],
+                        "grid",
+                        _MOT_FIELD_GRID_PANEL_PARAMS,
+                    ),
+                    ConsoleDefaultPanel(
+                        MOT_FIELD_FINAL_OUTPUT_NAMES[0],
+                        "grid",
+                        _MOT_FIELD_GRID_PANEL_PARAMS,
+                    ),
                 ),
             )
         if item.key == PULSE_SCAN_MEASUREMENT_KEY:
-
-            def build_scan(values: Mapping[str, object]):
-                from zlc_data.vocabulary import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
-                from zlc_neutral_atom.scan import (
-                    ApiSegmentTable,
-                    ApiSlotSegmentedProgram,
-                    AutonomousScanSlotProgram,
-                )
-                from zlc_pulse import load_pulse_document
-                from zlc_workbench.pulse_editor.scan_workspace import (
-                    commit_scan_candidate,
-                    execute_numeric_table_program,
-                    execute_scan_program,
-                )
-
-                pulse = values.get("pulse")
-                if not pulse:
-                    raise ValueError("pulse scan needs a PulseDocument path")
-                document = load_pulse_document(pulse)
-                slots = dict(values.get("pulse_slots") or {})
-                sweep_kind = str(slots.get("sweep_kind") or "")
-                source = str(slots.get("program") or "")
-                y_signal = values.get("y_signal")
-                if not isinstance(y_signal, str) or not y_signal.strip():
-                    raise ValueError(
-                        "Pulse scan requires an exact Camera frame, Occupancy "
-                        "counts/occupied, or Figure Area signal"
-                    )
-                if sweep_kind == SWEEP_SCAN_SLOT:
-                    candidate = execute_scan_program(document, source)
-                    committed = commit_scan_candidate(
-                        document,
-                        candidate.candidate,
-                        "generated",
-                    )
-                    api_values = dict(slots.get("api") or {})
-                    api_order = tuple(
-                        parameter.parameter_id
-                        for parameter in committed.api_parameters
-                    )
-                    missing = tuple(
-                        parameter_id
-                        for parameter_id in api_order
-                        if parameter_id not in api_values
-                    )
-                    extra = tuple(
-                        parameter_id
-                        for parameter_id in api_values
-                        if parameter_id not in set(api_order)
-                    )
-                    if missing or extra:
-                        raise ValueError(
-                            "SCAN_SLOT requires one fixed value for every API "
-                            f"parameter; missing={missing}, extra={extra}"
-                        )
-                    program = AutonomousScanSlotProgram(
-                        committed,
-                        tuple(
-                            (parameter_id, api_values[parameter_id])
-                            for parameter_id in api_order
-                        ),
-                    )
-                    return PulseScanBindingIntent(program, y_signal.strip())
-                if sweep_kind == SWEEP_API_SLOT:
-                    columns = tuple(
-                        parameter.parameter_id
-                        for parameter in document.api_parameters
-                    )
-                    rows = execute_numeric_table_program(
-                        source,
-                        width=len(columns),
-                    )
-                    program = ApiSlotSegmentedProgram(
-                        document,
-                        ApiSegmentTable(columns, rows),
-                        (
-                            "Explicit API-slot sweep authored in TaskConsole"
-                        ),
-                    )
-                    return PulseScanBindingIntent(program, y_signal.strip())
-                raise ValueError("choose a SCAN_SLOT or API_SLOT sweep")
-
             return ConsoleNodeSpec(
                 key=item.key, kind=kind, title=_short_title(item.key),
                 description=item.title,
-                params=_pulse_scan_params(),
+                form=pulse_scan_form(),
                 declared_outputs=(
                     ConsoleSignalDecl(
-                        "scan",
+                        PULSE_SCAN_FINAL_OUTPUT_NAMES[0],
                         "scan",
                         "Signal",
-                        "",
                         "scan result",
                     ),
                 ),
-                build_request=build_scan,
+                build_request=build_pulse_scan_binding,
             )
         if item.key == OCCUPANCY_STREAM_PROCESSOR_KEY:
-
-            def build_occupancy(values: Mapping[str, object]):
-                camera_frame = values.get("camera_frame")
-                if not isinstance(camera_frame, str) or not camera_frame.strip():
-                    raise ValueError(
-                        "occupancy requires a running Camera frame output"
-                    )
-                source = str(values.get("calibration_source", "Task output"))
-                if source not in OCCUPANCY_CALIBRATION_SOURCES:
-                    raise ValueError("unknown occupancy calibration source")
-                calibration_signal = None
-                calibration_ref_path = None
-                if source == "Task output":
-                    value = values.get("calibration_task")
-                    if not isinstance(value, str) or not value.strip():
-                        raise ValueError(
-                            "occupancy requires a successful Calibration task output"
-                        )
-                    calibration_signal = value.strip()
-                else:
-                    value = values.get(
-                        "calibration_file",
-                        DEFAULT_CALIBRATION_REF_PATH,
-                    )
-                    if not isinstance(value, str) or not value.strip():
-                        raise ValueError(
-                            "occupancy requires an explicit saved calibration file"
-                        )
-                    calibration_ref_path = str(
-                        Path(value).expanduser().resolve()
-                    )
-                return OccupancyBindingIntent(
-                    camera_frame_signal=camera_frame.strip(),
-                    calibration_signal=calibration_signal,
-                    calibration_ref_path=calibration_ref_path,
-                    model_kind=parse_occupancy_readout_method(
-                        values.get("readout_method", "box")
-                    ),
-                )
-
             return ConsoleNodeSpec(
                 key=item.key,
                 kind=kind,
                 title="Judge occupancy",
                 description=item.title,
-                params=_occupancy_params(),
+                form=occupancy_form(),
                 declared_outputs=(
                     ConsoleSignalDecl(
-                        "occupied",
-                        "occupied",
-                        "Occupancy",
-                        "",
-                        "site occupancy",
-                    ),
-                    ConsoleSignalDecl(
-                        "counts",
+                        OCCUPANCY_LIVE_OUTPUT_NAMES[0],
                         "counts",
                         "Counts",
-                        "counts",
                         "site counts",
                     ),
                     ConsoleSignalDecl(
-                        "rate",
+                        OCCUPANCY_LIVE_OUTPUT_NAMES[1],
+                        "occupied",
+                        "Occupancy",
+                        "site occupancy",
+                    ),
+                    ConsoleSignalDecl(
+                        OCCUPANCY_LIVE_OUTPUT_NAMES[2],
                         "rate",
                         "Loading rate",
-                        "",
                         "valid-site occupancy fraction for each repeat/point cell",
                     ),
                 ),
-                build_request=build_occupancy,
+                build_request=build_occupancy_binding,
             )
         if kind == "task":
             raise TypeError(
@@ -866,51 +566,27 @@ class ConsoleCatalogView:
         )
 
     # -------------------------------------------------------------- queries
-    def _supported(self, item: _CatalogItem) -> bool:
-        """Project only capabilities the current installation can actually bind."""
-
-        cameras = self.camera_roles()
-        sequencers = self.sequencer_roles()
-        if item.key == CAMERA_MEASUREMENT_KEY:
-            return bool(cameras)
-        if item.key == SITEMAP_CALIBRATION_TASK_KEY:
-            return bool(self.sitemap_camera_roles() and sequencers)
-        if item.key == MOT_FIELD_TASK_KEY:
-            return "mot_camera" in cameras and bool(sequencers)
-        if item.key in (
-            PULSE_SCAN_MEASUREMENT_KEY,
-            TEMPERATURE_RELEASE_RECAPTURE_KEY,
-            READOUT_DURATION_FIDELITY_KEY,
-        ):
-            return bool(cameras and sequencers)
-        if item.key == GREY_MOLASSES_DETUNING_KEY:
-            # A Definition is product vocabulary, not a capability probe.  An
-            # installation with camera+sequencer but no synchronized RF Port
-            # must still show this Measurement and reject Start by name.
-            return bool(cameras and sequencers)
-        if item.key == OCCUPANCY_STREAM_PROCESSOR_KEY:
-            return bool(cameras and sequencers)
-        return True
-
     def specs(self, kind: str | None = None) -> tuple[ConsoleNodeSpec, ...]:
         if kind is None:
             return self._specs
         return tuple(spec for spec in self._specs if spec.kind == kind)
 
-    def spec_named(self, name: str) -> ConsoleNodeSpec | None:
-        return self._by_name.get(str(name))
+    def spec_for_definition(
+        self,
+        tree: Mapping[str, object],
+    ) -> ConsoleNodeSpec | None:
+        return self._by_key.get(definition_key_from_tree(tree))
+
+    def spec_for_key(self, key: DefinitionKey) -> ConsoleNodeSpec | None:
+        if not isinstance(key, DefinitionKey):
+            return None
+        return self._by_key.get(key)
 
     def camera_roles(self) -> tuple[str, ...]:
-        installed = set(self._experiment.device_catalog.roles("camera"))
-        return tuple(
-            role for role in CAMERA_MEASUREMENT_ROLES if role in installed
-        )
+        return camera_measurement_roles(self._installed_camera_roles)
 
     def sitemap_camera_roles(self) -> tuple[str, ...]:
-        return tuple(self._experiment.readout.sitemap_camera_roles())
-
-    def sequencer_roles(self) -> tuple[str, ...]:
-        return tuple(self._experiment.device_catalog.roles("sequencer"))
+        return self._sitemap_camera_roles
 
     def rf_roles(self) -> tuple[str, ...]:
-        return tuple(self._experiment.device_catalog.roles("rf"))
+        return self._installed_rf_roles

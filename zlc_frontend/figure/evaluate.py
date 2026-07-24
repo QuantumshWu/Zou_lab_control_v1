@@ -129,7 +129,12 @@ def _axis_coordinate(axis: AxisSpec, index: int) -> Any:
     return axis.coordinate_at(index)
 
 
-def _evaluated_axis(axis: AxisSpec, indices: tuple[int, ...]) -> EvaluatedAxis:
+def evaluate_axis(axis: AxisSpec, indices: tuple[int, ...]) -> EvaluatedAxis:
+    """Evaluate declared coordinates for one explicit ordered index set."""
+
+    if not isinstance(axis, AxisSpec):
+        raise TypeError("axis must be AxisSpec")
+    indices = tuple(indices)
     return EvaluatedAxis(
         axis.axis_id,
         axis.name,
@@ -675,7 +680,7 @@ def _image(
     axes = {axis.axis_id: axis for axis in working.cell_axes + working.data_axes}
     x_axis, y_axis = axes[binding_x.axis_id], axes[binding_y.axis_id]
     x_indices, y_indices = allowed[x_axis.axis_id], allowed[y_axis.axis_id]
-    x_out, y_out = _evaluated_axis(x_axis, x_indices), _evaluated_axis(y_axis, y_indices)
+    x_out, y_out = evaluate_axis(x_axis, x_indices), evaluate_axis(y_axis, y_indices)
     cell_ids = {axis.axis_id for axis in working.cell_axes}
     data_ids = {axis.axis_id for axis in working.data_axes}
     if {x_axis.axis_id, y_axis.axis_id} <= data_ids:
@@ -746,7 +751,7 @@ def _curve(
     axes = {axis.axis_id: axis for axis in working.cell_axes + working.data_axes}
     axis = axes[binding.axis_id]
     indices = allowed[axis.axis_id]
-    out_axis = _evaluated_axis(axis, indices)
+    out_axis = evaluate_axis(axis, indices)
     output = np.zeros((len(indices),), dtype=working.values.dtype)
     valid = np.zeros(output.shape, dtype=bool)
     positions = {index: position for position, index in enumerate(indices)}

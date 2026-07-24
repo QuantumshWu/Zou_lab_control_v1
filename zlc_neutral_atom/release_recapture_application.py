@@ -5,7 +5,11 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
-from zlc_data import BlockId, DatasetSchema
+from zlc_data import BlockId, DatasetSchema, dataset_revision_ref_to_tree
+from zlc_neutral_atom.dataset_output import (
+    FinalDatasetOutput,
+    final_dataset_join_digest,
+)
 from zlc_neutral_atom.readout.calibration import ResolvedCalibration
 from zlc_neutral_atom.readout.calibration_reference import (
     calibration_artifact_ref_to_tree,
@@ -13,7 +17,15 @@ from zlc_neutral_atom.readout.calibration_reference import (
 from zlc_neutral_atom.readout.coupled_measurements import (
     BoundGreyMolassesDetuning,
     BoundTemperatureReleaseRecapture,
+    GreyMolassesDetuningRequest,
+    GREY_MOLASSES_DETUNING_OUTPUT_NAMES,
+    TemperatureReleaseRecaptureRequest,
+    TEMPERATURE_RELEASE_RECAPTURE_OUTPUT_NAMES,
+    bind_grey_molasses_detuning,
+    bind_temperature_release_recapture,
 )
+from zlc_neutral_atom.rf import BoundRfTablePort
+from zlc_neutral_atom.runtime.capture import BoundCapturePort
 from zlc_neutral_atom.readout.release_recapture_pipeline import (
     ReleaseRecapturePipelineSpec,
     release_recapture_output_schema,
@@ -21,9 +33,11 @@ from zlc_neutral_atom.readout.release_recapture_pipeline import (
 from zlc_neutral_atom.runtime.run import RunHandle, RunPlan
 from zlc_neutral_atom.runtime.streams import StreamId
 from zlc_neutral_atom.timing.release_recapture import (
+    TriggeredReleaseRecaptureResult,
     TriggeredReleaseRecaptureSpec,
     compile_triggered_release_recapture_pipeline,
 )
+from zlc_neutral_atom.timing.pulse import BoundPulsePort
 from zlc_storage import canonical_digest
 
 
@@ -67,17 +81,78 @@ class PreparedTemperatureReleaseRecapture:
         )
 
 
+def _final_output(
+    result: TriggeredReleaseRecaptureResult,
+    *,
+    name: str,
+    owner: str,
+) -> dict[str, FinalDatasetOutput]:
+    if type(result) is not TriggeredReleaseRecaptureResult:
+        raise TypeError("result must be TriggeredReleaseRecaptureResult")
+    snapshot = result.survival
+    pipeline = result.release_recapture.pipeline
+    output = FinalDatasetOutput(
+        name,
+        snapshot,
+        final_dataset_join_digest(
+            owner=owner,
+            output_name=name,
+            source_identity={
+                "run_id": pipeline.run_id,
+                "dataset": dataset_revision_ref_to_tree(snapshot.ref),
+                "chain": pipeline.chain_contract_digest,
+            },
+            snapshot=snapshot,
+        ),
+    )
+    return {output.name: output}
+
+
+def temperature_final_outputs(
+    result: TriggeredReleaseRecaptureResult,
+) -> dict[str, FinalDatasetOutput]:
+    """Publish the Temperature Measurement's exact survival curve."""
+
+    return _final_output(
+        result,
+        name=TEMPERATURE_RELEASE_RECAPTURE_OUTPUT_NAMES[0],
+        owner="temperature-release-recapture",
+    )
+
+
+def grey_molasses_final_outputs(
+    result: TriggeredReleaseRecaptureResult,
+) -> dict[str, FinalDatasetOutput]:
+    """Publish the Grey-molasses Measurement's exact recapture curve."""
+
+    return _final_output(
+        result,
+        name=GREY_MOLASSES_DETUNING_OUTPUT_NAMES[0],
+        owner="grey-molasses-detuning",
+    )
+
+
 def prepare_temperature_release_recapture(
-    bound: BoundTemperatureReleaseRecapture,
+    request: TemperatureReleaseRecaptureRequest,
     calibration: ResolvedCalibration,
     *,
+    pulse_port: BoundPulsePort,
+    camera_port: BoundCapturePort,
     start_run: Callable[[RunPlan], RunHandle],
 ) -> PreparedTemperatureReleaseRecapture:
-    if not isinstance(bound, BoundTemperatureReleaseRecapture):
-        raise TypeError("bound must be BoundTemperatureReleaseRecapture")
+    if not isinstance(request, TemperatureReleaseRecaptureRequest):
+        raise TypeError("request must be TemperatureReleaseRecaptureRequest")
     if type(calibration) is not ResolvedCalibration:
         raise TypeError("calibration must be an admitted ResolvedCalibration")
     calibration._require_authority()
+    bound = bind_temperature_release_recapture(
+        request,
+        calibration,
+        pulse_port=pulse_port,
+        camera_port=camera_port,
+    )
+    if not isinstance(bound, BoundTemperatureReleaseRecapture):
+        raise RuntimeError("temperature binding returned another domain value")
     if calibration.reference != bound.request.calibration_ref:
         raise ValueError("calibration differs from the bound Measurement request")
     return _prepare_release_recapture(
@@ -93,16 +168,28 @@ def prepare_temperature_release_recapture(
 
 
 def prepare_grey_molasses_detuning(
-    bound: BoundGreyMolassesDetuning,
+    request: GreyMolassesDetuningRequest,
     calibration: ResolvedCalibration,
     *,
+    pulse_port: BoundPulsePort,
+    camera_port: BoundCapturePort,
+    rf_port: BoundRfTablePort,
     start_run: Callable[[RunPlan], RunHandle],
 ) -> PreparedTemperatureReleaseRecapture:
-    if not isinstance(bound, BoundGreyMolassesDetuning):
-        raise TypeError("bound must be BoundGreyMolassesDetuning")
+    if not isinstance(request, GreyMolassesDetuningRequest):
+        raise TypeError("request must be GreyMolassesDetuningRequest")
     if type(calibration) is not ResolvedCalibration:
         raise TypeError("calibration must be an admitted ResolvedCalibration")
     calibration._require_authority()
+    bound = bind_grey_molasses_detuning(
+        request,
+        calibration,
+        pulse_port=pulse_port,
+        camera_port=camera_port,
+        rf_port=rf_port,
+    )
+    if not isinstance(bound, BoundGreyMolassesDetuning):
+        raise RuntimeError("Grey-molasses binding returned another domain value")
     if calibration.reference != bound.request.calibration_ref:
         raise ValueError("calibration differs from the bound Measurement request")
     return _prepare_release_recapture(
@@ -177,6 +264,8 @@ def _prepare_release_recapture(
 
 __all__ = [
     "PreparedTemperatureReleaseRecapture",
+    "grey_molasses_final_outputs",
     "prepare_grey_molasses_detuning",
     "prepare_temperature_release_recapture",
+    "temperature_final_outputs",
 ]

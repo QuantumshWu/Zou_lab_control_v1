@@ -1,4 +1,4 @@
-"""Headless geometry and immutable state shared by physical site maps."""
+"""Headless drawing geometry and immutable state for SiteMap presentation."""
 
 from __future__ import annotations
 
@@ -73,7 +73,12 @@ def immutable_site_state(
     *,
     site_count: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Validate and freeze one calibrated site-state triple behind owned bytes."""
+    """Structurally freeze one already-admitted SiteMap projection.
+
+    Calibration/occupancy owners decide whether a site state is physically
+    admissible.  The frontend checks only the shape, dtype and finite drawing
+    coordinates required by its render payload.
+    """
 
     if isinstance(site_count, bool) or not isinstance(site_count, Integral):
         raise TypeError("site_count must be an integer")
@@ -107,8 +112,6 @@ def immutable_site_state(
             )
         )
     occupied_array, validity_array = states
-    if np.any(occupied_array & ~validity_array):
-        raise ValueError("invalid sites require canonical False occupied fillers")
     return centers, occupied_array, validity_array
 
 

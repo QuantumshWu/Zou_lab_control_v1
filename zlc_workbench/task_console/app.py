@@ -1,109 +1,94 @@
-"""The task console's composition root -- the one place that opens the console window.
+"""Compose and open the TaskConsole from explicit application capabilities.
 
-Every entry goes through :func:`open_task_console`: the double-clickable
-``task_console.bat``, the root ``task_console.py`` launcher, and
-``Experiment.task_console()`` from a notebook.
-
-The window preserves the main Monitor/Logic tabbed board, panel cards, and
-Fluent chrome in the named presentation modules under this package.  Its data plane is
-rewired onto the CURRENT architecture per the design document's section 10; the
-four contracted seams this root assembles, in rewiring order:
-
-1. CATALOG -- the ``zlc_neutral_atom`` DefinitionCatalog (measurement /
-   stream-processor / task definitions), mapped through a local CatalogView
-   adapter into the skeleton's Add-Panel / Logic-tab vocabulary.  No global
-   registry: plain imports; duplicate keys fail at startup.
-2. RUN -- panel/logic Start compiles an immutable PipelineSpec ->
-   ``compile_pipeline`` -> one flat RunPlan under a single RunController; the
-   skeleton never starts nested runs or owns terminal state.
-3. MONITOR -- live panels consume admitted ``MonitorTap -> MonitorDataset ->
-   LiveDatasetSlot``: the tick reads coalesced revision notifications and takes
-   atomic MonitorDatasetSnapshots; no mutable signal hub returns.
-4. RENDER -- panels draw through the worker-raster pipeline (``zlc_frontend``
-   encoded-raster / render DTOs onto the qt_widgets raster
-   boards); no transitional matplotlib live stack.
-
-All four seams are required by this composition root.  A missing catalog,
-runtime, live-data, or render binding is a startup/runtime defect; the product
-does not expose a transitional partial TaskConsole.
+The outer application supplies one :class:`TaskConsoleApplicationPorts` value.
+This module projects the installed Definition catalog into UI forms, freezes
+those forms into typed application intents, binds their prepared run commands to
+the console lifecycle, and connects typed live/final outputs to the data plane.
+The window owns interaction and presentation only; domain request construction,
+acquisition, processing, and dataset schemas remain with their package owners.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+from .application_ports import TaskConsoleApplicationPorts
 
-__all__ = ["open_task_console"]
+__all__ = ["TaskConsoleApplicationPorts", "open_task_console"]
 
 
-def open_task_console(experiment, *, state=None, task=None, **kwargs):
-    """Open the console UI for ``experiment`` and return the console body.
+def open_task_console(
+    ports: TaskConsoleApplicationPorts,
+    *,
+    state=None,
+    task=None,
+    **kwargs,
+):
+    """Open the console from one closed application-port value.
 
-    ``experiment`` is the current ``Zou_lab_control.notebook`` Experiment.  The
-    seams are derived from it HERE and nowhere else: the skeleton is handed a
-    catalog view, a run factory and a data plane, and never imports the domain.
+    The shell is handed immutable installation facts plus the exact operations
+    it can perform.  It cannot discover another service or retain an owning
+    application object.
     """
 
-    from Zou_lab_control.notebook.facade import (
-        _prepare_capture_for_workbench,
-        _prepare_camera_measurement_for_workbench,
-        _prepare_grey_molasses_detuning_for_workbench,
-        _prepare_readout_duration_fidelity_for_workbench,
-        _prepare_temperature_release_recapture_for_workbench,
-    )
+    if not isinstance(ports, TaskConsoleApplicationPorts):
+        raise TypeError("ports must be TaskConsoleApplicationPorts")
+
     from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_KEY
     from zlc_neutral_atom.camera_measurement import CameraMeasurementRequest
     from zlc_neutral_atom.mot_field import MOT_FIELD_TASK_KEY
+    from zlc_neutral_atom.mot_field_task import (
+        MotFieldTaskIntent,
+        PreparedMotFieldTask,
+    )
+    from zlc_neutral_atom.readout.calibration_task import (
+        CalibrationTaskIntent,
+        PreparedCalibrationTask,
+    )
     from zlc_neutral_atom.readout.calibration_reference import (
         CalibrationArtifactRef,
+    )
+    from zlc_neutral_atom.readout.calibration_projection import (
+        CALIBRATION_FINAL_OUTPUT_NAMES,
     )
     from zlc_neutral_atom.readout.occupancy import (
         OCCUPANCY_STREAM_PROCESSOR_KEY,
     )
-    from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
     from zlc_neutral_atom.readout.coupled_measurements import (
         GREY_MOLASSES_DETUNING_KEY,
         READOUT_DURATION_FIDELITY_KEY,
         TEMPERATURE_RELEASE_RECAPTURE_KEY,
+        GreyMolassesDetuningIntent,
+        ReadoutDurationFidelityIntent,
+        TemperatureReleaseRecaptureIntent,
+    )
+    from zlc_neutral_atom.readout.coupled_application import (
+        CoupledMeasurementApplicationCommand,
     )
     from zlc_neutral_atom.readout.sitemap import SITEMAP_CALIBRATION_TASK_KEY
     from zlc_neutral_atom.scan import PULSE_SCAN_MEASUREMENT_KEY
-    from zlc_neutral_atom.scan import (
-        ApiSlotSegmentedProgram,
-        AutonomousScanSlotProgram,
-    )
-
-    from .calibration_task import (
-        CalibrationTaskExecution,
-        CalibrationTaskHandle,
-        CalibrationTaskIntent,
-    )
+    from zlc_neutral_atom.scan.application import PreparedExactScan
     from .catalog_bridge import ConsoleCatalogView
-    from .data_plane import ConsoleDataPlane, single_output_projection
-    from .mot_field_task import MotFieldTaskHandle, MotFieldTaskIntent
-    from zlc_workbench.mot_field_live import MotFieldGridLiveSlot
+    from .calibration_presentation import CalibrationFinalPresentationAdapter
+    from .data_plane import ConsoleDataPlane
     from .occupancy_binding import (
         OccupancyBindingIntent,
         ReactiveOccupancyNode,
     )
     from .pulse_scan_binding import (
-        PULSE_SCAN_CAMERA_FRAME_SOURCE,
-        PULSE_SCAN_OCCUPANCY_SOURCE,
         PulseScanBindingIntent,
-        classify_pulse_scan_producer,
+        resolve_typed_scan_source,
     )
-    from .coupled_measurement_presenter import (
-        GreyMolassesDetuningIntent,
-        ReadoutDurationFidelityIntent,
-        TemperatureReleaseRecaptureIntent,
-        freeze_grey_molasses_detuning_request,
-        freeze_readout_duration_fidelity_request,
-        freeze_temperature_release_recapture_request,
+    from .coupled_measurement_forms import (
+        CoupledMeasurementBinding,
     )
-    from .result_projection import project_final_signals
     from .window import show_task_console
     from .run_bridge import ConsoleRunNode
 
-    catalog_view = ConsoleCatalogView(experiment)
+    catalog_view = ConsoleCatalogView(
+        installed_camera_roles=ports.installed_camera_roles,
+        sitemap_camera_roles=ports.sitemap_camera_roles,
+        installed_rf_roles=ports.installed_rf_roles,
+        camera_request_builder=ports.build_camera_measurement_request,
+    )
     data_plane = ConsoleDataPlane()
     console: list = []            # filled below; the wake closure needs the body
 
@@ -128,7 +113,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         calibration = console[0].resolve_console_producer(signal_key)
         if (
             calibration.definition_key != SITEMAP_CALIBRATION_TASK_KEY
-            or calibration.output_name != "calibration"
+            or calibration.output_name != CALIBRATION_FINAL_OUTPUT_NAMES[0]
         ):
             raise ValueError(
                 f"{measurement_name} Calibration must select the calibration "
@@ -162,258 +147,129 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 reason="Pulse scan is taking exact source ownership",
             )
 
-    def freeze_pulse_scan_request(intent: PulseScanBindingIntent):
-        """Resolve Signal(y) into a dedicated current exact source pipeline."""
+    def resolve_scan_calibration(
+        occupancy: OccupancyBindingIntent,
+    ) -> CalibrationArtifactRef:
+        """Resolve the operator's explicit calibration choice to one ref."""
 
-        if not console:
-            raise RuntimeError(
-                "TaskConsole composition is not ready for Pulse scan binding"
-            )
-        source = console[0].resolve_pulse_scan_source(intent.y_signal)
-        producer = source.producer
-        transform = source.transform_spec
-        program = intent.program
-
-        def direct_request(*, camera_role: str):
-            common = {
-                "camera_role": camera_role,
-                "output_transform_spec": transform,
-            }
-            if isinstance(program, AutonomousScanSlotProgram):
-                return experiment.readout.scan_request(
-                    program.document,
-                    api_values=dict(program.api_values),
-                    **common,
-                )
-            if isinstance(program, ApiSlotSegmentedProgram):
-                return experiment.readout.api_scan_request(
-                    program.document,
-                    api_table=program.table,
-                    segmentation_rationale=program.segmentation_rationale,
-                    **common,
-                )
-            raise TypeError("Pulse scan intent contains an unknown program")
-
-        if source.source_kind == PULSE_SCAN_CAMERA_FRAME_SOURCE:
-            if not isinstance(producer.request, CameraMeasurementRequest):
-                raise TypeError(
-                    "Pulse scan Camera source did not build a "
-                    "CameraMeasurementRequest"
-                )
-            if producer.request.frames_per_cycle != 1:
-                raise ValueError(
-                    "Pulse scan Camera y requires exactly one frame per scan cell"
-                )
-            return direct_request(
-                camera_role=producer.request.camera_ref.role
-            ), (producer.run_node,)
-
-        if source.source_kind == PULSE_SCAN_OCCUPANCY_SOURCE:
-            if not isinstance(producer.request, OccupancyBindingIntent):
-                raise TypeError(
-                    "Pulse scan Occupancy source did not build an "
-                    "OccupancyBindingIntent"
-                )
-            camera = console[0].resolve_console_producer(
-                producer.request.camera_frame_signal
-            )
-            if (
-                classify_pulse_scan_producer(
-                    camera.definition_key,
-                    camera.output_name,
-                )
-                != PULSE_SCAN_CAMERA_FRAME_SOURCE
-                or not isinstance(camera.request, CameraMeasurementRequest)
-            ):
-                raise ValueError(
-                    "selected Occupancy y no longer resolves to one Camera frame"
-                )
-            if camera.request.frames_per_cycle != 1:
-                raise ValueError(
-                    "Pulse scan Occupancy y requires one Camera frame per cell"
-                )
-            calibration_ref = resolve_calibration_reference(
-                producer.request.calibration_signal,
+        if occupancy.calibration_signal is not None:
+            return resolve_calibration_reference(
+                occupancy.calibration_signal,
                 measurement_name="Pulse scan Occupancy y",
             )
-            common = {
-                "camera_role": camera.request.camera_ref.role,
-                "calibration_ref": calibration_ref,
-                "output_name": producer.output_name,
-                "output_transform_spec": transform,
-            }
-            if isinstance(program, AutonomousScanSlotProgram):
-                request = experiment.readout.occupancy_scan_request(
-                    program.document,
-                    api_values=dict(program.api_values),
-                    **common,
-                )
-            elif isinstance(program, ApiSlotSegmentedProgram):
-                request = experiment.readout.api_occupancy_scan_request(
-                    program.document,
-                    api_table=program.table,
-                    segmentation_rationale=program.segmentation_rationale,
-                    **common,
-                )
-            else:
-                raise TypeError("Pulse scan intent contains an unknown program")
-            return request, (producer.run_node, camera.run_node)
+        path = occupancy.calibration_ref_path
+        if path is None:
+            raise RuntimeError("Pulse scan Occupancy source lost its calibration")
+        return ports.load_saved_calibration_reference(path)
 
-        raise RuntimeError(
-            f"Pulse scan resolver returned unknown source kind "
-            f"{source.source_kind!r}"
+    def coupled_measurement_node(
+        spec,
+        values,
+        *,
+        instance_id: str,
+        instance_label: str,
+        intent_type,
+        measurement_name: str,
+        prepare_application,
+    ):
+        """Bind one of the three closed coupled Measurement commands."""
+
+        binding = spec.build_request(values)
+        if (
+            not isinstance(binding, CoupledMeasurementBinding)
+            or not isinstance(binding.intent, intent_type)
+        ):
+            raise TypeError(
+                f"{measurement_name} form did not produce its typed binding"
+            )
+        calibration_ref = resolve_calibration_reference(
+            binding.calibration_signal,
+            measurement_name=measurement_name,
         )
 
-    def run_factory(spec, values):
+        def prepare(current_binding):
+            if current_binding != binding:
+                raise RuntimeError(
+                    f"{measurement_name} binding changed after request freeze"
+                )
+            return prepare_application(
+                current_binding.intent,
+                calibration_ref,
+            )
+
+        node = ConsoleRunNode(
+            spec,
+            values,
+            instance_id=instance_id,
+            instance_label=instance_label,
+            prepare=prepare,
+            request_owner_wake=request_owner_wake,
+            frozen_request=binding,
+        )
+
+        def start(command):
+            if not isinstance(command, CoupledMeasurementApplicationCommand):
+                raise TypeError(
+                    f"{measurement_name} prepare returned another command"
+                )
+            return command.start()
+
+        node.bind_starter(start)
+        return node
+
+    def run_factory(
+        spec,
+        values,
+        *,
+        instance_id: str,
+        instance_label: str,
+    ):
         if spec.key == CAMERA_MEASUREMENT_KEY:
             def prepare_camera(request):
                 if isinstance(request, CameraMeasurementRequest):
-                    return _prepare_camera_measurement_for_workbench(
-                        experiment,
-                        request,
-                    )
+                    return ports.prepare_camera_measurement(request)
                 raise TypeError("Camera form must produce CameraMeasurementRequest")
 
             node = ConsoleRunNode(
                 spec,
                 values,
+                instance_id=instance_id,
+                instance_label=instance_label,
                 prepare=prepare_camera,
                 request_owner_wake=request_owner_wake,
             )
             _bind_camera_execution(node, data_plane)
-            node.bind_final_projector(
-                lambda result, current=node: project_final_signals(
-                    experiment,
-                    current,
-                    result,
-                )
-            )
             return node
         if spec.key == TEMPERATURE_RELEASE_RECAPTURE_KEY:
-            intent = spec.build_request(values)
-            if not isinstance(intent, TemperatureReleaseRecaptureIntent):
-                raise TypeError(
-                    "temperature form did not produce its typed intent"
-                )
-            calibration_ref = resolve_calibration_reference(
-                intent.calibration_signal,
+            return coupled_measurement_node(
+                spec,
+                values,
+                instance_id=instance_id,
+                instance_label=instance_label,
+                intent_type=TemperatureReleaseRecaptureIntent,
                 measurement_name="Temperature",
+                prepare_application=ports.prepare_temperature_release_recapture,
             )
-
-            def prepare_temperature(current_intent):
-                if current_intent != intent:
-                    raise RuntimeError(
-                        "temperature binding changed after producer resolution"
-                    )
-                request = freeze_temperature_release_recapture_request(
-                    experiment,
-                    current_intent,
-                    calibration_ref=calibration_ref,
-                )
-                return _prepare_temperature_release_recapture_for_workbench(
-                    experiment,
-                    request,
-                )
-
-            node = ConsoleRunNode(
-                spec,
-                values,
-                prepare=prepare_temperature,
-                request_owner_wake=request_owner_wake,
-            )
-            node.bind_starter(lambda prepared: prepared.start())
-            node.bind_final_projector(
-                lambda result, current=node: project_final_signals(
-                    experiment,
-                    current,
-                    result,
-                )
-            )
-            return node
         if spec.key == READOUT_DURATION_FIDELITY_KEY:
-            intent = spec.build_request(values)
-            if not isinstance(intent, ReadoutDurationFidelityIntent):
-                raise TypeError(
-                    "readout-duration form did not produce its typed intent"
-                )
-
-            calibration_ref = resolve_calibration_reference(
-                intent.calibration_signal,
+            return coupled_measurement_node(
+                spec,
+                values,
+                instance_id=instance_id,
+                instance_label=instance_label,
+                intent_type=ReadoutDurationFidelityIntent,
                 measurement_name="Fidelity vs duration",
+                prepare_application=ports.prepare_readout_duration_fidelity,
             )
-
-            def prepare_duration(current_intent):
-                if current_intent != intent:
-                    raise RuntimeError(
-                        "readout-duration intent changed after construction"
-                    )
-                request = freeze_readout_duration_fidelity_request(
-                    experiment,
-                    current_intent,
-                    calibration_ref=calibration_ref,
-                )
-                return _prepare_readout_duration_fidelity_for_workbench(
-                    experiment,
-                    request,
-                )
-
-            node = ConsoleRunNode(
-                spec,
-                values,
-                prepare=prepare_duration,
-                request_owner_wake=request_owner_wake,
-            )
-            node.bind_starter(lambda prepared: prepared.start())
-            node.bind_final_projector(
-                lambda result, current=node: project_final_signals(
-                    experiment,
-                    current,
-                    result,
-                )
-            )
-            return node
         if spec.key == GREY_MOLASSES_DETUNING_KEY:
-            intent = spec.build_request(values)
-            if not isinstance(intent, GreyMolassesDetuningIntent):
-                raise TypeError(
-                    "grey-molasses form did not produce its typed intent"
-                )
-
-            calibration_ref = resolve_calibration_reference(
-                intent.calibration_signal,
-                measurement_name="Grey molasses detuning",
-            )
-
-            def prepare_grey(current_intent):
-                if current_intent != intent:
-                    raise RuntimeError(
-                        "grey-molasses intent changed after construction"
-                    )
-                request = freeze_grey_molasses_detuning_request(
-                    experiment,
-                    current_intent,
-                    calibration_ref=calibration_ref,
-                )
-                return _prepare_grey_molasses_detuning_for_workbench(
-                    experiment,
-                    request,
-                )
-
-            node = ConsoleRunNode(
+            return coupled_measurement_node(
                 spec,
                 values,
-                prepare=prepare_grey,
-                request_owner_wake=request_owner_wake,
+                instance_id=instance_id,
+                instance_label=instance_label,
+                intent_type=GreyMolassesDetuningIntent,
+                measurement_name="Grey molasses detuning",
+                prepare_application=ports.prepare_grey_molasses_detuning,
             )
-            node.bind_starter(lambda prepared: prepared.start())
-            node.bind_final_projector(
-                lambda result, current=node: project_final_signals(
-                    experiment,
-                    current,
-                    result,
-                )
-            )
-            return node
         if spec.key == OCCUPANCY_STREAM_PROCESSOR_KEY:
             if not console:
                 raise RuntimeError(
@@ -450,281 +306,119 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                     "a frame yet"
                 )
             if intent.calibration_signal is not None:
-                calibration = console[0].resolve_console_producer(
-                    intent.calibration_signal
+                calibration_ref = resolve_calibration_reference(
+                    intent.calibration_signal,
+                    measurement_name="Occupancy",
                 )
-                if (
-                    calibration.definition_key != SITEMAP_CALIBRATION_TASK_KEY
-                    or calibration.output_name != "calibration"
-                ):
-                    raise ValueError(
-                        "occupancy Calibration must select the calibration output "
-                        "of a Calibrate readout Task row in this TaskConsole"
-                    )
-                if calibration.running:
-                    raise RuntimeError(
-                        "the selected Calibrate readout Task is still running"
-                    )
-                if (
-                    not calibration.final_result_resolved
-                    or not isinstance(
-                        calibration.final_result,
-                        CalibrationArtifactRef,
-                    )
-                ):
-                    raise RuntimeError(
-                        "the selected Calibrate readout row has no successful "
-                        "current FINAL CalibrationArtifactRef; run it successfully "
-                        "before starting occupancy"
-                    )
-                calibration_ref = calibration.final_result
-
-                def load_selected_calibration():
-                    return experiment.readout.load_calibration(calibration_ref)
-
             else:
                 calibration_path = intent.calibration_ref_path
                 if calibration_path is None:
                     raise RuntimeError("occupancy lost its saved calibration path")
+                calibration_ref = ports.load_saved_calibration_reference(
+                    calibration_path
+                )
 
-                def load_selected_calibration():
-                    return experiment.readout.load_saved_calibration(
-                        calibration_path
-                    )
-
-            def resolve_calibration():
-                # ReactiveOccupancyNode invokes this closure on its sole worker;
-                # neither repository admission nor saved-file I/O runs on Qt.
-                resolved = load_selected_calibration()
-                expected = ReadoutBindingKey(source.request.camera_ref.role)
-                if resolved.artifact.frame_contract.binding != expected:
-                    raise ValueError(
-                        "selected Camera role differs from the admitted "
-                        "calibration readout binding"
-                    )
-                resolved.artifact.select_model(intent.model_kind)
-                return resolved
+            def prepare_occupancy_application():
+                return ports.prepare_reactive_occupancy(
+                    source.request,
+                    source.output_name,
+                    calibration_ref=calibration_ref,
+                    model_kind=intent.model_kind,
+                )
 
             return ReactiveOccupancyNode(
                 spec,
                 values,
+                instance_id=instance_id,
+                instance_label=instance_label,
                 intent=intent,
                 source_node=source.run_node,
                 initial_source=source_value,
-                resolve_calibration=resolve_calibration,
+                prepare_application=prepare_occupancy_application,
                 data_plane=data_plane,
                 request_owner_wake=request_owner_wake,
             )
         if spec.key == SITEMAP_CALIBRATION_TASK_KEY:
-            frozen_intent = spec.build_request(values)
-            if not isinstance(frozen_intent, CalibrationTaskIntent):
+            intent = spec.build_request(values)
+            if not isinstance(intent, CalibrationTaskIntent):
                 raise TypeError("calibration catalog returned invalid intent")
-
-            def prepare_calibration_task(current_intent):
-                if current_intent != frozen_intent:
-                    raise RuntimeError(
-                        "calibration binding changed after request freeze"
-                    )
-                if current_intent.source_mode == "live":
-                    sequence = experiment.readout.sitemap_request(
-                        frames=current_intent.threshold_frames,
-                        camera_role=current_intent.camera_role,
-                        pulse=current_intent.pulse,
-                        reference_exposure_s=current_intent.reference_exposure_s,
-                        readout_exposure_s=current_intent.readout_exposure_s,
-                        threshold_method=current_intent.threshold_method,
-                        roi_radius=current_intent.roi_radius,
-                    )
-                    return CalibrationTaskExecution(
-                        current_intent,
-                        sequence.analysis,
-                        sequence=sequence,
-                    )
-                source = experiment.readout._resolve_saved_calibration_capture(
-                    Path(current_intent.folder) / "frames",
-                    expected_camera_role=current_intent.camera_role,
-                )
-                analysis = experiment.readout.sitemap_analysis_request(
-                    camera_role=current_intent.camera_role,
-                    threshold_method=current_intent.threshold_method,
-                    roi_radius=current_intent.roi_radius,
-                )
-                return CalibrationTaskExecution(
-                    current_intent,
-                    analysis,
-                    source_capture_ref=source,
-                )
 
             node = ConsoleRunNode(
                 spec,
                 values,
-                prepare=prepare_calibration_task,
+                instance_id=instance_id,
+                instance_label=instance_label,
+                prepare=ports.prepare_calibration_task,
                 request_owner_wake=request_owner_wake,
+                frozen_request=intent,
+                final_presentation_owner=CalibrationFinalPresentationAdapter(),
             )
 
-            def start_calibration_sequence(request):
-                if request.sequence is None:
-                    start_capture = experiment.start
-                else:
-                    grouping = (
-                        request.sequence.capture_request.within_point_grouping
+            def start_calibration_task(command):
+                if not isinstance(command, PreparedCalibrationTask):
+                    raise TypeError(
+                        "Calibration application prepare returned another command"
                     )
-                    if grouping is None:
-                        raise RuntimeError(
-                            "live calibration capture lost its frozen event grouping"
-                        )
-                    reference_event = (
-                        request.analysis.layout.reference_event_indices[0]
-                    )
-                    reference_ordinals = tuple(
-                        ordinal
-                        for ordinal, (_repeat, event) in enumerate(grouping)
-                        if event == reference_event
-                    )
-
-                    start_capture = (
-                        lambda capture_request: _start_capture_preview(
-                            _prepare_capture_for_workbench(
-                                experiment,
-                                capture_request,
-                            ),
-                            node,
-                            data_plane,
-                            project_snapshot=single_output_projection("frame"),
-                            source_ordinals=reference_ordinals,
-                        )
-                    )
-
-                return CalibrationTaskHandle(
-                    request,
-                    start_capture=start_capture,
-                    build_calibration_request=(
-                        lambda source, analysis: (
-                            experiment.readout.calibration_request(
-                                source,
-                                analysis,
-                            )
-                        )
-                    ),
-                    start_calibration=experiment.readout.start_calibration,
-                    write_outputs=(
-                        lambda source, calibration, intent: (
-                            experiment.readout._write_calibration_task_outputs(
-                                source,
-                                calibration,
-                                folder=intent.folder,
-                                save_frames=(
-                                    intent.save_frames
-                                    if intent.source_mode == "live"
-                                    else False
-                                ),
-                            )
-                        )
-                    ),
+                if not command.has_live_output:
+                    return command.start()
+                return command.start(
+                    _CalibrationLivePreviewHost(node, data_plane)
                 )
 
-            node.bind_starter(start_calibration_sequence)
-            node.bind_final_projector(
-                lambda result, current=node: project_final_signals(
-                    experiment,
-                    current,
-                    result,
-                )
-            )
+            node.bind_starter(start_calibration_task)
             return node
         if spec.key == MOT_FIELD_TASK_KEY:
             intent = spec.build_request(values)
             if not isinstance(intent, MotFieldTaskIntent):
                 raise TypeError("MOT form did not produce MotFieldTaskIntent")
 
-            def bind_mot_field(current):
-                if current != intent:
-                    raise RuntimeError(
-                        "MOT-field intent changed after construction"
-                    )
-                return experiment.readout.mot_field_request(
-                    current.pulse,
-                    center_x=current.center_x,
-                    center_y=current.center_y,
-                    center_z=current.center_z,
-                    span=current.span,
-                    points=current.points,
-                    roi_cx=None if current.roi_cx == 0.0 else current.roi_cx,
-                    roi_cy=None if current.roi_cy == 0.0 else current.roi_cy,
-                    roi_radius=current.roi_radius,
-                    camera_role=current.camera_role,
-                )
-
             node = ConsoleRunNode(
                 spec,
                 values,
-                prepare=lambda request: request,
+                instance_id=instance_id,
+                instance_label=instance_label,
+                prepare=ports.prepare_mot_field_task,
                 request_owner_wake=request_owner_wake,
+                frozen_request=intent,
             )
 
-            def start_mot_field(current):
-                request = bind_mot_field(current)
-                prepared = (
-                    experiment.readout._prepare_mot_field_scan_for_workbench(
-                        request
+            def start_mot_field(prepared):
+                if not isinstance(prepared, PreparedMotFieldTask):
+                    raise TypeError(
+                        "MOT application prepare returned another command"
                     )
-                )
-                slot = MotFieldGridLiveSlot(
-                    request,
-                    prepared.source_schema,
-                    prepared.output_contract,
-                )
+                live_output = prepared.live_output
                 attached = False
                 try:
-                    data_plane.attach(
-                        node,
-                        slot,
-                        project_snapshot=single_output_projection("grid"),
-                    )
+                    data_plane.attach(node, live_output)
                     attached = True
-                    slot.set_change_listener(
+                    live_output.set_change_listener(
                         lambda: data_plane.mark_changed(node)
                     )
-
-                    def start_exact_scan(bound_request):
-                        if bound_request != request:
-                            raise RuntimeError(
-                                "MOT scan request changed after preparation"
-                            )
-                        return prepared.start(slot.preview_port)
-
-                    return MotFieldTaskHandle(
-                        request,
-                        report_folder=current.folder,
-                        start_scan=start_exact_scan,
-                        materialize_scan=experiment.readout.materialize_scan,
-                    )
+                    return prepared.start()
                 except BaseException:
                     if attached:
                         data_plane.detach_live(node)
                     else:
-                        slot.close()
+                        live_output.close()
                     raise
 
             node.bind_starter(start_mot_field)
-            node.bind_final_projector(
-                lambda result, current=node: project_final_signals(
-                    experiment,
-                    current,
-                    result,
-                )
-            )
             return node
         if spec.key == PULSE_SCAN_MEASUREMENT_KEY:
             intent = spec.build_request(values)
             if not isinstance(intent, PulseScanBindingIntent):
                 raise TypeError("Pulse scan form did not produce its typed intent")
-            request, serving_nodes = freeze_pulse_scan_request(intent)
-            serving_nodes = tuple(
-                {id(node): node for node in serving_nodes if node is not None}.values()
+            if not console:
+                raise RuntimeError(
+                    "TaskConsole composition is not ready for Pulse scan binding"
+                )
+            selected = console[0].resolve_pulse_scan_source(intent.y_signal)
+            source, serving_nodes = resolve_typed_scan_source(
+                selected,
+                resolve_producer=console[0].resolve_console_producer,
+                resolve_calibration=resolve_scan_calibration,
             )
-            for serving in serving_nodes:
-                serving.cancel("Pulse scan is taking exact source ownership")
 
             def prepare_scan(current):
                 if current != intent:
@@ -732,27 +426,37 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                         "Pulse scan binding changed after request freeze"
                     )
                 for serving in serving_nodes:
+                    serving.cancel(
+                        "Pulse scan is taking exact source ownership"
+                    )
+                for serving in serving_nodes:
                     retire_for_exact_scan(serving)
-                return request
+                return ports.prepare_scan_source(
+                    current.program,
+                    source,
+                )
+
+            def start_scan(command):
+                if not isinstance(command, PreparedExactScan):
+                    raise TypeError(
+                        "Pulse scan prepare returned another command"
+                    )
+                return command.start()
 
             node = ConsoleRunNode(
                 spec,
                 values,
+                instance_id=instance_id,
+                instance_label=instance_label,
                 prepare=prepare_scan,
                 request_owner_wake=request_owner_wake,
                 frozen_request=intent,
             )
-            node.bind_starter(experiment.start_scan)
-            node.bind_final_projector(
-                lambda result, current=node: project_final_signals(
-                    experiment,
-                    current,
-                    result,
-                )
-            )
+            node.bind_starter(start_scan)
             return node
-        raise NotImplementedError(
-            f"TaskConsole has no current runtime binding for {spec.key}"
+        raise RuntimeError(
+            "TaskConsole catalog/runtime binding invariant violated for "
+            f"{spec.key}"
         )
 
     body = show_task_console(
@@ -760,10 +464,45 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         catalog_view=catalog_view,
         run_factory=run_factory,
         data_plane=data_plane,
+        pulse_template_reader=ports.read_pulse_template,
         **kwargs,
     )
     console.append(body)
     return body
+
+
+class _CalibrationLivePreviewHost:
+    """Host one task-owned preview slot without interpreting calibration data."""
+
+    __slots__ = ("_data_plane", "_node", "_slot")
+
+    def __init__(self, node, data_plane) -> None:
+        self._node = node
+        self._data_plane = data_plane
+        self._slot = None
+
+    def open_calibration_preview(self, spec, *, output_owner):
+        from zlc_frontend.figure import DatasetId
+        from zlc_workbench.live_slot import LiveDatasetSlot
+
+        if self._slot is not None:
+            raise RuntimeError("calibration task already owns a live preview")
+        slot = LiveDatasetSlot(
+            spec,
+            dataset_id=DatasetId(f"console-calibration-{id(self._node):x}"),
+            retain_on_terminal=True,
+            output_owner=output_owner,
+        )
+        try:
+            self._data_plane.attach(self._node, slot)
+            slot.set_change_listener(
+                lambda: self._data_plane.mark_changed(self._node)
+            )
+        except BaseException:
+            slot.close()
+            raise
+        self._slot = slot
+        return slot
 
 
 def _bind_camera_execution(node, data_plane) -> None:
@@ -773,7 +512,6 @@ def _bind_camera_execution(node, data_plane) -> None:
     from zlc_neutral_atom.capture_application import PreparedFiniteCameraMeasurement
     from zlc_neutral_atom.monitor_application import PreparedLiveCameraMeasurement
     from zlc_workbench.live_slot import LiveDatasetSlot
-    from .camera_projection import project_camera_frame_snapshots
 
     def start(command):
         if isinstance(command, PreparedLiveCameraMeasurement):
@@ -788,15 +526,10 @@ def _bind_camera_execution(node, data_plane) -> None:
                     view_spec,
                     dataset_id=dataset_id,
                     retain_on_terminal=True,
+                    output_owner=command,
                 )
                 try:
-                    data_plane.attach(
-                        node,
-                        slot,
-                        project_snapshot=lambda snapshot: (
-                            project_camera_frame_snapshots(snapshot, node.request)
-                        ),
-                    )
+                    data_plane.attach(node, slot)
                 except BaseException:
                     slot.close()
                     raise
@@ -819,13 +552,16 @@ def _bind_camera_execution(node, data_plane) -> None:
                 "Camera execution requires a prepared live or finite Camera "
                 "measurement"
             )
+        if command.live_preview_output_name is None:
+            # The capacity-one exact preview has no READOUT_EVENT identity and
+            # therefore cannot truthfully publish a multi-frame cycle.  The
+            # committed FINAL artifact publishes every named frame_i instead.
+            return command.start()
         return _start_capture_preview(
             command,
             node,
             data_plane,
-            project_snapshot=lambda snapshot: (
-                project_camera_frame_snapshots(snapshot, node.request)
-            ),
+            output_owner=command,
         )
 
     node.bind_starter(start)
@@ -836,14 +572,12 @@ def _start_capture_preview(
     node,
     data_plane,
     *,
-    project_snapshot,
-    source_ordinals: tuple[int, ...] | None = None,
+    output_owner,
 ):
-    """Start one finite exact capture with an explicit output projection."""
+    """Start one finite exact capture with its application output owner."""
 
     import uuid
 
-    from zlc_data import BlockId
     from zlc_frontend.figure import DatasetId
     from zlc_workbench.live_slot import LiveDatasetSlot
 
@@ -861,13 +595,10 @@ def _start_capture_preview(
             preview_spec,
             dataset_id=DatasetId(f"console-capture-{token}"),
             retain_on_terminal=True,
+            output_owner=output_owner,
         )
         try:
-            data_plane.attach(
-                node,
-                slot,
-                project_snapshot=project_snapshot,
-            )
+            data_plane.attach(node, slot)
         except BaseException:
             slot.close()
             raise
@@ -877,9 +608,7 @@ def _start_capture_preview(
 
     try:
         return command.start_with_preview(
-            block_id=BlockId(f"console-capture-preview-{token}"),
             factory=factory,
-            source_ordinals=source_ordinals,
         )
     except BaseException:
         if attached:

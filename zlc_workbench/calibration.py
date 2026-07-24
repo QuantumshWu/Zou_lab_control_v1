@@ -10,74 +10,31 @@ never rewrite the independent expected-center evidence.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 from zlc_frontend.form import FormChoice, FormFieldProps, FormSpec
-from zlc_neutral_atom.capture_reference import CaptureArtifactRef
 from zlc_neutral_atom.readout.calibration import (
     BackgroundMode,
     BoxReducer,
+    CALIBRATION_MAXIMUM_DETECTOR_THRESHOLD_REL,
+    CALIBRATION_MAXIMUM_SITE_FIDELITY,
+    CALIBRATION_MINIMUM_BOX_RADIUS,
+    CALIBRATION_MINIMUM_DETECTOR_DISTANCE,
+    CALIBRATION_MINIMUM_DETECTOR_REFINE_HALF,
+    CALIBRATION_MINIMUM_DETECTOR_THRESHOLD_REL,
+    CALIBRATION_MINIMUM_HISTOGRAM_BINS,
+    CALIBRATION_MINIMUM_MAX_DROP,
+    CALIBRATION_MINIMUM_PSF_BACKGROUND_PADDING,
+    CALIBRATION_MINIMUM_PSF_HALF_WIDTH,
+    CALIBRATION_MINIMUM_SITE_FIDELITY,
+    CALIBRATION_MINIMUM_SPLIT_SEED,
     CalibrationAnalysisRequest,
     ReadoutModelKind,
 )
+from zlc_neutral_atom.readout.calibration_application import (
+    CalibrationArtifactRequest,
+)
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
-from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
-from zlc_storage import positive_real
-
-
-@dataclass(frozen=True, slots=True, eq=False)
-class CalibrationEditorSeed:
-    """Fixed source authority plus the initial editable analysis intent."""
-
-    source_capture_ref: CaptureArtifactRef
-    readout_binding: ReadoutBindingKey
-    analysis: CalibrationAnalysisRequest
-    timeout_seconds: float
-    previous_reference: CalibrationArtifactRef | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.source_capture_ref, CaptureArtifactRef):
-            raise TypeError("source_capture_ref must be CaptureArtifactRef")
-        if not isinstance(self.readout_binding, ReadoutBindingKey):
-            raise TypeError("readout_binding must be ReadoutBindingKey")
-        if not isinstance(self.analysis, CalibrationAnalysisRequest):
-            raise TypeError("analysis must be CalibrationAnalysisRequest")
-        object.__setattr__(
-            self,
-            "timeout_seconds",
-            positive_real(self.timeout_seconds, "timeout_seconds"),
-        )
-        if self.previous_reference is not None and not isinstance(
-            self.previous_reference,
-            CalibrationArtifactRef,
-        ):
-            raise TypeError(
-                "previous_reference must be CalibrationArtifactRef or None"
-            )
-
-
-def calibration_seed_from_computation(
-    computation: object,
-    reference: CalibrationArtifactRef,
-    *,
-    timeout_seconds: float,
-) -> CalibrationEditorSeed:
-    """Project one paired, admitted computation into an immutable editor seed."""
-
-    from zlc_neutral_atom.readout.analysis import CalibrationComputation
-
-    if not isinstance(computation, CalibrationComputation):
-        raise TypeError("calibration loader must return CalibrationComputation")
-    if not isinstance(reference, CalibrationArtifactRef):
-        raise TypeError("reference must be CalibrationArtifactRef")
-    artifact = computation.artifact
-    return CalibrationEditorSeed(
-        artifact.source_binding.source_capture_ref,
-        artifact.frame_contract.binding,
-        computation.report.request,
-        timeout_seconds,
-        reference,
-    )
 
 
 def calibration_analysis_form(request: CalibrationAnalysisRequest) -> FormSpec:
@@ -116,7 +73,7 @@ def calibration_analysis_form(request: CalibrationAnalysisRequest) -> FormSpec:
                 default=request.box_radius,
                 required=True,
                 unit="px",
-                minimum=0,
+                minimum=CALIBRATION_MINIMUM_BOX_RADIUS,
             ),
             FormFieldProps(
                 "box_reducer",
@@ -132,7 +89,7 @@ def calibration_analysis_form(request: CalibrationAnalysisRequest) -> FormSpec:
                 default=request.psf_half_width,
                 required=True,
                 unit="px",
-                minimum=0,
+                minimum=CALIBRATION_MINIMUM_PSF_HALF_WIDTH,
             ),
             FormFieldProps(
                 "psf_background",
@@ -150,7 +107,7 @@ def calibration_analysis_form(request: CalibrationAnalysisRequest) -> FormSpec:
                 default=request.psf_background_padding,
                 required=True,
                 unit="px",
-                minimum=1,
+                minimum=CALIBRATION_MINIMUM_PSF_BACKGROUND_PADDING,
             ),
             FormFieldProps(
                 "train_fraction",
@@ -166,7 +123,7 @@ def calibration_analysis_form(request: CalibrationAnalysisRequest) -> FormSpec:
                 "Split seed",
                 default=request.split_seed,
                 required=True,
-                minimum=0,
+                minimum=CALIBRATION_MINIMUM_SPLIT_SEED,
             ),
             FormFieldProps(
                 "histogram_bins",
@@ -174,7 +131,7 @@ def calibration_analysis_form(request: CalibrationAnalysisRequest) -> FormSpec:
                 "Histogram bins",
                 default=request.histogram_bins,
                 required=True,
-                minimum=2,
+                minimum=CALIBRATION_MINIMUM_HISTOGRAM_BINS,
             ),
             FormFieldProps(
                 "minimum_site_fidelity",
@@ -182,8 +139,8 @@ def calibration_analysis_form(request: CalibrationAnalysisRequest) -> FormSpec:
                 "Minimum site fidelity",
                 default=request.minimum_site_fidelity,
                 required=True,
-                minimum=0.5,
-                maximum=1.0,
+                minimum=CALIBRATION_MINIMUM_SITE_FIDELITY,
+                maximum=CALIBRATION_MAXIMUM_SITE_FIDELITY,
             ),
             FormFieldProps(
                 "max_drop",
@@ -191,7 +148,7 @@ def calibration_analysis_form(request: CalibrationAnalysisRequest) -> FormSpec:
                 "Maximum dropped sites",
                 default=request.max_drop,
                 required=True,
-                minimum=0,
+                minimum=CALIBRATION_MINIMUM_MAX_DROP,
                 maximum=request.site_count,
             ),
             FormFieldProps(
@@ -200,7 +157,7 @@ def calibration_analysis_form(request: CalibrationAnalysisRequest) -> FormSpec:
                 "Detector minimum distance",
                 default=request.detector_min_distance,
                 unit="px",
-                minimum=1,
+                minimum=CALIBRATION_MINIMUM_DETECTOR_DISTANCE,
             ),
             FormFieldProps(
                 "detector_threshold_rel",
@@ -208,8 +165,8 @@ def calibration_analysis_form(request: CalibrationAnalysisRequest) -> FormSpec:
                 "Detector relative threshold",
                 default=request.detector_threshold_rel,
                 required=True,
-                minimum=0.0,
-                maximum=1.0,
+                minimum=CALIBRATION_MINIMUM_DETECTOR_THRESHOLD_REL,
+                maximum=CALIBRATION_MAXIMUM_DETECTOR_THRESHOLD_REL,
             ),
             FormFieldProps(
                 "detector_refine_half",
@@ -218,7 +175,7 @@ def calibration_analysis_form(request: CalibrationAnalysisRequest) -> FormSpec:
                 default=request.detector_refine_half,
                 required=True,
                 unit="px",
-                minimum=0,
+                minimum=CALIBRATION_MINIMUM_DETECTOR_REFINE_HALF,
             ),
         )
     )
@@ -252,16 +209,8 @@ def calibration_analysis_from_form(
     ):
         raise TypeError("calibration model enabled fields must be bool")
     default_model = values["default_model_kind"]
-    if not isinstance(default_model, ReadoutModelKind):
-        raise TypeError("default_model_kind must be ReadoutModelKind")
-    if default_model not in model_kinds:
-        raise ValueError("default model must remain enabled")
     box_reducer = values["box_reducer"]
     background = values["psf_background"]
-    if not isinstance(box_reducer, BoxReducer):
-        raise TypeError("box_reducer must be BoxReducer")
-    if not isinstance(background, BackgroundMode):
-        raise TypeError("psf_background must be BackgroundMode")
     return replace(
         request,
         model_kinds=model_kinds,
@@ -282,45 +231,51 @@ def calibration_analysis_from_form(
     )
 
 
-def calibration_authority_summary(seed: CalibrationEditorSeed) -> str:
+def calibration_authority_summary(
+    request: CalibrationArtifactRequest,
+    previous_reference: CalibrationArtifactRef | None = None,
+) -> str:
     """Describe all fixed authority without serializing arrays into the GUI."""
 
-    if not isinstance(seed, CalibrationEditorSeed):
-        raise TypeError("seed must be CalibrationEditorSeed")
-    request = seed.analysis
-    layout = request.layout
-    centers = request.expected_centers_xy
+    if not isinstance(request, CalibrationArtifactRequest):
+        raise TypeError("request must be CalibrationArtifactRequest")
+    if previous_reference is not None and not isinstance(
+        previous_reference,
+        CalibrationArtifactRef,
+    ):
+        raise TypeError("previous_reference must be CalibrationArtifactRef or None")
+    analysis = request.analysis
+    layout = analysis.layout
+    centers = analysis.expected_centers_xy
     center_text = (
         "missing (formal Run will reject)"
         if centers is None
-        else f"{centers.shape[0]} independent centers"
+        else f"{analysis.site_count} independent centers"
     )
     residual_text = (
         "none"
-        if request.maximum_site_residual_px is None
-        else f"{request.maximum_site_residual_px:.6g} px"
+        if analysis.maximum_site_residual_px is None
+        else f"{analysis.maximum_site_residual_px:.6g} px"
     )
     previous = (
         "new calibration"
-        if seed.previous_reference is None
-        else f"editing {seed.previous_reference.target_ref} into a new artifact"
+        if previous_reference is None
+        else f"editing {previous_reference.target_ref} into a new artifact"
     )
     return (
-        f"source={seed.source_capture_ref.target_ref} · "
-        f"binding={seed.readout_binding.value} · {previous}\n"
+        f"source={request.source_capture_ref.target_ref} · "
+        f"binding={request.readout_binding.value} · {previous}\n"
         f"READOUT_EVENT={layout.readout_event_axis_id.value} · "
         f"reference={layout.reference_event_indices} · "
         f"readout={layout.readout_event_index}\n"
-        f"grid={request.grid_shape_yx} {request.ordering.value} · "
-        f"sites={request.site_count} · {center_text} · max residual={residual_text}\n"
+        f"grid={analysis.grid_shape_yx} {analysis.ordering.value} · "
+        f"sites={analysis.site_count} · {center_text} · max residual={residual_text}\n"
         "Spatial authority is frozen; detector/display output cannot rewrite it."
     )
 
 
 __all__ = [
-    "CalibrationEditorSeed",
     "calibration_analysis_form",
     "calibration_analysis_from_form",
     "calibration_authority_summary",
-    "calibration_seed_from_computation",
 ]

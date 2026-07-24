@@ -137,7 +137,7 @@ def _panel_geometry_px(
     *,
     kind: str,
 ) -> tuple[int, int, int, int, int, int]:
-    from zlc_data.panel_size import panel_size_cells
+    from zlc_frontend.panel_size import panel_size_cells
 
     rows, columns = panel_size_cells(size)
     left, right, bottom, top = panel_margins_px(kind)
@@ -363,7 +363,7 @@ def site_grid_geometry(
     produced its Qt size also scales every margin and gutter.
     """
 
-    from zlc_data.panel_size import panel_size_cells
+    from zlc_frontend.panel_size import panel_size_cells
 
     rows, columns = panel_size_cells(size)
     recommended_rows, recommended_columns = panel_size_cells(recommended)
@@ -463,7 +463,7 @@ _PULSE_PERIOD_MIN_PX = 46
 def optimal_pulse_size(channel_count: int, period_count: int) -> str:
     """Return the smallest panel preset that keeps pulse rows legible."""
 
-    from zlc_data.panel_size import PANEL_SIZES, panel_size_cells
+    from zlc_frontend.panel_size import PANEL_SIZES, panel_size_cells
 
     rows_needed = max(1, int(channel_count))
     periods_needed = max(1, int(period_count))

@@ -43,7 +43,7 @@ __all__ = [
     "STATUS_LOADED", "STATUS_RUNNING", "STATUS_DONE", "STATUS_ERROR", "STATUS_UNDERFLOW",
     "IMAGE_MAGIC", "REGISTER_LAYOUT_ID", "LAYOUT_STRUCT_VERSION", "build_fingerprint",
     "DEFAULT_CONFIG_PATH", "load_streamer_config", "params_from_config", "default_params",
-    "default_clock_hz",
+    "FROZEN_CLOCK_HZ", "FROZEN_SLOT_MUL_WIDTH", "default_clock_hz",
     "default_coeff_frac_bits", "default_slot_mul_width",
     "check_config_capacity", "format_capacity_report",
 ]
@@ -72,8 +72,9 @@ LAYOUT_STRUCT_VERSION = 3   # v3: word 63 is a geometry fingerprint (was static 
 # merely stricter/looser at validation time).  EVERYTHING ELSE in StreamerParams is a
 # bitstream-affecting geometry field and is hashed AUTOMATICALLY -- so a NEW field is fail-safe
 # (included by default; forgetting it is impossible), and only a genuine host-only cap is excluded
-# here.  (``slot_mul_width`` is a cfg-level DSP-estimate scalar, not a StreamerParams field and not
-# a build generic, so it never reaches the wire and is out of scope by construction.)
+# here.  ``slot_mul_width`` and the fabric clock are frozen RTL facts outside
+# ``StreamerParams``; the config loader rejects either value when it differs from
+# the deployed design, because the layout fingerprint cannot attest them.
 _FINGERPRINT_HOST_ONLY = frozenset({"ttl_delay_max_ticks"})
 
 
@@ -514,9 +515,10 @@ def scan_bank_words(program, p: StreamerParams, chunk_index: int,
 def pack_program(program, params: StreamerParams | None = None) -> dict[int, int]:
     """Pack a RuntimeSequenceProgram into the FINAL AXI write image (sparse).
 
-    Edges -> TICK/COEFF/MASK regions; the first TWO scan chunks -> the two banks
-    (the rest are streamed via :func:`scan_bank_words`); bus -> BUS region; scalars
-    -> CTRL.  COMMAND/STATUS/CURSOR/BANK_READY are runtime mailbox words."""
+    Edges -> TICK/COEFF/MASK regions; the two resident scan chunks -> the two
+    banks; bus -> BUS region; scalars -> CTRL. The current deployment rejects a
+    larger table before this image reaches hardware. COMMAND/STATUS/CURSOR/
+    BANK_READY are runtime mailbox words."""
     p = params or StreamerParams()
     check_rtl_assumptions(p)   # hard gate: never pack for a geometry the shipped RTL corrupts
     bases = region_bases(p)
@@ -561,9 +563,8 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
         for k in range(p.mask_words):
             w[bases["mask"] + i * p.mask_words + k] = mw[k] if k < len(mw) else 0
 
-    # first two scan chunks -> banks 0 and 1; record which chunk each bank holds so
-    # the engine's bank_chunk handshake accepts them (host updates these while
-    # streaming/re-sweeping).
+    # The complete currently admitted scan occupies banks 0 and 1. Record each
+    # resident chunk identity for the frozen bank handshake.
     for chunk in (0, 1):
         w.update(scan_bank_words(program, p, chunk))
     w[CtrlWords.BANK0_CHUNK] = 0
@@ -666,8 +667,7 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
 
 def unpack_program(words: Mapping[int, int], params: StreamerParams | None = None) -> dict:
     """Reconstruct program fields from a packed image (host<->FPGA contract check).
-    Reads only the first two scan chunks (what's resident); streamed chunks are
-    validated separately via :func:`scan_bank_words`."""
+    Reads the two resident scan chunks used by the current deployment."""
     p = params or StreamerParams()
     bases = region_bases(p)
 
@@ -869,9 +869,9 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
                    target_pct: float = 90.0, bank_size: int = 2048,
                    max_edges_cap: int = 16384,
                    engine_logic_luts: int = 12843, engine_ff: int = 11502, engine_dsp: int | None = None) -> SolvedCapacity:
-    """Maximise max_edges under <=target_pct of the part's RAMB36 (edges are the
-    bounded resource; scan points are UNBOUNDED via streaming, so only the 2-bank
-    window costs BRAM).  Edge fields are parallel BRAMs (no width padding).
+    """Maximise max_edges under <=target_pct of the part's RAMB36. Scan capacity
+    is the two-bank resident window; edge fields are parallel BRAMs (no width
+    padding).
 
     LUT/FF/DSP/RAMB36 estimates are CALIBRATED to a real Vivado 2019.1 place+ROUTE of the
     35T build (zlc_pulse_streamer_top, 2026-06-29 routed): 18607 slice LUTs (89%), 11502 FF
@@ -901,8 +901,7 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
         if _edge_ramb(cand, base) + fixed <= budget:
             max_edges = cand
             break
-    # spend leftover RAMB36 on a BIGGER resident scan window (fewer host refills /
-    # lower underflow risk); scan points stay unbounded via streaming regardless.
+    # Spend leftover RAMB36 on a larger fully resident autonomous scan window.
     chosen_bank = bank_size
     for cand in (8192, 4096, 2048, 1024, bank_size):
         if cand < bank_size:
@@ -933,8 +932,8 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
 DEFAULT_CONFIG_FILENAME = "streamer_config.json"
 DEFAULT_FPGA_PART = "xc7a35tfgg484-2"
 DEFAULT_TARGET_PCT = 90.0
-DEFAULT_CLOCK_HZ = 50_000_000.0
-DEFAULT_SLOT_MUL_WIDTH = 25
+FROZEN_CLOCK_HZ = 50_000_000.0
+FROZEN_SLOT_MUL_WIDTH = 25
 
 # StreamerParams constructor field names (so config["params"] can carry extra keys
 # like slot_mul_width without breaking the dataclass).
@@ -1001,11 +1000,24 @@ def load_streamer_config(path: str | Path | None = None) -> dict:
     except (TypeError, ValueError) as exc:
         warnings.append(f"invalid params in config ({exc}); using built-in defaults.")
         params = StreamerParams()
-    slot_mul = params_map.get("slot_mul_width", DEFAULT_SLOT_MUL_WIDTH)
+    slot_mul = params_map.get("slot_mul_width", FROZEN_SLOT_MUL_WIDTH)
     try:
         slot_mul = int(slot_mul)
-    except (TypeError, ValueError):
-        slot_mul = DEFAULT_SLOT_MUL_WIDTH
+    except (TypeError, ValueError) as exc:
+        raise ValueError("slot_mul_width must be an integer") from exc
+    if isinstance(slot_mul, bool) or slot_mul != FROZEN_SLOT_MUL_WIDTH:
+        raise ValueError(
+            "slot_mul_width differs from the frozen RTL "
+            f"({FROZEN_SLOT_MUL_WIDTH})"
+        )
+    try:
+        clock_hz = float(raw.get("clock_hz", FROZEN_CLOCK_HZ))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("clock_hz must be numeric") from exc
+    if not math.isfinite(clock_hz) or clock_hz != FROZEN_CLOCK_HZ:
+        raise ValueError(
+            f"clock_hz differs from the frozen RTL ({FROZEN_CLOCK_HZ:g} Hz)"
+        )
     # Surface (don't fail) RTL-assumption violations at load time -- estimation should
     # still answer, but pack_program will hard-reject the same geometry before upload.
     try:
@@ -1015,7 +1027,7 @@ def load_streamer_config(path: str | Path | None = None) -> dict:
     return {
         "params": params,
         "fpga_part": str(raw.get("fpga_part", DEFAULT_FPGA_PART)),
-        "clock_hz": float(raw.get("clock_hz", DEFAULT_CLOCK_HZ)),
+        "clock_hz": clock_hz,
         "target_pct": float(raw.get("target_pct", DEFAULT_TARGET_PCT)),
         "slot_mul_width": slot_mul,
         "source": source,

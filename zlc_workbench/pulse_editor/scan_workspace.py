@@ -14,35 +14,29 @@ from dataclasses import dataclass, replace
 import math
 import os
 from pathlib import Path
-import re
 import tempfile
 from typing import Literal, Sequence
 
-from zlc_data.scan_template import ScanColumnSpec, scan_table_template
+from zlc_pulse.scan_template import scan_table_template
 from zlc_pulse import (
     FIELD_DAC,
     FIELD_DURATION,
-    TIME_UNIT_TO_NS,
     FrozenScanTable,
     PulseDocument,
     ScanNormalizationReport,
-    attach_scan_recipe,
+    ScanSlotSchema,
+    coerce_numeric_scan_table,
+    commit_scan_table,
+    evaluate_numeric_scan_program,
     freeze_scan_table,
     load_pulse_document,
+    parameter_value_in_unit,
+    scan_column_specs,
+    scan_slot_schema,
 )
 
 
 ScanCandidateSource = Literal["generated", "loaded"]
-
-
-@dataclass(frozen=True)
-class ScanSlotSchema:
-    """The exact ordered meaning of every column in one candidate table."""
-
-    columns: tuple[str, ...]
-    fields: tuple[tuple[str, str | None, str | None, str], ...]
-    time_step_ns: float
-    target_abi_fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -101,111 +95,6 @@ class ScanCandidateResult:
     normalization: ScanNormalizationReport
 
 
-def scan_slot_schema(document: PulseDocument) -> ScanSlotSchema:
-    """Describe column identity and order without including mutable nominal values."""
-
-    if not isinstance(document, PulseDocument):
-        raise TypeError("document must be PulseDocument")
-    parameters = tuple(document.scan_parameters)
-    return ScanSlotSchema(
-        tuple(parameter.parameter_id for parameter in parameters),
-        tuple(
-            (
-                parameter.field.kind,
-                parameter.field.period_id,
-                parameter.field.port,
-                parameter.unit,
-            )
-            for parameter in parameters
-        ),
-        float(document.time_step_ns),
-        document.target.abi_fingerprint,
-    )
-
-
-def scan_column_specs(document: PulseDocument) -> tuple[ScanColumnSpec, ...]:
-    """Derive the established kind-aware starter sweeps from current semantics."""
-
-    if not isinstance(document, PulseDocument):
-        raise TypeError("document must be PulseDocument")
-    specs: list[ScanColumnSpec] = []
-    period_positions = {
-        period.period_id: index for index, period in enumerate(document.periods)
-    }
-    used_names: set[str] = set()
-    for parameter in document.scan_parameters:
-        field = parameter.field
-        period_index = period_positions[field.period_id]
-        period = document.periods[period_index]
-        period_title = f"Period {period_index + 1}"
-        if period.name:
-            period_title += f" {period.name!r}"
-        if field.kind == FIELD_DAC:
-            port_title = document.target.by_key[field.port].label
-            display_label = f"{period_title} · {port_title}"
-            semantic_name = f"{port_title}_p{period_index + 1}"
-            authored_label = (
-                "" if parameter.label == port_title else parameter.label
-            )
-        elif field.kind == FIELD_DURATION:
-            display_label = f"{period_title} · duration"
-            semantic_name = f"duration_p{period_index + 1}"
-            authored_label = parameter.label
-        # ParameterId remains the compiler/table identity.  The code editor,
-        # table header and progress use one presentation name: an explicitly
-        # authored label when present, otherwise the physical field/period.
-        # This keeps an old opaque implementation id out of the UI without
-        # changing which column the compiler binds.
-        raw_name = authored_label or semantic_name
-        stem = re.sub(r"[^A-Za-z0-9_]+", "_", raw_name).strip("_").lower()
-        stem = stem or "scan_value"
-        if stem[0].isdigit():
-            stem = f"scan_{stem}"
-        template_name = stem
-        suffix = 2
-        while template_name in used_names:
-            template_name = f"{stem}_{suffix}"
-            suffix += 1
-        used_names.add(template_name)
-        if parameter.field.kind == FIELD_DAC:
-            port = document.target.by_key[parameter.field.port]
-            assert port.signed_range is not None
-            lo, hi = port.signed_range
-            specs.append(
-                ScanColumnSpec(
-                    template_name,
-                    float(lo),
-                    float(hi),
-                    is_dac=True,
-                    unit="value",
-                    label=display_label,
-                )
-            )
-            continue
-        if parameter.field.kind != FIELD_DURATION:
-            raise ValueError("only duration and DAC fields may be scan columns")
-        nominal_value, nominal_unit = document.field_value(parameter.field)
-        unit_scale_ns = TIME_UNIT_TO_NS[parameter.unit]
-        nominal = (
-            float(nominal_value)
-            * TIME_UNIT_TO_NS[nominal_unit]
-            / unit_scale_ns
-        )
-        tick = float(document.time_step_ns) / unit_scale_ns
-        specs.append(
-            ScanColumnSpec(
-                template_name,
-                tick,
-                max(nominal * 2.0, 100.0 * tick),
-                is_dac=False,
-                unit=parameter.unit,
-                label=display_label,
-                quantum=tick,
-            )
-        )
-    return tuple(specs)
-
-
 def default_scan_program(document: PulseDocument, kind: str = "column_stack") -> str:
     normalized = str(kind)
     if normalized not in ("column_stack", "grid"):
@@ -223,54 +112,11 @@ def execute_scan_program(document: PulseDocument, source: str) -> ScanCandidateR
         raise TypeError("document must be PulseDocument")
     if not document.scan_parameters:
         raise ValueError("bind at least one field to a scan parameter first")
-    rows = execute_numeric_table_program(
+    rows = evaluate_numeric_scan_program(
         source,
         width=len(document.scan_parameters),
     )
     return _freeze_candidate(document, rows, recipe_source=str(source))
-
-
-def execute_numeric_table_program(
-    source: str,
-    *,
-    width: int,
-) -> tuple[tuple[int | float, ...], ...]:
-    """Execute the one trusted-local ``scan_table`` program contract.
-
-    Both SCAN_SLOT and API_SLOT editors expose the same program surface.  The
-    physical owner differs only after the numeric matrix exists: SCAN_SLOT rows
-    are clock/range-normalized into a :class:`FrozenScanTable`, while API_SLOT
-    rows become an :class:`ApiSegmentTable`.  Keeping execution and strict shape
-    validation here prevents those two visible editors from acquiring subtly
-    different Python/NumPy semantics.
-    """
-
-    if isinstance(width, bool) or not isinstance(width, int) or width < 1:
-        raise ValueError("scan program width must be a positive integer")
-    text = str(source)
-    if not text.strip():
-        raise ValueError("scan program source must be non-empty")
-    import numpy as np
-
-    namespace = {
-        "__name__": "__zlc_scan_program__",
-        "np": np,
-        "numpy": np,
-        "math": math,
-        "n_slots": width,
-    }
-    # This is the formal trusted-local experiment-program surface.  It is not a
-    # sandbox and intentionally retains normal Python/import semantics.
-    exec(compile(text, "<Pulse scan program>", "exec"), namespace, namespace)  # noqa: S102
-    if "scan_table" not in namespace:
-        raise ValueError(
-            "assign an N_points x N_parameters array to 'scan_table'"
-        )
-    return _strict_numeric_matrix(
-        namespace["scan_table"],
-        width=width,
-        field="scan_table",
-    )
 
 
 def load_scan_array(document: PulseDocument, path: str | Path) -> ScanCandidateResult:
@@ -287,7 +133,7 @@ def load_scan_array(document: PulseDocument, path: str | Path) -> ScanCandidateR
         import numpy as np
 
         value = np.load(resolved, allow_pickle=False)
-        rows = _strict_numeric_matrix(value, width=width, field=resolved.name)
+        rows = coerce_numeric_scan_table(value, width=width, field=resolved.name)
     elif suffix == ".csv":
         with resolved.open("r", encoding="utf-8", newline="") as stream:
             parsed = [
@@ -431,20 +277,15 @@ def commit_scan_candidate(
         raise ValueError("scan candidate is stale because the parameter schema changed")
     if candidate.table.columns != current_schema.columns:
         raise ValueError("scan candidate columns are not in current ParameterId order")
-    committed = replace(document, scan_table=candidate.table, scan_recipe=None)
-    if normalized_source == "generated":
-        if candidate.recipe_source is None:
-            return committed
-        generated_columns = {
-            parameter_id: tuple(row[index] for row in candidate.table.rows)
-            for index, parameter_id in enumerate(candidate.table.columns)
-        }
-        return attach_scan_recipe(
-            committed,
-            source=candidate.recipe_source,
-            generated_columns=generated_columns,
-        )
-    return committed
+    return commit_scan_table(
+        document,
+        candidate.table,
+        recipe_source=(
+            candidate.recipe_source
+            if normalized_source == "generated"
+            else None
+        ),
+    )
 
 
 def candidate_snapshot(
@@ -516,23 +357,18 @@ def format_scan_slots(document: PulseDocument) -> str:
         for index, (parameter, display) in enumerate(
             zip(document.scan_parameters, display_specs, strict=True)
         ):
-            nominal, nominal_unit = document.field_value(parameter.field)
-            if parameter.field.kind == FIELD_DURATION:
-                nominal = (
-                    float(nominal)
-                    * TIME_UNIT_TO_NS[nominal_unit]
-                    / TIME_UNIT_TO_NS[parameter.unit]
-                )
+            nominal = parameter_value_in_unit(document, parameter)
             if parameter.field.kind == FIELD_DAC:
-                port = document.target.by_key[parameter.field.port]
-                assert port.signed_range is not None
                 allowed = (
-                    f"signed integer {port.signed_range[0]}..{port.signed_range[1]} "
+                    f"signed integer {_format_number(display.lo)}.."
+                    f"{_format_number(display.hi)} "
                     "(0 = 0 V)"
                 )
             else:
+                assert display.quantum is not None
                 allowed = (
-                    f"snapped to a whole {_format_number(document.time_step_ns)} ns "
+                    f"snapped to a whole {_format_number(display.quantum)} "
+                    f"{display.unit} "
                     "tick (≥ 1 tick)"
                 )
             field = parameter.field
@@ -595,36 +431,6 @@ def _freeze_candidate(
     )
 
 
-def _strict_numeric_matrix(
-    value: object,
-    *,
-    width: int,
-    field: str,
-) -> tuple[tuple[int | float, ...], ...]:
-    import numpy as np
-
-    try:
-        array = np.asarray(value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{field} must be one rectangular numeric matrix") from error
-    if array.ndim == 1 and width == 1:
-        array = array.reshape((-1, 1))
-    elif array.ndim != 2:
-        raise ValueError(f"{field} must be exactly two-dimensional")
-    if array.shape[0] < 1:
-        raise ValueError(f"{field} must contain at least one scan point")
-    if array.shape[1] != width:
-        raise ValueError(
-            f"{field} has {array.shape[1]} columns; current scan parameters require {width}"
-        )
-    if array.dtype.kind not in "iuf":
-        raise TypeError(f"{field} must contain only real numeric values")
-    numeric = array.astype(float, copy=False)
-    if not bool(np.isfinite(numeric).all()):
-        raise ValueError(f"{field} must contain only finite values")
-    return tuple(tuple(row) for row in numeric.tolist())
-
-
 def _strict_text_rows(
     rows: Sequence[Sequence[str]],
     *,
@@ -667,20 +473,16 @@ __all__ = [
     "ScanCandidateResult",
     "ScanCandidateSnapshot",
     "ScanCandidateSource",
-    "ScanSlotSchema",
     "ScanWorkspaceCandidate",
     "ScanWorkspaceSnapshot",
     "candidate_from_document",
     "candidate_snapshot",
     "commit_scan_candidate",
     "default_scan_program",
-    "execute_numeric_table_program",
     "execute_scan_program",
     "format_scan_slots",
     "format_scan_table",
     "load_scan_array",
     "load_scan_program_source",
     "save_scan_array",
-    "scan_column_specs",
-    "scan_slot_schema",
 ]

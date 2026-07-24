@@ -83,7 +83,7 @@ def test_every_row_stays_aligned_in_the_show_all_compact_view(editor, applicatio
     to the shared row height, so the skew must stay within rounding for every row.
     """
 
-    from zlc_neutral_atom.timing.ports import PORT_CLOCK
+    from zlc_pulse import PORT_CLOCK
 
     state = editor.read_state()
     state.visible_ports = [

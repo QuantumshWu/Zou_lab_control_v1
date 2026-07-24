@@ -1,56 +1,64 @@
-"""CATALOG seam contract: the console vocabulary is a faithful catalog projection.
-
-Every composed domain Definition maps to exactly ONE ConsoleNodeSpec (an unknown
-definition type refuses rather than dropping -- the omission the projection
-exists to catch), the projection layer stays headless (no Qt import), and the
-camera entry freezes a real typed request against a virtual installation.
-"""
+"""TaskConsole catalog is a headless, lossless projection of domain definitions."""
 
 from __future__ import annotations
 
 import ast
 import pathlib
-import subprocess
-import sys
+
+from zlc_neutral_atom.camera_measurement import CameraMeasurementRequest
+from zlc_neutral_atom.catalog import definition_key_to_tree
+from zlc_neutral_atom.installation import DeviceRef
+from zlc_workbench.task_console.catalog_bridge import ConsoleCatalogView
+
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 
-def test_every_definition_projects_to_exactly_one_spec_headless():
-    code = (
-        "import tempfile, pathlib\n"
-        "from Zou_lab_control.notebook import connect\n"
-        "from zlc_workbench.task_console.catalog_bridge import ConsoleCatalogView\n"
-        "from zlc_workbench.task_console.intent import compose_task_console_catalog\n"
-        "import sys\n"
-        "exp = connect('virtual', repository=pathlib.Path(tempfile.mkdtemp())/'ws')\n"
-        "try:\n"
-        "    view = ConsoleCatalogView(exp)\n"
-        "    catalog = compose_task_console_catalog()\n"
-        "    assert len(view.specs()) == len(catalog.definitions)\n"
-        "    keys = [spec.key for spec in view.specs()]\n"
-        "    assert len(set(keys)) == len(keys)\n"
-        "    assert {spec.kind for spec in view.specs()} <= {'camera', 'measurement', 'processor', 'task'}\n"
-        "    for spec in view.specs():\n"
-        "        assert view.spec_named(spec.title) is spec\n"
-        "        assert spec.form_spec.fields\n"
-        "        assert spec.declared_outputs\n"
-        "        assert spec.title == spec.key.stable_definition_id.replace('_','-')"
-        ".replace('-',' ').capitalize()\n"
-        "        assert spec.description\n"
-        "    camera = next(s for s in view.specs() if s.kind == 'camera')\n"
-        "    request = camera.build_request({'camera_role': view.camera_roles()[0]})\n"
-        "    assert type(request).__name__ == 'CameraMonitorRequest'\n"
-        "    assert not any(name == 'PyQt5' or name.startswith('PyQt5.') for name in sys.modules)\n"
-        "finally:\n"
-        "    exp.close()\n"
+def _camera_request_builder(*, camera_role="camera", repeat=0, frames_per_cycle=1):
+    return CameraMeasurementRequest(
+        DeviceRef("test-installation", "test-runtime", str(camera_role)),
+        repeat=int(repeat),
+        frames_per_cycle=int(frames_per_cycle),
     )
-    subprocess.run([sys.executable, "-c", code], cwd=REPO, check=True)
 
 
-def test_the_bridge_module_is_qt_free_by_construction():
-    tree = ast.parse((REPO / "zlc_workbench" / "task_console" / "catalog_bridge.py")
-                     .read_text(encoding="utf-8"))
+def _view() -> ConsoleCatalogView:
+    return ConsoleCatalogView(
+        installed_camera_roles=("camera", "mot_camera"),
+        sitemap_camera_roles=("camera",),
+        installed_rf_roles=(),
+        camera_request_builder=_camera_request_builder,
+    )
+
+
+def test_every_definition_projects_to_one_stable_key_and_current_form() -> None:
+    view = _view()
+    specs = view.specs()
+    assert specs
+    assert len({spec.key for spec in specs}) == len(specs)
+    assert {spec.kind for spec in specs} <= {
+        "camera", "measurement", "processor", "task"
+    }
+    for spec in specs:
+        assert view.spec_for_key(spec.key) is spec
+        assert view.spec_for_definition(definition_key_to_tree(spec.key)) is spec
+        assert spec.form.fields
+        assert spec.title and spec.description
+
+    camera = next(spec for spec in specs if spec.kind == "camera")
+    request = camera.build_request(
+        {"camera_role": "mot_camera", "frames_per_cycle": 3, "repeat": 0}
+    )
+    assert request.output_names == ("frame_0", "frame_1", "frame_2")
+    assert tuple(output.name for output in camera.outputs_for(request)) == request.output_names
+
+
+def test_the_bridge_module_is_qt_free_by_construction() -> None:
+    tree = ast.parse(
+        (REPO / "zlc_workbench" / "task_console" / "catalog_bridge.py").read_text(
+            encoding="utf-8"
+        )
+    )
     roots = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

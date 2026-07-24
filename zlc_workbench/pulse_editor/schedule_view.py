@@ -29,7 +29,6 @@ from zlc_frontend.qt_widgets import (
     FluentGroupBox,
     FluentLabel,
     FluentLineEdit,
-    FluentScanLineEdit,
     FluentScrollArea,
     FluentSwitch,
     format_compact_number,
@@ -68,6 +67,7 @@ from ._layout import (
     time_unit_width as _time_unit_width,
 )
 from .repeat_presentation import pulse_repeat_presentation
+from .scan_line_edit import FluentScanLineEdit
 
 
 DURATION_UNITS = ("ns", "us", "ms", "s")
@@ -139,28 +139,7 @@ def _repeat_summary_text(document: PulseDocument) -> str:
 def _restart_high_ports(document: PulseDocument) -> tuple[str, ...]:
     """Stable ids of digital outputs high when a partial inner loop restarts."""
 
-    repeat = document.repeat
-    if repeat is None:
-        return ()
-    period_ids = tuple(period.period_id for period in document.periods)
-    start = period_ids.index(repeat.start_period_id)
-    end = period_ids.index(repeat.end_period_id)
-    if start == 0 and end == len(period_ids) - 1:
-        return ()
-    digital_by_lane = {
-        port.lanes[0]: port
-        for port in document.target.ports
-        if port.kind == PORT_DIGITAL
-    }
-    return tuple(
-        digital_by_lane[lane].key
-        for lane, high in zip(
-            document.target.raw_lanes,
-            document.periods[0].states,
-            strict=True,
-        )
-        if high and lane in digital_by_lane
-    )
+    return document.repeat_restart_high_ports()
 
 
 def _schedule_facts(
@@ -179,22 +158,13 @@ def _schedule_facts(
         if high and period_id in period_ids
     }
     active.update(port for port, value in analog_active.items() if value)
-    base_ns = {
-        period.period_id: float(period.duration) * TIME_UNIT_TO_NS[period.unit]
-        for period in document.periods
-    }
-    total_ns = sum(base_ns.values())
+    total_ns = document.authored_duration_ns()
     repeat = None
     if document.repeat is not None:
         repeat = (
             document.repeat.start_period_id,
             document.repeat.end_period_id,
             document.repeat.count,
-        )
-        start = period_ids.index(repeat[0])
-        end = period_ids.index(repeat[1])
-        total_ns += (repeat[2] - 1) * sum(
-            base_ns[period_id] for period_id in period_ids[start : end + 1]
         )
     point_count = 0 if document.scan_table is None else len(document.scan_table.rows)
     parts = [
@@ -318,15 +288,7 @@ def _digital_values(document: PulseDocument) -> dict[tuple[str, str], bool]:
     exclusively from logical ``PulsePortSpec.key`` values.
     """
 
-    positions = {lane: index for index, lane in enumerate(document.target.raw_lanes)}
-    result: dict[tuple[str, str], bool] = {}
-    for port in document.target.ports:
-        if port.kind != PORT_DIGITAL:
-            continue
-        position = positions[port.lanes[0]]
-        for period in document.periods:
-            result[(period.period_id, port.key)] = bool(period.states[position])
-    return result
+    return document.digital_output_cells()
 
 
 def _analog_values(

@@ -60,11 +60,12 @@ def _archive_path(path: Path) -> Path:
 
 
 def _load_archive(path: Path):
-    """Lazy worker entry so importing the window does no archive work."""
+    """Decode and project one archive entirely on the shared worker lane."""
 
-    from zlc_frontend.figure_archive import load_figure_archive
+    from zlc_workbench.data_figure.archive_repository import load_figure_archive
 
-    return load_figure_archive(path)
+    archive = load_figure_archive(path)
+    return archive, project_figure_info(archive)
 
 
 class FigureViewer(QtWidgets.QWidget):
@@ -226,8 +227,11 @@ class FigureViewer(QtWidgets.QWidget):
             self._active_load = None
             if not self._closing and revision == self._load_revision:
                 try:
-                    archive = future.result()
-                    self._accept_archive(revision, archive)
+                    loaded = future.result()
+                    if not isinstance(loaded, tuple) or len(loaded) != 2:
+                        raise TypeError("Figure archive worker returned invalid values")
+                    archive, info = loaded
+                    self._accept_archive(revision, archive, info)
                 except CancelledError:
                     self.info_pane.status.show_message(
                         f"Load cancelled: {display_path(str(path))}",
@@ -247,7 +251,7 @@ class FigureViewer(QtWidgets.QWidget):
             self._start_pending_load()
         self._finish_close_if_ready()
 
-    def _accept_archive(self, revision: int, archive) -> None:
+    def _accept_archive(self, revision: int, archive, info: tuple) -> None:
         """Build a hidden candidate; its admitted first front commits the generation."""
 
         from zlc_workbench.data_figure.app import create_data_figure_pane
@@ -258,19 +262,21 @@ class FigureViewer(QtWidgets.QWidget):
         )
         from zlc_frontend.figure import ViewIntent
 
-        metadata = archive.metadata
+        value = archive.archive
+        metadata = value.metadata
         if not isinstance(metadata, Mapping):
             raise TypeError("FigureArchive metadata must be a mapping")
-        info = project_figure_info(archive)
-        single_intent, _single_reason = _classify_single_typed(archive.figure)
+        if not isinstance(info, tuple) or len(info) != 5:
+            raise TypeError("Figure info worker returned invalid values")
+        single_intent, _single_reason = _classify_single_typed(value.figure)
         grid_intent, grid_panel_count, _grid_reason = _classify_typed_grid(
-            archive.figure
+            value.figure
         )
         size_name = metadata.get("size_name")
         if size_name is not None:
             if not isinstance(size_name, str):
                 raise TypeError("FigureArchive size_name must be text or null")
-            from zlc_data.panel_size import panel_size_cells
+            from zlc_frontend.panel_size import panel_size_cells
 
             panel_size_cells(size_name)
         raw_pixel_ratio = metadata.get("pixel_ratio", 1.0)
@@ -299,8 +305,8 @@ class FigureViewer(QtWidgets.QWidget):
         is_grid = grid_intent is not None and grid_panel_count is not None
         if is_grid and size_name is None:
             authored_display = (
-                archive.display is not None
-                and archive.display != _default_typed_state(grid_intent)
+                value.display is not None
+                and value.display != _default_typed_state(grid_intent)
             )
             if (
                 authored_display
@@ -318,21 +324,21 @@ class FigureViewer(QtWidgets.QWidget):
             {
                 "local_fit": True,
                 "local_fit_archive_path": archive.path,
-                "local_fit_archive_metadata": archive.metadata,
+                "local_fit_archive_metadata": value.metadata,
             }
             if local_fit
             else {}
         )
         display_options = (
-            {"initial_grid_display": archive.display}
+            {"initial_grid_display": value.display}
             if is_grid
-            else {"initial_display": archive.display}
+            else {"initial_display": value.display}
         )
         candidate = create_data_figure_pane(
-            archive.figure,
+            value.figure,
             initial_fit_result_identity=(
-                archive.payload_digest
-                if archive.figure.has_fit_overlays
+                value.payload_digest
+                if value.figure.has_fit_overlays
                 else None
             ),
             embedded=True,
@@ -426,7 +432,7 @@ class FigureViewer(QtWidgets.QWidget):
 
         if self._closing or self.figure_pane is not pane:
             return
-        from zlc_frontend.figure_archive import LoadedFigureArchive
+        from zlc_workbench.data_figure.archive_repository import LoadedFigureArchive
 
         if not isinstance(handle, LoadedFigureArchive):
             # FigureViewer only injects local archive persistence.  A durable

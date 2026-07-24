@@ -11,7 +11,7 @@ import pathlib
 
 import pytest
 
-from zlc_data.console_records import (
+from zlc_workbench.task_console.console_records import (
     DEFAULT_UPDATE_MS,
     PANEL_KINDS,
     UPDATE_INTERVALS,
@@ -19,8 +19,9 @@ from zlc_data.console_records import (
 )
 
 
-KINDS = ("2d", "1d", "monitor", "hist")
+KINDS = ("2d", "sites", "1d", "monitor", "hist", "grid")
 DEFAULT = {
+    "panel_id": "panel-test",
     "title": "",
     "row": 0,
     "col": 0,
@@ -32,14 +33,16 @@ DEFAULT = {
 
 def test_a_fresh_panel_is_unbound_for_every_kind() -> None:
     for kind in KINDS:
-        assert PanelConfig(kind=kind).to_dict() == {"kind": kind, **DEFAULT}
+        assert PanelConfig(panel_id="panel-test", kind=kind).to_dict() == {
+            "kind": kind,
+            **DEFAULT,
+        }
 
 
 @pytest.mark.parametrize(
     "kwargs, expected",
     [
         ({"kind": "1d", "signal": "cam/frame"}, {"signal": "cam/frame"}),
-        ({"kind": "1d", "row": -5, "col": -3}, {"row": 0, "col": 0}),
         (
             {"kind": "1d", "title": "T", "row": 7, "col": 9, "size": "1x2"},
             {"title": "T", "row": 7, "col": 9, "size": "1x2"},
@@ -52,13 +55,12 @@ def test_construction_keeps_the_declared_single_binding(kwargs, expected) -> Non
         assert record[key] == value
 
 
-@pytest.mark.parametrize(
-    "stored, effective",
-    [(200, 200), (999, DEFAULT_UPDATE_MS), (0, DEFAULT_UPDATE_MS)],
-)
-def test_an_out_of_set_refresh_interval_falls_back(stored, effective) -> None:
-    assert PanelConfig(kind="1d", params={"update_ms": stored}).update_ms == effective
-    assert effective in UPDATE_INTERVALS
+def test_refresh_interval_is_exact_and_invalid_values_fail_closed() -> None:
+    assert PanelConfig(kind="1d").update_ms == DEFAULT_UPDATE_MS
+    assert PanelConfig(kind="1d", params={"update_ms": 200}).update_ms == 200
+    for invalid in (999, 0, True, "200"):
+        with pytest.raises(ValueError):
+            PanelConfig(kind="1d", params={"update_ms": invalid}).update_ms
 
 
 def test_the_record_round_trips_through_its_codec() -> None:
@@ -86,23 +88,20 @@ def test_invalid_or_obsolete_records_fail_closed(mutate, error) -> None:
         PanelConfig.from_dict(payload)
 
 
-def test_construction_clamps_a_negative_position_but_loading_refuses_one() -> None:
-    assert PanelConfig(kind="1d", row=-5).row == 0
-    payload = PanelConfig(kind="1d").to_dict()
-    payload["row"] = -1
+def test_negative_positions_are_never_silently_rewritten() -> None:
     with pytest.raises(ValueError):
-        PanelConfig.from_dict(payload)
+        PanelConfig(kind="1d", row=-5)
 
 
 def test_only_end_to_end_live_renderers_are_addable() -> None:
-    assert list(PANEL_KINDS) == ["2d", "1d", "monitor", "hist"]
-    for kind in ("sites", "pulse", "grid"):
+    assert list(PANEL_KINDS) == list(KINDS)
+    for kind in ("pulse",):
         with pytest.raises(ValueError):
             PanelConfig(kind=kind)
 
 
 def test_the_record_module_reaches_for_no_toolkit_and_no_renderer() -> None:
-    import zlc_data.console_records as records
+    import zlc_workbench.task_console.console_records as records
 
     tree = ast.parse(pathlib.Path(records.__file__).read_text(encoding="utf-8"))
     modules: set[str] = set()
@@ -111,5 +110,7 @@ def test_the_record_module_reaches_for_no_toolkit_and_no_renderer() -> None:
             modules.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             modules.add(node.module)
-    roots = {name.split(".")[0] for name in modules} - {"__future__", "typing"}
-    assert roots <= {"zlc_data", "zlc_storage"}, roots
+    assert not any(
+        name.split(".")[0] in {"matplotlib", "PyQt5", "PySide2", "PySide6"}
+        for name in modules
+    )

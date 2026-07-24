@@ -6,19 +6,22 @@ from fractions import Fraction
 
 import pytest
 
-from zlc_data.scan_template import ScanColumnSpec, scan_table_template
+from zlc_pulse.scan_template import scan_table_template
 from zlc_neutral_atom.pulse_programs import DEFAULT_PROBE_PULSE_PATH
 from zlc_neutral_atom.scan import ApiSegmentTable, ApiSlotSegmentedProgram
-from zlc_pulse import load_pulse_document
-from zlc_workbench._domain_wiring import _api_column_specs
-from zlc_workbench.pulse_editor.scan_workspace import execute_numeric_table_program
+from zlc_pulse import (
+    ScanColumnSpec,
+    api_column_specs,
+    evaluate_numeric_scan_program,
+    load_pulse_document,
+)
 
 
 def _default_api_program_parts():
     document = load_pulse_document(DEFAULT_PROBE_PULSE_PATH)
-    specs = _api_column_specs(document)
+    specs = api_column_specs(document)
     source = scan_table_template("column_stack", specs)
-    rows = execute_numeric_table_program(source, width=len(specs))
+    rows = evaluate_numeric_scan_program(source, width=len(specs))
     columns = tuple(
         parameter.parameter_id for parameter in document.api_parameters
     )
@@ -66,5 +69,5 @@ def test_api_scan_rejects_an_off_grid_row_when_the_program_is_built():
 
 
 def test_duration_column_cannot_exist_without_domain_owned_quantum():
-    with pytest.raises(ValueError, match="native-unit quantum"):
+    with pytest.raises(TypeError, match="native-unit quantum"):
         ScanColumnSpec("duration", 20, 200, unit="ns")

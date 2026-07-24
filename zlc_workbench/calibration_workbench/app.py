@@ -9,12 +9,11 @@ if TYPE_CHECKING:
     from zlc_neutral_atom.readout.calibration_reference import (
         CalibrationArtifactRef,
     )
-    from zlc_workbench.calibration import CalibrationEditorSeed
+    from zlc_neutral_atom.readout.calibration_application import (
+        CalibrationArtifactRequest,
+    )
 
     from .window import CalibrationWorkbenchWindow
-
-
-_DEFAULT_CALIBRATION_GUI_TIMEOUT_SECONDS = 300.0
 
 
 def open_calibration_report_workbench(
@@ -54,29 +53,22 @@ def open_calibration_workbench(
     computation_loader,
     run_starter,
     *,
-    seed: CalibrationEditorSeed | None = None,
+    request: CalibrationArtifactRequest | None = None,
     reference: CalibrationArtifactRef | None = None,
-    timeout_seconds: float = _DEFAULT_CALIBRATION_GUI_TIMEOUT_SECONDS,
 ) -> CalibrationWorkbenchWindow:
-    """Open formal creation/editing from one request seed or exact artifact ref."""
+    """Open formal creation/editing from one request or exact artifact ref."""
 
     from zlc_workbench.window_runtime import open_workbench_window
-    from zlc_storage import positive_real
 
     from .window import CalibrationWorkbenchWindow
 
-    if (seed is None) == (reference is None):
-        raise ValueError("provide exactly one calibration seed or reference")
-    if seed is not None:
-        timeout = seed.timeout_seconds
-    else:
-        timeout = positive_real(timeout_seconds, "timeout_seconds")
+    if (request is None) == (reference is None):
+        raise ValueError("provide exactly one calibration request or reference")
     return open_workbench_window(
         lambda: CalibrationWorkbenchWindow(
             computation_loader,
             run_starter,
-            seed=seed,
+            request=request,
             reference=reference,
-            timeout_seconds=timeout,
         )
     )

@@ -75,7 +75,7 @@ def _curve_figure():
         repeat,
         (scan,),
         PointLayout.rect_c((4,)),
-        ValueSchema((), ValidityContract.value(), np.dtype("<f8")),
+        ValueSchema.scalar(np.dtype("<f8")),
     )
     block = DataBlock(
         BlockId("curve-block"),
@@ -209,7 +209,7 @@ def _sparse_curve_fit_figure():
         repeat,
         (grid_x, grid_y, scan),
         point_layout,
-        ValueSchema((), ValidityContract.value(), values.dtype),
+        ValueSchema.scalar(values.dtype),
     )
     block = DataBlock(
         BlockId("sparse-curve-block"),

@@ -124,35 +124,34 @@ def render_evaluated_figure(
 ):
     """Construct a caller-owned Figure with canonical artist styles frozen in.
 
-    Later caller-driven draw/save operations are outside the product compose lane.  Product PNG
-    and file export must use :func:`save_evaluated_figure`, which keeps construction *and* Agg
-    draw under the serialized style context.
+    Later caller-driven draw/save operations are outside the product compose lane.  Product
+    encoding must use :func:`encode_evaluated_figure`, which keeps construction and Agg draw
+    under the serialized style context.
     """
 
     dpi = _render_dpi(dpi)
     with render_style_context():
         return _render_evaluated_figure(document, evaluated, fit_results, dpi=dpi)
 
-def save_evaluated_figure(
+def encode_evaluated_figure(
     document: FigureDocument,
     evaluated: EvaluatedFigureData,
     fit_results: dict[str, FitResultBatch],
-    destination,
     *,
     image_format: str,
     dpi: float,
-) -> None:
-    """Construct, draw, and release one product figure on the Matplotlib compose lane."""
+) -> bytes:
+    """Encode one product figure into immutable bytes on the compose lane."""
 
-    _save_evaluated_figure(
+    payload, _regions = _encode_evaluated_figure(
         document,
         evaluated,
         fit_results,
-        destination,
         image_format=image_format,
         dpi=dpi,
         include_panel_regions=False,
     )
+    return payload
 
 def encode_evaluated_figure_with_panel_regions(
     document: FigureDocument,
@@ -163,17 +162,14 @@ def encode_evaluated_figure_with_panel_regions(
 ) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
     """Encode a product PNG and the final Agg panel rectangles from one draw."""
 
-    output = BytesIO()
-    regions = _save_evaluated_figure(
+    return _encode_evaluated_figure(
         document,
         evaluated,
         fit_results,
-        output,
         image_format="png",
         dpi=dpi,
         include_panel_regions=True,
     )
-    return output.getvalue(), regions
 
 def encode_evaluated_panel_with_regions(
     document: FigureDocument,
@@ -192,12 +188,10 @@ def encode_evaluated_panel_with_regions(
 
     width = positive_integer(width, "width")
     height = positive_integer(height, "height")
-    output = BytesIO()
-    regions = _save_evaluated_figure(
+    return _encode_evaluated_figure(
         document,
         evaluated,
         fit_results,
-        output,
         image_format="png",
         dpi=dpi,
         include_panel_regions=True,
@@ -206,13 +200,11 @@ def encode_evaluated_panel_with_regions(
         panel_title=str(title),
         panel_value_label=str(value_label),
     )
-    return output.getvalue(), regions
 
-def _save_evaluated_figure(
+def _encode_evaluated_figure(
     document: FigureDocument,
     evaluated: EvaluatedFigureData,
     fit_results: dict[str, FitResultBatch],
-    destination,
     *,
     image_format: str,
     dpi: float,
@@ -221,9 +213,10 @@ def _save_evaluated_figure(
     panel_display_state: object | None = None,
     panel_title: str = "",
     panel_value_label: str = "Signal",
-) -> tuple[FigurePanelRegion, ...]:
+) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
     dpi = _render_dpi(dpi)
     regions: tuple[FigurePanelRegion, ...] = ()
+    output = BytesIO()
     with render_style_context():
         figure = None
         try:
@@ -238,7 +231,7 @@ def _save_evaluated_figure(
                 panel_value_label=panel_value_label,
             )
             if panel_geometry is None:
-                figure.savefig(destination, format=image_format, dpi=dpi)
+                figure.savefig(output, format=image_format, dpi=dpi)
             else:
                 from PIL import Image
 
@@ -251,7 +244,7 @@ def _save_evaluated_figure(
                     "RGBA",
                     (raster.width, raster.height),
                     raster.pixels,
-                ).save(destination, format=image_format.upper())
+                ).save(output, format=image_format.upper())
             if include_panel_regions:
                 regions = _figure_panel_regions(figure, evaluated, fit_results)
         finally:
@@ -261,7 +254,7 @@ def _save_evaluated_figure(
             # The caller's last strong local must be gone before collecting the
             # remaining Matplotlib artist-parent cycles.
             gc.collect()
-    return regions
+    return output.getvalue(), regions
 
 def _render_evaluated_figure(
     document: FigureDocument,
@@ -709,8 +702,8 @@ def _render_evaluated_figure(
         raise
 
 __all__ = [
+    "encode_evaluated_figure",
     "render_evaluated_figure",
-    "save_evaluated_figure",
     "encode_evaluated_figure_with_panel_regions",
     "encode_evaluated_panel_with_regions",
 ]

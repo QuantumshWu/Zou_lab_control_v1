@@ -20,6 +20,10 @@ from zlc_neutral_atom.installation import (
     DeviceInfo,
     DeviceRef,
 )
+from zlc_neutral_atom.installation_plan import (
+    InstallationDevicePlan,
+    installation_device_plan,
+)
 from zlc_neutral_atom.installation_config import (
     InstallationConfigDocument,
     RemotePulseInstallationConfig,
@@ -779,29 +783,35 @@ def _catalog(
     runtime_instance_id: str,
     assets: InstallationAssetMap,
     devices: Mapping[str, object],
+    plan: tuple[InstallationDevicePlan, ...],
 ) -> DeviceCatalogView:
-    domains = {
-        "camera": "camera",
-        "mot_camera": "camera",
-        "sequencer": "sequencer",
-        "rf": "rf",
-        "trap": "trap",
-    }
+    planned = {item.role: item for item in plan}
+    by_role = {asset.role: asset for asset in assets.assets}
+    if set(by_role) != set(planned):
+        raise RuntimeError(
+            "composed installation assets differ from its public device plan"
+        )
+    for role, item in planned.items():
+        if role not in devices:
+            raise RuntimeError(f"installation did not compose planned role {role!r}")
+        actual_kind = by_role[role].adapter_kind
+        if actual_kind != item.adapter_kind:
+            raise RuntimeError(
+                f"installation role {role!r} built adapter {actual_kind!r}, "
+                f"expected {item.adapter_kind!r}"
+            )
     return DeviceCatalogView(
         installation_id,
         runtime_instance_id,
         0,
         tuple(
             DeviceInfo(
-                DeviceRef(installation_id, runtime_instance_id, asset.role),
-                domains[asset.role],
-                asset.adapter_kind,
-                str(asset.resource_key),
+                DeviceRef(installation_id, runtime_instance_id, item.role),
+                item.domain,
+                by_role[item.role].adapter_kind,
+                str(by_role[item.role].resource_key),
             )
-            for asset in assets.assets
-            if asset.role in devices
-            and asset.role in domains
-            and asset.role != "trap"
+            for item in plan
         ),
     )
 
@@ -926,6 +936,7 @@ def create_virtual_installation(
             runtime_instance_id,
             assets,
             devices,
+            installation_device_plan("virtual"),
         )
         resources = ResourceArbiter()
         controller = RunController(resources)
@@ -1124,6 +1135,7 @@ def create_remote_pulse_installation(
             runtime_instance_id,
             assets,
             devices,
+            installation_device_plan("remote_pulse"),
         )
         resources = ResourceArbiter()
         controller = RunController(resources)

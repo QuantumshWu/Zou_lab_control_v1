@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import threading
 from typing import Callable
+from uuid import uuid4
 
 from zlc_data import (
     AxisId,
@@ -14,9 +15,12 @@ from zlc_data import (
     PointLayout,
     READOUT_EVENT,
     REPEAT,
+    SPATIAL_X,
+    SPATIAL_Y,
 )
 from zlc_neutral_atom.acquisition import CameraAcquisitionMode
 from zlc_neutral_atom.artifacts import (
+    CaptureArtifactRef,
     CaptureRepository,
     compile_capture_artifact_pipeline,
 )
@@ -33,9 +37,19 @@ from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.camera_measurement import (
     CameraMeasurementDescriptor,
     CameraMeasurementRequest,
+    camera_measurement_final_outputs,
+)
+from zlc_neutral_atom.dataset_output import (
+    LiveDatasetOutput,
+    single_live_dataset_output,
 )
 from zlc_neutral_atom.runtime.capture import BoundCapturePort
-from zlc_neutral_atom.runtime.dataset import DatasetCellAddress, DatasetCellSchedule
+from zlc_neutral_atom.runtime.dataset import (
+    DatasetCellAddress,
+    DatasetCellSchedule,
+    DatasetPreviewSnapshot,
+    MonitorDatasetSnapshot,
+)
 from zlc_neutral_atom.runtime.pipeline import (
     CapturePreviewPort,
     CapturePreviewSpec,
@@ -112,10 +126,35 @@ class PlanDescriptor:
     execution_form: PulseExecutionForm
     trigger_channel: str
     expected_frames: int
-    output_shape: tuple[int, ...]
-    output_schema_fingerprint: str
+    output_schema: DatasetSchema
     compiled_pulse_digest: str
     resource_claims: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CapturePreviewImageContext:
+    """Capture-owned physical image axes for one exact preview Dataset."""
+
+    schema: DatasetSchema
+    y_axis: AxisSpec
+    x_axis: AxisSpec
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.schema, DatasetSchema):
+            raise TypeError("schema must be DatasetSchema")
+        if not isinstance(self.y_axis, AxisSpec) or self.y_axis.role != SPATIAL_Y:
+            raise ValueError("y_axis must be the declared SPATIAL_Y axis")
+        if not isinstance(self.x_axis, AxisSpec) or self.x_axis.role != SPATIAL_X:
+            raise ValueError("x_axis must be the declared SPATIAL_X axis")
+        data_axes = self.schema.cell_schema.data_axes
+        if (
+            len(data_axes) != 2
+            or {axis.axis_id for axis in data_axes}
+            != {self.y_axis.axis_id, self.x_axis.axis_id}
+        ):
+            raise ValueError(
+                "preview image axes must exactly cover the Dataset data axes"
+            )
 
 
 class _PreparedExactCapture:
@@ -127,6 +166,7 @@ class _PreparedExactCapture:
         "_lock",
         "_one_shot_name",
         "_pipeline",
+        "_preview_block_id",
         "_preview_edge",
         "_preview_schema",
         "_repository",
@@ -157,6 +197,9 @@ class _PreparedExactCapture:
         self._start_run = start_run
         self._descriptor = descriptor
         self._one_shot_name = canonical_text(one_shot_name, "one_shot_name")
+        self._preview_block_id = BlockId(
+            f"capture-preview-{uuid4().hex}"
+        )
         self._preview_edge = CapturePreviewSpec.dataset_edge_for_capture(
             self._pipeline
         )
@@ -189,6 +232,21 @@ class _PreparedExactCapture:
             self._preview_schema = self._preview_edge.schema
             return self._preview_schema
 
+    @property
+    def preview_image_context(self) -> CapturePreviewImageContext:
+        """Return the closed physical image contract; never infer it in a GUI."""
+
+        schema = self.preview_schema
+        axes = schema.cell_schema.data_axes
+        y_axes = tuple(axis for axis in axes if axis.role == SPATIAL_Y)
+        x_axes = tuple(axis for axis in axes if axis.role == SPATIAL_X)
+        if len(axes) != 2 or len(y_axes) != 1 or len(x_axes) != 1:
+            raise ValueError(
+                "finite capture preview requires declared SPATIAL_Y, SPATIAL_X "
+                "axes covering the complete physical data cell"
+            )
+        return CapturePreviewImageContext(schema, y_axes[0], x_axes[0])
+
     def start(self) -> RunHandle:
         self._claim_start()
         plan = compile_capture_artifact_pipeline(
@@ -200,20 +258,17 @@ class _PreparedExactCapture:
     def start_with_preview(
         self,
         *,
-        block_id: BlockId,
         factory: Callable[[CapturePreviewSpec], CapturePreviewPort],
         source_ordinals: tuple[int, ...] | None = None,
     ) -> RunHandle:
         """Start once, optionally publishing only named physical frame ordinals."""
 
-        if not isinstance(block_id, BlockId):
-            raise TypeError("block_id must be BlockId")
         if not callable(factory):
             raise TypeError("factory must be callable")
         self.preview_schema
         self._claim_start()
         preview_spec = CapturePreviewSpec(
-            block_id,
+            self._preview_block_id,
             self._preview_edge,
             source_ordinals,
         )
@@ -268,17 +323,55 @@ class PreparedFiniteCameraMeasurement(_PreparedExactCapture):
         repository: CaptureRepository,
         start_run: Callable[[RunPlan], RunHandle],
         descriptor: CameraMeasurementDescriptor,
+        request: CameraMeasurementRequest,
     ) -> None:
         if not isinstance(pipeline, MinimalPipelineSpec):
             raise TypeError("pipeline must be MinimalPipelineSpec")
         if not isinstance(descriptor, CameraMeasurementDescriptor):
             raise TypeError("descriptor must be CameraMeasurementDescriptor")
+        if not isinstance(request, CameraMeasurementRequest):
+            raise TypeError("request must be CameraMeasurementRequest")
+        self._request = request
         super().__init__(
             pipeline,
             repository,
             start_run,
             descriptor,
             one_shot_name="PreparedFiniteCameraMeasurement",
+        )
+
+    @property
+    def live_preview_output_name(self) -> str | None:
+        """Return the only honest capacity-one Camera preview name, if any."""
+
+        if self._request.frames_per_cycle != 1:
+            return None
+        return self._request.output_names[0]
+
+    def live_dataset_outputs(
+        self,
+        frozen: DatasetPreviewSnapshot | MonitorDatasetSnapshot,
+    ) -> dict[str, LiveDatasetOutput]:
+        """Publish the finite preview under the request-owned Camera name."""
+
+        output_name = self.live_preview_output_name
+        if output_name is None:
+            raise RuntimeError(
+                "a capacity-one preview cannot identify a multi-frame Camera cycle"
+            )
+        output = single_live_dataset_output(output_name, frozen)
+        return {output.name: output}
+
+    def final_dataset_outputs(self, reference: CaptureArtifactRef):
+        """Materialize the request-owned Camera outputs from its FINAL ref."""
+
+        if not isinstance(reference, CaptureArtifactRef):
+            raise TypeError("Camera FINAL result must be CaptureArtifactRef")
+        source = self._repository.materialize_final(reference)
+        return camera_measurement_final_outputs(
+            reference,
+            source,
+            self._request,
         )
 
 
@@ -312,8 +405,7 @@ def bind_finite_capture_spec(
         execution_form,
         binding.trigger_channel,
         binding.expected_frames,
-        binding.measurement.capture_contract.dataset_schema.physical_shape,
-        binding.measurement.capture_contract.dataset_schema.fingerprint,
+        binding.measurement.capture_contract.dataset_schema,
         binding.compiled_artifact.fingerprint,
         (
             str(binding.pulse_port.resource_claim.key),
@@ -436,6 +528,7 @@ def prepare_finite_camera_measurement(
         repository,
         start_run,
         descriptor,
+        request,
     )
 
 
@@ -473,6 +566,7 @@ def bind_finite_capture_request(
 
 __all__ = [
     "CAPTURE_READOUT_EVENT_AXIS_ID",
+    "CapturePreviewImageContext",
     "CaptureRequest",
     "PlanDescriptor",
     "PreparedFiniteCapture",

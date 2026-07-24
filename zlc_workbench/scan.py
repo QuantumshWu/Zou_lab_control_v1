@@ -618,7 +618,7 @@ class ScanPanelController:
         presenter = self._preview_presenter
         if progressive is not None and presenter is not None:
             try:
-                slot = ExactDatasetLiveSlot(progressive.preview_spec)
+                slot = ExactDatasetLiveSlot(progressive.output_owner.preview_spec)
                 self._preview = ProgressiveScanPreview(
                     slot,
                     progressive,
@@ -628,10 +628,11 @@ class ScanPanelController:
                     request_owner_wake=self._request_wake,
                 )
                 preview_port = slot
-                self._progressive_summary = progressive.projection_summary
-                self._progressive_interactive = progressive.interactive_curve
+                presentation = progressive.presentation
+                self._progressive_summary = presentation.projection_summary
+                self._progressive_interactive = presentation.interactive_curve
                 self._interaction_unavailable_reason = (
-                    progressive.interaction_unavailable_reason
+                    presentation.interaction_unavailable_reason
                 )
             except BaseException as error:
                 self._record_diagnostic(

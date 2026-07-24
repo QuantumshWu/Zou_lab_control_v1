@@ -10,7 +10,14 @@ from typing import Callable
 
 import numpy as np
 
-from zlc_storage.canonical import canonical_text, sha256_text
+from zlc_storage.canonical import (
+    canonical_text,
+    finite_real,
+    integer,
+    positive_integer,
+    positive_real,
+    sha256_text,
+)
 
 from ._arrays import immutable_array, immutable_bool_array
 from .axis import AxisId, AxisSpec, SCALAR
@@ -71,14 +78,11 @@ class FitParameterConstraint:
             value = getattr(self, field)
             if value is None:
                 continue
-            if isinstance(value, bool) or not isinstance(value, Real):
-                raise TypeError(f"constraint {field} must be a finite real number or None")
-            normalized = float(value)
-            if not math.isfinite(normalized):
-                raise ValueError(f"constraint {field} must be finite")
-            if normalized == 0.0:
-                normalized = 0.0
-            object.__setattr__(self, field, normalized)
+            object.__setattr__(
+                self,
+                field,
+                finite_real(value, f"constraint {field}"),
+            )
         if self.lower is not None and self.upper is not None and not self.lower < self.upper:
             raise ValueError("constraint lower must be below upper")
         for field in ("initial", "fixed"):
@@ -99,17 +103,16 @@ class FitNumericPolicy:
     covariance_rcond: float = 1e-12
 
     def __post_init__(self) -> None:
-        value = self.max_evaluations
-        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
-            raise ValueError("max_evaluations must be a positive integer")
-        object.__setattr__(self, "max_evaluations", int(value))
-        value = self.covariance_rcond
-        if isinstance(value, bool) or not isinstance(value, Real):
-            raise TypeError("covariance_rcond must be a positive finite real number")
-        normalized = float(value)
-        if not math.isfinite(normalized) or normalized <= 0:
-            raise ValueError("covariance_rcond must be a positive finite real number")
-        object.__setattr__(self, "covariance_rcond", normalized)
+        object.__setattr__(
+            self,
+            "max_evaluations",
+            positive_integer(self.max_evaluations, "max_evaluations"),
+        )
+        object.__setattr__(
+            self,
+            "covariance_rcond",
+            positive_real(self.covariance_rcond, "covariance_rcond"),
+        )
 
 
 @dataclass(frozen=True)
@@ -643,13 +646,11 @@ class FitResultBatch:
         amplitude or phase.
         """
 
-        if (
-            isinstance(batch_storage_index, bool)
-            or not isinstance(batch_storage_index, Integral)
-            or not 0 <= int(batch_storage_index) < self.batch_layout.storage_size
-        ):
+        normalized_index = integer(batch_storage_index, "batch_storage_index")
+        assert normalized_index is not None
+        if not 0 <= normalized_index < self.batch_layout.storage_size:
             raise IndexError("batch_storage_index is outside the result layout")
-        index = int(batch_storage_index)
+        index = normalized_index
         if self.statuses[index] is not FitBatchStatus.CONVERGED:
             raise ValueError("cannot evaluate a failed fit batch")
         from .fit_model import evaluate_fit_model

@@ -12,14 +12,16 @@ from zlc_pulse import (
     PORT_DIGITAL,
     PulseDocument,
     PulseExecutionForm,
-    PulsePeriod,
     PulseTarget,
     PulseTimelineDocument,
     bind_pulse_document_target,
     build_pulse_timeline,
     compile_pulse_artifact,
+    insert_period,
     load_pulse_document,
+    new_period,
     new_pulse_document,
+    nominal_scan_reference,
     pulse_document_path,
     save_pulse_document,
     set_digital_output,
@@ -94,14 +96,10 @@ class PulseEditorSession:
                 first_digital,
                 True,
             )
-        blank_states = tuple(0 for _ in target.raw_lanes)
-        document = replace(
+        document = insert_period(
             document,
-            periods=(
-                document.periods[0],
-                PulsePeriod("p2", 1000, "ns", "", blank_states),
-            ),
-        )
+            period=new_period(document, duration=1000, unit="ns"),
+        ).document
         return cls(document)
 
     @classmethod
@@ -176,14 +174,7 @@ class PulseEditorSession:
 
         with self._lock:
             document = self._document
-        if not document.scan_parameters:
-            return document
-        return replace(
-            document,
-            scan_parameters=(),
-            scan_table=None,
-            scan_recipe=None,
-        )
+        return nominal_scan_reference(document)
 
     def preview(self) -> tuple[int, PulseTimelineDocument]:
         revision, document = self.capture_document()

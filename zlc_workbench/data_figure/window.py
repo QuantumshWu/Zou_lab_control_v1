@@ -25,11 +25,13 @@ from zlc_frontend import (
     BoardFrame,
     CurvePanelPayload,
     DataFigure,
+    FitAuthoringDraft,
     FitAuthoringOption,
     HistogramPanelPayload,
     ImagePanelPayload,
     MeterDisplayState,
     MeterPanelPayload,
+    reconcile_fit_authoring_draft,
 )
 from zlc_frontend.curve_display import CurveDisplayState, curve_home_x_limits
 from zlc_frontend.display_range import RelimMode
@@ -140,7 +142,7 @@ class VisibleDataFigurePresentation:
                 raise TypeError(
                     "visible presentation size_name must be text or None"
                 )
-            from zlc_data.panel_size import panel_size_cells
+            from zlc_frontend.panel_size import panel_size_cells
 
             panel_size_cells(self.size_name)
         ratio = float(self.pixel_ratio)
@@ -253,7 +255,7 @@ class DataFigureWindow(FrozenRasterWindow):
         if size_name is not None:
             if not isinstance(size_name, str):
                 raise TypeError("size_name must be text or None")
-            from zlc_data.panel_size import panel_size_cells
+            from zlc_frontend.panel_size import panel_size_cells
 
             panel_size_cells(size_name)
         pixel_ratio = float(pixel_ratio)
@@ -316,6 +318,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._fit_initial_selection_consumed = False
         self._fit_auto_open_consumed = False
         self._fit_options: dict[str, FitAuthoringOption] = {}
+        self._fit_authoring_draft: FitAuthoringDraft | None = None
         self._fit_cancelled: threading.Event | None = None
         self._fit_draft: FitDraftResult | None = None
         self._fit_draft_summary: str | None = None
@@ -426,7 +429,6 @@ class DataFigureWindow(FrozenRasterWindow):
             pane.setObjectName("figureViewerFitAuthoring")
             pane.fitRequested.connect(self._start_fit)
             pane.fitRequestRejected.connect(self._reject_fit_request)
-            pane.cancelRequested.connect(self._cancel_fit)
             pane.clearRequested.connect(self._clear_fit)
             pane.editorChanged.connect(self._fit_editor_changed)
             save_button = FluentButton("Save Fit", pane, color=GREEN)
@@ -474,6 +476,7 @@ class DataFigureWindow(FrozenRasterWindow):
         if len(self._boards) != 1 or not isinstance(self._boards[0], FrozenRasterView):
             raise RuntimeError("typed grid overview did not admit one encoded board")
         board = self._boards[0]
+        tab_host = self._tab_host_for_board(board)
         if self._logical_panel_size is not None:
             board.setFixedSize(*self._logical_panel_size)
         board.normalizedDoubleClicked.connect(self._focus_grid_region)
@@ -482,7 +485,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._view_family = f"{overview.intent.value.lower()}-overview"
         self._display = None
         self._typed_contract = None
-        self._tabs.setCurrentWidget(board)
+        self._tabs.setCurrentWidget(tab_host)
         self._tabs.tabBar().setVisible(False)
         self._mode.setText(f"EXACT {overview.intent.value} GRID · DISPLAY ONLY")
         self._status.setText("READY")
@@ -593,9 +596,10 @@ class DataFigureWindow(FrozenRasterWindow):
         self._visible_figure = overview.figure
         self._view_family = f"{overview.intent.value.lower()}-overview"
         overview_board = self._boards[0]
-        if self._tabs.indexOf(overview_board) < 0:
-            self._tabs.insertTab(0, overview_board, "Overview")
-        self._tabs.setCurrentWidget(overview_board)
+        overview_host = self._tab_host_for_board(overview_board)
+        if self._tabs.indexOf(overview_host) < 0:
+            self._tabs.insertTab(0, overview_host, "Overview")
+        self._tabs.setCurrentWidget(overview_host)
         self._tabs.tabBar().setVisible(False)
         self._mode.setText(f"EXACT {overview.intent.value} GRID · DISPLAY ONLY")
         self._status.setText("READY")
@@ -1184,13 +1188,23 @@ class DataFigureWindow(FrozenRasterWindow):
         if draft is not None and authority is not None:
             authority.discard(draft)
 
+    def _capture_fit_authoring_draft(self) -> None:
+        """Retain the pane's reversible model/args text before option refresh."""
+
+        pane = self._fit_pane
+        if pane is None:
+            return
+        draft = pane.draft_state
+        if draft is not None:
+            self._fit_authoring_draft = draft
+
     def _advance_fit_editor(self, *, prepare: bool) -> None:
+        self._capture_fit_authoring_draft()
         self._fit_editor_revision += 1
         # A saved-result reload belongs to the exact editor revision that
         # requested the save; never occupy the lane with stale authority.
         self._deferred_fit_reload = None
         self._discard_fit_draft()
-        self._queue_fit_overlay(None, None)
         if self._fit_job_kind == "fit" and self._fit_cancelled is not None:
             self._fit_cancelled.set()
         if prepare:
@@ -1201,6 +1215,12 @@ class DataFigureWindow(FrozenRasterWindow):
             self._summary.setText("")
             self._fit_prepare_pending = True
             self._wake.request_owner_wake()
+        # Editing model/args or accepting a selector candidate only changes the
+        # local authoring draft.  Keep the last submitted overlay painted until
+        # Fit or Clear is explicitly pressed; merely typing must never enqueue
+        # a raster job.  The old execution is no longer saveable against the
+        # changed draft, so reconcile the buttons synchronously.
+        self._sync_fit_authoring_busy()
 
     def _fit_editor_changed(self, _pane_revision: int) -> None:
         if self._closing:
@@ -1270,15 +1290,6 @@ class DataFigureWindow(FrozenRasterWindow):
             self._fit_cancelled = None
             pane.set_busy(None, draft_ready=False)
 
-    def _cancel_fit(self) -> None:
-        if self._fit_job_kind != "fit" or self._fit_cancelled is None:
-            return
-        self._fit_cancelled.set()
-        pane = self._fit_pane
-        if pane is not None:
-            pane.clear_button.setEnabled(False)
-        self._status.setText("CANCELLING FIT")
-
     def _save_fit(self) -> None:
         pane = self._fit_pane
         authority = self._fit_authority
@@ -1334,17 +1345,22 @@ class DataFigureWindow(FrozenRasterWindow):
                 self._fit_save_button.setEnabled(True)
 
     def _clear_fit(self) -> None:
-        if self._closing or self._fit_future is not None:
+        if self._closing:
+            return
+        fitting = self._fit_future is not None and self._fit_job_kind == "fit"
+        if self._fit_future is not None and not fitting:
             return
         self._fit_editor_revision += 1
+        if fitting and self._fit_cancelled is not None:
+            self._fit_cancelled.set()
         self._discard_fit_draft()
         self._queue_fit_overlay(None, None)
         pane = self._fit_pane
         if pane is not None:
-            pane.set_busy(None, draft_ready=False)
+            pane.set_busy("fit" if fitting else None, draft_ready=False)
         if self._fit_save_button is not None:
             self._fit_save_button.setEnabled(False)
-        self._status.setText("FIT CLEARED")
+        self._status.setText("CLEARING FIT" if fitting else "FIT CLEARED")
         self._summary.setText("Source view preserved; selection remains a draft candidate")
         self._diagnostic.setText("")
 
@@ -1864,7 +1880,9 @@ class DataFigureWindow(FrozenRasterWindow):
         # immutable data front.  Their faults can disable UI, never roll it back.
         try:
             if self._grid_overview is not None and len(self._boards) == 1:
-                overview_index = self._tabs.indexOf(self._boards[0])
+                overview_index = self._tabs.indexOf(
+                    self._tab_host_for_board(self._boards[0])
+                )
                 if overview_index >= 0:
                     self._tabs.removeTab(overview_index)
             if not self._typed_pages_admitted:
@@ -2068,8 +2086,14 @@ class DataFigureWindow(FrozenRasterWindow):
                     self._fit_prepare_pending = True
                 else:
                     assert pane is not None
-                    preferred = pane.model_combo.currentData()
                     model_ids = {option.spec.model_id for option in options}
+                    previous = self._fit_authoring_draft
+                    preferred = (
+                        previous.selected_model_id
+                        if previous is not None
+                        and previous.selected_model_id in model_ids
+                        else pane.model_combo.currentData()
+                    )
                     if preferred not in model_ids:
                         preferred = (
                             None
@@ -2078,7 +2102,17 @@ class DataFigureWindow(FrozenRasterWindow):
                         )
                     if preferred not in model_ids:
                         preferred = None
-                    pane.install_options(options, selected_model=preferred)
+                    authoring = reconcile_fit_authoring_draft(
+                        options,
+                        previous,
+                        selected_model=preferred,
+                    )
+                    pane.install_options(
+                        options,
+                        selected_model=authoring.selected_model_id,
+                    )
+                    pane.set_draft_state(authoring)
+                    self._fit_authoring_draft = authoring
                     self._fit_options = {
                         option.spec.model_id: option for option in options
                     }

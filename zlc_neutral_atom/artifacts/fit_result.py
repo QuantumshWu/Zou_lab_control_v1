@@ -461,7 +461,8 @@ class FitResultRepository:
                     raise TypeError(
                         "capture_repository is required for a capture fit result"
                     )
-                source_artifact = capture_repository.load(source_ref)
+                source_admission = capture_repository.admit(source_ref)
+                source_artifact = source_admission.artifact
                 source_schema = source_artifact.frame_source.schema
                 source_dataset_ref = source_artifact.frame_source.ref(
                     source_artifact.provenance.generation

@@ -2,62 +2,32 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable
 import uuid
 
-from zlc_data import dataset_revision_ref_to_tree
-from zlc_data.console_records import console_signal_key
+from .console_records import console_signal_key
+from zlc_frontend.site_map_render import build_occupancy_cell_view
 from zlc_neutral_atom.catalog import DefinitionKey
-from zlc_neutral_atom.readout.calibration import (
-    ReadoutModelKind,
-    ResolvedCalibration,
+from zlc_neutral_atom.readout.calibration import ReadoutModelKind
+from zlc_neutral_atom.readout.occupancy import (
+    OCCUPANCY_LIVE_OUTPUT_NAMES,
+    ReactiveOccupancyMonitorEvaluation,
 )
-from zlc_neutral_atom.readout.calibration_reference import (
-    calibration_artifact_ref_to_tree,
+from zlc_neutral_atom.readout.reactive_occupancy_application import (
+    PreparedReactiveOccupancyMonitor,
 )
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
-from zlc_storage import canonical_digest, canonical_text
+from zlc_storage import canonical_text
 
 from .data_plane import ConsoleDataPlane, ConsoleSignalValue
-from .result_projection import project_reactive_occupancy
 
 __all__ = [
     "ConsoleProducerBinding",
     "OccupancyBindingIntent",
     "ReactiveOccupancyNode",
-    "occupancy_readout_method_labels",
-    "parse_occupancy_readout_method",
 ]
-
-
-_OCCUPANCY_READOUT_METHODS = (
-    ("box", ReadoutModelKind.BOX),
-    ("per-site PSF", ReadoutModelKind.PER_SITE_PSF),
-    ("uniform PSF", ReadoutModelKind.UNIFORM_PSF),
-)
-if {
-    kind for _label, kind in _OCCUPANCY_READOUT_METHODS if kind is not None
-} != set(ReadoutModelKind):
-    raise RuntimeError("occupancy readout method labels do not cover ReadoutModelKind")
-
-
-def occupancy_readout_method_labels() -> tuple[str, ...]:
-    """Main-compatible visible labels for the closed calibration model enum."""
-
-    return tuple(label for label, _kind in _OCCUPANCY_READOUT_METHODS)
-
-
-def parse_occupancy_readout_method(value: object) -> ReadoutModelKind | None:
-    """Map one visible form label to the calibration owner's model kind."""
-
-    label = "box" if value in (None, "") else str(value)
-    for candidate, kind in _OCCUPANCY_READOUT_METHODS:
-        if label == candidate:
-            return kind
-    raise ValueError(f"unknown occupancy Readout method {label!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,12 +100,13 @@ class ReactiveOccupancyNode:
     """Latest-revision Processor over one already-running Camera signal.
 
     The node owns no device and never starts the selected producer.  Its sole
-    worker admits the frozen calibration once, then classifies each new
-    immutable camera front.  Counts, occupied, and the validity-aware loading
-    rate are admitted to the console data plane together and retain the camera
-    revision/run/epoch lineage.  The occupied value also carries the typed
-    same-shot SiteMap presentation; no geometry or judged-frame side signal is
-    manufactured.
+    shared TaskConsole monitor lane admits the frozen neutral application once,
+    then passes each accepted immutable Camera revision to that application's
+    ``evaluate`` operation.  This node owns only binding/lifecycle checks and
+    atomic result publication.  Counts, occupied, and the validity-aware
+    loading rate retain the Camera revision/run/epoch lineage.  The occupied
+    value also carries the typed same-shot SiteMap presentation; no geometry or
+    judged-frame side signal is manufactured.
     """
 
     def __init__(
@@ -143,10 +114,12 @@ class ReactiveOccupancyNode:
         spec,
         values,
         *,
+        instance_id: str,
+        instance_label: str,
         intent: OccupancyBindingIntent,
         source_node: object,
         initial_source: ConsoleSignalValue,
-        resolve_calibration: Callable[[], ResolvedCalibration],
+        prepare_application: Callable[[], PreparedReactiveOccupancyMonitor],
         data_plane: ConsoleDataPlane,
         request_owner_wake: Callable[[], None],
     ) -> None:
@@ -178,31 +151,30 @@ class ReactiveOccupancyNode:
             raise ValueError(
                 "initial Camera value does not belong to the selected producer instance"
             )
-        if not callable(resolve_calibration):
-            raise TypeError("resolve_calibration must be callable")
+        if not callable(prepare_application):
+            raise TypeError("prepare_application must be callable")
         if not isinstance(data_plane, ConsoleDataPlane):
             raise TypeError("data_plane must be ConsoleDataPlane")
         if not callable(request_owner_wake):
             raise TypeError("request_owner_wake must be callable")
+        identity = str(instance_id).strip()
+        label = str(instance_label).strip()
+        if not identity or not label:
+            raise ValueError("console instance id and label must be non-empty")
         self._spec = spec
-        self.instance_label = str(spec.title)
+        self.instance_id = identity
+        self.instance_label = label
         self._values = dict(values)
-        self._output_declarations = tuple(spec.outputs_for(self._values))
         self._request = intent
+        self._output_declarations = tuple(spec.outputs_for(self._request))
         self._source_node = source_node
         self._source_lifecycle_generation = source_generation
         self._initial_source: ConsoleSignalValue | None = initial_source
         self._source_run_id = initial_source.run_id
         self._source_epoch_id = initial_source.epoch_id
-        self._resolve_calibration = resolve_calibration
+        self._prepare_application = prepare_application
         self._data_plane = data_plane
         self._request_owner_wake = request_owner_wake
-        self._executor: ThreadPoolExecutor | None = None
-        self._binding_future: Future | None = None
-        self._work_future: Future | None = None
-        self._work_source: ConsoleSignalValue | None = None
-        self._calibration: ResolvedCalibration | None = None
-        self._last_source_ref = None
         self._run_id = RunId(f"reactive-occupancy-{uuid.uuid4().hex}")
         self._state: RunState | None = None
         self._phase = "not started"
@@ -219,7 +191,7 @@ class ReactiveOccupancyNode:
 
     @property
     def display_label(self) -> str:
-        return self._spec.title
+        return self.instance_label
 
     @property
     def layer(self) -> str:
@@ -258,19 +230,23 @@ class ReactiveOccupancyNode:
         return False
 
     @property
-    def final_projection_resolved(self) -> bool:
+    def final_outputs_resolved(self) -> bool:
         return False
 
     @property
-    def projected_final_signals(self):
+    def materialized_final_outputs(self):
         return None
 
     @property
-    def final_projection_error(self) -> None:
+    def materialized_final_presentations(self):
+        return None
+
+    @property
+    def final_output_error(self) -> None:
         return None
 
     def signal_key(self, output_name: str) -> str:
-        return console_signal_key(self.instance_label, output_name)
+        return console_signal_key(self.instance_id, output_name)
 
     def published_signals(self) -> tuple[str, ...]:
         return tuple(
@@ -285,119 +261,32 @@ class ReactiveOccupancyNode:
             raise RuntimeError("reactive occupancy nodes are one-shot")
         self._state = RunState.RUNNING
         self._phase = "admitting calibration"
-        self._executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="console-reactive-occupancy",
-        )
-        self._binding_future = self._submit(self._resolve_calibration)
+        source, self._initial_source = self._initial_source, None
+        if source is None:
+            self._fail(RuntimeError("reactive occupancy lost its initial source"))
+            return
+        try:
+            self._data_plane.attach_monitor_processor(
+                self,
+                source_name=self._request.camera_frame_signal,
+                initial_source=source,
+            )
+        except Exception as error:
+            self._fail(error)
 
     def cancel(self, _reason: str = "Console user requested stop") -> None:
         if self._state is None or self._state.terminal:
             return
         self._cancel_requested = True
         self._phase = "stopping after current pure transform"
-        self._finish_cancel_if_idle()
+        if self._data_plane.cancel_monitor_processor(self):
+            self._accept_monitor_cancelled()
 
     def poll(self) -> RunSnapshot | None:
         if self._state is None:
             return None
         if self._state.terminal:
             return self._snapshot()
-
-        binding = self._binding_future
-        if binding is not None and binding.done():
-            self._binding_future = None
-            try:
-                calibration = binding.result()
-                if type(calibration) is not ResolvedCalibration:
-                    raise TypeError(
-                        "calibration resolver did not return ResolvedCalibration"
-                    )
-                calibration.reference
-                self._calibration = calibration
-                self._phase = "waiting for a new Camera revision"
-            except BaseException as error:
-                self._fail(error)
-
-        work = self._work_future
-        if self._state is RunState.RUNNING and work is not None and work.done():
-            source = self._work_source
-            self._work_future = None
-            self._work_source = None
-            try:
-                if source is None:
-                    raise RuntimeError("occupancy transform lost its source revision")
-                counts, occupied, rate, presentation = work.result()
-                calibration = self._calibration
-                if type(calibration) is not ResolvedCalibration:
-                    raise RuntimeError("occupancy calibration was not admitted")
-                reference = calibration.reference
-                model = calibration.artifact.select_model(self._request.model_kind)
-                join_digest = canonical_digest(
-                    {
-                        "owner": "zlc-workbench.reactive-occupancy-join",
-                        "source_revision": dataset_revision_ref_to_tree(
-                            source.snapshot.ref
-                        ),
-                        "source_event": source.join_digest,
-                        "calibration": calibration_artifact_ref_to_tree(reference),
-                        "model_kind": model.kind.value,
-                    }
-                )
-                declared = {
-                    output.name: self.signal_key(output.name)
-                    for output in self._output_declarations
-                }
-                if set(declared) != {"counts", "occupied", "rate"}:
-                    raise RuntimeError(
-                        "occupancy catalog must declare counts, occupied, and rate"
-                    )
-                self._data_plane.publish_processor(
-                    self,
-                    {
-                        declared["counts"]: ConsoleSignalValue(
-                            name=declared["counts"],
-                            source=self.name,
-                            snapshot=counts,
-                            coverage=source.coverage,
-                            run_id=source.run_id,
-                            epoch_id=source.epoch_id,
-                            join_digest=join_digest,
-                        ),
-                        declared["occupied"]: ConsoleSignalValue(
-                            name=declared["occupied"],
-                            source=self.name,
-                            snapshot=occupied,
-                            coverage=source.coverage,
-                            run_id=source.run_id,
-                            epoch_id=source.epoch_id,
-                            join_digest=join_digest,
-                            presentation=presentation,
-                        ),
-                        declared["rate"]: ConsoleSignalValue(
-                            name=declared["rate"],
-                            source=self.name,
-                            snapshot=rate,
-                            coverage=source.coverage,
-                            run_id=source.run_id,
-                            epoch_id=source.epoch_id,
-                            join_digest=join_digest,
-                        ),
-                    },
-                )
-                self._last_source_ref = source.snapshot.ref
-                self._phase = "waiting for a new Camera revision"
-            except BaseException as error:
-                self._fail(error)
-
-        if self._state is not RunState.RUNNING:
-            return self._snapshot()
-        if self._cancel_requested:
-            self._finish_cancel_if_idle()
-            return self._snapshot()
-        if self._calibration is None or self._work_future is not None:
-            return self._snapshot()
-
         if (
             getattr(self._source_node, "lifecycle_generation", None)
             != self._source_lifecycle_generation
@@ -414,80 +303,114 @@ class ReactiveOccupancyNode:
                 )
             )
             return self._snapshot()
-        source, self._initial_source = (
-            self._initial_source,
-            None,
-        )
-        if source is None:
-            source = self._data_plane.freeze().value(
-                self._request.camera_frame_signal
-            )
-        if source is None:
-            self._fail(
-                RuntimeError(
-                    "selected Camera source no longer publishes a frame signal"
-                )
-            )
-            return self._snapshot()
-        if (
-            source.run_id != self._source_run_id
-            or source.epoch_id != self._source_epoch_id
-        ):
-            self._fail(
-                RuntimeError(
-                    "selected Camera signal now belongs to another Run/epoch; "
-                    "restart Occupancy to bind the new producer generation"
-                )
-            )
-            return self._snapshot()
-        if source.snapshot.ref != self._last_source_ref:
-            calibration = self._calibration
-            self._work_source = source
-            self._work_future = self._submit(
-                lambda: project_reactive_occupancy(
-                    source.snapshot,
-                    calibration,
-                    coverage=source.coverage,
-                    model_kind=self._request.model_kind,
-                    run_id=source.run_id,
-                    epoch_id=source.epoch_id,
-                )
-            )
-            self._phase = (
-                "classifying Camera revision "
-                f"{source.snapshot.ref.revision.value}"
-            )
         return self._snapshot()
 
     def shutdown(self) -> None:
         self.cancel("TaskConsole is closing")
 
-    def _submit(self, work: Callable[[], object]) -> Future:
-        executor = self._executor
-        if executor is None:
-            raise RuntimeError("reactive occupancy worker is not running")
-        future = executor.submit(work)
-        future.add_done_callback(lambda _future: self._request_owner_wake())
-        return future
+    def _prepare_monitor_application(self) -> PreparedReactiveOccupancyMonitor:
+        return self._prepare_application()
 
-    def _finish_cancel_if_idle(self) -> None:
-        if self._binding_future is not None or self._work_future is not None:
+    def _validate_monitor_source(self, source: ConsoleSignalValue) -> None:
+        if not isinstance(source, ConsoleSignalValue):
+            raise TypeError("occupancy source must be ConsoleSignalValue")
+        if source.name != self._request.camera_frame_signal:
+            raise ValueError("occupancy received another Camera signal")
+        if not isinstance(source.coverage, MonitorCoverage):
+            raise ValueError("occupancy requires Camera monitor coverage")
+        if (
+            source.run_id != self._source_run_id
+            or source.epoch_id != self._source_epoch_id
+        ):
+            raise RuntimeError(
+                "selected Camera signal now belongs to another Run/epoch; "
+                "restart Occupancy to bind the new producer generation"
+            )
+        if (
+            getattr(self._source_node, "lifecycle_generation", None)
+            != self._source_lifecycle_generation
+        ):
+            raise RuntimeError("selected Camera producer generation changed")
+
+    def _monitor_application_ready(self, application: object) -> None:
+        if not isinstance(application, PreparedReactiveOccupancyMonitor):
+            raise TypeError(
+                "Occupancy prepare did not return its application command"
+            )
+        if self._state is RunState.RUNNING and not self._cancel_requested:
+            self._phase = "waiting for a new Camera revision"
+
+    def _monitor_work_started(self, source: ConsoleSignalValue) -> None:
+        self._validate_monitor_source(source)
+        if self._state is RunState.RUNNING and not self._cancel_requested:
+            self._phase = (
+                "classifying Camera revision "
+                f"{source.snapshot.ref.revision.value}"
+            )
+
+    def _accept_monitor_result(
+        self,
+        source: ConsoleSignalValue,
+        result: object,
+    ) -> None:
+        if self._state is not RunState.RUNNING or self._cancel_requested:
             return
-        self._state = RunState.CANCELLED
-        self._phase = "cancelled"
-        self._close_executor()
+        self._validate_monitor_source(source)
+        if not isinstance(result, ReactiveOccupancyMonitorEvaluation):
+            raise TypeError(
+                "occupancy worker returned an invalid neutral evaluation"
+            )
+        evaluation = result
+        cell = evaluation.cell
+        site_map = cell.site_map
+        calibration_identity = cell.calibration_ref.target_ref
+        presentation = build_occupancy_cell_view(
+            cell.background_value,
+            cell.background_ref,
+            cell.occupied_value,
+            cell.occupied_ref,
+            cell.selection,
+            site_axis=site_map.site_axis,
+            coordinate_frame=site_map.coordinate_frame,
+            centers_xy=site_map.coordinates_xy,
+            calibration_site_validity=site_map.validity.mask,
+            calibration_identity=calibration_identity,
+            run_id=source.run_id,
+            provenance_epoch_id=source.epoch_id,
+            summary=(
+                f"Camera run={source.run_id} | "
+                f"calibration={calibration_identity} | "
+                f"revision={cell.background_ref.revision.value} | "
+                f"logical point={cell.logical_point}"
+            ),
+        )
+        self._data_plane.publish_processor(
+            self,
+            evaluation.outputs,
+            run_id=source.run_id,
+            epoch_id=source.epoch_id,
+            presentations={OCCUPANCY_LIVE_OUTPUT_NAMES[1]: presentation},
+        )
+        self._phase = "waiting for a new Camera revision"
 
-    def _fail(self, error: BaseException) -> None:
+    def _accept_monitor_failure(self, error: Exception) -> None:
+        if self._state is None or self._state.terminal:
+            return
         self._error = f"{type(error).__name__}: {error}"
         self._state = RunState.FAILED
         self._phase = "failed"
-        if self._binding_future is None and self._work_future is None:
-            self._close_executor()
 
-    def _close_executor(self) -> None:
-        executor, self._executor = self._executor, None
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+    def _accept_monitor_cancelled(self) -> None:
+        if self._state is RunState.RUNNING:
+            self._state = RunState.CANCELLED
+            self._phase = "cancelled"
+
+    def _request_monitor_owner_wake(self) -> None:
+        self._request_owner_wake()
+
+    def _fail(self, error: Exception) -> None:
+        self._accept_monitor_failure(error)
+        self._data_plane.cancel_monitor_processor(self)
 
     def _snapshot(self) -> RunSnapshot:
         state = self._state

@@ -1,13 +1,13 @@
 """The grouped-signal picker's data layer: names -> tree groups -> a filled combo.
 
 `FluentTreeComboBox` migrated into this package but its data helpers did not -
-they stayed in the old monolith's `frontend/param_widgets.py`, so a new consumer
+they stayed in the old monolith's parameter registry, so a new consumer
 could get the widget and then had to reach back into the old tree to fill it.
 That is the reverse of this migration's package direction, and it is why no
 window under `Zou_lab_control/workbench/` used the picker at all.
 
 Pure Qt-combo utilities: only this package's own widgets plus plain data.  No
-domain types, no hub, no `ParamDecl` - which is exactly why the cluster could
+domain types and no hub - which is exactly why the cluster could
 move as a unit without dragging the old tree with it.
 """
 

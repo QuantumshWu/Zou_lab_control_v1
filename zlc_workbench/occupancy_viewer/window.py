@@ -44,6 +44,16 @@ def _label(parent, name, text, *, wrap=False):
     return result
 
 
+def _cell_label(navigation, repeat_index, logical_point) -> str:
+    indices = (repeat_index, *tuple(logical_point))
+    labels = []
+    for axis, index in zip(navigation.axes, indices, strict=True):
+        coordinate = axis.coordinate_at(index)
+        unit = "" if axis.unit is None else f" {axis.unit}"
+        labels.append(f"{axis.name}={coordinate}{unit} [index {index}]")
+    return " | ".join(labels)
+
+
 class OccupancyCellWindow(QtWidgets.QWidget):
     """Navigate exact cells and interact with one worker-rasterized SiteMap."""
 
@@ -206,7 +216,7 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         return self._navigation.selection_for_indices(indices[0], tuple(indices[1:]))
 
     def _set_controls(self, selection):
-        repeat, _storage, logical, _label_text = self._navigation.resolve_selection(selection)
+        repeat, _storage, logical = self._navigation.resolve_selection(selection)
         with signals_blocked(self._navigator):
             self._navigator.set_indices((repeat, *logical))
 
@@ -223,7 +233,8 @@ class OccupancyCellWindow(QtWidgets.QWidget):
             self._status.setText("NEEDS CELL SELECTION")
             self._summary.setText("Choose every non-singleton repeat / point index")
         elif selection != self._presented_selection:
-            _r, _p, _logical, label = self._navigation.resolve_selection(selection)
+            repeat, _storage, logical = self._navigation.resolve_selection(selection)
+            label = _cell_label(self._navigation, repeat, logical)
             self._status.setText("EXACT CELL READY TO LOAD")
             self._summary.setText(label)
         self._diagnostic.setText("")
@@ -237,7 +248,8 @@ class OccupancyCellWindow(QtWidgets.QWidget):
     def _queue_cell(self, selection):
         if self._closing:
             return
-        repeat, storage, logical, label = self._navigation.resolve_selection(selection)
+        repeat, storage, logical = self._navigation.resolve_selection(selection)
+        label = _cell_label(self._navigation, repeat, logical)
         selection = self._navigation.selection_for_indices(repeat, logical)
         self._request_revision += 1
         self._requested_selection = selection
@@ -289,7 +301,7 @@ class OccupancyCellWindow(QtWidgets.QWidget):
             self._refresh_candidate()
             return
         try:
-            repeat, _storage, logical, _label_text = navigation.resolve_selection(initial)
+            repeat, _storage, logical = navigation.resolve_selection(initial)
             self._queue_cell(navigation.selection_for_indices(repeat, logical))
         except BaseException as error:
             self._status.setText("INITIAL CELL SELECTION INVALID")
@@ -352,11 +364,8 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         view = self._loaded_view
         if view is None:
             return
-        valid = int(view.site_validity.sum())
-        occupied = int((view.occupied & view.site_validity).sum())
         text = (
-            f"{view.summary}\noccupied={occupied}/{valid} valid sites | "
-            f"invalid={view.site_axis.size - valid}"
+            f"{view.summary}\n{view.site_count_summary}"
         )
         if self._rectangle_candidate is not None:
             lo_x, lo_y, hi_x, hi_y = self._rectangle_candidate

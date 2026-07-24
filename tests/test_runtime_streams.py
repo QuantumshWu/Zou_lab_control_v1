@@ -53,7 +53,7 @@ from zlc_neutral_atom.runtime.streams import (
 
 PAYLOAD_FINGERPRINT = "1" * 64
 JOIN_FINGERPRINT = "2" * 64
-SCALAR_SCHEMA = ValueSchema((), ValidityContract.value(), np.dtype("<f8"))
+SCALAR_SCHEMA = ValueSchema.scalar(np.dtype("<f8"))
 TRACE_BINDING = TraceBinding("run-one", "camera-one")
 
 
@@ -621,7 +621,7 @@ def test_stream_rejects_materialized_dataset_payloads():
     )
     repeat = AxisSpec(AxisId("repeat"), "repeat", REPEAT, 1)
     point = AxisSpec(AxisId("point"), "point", SPATIAL_X, 1)
-    scalar = ValueSchema((), ValidityContract.value(), np.dtype("<f8"))
+    scalar = ValueSchema.scalar(np.dtype("<f8"))
     schema = DatasetSchema(repeat, (point,), PointLayout.rect_c((1,)), scalar)
     block = DataBlock(
         BlockId("block"),

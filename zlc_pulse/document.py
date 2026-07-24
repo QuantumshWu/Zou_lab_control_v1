@@ -692,6 +692,69 @@ class PulseDocument:
                 )
         return cells
 
+    def digital_output_cells(self) -> dict[tuple[str, str], bool]:
+        """Return each period's value for every logical digital output.
+
+        ``PulsePeriod.states`` is the compiler/storage representation indexed by
+        raw FPGA lane.  Logical port-to-lane ownership belongs to
+        :class:`PulseTarget`; a GUI must not repeat that mapping merely to draw
+        an editor cell.  This projection therefore sits beside the document's
+        DAC-cell projection and is the single user-layer answer consumed by
+        every authoring surface.
+        """
+
+        positions = {
+            lane: index for index, lane in enumerate(self.target.raw_lanes)
+        }
+        cells: dict[tuple[str, str], bool] = {}
+        for port in self.target.ports:
+            if port.kind != PORT_DIGITAL:
+                continue
+            position = positions[port.lanes[0]]
+            for period in self.periods:
+                cells[(period.period_id, port.key)] = bool(
+                    period.states[position]
+                )
+        return cells
+
+    def authored_duration_ns(self) -> float:
+        """Return one authored timeline's duration including its repeat region."""
+
+        period_ids = tuple(period.period_id for period in self.periods)
+        durations = {
+            period.period_id: float(period.duration) * TIME_UNIT_TO_NS[period.unit]
+            for period in self.periods
+        }
+        total = sum(durations.values())
+        if self.repeat is None:
+            return total
+        start = period_ids.index(self.repeat.start_period_id)
+        end = period_ids.index(self.repeat.end_period_id)
+        repeated_once = sum(
+            durations[period_id] for period_id in period_ids[start : end + 1]
+        )
+        return total + (self.repeat.count - 1) * repeated_once
+
+    def repeat_restart_high_ports(self) -> tuple[str, ...]:
+        """Logical outputs already high when a partial repeat region restarts."""
+
+        repeat = self.repeat
+        if repeat is None:
+            return ()
+        period_ids = tuple(period.period_id for period in self.periods)
+        start = period_ids.index(repeat.start_period_id)
+        end = period_ids.index(repeat.end_period_id)
+        if start == 0 and end == len(period_ids) - 1:
+            return ()
+        cells = self.digital_output_cells()
+        first_period_id = self.periods[0].period_id
+        return tuple(
+            port.key
+            for port in self.target.ports
+            if port.kind == PORT_DIGITAL
+            and cells[(first_period_id, port.key)]
+        )
+
     def _scan_definition_contract(self) -> tuple[object, ...]:
         table = self.scan_table
         if table is None:

@@ -1,6 +1,6 @@
 """RUN seam: one console node's Run lifecycle, off the GUI thread.
 
-Seam 2 of the composition root's rewiring contract (``app.py``).  A console node
+Run seam of the composition root (``app.py``).  A console node
 is a frozen typed request plus a Run: the CATALOG seam freezes the request
 (:mod:`.catalog_bridge`), this module owns what happens next -- prepare, start,
 cancel, and the snapshot the board polls each tick.
@@ -21,9 +21,9 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 import threading
-from typing import Callable
+from typing import Callable, Mapping
 
-from zlc_data.console_records import console_signal_key
+from .console_records import console_signal_key
 from zlc_workbench.run_owner import QtRunOwnerMailbox
 
 __all__ = ["ConsoleRunNode"]
@@ -51,14 +51,22 @@ class ConsoleRunNode:
         spec,
         values,
         *,
+        instance_id: str,
+        instance_label: str,
         prepare: Callable[[object], object],
         request_owner_wake: Callable[[], None],
         frozen_request: object = _BUILD_REQUEST,
+        final_presentation_owner: object | None = None,
     ) -> None:
         if not callable(prepare):
             raise TypeError("prepare must be callable")
+        identity = str(instance_id).strip()
+        label = str(instance_label).strip()
+        if not identity or not label:
+            raise ValueError("console instance id and label must be non-empty")
         self._spec = spec
-        self.instance_label = str(spec.title)
+        self.instance_id = identity
+        self.instance_label = label
         self._values = dict(values)
         self._prepare = prepare
         # One worker thread per node: a node's prepare/start/cancel jobs must not
@@ -74,10 +82,23 @@ class ConsoleRunNode:
             if frozen_request is _BUILD_REQUEST
             else frozen_request
         )
-        # Freeze the output vocabulary beside the request.  Camera output
-        # cardinality is request state (frames_per_cycle), not a late guess from
-        # whichever Dataset revision happens to reach the GUI first.
-        self._output_declarations = tuple(spec.outputs_for(self._values))
+        # Freeze the visible vocabulary from the same typed request.  Camera
+        # cardinality is application-owned request state, never re-derived from
+        # form values or a later Dataset revision.
+        self._output_declarations = tuple(spec.outputs_for(self._request))
+        if final_presentation_owner is not None and not callable(
+            getattr(
+                final_presentation_owner,
+                "materialize_final_presentations",
+                None,
+            )
+        ):
+            raise TypeError(
+                "final_presentation_owner must expose "
+                "materialize_final_presentations()"
+            )
+        self._final_presentation_owner = final_presentation_owner
+        self._prepared_command = None
         self._handle = None
         self._start_future: Future | None = None
         self._start_pending = False
@@ -88,10 +109,10 @@ class ConsoleRunNode:
         # deliberately not inferred from the terminal snapshot: only
         # RunHandle.result() carries the value committed by the Run.
         self._final_result = _UNRESOLVED_FINAL
-        self._final_projector = None
-        self._final_projection_submitted = False
-        self._projected_final_signals = None
-        self._final_projection_error: str | None = None
+        self._final_outputs_submitted = False
+        self._materialized_final_outputs = None
+        self._materialized_final_presentations = None
+        self._final_output_error: str | None = None
         self._error: str | None = None
         self._start_exception: BaseException | None = None
         self._stop_requested = False
@@ -109,9 +130,9 @@ class ConsoleRunNode:
 
     @property
     def display_label(self) -> str:
-        """The catalog title shown wherever the console names this producer."""
+        """The saved row label shown wherever the console names this producer."""
 
-        return self._spec.title
+        return self.instance_label
 
     @property
     def layer(self) -> str:
@@ -121,21 +142,22 @@ class ConsoleRunNode:
 
     @property
     def prefix(self) -> str:
-        """Qualified signals no longer use mutable Hub-era prefixes."""
+        """Signal qualification is owned by the persisted instance identity."""
 
         return ""
 
     def signal_key(self, output_name: str) -> str:
         """Exact panel-binding key for one definition-owned output."""
 
-        return console_signal_key(self.instance_label, output_name)
+        return console_signal_key(self.instance_id, output_name)
 
     def published_signals(self) -> tuple[str, ...]:
         """Return the exact producer-instance outputs published by this node.
 
-        The short names remain owned by the catalog.  Qualifying them with the
-        saved row title prevents two valid producers of ``frame`` or ``counts``
-        from overwriting one another in the board data plane.
+        The short names remain owned by the domain applications.  The catalog
+        supplies only their Workbench labels.  Qualifying them with the
+        saved immutable row id prevents two valid producers of ``frame`` or
+        ``counts`` from overwriting one another in the board data plane.
         """
 
         return tuple(
@@ -166,12 +188,37 @@ class ConsoleRunNode:
     def start_exception(self) -> BaseException | None:
         """Structured exception from the most recent start submission.
 
-        Normal presentation uses :attr:`last_error`.  The TaskConsole shell also
-        needs an exact ``RunStartRejected`` payload to retire a conflicting Logic
-        row without parsing text or weakening runtime admission.
+        Normal presentation uses :attr:`last_error`; typed resource admission
+        is normalized separately by :attr:`resource_conflict`.
         """
 
         return self._start_exception
+
+    @property
+    def resource_conflict(self):
+        """Return one typed admission conflict across direct/composite starts.
+
+        ``RunStartRejected`` belongs to the synchronous controller start API.
+        A composite handle instead carries the same ``ResourceBusy`` outcome
+        on its immutable snapshot.  Normalizing both here keeps the Qt shell
+        independent of exception timing and forbids RunId parsing from text.
+        """
+
+        from zlc_neutral_atom.runtime.resources import ResourceBusy
+        from zlc_neutral_atom.runtime.run import RunStartRejected
+
+        direct = self._start_exception
+        if isinstance(direct, RunStartRejected):
+            return direct.outcome
+        snapshot = self._snapshot
+        conflict = (
+            None
+            if snapshot is None
+            else getattr(snapshot, "admission_rejection", None)
+        )
+        if conflict is not None and not isinstance(conflict, ResourceBusy):
+            raise TypeError("RunSnapshot admission_rejection must be ResourceBusy")
+        return conflict
 
     @property
     def final_result(self):
@@ -199,31 +246,45 @@ class ConsoleRunNode:
         return self._final_result is not _UNRESOLVED_FINAL
 
     @property
-    def final_projection_resolved(self) -> bool:
-        """Whether the optional FINAL dataset projection has finished.
+    def final_outputs_resolved(self) -> bool:
+        """Whether the optional FINAL output materialization has finished.
 
-        A committed artifact remains a successful result even when its
-        presentation projection fails.  The separate projection error is shown
-        by the Workbench without rewriting Run terminal truth.
+        A committed artifact remains a successful result even when its named
+        output materialization or optional frontend presentation fails.  That
+        boundary error is shown by the Workbench without rewriting Run terminal
+        truth.
         """
 
         return (
             self._final_result is not _UNRESOLVED_FINAL
             and (
-                self._final_projector is None
-                or self._projected_final_signals is not None
+                self._prepared_command is None
+                or not callable(
+                    getattr(
+                        self._prepared_command,
+                        "final_dataset_outputs",
+                        None,
+                    )
+                )
+                or self._materialized_final_outputs is not None
             )
         )
 
     @property
-    def projected_final_signals(self):
-        if self._projected_final_signals is None:
+    def materialized_final_outputs(self):
+        if self._materialized_final_outputs is None:
             return None
-        return dict(self._projected_final_signals)
+        return dict(self._materialized_final_outputs)
 
     @property
-    def final_projection_error(self) -> str | None:
-        return self._final_projection_error
+    def materialized_final_presentations(self):
+        if self._materialized_final_presentations is None:
+            return None
+        return dict(self._materialized_final_presentations)
+
+    @property
+    def final_output_error(self) -> str | None:
+        return self._final_output_error
 
     @property
     def running(self) -> bool:
@@ -253,7 +314,7 @@ class ConsoleRunNode:
 
     @property
     def worker_idle(self) -> bool:
-        """Whether this node has no pending prepare/start/projection callback."""
+        """Whether this node has no pending prepare/start/output callback."""
 
         return self._owner.worker_idle
 
@@ -276,23 +337,6 @@ class ConsoleRunNode:
         if not callable(start):
             raise TypeError("starter must be callable")
         self._starter = start
-
-    def bind_final_projector(
-        self,
-        projector: Callable[[object], object],
-    ) -> None:
-        """Bind the composition-owned FINAL artifact -> display projection.
-
-        Projection may load a large artifact, so it always runs on this node's
-        worker after the Run result is available; the Qt owner only admits the
-        completed immutable snapshots.
-        """
-
-        if not callable(projector):
-            raise TypeError("final projector must be callable")
-        if self._final_projector is not None:
-            raise RuntimeError("this node already has a final projector")
-        self._final_projector = projector
 
     def start(self, start: Callable[[object], object] | None = None) -> None:
         """Prepare and start on the worker.  Returns immediately.
@@ -323,11 +367,13 @@ class ConsoleRunNode:
         self._stop_reason = "Console user requested stop"
         generation = self._owner.begin_generation()
         self._handle = None
+        self._prepared_command = None
         self._snapshot = None
         self._final_result = _UNRESOLVED_FINAL
-        self._final_projection_submitted = False
-        self._projected_final_signals = None
-        self._final_projection_error = None
+        self._final_outputs_submitted = False
+        self._materialized_final_outputs = None
+        self._materialized_final_presentations = None
+        self._final_output_error = None
         request = self._request
         prepare = self._prepare
 
@@ -335,7 +381,7 @@ class ConsoleRunNode:
             prepared = prepare(request)
             if self._stop_event.is_set():
                 raise _StartSuppressed()
-            return start(prepared)
+            return prepared, start(prepared)
 
         future = self._owner.submit(
             "start",
@@ -368,22 +414,48 @@ class ConsoleRunNode:
         for completion in self._owner.drain_completions():
             if completion.generation != self._owner.generation:
                 continue          # a job from a superseded generation; its result is stale
-            if completion.kind == "project-final":
+            if completion.kind == "materialize-final-outputs":
                 error = completion.future.exception()
                 if error is None:
-                    projected = completion.future.result()
+                    projected, presentations = completion.future.result()
                     if not isinstance(projected, dict):
-                        self._final_projection_error = (
-                            "TypeError: final projector must return a dict"
+                        self._final_output_error = (
+                            "TypeError: final output owner must return a dict"
                         )
-                        self._projected_final_signals = {}
+                        self._materialized_final_outputs = {}
+                        self._materialized_final_presentations = {}
+                    elif not isinstance(presentations, dict):
+                        self._final_output_error = (
+                            "TypeError: final presentation owner must return a dict"
+                        )
+                        self._materialized_final_outputs = {}
+                        self._materialized_final_presentations = {}
                     else:
-                        self._projected_final_signals = dict(projected)
+                        actual = set(map(str, projected))
+                        if not actual:
+                            self._final_output_error = (
+                                "ValueError: final outputs factory returned no outputs"
+                            )
+                            self._materialized_final_outputs = {}
+                            self._materialized_final_presentations = {}
+                        elif not set(map(str, presentations)).issubset(actual):
+                            self._final_output_error = (
+                                "ValueError: FINAL presentation has no matching "
+                                "domain output"
+                            )
+                            self._materialized_final_outputs = {}
+                            self._materialized_final_presentations = {}
+                        else:
+                            self._materialized_final_outputs = dict(projected)
+                            self._materialized_final_presentations = dict(
+                                presentations
+                            )
                 else:
-                    self._final_projection_error = (
+                    self._final_output_error = (
                         f"{type(error).__name__}: {error}"
                     )
-                    self._projected_final_signals = {}
+                    self._materialized_final_outputs = {}
+                    self._materialized_final_presentations = {}
                 continue
             error = completion.future.exception()
             if error is not None:
@@ -404,7 +476,8 @@ class ConsoleRunNode:
                 continue
             if completion.kind == "start":
                 self._start_pending = False
-                self._handle = completion.future.result()
+                prepared, self._handle = completion.future.result()
+                self._prepared_command = prepared
                 self._owner.set_handle(self._handle)
                 if self._stop_requested:
                     self._handle.cancel(self._stop_reason)
@@ -425,16 +498,36 @@ class ConsoleRunNode:
                         pass
                     else:
                         self._owner.mark_owner_reaped()
-                        projector = self._final_projector
+                        command = self._prepared_command
+                        outputs_factory = getattr(
+                            command,
+                            "final_dataset_outputs",
+                            None,
+                        )
                         if (
-                            projector is not None
-                            and not self._final_projection_submitted
+                            callable(outputs_factory)
+                            and not self._final_outputs_submitted
                         ):
                             result = self._final_result
-                            self._final_projection_submitted = True
+                            presentation_owner = self._final_presentation_owner
+
+                            def materialize_final_outputs():
+                                outputs = outputs_factory(result)
+                                presentations = (
+                                    {}
+                                    if presentation_owner is None
+                                    else presentation_owner.materialize_final_presentations(
+                                        command,
+                                        result,
+                                        outputs,
+                                    )
+                                )
+                                return outputs, presentations
+
+                            self._final_outputs_submitted = True
                             self._owner.submit(
-                                "project-final",
-                                lambda: projector(result),
+                                "materialize-final-outputs",
+                                materialize_final_outputs,
                                 generation=self._owner.generation,
                             )
                 elif self._snapshot.state.name != "SUCCEEDED":
@@ -446,7 +539,7 @@ class ConsoleRunNode:
         """Join this node's already-submitted Run without draining Qt completions.
 
         ``Future`` and ``RunHandle`` are the two thread-safe ownership edges.
-        GUI-owned snapshots and final projection remain exclusively in
+        GUI-owned snapshots and FINAL output admission remain exclusively in
         :meth:`poll`.  The bound Port/Run owns its finite I/O deadlines; this
         join does not invent a second user-tunable timeout.
         """
@@ -455,7 +548,7 @@ class ConsoleRunNode:
         if future is None:
             return
         try:
-            handle = future.result()
+            _prepared, handle = future.result()
         except _StartSuppressed:
             return
         handle.cancel(str(reason))

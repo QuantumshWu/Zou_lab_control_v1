@@ -381,7 +381,6 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
     tmp_path,
 ):
     from Zou_lab_control.notebook import connect
-    from Zou_lab_control.notebook.facade import _prepare_capture_for_workbench
 
     class RecordingPreview:
         def __init__(self, spec) -> None:
@@ -437,10 +436,7 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
         assert selected == (0, 3)
 
         def run_preview(source_ordinals, suffix):
-            prepared = _prepare_capture_for_workbench(
-                experiment,
-                sequence.capture_request,
-            )
+            prepared = experiment.readout.prepare_capture(sequence.capture_request)
 
             def factory(spec):
                 port = RecordingPreview(spec)
@@ -448,7 +444,6 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
                 return port
 
             handle = prepared.start_with_preview(
-                block_id=BlockId(f"ordinal-preview-{suffix}"),
                 factory=factory,
                 source_ordinals=source_ordinals,
             )
@@ -472,10 +467,7 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
         assert all_port.missed_events == [0] * 6
         assert all_port.failure is None and all_port.terminal
 
-        rejected = _prepare_capture_for_workbench(
-            experiment,
-            sequence.capture_request,
-        )
+        rejected = experiment.readout.prepare_capture(sequence.capture_request)
 
         def rejected_factory(spec):
             port = RecordingPreview(spec)
@@ -484,7 +476,6 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
 
         with pytest.raises(ValueError, match="frozen cell schedule"):
             rejected.start_with_preview(
-                block_id=BlockId("ordinal-preview-out-of-range"),
                 factory=rejected_factory,
                 source_ordinals=(6,),
             )

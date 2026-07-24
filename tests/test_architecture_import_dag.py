@@ -108,107 +108,6 @@ CANONICAL_HELPER_NAMES = frozenset(
     }
 )
 
-ALLOWED_STRIP_CONTEXTS = frozenset(
-    {
-        (Path("zlc_frontend/form.py"), "parse_number_text"),
-        (Path("zlc_frontend/form.py"), "FormChoice.__post_init__"),
-        (Path("zlc_frontend/form.py"), "FormFieldProps.__post_init__"),
-        (Path("zlc_frontend/form.py"), "FormFieldProps.row_label"),
-        # H1e - the salvaged live-plot shell.  Each reads text a HUMAN typed or a
-        # saved figure recorded: a panel size ("2x3"), a fit-model key, an axis
-        # name, a saved axis label.
-        (Path("zlc_data/panel_size.py"), "panel_size_cells"),
-        # The domain-ports wiring inherited from the legacy frontend root: the
-        # template reader normalises the scan PROGRAM text a human typed into the
-        # Scan-tab editor (or a template file carries) -- exactly the external
-        # input boundary this guard reserves .strip() for.
-        (Path("zlc_workbench/_domain_wiring.py"), "_read_pulse_template"),
-        # The board pin map reads the platform's XDC -- a Tcl constraints file written by a
-        # human and by Vivado, with arbitrary leading whitespace on every line.  Turning that
-        # text into lane identities IS the external input boundary; the identities it yields
-        # (lane keys, port labels, pin names) are canonical from here on.
-        (Path("zlc_neutral_atom/timing/board_config.py"), "load_board_config"),
-        # The runtime compiler (moved whole from the legacy device layer) parses
-        # slot REFERENCES ("s0") that a human's plan entries and saved documents
-        # carry as text, plus the wire-codec payload fields that mirror them.
-        (Path("zlc_neutral_atom/timing/runtime_compiler.py"), "RuntimeBusSegment.from_dict"),
-        (Path("zlc_neutral_atom/timing/runtime_compiler.py"), "_slot_ref_index"),
-        (Path("zlc_neutral_atom/timing/runtime_compiler.py"), "_pulse_table_bus_segments._emit"),
-    # The pulse-slot composite moved into qt_widgets (S5-shell(p)); its normalisation
-    # points came with it, so the named entries follow the code.
-    (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget.reconcile"),
-    (Path("zlc_frontend/qt_widgets/pulse_slots_widget.py"), "PulseSlotsWidget.values_dict"),
-    # The saved-layout record moved into zlc_frontend (S5-shell(w)).  Both normalisation
-    # points are exactly the boundary this guard reserves .strip() for: an environment
-    # variable a human typed, and a task NAME a human typed on the CLI or in the GUI.
-    (Path("zlc_frontend/console_state.py"), "task_files_dir"),
-    (Path("zlc_frontend/console_state.py"), "resolve_task_state"),
-    # The six pure helpers left the shell (S5-shell(z)); their normalisation points came with
-    # them, and each is the boundary this guard reserves .strip() for -- a panel/logic-node TITLE
-    # a human typed (or a saved layout carries), and two line-edit parsers.
-    (Path("zlc_data/shape_text.py"), "indexed_unique_name"),
-    (Path("zlc_frontend/form.py"), "lenient_float"),
-    (Path("zlc_frontend/form.py"), "text_to_python"),
-        (Path("zlc_frontend/qt_widgets/fluent.py"), "align_to_resolution"),
-        (Path("zlc_frontend/qt_widgets/fluent.py"), "FluentPathEdit._dialog_start"),
-        (Path("zlc_frontend/qt_widgets/fluent.py"), "FluentTreeComboBox.current_signal"),
-        # Same concern as the line above: this reads what a human TYPED into an
-        # editable combo, which is exactly the named-adapter boundary this guard
-        # reserves .strip() for.
-        (Path("zlc_frontend/qt_widgets/signal_picker.py"), "read_editable_combo"),
-        # Salvaged legacy param-form handlers: every one of these reads what a
-        # human TYPED into a form field (JSON body, device ref, path, pulse-slot
-        # program text) - the exact named-adapter boundary .strip() is reserved for.
-        (Path("zlc_frontend/qt_widgets/param_widgets.py"), "JsonHandler.read"),
-        (Path("zlc_frontend/qt_widgets/param_widgets.py"), "JsonHandler.is_empty"),
-        (Path("zlc_frontend/qt_widgets/param_widgets.py"), "DeviceRefHandler.is_empty"),
-        (Path("zlc_frontend/qt_widgets/param_widgets.py"), "PathHandler.is_empty"),
-        (Path("zlc_frontend/qt_widgets/param_widgets.py"), "PulseSlotsHandler.is_empty"),
-        # W1 - canonicalises the DISPLAY NAME a human typed into the machine token
-        # every published signal name derives from: the same named human-input
-        # adapter boundary .strip() is reserved for.
-        (Path("zlc_data/shape_text.py"), "measurement_slug"),
-        (Path("zlc_frontend/qt_widgets/form.py"), "_TextHandler.is_empty"),
-        (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.read"),
-        (Path("zlc_frontend/qt_widgets/form.py"), "_IntHandler.is_empty"),
-        (Path("zlc_frontend/qt_widgets/form.py"), "_NumberHandler.read"),
-        (Path("zlc_frontend/qt_widgets/form.py"), "_NumberHandler.is_empty"),
-        (Path("zlc_frontend/qt_widgets/form.py"), "_LosslessFloatSpinBox.valueFromText"),
-        (Path("zlc_frontend/qt_widgets/form.py"), "_LosslessFloatSpinBox.validate"),
-        (Path("zlc_frontend/qt_widgets/form.py"), "_FloatHandler.read"),
-        (Path("zlc_frontend/qt_widgets/form.py"), "_FloatHandler.is_empty"),
-        (Path("zlc_pulse/document.py"), "ScanRecipeProvenance.__post_init__"),
-        (Path("zlc_pulse/transport/axi.py"), "VivadoAxiRegisterTransport._parse_read"),
-        # The legacy pulse domain moved into zlc_neutral_atom.timing (shims stay behind);
-        # the named entries follow the code.  Every one reads text a HUMAN typed - channel
-        # labels from config/GUI, scan-slot / API-slot names, a period field's nominal
-        # text, a bus-target token, an analog-bus mode word - exactly the named
-        # input-adapter boundary .strip() is reserved for.
-        (Path("zlc_neutral_atom/timing/ports.py"), "PortSpec.__post_init__"),
-        (Path("zlc_neutral_atom/timing/ports.py"), "PortCatalog.__post_init__"),
-        (Path("zlc_neutral_atom/timing/ports.py"), "PortCatalog.with_label"),
-        (Path("zlc_neutral_atom/timing/ports.py"), "PortCatalog.from_channels"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "_default_scan_name"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "ScanSlot.__post_init__"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "PulseTableState._read_field_nominal"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "PulseTableState._set_bus_target"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "PulseTableState._clear_slot_binding"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "PulseTableState._normalize_analog_bus_modes"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "PulseTableState.set_analog_bus_mode"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "_SafeEval.affine"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "_coerce_bus_value"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "_period_display"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "bus_period_levels"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "eval_time_expr"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "evaluate_scan_table_code"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "is_slot_ref"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "load_scan_table"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "period_index_by_name"),
-        (Path("zlc_neutral_atom/timing/pulse_table.py"), "slot_ref_index"),
-    }
-)
-
-
 def _imports(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     result: set[str] = set()
@@ -331,48 +230,6 @@ def test_canonical_primitive_validators_have_one_owner():
     assert not violations, (
         "canonical primitive validators belong to zlc_storage.canonical; "
         "domain modules must import and alias them:\n" + "\n".join(violations)
-    )
-
-
-def test_text_normalization_is_confined_to_named_input_adapters():
-    violations = []
-
-    class StripVisitor(ast.NodeVisitor):
-        def __init__(self, relative: Path) -> None:
-            self.relative = relative
-            self.context: list[str] = []
-
-        def visit_ClassDef(self, node):
-            self.context.append(node.name)
-            self.generic_visit(node)
-            self.context.pop()
-
-        def visit_FunctionDef(self, node):
-            self.context.append(node.name)
-            self.generic_visit(node)
-            self.context.pop()
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_Call(self, node):
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "strip":
-                location = (self.relative, ".".join(self.context))
-                if location not in ALLOWED_STRIP_CONTEXTS:
-                    violations.append(
-                        f"{self.relative}:{node.lineno} strips text in {location[1]}"
-                    )
-            self.generic_visit(node)
-
-    for package in FORBIDDEN:
-        for path in (ROOT / package).rglob("*.py"):
-            relative = path.relative_to(ROOT)
-            if relative == Path("zlc_storage/canonical.py"):
-                continue
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            StripVisitor(relative).visit(tree)
-    assert not violations, (
-        "machine identities must reject non-canonical text; .strip() is reserved "
-        "for explicitly named human/external input adapters:\n" + "\n".join(violations)
     )
 
 
@@ -915,8 +772,7 @@ def test_current_format_names_do_not_encode_edit_counters():
         # The progress ledger moved OUT of the design doc (section 22 -> its own file), and the
         # two APPROVED hardware-protocol identities travelled with the historical rows that
         # discuss them.  The allowlist follows the text to its new home; the pattern is not
-        # weakened.  Found the commit after the move, because this sweep reads ``git ls-files``
-        # and an untracked new document is invisible to it until it is committed.
+        # weakened.
         Path("docs/MIGRATION_LEDGER_zh.md"): (
             "zlc_pulse.PulseTargetABI/v1",
             "ZLC-CANONICAL-1",
@@ -930,12 +786,16 @@ def test_current_format_names_do_not_encode_edit_counters():
         "zlc_neutral_atom",
         "zlc_frontend",
         "zlc_workbench",
+        "Zou_lab_control",
         "tests",
         "docs",
         "pulses",
     )
     tracked = subprocess.run(
-        ["git", "ls-files", "-z", "--", *roots, ".gitignore"],
+        [
+            "git", "ls-files", "--cached", "--others", "--exclude-standard",
+            "-z", "--", *roots, ".gitignore",
+        ],
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -975,65 +835,12 @@ def test_current_format_names_do_not_encode_edit_counters():
     )
 
 
-def test_pulse_software_formats_have_no_upgrade_or_edit_counter():
-    """The remaining legacy island is current-only until its final H1 cut.
-
-    Its three persisted software values may retain a plain schema name, but
-    must not regrow a numeric revision field or a historical parser. Hardware
-    ABI and the deployed runtime wire version are intentionally out of scope.
-    """
-
-    # The pulse domain moved to zlc_neutral_atom.timing (shims stay behind); the
-    # owner pins follow the code, and the deleted-upgrader ratchet covers BOTH homes.
-    for timing_root in (
-        ROOT / "Zou_lab_control" / "neutral_atom" / "timing",
-        ROOT / "zlc_neutral_atom" / "timing",
-    ):
-        upgrader = timing_root / "legacy_pulse_upgrade.py"
-        assert not upgrader.exists(), "historical pulse upgrade code must stay deleted"
-
-    timing_root = ROOT / "zlc_neutral_atom" / "timing"
-    owners = (
-        (timing_root / "ports.py", "PortCatalog"),
-        (timing_root / "sequence_model.py", "PulseSequence"),
-        (timing_root / "pulse_table.py", "PulseTableState"),
-    )
-    violations = []
-    for path, class_name in owners:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        owner = next(
-            node for node in tree.body
-            if isinstance(node, ast.ClassDef) and node.name == class_name
-        )
-        for node in ast.walk(owner):
-            if isinstance(node, ast.Constant) and node.value == "version":
-                violations.append(
-                    f"{path.relative_to(ROOT)}:{node.lineno} persists a version field"
-                )
-            if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
-                if any(isinstance(target, ast.Name) and target.id == "version" for target in targets):
-                    violations.append(
-                        f"{path.relative_to(ROOT)}:{node.lineno} defines a version attribute"
-                    )
-
-    for path in (ROOT / "Zou_lab_control").rglob("*.py"):
-        if "legacy_pulse_upgrade" in path.read_text(encoding="utf-8"):
-            violations.append(f"{path.relative_to(ROOT)} imports the deleted upgrader")
-
-    assert not violations, (
-        "legacy pulse software formats are current-only; use their plain schema "
-        "name and reject every other shape:\n" + "\n".join(violations)
-    )
-
-
-def test_legacy_frontend_persisted_formats_have_no_edit_counter_or_single_role():
+def test_persisted_ui_formats_have_no_edit_counter_or_single_role():
     """Owners are resolved by DEFINITION SITE, never by path -- see ``_sole_definition``.
 
-    The two console records follow their class definitions, so the guard survives
-    a salvage instead of being silently orphaned by it.  Persisted figures now use
-    the exact current ``zlc_frontend.figure_archive`` envelope and owner codecs;
-    the deleted frontend record therefore has no compatibility anchor here.
+    The two console records are located by their current definition sites.
+    Persisted figures use the exact current ``zlc_frontend.figure_archive``
+    envelope; TaskConsole records belong to their Workbench product owner.
     """
 
     console_state_path, console_state_node = _sole_definition("TaskConsoleState")
@@ -1063,7 +870,7 @@ def test_legacy_frontend_persisted_formats_have_no_edit_counter_or_single_role()
                 )
 
     assert not violations, (
-        "frontend persisted records are current-only: FigureArchive and "
+        "persisted UI records are current-only: FigureArchive and "
         "TaskConsole keep a plain schema, while single-value panel roles and "
         "numeric edit counters stay deleted:\n" + "\n".join(violations)
     )

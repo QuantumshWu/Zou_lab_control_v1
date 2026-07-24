@@ -139,7 +139,7 @@ def _curve_product(repeats: int):
         repeat,
         (scan,),
         PointLayout.rect_c((scan.size,)),
-        ValueSchema((), ValidityContract.value(), np.dtype("<f8"), "count"),
+        ValueSchema.scalar(np.dtype("<f8"), "count"),
     )
     snapshot = _snapshot(schema, np.zeros(schema.physical_shape), f"curve-{repeats}")
     bound = suggest_fit_draft(
@@ -255,7 +255,7 @@ def test_point_fit_range_projection_reconstructs_resolved_layout_exactly(
         repeat,
         (site, fit_axis),
         point_layout,
-        ValueSchema((), ValidityContract.value(), np.dtype("<f8")),
+        ValueSchema.scalar(np.dtype("<f8")),
     )
     roi = Selection.index_range(fit_axis.axis_id, 1, 6)
 

@@ -125,13 +125,28 @@ class ThresholdMethod(str, Enum):
     """Fallback threshold estimator when bracket labels cannot train a site.
 
     Long-short-long reference labels remain the authoritative threshold source
-    whenever they are usable.  This choice controls the same quick fallback
-    that Main exposed as ``otsu`` versus ``bimodal``; it is analysis intent,
-    not a GUI-only preference.
+    whenever they are usable.  This choice controls the quick ``otsu`` versus
+    ``bimodal`` fallback; it is analysis intent, not a GUI-only preference.
     """
 
     OTSU = "otsu"
     BIMODAL = "bimodal"
+
+
+# Public request constraints.  Presentation projects these values; the
+# request constructor below remains the only validator.
+CALIBRATION_MINIMUM_BOX_RADIUS = 0
+CALIBRATION_MINIMUM_PSF_HALF_WIDTH = 0
+CALIBRATION_MINIMUM_PSF_BACKGROUND_PADDING = 1
+CALIBRATION_MINIMUM_SPLIT_SEED = 0
+CALIBRATION_MINIMUM_HISTOGRAM_BINS = 2
+CALIBRATION_MINIMUM_SITE_FIDELITY = 0.5
+CALIBRATION_MAXIMUM_SITE_FIDELITY = 1.0
+CALIBRATION_MINIMUM_MAX_DROP = 0
+CALIBRATION_MINIMUM_DETECTOR_DISTANCE = 1
+CALIBRATION_MINIMUM_DETECTOR_THRESHOLD_REL = 0.0
+CALIBRATION_MAXIMUM_DETECTOR_THRESHOLD_REL = 1.0
+CALIBRATION_MINIMUM_DETECTOR_REFINE_HALF = 0
 
 
 def _immutable_array(
@@ -242,14 +257,25 @@ class CalibrationAnalysisRequest:
             raise ValueError("train_fraction must be in (0, 1)")
         seed = _nonnegative_integer(self.split_seed, "split_seed")
         bins = _positive_integer(self.histogram_bins, "histogram_bins")
-        if bins < 2:
-            raise ValueError("histogram_bins must be at least two")
+        if bins < CALIBRATION_MINIMUM_HISTOGRAM_BINS:
+            raise ValueError(
+                "histogram_bins must be at least "
+                f"{CALIBRATION_MINIMUM_HISTOGRAM_BINS}"
+            )
         minimum_site_fidelity = _finite_float(
             self.minimum_site_fidelity,
             "minimum_site_fidelity",
         )
-        if not 0.5 <= minimum_site_fidelity <= 1.0:
-            raise ValueError("minimum_site_fidelity must be in [0.5, 1.0]")
+        if not (
+            CALIBRATION_MINIMUM_SITE_FIDELITY
+            <= minimum_site_fidelity
+            <= CALIBRATION_MAXIMUM_SITE_FIDELITY
+        ):
+            raise ValueError(
+                "minimum_site_fidelity must be in "
+                f"[{CALIBRATION_MINIMUM_SITE_FIDELITY}, "
+                f"{CALIBRATION_MAXIMUM_SITE_FIDELITY}]"
+            )
         site_count = grid[0] * grid[1]
         max_drop = (
             min(5, site_count)
@@ -267,8 +293,16 @@ class CalibrationAnalysisRequest:
             self.detector_threshold_rel,
             "detector_threshold_rel",
         )
-        if not 0.0 <= threshold_rel <= 1.0:
-            raise ValueError("detector_threshold_rel must be in [0, 1]")
+        if not (
+            CALIBRATION_MINIMUM_DETECTOR_THRESHOLD_REL
+            <= threshold_rel
+            <= CALIBRATION_MAXIMUM_DETECTOR_THRESHOLD_REL
+        ):
+            raise ValueError(
+                "detector_threshold_rel must be in "
+                f"[{CALIBRATION_MINIMUM_DETECTOR_THRESHOLD_REL}, "
+                f"{CALIBRATION_MAXIMUM_DETECTOR_THRESHOLD_REL}]"
+            )
         refine_half = _nonnegative_integer(
             self.detector_refine_half,
             "detector_refine_half",
@@ -1111,6 +1145,18 @@ __all__ = [
     "CalibrationAnalysisRequest",
     "CalibrationArtifact",
     "CalibrationSourceBinding",
+    "CALIBRATION_MAXIMUM_DETECTOR_THRESHOLD_REL",
+    "CALIBRATION_MAXIMUM_SITE_FIDELITY",
+    "CALIBRATION_MINIMUM_BOX_RADIUS",
+    "CALIBRATION_MINIMUM_DETECTOR_DISTANCE",
+    "CALIBRATION_MINIMUM_DETECTOR_REFINE_HALF",
+    "CALIBRATION_MINIMUM_DETECTOR_THRESHOLD_REL",
+    "CALIBRATION_MINIMUM_HISTOGRAM_BINS",
+    "CALIBRATION_MINIMUM_MAX_DROP",
+    "CALIBRATION_MINIMUM_PSF_BACKGROUND_PADDING",
+    "CALIBRATION_MINIMUM_PSF_HALF_WIDTH",
+    "CALIBRATION_MINIMUM_SITE_FIDELITY",
+    "CALIBRATION_MINIMUM_SPLIT_SEED",
     "GridOrder",
     "PerSitePsfFeature",
     "ReadoutFeature",

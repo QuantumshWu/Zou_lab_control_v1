@@ -6,7 +6,6 @@ two-input physical join rather than a DataFigure, copies its exact BoardFrame
 into the shared ``SinglePanelHost``.  The editor never evaluates data or owns a
 Matplotlib composer.
 
-Every import names a TRUE owner -- nothing here touches the legacy tree.
 """
 
 from __future__ import annotations
@@ -33,24 +32,19 @@ from zlc_frontend.qt_widgets import (
     GREY,
     ORANGE,
     RED,
-    MeasurementPanel,
     scaled_px,
     signals_blocked as _signals_blocked,
 )
-from zlc_frontend.console_state import (
-    TaskConsoleState as _TaskConsoleState,
-    task_files_dir as _task_files_dir,
-)
-from zlc_frontend.form import lenient_float as _safe_float
+from zlc_frontend.form import choice_value_from_tree, lenient_float as _safe_float
 from zlc_frontend.panel_params import panel_param_decls as _panel_param_decls
+from zlc_frontend import RELIM_PARAM as _RELIM_PARAM
 from zlc_frontend.render_style import panel_display_size
-from .panel_types import RELIM_PARAM as _RELIM_PARAM
 from zlc_storage.paths import display_path
+from .layout_repository import task_files_dir as _task_files_dir
+from .measurement_panel import MeasurementPanel
 
 
-PARAM_WIDGETS = _qt_widgets.param_widgets.PARAM_WIDGETS
-ParamWidgetContext = _qt_widgets.param_widgets.ParamWidgetContext
-fill_grouped_signal_combo = _qt_widgets.param_widgets.fill_grouped_signal_combo
+FORM_WIDGET_HANDLERS = _qt_widgets.FORM_WIDGET_HANDLERS
 
 #: Containers the Save row offers.  A container is a DATA-layer choice (which file
 #: the same picture lands in), never an art knob: geometry, dpi and typography are
@@ -94,15 +88,22 @@ class PanelEditor(QtWidgets.QWidget):
         same card state also backs Setting and no second window is opened;
       * manual x/y limits + Save Fig;
       * for a panel that came from a measurement, that measurement's
-        AUTO-generated parameter form (the same ParamDecl form the launcher
+        AUTO-generated parameter form (the same FormSpec the launcher
         uses, bound to the one spec) whose Start RE-RUNS the measurement into
         this very Monitor panel with the edited params.
 
     The whole page lives in a scroll area, so the snapshot never pushes the
-    fit/limits row off-screen (the old single-editor cutoff)."""
+    fit/limits row off-screen."""
 
 
-    def __init__(self, card: "PanelCard", console: "TaskConsole", parent=None):
+    def __init__(
+        self,
+        card: "PanelCard",
+        console: "TaskConsole",
+        parent: QtWidgets.QWidget,
+    ):
+        if parent is None:
+            raise TypeError("PanelEditor requires its tab-stack parent")
         super().__init__(parent)
         self.card = card
         self.console = console
@@ -130,17 +131,10 @@ class PanelEditor(QtWidgets.QWidget):
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         scroll = FluentScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         outer.addWidget(scroll)
         page = QtWidgets.QWidget()
         page.setStyleSheet("background: transparent;")
-        page.setMinimumWidth(0)
-        page.setSizePolicy(
-            QtWidgets.QSizePolicy.Ignored,
-            QtWidgets.QSizePolicy.Preferred,
-        )
-        scroll.setWidget(page)
+        scroll.set_width_bounded_widget(page)
         col = QtWidgets.QVBoxLayout(page)
         margin = scaled_px(10, minimum=6)
         col.setContentsMargins(margin, margin, margin, margin)
@@ -184,11 +178,12 @@ class PanelEditor(QtWidgets.QWidget):
         if source_spec is not None:
             section("Source: %s" % source_spec.name)
             self.source_form = MeasurementPanel(
-                [source_spec], single=True, controls=False,
-                signals_provider=getattr(console, "_signal_names", None),
-                sources_provider=getattr(console, "_signal_providers", None),
-                formats_provider=getattr(console, "_signal_formats", None),
-                short_names_provider=getattr(console, "_signal_short_names", None))
+                [source_spec],
+                single=True,
+                controls=False,
+                runtime=console.form_runtime_for_logic(self._source_row),
+                pulse_template_reader=console._pulse_template_reader,
+            )
             self.source_form.seed_values(self._source_row.node.values or {})
             col.addWidget(self.source_form)
             self.source_apply_button = FluentButton("Apply", color=ACCENT)
@@ -200,14 +195,6 @@ class PanelEditor(QtWidgets.QWidget):
 
         # ---- Parameters: the plot's own functional params, auto-discovered from the
         # kind's declarations, so a kind that gains a knob shows it with no wiring here.
-        functional = [spec for spec in _panel_param_decls(card.config.kind)
-                      if not spec.display]
-        if functional:
-            section("Parameters")
-            for spec in functional:
-                widget = card._make_param_widget(spec, apply=self._edit_param)
-                col.addWidget(FluentSettingRow(spec.label, widget, label_width=label_w))
-
         # ---- Display: the same view knobs the Setting popup renders, through the card's
         # SHARED row emitter and writing the SAME config.params through the card's one
         # writer -- the two surfaces are views of one state and cannot drift.
@@ -215,15 +202,15 @@ class PanelEditor(QtWidgets.QWidget):
         self.ed_fixed_lo = self.ed_fixed_hi = None
         self.ed_params = {}
         section("Display")
-        display_specs = ([spec for spec in _panel_param_decls(card.config.kind)
-                          if spec.display] + [_RELIM_PARAM])
+        display_specs = list(_panel_param_decls(card.config.kind)) + [_RELIM_PARAM]
         self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, label_w)
         card._mount_grid_row_inventory(
             self,
             col.addWidget,
-            self._edit_param,
-            label_w,
-            self.ed_params,
+            view_apply=self._edit_grid_facet,
+            param_apply=self._edit_param,
+            label_w=label_w,
+            form_widgets=self.ed_params,
         )
         self.repeat_mode_row, self.repeat_mode_combo = card._make_repeat_mode_row(
             self._edit_repeat_mode,
@@ -252,7 +239,7 @@ class PanelEditor(QtWidgets.QWidget):
         head.addWidget(FluentLabel("frozen snapshot of current data"), 1)
         self.refresh_button = FluentButton("Refresh", color=GREY)
         self.refresh_button.setToolTip("Re-snapshot the panel's current data")
-        self.refresh_button.clicked.connect(self.rebuild)
+        self.refresh_button.clicked.connect(self.refresh_snapshot)
         head.addWidget(self.refresh_button)
         col.addLayout(head)
         self.canvas_holder = QtWidgets.QVBoxLayout()
@@ -349,11 +336,14 @@ class PanelEditor(QtWidgets.QWidget):
         col.addWidget(self.status)
         col.addStretch(1)
 
-        # The TaskConsole mounts this editor into the tab stack before calling
-        # ``rebuild``.  Building the raster host here would briefly make that
-        # child a top-level native window while the page has no tab parent yet.
+        # The host is permanent Edit chrome, even before the source has data.
+        # TaskConsole supplies the tab stack as parent before construction, so
+        # this child can never transiently become a native top-level window and
+        # never has to be created after an already-visible page (which leaves a
+        # newly inserted QWidget explicitly hidden on Qt).
+        self._ensure_snapshot_surface()
 
-    def rebuild(self) -> None:
+    def refresh_snapshot(self) -> None:
         """Copy the card's immutable front into one stable shared host.
 
         Edit is another view of the same Figure, not a nested DataFigureWindow
@@ -494,7 +484,7 @@ class PanelEditor(QtWidgets.QWidget):
         if not self._follow_next_front:
             return
         self._follow_next_front = False
-        self.rebuild()
+        self.refresh_snapshot()
 
     def teardown(self) -> None:
         """Release this tab's frozen Qt presentation surface."""
@@ -532,7 +522,7 @@ class PanelEditor(QtWidgets.QWidget):
         if key == "relim":
             # a 2D image has no Display fixed row (its clim lives in the Limits colour-range row):
             # re-seed THOSE boxes here so picking relim in the chooser fills/empties them to match the
-            # pin -- runs even when ed_fixed_row is None, unlike the block above (#2 colour range).
+            # pin -- runs even when ed_fixed_row is None, unlike the colour-range block above.
             self._seed_clim_boxes()
         # ``front_presented`` copies the accepted immutable raster into this
         # frozen view.  There is deliberately no Edit-side composer.
@@ -543,11 +533,14 @@ class PanelEditor(QtWidgets.QWidget):
         self._follow_next_front = True
         self.card._commit_repeat_mode(mode)
 
-    def _edit_grid_facet(self, intent, axis_id) -> None:
+    def _edit_grid_facet(self, intent, axis_id) -> bool:
         if self.card is None:
-            return
+            return False
         self._follow_next_front = True
-        self.card._commit_grid_facet(intent, axis_id)
+        changed = self.card._commit_grid_facet(intent, axis_id)
+        if changed:
+            self.card._refresh_grid_control_surface(self)
+        return changed
 
     def _sync_fixed_lim_enabled(self, relim: str) -> None:
         """The Edit tab's fixed lo/hi row is ALWAYS in the layout -- only its INPUTS enable when
@@ -566,7 +559,7 @@ class PanelEditor(QtWidgets.QWidget):
                 w.setEnabled(fixed)
 
     def _edit_fixed_lim(self) -> None:
-        """The Edit tab's fixed lo/hi committed (#H2): apply to the LIVE card through its ONE
+        """Commit the Edit tab's fixed lo/hi to the live card through its one
         ``apply_fixed_lims`` path (config.params + local display commit), then let the next accepted
         front update this tab.  It never re-reads acquisition merely because a limit changed."""
         if self.card is None:
@@ -596,7 +589,7 @@ class PanelEditor(QtWidgets.QWidget):
         self._update_save_preview()               # default save name follows the title
 
     def _apply_source_form(self) -> None:
-        """Apply the SOURCE node's edited parameter form (#2) to the producing node --
+        """Apply the source node's edited parameter form to the producing node --
         rebuild + restart it (or live where it accepts), then re-snapshot."""
         if self._source_row is None or self.source_form is None:
             return
@@ -621,18 +614,8 @@ class PanelEditor(QtWidgets.QWidget):
         card = self.card
         self._refresh_display_params()
         if card is not None:
-            card._seed_grid_view_controls(
-                self.grid_intent_combo,
-                self.grid_facet_combo,
-            )
-            histogram_grid = (
-                card._grid_cell_intent() is card._histogram_intent()
-            )
-            self.grid_bins_row.setVisible(histogram_grid)
-            self.grid_ylog_row.setVisible(histogram_grid)
-            self.grid_colormap_row.setVisible(
-                card._grid_cell_intent() is card._image_intent()
-            )
+            card._sync_fit_authoring_from_presented(prepare_authoring=True)
+            card._refresh_grid_control_surface(self)
             card._seed_repeat_mode_control(
                 self.repeat_mode_combo,
                 self.repeat_mode_row,
@@ -647,23 +630,28 @@ class PanelEditor(QtWidgets.QWidget):
         """Re-seed the Edit tab's display-knob controls (``ed_params``) from the live card's
         ``config.params`` -- the SINGLE source of truth -- so switching back to this tab shows the
         CURRENT values even when they were changed in the Setting popup (which writes the same
-        config.params).  Each control is re-seeded through its kind's ``PARAM_WIDGETS.write`` (the card
+        config.params).  Each control is re-seeded through its frontend form handler (the card
         records the kinds while building both surfaces' rows), signals blocked so re-seeding does not
-        re-fire ``_edit_param``.  The #6 mirror of ``PanelCard.refresh_on_show`` -- both surfaces are a
+        re-fire ``_edit_param``.  Like ``PanelCard.refresh_on_show``, both surfaces are a
         VIEW of config.params, refreshed on show, never private copies that drift."""
         if self.card is None:
             return
-        kinds = getattr(self.card, "_param_kinds", {})
+        fields = getattr(self.card, "_param_fields", {})
         params = self.card.config.params
         for key, widget in self.ed_params.items():
-            kind = kinds.get(key)
-            if kind is None or key not in params:
+            field = fields.get(key)
+            if field is None or key not in params:
                 continue
             with _signals_blocked(widget):
-                try:
-                    PARAM_WIDGETS[kind].write(widget, params[key])
-                except (TypeError, ValueError):
-                    continue
+                FORM_WIDGET_HANDLERS[field.kind].write(
+                    field,
+                    widget,
+                    (
+                        choice_value_from_tree(field, params[key])
+                        if field.kind == "choice"
+                        else params[key]
+                    ),
+                )
 
     def _limit_axes(self):
         """The view-window rows this editor built, as ``(param key, lo box, hi box)``.
@@ -715,8 +703,7 @@ class PanelEditor(QtWidgets.QWidget):
         """Put the STORED x-window pin (``view_xlim`` in ``config.params``) into the boxes.  The boxes
         EDIT THE PIN, never the live autoscaled range, so their text never wanders on its own: empty
         boxes mean 'no pin' (autoscale), a value means 'pinned there'.  Called on build / tab-show /
-        after Clear -- NEVER on the refresh tick (the root cause of the old 'I type and it rewrites'
-        bug was ``fill_limits`` doing ``setText`` every tick).  The live range is shown separately as a
+        after Clear -- NEVER on the refresh tick.  The live range is shown separately as a
         non-destructive grey hint (:meth:`refresh_limit_hints`)."""
         if self.xmin is None:
             return                          # no Limits controls on this editor instance
@@ -735,9 +722,9 @@ class PanelEditor(QtWidgets.QWidget):
     def refresh_limit_hints(self) -> None:
         """Refresh ONLY the grey PLACEHOLDER of the x-range boxes to the panel's current x-window -- a
         non-destructive live reference.  Qt shows a placeholder ONLY while the box is empty, so this can
-        never overwrite a pinned value or the operator's in-progress typing.  This is the tick-safe
-        successor of the old ``fill_limits`` (whose per-tick ``setText`` clobbered input): the tick calls
-        THIS, so the boxes stay a live VIEW of the x-window (unpinned) while remaining freely editable."""
+        never overwrite a pinned value or the operator's in-progress typing.  The
+        tick updates only this hint, so the boxes stay a live view of the x-window
+        while remaining freely editable."""
         if self.xmin is None:
             return                          # no Limits controls on this editor instance
         # Colour-range live hint: show the current clim as the grey placeholder so an empty
@@ -861,10 +848,10 @@ class PanelEditor(QtWidgets.QWidget):
         p = self.card.config.params if self.card is not None else {}
         lo = hi = ""
         if str(p.get("relim")) == "fixed":
-            try:
-                lo, hi = f"{float(p.get('fixed_lo')):.6g}", f"{float(p.get('fixed_hi')):.6g}"
-            except (TypeError, ValueError):
-                lo = hi = ""
+            lo, hi = (
+                f"{float(p.get('fixed_lo')):.6g}",
+                f"{float(p.get('fixed_hi')):.6g}",
+            )
         with _signals_blocked(self.clo, self.chi):
             self.clo.setText(lo); self.chi.setText(hi)
 
@@ -936,7 +923,10 @@ class PanelEditor(QtWidgets.QWidget):
             display = self._snapshot_display
             if figure is None or display is None:
                 raise RuntimeError("the editor has no exact typed figure to save")
-            figure.save_archive(
+            from zlc_workbench.data_figure.archive_repository import save_figure_archive
+
+            save_figure_archive(
+                figure,
                 stem.with_suffix(".npz"),
                 display=display,
                 metadata={

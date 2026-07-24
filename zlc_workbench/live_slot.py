@@ -8,14 +8,16 @@ are Figure-owned branches over an accepted immutable front.
 from __future__ import annotations
 
 import threading
-from typing import Callable
+from typing import Callable, Mapping
 
 from zlc_frontend.figure import DatasetId
-from zlc_neutral_atom.monitor_application import (
-    CameraMonitorLiveDataset,
-    CameraMonitorViewSpec,
+from zlc_neutral_atom.monitor_application import CameraMonitorViewSpec
+from zlc_neutral_atom.dataset_output import (
+    LiveDatasetOutput,
+    LiveDatasetOutputOwner,
+    LiveDatasetSnapshotSource,
 )
-from zlc_neutral_atom.runtime.dataset import MonitorDataset, MonitorDatasetSnapshot
+from zlc_neutral_atom.runtime.dataset import MonitorDatasetSnapshot
 from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
 from zlc_storage import canonical_text
 
@@ -29,6 +31,7 @@ class LiveDatasetSlot:
         *,
         dataset_id: DatasetId,
         retain_on_terminal: bool = True,
+        output_owner: LiveDatasetOutputOwner | None = None,
     ) -> None:
         if not isinstance(spec, (CapturePreviewSpec, CameraMonitorViewSpec)):
             raise TypeError("spec must be a supported live dataset spec")
@@ -36,11 +39,18 @@ class LiveDatasetSlot:
             raise TypeError("dataset_id must be DatasetId")
         if not isinstance(retain_on_terminal, bool):
             raise TypeError("retain_on_terminal must be bool")
+        if output_owner is not None and not callable(
+            getattr(output_owner, "live_dataset_outputs", None)
+        ):
+            raise TypeError(
+                "output_owner must implement the neutral live output contract"
+            )
         self.spec = spec
         self.dataset_id = dataset_id
         self._retain_on_terminal = retain_on_terminal
+        self._output_owner = output_owner
         self._lock = threading.Lock()
-        self._dataset: MonitorDataset | CameraMonitorLiveDataset | None = None
+        self._dataset: LiveDatasetSnapshotSource | None = None
         self._run_id: str | None = None
         self._causation_domain_id: str | None = None
         self._listener: Callable[[], None] | None = None
@@ -94,18 +104,13 @@ class LiveDatasetSlot:
 
     def bind(
         self,
-        dataset: MonitorDataset | CameraMonitorLiveDataset,
+        dataset: LiveDatasetSnapshotSource,
         *,
         run_id: str,
         causation_domain_id: str,
     ) -> None:
-        expected = (
-            CameraMonitorLiveDataset
-            if isinstance(self.spec, CameraMonitorViewSpec)
-            else MonitorDataset
-        )
-        if not isinstance(dataset, expected):
-            raise TypeError(f"dataset must be {expected.__name__}")
+        if not isinstance(dataset, LiveDatasetSnapshotSource):
+            raise TypeError("dataset must implement LiveDatasetSnapshotSource")
         run_id = canonical_text(run_id, "run_id")
         causation_domain_id = canonical_text(
             causation_domain_id,
@@ -156,16 +161,23 @@ class LiveDatasetSlot:
             dataset = self._dataset
             run_id = self._run_id
             causation = self._causation_domain_id
-        snapshot = (
-            dataset.materialize()
-            if isinstance(dataset, CameraMonitorLiveDataset)
-            else dataset.materialize(None)
-        )
+        snapshot = dataset.freeze_current()
         with self._lock:
             if self._closed or self._dataset is not dataset:
                 raise RuntimeError("live slot lifetime ended while freezing a snapshot")
         assert run_id is not None and causation is not None
         return run_id, causation, snapshot
+
+    def freeze_live_outputs(
+        self,
+    ) -> tuple[str, str, Mapping[str, LiveDatasetOutput]]:
+        """Delegate naming/materialization to the frozen application owner."""
+
+        owner = self._output_owner
+        if owner is None:
+            raise RuntimeError("live slot has no application output owner")
+        run_id, causation, snapshot = self.freeze_current()
+        return run_id, causation, owner.live_dataset_outputs(snapshot)
 
     def fail(self, message: str) -> None:
         message = canonical_text(message, "preview failure")
@@ -207,7 +219,7 @@ class LiveDatasetSlot:
         *,
         closed: bool = False,
         withdrawn: bool = False,
-    ) -> tuple[MonitorDataset | CameraMonitorLiveDataset | None, Callable | None]:
+    ) -> tuple[LiveDatasetSnapshotSource | None, Callable | None]:
         with self._lock:
             if closed and self._closed:
                 return None, None

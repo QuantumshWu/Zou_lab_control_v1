@@ -6,23 +6,25 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 import math
-from numbers import Integral
 import numpy as np
 
-from zlc_storage.canonical import canonical_digest, canonical_text, sha256_text
+from zlc_storage.canonical import (
+    canonical_digest,
+    canonical_text,
+    positive_integer,
+    sha256_text,
+)
 
 from ._arrays import canonical_dtype, immutable_array
 from .axis import AxisId, AxisSpec, SCALAR_AXIS
 from .layout import AxisLayout, AxisLayoutMode
 from .numeric import (
-    _integer_sum_requires_object,
     canonical_mean_dtype,
     canonical_sum_dtype,
     checked_numeric_sum,
 )
-from .schema import DatasetSchema, ValueSchema
+from .schema import DatasetSchema
 from .selection import (
-    CoordinateRangeSelection,
     IndexRangeSelection,
     IndexSelection,
     Selection,
@@ -36,14 +38,12 @@ from .validity import (
     Invalid,
     RowComponentValidity,
     Valid,
-    ValidityContract,
     ValidityMode,
 )
 from .value import (
     DataBlock,
     DatasetRevisionRef,
     OwnedSnapshot,
-    Value,
 )
 
 
@@ -95,13 +95,14 @@ class ReductionSpec:
         if not isinstance(self.validity_policy, ValidityPolicy):
             raise TypeError("validity_policy must be ValidityPolicy")
         if self.validity_policy is ValidityPolicy.MIN_COUNT:
-            if (
-                isinstance(self.minimum_valid_count, bool)
-                or not isinstance(self.minimum_valid_count, Integral)
-                or self.minimum_valid_count <= 0
-            ):
-                raise ValueError("MIN_COUNT requires a positive minimum_valid_count")
-            object.__setattr__(self, "minimum_valid_count", int(self.minimum_valid_count))
+            object.__setattr__(
+                self,
+                "minimum_valid_count",
+                positive_integer(
+                    self.minimum_valid_count,
+                    "MIN_COUNT minimum_valid_count",
+                ),
+            )
         elif self.minimum_valid_count is not None:
             raise ValueError("minimum_valid_count is only valid with MIN_COUNT")
         object.__setattr__(self, "axis_ids", tuple(sorted(axis_ids, key=lambda item: item.value)))
@@ -401,61 +402,6 @@ def resolve_transformed_schema(
     return output
 
 
-def resolve_value_transform_schema(
-    schema: ValueSchema,
-    spec: DataTransformSpec,
-) -> ValueSchema:
-    """Resolve one named-axis transform over a single :class:`Value`.
-
-    A ``Value`` has data axes only.  Consequently every operation must name an
-    axis that is still present in ``schema.data_axes``; repeat/point cell-axis
-    operations are rejected as absent rather than being guessed or fabricated.
-    """
-
-    if not isinstance(schema, ValueSchema):
-        raise TypeError("schema must be ValueSchema")
-    if not isinstance(spec, DataTransformSpec):
-        raise TypeError("spec must be DataTransformSpec")
-    state = _run_operations(
-        _value_source_state(schema, values=None, validity=None),
-        spec,
-    )
-    return _value_schema_from_transformed(state.schema)
-
-
-def apply_value_transform(
-    value: Value,
-    spec: DataTransformSpec,
-) -> Value:
-    """Apply one named-axis transform directly to an immutable ``Value``.
-
-    Range selections retain their named axes, index selections explicitly drop
-    only the selected axis, and reductions drop only their declared axes.  No
-    trailing data axis is flattened, selected implicitly, or averaged.
-    """
-
-    if not isinstance(value, Value):
-        raise TypeError("value must be Value")
-    if not isinstance(spec, DataTransformSpec):
-        raise TypeError("spec must be DataTransformSpec")
-    state = _run_operations(
-        _value_source_state(
-            value.schema,
-            values=value.values.reshape((1, *value.schema.data_shape)),
-            validity=_value_source_validity(value),
-        ),
-        spec,
-    )
-    if state.values is None or state.validity is None:
-        raise RuntimeError("materialized Value transform produced no data")
-    schema = _value_schema_from_transformed(state.schema)
-    return Value(
-        state.values.reshape(schema.data_shape),
-        _value_validity_from_transformed(state.validity),
-        schema,
-    )
-
-
 def _compile_transform_schema(
     schema: DatasetSchema,
     spec: DataTransformSpec,
@@ -560,12 +506,16 @@ def materialize_transformed_snapshot(
 ) -> OwnedSnapshot:
     """Execute one cell-preserving transform into its final DataBlock."""
 
+    if not isinstance(snapshot, OwnedSnapshot):
+        raise TypeError("snapshot must be OwnedSnapshot")
     if not isinstance(output_ref, DatasetRevisionRef):
         raise TypeError("output_ref must be DatasetRevisionRef")
     if not isinstance(output_schema, DatasetSchema):
         raise TypeError("output_schema must be DatasetSchema")
     if output_ref.block_id == snapshot.ref.block_id:
         raise ValueError("a transformed snapshot cannot reuse its source BlockId")
+    if output_ref.revision != snapshot.ref.revision:
+        raise ValueError("a transformed snapshot must retain its source revision")
     if output_ref.schema_fingerprint != output_schema.fingerprint:
         raise ValueError("output_ref schema fingerprint differs from output_schema")
     if _source_transformed_schema(output_schema).fingerprint != transform.output_schema_fingerprint:
@@ -611,84 +561,6 @@ def _execute_transform(block: DataBlock, spec: DataTransformSpec) -> _State:
         validity=_source_validity(block),
     )
     return _run_operations(state, spec)
-
-
-def _value_source_state(
-    schema: ValueSchema,
-    *,
-    values: np.ndarray | None,
-    validity: Valid | Invalid | RowComponentValidity | None,
-) -> _State:
-    """Enter the shared transform engine without inventing a cell axis."""
-
-    if not isinstance(schema, ValueSchema):
-        raise TypeError("schema must be ValueSchema")
-    transformed = TransformedSchema(
-        (),
-        AxisLayout.rect_c(()),
-        schema.data_axes,
-        (
-            schema.validity_contract.component_axis_ids
-            if schema.validity_contract.mode is ValidityMode.COMPONENTS
-            else ()
-        ),
-        schema.dtype,
-        schema.value_unit,
-    )
-    return _State(transformed, values, validity)
-
-
-def _value_source_validity(
-    value: Value,
-) -> Valid | Invalid | RowComponentValidity:
-    validity = value.validity
-    if isinstance(validity, (Valid, Invalid)):
-        return validity
-    if isinstance(validity, ComponentValidity):
-        return RowComponentValidity(
-            validity.axis_ids,
-            validity.mask.reshape((1, *validity.mask.shape)),
-        )
-    raise TypeError(f"unsupported Value validity {type(validity).__name__}")
-
-
-def _value_schema_from_transformed(schema: TransformedSchema) -> ValueSchema:
-    if (
-        schema.cell_axes
-        or schema.cell_layout.logical_shape
-        or schema.cell_layout.storage_size != 1
-    ):
-        raise RuntimeError("Value transform cannot produce cell axes")
-    validity_contract = (
-        ValidityContract.components(*schema.validity_axis_ids)
-        if schema.validity_axis_ids
-        else ValidityContract.value()
-    )
-    return ValueSchema(
-        schema.data_axes,
-        validity_contract,
-        schema.dtype,
-        schema.value_unit,
-    )
-
-
-def _value_validity_from_transformed(
-    validity: Valid | Invalid | RowComponentValidity,
-) -> Valid | Invalid | ComponentValidity:
-    if isinstance(validity, (Valid, Invalid)):
-        return validity
-    if not isinstance(validity, RowComponentValidity):
-        raise TypeError(
-            "transformed Value validity must be Valid, Invalid, or "
-            "RowComponentValidity"
-        )
-    if validity.mask.shape[0] != 1:
-        raise RuntimeError("Value transform produced more than one physical row")
-    if validity.axis_ids:
-        return ComponentValidity(validity.axis_ids, validity.mask[0])
-    if validity.mask.shape != (1,):
-        raise RuntimeError("scalar Value validity has an unexpected shape")
-    return VALID if bool(validity.mask[0]) else INVALID
 
 
 def _source_state(
@@ -1344,9 +1216,7 @@ __all__ = [
     "TransformedSchema",
     "ValidityPolicy",
     "apply_transform",
-    "apply_value_transform",
     "commit_transform",
     "materialize_transformed_snapshot",
     "resolve_transformed_schema",
-    "resolve_value_transform_schema",
 ]

@@ -19,7 +19,6 @@ from PyQt5 import QtCore, QtTest, QtWidgets
 from conftest import pulse_backend_completion_for
 from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_neutral_atom.runtime.run import RunState
-from zlc_neutral_atom.timing.board_config import DEFAULT_BOARD_CONFIG
 from zlc_pulse import (
     FIELD_DURATION,
     FrozenScanTable,
@@ -121,7 +120,7 @@ def _scan_document():
 def _server_manifest():
     return pulse_target_manifest_from_xdc(
         load_deployed_pulse_target(),
-        DEFAULT_BOARD_CONFIG,
+        Path(__file__).resolve().parents[1] / "fpga" / "board_config" / "board.xdc",
     )
 
 

@@ -408,8 +408,8 @@ def test_formal_viewer_keeps_old_generation_when_candidate_first_render_fails(
         assert old_board is not None and old_board.front_frame is not None
         old_front = old_board.front_frame
 
-        import Zou_lab_control.workbench as workbench
-        import Zou_lab_control.workbench._figure as figure_workbench
+        import zlc_workbench.data_figure.app as workbench
+        import zlc_workbench.data_figure.render_lane as figure_workbench
 
         original_create = workbench.create_data_figure_pane
         candidates = []

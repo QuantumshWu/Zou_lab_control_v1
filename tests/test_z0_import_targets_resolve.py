@@ -1,13 +1,4 @@
-"""Every first-party import must point at a module that exists -- zero exceptions.
-
-A migration renames and deletes packages for a living, and Python only notices a
-broken import when the line actually runs.  This codebase imports lazily almost
-everywhere -- to keep Qt, SciPy and the pulse compiler off the import path -- so a
-target can rot for a long time with nobody finding out.  After the one-shot legacy
-purge (directive 2026-07-21) the ledger of tolerated breakage is gone with the
-files it named: every tracked ``.py`` file, production and test alike, must import
-only modules that exist on disk.
-"""
+"""Every current first-party import must point at a module that exists."""
 
 from __future__ import annotations
 
@@ -25,10 +16,16 @@ FIRST_PARTY = ("Zou_lab_control", "zlc_data", "zlc_storage", "zlc_pulse",
 
 def _tracked_python_files():
     listing = subprocess.run(
-        ["git", "ls-files", "*.py"],
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "*.py"],
         cwd=ROOT, capture_output=True, text=True, check=True,
     )
-    return tuple(sorted(Path(line) for line in listing.stdout.split() if line))
+    return tuple(
+        sorted(
+            path
+            for line in listing.stdout.splitlines()
+            if line and (path := Path(line)).is_file()
+        )
+    )
 
 
 def _module_exists(dotted: str) -> bool:

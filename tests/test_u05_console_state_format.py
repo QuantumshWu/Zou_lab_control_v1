@@ -1,11 +1,11 @@
-"""The current saved-console format lives in ``zlc_data.console_records``."""
+"""The current saved-console format belongs to the TaskConsole product."""
 
 from __future__ import annotations
 
 import ast
 import pathlib
 
-from zlc_data.console_records import (
+from zlc_workbench.task_console.console_records import (
     CONSOLE_STATE_SCHEMA,
     LOGIC_NODE_CONFIG_FIELDS,
     PANEL_CONFIG_FIELDS,
@@ -25,21 +25,21 @@ def test_all_three_console_record_field_specs_live_together():
     assert TASK_CONSOLE_STATE_FIELDS == {
         "schema": str, "name": str, "interval_ms": int, "panels": list, "logic": list}
     assert set(PANEL_CONFIG_FIELDS) == {
-        "kind", "title", "row", "col", "size", "signal", "params"}
-    assert set(LOGIC_NODE_CONFIG_FIELDS) == {"kind", "name", "title", "values"}
+        "panel_id", "kind", "title", "row", "col", "size", "signal", "params"}
+    assert set(LOGIC_NODE_CONFIG_FIELDS) == {
+        "node_id", "kind", "definition_key", "title", "values"}
     # ``schema`` is a FIELD here, not merely a check: it round-trips into the file, and the
     # exact-key rule means a payload missing it is refused rather than defaulted.
     assert "schema" in TASK_CONSOLE_STATE_FIELDS
     assert "schema" not in PANEL_CONFIG_FIELDS and "schema" not in LOGIC_NODE_CONFIG_FIELDS
 
 
-def test_the_record_module_still_touches_no_filesystem():
-    """The line this slice declined to cross, asserted rather than left as prose.
+def test_the_record_module_touches_no_filesystem():
+    """Records remain renderer-free values; the workbench repository owns I/O."""
 
-    ``zlc_data`` serialises; it does not open files.  If a later slice moves save/load in
-    here, this is the assertion it has to argue with."""
-
-    text = (REPO / "zlc_data" / "console_records.py").read_text(encoding="utf-8")
+    text = (REPO / "zlc_workbench" / "task_console" / "console_records.py").read_text(
+        encoding="utf-8"
+    )
     tree = ast.parse(text)
     modules: set[str] = set()
     for node in ast.walk(tree):

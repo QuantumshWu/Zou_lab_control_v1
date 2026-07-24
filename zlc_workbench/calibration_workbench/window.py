@@ -16,11 +16,12 @@ from zlc_frontend.qt_widgets import (
     GREY,
     ORANGE,
 )
+from zlc_neutral_atom.readout.calibration_application import (
+    CalibrationArtifactRequest,
+)
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
 from zlc_neutral_atom.runtime.run import RunCancelled, RunHandle
-from zlc_storage import positive_real
 from zlc_workbench.calibration import (
-    CalibrationEditorSeed,
     calibration_analysis_form,
     calibration_analysis_from_form,
     calibration_authority_summary,
@@ -44,16 +45,18 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
         computation_loader,
         run_starter,
         *,
-        seed: CalibrationEditorSeed | None,
+        request: CalibrationArtifactRequest | None,
         reference: CalibrationArtifactRef | None,
-        timeout_seconds: float,
     ) -> None:
         if not callable(computation_loader) or not callable(run_starter):
             raise TypeError("calibration Workbench callables must be callable")
-        if (seed is None) == (reference is None):
-            raise ValueError("provide exactly one calibration seed or reference")
-        if seed is not None and not isinstance(seed, CalibrationEditorSeed):
-            raise TypeError("seed must be CalibrationEditorSeed or None")
+        if (request is None) == (reference is None):
+            raise ValueError("provide exactly one calibration request or reference")
+        if request is not None and not isinstance(
+            request,
+            CalibrationArtifactRequest,
+        ):
+            raise TypeError("request must be CalibrationArtifactRequest or None")
         if reference is not None and not isinstance(
             reference,
             CalibrationArtifactRef,
@@ -62,8 +65,8 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
 
         self._computation_loader = computation_loader
         self._run_starter = run_starter
-        self._seed: CalibrationEditorSeed | None = None
-        self._timeout_seconds = positive_real(timeout_seconds, "timeout_seconds")
+        self._request: CalibrationArtifactRequest | None = None
+        self._opened_reference = reference
         self._form: FluentParameterForm | None = None
         self._editor_revision = 0
         self._run_revision: int | None = None
@@ -125,10 +128,10 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
         self._calibrate_button.clicked.connect(self._start_calibration)
         self._stop_button.clicked.connect(self._stop_calibration)
         self._reset_button.clicked.connect(self._reset_request)
-        if seed is not None:
-            self._install_seed(seed)
+        if request is not None:
+            self._install_request(request, previous_reference=None)
             self._status.setText("CALIBRATION REQUEST READY")
-            self._summary.setText(calibration_authority_summary(seed))
+            self._summary.setText(calibration_authority_summary(request))
             self._set_busy(None)
         else:
             assert reference is not None
@@ -138,7 +141,6 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
                 _prepare_calibration_editor,
                 self._computation_loader,
                 reference,
-                self._timeout_seconds,
                 self._cancelled,
             ):
                 self._raster_job_kind = None
@@ -150,7 +152,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
 
     @property
     def editor_ready(self) -> bool:
-        return self._seed is not None and self._form is not None
+        return self._request is not None and self._form is not None
 
     @property
     def worker_idle(self) -> bool:
@@ -162,7 +164,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
 
     def _set_busy(self, kind: str | None) -> None:
         busy = kind is not None
-        ready = self._seed is not None and self._form is not None
+        ready = self._request is not None and self._form is not None
         if self._form is not None:
             self._form.setEnabled(not busy and not self._close_requested)
         self._calibrate_button.setEnabled(not busy and ready)
@@ -171,23 +173,35 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
         if not self._closing:
             self._close_button.setEnabled(not self._close_requested)
 
-    def _install_seed(self, seed: CalibrationEditorSeed) -> None:
-        if not isinstance(seed, CalibrationEditorSeed):
-            raise TypeError("prepare worker returned an invalid editor seed")
+    def _install_request(
+        self,
+        request: CalibrationArtifactRequest,
+        *,
+        previous_reference: CalibrationArtifactRef | None,
+    ) -> None:
+        if not isinstance(request, CalibrationArtifactRequest):
+            raise TypeError("prepare worker returned an invalid calibration request")
+        if previous_reference is not None and not isinstance(
+            previous_reference,
+            CalibrationArtifactRef,
+        ):
+            raise TypeError("previous_reference must be CalibrationArtifactRef or None")
         prior = self._form_scroll.takeWidget()
         if prior is not None:
             prior.deleteLater()
         form = FluentParameterForm(
-            calibration_analysis_form(seed.analysis),
+            calibration_analysis_form(request.analysis),
             parent=self,
         )
         form.setObjectName("calibrationParameters")
         form.changed.connect(self._editor_changed)
         self._form_scroll.setWidget(form)
         self._form = form
-        self._seed = seed
-        self._saved_reference = seed.previous_reference
-        self._authority.setText(calibration_authority_summary(seed))
+        self._request = request
+        self._saved_reference = previous_reference
+        self._authority.setText(
+            calibration_authority_summary(request, previous_reference)
+        )
 
     def _editor_changed(self, *_args) -> None:
         self._editor_revision += 1
@@ -208,14 +222,19 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
     def _start_calibration(self) -> None:
         if not self.worker_idle or self._closing or self._close_requested:
             return
-        seed = self._seed
+        request = self._request
         form = self._form
-        if seed is None or form is None:
+        if request is None or form is None:
             return
         try:
             analysis = calibration_analysis_from_form(
-                seed.analysis,
+                request.analysis,
                 form.read_all(),
+            )
+            frozen_request = CalibrationArtifactRequest(
+                request.source_capture_ref,
+                request.readout_binding,
+                analysis,
             )
         except (TypeError, ValueError) as error:
             self._status.setText("CALIBRATION REQUEST INVALID")
@@ -237,12 +256,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
         try:
             self._run_owner.submit(
                 "start",
-                lambda: self._run_starter(
-                    seed.source_capture_ref,
-                    seed.readout_binding,
-                    analysis,
-                    seed.timeout_seconds,
-                ),
+                lambda: self._run_starter(frozen_request),
                 generation=generation,
             )
         except BaseException as error:
@@ -445,7 +459,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
         kind, self._raster_job_kind = self._raster_job_kind, None
         if kind == "prepare":
             try:
-                seed, bundle, render_error = future.result()
+                request, bundle, render_error = future.result()
                 if bundle is not None and not isinstance(
                     bundle,
                     EncodedRasterDocument,
@@ -461,14 +475,22 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             else:
                 if not self._closing:
                     try:
-                        self._install_seed(seed)
+                        self._install_request(
+                            request,
+                            previous_reference=self._opened_reference,
+                        )
                         displayed = bundle is not None and self._present_bundle(bundle)
                         self._status.setText(
                             "CALIBRATION READY"
                             if render_error is None and (bundle is None or displayed)
                             else "CALIBRATION READY · PRIOR REPORT DISPLAY FAILED"
                         )
-                        self._summary.setText(calibration_authority_summary(seed))
+                        self._summary.setText(
+                            calibration_authority_summary(
+                                request,
+                                self._opened_reference,
+                            )
+                        )
                         if render_error is not None:
                             self._diagnostic.setText(render_error)
                         elif bundle is None or displayed:

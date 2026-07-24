@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import cached_property
 import math
-from typing import Any
+from typing import Any, Mapping
 
 from zlc_data import (
     SCAN_POINT,
@@ -302,6 +302,37 @@ class AutonomousScanSlotProgram:
         if execution_document.api_parameters:
             raise RuntimeError("autonomous SCAN_SLOT retained unresolved APIs")
         object.__setattr__(self, "api_values", api_values)
+
+    @classmethod
+    def from_api_values(
+        cls,
+        document: PulseDocument,
+        values: Mapping[str, int | float] | None = None,
+    ) -> "AutonomousScanSlotProgram":
+        """Freeze the document's complete whole-run API assignment.
+
+        API declaration order and completeness are pulse-scan semantics.  A
+        notebook or GUI may collect the mapping, but it must not independently
+        decide how that mapping becomes an autonomous program.
+        """
+
+        if not isinstance(document, PulseDocument):
+            raise TypeError("document must be PulseDocument")
+        supplied = {} if values is None else dict(values)
+        expected = tuple(
+            parameter.parameter_id for parameter in document.api_parameters
+        )
+        if set(supplied) != set(expected):
+            missing = tuple(key for key in expected if key not in supplied)
+            extra = tuple(key for key in supplied if key not in set(expected))
+            raise ValueError(
+                "SCAN_SLOT requires explicit whole-run values for every API "
+                f"parameter; missing={missing}, extra={extra}"
+            )
+        return cls(
+            document,
+            tuple((key, supplied[key]) for key in expected),
+        )
 
     @property
     def execution_document(self) -> PulseDocument:

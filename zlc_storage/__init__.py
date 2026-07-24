@@ -8,7 +8,6 @@ does not initialize filesystem, journal, or lease machinery.
 from importlib import import_module
 
 from .canonical import (
-    CANONICAL_MEDIA_TYPE,
     CanonicalArrayEvent,
     CanonicalEncodingError,
     CanonicalListEvent,
@@ -64,7 +63,6 @@ def __dir__() -> list[str]:
     return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 __all__ = [
-    "CANONICAL_MEDIA_TYPE",
     "CanonicalEncodingError",
     "CanonicalArrayEvent",
     "CanonicalListEvent",

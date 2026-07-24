@@ -8,7 +8,6 @@ whole-application projection.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from pathlib import Path
 
 from zlc_frontend.form import FormFieldProps, FormSpec
@@ -24,26 +23,6 @@ _VIRTUAL = "virtual"
 _REMOTE_PULSE = "remote_pulse"
 _BACKENDS = frozenset((_VIRTUAL, _REMOTE_PULSE))
 _MIN_POSITIVE_FLOAT = float.fromhex("0x0.0000000000001p-1022")
-
-
-@dataclass(frozen=True, slots=True)
-class ConfiguredDeviceRow:
-    """One read-only row describing what a config will compose."""
-
-    role: str
-    domain: str
-    adapter_kind: str
-    detail: str
-
-    def __post_init__(self) -> None:
-        for field in ("role", "domain", "adapter_kind", "detail"):
-            value = getattr(self, field)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"configured device {field} must be non-empty text")
-            if value != value.strip():
-                raise ValueError(
-                    f"configured device {field} cannot have surrounding whitespace"
-                )
 
 
 def form_spec(
@@ -121,57 +100,6 @@ def form_spec(
                 description="Must be finite and greater than zero.",
             ),
         )
-    )
-
-
-def configured_devices(
-    document: InstallationConfigDocument,
-) -> tuple[ConfiguredDeviceRow, ...]:
-    """Return the exact, read-only device rows for an executable current config."""
-
-    if not isinstance(document, InstallationConfigDocument):
-        raise TypeError("document must be InstallationConfigDocument")
-    if document.backend == _VIRTUAL:
-        seed = _virtual_config(document).seed
-        seed_text = "random" if seed is None else str(seed)
-        return (
-            ConfiguredDeviceRow(
-                "trap",
-                "trap",
-                "VirtualAtomArray",
-                f"Private simulator model; seed={seed_text}",
-            ),
-            ConfiguredDeviceRow(
-                "sequencer",
-                "sequencer",
-                "VirtualSequencer",
-                "In-process pulse target execution",
-            ),
-            ConfiguredDeviceRow(
-                "camera",
-                "camera",
-                "VirtualCamera",
-                "Externally triggered readout camera",
-            ),
-            ConfiguredDeviceRow(
-                "mot_camera",
-                "camera",
-                "VirtualCamera",
-                "MOT camera; free-running live and externally triggered finite acquisition",
-            ),
-        )
-
-    remote = _remote_config(document)
-    return (
-        ConfiguredDeviceRow(
-            "sequencer",
-            "sequencer",
-            "RemotePulseExecutionClient",
-            (
-                f"{remote.host}:{remote.port}; "
-                f"timeout={remote.transport_timeout_seconds:g} s"
-            ),
-        ),
     )
 
 
@@ -278,6 +206,25 @@ class DeviceConfigEditorSession:
         self._backend = backend
         self._values = form_spec(backend).default_values()
         return True
+
+    def replace_new(self, backend: str) -> None:
+        """Start one untitled editor generation for ``backend``.
+
+        ``New`` is a document boundary, not a backend-field edit.  It therefore
+        forgets the previous file/CAS baseline even when the requested backend
+        is unchanged.  The active installation baseline is deliberately kept:
+        it is an independent runtime fact used only for restart-required
+        presentation.
+        """
+
+        backend = _backend(backend)
+        values = form_spec(backend).default_values()
+        self._backend = backend
+        self._values = values
+        self._baseline_backend = backend
+        self._baseline_values = dict(values)
+        self._path = None
+        self._baseline_digest = None
 
     def candidate(self) -> InstallationConfigDocument:
         """Construct and authoritatively validate the current draft."""
@@ -436,8 +383,6 @@ def _same_state(
 
 
 __all__ = [
-    "ConfiguredDeviceRow",
     "DeviceConfigEditorSession",
-    "configured_devices",
     "form_spec",
 ]

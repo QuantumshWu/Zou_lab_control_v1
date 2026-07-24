@@ -8,7 +8,8 @@ adds only the neutral-atom physics that consumes its FINAL artifact:
   fluorescence rule; and
 * refine the grid argmax by a local centre of mass.
 
-There is no host-stepped fallback and no child-plan/workflow engine.
+Autonomous SCAN_SLOT execution is the normal path; this module contains only
+the concrete MOT scan physics and result materialization.
 """
 
 from __future__ import annotations
@@ -17,30 +18,48 @@ from dataclasses import dataclass, replace
 from itertools import product
 import math
 from numbers import Integral, Real
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
 from zlc_data import (
+    REPEAT,
     SPATIAL_X,
     SPATIAL_Y,
+    AxisId,
     AxisSpec,
+    BlockId,
+    DataBlock,
+    DatasetRevision,
     DatasetSchema,
+    OwnedSnapshot,
+    PointLayout,
+    StreamGenerationId,
+    VALID,
     ValidityContract,
     ValueSchema,
     expand_dataset_validity,
     immutable_array,
 )
 from zlc_neutral_atom.catalog import DefinitionKey, TaskDefinition
+from zlc_neutral_atom.dataset_output import (
+    FinalDatasetOutput,
+    final_dataset_join_digest,
+)
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.scan import AutonomousScanSlotProgram, ScanArtifactRef
+from zlc_neutral_atom.scan.reference import scan_artifact_ref_to_tree
 from zlc_neutral_atom.scan.repository import MaterializedScanData
 from zlc_pulse import FrozenScanTable, PulseDocument, freeze_scan_table
 from zlc_pulse.document import FIELD_DAC
-from zlc_storage import canonical_text, finite_real, positive_real
+from zlc_storage import canonical_digest, canonical_text, finite_real, positive_real
+
+if TYPE_CHECKING:
+    from zlc_neutral_atom.scan.source_binding import ScanRequest
 
 
 MOT_SCAN_PARAMETER_IDS = ("da_x", "da_y", "da_z")
+MOT_FIELD_FINAL_OUTPUT_NAMES = ("mot_field", "scan")
 MOT_FIELD_REQUEST_SCHEMA = "zlc_neutral_atom.MotFieldRequest"
 MOT_FIELD_TASK_KEY = DefinitionKey(
     "zlc_neutral_atom.mot_field",
@@ -52,6 +71,13 @@ MOT_FIELD_TASK_DEFINITION = TaskDefinition(
     MOT_FIELD_REQUEST_SCHEMA,
 )
 MOT_FIELD_TASK_DEFINITIONS = (MOT_FIELD_TASK_DEFINITION,)
+DEFAULT_MOT_FIELD_CAMERA_ROLE = "mot_camera"
+DEFAULT_MOT_FIELD_CENTER_CODE = 0.0
+DEFAULT_MOT_FIELD_SPAN_CODE = 12.0
+DEFAULT_MOT_FIELD_POINTS = 7
+MINIMUM_MOT_FIELD_POINTS = 2
+DEFAULT_MOT_FIELD_ROI_CENTER_PX = 0.0
+DEFAULT_MOT_FIELD_ROI_RADIUS_PX = 8.0
 
 
 def _axis_codes(center: float, span: float, points: int) -> tuple[int, ...]:
@@ -60,8 +86,11 @@ def _axis_codes(center: float, span: float, points: int) -> tuple[int, ...]:
     if isinstance(points, bool) or not isinstance(points, Integral):
         raise TypeError("MOT points must be an integer")
     points = int(points)
-    if points < 2:
-        raise ValueError("MOT points must be at least 2")
+    if points < MINIMUM_MOT_FIELD_POINTS:
+        raise ValueError(
+            "MOT points must be at least "
+            f"{MINIMUM_MOT_FIELD_POINTS}"
+        )
     values = np.unique(
         np.round(np.linspace(center - span, center + span, points)).astype(int)
     )
@@ -133,7 +162,7 @@ class MotFieldRequest:
     sequencer_ref: DeviceRef
     roi_cx: float | None = None
     roi_cy: float | None = None
-    roi_radius: float = 8.0
+    roi_radius: float = DEFAULT_MOT_FIELD_ROI_RADIUS_PX
     trigger_channel: str | None = None
 
     def __post_init__(self) -> None:
@@ -161,6 +190,24 @@ class MotFieldRequest:
                 "trigger_channel",
                 canonical_text(self.trigger_channel, "trigger_channel"),
             )
+
+    def as_scan_request(self) -> "ScanRequest":
+        """Expose the exact Camera scan owned by this MOT request.
+
+        The notebook supplies installation identities when constructing this
+        request; the MOT domain, not that facade, owns how its physics intent
+        maps onto the generic scan application.
+        """
+
+        from zlc_neutral_atom.scan.source_binding import ScanRequest
+
+        return ScanRequest(
+            program=self.program,
+            camera_ref=self.camera_ref,
+            sequencer_ref=self.sequencer_ref,
+            trigger_channel=self.trigger_channel,
+            output_transform_spec=None,
+        )
 
 
 @dataclass(frozen=True, eq=False)
@@ -209,7 +256,7 @@ class MotFieldResult:
 
 
 class MotRoiProjector:
-    """Reusable Main-compatible ROI geometry for one camera frame shape."""
+    """Reusable circular ROI geometry for one camera frame shape."""
 
     __slots__ = (
         "_frame_shape",
@@ -323,7 +370,7 @@ def mot_roi_intensity(
     *,
     validity: np.ndarray | None = None,
 ) -> float:
-    """Mean circular-ROI counts minus annulus mean using Main's rule."""
+    """Mean circular-ROI counts minus the surrounding annulus mean."""
 
     data = np.asarray(frame)
     if data.ndim != 2:
@@ -432,7 +479,7 @@ def refine_mot_optimum(
     block: np.ndarray,
     axes: Sequence[Sequence[int | float]],
 ) -> tuple[tuple[float, float, float], float]:
-    """Refine the grid argmax using main's local 3^n centre-of-mass rule."""
+    """Refine the grid argmax using a local 3^n centre-of-mass rule."""
 
     values = np.asarray(block, dtype=float)
     coordinates = tuple(np.asarray(axis, dtype=float) for axis in axes)
@@ -502,12 +549,104 @@ def analyze_mot_scan(
     )
 
 
+def materialize_mot_field_snapshot(result: MotFieldResult) -> OwnedSnapshot:
+    """Express a typed logical 3-D MOT result in Dataset storage order."""
+
+    if not isinstance(result, MotFieldResult):
+        raise TypeError("result must be MotFieldResult")
+    axes = tuple(result.point_axes)
+    layout = PointLayout.rect_c(tuple(axis.size for axis in axes))
+    physical = np.empty((1, layout.storage_size, 1), dtype="<f8")
+    for storage_index in range(layout.storage_size):
+        physical[0, storage_index, 0] = result.intensity[
+            layout.multi_index(storage_index)
+        ]
+    identity = canonical_digest(
+        {
+            "owner": "zlc_neutral_atom.mot-field-result",
+            "repository_id": result.scan_ref.repository_id,
+            "scan_manifest": result.scan_ref.manifest_digest,
+            "axes": tuple(
+                tuple(axis.coordinate_at(index) for index in range(axis.size))
+                for axis in result.point_axes
+            ),
+            "intensity": np.asarray(result.intensity).tolist(),
+            "best_field": result.best_field,
+            "best_intensity": result.best_intensity,
+        }
+    )
+    schema = DatasetSchema(
+        AxisSpec(
+            AxisId("mot-field.repeat"),
+            "repeat",
+            REPEAT,
+            1,
+            (0,),
+        ),
+        axes,
+        layout,
+        ValueSchema.scalar(np.dtype("<f8"), "counts"),
+    )
+    block = DataBlock(
+        BlockId(f"mot-field-intensity-{identity[:20]}"),
+        DatasetRevision(0),
+        physical,
+        VALID,
+        schema,
+    )
+    generation = StreamGenerationId(f"mot-field-result-{identity}")
+    return OwnedSnapshot(block.ref(generation), block)
+
+
+def mot_field_final_outputs(
+    result: MotFieldResult,
+    source_scan: MaterializedScanData,
+) -> dict[str, FinalDatasetOutput]:
+    """Publish the analyzed MOT grid and its exact source scan together."""
+
+    if not isinstance(result, MotFieldResult):
+        raise TypeError("result must be MotFieldResult")
+    if not isinstance(source_scan, MaterializedScanData):
+        raise TypeError("source_scan must be MaterializedScanData")
+    if source_scan.artifact_ref != result.scan_ref:
+        raise ValueError("MOT result and materialized source name different scans")
+    source_identity = scan_artifact_ref_to_tree(result.scan_ref)
+    snapshots = dict(
+        zip(
+            MOT_FIELD_FINAL_OUTPUT_NAMES,
+            (materialize_mot_field_snapshot(result), source_scan.snapshot),
+            strict=True,
+        )
+    )
+    return {
+        name: FinalDatasetOutput(
+            name,
+            snapshot,
+            final_dataset_join_digest(
+                owner="mot-field",
+                output_name=name,
+                source_identity=source_identity,
+                snapshot=snapshot,
+            ),
+        )
+        for name, snapshot in snapshots.items()
+    }
+
+
 __all__ = [
+    "DEFAULT_MOT_FIELD_CAMERA_ROLE",
+    "DEFAULT_MOT_FIELD_CENTER_CODE",
+    "DEFAULT_MOT_FIELD_POINTS",
+    "DEFAULT_MOT_FIELD_ROI_CENTER_PX",
+    "DEFAULT_MOT_FIELD_ROI_RADIUS_PX",
+    "DEFAULT_MOT_FIELD_SPAN_CODE",
     "MOT_FIELD_REQUEST_SCHEMA",
+    "MOT_FIELD_FINAL_OUTPUT_NAMES",
     "MOT_FIELD_TASK_DEFINITION",
     "MOT_FIELD_TASK_DEFINITIONS",
     "MOT_FIELD_TASK_KEY",
     "MOT_SCAN_PARAMETER_IDS",
+    "MINIMUM_MOT_FIELD_POINTS",
     "MotFieldRequest",
     "MotFieldResult",
     "MotRoiProjector",
@@ -515,6 +654,8 @@ __all__ = [
     "build_mot_intensity_projector",
     "build_mot_scan_program",
     "mot_intensity_schema",
+    "materialize_mot_field_snapshot",
+    "mot_field_final_outputs",
     "mot_roi_intensity",
     "refine_mot_optimum",
 ]

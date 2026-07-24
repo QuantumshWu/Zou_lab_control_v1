@@ -65,7 +65,7 @@ from zlc_frontend.matplotlib_render import (
     release_agg_figure,
 )
 from zlc_frontend.selector import CurveRangeGesture
-from Zou_lab_control.workbench import _figure as figure_workbench
+import zlc_workbench.data_figure.app as figure_workbench
 
 
 @pytest.fixture(scope="module")
@@ -357,7 +357,7 @@ def test_curve_grid_focus_interaction_back_and_atomic_exports(
 ) -> None:
     figure = _curve_grid()
     expected = figure.evaluated.layers[0].cells[1].series
-    window = figure_workbench.open_data_figure_workbench(figure)
+    window = figure_workbench.create_data_figure_pane(figure)
     try:
         _until(application, lambda: window.raster_ready and window.worker_idle)
         overview = window._grid_overview
@@ -449,7 +449,7 @@ def test_failed_curve_focus_does_not_publish_worker_cache(
         "render_interactive_curve",
         rejected_render,
     )
-    window = figure_workbench.open_data_figure_workbench(figure)
+    window = figure_workbench.create_data_figure_pane(figure)
     try:
         _until(application, lambda: window.raster_ready and window.worker_idle)
         overview = window._grid_overview
@@ -469,7 +469,7 @@ def test_rejected_curve_present_keeps_worker_cache_for_retry(
     application,
     monkeypatch,
 ) -> None:
-    window = figure_workbench.open_data_figure_workbench(_curve_grid())
+    window = figure_workbench.create_data_figure_pane(_curve_grid())
     try:
         _until(application, lambda: window.raster_ready and window.worker_idle)
         overview = window._grid_overview
@@ -510,7 +510,7 @@ def test_escape_during_curve_rerender_cannot_late_present(
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(SinglePanelAggRenderer, "render_interactive_curve", blocked)
-    window = figure_workbench.open_data_figure_workbench(figure)
+    window = figure_workbench.create_data_figure_pane(figure)
     try:
         _until(application, lambda: window.raster_ready and window.worker_idle)
         overview = window._grid_overview
@@ -549,7 +549,7 @@ def test_close_during_curve_focus_cannot_present_a_late_front(
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(DataFigure, "focused_typed_panel", blocked)
-    window = figure_workbench.open_data_figure_workbench(figure)
+    window = figure_workbench.create_data_figure_pane(figure)
     _until(application, lambda: window.raster_ready and window.worker_idle)
     overview = window._grid_overview
     assert overview is not None
@@ -563,7 +563,7 @@ def test_close_during_curve_focus_cannot_present_a_late_front(
 
 
 def test_multi_layer_curve_grid_stays_on_complete_encoded_fallback(application) -> None:
-    window = figure_workbench.open_data_figure_workbench(_curve_grid(layers=2))
+    window = figure_workbench.create_data_figure_pane(_curve_grid(layers=2))
     try:
         _until(application, lambda: window.raster_ready and window.worker_idle)
         assert window._view_family == "encoded"
@@ -585,7 +585,7 @@ def test_noninteractive_curve_axes_keep_complete_encoded_fallback(
     application,
     coordinates,
 ) -> None:
-    window = figure_workbench.open_data_figure_workbench(
+    window = figure_workbench.create_data_figure_pane(
         _curve_grid(scan_coordinates=coordinates)
     )
     try:

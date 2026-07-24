@@ -119,7 +119,7 @@ capacity distinguishes the one-time FIRE transition from the steady sweep.
 The algorithm is bounded by the stored edge/point data, not by `loop_count`.
 
 Trigger schedules and playback objects are optional materialized projections.
-They return immediately when no channel is requested and reject projections
-above their explicit cardinality limit; the authoritative compact TargetIR and
-the hardware execution path remain valid without expanding billions of loop
-iterations in host memory.
+They return immediately when no channel is requested. The authoritative
+compact TargetIR and hardware execution path do not depend on materializing a
+projection; a requested projection either completes or reports its operation
+error.

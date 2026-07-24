@@ -18,17 +18,15 @@ import time
 import weakref
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from qframelesswindow import FramelessWindow, StandardTitleBar
 
 from ..typography import FONT_FAMILY, FONT_PATH
 
 from .style import (
     ACCENT,
-    API_VIOLET,
-    API_VIOLET_DARK,
     AUTO_SCALE_BASIS,
     AUTO_SCALE_MARGIN,
     BG,
-    CARD_PAD,
     CARD_TITLE_PX,
     COMBO_TRI_SIZE,
     COMBO_WIDTH,
@@ -40,13 +38,10 @@ from .style import (
     FONT_SIZE,
     GREEN,
     GREY,
-    HINT,
     HOVER,
     MUTED_LABEL_STYLE,
     ORANGE,
     ORANGE_DARK,
-    ORANGE_TINT,
-    PADDING_H,
     PADDING_V,
     PLACEHOLDER,
     RADIUS,
@@ -62,30 +57,9 @@ from .style import (
     WINDOW_MIN_FLOOR_PX,
     WINDOW_MIN_PX,
     WINDOW_PAD,
-    WINDOW_SCREEN_FRACTION,
     WINDOW_TITLEBAR_FLOOR_PX,
     WINDOW_TITLEBAR_PX,
-    YELLOW,
 )
-
-try:  # Provided by the PyQt5-Frameless-Window distribution (module qframelesswindow).
-    from qframelesswindow import FramelessWindow, StandardTitleBar
-except ImportError:  # pragma: no cover - depends on the desktop package.
-    # Degrade to a plain top-level window, but make the missing dependency LOUD:
-    # a silent fallback once hid a requirements typo and shipped a frameless-less
-    # GUI on the real machine.  Install "PyQt5-Frameless-Window" to get the
-    # Fluent title bar.
-    import warnings
-
-    warnings.warn(
-        "qframelesswindow not installed (pip install PyQt5-Frameless-Window); "
-        "falling back to a plain window without the Fluent title bar.",
-        RuntimeWarning,
-        stacklevel=2,
-    )
-    FramelessWindow = QtWidgets.QWidget
-    StandardTitleBar = None
-
 
 def window_pad(mult: float = 1.0) -> int:
     """The window padding / card-gap at ``mult`` x the single :data:`WINDOW_PAD` unit, display-scaled."""
@@ -105,10 +79,6 @@ _WINDOWS_FLUENT_FONT_FILES = (
 )
 # Matches one float token; used by align_to_resolution to snap numbers inside a value.
 _FLOAT_TOKEN_RE = re.compile(r"(?<![A-Za-z_])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
-
-
-def fluent_scale() -> float:
-    return _FLUENT_SCALE
 
 
 # The fluent design-basis window: the automatic scale fits this logical size
@@ -527,93 +497,11 @@ def signals_blocked(*widgets: QtWidgets.QWidget | None):
             widget.blockSignals(previous)
 
 
-@contextlib.contextmanager
-def batched_updates(*widgets: QtWidgets.QWidget | None):
-    """Suspend repaints on each widget for a bulk change, repainting once after.
-
-    Wrap a teardown + rebuild of many child widgets in this so each ``addWidget``
-    on the (visible) tree does not trigger its own relayout + repaint; the single
-    repaint on exit is the dominant speed-up for large dynamic panels.
-    """
-
-    saved = [(w, w.updatesEnabled()) for w in widgets if w is not None]
-    for widget, _previous in saved:
-        widget.setUpdatesEnabled(False)
-    try:
-        yield
-    finally:
-        for widget, previous in saved:
-            widget.setUpdatesEnabled(previous)
-
-
 def format_compact_number(value: float, *, digits: int = 12) -> str:
     if not math.isfinite(float(value)):
         return str(value)
     text = f"{float(value):.{digits}g}"
     return text.replace("e+0", "e").replace("e+", "e")
-
-
-def _confocal_float2str(value: float, *, length: int | None = None) -> str:
-    """Match Confocal_GUIv2.helper.float2str for numeric spin boxes."""
-
-    if length is not None:
-        length = max(int(length), 5)
-        sign = "-" if value < 0 else ""
-        abs_val = abs(float(value))
-        int_part = str(int(abs_val))
-        dec_places = length - len(sign) - len(int_part) - 1
-        if dec_places < 0:
-            dec_places = 0
-        text = f"{float(value):.{dec_places}f}"
-        if "." in text:
-            text = text.rstrip("0").rstrip(".")
-        return text[:length]
-    return str(value)
-
-
-#: SI engineering prefixes, matching Confocal_GUIv2.helper.float2str_eng's ``si_map`` (one source of
-#: the n/µ/m/k/M/G/T substitution).  Read-only value DISPLAYS (a device read-back, a range label)
-#: engineering-scale through :func:`eng_mantissa_prefix`; the editable spin box stays plain decimal
-#: (confocal does NOT SI-scale its editor -- so does ``FluentDoubleSpinBox``).
-_SI_PREFIX = {-9: "n", -6: "µ", -3: "m", 0: "", 3: "k", 6: "M", 9: "G", 12: "T"}
-
-
-def eng_mantissa_prefix(value: float, *, length: int = 6) -> tuple[str, str]:
-    """Split ``value`` into ``(mantissa_string, si_prefix)`` for a READ-ONLY engineering display,
-    matching Confocal_GUIv2's ``float2str_eng``: a plain decimal when ``0.001 < |x| < 1000`` (prefix
-    ``""``), otherwise the mantissa in ``[1, 1000)`` times an SI prefix (``6.83e9 -> ("6.83", "G")``,
-    ``5e-3 -> ("5", "m")``).  Returned split (not glued) so a caller can attach the prefix to the UNIT
-    -- ``f"{mant} {prefix}{unit}"`` reads ``"6.83 GHz"``.  ``length`` caps the mantissa width."""
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return str(value), ""
-    if not math.isfinite(v):
-        return ("nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")), ""
-    if v == 0.0:
-        return "0", ""
-    length = max(int(length), 5)
-    sign = "-" if v < 0 else ""
-    a = abs(v)
-    if 0.001 < a < 1000.0:                       # the human-comfortable band: plain decimal, no prefix
-        mant, exp = a, 0
-    else:
-        exp = int(math.floor(math.log10(a) / 3.0) * 3)
-        exp = max(-9, min(12, exp))              # clamp to the prefixes we actually have
-        mant = a / (10.0 ** exp)
-    dec = max(0, length - len(sign) - len(str(int(mant))) - 1)   # room for sign + int part + '.'
-    text = f"{mant:.{dec}f}"
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return f"{sign}{text}", _SI_PREFIX[exp]
-
-
-def float2str_eng(value: float, *, length: int = 6) -> str:
-    """Engineering-scaled string (mantissa glued to its SI prefix): ``6.83e9 -> "6.83G"`` -- the
-    prefix-attached-to-number form for a range label; :func:`eng_mantissa_prefix` keeps them split
-    when the prefix must ride the unit instead."""
-    mant, prefix = eng_mantissa_prefix(value, length=length)
-    return f"{mant}{prefix}"
 
 
 def align_to_resolution(value: str | float, resolution: float, *, allow_any: bool = True) -> str:
@@ -1046,128 +934,6 @@ class FluentButton(QtWidgets.QPushButton):
         return self._dirty
 
 
-class FluentTriStateToggle(QtWidgets.QAbstractButton):
-    """Capsule-style MUTUALLY-EXCLUSIVE multi-state toggle -- a faithful port of the Confocal-GUIv2
-    ``TriStateToggleSwitch`` (the "on start: single / replace / parallel" capsule).  ALL option labels
-    stay visible and a white thumb slides to overlay the active one; clicking cycles to the next state.
-    The track is the placeholder grey, the thumb white, the labels the standard text colour (sizes /
-    colours read from this module's tokens + ``scaled_px``, so it scales with DPI).
-
-    It exposes the SAME ``currentText`` / ``setCurrentText`` / ``activated(int)`` surface as
-    :class:`FluentComboBox`, so a param form's choice handler swaps a toggle for a combo with no other
-    change (it only decides which to BUILD; read / write / wiring are identical)."""
-
-    activated = QtCore.pyqtSignal(int)          # mirrors QComboBox.activated(int): a USER pick (a cycle)
-
-    def __init__(self, options, parent=None):
-        super().__init__(parent)
-        self._options = [str(o) for o in options] or [""]
-        self._state = 0
-        self._offset = 0.0
-        self._animating = False
-        self.setCursor(QtCore.Qt.PointingHandCursor)
-        self.setFont(QtGui.QFont(FONT, fluent_font_size()))
-        self._anim = QtCore.QPropertyAnimation(self, b"offset", self)
-        self._anim.setDuration(150)
-        self._anim.stateChanged.connect(self._on_anim_state_changed)
-        # A FIXED size policy pins the capsule to its sizeHint (= widest label per
-        # segment): a settings row adds the control with ``addWidget(control, 1)`` so a
-        # default (Minimum) horizontal policy lets the row stretch the toggle to fill the
-        # whole row -- the segments would balloon far past their text.  Fixed both ways
-        # keeps each segment exactly as wide as its label needs.
-        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        self.setMinimumSize(self.sizeHint())
-
-    def _seg_width(self) -> float:
-        return self.width() / max(1, len(self._options))
-
-    def sizeHint(self) -> QtCore.QSize:
-        fm = QtGui.QFontMetrics(self.font())
-        pad = scaled_px(18, minimum=12)
-        seg = max((fluent_text_width(fm, o) for o in self._options), default=0) + pad
-        return QtCore.QSize(int(seg * len(self._options)), scaled_px(30, minimum=24))
-
-    def paintEvent(self, event) -> None:
-        del event
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        seg = self._seg_width()
-        margin = scaled_px(3, minimum=2)
-        # 1) capsule track (placeholder grey; muted when disabled)
-        painter.setBrush(QtGui.QBrush(QtGui.QColor(PLACEHOLDER if self.isEnabled() else BG)))
-        painter.setPen(QtCore.Qt.NoPen)
-        painter.drawRoundedRect(0, 0, w, h, h / 2, h / 2)
-        # 2) white thumb overlaying the active segment (animated x while sliding)
-        x = self._offset if self._animating else self._state * seg
-        th = max(1, h - 2 * margin)
-        painter.setBrush(QtGui.QBrush(QtGui.QColor("#FFFFFF")))
-        painter.drawRoundedRect(int(x + margin), int(margin), int(seg - 2 * margin), int(th), th / 2, th / 2)
-        # 3) labels on top, centred per segment
-        painter.setPen(QtGui.QColor(TEXT if self.isEnabled() else PLACEHOLDER))
-        for i, label in enumerate(self._options):
-            painter.drawText(QtCore.QRectF(i * seg, 0, seg, h), QtCore.Qt.AlignCenter, label)
-        painter.end()
-
-    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        # Click-to-segment: the active state is the segment the user actually clicked,
-        # not the "next" one (cycling forces a user to walk past intermediate states to
-        # reach the one they want).  Map the press x to a segment index, clamped in range.
-        if event.button() != QtCore.Qt.LeftButton:
-            super().mousePressEvent(event)
-            return
-        seg = self._seg_width()
-        idx = int(event.x() // seg) if seg > 0 else 0
-        idx = max(0, min(idx, len(self._options) - 1))
-        if idx != self._state:
-            prev = self._state
-            self._state = idx
-            self._animate(prev, idx)
-            self.activated.emit(self._state)
-        event.accept()
-
-    def _animate(self, prev_idx: int, new_idx: int) -> None:
-        seg = self._seg_width()
-        if not self.isEnabled() or self.width() <= 0:
-            self._offset = new_idx * seg
-            self.update()
-            return
-        self._anim.stop()
-        self._anim.setStartValue(prev_idx * seg)
-        self._anim.setEndValue(new_idx * seg)
-        self._anim.start()
-
-    def _on_anim_state_changed(self, new_state, _old) -> None:
-        self._animating = new_state == QtCore.QAbstractAnimation.Running
-        if not self._animating:
-            self._offset = self._state * self._seg_width()
-            self.update()
-
-    def getOffset(self) -> float:
-        return float(self._offset)
-
-    def setOffset(self, value: float) -> None:
-        self._offset = float(value)
-        self.update()
-
-    offset = QtCore.pyqtProperty(float, fget=getOffset, fset=setOffset)
-
-    # ---- QComboBox-compatible surface (so a choice handler is widget-agnostic) ----
-    def currentText(self) -> str:
-        return self._options[self._state] if self._options else ""
-
-    def setCurrentText(self, text: str) -> None:
-        for i, opt in enumerate(self._options):
-            if opt == str(text):
-                self._state = i
-                self._offset = i * self._seg_width()
-                self.update()
-                return
-
-    def state(self) -> int:                       # confocal parity: the active index
-        return self._state
-
-
 def _apply_fluent_context_menu(widget, event) -> None:
     """Pop ``widget``'s right-click menu with the Fluent rounded-card chrome instead of the platform's
     opaque SQUARE "black box" menu.  The ONE shared context-menu builder for every editable text widget
@@ -1541,7 +1307,7 @@ class FluentPathEdit(QtWidgets.QWidget):
     def _dialog_start(self) -> str:
         """Where the Browse dialog opens: the current path if it's a real file/dir or sits in
         a real directory the user typed; otherwise ``base_dir`` (the folder these files live
-        in, created if needed) so a BARE default like ``mot_field_template.json`` still lands in
+        in, when it exists) so a BARE default like ``mot_field_template.json`` still lands in
         ``pulses/`` rather than the CWD; otherwise the CWD."""
         import os
         cur = self.edit.text().strip()
@@ -1552,12 +1318,8 @@ class FluentPathEdit(QtWidgets.QWidget):
             return cur
         if self._base_dir:
             base = os.path.abspath(self._base_dir)
-            if not os.path.isdir(base):
-                try:
-                    os.makedirs(base, exist_ok=True)
-                except OSError:
-                    return os.getcwd()
-            return base
+            if os.path.isdir(base):
+                return base
         return os.getcwd()
 
     def text(self) -> str:
@@ -1648,7 +1410,7 @@ class FluentSettingRow(QtWidgets.QWidget):
         h.addWidget(lbl)
         # A control that FILLS the cell (a combo / line-edit / spin / switch -- Expanding/Preferred
         # horizontal policy) is stretched so its left edge sits flush against the label column.  A
-        # control pinned to its sizeHint (FIXED horizontal policy -- the FluentTriStateToggle capsule,
+        # control pinned to its sizeHint (FIXED horizontal policy -- compact controls,
         # a FluentButton) must NOT be stretched: a stretch cell CENTRES a non-filling widget, so the
         # toggle would float in the middle of the row instead of left-aligning under its label.  Add it
         # left-aligned with a trailing stretch instead (confocal's TriStateToggleSwitch row idiom), so
@@ -1700,7 +1462,7 @@ class _RoundedPopupCard(QtCore.QObject):
             return True
         if et == QtCore.QEvent.Move and self._combo is not None and isinstance(obj, QtWidgets.QWidget):
             geo = obj.geometry()
-            target = self._combo._popup_origin(geo.width())
+            target = self._combo._popup_origin(geo.width(), geo.height())
             if abs(geo.top() - target.y()) > 1 or geo.left() != target.x():
                 obj.move(target)
             return False
@@ -1880,16 +1642,6 @@ def fluent_confirm(
 _COMBO_MAX_VISIBLE_ITEMS = 12
 
 
-def _available_height_below_anchor(anchor: QtWidgets.QWidget, gap: int) -> int | None:
-    """Return the popup height that fits below ``anchor`` on its current screen."""
-
-    screen = anchor.screen() if hasattr(anchor, "screen") else QtWidgets.QApplication.primaryScreen()
-    if screen is None:
-        return None
-    top = anchor.mapToGlobal(QtCore.QPoint(0, anchor.height())).y() + int(gap)
-    return max(0, screen.availableGeometry().bottom() - top + 1)
-
-
 class FluentComboBox(QtWidgets.QComboBox):
     """A non-editable Fluent combo that paints its own current text.
 
@@ -2032,7 +1784,7 @@ class FluentComboBox(QtWidgets.QComboBox):
     def showPopup(self):  # noqa: N802 - Qt naming
         # Reconfigure the popup container (translucent + rounded-card event filter)
         # in case Qt rebuilt it since __init__.  The OUTER gap (dropdown sits a few
-        # px off the box) AND the ALWAYS-DOWNWARD placement are enforced by the
+        # px off the box) and screen-aware placement are enforced by the
         # container's Move event filter (_RoundedPopupCard), which beats Qt's
         # deferred flush-positioning that a showPopup-time move() cannot.
         self._configure_popup_container()
@@ -2051,7 +1803,7 @@ class FluentComboBox(QtWidgets.QComboBox):
         if container is not None and container is not self:
             container.setFixedWidth(width)
         self._resize_popup_to_contents()
-        self._place_popup_below()
+        self._place_popup()
 
     def _popup_text_width(self) -> int:
         view = self.view()
@@ -2069,25 +1821,59 @@ class FluentComboBox(QtWidgets.QComboBox):
         available = screen.availableGeometry() if screen is not None else None
         return int(min(width, available.width()) if available is not None else width)
 
-    def _popup_origin(self, popup_width: int) -> QtCore.QPoint:
-        anchor = self.mapToGlobal(QtCore.QPoint(0, self.height()))
-        left = anchor.x() if popup_width <= self.width() else anchor.x() + self.width() - popup_width
+    def _popup_vertical_space(self) -> tuple[int, int, QtCore.QRect | None]:
+        """Return usable space below/above the field on its active screen."""
+
         screen = self.screen() if hasattr(self, "screen") else None
         available = screen.availableGeometry() if screen is not None else None
+        if available is None:
+            return (QtWidgets.QWIDGETSIZE_MAX, 0, None)
+        top = self.mapToGlobal(QtCore.QPoint(0, 0)).y()
+        bottom = self.mapToGlobal(QtCore.QPoint(0, self.height())).y()
+        below_top = max(available.top(), bottom + self._gap)
+        above_bottom = min(available.bottom(), top - self._gap)
+        below = max(0, available.bottom() - below_top + 1)
+        above = max(0, above_bottom - available.top() + 1)
+        return below, above, available
+
+    def _popup_origin(self, popup_width: int, popup_height: int) -> QtCore.QPoint:
+        anchor_top = self.mapToGlobal(QtCore.QPoint(0, 0))
+        anchor_bottom = self.mapToGlobal(QtCore.QPoint(0, self.height()))
+        left = (
+            anchor_bottom.x()
+            if popup_width <= self.width()
+            else anchor_bottom.x() + self.width() - popup_width
+        )
+        screen = self.screen() if hasattr(self, "screen") else None
+        available = screen.availableGeometry() if screen is not None else None
+        below, above, _ = self._popup_vertical_space()
+        if popup_height <= below or below >= above:
+            top = anchor_bottom.y() + self._gap
+        else:
+            top = anchor_top.y() - self._gap - popup_height
         if available is not None:
             left = max(available.left(), min(left, available.right() - popup_width + 1))
-        return QtCore.QPoint(int(left), anchor.y() + self._gap)
+            top = max(
+                available.top(),
+                min(top, available.bottom() - popup_height + 1),
+            )
+        return QtCore.QPoint(int(left), int(top))
 
-    def _place_popup_below(self) -> None:
-        """Force the open drop-down to sit BELOW the box (never flipped above it).
+    def _place_popup(self) -> None:
+        """Place the open drop-down on the side with usable screen space.
 
-        The Move filter reapplies the same target after Qt's deferred placement.
-        Wide content grows left from the field's right edge; vertical overflow scrolls."""
+        Below is preferred when it fits.  Otherwise the popup moves above; if
+        neither side fits, the larger side gets a scrolling popup.  Wide
+        content still grows left from the field's right edge.  The Move filter
+        reapplies this same target after Qt's deferred native placement.
+        """
         view = self.view()
         container = view.window() if view is not None else None
         if container is None or container is self:
             return
-        container.move(self._popup_origin(container.width()))
+        container.move(
+            self._popup_origin(container.width(), container.height())
+        )
 
     def _popup_pad(self) -> int:
         return 2 * self._gap
@@ -2106,8 +1892,10 @@ class FluentComboBox(QtWidgets.QComboBox):
         if row_h <= 0:
             row_h = view.fontMetrics().height() + scaled_px(8)
         desired = rows * row_h + 2 * view.frameWidth() + self._popup_pad()
-        available = _available_height_below_anchor(self, self._gap)
-        return int(desired if available is None else min(desired, available))
+        below, above, available = self._popup_vertical_space()
+        if available is None:
+            return int(desired)
+        return int(min(desired, max(below, above)))
 
     def _resize_popup_to_contents(self, *_) -> None:
         """Apply one content/available-space height contract to list and tree popups."""
@@ -2975,7 +2763,7 @@ class FluentSpinBox(_WheelFocusGuardMixin, QtWidgets.QSpinBox):
         self.setMinimumHeight(scaled_px(30, minimum=22))
         # Left-align with zero internal text margins so the text's left inset is
         # exactly the stylesheet ``padding`` (EDIT_PADDING_H) -- identical to a
-        # plain FluentLineEdit / FluentScanLineEdit.  Center alignment made the
+        # plain FluentLineEdit.  Center alignment made the
         # left gap content-dependent and looked narrower than the line edits.
         self.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.lineEdit().setTextMargins(0, 0, 0, 0)
@@ -3028,17 +2816,6 @@ class FluentInputDialog(QtWidgets.QDialog):
         return "", False
 
 
-def fluent_text_prompt(
-    parent,
-    title: str,
-    prompt: str,
-    *,
-    text: str = "",
-) -> tuple[str, bool]:
-    """Request one line of text through the shared Fluent input surface."""
-    return FluentInputDialog(prompt, text, parent, title=title).getText()
-
-
 class FluentCodeEdit(QtWidgets.QPlainTextEdit):
     """A monospace code/expression editor with the house Fluent chrome (white card, light
     border, Consolas font, Fluent scrollbars).  ONE source for the look so every code editor
@@ -3061,65 +2838,11 @@ class FluentCodeEdit(QtWidgets.QPlainTextEdit):
         _apply_fluent_context_menu(self, event)   # Fluent right-click (undo/cut/copy/paste), not the native menu
 
 
-class FluentFloatingEditor(QtWidgets.QDialog):
-    """A NON-modal floating multi-line editor: a prompt label over a large
-    :class:`FluentCodeEdit`, with **Apply + Close BELOW the box**.
-
-    Non-modal on purpose: the panel/frame behind it stays VISIBLE and INTERACTIVE, and
-    Apply updates it LIVE (you watch the plot change without dismissing the editor).  It is
-    parented to the caller's TOP-LEVEL window, so it shares that window's screen + device
-    scale -- this is what prevents the "one widget scaled, the other not" DPI bug a
-    differently-parented top-level dialog hits.  ``applied`` fires with the current text on
-    every Apply; the caller writes it back and re-renders."""
-
-    applied = QtCore.pyqtSignal(str)
-
-    def __init__(self, prompt: str, text: str = "", parent=None, *, title: str = "",
-                 min_size: tuple[int, int] = (560, 260)):
-        # Qt.Window: a real top-level the user can move/resize, but OWNED by ``parent`` so it
-        # rides the parent's screen/scale and is destroyed when the parent closes.
-        super().__init__(parent, QtCore.Qt.Window | QtCore.Qt.WindowTitleHint
-                         | QtCore.Qt.WindowCloseButtonHint)
-        if title:
-            self.setWindowTitle(title)
-        self.setModal(False)                      # NON-modal: frame stays usable behind it
-        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
-        self.setFont(QtGui.QFont(FONT, fluent_font_size()))
-        self.setStyleSheet("QDialog { background: white; }")
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(scaled_px(12), scaled_px(12), scaled_px(12), scaled_px(12))
-        layout.setSpacing(scaled_px(8, minimum=5))
-
-        layout.addWidget(FluentLabel(prompt, self))
-        self._edit = FluentCodeEdit(str(text), self)
-        self._edit.setMinimumSize(scaled_px(int(min_size[0]), minimum=int(min_size[0] * 0.8)),
-                                  scaled_px(int(min_size[1]), minimum=int(min_size[1] * 0.7)))
-        layout.addWidget(self._edit, 1)
-
-        # Apply + Close UNDER the editor (Apply = write back + re-render, keep open; Close =
-        # dismiss).  Apply is the comfortable place to commit a long expression.
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.addStretch()
-        apply = FluentButton("Apply", self, color=GREEN)
-        close = FluentButton("Close", self, color=GREY)
-        apply.clicked.connect(lambda: self.applied.emit(self._edit.toPlainText()))
-        close.clicked.connect(self.close)
-        btn_row.addWidget(apply)
-        btn_row.addWidget(close)
-        layout.addLayout(btn_row)
-
-    def text(self) -> str:
-        return self._edit.toPlainText()
-
-
 class FluentDoubleSpinBox(_WheelFocusGuardMixin, QtWidgets.QDoubleSpinBox):
-    """Confocal_GUIv2-style double spinbox with an inline step editor.
+    """Lossless double spin box with an inline step editor.
 
-    The historical control intentionally rounds values to ``length`` significant display
-    characters.  That remains the default for presentation-oriented settings.  Physical pulse
-    values must instead pass ``quantize_to_display=False``: the same Fluent styling and step
-    editor are retained, while Qt's full stored ``double`` is never replaced by a shortened
-    display string.  Visual reuse must not become an authority-changing numeric transform.
+    ``length`` sizes the initial numeric range; it never rounds the stored value.
+    Visual formatting must not become an authority-changing transform.
     """
 
     def __init__(
@@ -3127,12 +2850,8 @@ class FluentDoubleSpinBox(_WheelFocusGuardMixin, QtWidgets.QDoubleSpinBox):
         length=5,
         allow_minus: bool = False,
         parent=None,
-        *,
-        quantize_to_display: bool = True,
     ):
-        self._quantize_to_display = True
         super().__init__(parent)
-        self._quantize_to_display = bool(quantize_to_display)
         self._install_wheel_focus_guard()
         self.setButtonSymbols(QtWidgets.QAbstractSpinBox.PlusMinus)
         self.setMinimumHeight(scaled_px(30, minimum=22))
@@ -3166,34 +2885,13 @@ class FluentDoubleSpinBox(_WheelFocusGuardMixin, QtWidgets.QDoubleSpinBox):
         else:
             self.setRange(10 ** -(self.length - 2), 10**self.length - 1)
         self.setSingleStep(1)
-        self.setDecimals(self.length - 2)
-        if self._quantize_to_display:
-            self.lineEdit().setMaxLength(self.length)
-
-    def setValue(self, value: float) -> None:
-        if self._quantize_to_display:
-            value = float(_confocal_float2str(value, length=self.length))
-        super().setValue(value)
-
-    def setSingleStep(self, step: float) -> None:
-        if self._quantize_to_display:
-            step = float(_confocal_float2str(step, length=self.length))
-        super().setSingleStep(step)
-
-    def stepBy(self, steps: int) -> None:
-        if not self._quantize_to_display:
-            super().stepBy(steps)
-            return
-        current = self.value()
-        step = self.singleStep()
-        target = float(_confocal_float2str(current + steps * step, length=self.length))
-        if self.minimum() <= target <= self.maximum():
-            super(FluentDoubleSpinBox, self).setValue(target)
+        self.setDecimals(323)
 
     def textFromValue(self, value: float) -> str:
-        if not self._quantize_to_display:
-            return super().textFromValue(value)
-        return _confocal_float2str(value, length=self.length)
+        return repr(float(value))
+
+    def valueFromText(self, text: str) -> float:
+        return float(text.strip())
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -3260,6 +2958,29 @@ class FluentScrollArea(QtWidgets.QScrollArea):
             """
         )
 
+    def set_width_bounded_widget(self, widget: QtWidgets.QWidget) -> None:
+        """Mount vertical content that must never widen its visible host.
+
+        Logic lists and Edit pages are window-bounded surfaces: long status
+        text, paths, signal names, or form size hints must reflow/elide inside
+        the viewport while vertical overflow remains reachable.  Monitor boards
+        intentionally do *not* use this mode because a single authored panel may
+        be wider than the viewport and must then expose the Fluent horizontal
+        scrollbar.
+        """
+
+        if not isinstance(widget, QtWidgets.QWidget):
+            raise TypeError("bounded scroll content must be a QWidget")
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        widget.setMinimumWidth(0)
+        widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
+        self.setWidget(widget)
+
 
 def apply_fluent_scrollbars(widget: "QtWidgets.QAbstractScrollArea") -> None:
     """Give any scroll-area-based widget (QPlainTextEdit, QTextEdit, QTableView, ...) the
@@ -3274,12 +2995,7 @@ def apply_fluent_scrollbars(widget: "QtWidgets.QAbstractScrollArea") -> None:
 
 
 class FluentWindow(FramelessWindow):
-    """Frameless Confocal-style wrapper for PyQt frontends.
-
-    The original Confocal GUI uses ``qframelesswindow`` with a 32 px custom
-    titlebar.  This wrapper keeps that shape when the optional package is
-    installed and falls back to a regular QWidget otherwise.
-    """
+    """Frameless wrapper for PyQt frontends."""
 
     hidden = QtCore.pyqtSignal()   # fires on close OR hide/minimize (event-loop quit)
     closed = QtCore.pyqtSignal()   # notification AFTER a committed close; never a close command
@@ -3301,41 +3017,22 @@ class FluentWindow(FramelessWindow):
         self.setObjectName("FluentWindow")
         self.setStyleSheet(f"QWidget#FluentWindow {{ background: {BG}; }}")
 
-        self._zlc_title_bar = None
-        self._zlc_title = None
-        if StandardTitleBar is not None:
-            title_bar = StandardTitleBar(self)
-            title_bar.iconLabel.setFixedSize(0, 0)
-            # FluentWindow OWNS the title rendering.  StandardTitleBar positions its
-            # own title label via an internal layout whose left inset is version
-            # dependent AND is re-activated by any later title set -- e.g. the pulse
-            # GUI's _set_gui_title() calls titleBar.setTitle() right after
-            # setWindowTitle(), which kept undoing an external alignment (console,
-            # set once, looked fine; pulse, re-set at runtime, floated to the edge).
-            # So HIDE the built-in label and draw the title ourselves with a FREE
-            # child label pinned to the body content column -- it is NOT in the title
-            # bar layout, so no title-setting path and no qframelesswindow version
-            # can move it.  Fix once here => every FluentWindow GUI is fixed alike.
-            try:
-                title_bar.titleLabel.hide()
-            except Exception:  # pragma: no cover - defensive across versions
-                pass
-            self.setTitleBar(title_bar)
-            self._zlc_title_bar = title_bar
-            self.setWindowTitle(title)
-            self._zlc_title = QtWidgets.QLabel(title, title_bar)
-            self._zlc_title.setObjectName("zlcWindowTitle")
-            self._zlc_title.setStyleSheet(
-                f'QLabel#zlcWindowTitle {{ background: transparent; color: {TEXT};'
-                f' font: {fluent_font_size()}pt "{FONT}"; }}')
-            self._zlc_title.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
-            self._zlc_title.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
-            self._zlc_title.show()
-            self.windowTitleChanged.connect(self._zlc_title.setText)
-            top_margin = scaled_px(32)
-        else:
-            self.setWindowTitle(title)
-            top_margin = 0
+        title_bar = StandardTitleBar(self)
+        title_bar.iconLabel.setFixedSize(0, 0)
+        title_bar.titleLabel.hide()
+        self.setTitleBar(title_bar)
+        self._zlc_title_bar = title_bar
+        self.setWindowTitle(title)
+        self._zlc_title = QtWidgets.QLabel(title, title_bar)
+        self._zlc_title.setObjectName("zlcWindowTitle")
+        self._zlc_title.setStyleSheet(
+            f'QLabel#zlcWindowTitle {{ background: transparent; color: {TEXT};'
+            f' font: {fluent_font_size()}pt "{FONT}"; }}')
+        self._zlc_title.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self._zlc_title.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
+        self._zlc_title.show()
+        self.windowTitleChanged.connect(self._zlc_title.setText)
+        top_margin = scaled_px(32)
 
         if widget is None:
             raise ValueError("FluentWindow needs a constructed widget.")
@@ -3346,8 +3043,7 @@ class FluentWindow(FramelessWindow):
         layout.setContentsMargins(0, top_margin, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.loaded)
-        if StandardTitleBar is not None:
-            self.titleBar.raise_()
+        self.titleBar.raise_()
         self.loaded.adjustSize()
         self.resize(max(scaled_px(900, minimum=680), self.loaded.width()), self.loaded.height() + top_margin)
 
@@ -3357,22 +3053,17 @@ class FluentWindow(FramelessWindow):
         The label spans from ``TITLE_LEFT_INSET`` to just left of the first window
         control button, vertically centred in the 32 px bar.  Being a free child of
         the title bar (NOT in its layout), it is immune to title-set churn and to
-        qframelesswindow's version-dependent default insets -- the title therefore
-        sits on the SAME left column as the body content on every GUI and DPR."""
-        lab = getattr(self, "_zlc_title", None)
-        tb = getattr(self, "_zlc_title_bar", None)
-        if lab is None or tb is None:
-            return
-        try:
-            x = scaled_px(TITLE_LEFT_INSET)
-            right = tb.width()
-            for child in tb.findChildren(QtWidgets.QAbstractButton):
-                if child.isVisible() and child.width() > 0:
-                    right = min(right, child.x())
-            lab.setGeometry(x, 0, max(0, right - x - scaled_px(8)), tb.height())
-            lab.raise_()
-        except Exception:  # pragma: no cover - defensive across qframelesswindow versions
-            pass
+        title-bar layout changes -- the title therefore sits on the SAME left
+        column as the body content on every GUI and DPR."""
+        lab = self._zlc_title
+        tb = self._zlc_title_bar
+        x = scaled_px(TITLE_LEFT_INSET)
+        right = tb.width()
+        for child in tb.findChildren(QtWidgets.QAbstractButton):
+            if child.isVisible() and child.width() > 0:
+                right = min(right, child.x())
+        lab.setGeometry(x, 0, max(0, right - x - scaled_px(8)), tb.height())
+        lab.raise_()
 
     def showEvent(self, event):  # noqa: N802 - Qt naming
         super().showEvent(event)
@@ -3552,39 +3243,6 @@ class ElidedLabel(QtWidgets.QLabel):
         super().setText(shown)
 
 
-def arbitrate_status_line(
-    *,
-    error: str = "",
-    task: str = "",
-    warning: str = "",
-    notice: str = "",
-) -> tuple[str, str]:
-    """THE priority ladder every persistent status strip shares.
-
-    A wedged component must never fail silently, so a red error outranks even a
-    running task's progress line; the display-behind advisory is amber because
-    the RUN is unaffected (acquisition is never throttled by the display); a
-    plain notice is the lowest tier; nothing at all leaves the strip empty at
-    its fixed height so the layout never jumps.  Windows differ in where their
-    four inputs come from, never in how they rank, which is why the ranking
-    lives here instead of being retyped per window.
-
-    Returns ``(text, severity)`` ready for :meth:`FluentStatusStrip.show_message`.
-    """
-
-    for text, severity in (
-        (error, "error"),
-        (task, "task"),
-        (warning, "warning"),
-        (notice, "info"),
-    ):
-        if not isinstance(text, str):
-            raise TypeError("status inputs must be str")
-        if text:
-            return text, severity
-    return "", "info"
-
-
 class FluentStatusStrip(FluentFrame):
     """The PERSISTENT one-line status surface a GUI mounts once and feeds forever.
 
@@ -3654,239 +3312,6 @@ class FluentStatusStrip(FluentFrame):
     def text(self) -> str:
         """The current message's FULL text (the label elides for display only)."""
         return self.message.text()
-
-
-class FluentScanDot(QtWidgets.QAbstractButton):
-    """Small round toggle that marks a field as a scan parameter.
-
-    Unbound: a hollow grey dot.  Bound: a filled orange dot showing its 1-based
-    slot number.  Click toggles; the consumer connects ``toggled``.
-    """
-
-    def __init__(self, parent=None, *, tooltip: str = "Click to scan this field"):
-        super().__init__(parent)
-        self.setCheckable(True)
-        self.setCursor(QtCore.Qt.PointingHandCursor)
-        self._number: int | None = None
-        self._api = False        # api-slot state (violet); scan state is isChecked() (orange)
-        diameter = Metrics.dot()
-        self.setFixedSize(diameter, diameter)
-        self.setToolTip(tooltip)
-
-    def set_number(self, number: int | None) -> None:
-        self._number = None if number is None else int(number)
-        self.update()
-
-    def set_api(self, api: bool) -> None:
-        """Mark the dot as an API slot (violet) -- distinct from a scan slot (orange,
-        ``setChecked``).  An API-slot field keeps its value, so only the dot recolours."""
-        self._api = bool(api)
-        self.update()
-
-    def nextCheckState(self) -> None:  # noqa: N802 - Qt API name
-        # The dot's binding state is driven by the model via set_field_state, not by the
-        # click toggle: a click only emits ``clicked`` to drive the none->scan->api->off cycle,
-        # which then re-applies the correct visual.  Without this, the auto-toggle would leave a
-        # just-cleared dot stuck "checked" (orange) when the cycle landed on API or off.
-        pass
-
-    def number(self) -> int | None:
-        return self._number
-
-    def paintEvent(self, event) -> None:
-        del event
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        center = QtCore.QPointF(self.width() / 2.0, self.height() / 2.0)
-        radius = min(self.width(), self.height()) / 2.0 - max(1.0, scaled_px(1))
-        if self.isChecked() or self._api:
-            painter.setBrush(QtGui.QColor(API_VIOLET if self._api else ORANGE))
-            painter.setPen(QtCore.Qt.NoPen)
-            painter.drawEllipse(center, radius, radius)
-            if self._number is not None:
-                painter.setPen(QtGui.QColor("#FFFFFF"))
-                font = QtGui.QFont(FONT, max(6, fluent_font_size() - 5))
-                font.setBold(True)
-                painter.setFont(font)
-                painter.drawText(self.rect(), QtCore.Qt.AlignCenter, str(self._number))
-        else:
-            painter.setBrush(QtCore.Qt.NoBrush)
-            painter.setPen(QtGui.QPen(QtGui.QColor(PLACEHOLDER), max(1, scaled_px(1))))
-            painter.drawEllipse(center, radius, radius)
-            painter.setBrush(QtGui.QColor(PLACEHOLDER))
-            painter.setPen(QtCore.Qt.NoPen)
-            painter.drawEllipse(center, radius * 0.42, radius * 0.42)
-        painter.end()
-
-
-def _bound_field_style(*, selector: str, text: str, border: str, fill: str | None = None) -> str:
-    """The ONE stylesheet recipe for a scan/api BOUND field: a coloured border + text (+ optional
-    background ``fill``) with the shared radius / padding / font.  ``selector`` differs (a scan mark
-    also covers combos, an api mark only the line edit); ``fill`` is ``None`` for the api border-only
-    look.  Qt ignores CSS whitespace, so this single canonical form renders identically to the
-    previously hand-written orange (multi-line) / api (inline) stylesheets (#D1)."""
-    bg = f"background: {fill}; " if fill else ""
-    return (
-        f"{selector} {{ {bg}color: {text}; border: 1px solid {border}; "
-        f"border-radius: {_radius()}px; "
-        f"padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px; "
-        f'font: {fluent_font_size()}pt "{FONT}"; }}'
-    )
-
-
-def mark_scan_field(widget: QtWidgets.QWidget, *, bound: bool) -> None:
-    """Apply (or clear) the orange disabled look on a field bound to a scan slot."""
-
-    widget.setProperty("zlcScanBound", bool(bound))
-    widget.setEnabled(not bound)
-    if bound:
-        widget.setStyleSheet(_bound_field_style(
-            selector="QLineEdit, QComboBox", text=ORANGE_DARK, border=ORANGE, fill=ORANGE_TINT))
-    else:
-        widget.setStyleSheet("")
-
-
-def _muted_line_style() -> str:
-    """Read-only / inactive look for a field that must stay *enabled* (so its
-    embedded scan dot keeps receiving clicks)."""
-
-    return (
-        f"QLineEdit {{ background: {BG}; color: {PLACEHOLDER}; "
-        f"border: 1px solid {PLACEHOLDER}; border-radius: {_radius()}px; "
-        f"padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px; "
-        f'font: {fluent_font_size()}pt "{FONT}"; }}'
-    )
-
-
-class FluentScanLineEdit(FluentLineEdit):
-    """A line edit with a round 'scan' toggle embedded on the right edge.
-
-    The dot behaves like a spinbox's inline button: it sits inside the field
-    (vertically centered) and stays clickable even when the field is bound.
-    Binding turns the field orange + read-only and shows the slot number on the
-    dot; clicking the dot emits :attr:`scanClicked`.
-    """
-
-    scanClicked = QtCore.pyqtSignal()
-
-    def __init__(self, text: str = "", parent=None, *, tooltip: str = "Click the dot to scan this field"):
-        super().__init__(text, parent)
-        self._base_style = self.styleSheet()
-        self._dot = FluentScanDot(self, tooltip=tooltip)
-        self._dot.clicked.connect(self.scanClicked)
-        self._field_state: tuple[bool, str | None, int | None] | None = None
-        self._reserve_right()
-
-    @property
-    def dot(self) -> "FluentScanDot":
-        """The embedded toggle, for hosts that bind it to their own handler.
-
-        ``scanClicked`` covers the common case; a host that needs the button
-        itself -- to set its slot number, or to connect ``clicked`` alongside
-        other dots -- gets it here rather than reaching for the private field.
-        """
-
-        return self._dot
-
-    def _dot_size(self) -> int:
-        return Metrics.dot()
-
-    def _reserve_right(self) -> None:
-        # Left margin 0: the stylesheet ``padding`` (EDIT_PADDING_H) already sets
-        # the left text inset, so the text/number left edge lines up with a plain
-        # FluentLineEdit / spinbox.  Only reserve space on the RIGHT for the dot.
-        margin = self._dot_size() + scaled_px(3)
-        self.setTextMargins(0, 0, margin, 0)
-
-    def _place_dot(self) -> None:
-        diameter = self._dot_size()
-        x = self.width() - diameter - scaled_px(4)
-        y = (self.height() - diameter) // 2
-        self._dot.setGeometry(int(x), int(y), int(diameter), int(diameter))
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._place_dot()
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._place_dot()
-
-    def set_field_state(
-        self,
-        *,
-        editable: bool,
-        binding: str | None = None,
-        number: int | None = None,
-    ) -> None:
-        """Project the complete edit/binding state in one operation.
-
-        ``editable`` describes the underlying field (for example a DAC Hold is
-        not editable).  ``binding`` is either ``"scan"``, ``"api"``, or
-        ``None``.  These facts cannot be applied independently: scan binding is
-        always read-only, while an API-bound Hold must remain read-only even
-        though ordinary API values are editable.  One reducer owns the dot,
-        badge, read-only flag, and stylesheet so setter order cannot leave a
-        mixed visual state.
-        """
-
-        normalized = None if binding is None else str(binding).strip().lower()
-        if normalized not in (None, "scan", "api"):
-            raise ValueError("binding must be 'scan', 'api', or None")
-        if normalized is None and number is not None:
-            raise ValueError("an unbound field cannot have a binding number")
-        state = (bool(editable), normalized, number)
-        if state == self._field_state:
-            return
-        self._field_state = state
-
-        is_scan = normalized == "scan"
-        is_api = normalized == "api"
-        self._dot.set_api(is_api)
-        self._dot.setChecked(is_scan)
-        self._dot.set_number(number if normalized is not None else None)
-        self.setReadOnly(is_scan or not state[0])
-        if is_scan:
-            style = _bound_field_style(
-                selector="QLineEdit",
-                text=ORANGE_DARK,
-                border=ORANGE,
-                fill=ORANGE_TINT,
-            )
-        elif is_api:
-            style = _bound_field_style(
-                selector="QLineEdit",
-                text=API_VIOLET_DARK,
-                border=API_VIOLET,
-                fill=None,
-            )
-        else:
-            style = self._base_style if state[0] else _muted_line_style()
-        self.setStyleSheet(style)
-        self._reserve_right()
-        self.update()
-
-
-class FluentLabeledField(QtWidgets.QWidget):
-    """A ``label : widget [suffix]`` row with a shared, aligned height."""
-
-    def __init__(self, label: str, widget: QtWidgets.QWidget, *, label_width: int | None = None, suffix: QtWidgets.QWidget | None = None, parent=None):
-        super().__init__(parent)
-        self.setStyleSheet("background: transparent;")
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(Metrics.gap_item())
-        self.label = ElidedLabel(str(label))
-        self.label.setFixedHeight(Metrics.row_h())
-        if label_width is not None:
-            self.label.setFixedWidth(int(label_width))
-        layout.addWidget(self.label)
-        widget.setFixedHeight(Metrics.row_h())
-        layout.addWidget(widget, 1)
-        self.field = widget
-        self.suffix = suffix
-        if suffix is not None:
-            layout.addWidget(suffix, 0, QtCore.Qt.AlignVCenter)
 
 
 class FluentFormGrid(QtWidgets.QWidget):

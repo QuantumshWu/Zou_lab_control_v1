@@ -29,7 +29,9 @@ from zlc_neutral_atom.acquisition.camera import (
 from zlc_neutral_atom.camera_measurement import (
     CameraMeasurementDescriptor,
     CameraMeasurementRequest,
+    project_camera_monitor_outputs,
 )
+from zlc_neutral_atom.dataset_output import LiveDatasetOutput
 from zlc_neutral_atom.runtime._failure import safe_error_summary
 from zlc_neutral_atom.runtime.cancellation import CancellationRequested
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
@@ -147,10 +149,10 @@ class CameraMonitorLiveDataset:
             after = self.raw.ingest_next(timeout=0.0)
             return after.revision.value > before.value
 
-    def materialize(self) -> MonitorDatasetSnapshot:
+    def freeze_current(self) -> MonitorDatasetSnapshot:
         with self._lock:
             self._ensure_open()
-            return self.raw.materialize(None)
+            return self.raw.freeze_current()
 
     def finish(self) -> None:
         with self._lock:
@@ -434,6 +436,14 @@ class PreparedLiveCameraMeasurement:
     @property
     def request(self) -> CameraMeasurementRequest:
         return self._request
+
+    def live_dataset_outputs(
+        self,
+        frozen: MonitorDatasetSnapshot,
+    ) -> dict[str, LiveDatasetOutput]:
+        """Name and split one monitor front by the frozen Camera request."""
+
+        return project_camera_monitor_outputs(frozen, self._request)
 
     def start_with_view(
         self,

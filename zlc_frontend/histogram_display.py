@@ -228,9 +228,7 @@ class FacetedHistogramDisplayState:
         return replace(self.display, thresholds=thresholds)
 
 
-_HISTOGRAM_CELL_THRESHOLDS_SCHEMA = (
-    "zlc_frontend.HistogramCellThresholds.v1"
-)
+_HISTOGRAM_CELL_THRESHOLDS_SCHEMA = "zlc_frontend.HistogramCellThresholds"
 
 
 def histogram_cell_thresholds_to_tree(

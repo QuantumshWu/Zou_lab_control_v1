@@ -88,6 +88,19 @@ class RunSnapshot:
     primary_error: str | None
     cleanup_errors: tuple[str, ...]
     recovery_instruction: str | None
+    # A synchronous ``RunController.start`` rejects with ``RunStartRejected``.
+    # A composite run-like owner may encounter that same admission boundary on
+    # its coordinator thread after its own handle has already been returned.
+    # Preserve the typed outcome across that async boundary; presentation must
+    # never parse ``primary_error`` to recover a conflicting RunId.
+    admission_rejection: ResourceBusy | None = None
+
+    def __post_init__(self) -> None:
+        if self.admission_rejection is not None and not isinstance(
+            self.admission_rejection,
+            ResourceBusy,
+        ):
+            raise TypeError("admission_rejection must be ResourceBusy or None")
 
 
 @dataclass(frozen=True)

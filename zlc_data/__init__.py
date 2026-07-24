@@ -1,5 +1,7 @@
 """Headless, domain-neutral semantics for named multidimensional data."""
 
+from importlib import import_module
+
 from ._arrays import immutable_array
 from ._diagnostic import exact_integer_text
 from .axis import (
@@ -65,6 +67,7 @@ from .value import (
     Value,
     ValuePayloadContract,
     canonical_value_array,
+    dataset_cell_value,
     expand_dataset_validity,
     expand_component_validity,
     expand_value_validity,
@@ -74,7 +77,9 @@ from .selection import (
     IndexRangeSelection,
     IndexSelection,
     Selection,
+    resolve_outer_cell_selection,
     resolve_selection_indices,
+    selection_for_outer_cell,
     selection_from_tree,
     selection_to_tree,
 )
@@ -88,11 +93,9 @@ from .transform import (
     TransformedSchema,
     ValidityPolicy,
     apply_transform,
-    apply_value_transform,
     commit_transform,
     materialize_transformed_snapshot,
     resolve_transformed_schema,
-    resolve_value_transform_schema,
 )
 from .transform_codec import (
     committed_transform_from_tree,
@@ -100,6 +103,13 @@ from .transform_codec import (
     data_transform_spec_from_tree,
     data_transform_spec_to_tree,
     transformed_schema_to_tree,
+)
+from .snapshot_projection import (
+    materialize_component_dataset,
+    materialize_dataset_acceptance_mask,
+    materialize_dataset_selection,
+    materialize_fit_parameter_snapshots,
+    materialize_numeric_dataset,
 )
 from .fit import (
     BoundFit,
@@ -128,6 +138,29 @@ from .fit import (
     suggest_fit_draft,
     validate_fit_result_source_binding,
 )
+
+_LAZY_EXPORTS = {
+    "HistogramFitResult": ("histogram_fit", "HistogramFitResult"),
+    "confidence_weighted_fidelity": (
+        "histogram_fit",
+        "confidence_weighted_fidelity",
+    ),
+    "fit_histogram": ("histogram_fit", "fit_histogram"),
+}
+
+
+def __getattr__(name: str):
+    try:
+        module_name, attribute_name = _LAZY_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(import_module(f".{module_name}", __name__), attribute_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 __all__ = [
     "AxisId",
@@ -158,6 +191,7 @@ __all__ = [
     "FitParameterDomain",
     "FitResultBatch",
     "FitSpec",
+    "HistogramFitResult",
     "INVALID",
     "HISTOGRAM_BIN",
     "MONITOR_HISTORY",
@@ -200,9 +234,9 @@ __all__ = [
     "axis_layout_to_tree",
     "axis_to_tree",
     "apply_transform",
-    "apply_value_transform",
     "bind_fit",
     "commit_transform",
+    "confidence_weighted_fidelity",
     "committed_transform_from_tree",
     "committed_transform_to_tree",
     "dataset_schema_fingerprint",
@@ -210,20 +244,28 @@ __all__ = [
     "dataset_schema_to_tree",
     "dataset_revision_ref_from_tree",
     "dataset_revision_ref_to_tree",
+    "dataset_cell_value",
     "decode_fit_result_batch",
     "decode_fit_spec",
     "encode_fit_result_batch",
     "encode_fit_spec",
     "exact_integer_text",
     "resolve_transformed_schema",
-    "resolve_value_transform_schema",
     "materialize_transformed_snapshot",
+    "materialize_component_dataset",
+    "materialize_dataset_acceptance_mask",
+    "materialize_dataset_selection",
+    "materialize_fit_parameter_snapshots",
+    "materialize_numeric_dataset",
+    "resolve_outer_cell_selection",
     "resolve_selection_indices",
+    "selection_for_outer_cell",
     "canonical_value_array",
     "expand_dataset_validity",
     "expand_component_validity",
     "expand_value_validity",
     "fit_model_catalog",
+    "fit_histogram",
     "fit_model_definition",
     "fit_spec_from_tree",
     "fit_spec_for",

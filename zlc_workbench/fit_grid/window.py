@@ -36,6 +36,7 @@ from zlc_frontend.qt_widgets import (
     FluentLabel,
     FluentPopup,
     FluentRevisionedFormEditor,
+    FluentScrollArea,
     FluentSwitch,
     GREY,
     ORANGE,
@@ -149,8 +150,18 @@ class SavedFitGridWindow(FrozenRasterWindow):
         )
         self._encoded_board.setObjectName("savedFitGridEncodedBoard")
         self._encoded_board.setMinimumSize(480, 320)
-        self._encoded_board.hide()
-        live_layout.addWidget(self._encoded_board, 1)
+        self._encoded_scroll = FluentScrollArea(self._live_page)
+        self._encoded_scroll.setObjectName("savedFitGridEncodedScroll")
+        self._encoded_scroll.setWidgetResizable(False)
+        self._encoded_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAsNeeded
+        )
+        self._encoded_scroll.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAsNeeded
+        )
+        self._encoded_scroll.setWidget(self._encoded_board)
+        self._encoded_scroll.hide()
+        live_layout.addWidget(self._encoded_scroll, 1)
         self._edit_image_display = FluentRevisionedFormEditor(
             image_display_form_spec(),
             "image display",
@@ -638,7 +649,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             )
         self._board_widget.present(frame)
         self._view_family = "typed-image"
-        self._encoded_board.hide()
+        self._encoded_scroll.hide()
         self._board_widget.show()
         self._current_panels = tuple(panels)
         self._current_frame = frame
@@ -660,9 +671,10 @@ class SavedFitGridWindow(FrozenRasterWindow):
             bundle.pages[0].png_bytes,
             image_format="PNG",
         )
+        self._encoded_board.adjustSize()
         self._view_family = "encoded"
         self._board_widget.hide()
-        self._encoded_board.show()
+        self._encoded_scroll.show()
         self._current_encoded_bundle = bundle
 
     def _set_selector_enabled(self, enabled: bool) -> None:

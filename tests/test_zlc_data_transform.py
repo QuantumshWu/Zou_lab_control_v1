@@ -7,6 +7,7 @@ import pytest
 
 from zlc_data import (
     REPEAT,
+    SCALAR_AXIS,
     SCAN_POINT,
     SITE,
     SPATIAL_X,
@@ -82,14 +83,22 @@ def block_for(
         if component_axes
         else ValidityContract.value()
     )
+    array = np.asarray(values)
+    cell_schema = (
+        ValueSchema(data_axes, contract, array.dtype)
+        if data_axes
+        else ValueSchema.scalar(array.dtype)
+    )
+    if not data_axes:
+        array = array[..., np.newaxis]
     schema = DatasetSchema(
         axis("repeat", REPEAT, repeat),
         point_axes,
         layout,
-        ValueSchema(data_axes, contract, np.asarray(values).dtype),
+        cell_schema,
     )
     return DataBlock(
-        BlockId("source"), DatasetRevision(3), np.asarray(values), validity, schema
+        BlockId("source"), DatasetRevision(3), array, validity, schema
     )
 
 
@@ -160,7 +169,7 @@ def test_repeated_index_ranges_preserve_absolute_coordinate_less_axis_indices():
     assert selected_axis.index_origin == 3
     assert selected_axis.unit == "pixel"
     assert tuple(selected_axis.coordinate_at(index) for index in range(3)) == (3, 4, 5)
-    np.testing.assert_array_equal(result.values, (3, 4, 5))
+    np.testing.assert_array_equal(result.values, [[3], [4], [5]])
 
 
 def test_empty_axis_layout_is_only_for_derived_sparse_results():
@@ -197,7 +206,7 @@ def test_rect_f_multi_point_mapping_is_recovered_before_selecting():
         result.schema.cell_layout.multi_index(index)
         for index in range(result.schema.cell_layout.storage_size)
     ] == [(0, 0), (0, 1), (1, 0), (1, 1)]
-    np.testing.assert_array_equal(result.values, [2, 3, 8, 9])
+    np.testing.assert_array_equal(result.values, [[2], [3], [8], [9]])
 
 
 def test_selecting_a_logically_valid_sparse_hole_returns_no_physical_row():
@@ -214,8 +223,8 @@ def test_selecting_a_logically_valid_sparse_hole_returns_no_physical_row():
     )
     assert result.schema.cell_axes == (block.schema.repeat_axis,)
     assert result.schema.cell_layout.storage_size == 0
-    assert result.values.shape == (0,)
-    assert result.expanded_validity().shape == (0,)
+    assert result.values.shape == (0, 1)
+    assert result.expanded_validity().shape == (0, 1)
 
 
 def test_data_axis_selection_preserves_every_other_data_axis():
@@ -298,8 +307,8 @@ def test_sparse_missing_policy_never_turns_holes_into_invalid_rows():
     )
     assert required.schema.cell_layout.storage_size == 1
     assert required.schema.cell_layout.multi_index(0) == (0, 0)
-    np.testing.assert_allclose(required.values, [3.0])
-    np.testing.assert_array_equal(required.expanded_validity(), [True])
+    np.testing.assert_allclose(required.values, [[3.0]])
+    np.testing.assert_array_equal(required.expanded_validity(), [[True]])
 
     omitted = apply_spec(
         block,
@@ -315,8 +324,8 @@ def test_sparse_missing_policy_never_turns_holes_into_invalid_rows():
         ),
     )
     assert omitted.schema.cell_layout.storage_size == 2
-    np.testing.assert_allclose(omitted.values, [3.0, 10.0])
-    np.testing.assert_array_equal(omitted.expanded_validity(), [True, True])
+    np.testing.assert_allclose(omitted.values, [[3.0], [10.0]])
+    np.testing.assert_array_equal(omitted.expanded_validity(), [[True], [True]])
 
 
 def test_component_validity_is_reduced_per_named_component():
@@ -378,8 +387,8 @@ def test_mixed_cell_and_data_mean_uses_one_valid_contributor_count():
             )
         ),
     )
-    assert result.schema.data_axes == ()
-    np.testing.assert_allclose(result.values, [(1.0 + 100.0 + 3.0) / 3.0])
+    assert result.schema.data_axes == (SCALAR_AXIS,)
+    np.testing.assert_allclose(result.values, [[(1.0 + 100.0 + 3.0) / 3.0]])
 
 
 def test_require_all_validity_marks_present_output_invalid_not_missing():
@@ -404,8 +413,8 @@ def test_require_all_validity_marks_present_output_invalid_not_missing():
         ),
     )
     assert result.schema.cell_layout.storage_size == 1
-    np.testing.assert_array_equal(result.expanded_validity(), [False])
-    np.testing.assert_array_equal(result.values, [0.0])
+    np.testing.assert_array_equal(result.expanded_validity(), [[False]])
+    np.testing.assert_array_equal(result.values, [[0.0]])
 
 
 def test_committed_transform_tree_has_one_hand_written_current_shape():
@@ -451,7 +460,7 @@ def test_commit_is_schema_bound_nonempty_and_authoritative():
         == committed.output_schema_fingerprint
     snapshot = OwnedSnapshot(block.ref(StreamGenerationId("generation-1")), block)
     authoritative = apply_transform(snapshot, committed)
-    np.testing.assert_array_equal(authoritative.values, [1])
+    np.testing.assert_array_equal(authoritative.values, [[1]])
     assert authoritative.source_ref == snapshot.ref
     assert authoritative.transform == committed
 
@@ -545,8 +554,8 @@ def test_reduction_axes_are_a_canonical_set_and_min_max_respect_validity():
             )
         ),
     )
-    np.testing.assert_array_equal(minimum.values, [2.0])
-    np.testing.assert_array_equal(maximum.values, [8.0])
+    np.testing.assert_array_equal(minimum.values, [[2.0]])
+    np.testing.assert_array_equal(maximum.values, [[8.0]])
 
 
 @pytest.mark.parametrize("method", tuple(ReductionMethod))
@@ -618,17 +627,20 @@ def test_integer_sum_is_exact_and_overflow_fails_closed():
         )
 
     maximum = np.iinfo(np.int64).max
-    np.testing.assert_array_equal(reduce_values(np.array([maximum, -maximum])).values, [0])
+    np.testing.assert_array_equal(
+        reduce_values(np.array([maximum, -maximum])).values,
+        [[0]],
+    )
     unsigned_maximum = np.iinfo(np.uint64).max
     np.testing.assert_array_equal(
         reduce_values(np.array([unsigned_maximum, 0], dtype=np.uint64)).values,
-        [unsigned_maximum],
+        [[unsigned_maximum]],
     )
     with pytest.raises(OverflowError):
         reduce_values(np.array([maximum, 1], dtype=np.int64))
     floating = reduce_values(np.array([40_000, 40_000], dtype=np.float16))
     assert floating.schema.dtype == np.dtype("<f8")
-    np.testing.assert_array_equal(floating.values, [80_000.0])
+    np.testing.assert_array_equal(floating.values, [[80_000.0]])
 
 
 def test_min_count_is_distinct_from_missing_and_invalid():
@@ -652,9 +664,9 @@ def test_min_count_is_distinct_from_missing_and_invalid():
     )
     valid = apply_spec(block, reduction(2))
     invalid = apply_spec(block, reduction(3))
-    np.testing.assert_array_equal(valid.values, [2.0])
-    np.testing.assert_array_equal(valid.expanded_validity(), [True])
-    np.testing.assert_array_equal(invalid.expanded_validity(), [False])
+    np.testing.assert_array_equal(valid.values, [[2.0]])
+    np.testing.assert_array_equal(valid.expanded_validity(), [[True]])
+    np.testing.assert_array_equal(invalid.expanded_validity(), [[False]])
     with pytest.raises(ValueError, match="maximum contributor"):
         commit_transform(block.schema, reduction(4))
 
@@ -679,7 +691,7 @@ def test_large_integral_coordinate_is_selected_without_float_rounding():
         point.axis_id, value, value, coordinate_frame=frame
     )
     result = apply_spec(block, DataTransformSpec((selection,)))
-    np.testing.assert_array_equal(result.values, [22])
+    np.testing.assert_array_equal(result.values, [[22]])
 
 
 def test_validity_stays_named_and_compact_for_large_images():
@@ -729,7 +741,7 @@ def test_dense_schema_commit_derives_the_expected_output_schema():
         repeat,
         (point,),
         PointLayout.rect_c((50_000,)),
-        ValueSchema((), ValidityContract.value(), np.dtype(np.float64)),
+        ValueSchema.scalar(np.dtype(np.float64)),
     )
     spec = DataTransformSpec(
         (
@@ -788,7 +800,7 @@ def test_factored_f_order_reduction_preserves_shape_and_values():
         repeat,
         (p0, p1),
         PointLayout.rect_f((100, 50)),
-        ValueSchema((), ValidityContract.value(), np.dtype(np.uint8)),
+        ValueSchema.scalar(np.dtype(np.uint8)),
     )
     block = DataBlock(
         BlockId("factored"),
@@ -803,7 +815,7 @@ def test_factored_f_order_reduction_preserves_shape_and_values():
             (ReductionSpec((p0.axis_id,), ReductionMethod.SUM),)
         ),
     )
-    assert result.values.shape == (10 * 50,)
+    assert result.values.shape == (10 * 50, 1)
     np.testing.assert_array_equal(result.values, 100)
 
 

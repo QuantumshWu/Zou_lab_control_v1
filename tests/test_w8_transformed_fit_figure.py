@@ -62,7 +62,7 @@ from zlc_frontend.figure import (
     suggest_fit_view,
 )
 from zlc_neutral_atom.artifacts import FitResultRepository
-from Zou_lab_control.workbench._frozen_raster import FrozenRasterWindow
+from zlc_workbench.frozen_raster import FrozenRasterWindow
 
 
 ROOT = Path(__file__).resolve().parents[1]

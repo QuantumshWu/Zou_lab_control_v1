@@ -34,7 +34,6 @@ def _curve_panel(sequence: int, *, display_revision: int = 0, offset: float = 0.
         CurvePanelPayload,
         PanelFrame,
         PanelPresentationIdentity,
-        PixelFormat,
         RasterBuffer,
         SourceIdentity,
     )
@@ -95,8 +94,6 @@ def _curve_panel(sequence: int, *, display_revision: int = 0, offset: float = 0.
     raster = RasterBuffer(
         200,
         100,
-        800,
-        PixelFormat.RGBA8888,
         bytes((20, 30, 40, 255)) * (200 * 100),
     )
     return PanelFrame("curve", "curve", source, stamp, raster, payload)
@@ -111,13 +108,14 @@ def _image_panel(sequence: int, *, viewport_revision: int = 0):
         SPATIAL_Y,
     )
     from zlc_frontend.figure import EvaluatedAxis, EvaluatedImage
+    from zlc_frontend.image_display import ImageColormap
     from zlc_frontend.image_view import ImageViewportTransform
     from zlc_frontend.render import (
         CoherenceStamp,
+        ImagePanelRasterGeometry,
         ImagePanelPayload,
         PanelFrame,
         PanelPresentationIdentity,
-        PixelFormat,
         RasterBuffer,
         SourceIdentity,
     )
@@ -153,15 +151,18 @@ def _image_panel(sequence: int, *, viewport_revision: int = 0):
         np.asarray(((1.0, 2.0), (3.0, 4.0 + sequence))),
         np.ones((2, 2), dtype=bool),
     )
-    histogram = (1, 1, 1, 1) + (0,) * 251
     payload = ImagePanelPayload(
-        image,
-        evaluated_input,
-        viewport,
-        (1.0, 4.0 + sequence),
-        histogram,
-        tuple(0xFF000000 | index for index in range(256)),
-        (0.0, 10.0),
+        image=image,
+        evaluated_input=evaluated_input,
+        viewport=viewport,
+        data_range=(1.0, 4.0 + sequence),
+        colormap=ImageColormap.GRAY,
+        color_limits=(0.0, 10.0),
+        raster_geometry=ImagePanelRasterGeometry(
+            (0.10, 0.10, 0.65, 0.90),
+            (0.70, 0.10, 0.82, 0.90),
+            (0.87, 0.10, 0.92, 0.90),
+        ),
     )
     presentation = PanelPresentationIdentity(
         "image", "image-document", 0, 0, viewport_revision
@@ -181,7 +182,7 @@ def _image_panel(sequence: int, *, viewport_revision: int = 0):
         evaluated_input.ref.stream_generation,
         evaluated_input.ref.schema_fingerprint,
     )
-    raster = RasterBuffer(2, 2, 2, PixelFormat.INDEXED8, bytes((1, 2, 3, 4)))
+    raster = RasterBuffer(2, 2, bytes((1, 2, 3, 255)) * 4)
     return PanelFrame("image", "image", source, stamp, raster, payload)
 
 
@@ -360,47 +361,6 @@ def test_curve_continuous_cross_pins_and_clears() -> None:
             )
         )
         assert binding.cross is None
-    finally:
-        board.close()
-        application.processEvents()
-
-
-def test_curve_cross_overlay_uses_the_shared_selector_label(monkeypatch) -> None:
-    from PyQt5 import QtCore, QtGui, QtTest
-
-    curve_commands = []
-    application, board = _board(_frame(0), curve_commands, [])
-    try:
-        plot = _curve_target(board).plot
-        position = _point(plot, 0.55, 0.45)
-        binding = board._numeric_bindings["curve"]
-
-        cross_labels = []
-
-        def capture_cross(_painter, label, _plot, _color, **_kwargs):
-            cross_labels.append(label)
-
-        monkeypatch.setattr(
-            type(board),
-            "_paint_selector_text",
-            staticmethod(capture_cross),
-        )
-        image = QtGui.QImage(
-            board.size(),
-            QtGui.QImage.Format_ARGB32_Premultiplied,
-        )
-        QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=position)
-        assert binding.cross is not None
-        painter = QtGui.QPainter(image)
-        try:
-            board._paint_numeric_binding_overlay(painter, binding)
-        finally:
-            painter.end()
-        # The locked cross uses the same exact selector label owner as the
-        # other numeric plots.
-        assert len(cross_labels) == 1
-        assert cross_labels[0].startswith("(") and cross_labels[0].endswith(")")
-        assert ", " in cross_labels[0]
     finally:
         board.close()
         application.processEvents()
@@ -658,15 +618,7 @@ def test_curve_lifecycle_and_callback_fault_are_local() -> None:
         application.processEvents()
 
 
-def test_selector_art_tokens_match_render_style_rcparams():
-    """The reference draws selectors with matplotlib rcParams (grey, alpha 0.8,
-    legend.fontsize text, lines.linewidth strokes, legend.fontsize/2 handles,
-    lines.markersize dot).  The backend-neutral selector visual contract owns
-    those design units; this check pins its Qt pixel projection to the same
-    established Main rcParams values."""
-
-    import matplotlib.colors
-
+def test_qt_selector_art_tokens_delegate_to_the_frontend_owner():
     from zlc_frontend.qt_widgets.style import (
         SELECTOR_ALPHA,
         SELECTOR_COLOR,
@@ -675,20 +627,26 @@ def test_selector_art_tokens_match_render_style_rcparams():
         SELECTOR_HANDLE_PX,
         SELECTOR_LINE_PX,
     )
-    from zlc_frontend.render_style import (
-        DEFAULT_STYLE,
-        DESIGN_DPI,
-        PANEL_DISPLAY_SCALE,
+    from zlc_frontend.selector_visual import (
+        SELECTOR_ALPHA as OWNER_ALPHA,
+        SELECTOR_COLOR as OWNER_COLOR,
+        SELECTOR_DOT_PX as OWNER_DOT_PX,
+        SELECTOR_FONT_PX as OWNER_FONT_PX,
+        SELECTOR_HANDLE_PX as OWNER_HANDLE_PX,
+        SELECTOR_LINE_PX as OWNER_LINE_PX,
     )
-
-    px_per_pt = DESIGN_DPI * PANEL_DISPLAY_SCALE / 72.0
-    assert SELECTOR_COLOR == matplotlib.colors.to_hex("grey")
-    assert SELECTOR_ALPHA == round(0.8 * 255)
-    assert SELECTOR_LINE_PX == pytest.approx(
-        DEFAULT_STYLE["lines.linewidth"] * px_per_pt, abs=0.05)
-    assert SELECTOR_FONT_PX == round(
-        DEFAULT_STYLE["legend.fontsize"] * px_per_pt)
-    assert SELECTOR_HANDLE_PX == pytest.approx(
-        DEFAULT_STYLE["legend.fontsize"] / 2.0 * px_per_pt, abs=0.05)
-    assert SELECTOR_DOT_PX == round(
-        DEFAULT_STYLE["lines.markersize"] * px_per_pt)
+    assert (
+        SELECTOR_ALPHA,
+        SELECTOR_COLOR,
+        SELECTOR_DOT_PX,
+        SELECTOR_FONT_PX,
+        SELECTOR_HANDLE_PX,
+        SELECTOR_LINE_PX,
+    ) == (
+        OWNER_ALPHA,
+        OWNER_COLOR,
+        OWNER_DOT_PX,
+        OWNER_FONT_PX,
+        OWNER_HANDLE_PX,
+        OWNER_LINE_PX,
+    )

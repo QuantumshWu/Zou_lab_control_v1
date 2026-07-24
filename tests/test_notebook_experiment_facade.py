@@ -128,9 +128,7 @@ def _case_scan_and_fit(root: Path) -> None:
         ),
     )
     with zlc.connect("virtual", repository=root) as exp:
-        scan_ref = exp.scan(
-            exp.readout.scan_request(document, timeout_seconds=15.0)
-        )
+        scan_ref = exp.scan(exp.readout.scan_request(document))
         source = exp.readout.materialize_scan(scan_ref)
         execution = exp.fit(
             scan_ref,

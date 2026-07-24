@@ -1,25 +1,15 @@
-# AGENTS.md — 当前仓库工作契约
+# AGENTS.md — 当前仓库执行契约
 
-## 权威边界
+## 恢复与权威
 
-- 权威链(2026-07-20 起):法条=`docs/DESIGN_CHARTER_zh.md`(宪法,每轮全文必读)→ 进度=`docs/MIGRATION_LEDGER_zh.md`(台账)→ 叙事=`docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md`。冲突以宪法为准;绝不新建计划/goal 文档。
-- `tests/README.md` 只说明测试入口；其它旧 roadmap、TaskConsole v2 设计及历史记录都不能反向定义目标架构。
-- 用户已经授权仓库内正常实现与验证；不要为普通命令重复索要权限或额外的继续确认。
-- `Zou_lab_control/` 中尚未迁走的 GUI/runtime 是 `SerializedLegacyAggBridge` legacy island。它的测试只约束该岛在 dependency-closed cut 前保持既有行为，不能约束 `zlc_frontend`、`zlc_workbench` 或其它目标包的架构。
+- 权威顺序固定为：用户最新明确要求 → 当前完整 `/goal` → 物理/算法事实与 `main` 正式用户行为 → `docs/DESIGN_CHARTER_zh.md` 与相关设计章节 → 当前实现 → 测试。
+- 每次上下文压缩后先完整读取当前 `/goal`，再从 Git 状态、当前 plan 与最近实现 checkpoint 恢复；只读取本任务相关的设计章节。不得重新回答用户已经得到答案的问题，不得重做已闭合审查，也不得把历史台账状态冒充当前任务。
+- `docs/MIGRATION_LEDGER_zh.md` 只保存历史因果和已完成 checkpoint，不是新的架构权威；除非正在核对某个明确 checkpoint，不全文读取。
+- 发现设计与事实冲突时，先由代码、真实产品流和物理约束重新推导，再同步修正设计；不能为了维护旧文档或旧测试而保留错误实现。
 
-## 硬约束
+## 当前包与产品边界
 
-- 中文沟通；代码标识符与 commit message 可用英文。
-- 所有工作只在 `codex/system-architecture-migration`；分主题详细 commit，`Co-authored-by: Codex <codex@openai.com>`；不 push。
-- 不保留兼容层、双格式、历史 archive、转换器或无消费者的防御机器。旧机制在最后消费者迁走的同一 dependency-closed cut 删除。
-- bitstream/RTL 冻结。只有证据证明现有 RTL 有真实 bug 或违背既定设计时，才单独评估硬件修改；不得为了架构偏好要求重烧。
-- 精密 pulse/trigger 时序由现有 FPGA、qCMOS 等硬件执行；host 只冻结计划、验证工作 envelope、排空数据与做末端对账，不用 sleep 调度硬件边沿。
-- calibration/readout 的物理与算法唯一权威是 `main@6c337d49c7086fa0ff21f879cd159bdf0e753f51`。偏离必须指出 main 的具体问题，并用同一原始帧的独立 oracle 证明差异。
-- 数据内核永久保留 `(R, P, *data_shape)`；不得把多维 `data_shape` 折成单一 `data_dim` item，也不得用隐式 `reshape(...)[0]`、flatten 或 trailing-axis 平均制造权威标量。
-
-## 当前包边界
-
-目标 DAG 为：
+目标依赖方向为：
 
 ```text
 zlc_storage   zlc_data   zlc_pulse
@@ -29,25 +19,27 @@ zlc_storage   zlc_data   zlc_pulse
                zlc_frontend
                      |
                zlc_workbench
+                     |
+             Zou_lab_control
 ```
 
-领域类型、canonical codec、digest、生命周期与硬件 I/O 各有且只有一个 owner；跨包嵌入值对象时调用 owner 的公开序列化器，不复制字段表或 validator。
+- `Zou_lab_control/` 现在只允许存在 public notebook/composition facade 和 launcher glue；它不是 legacy GUI/runtime 岛。旧 runtime、registry、DeviceSet、第二套算法或窗口实现不得留在该包。
+- 领域类型、canonical codec、digest、数据 shape/validity、生命周期、硬件 I/O、Figure/selector/Fit 和 Qt composition 各有且只有一个 owner。跨包嵌值对象时调用 owner 的公开 API，不复制字段表、validator、shape 规则或算法。
+- 数据内核永久保留 `(R, P, *data_shape)`；标量物理表示固定为 `(R,P,1)`。禁止按 rank/singleton 猜语义，禁止隐式 first/flatten/trailing mean，禁止把多维 `data_shape` 压成一个 item。
 
-## Rules 1–7 追溯整改 gate
+## 实现方法
 
-在设计文档记录的 Rules 1–7 全局状态全部为 `COMPLETE` 且独立对抗审查无 P0/P1 前，不开始新的迁移切片。整改范围每次由 `git rev-list main..HEAD` 与 `git diff --name-only main...HEAD` 机械产生，不能凭会话记忆抽样。
+- 先问产生现象的机制是否应该存在，再修代码。每个非 `main` 新机制必须能点名真实需求、唯一 owner、现有 consumer 和相对直接方案的必要收益；答不出就删除完整依赖闭包。
+- 不打局部补丁，不留 alias、wrapper、兼容 reader、迁移态、历史 archive、零消费者抽象、第二套实现或改名残余。删除必须覆盖生产者、消费者、导出、文档与已经失去意义的测试。
+- bitstream/RTL 冻结。只有证据证明现有 RTL 有真实 bug 或违背既定设计时才单独评估修改；不能为了架构偏好要求重烧。精密 pulse/trigger 时序由现有 FPGA、qCMOS 等硬件执行，host 只冻结计划、验证 envelope、排空数据和做末端对账。
+- calibration/readout 的物理与算法以 `main@6c337d49c7086fa0ff21f879cd159bdf0e753f51` 为基线；偏离必须指出 main 的具体错误并用同一原始输入的独立 oracle 证明。
+- 普通 Qt 编辑只修改稳定 widget/editor draft；不得构造全应用 snapshot、周期轮询或重建控件树。只有真实 worker、连接、Run、数据 revision 或 coherent board front 边界可发布 immutable snapshot。
+- UI 的正式界面、操作与美术默认逐项继承 `ZLC_main`；新后端可以不同，但没有明确更优理由时像素和手感必须一致。通用 widget、Figure/Divider、selector、Setting/Edit 和 renderer 必须复用唯一实现。
 
-1. 每条不变量一个 owner；其它边界信任已验证的不可变类型。
-2. 机制必须对应已经观测的失败；没有失败依据的守门、防伪、兼容和未来机器删除。
-3. 只给真实跨会话持久格式保留朴素格式名；不建版本迁移体系。
-4. 已验证物理逻辑选择性继承 main，并使用同帧独立 oracle。
-5. 测试必须有独立 oracle；不以实现同款公式镜像自证。
-6. 每个切片报告与 main 等价物的 PLOC/NCLOC/class 比；超过约 3 倍必须解释或压缩。
-7. 计划级决定与代码同 commit 写回活设计文档；教程/手册可等完整迁移后统一更新。
+## 工作与验证纪律
 
-## 验证与文件纪律
-
-- 先跑能证明改动边界的测试；跨子系统收敛或交付前再跑合并/全量验证。
-- GUI 视觉验收必须走用户真实入口和真实交互；headless 单元测试不能冒充最终视觉验收。
-- 修改文件使用 `apply_patch`；保留工作树中不属于当前主题的改动，提交时只 stage 选定文件/块。
-- 删除或重构后执行死符号/历史残余搜索、`git diff --check` 和相关测试；不得留下 TODO/FIXME 代替本目标内的实现。
+- 可以并鼓励使用 subagent 并行完成真实、互不重叠的文件切片或产品流；agent 可在明确文件范围内修改。禁止用 agent 反复复审同一个小改动、重复已闭合工作或制造审查仪式。
+- 修改文件使用 `apply_patch`；保留用户及其它 agent 的无关改动。只在主题闭合后逐文件 stage；禁 `git add -A`，禁 push，禁破坏性回退。
+- 迁移期间不为历史测试适配架构。先阅读测试所表达的物理/产品原理，只有它仍是 current contract 才更新或运行；普通改动不跑宽测试。关键边界用最窄的 `py_compile`、静态残余搜索、`git diff --check` 和一个真实产品流证明，全部迁移完成后再做合并验证。
+- GUI 快轨：先设 `QT_QPA_PLATFORM=offscreen`，再由唯一 `ensure_qt_app()` 经正式 composition root 打开窗口，使用真实 Qt input 和 outer-window `grab()`；不得另造窗口、DPI、尺寸或样式。慢轨从正式 `.py/.bat` launcher 按人类流程运行，只用于最终或争议复核。
+- 每个最终审查切片必须建立实际文件清单并逐文件读完，报告文件数、真实问题、保留抽象的 consumer 和删除内容。上下文压缩后从该 checkpoint 继续，不能把“文件不在”或某个测试通过当作审查完成。

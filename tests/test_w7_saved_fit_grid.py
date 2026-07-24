@@ -51,7 +51,6 @@ from zlc_frontend import (
     FitGridModel,
     ImageDisplayState,
     ImagePanelPayload,
-    PixelFormat,
 )
 from zlc_frontend.image_display import ImageColormap
 from zlc_frontend.figure import (
@@ -71,7 +70,7 @@ from zlc_frontend.qt_widgets import AxisLayoutNavigator, FrozenRasterView, QtRas
 from zlc_neutral_atom.artifacts import AdmittedCapture, FitResultRepository
 from zlc_neutral_atom.fit_reference import FitResultArtifactRef
 
-from Zou_lab_control.workbench._fit_grid import (
+from zlc_workbench.fit_grid.render_lane import (
     _build_image_grid_frame,
     _reframe_existing_image_panels,
     _rerasterize_grid_view,
@@ -349,7 +348,10 @@ def test_typed_image_page_preserves_repeat_sparse_holes_overlay_and_shared_clim(
     assert not hasattr(model, "result")
     assert model.layout.storage_size == result.batch_layout.storage_size == 4
     assert 0 < len(frame.panels) == len(projected) == 6 <= 36
-    assert all(panel.raster.pixel_format is PixelFormat.INDEXED8 for panel in frame.panels)
+    assert all(
+        len(panel.raster.pixels) == panel.raster.width * panel.raster.height * 4
+        for panel in frame.panels
+    )
     payloads = tuple(panel.display_payload for panel in frame.panels)
     assert all(isinstance(payload, ImagePanelPayload) for payload in payloads)
     assert {payload.color_limits for payload in payloads} == {color_limits}

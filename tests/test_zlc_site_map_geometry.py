@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_site_map_fact_and_exact_view_owners_are_headless() -> None:
-    for name in ("site_map.py", "occupancy_render.py"):
+    for name in ("site_map.py", "site_map_render.py"):
         tree = ast.parse((ROOT / "zlc_frontend" / name).read_text(encoding="utf-8"))
         roots = set()
         for node in ast.walk(tree):
@@ -30,7 +30,7 @@ def test_site_map_fact_and_exact_view_owners_are_headless() -> None:
             (
                 "import sys\n"
                 "import zlc_frontend.site_map\n"
-                "import zlc_frontend.occupancy_render\n"
+                "import zlc_frontend.site_map_render\n"
                 "assert not any(name == 'PyQt5' or name.startswith('PyQt5.') "
                 "for name in sys.modules)\n"
                 "assert not any(name == 'matplotlib' or name.startswith('matplotlib.') "

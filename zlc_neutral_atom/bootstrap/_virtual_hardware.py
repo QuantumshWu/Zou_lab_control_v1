@@ -39,7 +39,7 @@ _GREY_MOLASSES_HOT_FACTOR = 6.0
 
 
 def grey_molasses_cooling_factor(detuning_gamma: float) -> float:
-    """Main's virtual D1 grey-molasses floor at the default saturation of 3."""
+    """Virtual D1 grey-molasses floor at the default saturation of 3."""
 
     detuning = float(detuning_gamma)
     if not math.isfinite(detuning):

@@ -14,8 +14,8 @@ from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
 import Zou_lab_control.notebook as zlc
-from Zou_lab_control.workbench._figure import DataFigureWindow
-from Zou_lab_control.workbench._fit_grid import SavedFitGridWindow
+from zlc_workbench.data_figure.window import DataFigureWindow
+from zlc_workbench.fit_grid.window import SavedFitGridWindow
 from zlc_data import (
     SPATIAL_X,
     SPATIAL_Y,

@@ -47,7 +47,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from PyQt5 import QtCore
 
     from zlc_frontend.qt_widgets import ensure_qt_app
-    from zlc_workbench.pulse_editor.app import open_pulse_editor
+    from Zou_lab_control.workbench import open_pulse_editor
 
     application = ensure_qt_app()
     remote_endpoint = None

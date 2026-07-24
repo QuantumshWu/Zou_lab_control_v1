@@ -17,13 +17,18 @@ import math
 import numpy as np
 
 from zlc_data import AxisId, CoordinateFrameId, immutable_array
-from zlc_neutral_atom.capture_application import CaptureRequest
+from zlc_neutral_atom.capture_application import (
+    CAPTURE_READOUT_EVENT_AXIS_ID,
+    CaptureRequest,
+)
 from zlc_neutral_atom.catalog import DefinitionKey, TaskDefinition
+from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.runtime.capture import CameraPhysicalFacts
 from zlc_pulse import (
     FIELD_DURATION,
     PORT_DIGITAL,
     PulseDocument,
+    PulseExecutionForm,
     RepeatRegion,
     pulse_document_from_tree,
     resolve_api_parameters,
@@ -37,6 +42,7 @@ from zlc_storage import (
 from .calibration import (
     CalibrationAnalysisRequest,
     GridOrder,
+    ThresholdMethod,
 )
 from .contracts import (
     CalibrationCaptureLayout,
@@ -72,26 +78,17 @@ class SitemapCalibrationRequest:
     The capture request is complete before execution.  The calibration request
     itself can only be constructed after that capture has committed its exact
     ``CaptureArtifactRef``, so this value carries the already-frozen analysis
-    intent and the internal analysis deadline for the second stage.
+    intent for the second stage.
     """
 
     capture_request: CaptureRequest
     analysis: CalibrationAnalysisRequest
-    calibration_timeout_seconds: float
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture_request, CaptureRequest):
             raise TypeError("capture_request must be CaptureRequest")
         if not isinstance(self.analysis, CalibrationAnalysisRequest):
             raise TypeError("analysis must be CalibrationAnalysisRequest")
-        object.__setattr__(
-            self,
-            "calibration_timeout_seconds",
-            positive_real(
-                self.calibration_timeout_seconds,
-                "calibration_timeout_seconds",
-            ),
-        )
 
 
 def _pair(value: object, field: str) -> tuple[int, int]:
@@ -296,7 +293,7 @@ class SitemapAcquisitionProfile:
         readout_exposure_s: float,
         pulse_document: PulseDocument | None = None,
     ) -> PulseDocument:
-        """Freeze Main's long-short-long exposure intent into the fired pulse.
+        """Freeze the long-short-long exposure intent into the fired pulse.
 
         A caller-selected pulse is admitted through this profile's complete
         three-event/trigger validation before any API value is resolved.  The
@@ -354,6 +351,107 @@ class SitemapAcquisitionProfile:
         )
 
 
+def build_sitemap_analysis_request(
+    profile: SitemapAcquisitionProfile,
+    *,
+    threshold_method: ThresholdMethod | str = ThresholdMethod.OTSU,
+    roi_radius: int | None = None,
+) -> CalibrationAnalysisRequest:
+    """Apply operator analysis choices to one installation-owned profile."""
+
+    if not isinstance(profile, SitemapAcquisitionProfile):
+        raise TypeError("profile must be SitemapAcquisitionProfile")
+    if isinstance(threshold_method, str):
+        try:
+            threshold_method = ThresholdMethod(threshold_method.strip().lower())
+        except ValueError as error:
+            raise ValueError(
+                "threshold_method must be 'otsu' or 'bimodal'"
+            ) from error
+    if not isinstance(threshold_method, ThresholdMethod):
+        raise TypeError("threshold_method must be ThresholdMethod or str")
+    if roi_radius is not None:
+        if isinstance(roi_radius, bool) or not isinstance(roi_radius, int):
+            raise TypeError("roi_radius must be an integer or None")
+        if roi_radius < 1:
+            raise ValueError("roi_radius must be positive")
+    return replace(
+        profile.analysis_request(CAPTURE_READOUT_EVENT_AXIS_ID),
+        threshold_method=threshold_method,
+        **({} if roi_radius is None else {"box_radius": roi_radius}),
+    )
+
+
+def build_sitemap_calibration_request(
+    profile: SitemapAcquisitionProfile,
+    *,
+    camera_ref: DeviceRef,
+    sequencer_ref: DeviceRef,
+    repeat_groups: int,
+    pulse_document: PulseDocument | None = None,
+    reference_exposure_s: float | None = None,
+    readout_exposure_s: float | None = None,
+    threshold_method: ThresholdMethod | str = ThresholdMethod.OTSU,
+    roi_radius: int | None = None,
+) -> SitemapCalibrationRequest:
+    """Freeze the complete capture→calibration physical request.
+
+    Installation composition resolves concrete device references and the
+    profile.  This owner alone decides the three-event pulse, repeat-major
+    grouping, Camera cardinality and matching calibration analysis contract.
+    """
+
+    if not isinstance(profile, SitemapAcquisitionProfile):
+        raise TypeError("profile must be SitemapAcquisitionProfile")
+    if not isinstance(camera_ref, DeviceRef):
+        raise TypeError("camera_ref must be DeviceRef")
+    if not isinstance(sequencer_ref, DeviceRef):
+        raise TypeError("sequencer_ref must be DeviceRef")
+    if camera_ref.role != profile.readout_binding.value:
+        raise ValueError("camera_ref differs from the sitemap readout binding")
+    if sequencer_ref.role != profile.sequencer_role:
+        raise ValueError("sequencer_ref differs from the sitemap sequencer role")
+    repeats = positive_integer(repeat_groups, "repeat_groups")
+    if pulse_document is not None and not isinstance(pulse_document, PulseDocument):
+        raise TypeError("pulse_document must be PulseDocument or None")
+    if (reference_exposure_s is None) != (readout_exposure_s is None):
+        raise ValueError(
+            "reference_exposure_s and readout_exposure_s must be set together"
+        )
+
+    if reference_exposure_s is None:
+        selected_profile = (
+            profile
+            if pulse_document is None
+            else replace(profile, pulse_document=pulse_document)
+        )
+        document = selected_profile.document_for_repeats(repeats)
+    else:
+        assert readout_exposure_s is not None
+        document = profile.configured_document_for_repeats(
+            repeats,
+            reference_exposure_s=reference_exposure_s,
+            readout_exposure_s=readout_exposure_s,
+            pulse_document=pulse_document,
+        )
+    analysis = build_sitemap_analysis_request(
+        profile,
+        threshold_method=threshold_method,
+        roi_radius=roi_radius,
+    )
+    capture = CaptureRequest(
+        document,
+        PulseExecutionForm.STATIC_ONCE,
+        camera_ref,
+        sequencer_ref,
+        profile.trigger_channel,
+        repeats,
+        profile.event_count,
+        profile.repeat_major_grouping(repeats),
+    )
+    return SitemapCalibrationRequest(capture, analysis)
+
+
 def load_packaged_sitemap_pulse() -> PulseDocument:
     """Load the neutral-atom-owned pulse asset without a source-tree/CWD path."""
 
@@ -368,5 +466,7 @@ __all__ = [
     "SITEMAP_CALIBRATION_TASK_KEY",
     "SitemapAcquisitionProfile",
     "SitemapCalibrationRequest",
+    "build_sitemap_analysis_request",
+    "build_sitemap_calibration_request",
     "load_packaged_sitemap_pulse",
 ]

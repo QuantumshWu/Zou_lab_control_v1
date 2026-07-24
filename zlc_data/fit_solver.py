@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from numbers import Real
 import time
 from typing import Callable
 
 import numpy as np
 import scipy
 from scipy.optimize import least_squares
+from zlc_storage.canonical import finite_real
 
 from .fit_contract import (
     BoundFit,
@@ -82,13 +82,10 @@ def _fit_analysis(
     if cancel_check is not None and not callable(cancel_check):
         raise TypeError("cancel_check must be callable or None")
     if deadline_monotonic is not None:
-        if (
-            isinstance(deadline_monotonic, bool)
-            or not isinstance(deadline_monotonic, Real)
-            or not math.isfinite(float(deadline_monotonic))
-        ):
-            raise ValueError("deadline_monotonic must be a finite absolute deadline")
-        deadline_monotonic = float(deadline_monotonic)
+        deadline_monotonic = finite_real(
+            deadline_monotonic,
+            "deadline_monotonic",
+        )
 
     def packing_abort() -> None:
         _check_host_abort(cancel_check, deadline_monotonic)

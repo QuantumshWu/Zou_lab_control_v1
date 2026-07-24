@@ -12,7 +12,7 @@ from collections.abc import Sequence
 
 from PyQt5 import QtGui, QtWidgets
 
-from zlc_data.console_records import PanelConfig
+from .console_records import PanelConfig
 from zlc_frontend import board_layout as _layout
 from zlc_frontend.qt_widgets import CARD_PAD, CARD_TITLE_PX, scaled_px
 from zlc_frontend.render_style import panel_display_size

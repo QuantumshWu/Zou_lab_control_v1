@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from numbers import Integral, Real
+from numbers import Real
 from typing import Any
 
-from zlc_storage.canonical import exact_mapping as _exact_map
+from zlc_storage.canonical import (
+    exact_mapping as _exact_map,
+    integer,
+    nonnegative_integer,
+)
 
 from ._diagnostic import exact_integer_text
 from .axis import (
@@ -15,6 +19,7 @@ from .axis import (
     CoordinateFrameId,
     _canonical_numeric_coordinate,
 )
+from .layout import PointLayout
 
 
 @dataclass(frozen=True)
@@ -27,11 +32,11 @@ class IndexSelection:
     def __post_init__(self) -> None:
         if not isinstance(self.axis_id, AxisId):
             raise TypeError("axis_id must be AxisId")
-        if isinstance(self.index, bool) or not isinstance(self.index, Integral):
-            raise TypeError("selection index must be an integer")
-        if self.index < 0:
-            raise ValueError("selection index must be non-negative")
-        object.__setattr__(self, "index", int(self.index))
+        object.__setattr__(
+            self,
+            "index",
+            nonnegative_integer(self.index, "selection index"),
+        )
 
 
 @dataclass(frozen=True)
@@ -46,9 +51,9 @@ class IndexRangeSelection:
         if not isinstance(self.axis_id, AxisId):
             raise TypeError("axis_id must be AxisId")
         for name, value in (("start", self.start), ("stop", self.stop)):
-            if isinstance(value, bool) or not isinstance(value, Integral):
-                raise TypeError(f"selection {name} must be an integer")
-            object.__setattr__(self, name, int(value))
+            normalized = integer(value, f"selection {name}")
+            assert normalized is not None
+            object.__setattr__(self, name, normalized)
         if self.start < 0 or self.stop <= self.start:
             raise ValueError("index range must be a non-empty half-open interval")
 
@@ -207,6 +212,113 @@ def resolve_selection_indices(
     return indices, False
 
 
+def resolve_outer_cell_selection(
+    repeat_axis: AxisSpec,
+    point_axes: tuple[AxisSpec, ...],
+    point_layout: PointLayout,
+    selection: Selection | None,
+) -> tuple[int, int, tuple[int, ...]]:
+    """Resolve one exact named ``(repeat, point)`` cell.
+
+    Missing terms are accepted only for singleton axes.  This is the single
+    data-layer owner for mapping an axis-named selection onto the physical
+    point storage layout; presentation and experiment packages must not infer
+    the address from rank, tuple position, or a first/latest fallback.
+    """
+
+    if not isinstance(repeat_axis, AxisSpec):
+        raise TypeError("repeat_axis must be AxisSpec")
+    axes_after_repeat = tuple(point_axes)
+    if any(not isinstance(axis, AxisSpec) for axis in axes_after_repeat):
+        raise TypeError("point_axes must contain AxisSpec values")
+    if not isinstance(point_layout, PointLayout):
+        raise TypeError("point_layout must be PointLayout")
+    if point_layout.logical_shape != tuple(axis.size for axis in axes_after_repeat):
+        raise ValueError("point_layout logical shape differs from point_axes")
+    if selection is not None and not isinstance(selection, Selection):
+        raise TypeError("selection must be Selection or None")
+    axes = (repeat_axis, *axes_after_repeat)
+    by_axis = {} if selection is None else {
+        term.axis_id: term for term in selection.terms
+    }
+    known = {axis.axis_id for axis in axes}
+    if any(axis_id not in known for axis_id in by_axis):
+        raise ValueError("dataset cell selection may name only repeat and point axes")
+    indices: list[int] = []
+    for axis in axes:
+        term = by_axis.get(axis.axis_id)
+        if term is None:
+            if axis.size != 1:
+                raise ValueError(
+                    f"dataset cell requires an explicit index for axis {axis.axis_id}"
+                )
+            indices.append(0)
+            continue
+        if not isinstance(term, IndexSelection):
+            raise TypeError("dataset cell selection accepts only IndexSelection terms")
+        resolved, drop = resolve_selection_indices(axis, term)
+        if not drop or len(resolved) != 1:
+            raise ValueError("dataset cell selection must resolve one exact index")
+        indices.append(resolved.start)
+    logical_point = tuple(indices[1:])
+    try:
+        point_storage_index = point_layout.storage_index(logical_point)
+    except KeyError as error:
+        raise ValueError(
+            f"selected logical point {logical_point} is absent from PointLayout"
+        ) from error
+    return indices[0], point_storage_index, logical_point
+
+
+def selection_for_outer_cell(
+    repeat_axis: AxisSpec,
+    point_axes: tuple[AxisSpec, ...],
+    point_layout: PointLayout,
+    repeat_index: int,
+    logical_point: tuple[int, ...],
+) -> Selection:
+    """Build the canonical all-outer-axis selection for one physical cell."""
+
+    if not isinstance(repeat_axis, AxisSpec):
+        raise TypeError("repeat_axis must be AxisSpec")
+    axes_after_repeat = tuple(point_axes)
+    if any(not isinstance(axis, AxisSpec) for axis in axes_after_repeat):
+        raise TypeError("point_axes must contain AxisSpec values")
+    if not isinstance(point_layout, PointLayout):
+        raise TypeError("point_layout must be PointLayout")
+    if point_layout.logical_shape != tuple(axis.size for axis in axes_after_repeat):
+        raise ValueError("point_layout logical shape differs from point_axes")
+    normalized_repeat = integer(repeat_index, "repeat_index")
+    assert normalized_repeat is not None
+    repeat = normalized_repeat
+    if not 0 <= repeat < repeat_axis.size:
+        raise IndexError("repeat_index is outside the repeat axis")
+    try:
+        logical = tuple(logical_point)
+    except TypeError as error:
+        raise TypeError("logical_point must be an index tuple") from error
+    if len(logical) != len(axes_after_repeat):
+        raise ValueError("logical_point rank differs from point_axes")
+    point_layout.storage_index(logical)
+    terms = [IndexSelection(repeat_axis.axis_id, repeat)]
+    terms.extend(
+        IndexSelection(axis.axis_id, index)
+        for axis, index in zip(axes_after_repeat, logical, strict=True)
+    )
+    selection = Selection(tuple(terms))
+    resolved_repeat, _point_storage_index, resolved_logical = (
+        resolve_outer_cell_selection(
+            repeat_axis,
+            axes_after_repeat,
+            point_layout,
+            selection,
+        )
+    )
+    if resolved_repeat != repeat or resolved_logical != logical:
+        raise RuntimeError("canonical dataset-cell selection changed its address")
+    return selection
+
+
 def selection_to_tree(selection: Selection) -> dict[str, Any]:
     if not isinstance(selection, Selection):
         raise TypeError("selection must be Selection")
@@ -303,7 +415,9 @@ __all__ = [
     "IndexSelection",
     "Selection",
     "SelectionTerm",
+    "resolve_outer_cell_selection",
     "resolve_selection_indices",
+    "selection_for_outer_cell",
     "selection_from_tree",
     "selection_to_tree",
 ]

@@ -8,41 +8,26 @@ import threading
 from typing import Callable
 
 from zlc_data import (
-    BlockId,
     DatasetRevision,
     DatasetRevisionRef,
-    DatasetSchema,
-    IndexSelection,
-    Selection,
-    SITE,
     dataset_revision_ref_to_tree,
-    materialize_transformed_snapshot,
 )
 from zlc_frontend.matplotlib_render import (
     SinglePanelAggRenderer,
 )
 from zlc_frontend.curve_display import (
     CurveDisplayState,
-    numeric_curve_coordinates,
 )
 from zlc_frontend.display_range import RelimMode
 from zlc_frontend.figure import (
-    CURVE_CONTRACT,
-    DatasetDescriptor,
-    DatasetId,
-    FigureDocument,
     FigureEvaluator,
-    FigureLayer,
-    AxisViewRole,
-    EvaluatedAxis,
     EvaluatedInput,
     ResolvedDataset,
     ResolvedDatasetMap,
-    RepeatViewMode,
-    SuggestionStatus,
-    ViewIntent,
-    ViewPreferences,
-    suggest_view,
+)
+from zlc_frontend.scan_preview import (
+    SCAN_CURVE_PANEL_ID,
+    ScanCurvePresentation,
 )
 from zlc_frontend.render import (
     BoardFrame,
@@ -56,9 +41,8 @@ from zlc_frontend.render import (
     SourceIdentity,
     detached_render_fault,
 )
-from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewSpec
-from zlc_neutral_atom.scan import ScanOutputContract
-from zlc_storage import canonical_digest, canonical_text
+from zlc_neutral_atom.scan.application import PreparedExactScan
+from zlc_storage import canonical_digest
 
 from .exact_live_slot import ExactDatasetLiveSlot
 from .workspace import (
@@ -70,249 +54,28 @@ from .workspace import (
 )
 
 
-_PANEL_ID = "scan-curve"
 _COHERENCE_GROUP = "scan-output"
 _RASTER_WIDTH = 800
 _RASTER_HEIGHT = 520
 
 
 @dataclass(frozen=True, slots=True)
-class ScanDisplayIntent:
-    """Visible, non-authoritative site presentation choice for a scan panel."""
-
-    site_mode: str = "auto"
-    site_index: int = 0
-
-    def __post_init__(self) -> None:
-        mode = canonical_text(self.site_mode, "site_mode")
-        if mode not in {"auto", "batch", "select"}:
-            raise ValueError("site_mode must be 'auto', 'batch', or 'select'")
-        if (
-            isinstance(self.site_index, bool)
-            or not isinstance(self.site_index, int)
-            or self.site_index < 0
-        ):
-            raise ValueError("site_index must be a nonnegative integer")
-        if mode != "select" and self.site_index != 0:
-            raise ValueError("site_index is meaningful only when site_mode='select'")
-
-
-@dataclass(frozen=True, slots=True)
 class ProgressiveScanSpec:
-    """Frozen display-only plan paired with one authoritative output contract."""
+    """Composition pairing of one authoritative output and frontend view."""
 
-    output_contract: ScanOutputContract
-    output_block_id: BlockId
-    document: FigureDocument
-    projection_summary: str
-    preview_spec: ExactDatasetPreviewSpec
-    display_selection: Selection | None
-    display_preferences: ViewPreferences
-    interactive_curve: bool
-    interaction_unavailable_reason: str | None
+    output_owner: PreparedExactScan
+    presentation: ScanCurvePresentation
 
     def __post_init__(self) -> None:
-        if not isinstance(self.output_contract, ScanOutputContract):
-            raise TypeError("output_contract must be ScanOutputContract")
-        if not isinstance(self.preview_spec, ExactDatasetPreviewSpec):
-            raise TypeError("preview_spec must be ExactDatasetPreviewSpec")
+        if not isinstance(self.output_owner, PreparedExactScan):
+            raise TypeError("output_owner must be PreparedExactScan")
+        if not isinstance(self.presentation, ScanCurvePresentation):
+            raise TypeError("presentation must be ScanCurvePresentation")
         if (
-            self.output_contract.committed_transform.input_schema_fingerprint
-            != self.preview_spec.source_schema_fingerprint
+            self.presentation.document.datasets[0].schema_fingerprint
+            != self.output_owner.output_contract.output_schema_fingerprint
         ):
-            raise ValueError("progressive transform belongs to another source schema")
-        if not isinstance(self.output_block_id, BlockId):
-            raise TypeError("output_block_id must be BlockId")
-        if not isinstance(self.document, FigureDocument):
-            raise TypeError("document must be FigureDocument")
-        if self.display_selection is not None and not isinstance(
-            self.display_selection,
-            Selection,
-        ):
-            raise TypeError("display_selection must be Selection or None")
-        if not isinstance(self.display_preferences, ViewPreferences):
-            raise TypeError("display_preferences must be ViewPreferences")
-        if not isinstance(self.interactive_curve, bool):
-            raise TypeError("interactive_curve must be bool")
-        if self.interactive_curve:
-            if self.interaction_unavailable_reason is not None:
-                raise ValueError(
-                    "interactive curve cannot have an unavailable reason"
-                )
-        else:
-            object.__setattr__(
-                self,
-                "interaction_unavailable_reason",
-                canonical_text(
-                    self.interaction_unavailable_reason,
-                    "interaction_unavailable_reason",
-                ),
-            )
-        dataset_id = self.document.datasets[0].dataset_id if self.document.datasets else None
-        if (
-            len(self.document.datasets) != 1
-            or self.document.datasets[0].schema_fingerprint
-            != self.output_contract.output_schema_fingerprint
-            or len(self.document.layers) != 1
-            or self.document.layers[0].dataset_id != dataset_id
-            or self.document.layers[0].view.intent is not ViewIntent.CURVE
-            or any(
-                binding.role is AxisViewRole.FACET
-                for binding in self.document.layers[0].view.axis_bindings
-            )
-        ):
-            raise ValueError(
-                "progressive document must be one non-faceted CURVE over scan output"
-            )
-        object.__setattr__(
-            self,
-            "projection_summary",
-            canonical_text(self.projection_summary, "projection_summary"),
-        )
-
-    @property
-    def dataset_id(self) -> DatasetId:
-        return self.document.datasets[0].dataset_id
-
-
-def build_occupancy_progressive_spec(
-    source_schema: DatasetSchema,
-    output_contract: ScanOutputContract,
-    *,
-    identity: str,
-    display_intent: ScanDisplayIntent = ScanDisplayIntent(),
-) -> ProgressiveScanSpec:
-    """Derive one visible, non-authoritative curve view from declared axes."""
-
-    if not isinstance(source_schema, DatasetSchema):
-        raise TypeError("source_schema must be DatasetSchema")
-    if not isinstance(output_contract, ScanOutputContract):
-        raise TypeError("output_contract must be ScanOutputContract")
-    if not isinstance(display_intent, ScanDisplayIntent):
-        raise TypeError("display_intent must be ScanDisplayIntent")
-    identity = canonical_text(identity, "identity")
-    output_schema = output_contract.output_dataset_schema
-    if not output_schema.point_axes:
-        raise ValueError("progressive scan curve requires a declared point axis")
-    x_axis = output_schema.point_axes[0]
-    try:
-        numeric_curve_coordinates(
-            EvaluatedAxis(
-                x_axis.axis_id,
-                x_axis.name,
-                x_axis.role,
-                x_axis.unit,
-                tuple(range(x_axis.size)),
-                tuple(x_axis.coordinates),
-            )
-        )
-    except (TypeError, ValueError) as error:
-        interactive_curve = False
-        interaction_unavailable_reason = f"{type(error).__name__}: {error}"
-    else:
-        interactive_curve = True
-        interaction_unavailable_reason = None
-    first_point = output_schema.point_layout.multi_index(0)
-    terms = [
-        IndexSelection(axis.axis_id, first_point[index])
-        for index, axis in enumerate(output_schema.point_axes)
-        if axis.axis_id != x_axis.axis_id
-    ]
-    # Information-bearing trailing axes are selected, never averaged.  The
-    # exact coordinate is kept in ViewSpec and in the visible summary.
-    data_axes = output_schema.cell_schema.data_axes
-    site_axes = tuple(axis for axis in data_axes if axis.role == SITE)
-    if len(site_axes) != 1:
-        raise ValueError("occupancy output must declare exactly one SITE axis")
-    site_axis = site_axes[0]
-    if display_intent.site_mode == "batch":
-        if site_axis.size <= 1:
-            raise ValueError("site batch display requires at least 2 sites")
-        batch_axis = site_axis
-    elif display_intent.site_mode == "select":
-        if display_intent.site_index >= site_axis.size:
-            raise ValueError("selected site index exceeds the declared SITE axis")
-        batch_axis = None
-    else:
-        batch_axis = site_axis if site_axis.size > 1 else None
-    terms.extend(
-        IndexSelection(
-            axis.axis_id,
-            display_intent.site_index
-            if axis is site_axis and display_intent.site_mode == "select"
-            else 0,
-        )
-        for axis in data_axes
-        if axis is not batch_axis
-    )
-    selection = None if not terms else Selection(tuple(terms))
-    preferences = ViewPreferences(
-        repeat_mode=RepeatViewMode.MEAN,
-        x_axis_id=x_axis.axis_id,
-        batch_axis_ids=(
-            () if batch_axis is None else (batch_axis.axis_id,)
-        ),
-    )
-    suggestion = suggest_view(
-        output_schema,
-        ViewIntent.CURVE,
-        selection,
-        preferences,
-    )
-    if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
-        detail = " · ".join(reason.message for reason in suggestion.reasons)
-        raise ValueError(
-            "occupancy progressive curve needs an explicit display choice"
-            + ("" if not detail else f": {detail}")
-        )
-    view = suggestion.spec
-    dataset_id = DatasetId(f"scan-preview-{identity}")
-    document = FigureDocument(
-        f"scan-preview-{identity}",
-        0,
-        (
-            DatasetDescriptor(
-                dataset_id,
-                "Occupancy counts · PROVISIONAL",
-                output_schema.fingerprint,
-            ),
-        ),
-        (FigureLayer(_PANEL_ID, dataset_id, view),),
-    )
-    selections = []
-    axes_by_id = {
-        axis.axis_id: axis
-        for axis in (
-            output_schema.repeat_axis,
-            *output_schema.point_axes,
-            *output_schema.cell_schema.data_axes,
-        )
-    }
-    for term in terms:
-        axis = axes_by_id[term.axis_id]
-        selections.append(f"{axis.name}={axis.coordinate_at(term.index)}")
-    summary = f"x={x_axis.name} · repeat=mean/{output_schema.repeat_axis.size}"
-    if batch_axis is not None:
-        summary += f" · {batch_axis.name}=batch/{batch_axis.size}"
-    if selections:
-        summary += " · " + " · ".join(selections)
-    if not interactive_curve:
-        assert interaction_unavailable_reason is not None
-        summary += (
-            " · static curve (interactive selector unavailable: "
-            f"{interaction_unavailable_reason})"
-        )
-    return ProgressiveScanSpec(
-        output_contract,
-        BlockId(f"scan-preview-output-{identity}"),
-        document,
-        summary,
-        ExactDatasetPreviewSpec(source_schema.fingerprint),
-        selection,
-        preferences,
-        interactive_curve,
-        interaction_unavailable_reason,
-    )
+            raise ValueError("progressive presentation belongs to another output schema")
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,7 +115,7 @@ class ProgressiveScanPreview:
             raise TypeError("curve_display must be CurveDisplayState")
         if not callable(submit_worker) or not callable(request_owner_wake):
             raise TypeError("worker submission and owner wake must be callable")
-        if slot.spec != spec.preview_spec:
+        if slot.spec != spec.output_owner.preview_spec:
             raise ValueError("slot and progressive display contracts differ")
         self._owner_thread = threading.get_ident()
         self._slot = slot
@@ -379,10 +142,16 @@ class ProgressiveScanPreview:
         self._curve_relim_mode: RelimMode | None = None
         self._board = BoardController(
             BoardModel(
-                f"scan-preview-board-{spec.dataset_id.value}",
+                f"scan-preview-board-{spec.presentation.dataset_id.value}",
                 0,
                 RenderSurface.WORKER_RASTER_LIVE,
-                (PanelSlot(_PANEL_ID, "occupancy-curve", _COHERENCE_GROUP),),
+                (
+                    PanelSlot(
+                        SCAN_CURVE_PANEL_ID,
+                        "occupancy-curve",
+                        _COHERENCE_GROUP,
+                    ),
+                ),
             ),
             presenter,
             request_owner_wake,
@@ -396,7 +165,7 @@ class ProgressiveScanPreview:
 
     @property
     def interactive_curve(self) -> bool:
-        return self._spec.interactive_curve
+        return self._spec.presentation.interactive_curve
 
     @property
     def fault(self) -> BaseException | None:
@@ -463,7 +232,7 @@ class ProgressiveScanPreview:
         self._require_owner()
         if not isinstance(state, CurveDisplayState):
             raise TypeError("state must be CurveDisplayState")
-        if not self._spec.interactive_curve:
+        if not self._spec.presentation.interactive_curve:
             raise RuntimeError("this progressive curve uses a static fallback")
         with self._candidate_condition:
             if self._closed:
@@ -572,7 +341,7 @@ class ProgressiveScanPreview:
                 raise RuntimeError(failure)
             evaluator = FigureEvaluator()
             renderer = SinglePanelAggRenderer(
-                self._spec.document,
+                self._spec.presentation.document,
                 width=_RASTER_WIDTH,
                 height=_RASTER_HEIGHT,
             )
@@ -591,25 +360,19 @@ class ProgressiveScanPreview:
                     run_id, causation, source = frozen_candidate
                     frozen_candidate = None
                     if source.ref.revision > last_revision:
-                        output_ref = DatasetRevisionRef(
-                            self._spec.output_block_id,
-                            source.ref.stream_generation,
-                            self._spec.output_contract.output_schema_fingerprint,
-                            source.ref.revision,
-                        )
-                        output = materialize_transformed_snapshot(
-                            source.snapshot,
-                            self._spec.output_contract.committed_transform,
-                            output_ref=output_ref,
-                            output_schema=(
-                                self._spec.output_contract.output_dataset_schema
-                            ),
+                        output = self._spec.output_owner.materialize_provisional_output(
+                            source
                         )
                         last_revision = source.ref.revision
                         next_evaluated = evaluator.evaluate(
-                            self._spec.document,
+                            self._spec.presentation.document,
                             ResolvedDatasetMap(
-                                (ResolvedDataset(self._spec.dataset_id, output),)
+                                (
+                                    ResolvedDataset(
+                                        self._spec.presentation.dataset_id,
+                                        output,
+                                    ),
+                                )
                             ),
                             cancel_requested=lambda: self.closed,
                         )
@@ -662,7 +425,7 @@ class ProgressiveScanPreview:
                 evaluated = last_evaluated
                 display_payload = None
                 curve_has_valid_samples = False
-                if self._spec.interactive_curve:
+                if self._spec.presentation.interactive_curve:
                     raster, display_payload = renderer.render_interactive_curve(
                         evaluated,
                         display_state,
@@ -676,9 +439,9 @@ class ProgressiveScanPreview:
                 else:
                     raster = renderer.render(evaluated)
                 presentation = PanelPresentationIdentity(
-                    _PANEL_ID,
-                    self._spec.document.document_id,
-                    self._spec.document.revision,
+                    SCAN_CURVE_PANEL_ID,
+                    self._spec.presentation.document.document_id,
+                    self._spec.presentation.document.revision,
                     0,
                     display_state.revision,
                 )
@@ -752,7 +515,7 @@ class ProgressiveScanPreview:
                 return
         source_ref = candidate.output_ref
         source = SourceIdentity(
-            self._spec.dataset_id,
+            self._spec.presentation.dataset_id,
             source_ref.block_id,
             source_ref.stream_generation,
             source_ref.schema_fingerprint,
@@ -770,7 +533,7 @@ class ProgressiveScanPreview:
                     "source_ref": dataset_revision_ref_to_tree(source_ref),
                 }
             ),
-            (EvaluatedInput(self._spec.dataset_id, source_ref),),
+            (EvaluatedInput(self._spec.presentation.dataset_id, source_ref),),
             (candidate.presentation,),
         )
         if (
@@ -796,7 +559,7 @@ class ProgressiveScanPreview:
             sequence,
             (
                 PanelFrame(
-                    _PANEL_ID,
+                    SCAN_CURVE_PANEL_ID,
                     _COHERENCE_GROUP,
                     source,
                     stamp,
@@ -848,8 +611,6 @@ class ProgressiveScanPreview:
 
 
 __all__ = [
-    "build_occupancy_progressive_spec",
     "ProgressiveScanPreview",
     "ProgressiveScanSpec",
-    "ScanDisplayIntent",
 ]

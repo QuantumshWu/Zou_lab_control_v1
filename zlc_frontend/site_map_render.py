@@ -7,21 +7,26 @@ from dataclasses import dataclass
 import numpy as np
 
 from zlc_data import (
-    AxisLayout,
     AxisSpec,
+    ComponentValidity,
     CoordinateFrameId,
+    DatasetRevisionRef,
     IndexSelection,
-    PointLayout,
+    OwnedSnapshot,
     SITE,
     SPATIAL_X,
     SPATIAL_Y,
     Selection,
-    StreamGenerationId,
-    resolve_selection_indices,
+    Value,
+    ValueSchema,
+    dataset_cell_value,
+    dataset_revision_ref_to_tree,
+    expand_value_validity,
+    selection_to_tree,
 )
-from zlc_storage import canonical_text, positive_real, sha256_text
+from zlc_storage import canonical_digest, canonical_text, positive_real
 
-from .figure import EvaluatedImage, EvaluatedInput
+from .figure import DatasetId, EvaluatedImage, EvaluatedInput, evaluate_axis
 from .image_display import (
     ImageDisplayState,
     image_viewport_for_display_state,
@@ -38,155 +43,219 @@ from .render import (
     SiteMapPanelPayload,
     SourceIdentity,
 )
-from .site_map import immutable_site_state
+from .site_map import immutable_site_state, site_ring_radius
 
 
-@dataclass(frozen=True)
-class OccupancyCellNavigation:
-    """Frozen outer-axis identity for navigating one committed occupancy artifact."""
-
-    artifact_identity: str
-    schema_fingerprint: str
-    generation: StreamGenerationId
-    repeat_axis: AxisSpec
-    point_axes: tuple[AxisSpec, ...]
-    point_layout: PointLayout
-    cell_layout: AxisLayout
-
-    def __post_init__(self) -> None:
-        canonical_text(self.artifact_identity, "artifact_identity")
-        sha256_text(self.schema_fingerprint, "schema_fingerprint")
-        if not isinstance(self.generation, StreamGenerationId):
-            raise TypeError("generation must be StreamGenerationId")
-        if not isinstance(self.repeat_axis, AxisSpec):
-            raise TypeError("repeat_axis must be AxisSpec")
-        point_axes = tuple(self.point_axes)
-        if any(not isinstance(axis, AxisSpec) for axis in point_axes):
-            raise TypeError("point_axes must contain AxisSpec values")
-        axes = (self.repeat_axis, *point_axes)
-        if len({axis.axis_id for axis in axes}) != len(axes):
-            raise ValueError("occupancy navigation axes must have unique AxisId values")
-        if not isinstance(self.point_layout, PointLayout):
-            raise TypeError("point_layout must be PointLayout")
-        expected_shape = tuple(axis.size for axis in point_axes)
-        if self.point_layout.logical_shape != expected_shape:
-            raise ValueError("point_layout logical shape differs from point axes")
-        if not isinstance(self.cell_layout, AxisLayout):
-            raise TypeError("cell_layout must be AxisLayout")
-        expected_cell_shape = (self.repeat_axis.size, *expected_shape)
-        if (
-            self.cell_layout.logical_shape != expected_cell_shape
-            or self.cell_layout.storage_size
-            != self.repeat_axis.size * self.point_layout.storage_size
-        ):
-            raise ValueError("cell_layout differs from repeat and point layout")
-        object.__setattr__(self, "point_axes", point_axes)
-
-    @property
-    def axes(self) -> tuple[AxisSpec, ...]:
-        return (self.repeat_axis, *self.point_axes)
-
-    @property
-    def identity(self) -> tuple[str, str, StreamGenerationId]:
-        return (
-            self.artifact_identity,
-            self.schema_fingerprint,
-            self.generation,
+def _evaluated_image_cell(
+    values: np.ndarray,
+    validity: np.ndarray,
+    schema: ValueSchema,
+) -> tuple[EvaluatedImage, ImageViewportTransform, AxisSpec, AxisSpec]:
+    if not isinstance(schema, ValueSchema):
+        raise TypeError("schema must be ValueSchema")
+    axes = schema.data_axes
+    x_positions = tuple(
+        index for index, axis in enumerate(axes) if axis.role == SPATIAL_X
+    )
+    y_positions = tuple(
+        index for index, axis in enumerate(axes) if axis.role == SPATIAL_Y
+    )
+    if len(axes) != 2 or len(x_positions) != 1 or len(y_positions) != 1:
+        raise ValueError(
+            "site-map background requires exactly one SPATIAL_X and "
+            "SPATIAL_Y data axis"
         )
+    x_position, y_position = x_positions[0], y_positions[0]
+    x_axis, y_axis = axes[x_position], axes[y_position]
+    order_yx = (y_position, x_position)
+    image = EvaluatedImage(
+        evaluate_axis(x_axis, tuple(range(x_axis.size))),
+        evaluate_axis(y_axis, tuple(range(y_axis.size))),
+        np.transpose(values, order_yx),
+        np.transpose(validity, order_yx),
+        schema.value_unit,
+    )
+    return image, ImageViewportTransform((y_axis, x_axis)), x_axis, y_axis
 
-    @property
-    def linear_cell_count(self) -> int:
-        return self.cell_layout.storage_size
 
-    def resolve_selection(
-        self,
-        selection: Selection | None,
-    ) -> tuple[int, int, tuple[int, ...], str]:
-        """Resolve one exact named cell without first/latest/reduce fallbacks."""
-
-        if selection is not None and not isinstance(selection, Selection):
-            raise TypeError("selection must be Selection or None")
-        by_axis = {} if selection is None else {
-            term.axis_id: term for term in selection.terms
-        }
-        known = {axis.axis_id for axis in self.axes}
-        if any(axis_id not in known for axis_id in by_axis):
-            raise ValueError(
-                "occupancy cell selection may name only repeat and point axes"
-            )
-        indices = []
-        labels = []
-        for axis in self.axes:
-            term = by_axis.get(axis.axis_id)
-            if term is None:
-                if axis.size != 1:
-                    raise ValueError(
-                        f"occupancy cell requires an explicit index for axis {axis.axis_id}"
-                    )
-                index = 0
-            else:
-                if not isinstance(term, IndexSelection):
-                    raise TypeError(
-                        "occupancy cell selection accepts only exact IndexSelection terms"
-                    )
-                resolved, drop = resolve_selection_indices(axis, term)
-                if not drop or len(resolved) != 1:
-                    raise ValueError("occupancy cell selection must resolve one exact index")
-                index = resolved.start
-            coordinate = axis.coordinate_at(index)
-            unit = "" if axis.unit is None else f" {axis.unit}"
-            labels.append(f"{axis.name}={coordinate}{unit} [index {index}]")
-            indices.append(index)
-        logical_point = tuple(indices[1:])
-        try:
-            point_storage_index = self.point_layout.storage_index(logical_point)
-        except KeyError as error:
-            raise ValueError(
-                f"selected logical point {logical_point} is absent from PointLayout"
-            ) from error
-        return (
-            indices[0],
+def _image_cell(
+    snapshot: OwnedSnapshot,
+    repeat_index: int,
+    point_storage_index: int,
+) -> tuple[EvaluatedImage, ImageViewportTransform, AxisSpec, AxisSpec]:
+    return _image_value(
+        dataset_cell_value(
+            snapshot.block,
+            repeat_index,
             point_storage_index,
-            logical_point,
-            " | ".join(labels),
         )
+    )
 
-    def selection_for_indices(
-        self,
-        repeat_index: int,
-        logical_point: tuple[int, ...],
-    ) -> Selection:
-        """Build the canonical all-axis exact selection for one logical cell."""
 
-        logical = tuple(logical_point)
-        self.point_layout.storage_index(logical)
-        terms = [IndexSelection(self.repeat_axis.axis_id, repeat_index)]
-        terms.extend(
-            IndexSelection(axis.axis_id, index)
-            for axis, index in zip(self.point_axes, logical, strict=True)
+def _image_value(
+    value: Value,
+) -> tuple[EvaluatedImage, ImageViewportTransform, AxisSpec, AxisSpec]:
+    """Project one already selected image value without a dataset materialization."""
+
+    if not isinstance(value, Value):
+        raise TypeError("image cell must be Value")
+    return _evaluated_image_cell(
+        value.values,
+        expand_value_validity(value.validity, value.schema),
+        value.schema,
+    )
+
+
+def build_calibration_site_map_view(
+    snapshot: OwnedSnapshot,
+    *,
+    site_axis: AxisSpec,
+    coordinate_frame: CoordinateFrameId,
+    centers_xy: np.ndarray,
+    site_validity: np.ndarray,
+    calibration_identity: str,
+    run_id: str,
+    provenance_epoch_id: str,
+    summary: str,
+) -> "CalibrationSiteMapView":
+    """Build the canonical calibration presentation from declared typed data."""
+
+    schema = snapshot.block.schema
+    if schema.repeat_axis.size != 1 or schema.point_layout.storage_size != 1:
+        raise ValueError("calibration SiteMap background must contain one cell")
+    background, viewport, x_axis, y_axis = _image_cell(snapshot, 0, 0)
+    if (
+        x_axis.coordinate_frame != coordinate_frame
+        or y_axis.coordinate_frame != coordinate_frame
+    ):
+        raise ValueError(
+            "calibration background and site geometry use different coordinate frames"
         )
-        selection = Selection(tuple(terms))
-        self.resolve_selection(selection)
-        return selection
+    identity = canonical_digest(
+        {
+            "owner": "zlc_frontend.calibration-site-map-view",
+            "source": dataset_revision_ref_to_tree(snapshot.ref),
+            "calibration_identity": calibration_identity,
+        }
+    )
+    return CalibrationSiteMapView(
+        background=background,
+        background_input=EvaluatedInput(
+            DatasetId(f"calibration-reference-{identity}"),
+            snapshot.ref,
+        ),
+        calibration_input=EvaluatedInput(
+            DatasetId(f"calibration-sites-{identity}"),
+            snapshot.ref,
+        ),
+        home_viewport=viewport,
+        site_axis=site_axis,
+        coordinate_frame=coordinate_frame,
+        centers_xy=centers_xy,
+        site_radius=site_ring_radius(centers_xy),
+        site_validity=site_validity,
+        calibration_identity=calibration_identity,
+        run_id=run_id,
+        provenance_epoch_id=provenance_epoch_id,
+        summary=summary,
+    )
 
-    def selection_at_linear(self, linear_index: int) -> Selection:
-        """Map repeat-major physical order to a canonical exact selection."""
 
-        if (
-            isinstance(linear_index, bool)
-            or not isinstance(linear_index, int)
-            or not 0 <= linear_index < self.linear_cell_count
-        ):
-            raise IndexError("occupancy navigation index is out of range")
-        multi = self.cell_layout.multi_index(linear_index)
-        return self.selection_for_indices(multi[0], tuple(multi[1:]))
+def build_occupancy_cell_view(
+    background_value: Value,
+    background_ref: DatasetRevisionRef,
+    occupied_value: Value,
+    occupancy_ref: DatasetRevisionRef,
+    selection: Selection,
+    *,
+    site_axis: AxisSpec,
+    coordinate_frame: CoordinateFrameId,
+    centers_xy: np.ndarray,
+    calibration_site_validity: np.ndarray,
+    calibration_identity: str,
+    run_id: str,
+    provenance_epoch_id: str,
+    summary: str,
+) -> "OccupancyCellView":
+    """Build one same-cell Camera/SITE view from exact typed cell values.
 
-    def linear_index(self, selection: Selection) -> int:
-        repeat_index, _point_storage_index, logical, _label = self.resolve_selection(
-            selection
+    Domain admission and cell addressing happen before this presentation
+    boundary.  In particular, the Camera input is one chunk-backed ``Value``;
+    callers never need to materialize the complete capture artifact merely to
+    display one physical cell.
+    """
+
+    if not isinstance(background_value, Value) or not isinstance(
+        occupied_value,
+        Value,
+    ):
+        raise TypeError("background_value and occupied_value must be Value")
+    if not isinstance(background_ref, DatasetRevisionRef) or not isinstance(
+        occupancy_ref,
+        DatasetRevisionRef,
+    ):
+        raise TypeError("background_ref and occupancy_ref must be DatasetRevisionRef")
+    if not isinstance(selection, Selection):
+        raise TypeError("selection must be Selection")
+    if background_ref.revision != occupancy_ref.revision:
+        raise ValueError("occupancy revision differs from its Camera source")
+    background, viewport, x_axis, y_axis = _image_value(background_value)
+    if (
+        x_axis.coordinate_frame != coordinate_frame
+        or y_axis.coordinate_frame != coordinate_frame
+    ):
+        raise ValueError(
+            "Camera background and calibration geometry use different coordinate frames"
         )
-        return self.cell_layout.storage_index((repeat_index, *logical))
-
+    data_axes = occupied_value.schema.data_axes
+    if len(data_axes) != 1 or data_axes[0] != site_axis or site_axis.role != SITE:
+        raise ValueError("occupancy data must follow the calibration SITE axis")
+    if occupied_value.schema.dtype != np.dtype(bool):
+        raise TypeError("occupancy cell values must be boolean")
+    if not isinstance(occupied_value.validity, ComponentValidity) or (
+        occupied_value.validity.axis_ids != (site_axis.axis_id,)
+    ):
+        raise ValueError("occupancy cell validity must name exactly the SITE axis")
+    occupied_values = np.asarray(occupied_value.values, dtype=np.bool_)
+    site_validity = np.asarray(occupied_value.validity.mask, dtype=np.bool_)
+    admitted_sites = np.asarray(calibration_site_validity, dtype=np.bool_)
+    if admitted_sites.shape != site_validity.shape:
+        raise ValueError("calibration validity differs from the occupancy SITE axis")
+    if np.any(site_validity & ~admitted_sites):
+        raise ValueError("occupancy marks a calibration-invalid site as valid")
+    identity = canonical_digest(
+        {
+            "owner": "zlc_frontend.occupancy-cell-view",
+            "source": dataset_revision_ref_to_tree(background_ref),
+            "occupied": dataset_revision_ref_to_tree(occupancy_ref),
+            "calibration_identity": calibration_identity,
+            "selection": selection_to_tree(selection),
+        }
+    )
+    return OccupancyCellView(
+        background=background,
+        background_input=EvaluatedInput(
+            DatasetId(f"occupancy-frame-{identity}"),
+            background_ref,
+        ),
+        occupancy_input=EvaluatedInput(
+            DatasetId(f"occupancy-sites-{identity}"),
+            occupancy_ref,
+        ),
+        home_viewport=viewport,
+        site_axis=site_axis,
+        coordinate_frame=coordinate_frame,
+        centers_xy=centers_xy,
+        site_radius=site_ring_radius(centers_xy),
+        occupied=occupied_values,
+        site_validity=site_validity,
+        calibration_identity=calibration_identity,
+        cell_identity=identity,
+        cell_selection=selection,
+        run_id=run_id,
+        provenance_epoch_id=provenance_epoch_id,
+        summary=summary,
+    )
 
 @dataclass(frozen=True, eq=False)
 class OccupancyCellView:
@@ -288,6 +357,31 @@ class OccupancyCellView:
     @property
     def site_occupancy(self) -> np.ndarray:
         return self.occupied
+
+    @property
+    def valid_site_count(self) -> int:
+        """Number of physically admitted SITE components in this view."""
+
+        return int(np.count_nonzero(self.site_validity))
+
+    @property
+    def occupied_site_count(self) -> int:
+        """Number of occupied components among the admitted SITE components."""
+
+        return int(np.count_nonzero(self.occupied & self.site_validity))
+
+    @property
+    def invalid_site_count(self) -> int:
+        return self.site_axis.size - self.valid_site_count
+
+    @property
+    def site_count_summary(self) -> str:
+        """Canonical display text for component validity and occupancy counts."""
+
+        return (
+            f"occupied={self.occupied_site_count}/{self.valid_site_count} valid sites | "
+            f"invalid={self.invalid_site_count}"
+        )
 
     @property
     def presentation_kind(self) -> str:
@@ -691,10 +785,11 @@ class SiteMapComposer:
 
 __all__ = [
     "CalibrationSiteMapView",
-    "OccupancyCellNavigation",
     "OccupancyCellView",
     "OccupancySummarySiteMapView",
     "SiteMapComposer",
     "SiteMapView",
+    "build_calibration_site_map_view",
+    "build_occupancy_cell_view",
     "compose_site_map_front",
 ]

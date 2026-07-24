@@ -5,11 +5,8 @@ from __future__ import annotations
 from concurrent.futures import CancelledError
 import threading
 
-from zlc_frontend.site_map_render import (
-    OccupancyCellNavigation,
-    OccupancyCellView,
-    compose_site_map_front,
-)
+from zlc_frontend.site_map_render import OccupancyCellView, compose_site_map_front
+from zlc_neutral_atom.readout.occupancy_cell import OccupancyCellDomain
 
 
 _PANEL_ID = "sites"
@@ -24,8 +21,8 @@ def _cancel_point(cancelled: threading.Event) -> None:
 def _load_navigation(loader, reference, cancelled):
     _cancel_point(cancelled)
     result = loader(reference)
-    if not isinstance(result, OccupancyCellNavigation):
-        raise TypeError("navigation loader must return OccupancyCellNavigation")
+    if not isinstance(result, OccupancyCellDomain):
+        raise TypeError("navigation loader must return OccupancyCellDomain")
     if result.artifact_identity != reference.target_ref:
         raise ValueError("occupancy navigation names a different artifact")
     _cancel_point(cancelled)
@@ -78,7 +75,7 @@ def _cell_job(
             selection,
             expected_navigation=navigation,
         )
-    repeat, _storage, logical, _label = navigation.resolve_selection(selection)
+    repeat, _storage, logical = navigation.resolve_selection(selection)
     expected_selection = navigation.selection_for_indices(repeat, logical)
     if (
         not isinstance(loaded_view, OccupancyCellView)

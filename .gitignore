@@ -33,9 +33,9 @@ ENV/
 tutorials/_executed_check/
 **/_executed_check/
 
-# Generated local outputs -- ALL run output now lives under ONE root (_output/: calibrations data +
-# reports, generated Verilog, saved results), single-sourced in Zou_lab_control/_paths.py so it never
-# scatters loose folders across the repo root.  Legacy top-level names kept ignored for any explicit override.
+# Generated local outputs.  The composition root receives an explicit runtime
+# workspace; task-owned exports may use the repository-local _output default.
+# Ignore those local products and explicit scratch export folders, never source.
 /_output/
 **/_output/
 /generated_sequences/
@@ -110,6 +110,7 @@ docs/**/*.sty
 
 # Scratch GUI verification screenshots (devtools output, not deliverables)
 /_gui_shots/
+/.gui-evidence/
 
 # Pulse presets (pulses/): checked-in PulseDocument authoring JSON is committable.
 # Ignore only scratch files, unnamed timestamp saves, and local real-machine debug programs.

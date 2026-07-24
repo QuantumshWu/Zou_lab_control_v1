@@ -1,11 +1,10 @@
-"""A reusable, self-contained DAG renderer for a saved figure's PROVENANCE flow -- the "how was this
-data produced" tree the :mod:`~.figure_viewer` shows on its **Flow** tab.
+"""A reusable DAG renderer for a saved figure's typed production-flow DTO.
 
 A figure's provenance is NOT a single chain: a site map consumes occupancy + centres + an underlay frame,
 each of which flows up its OWN chain to a device.  So the graph BRANCHES UPWARD (several parents) and can
 CONVERGE (one source feeding two processors that both feed the plot).  This widget takes the neutral
-``{"nodes": [...], "edges": [...]}`` graph supplied as optional typed archive
-metadata and draws it as a node-link diagram:
+:class:`FlowGraph` supplied by the archive projection and draws it as a node-link
+diagram:
 
 * nodes are laid out in TOPOLOGICAL LAYERS -- the terminal ``plot`` at the bottom, each producing node one
   layer up from the node it feeds (longest-path layering, so an edge always points DOWN across >=1 layer),
@@ -29,7 +28,7 @@ and a large graph simply scrolls.
 
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from typing import Mapping, Protocol, runtime_checkable
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -59,20 +58,37 @@ def _role_style(role: str) -> tuple[str, str]:
     return _ROLE_STYLE.get(str(role), _DEFAULT_STYLE)
 
 
-class FlowGraphView(QtWidgets.QWidget):
-    """Paints a provenance ``flow_graph`` as a layered, branching node-link diagram (see module docstring).
+class _FlowGraphNodeModel(Protocol):
+    node_id: str
+    name: str
+    role: str
+    has_devices: bool
 
-    ``set_graph({"nodes": [...], "edges": [...]})`` lays it out and repaints; ``set_graph(None)`` (or an
-    empty / malformed graph) shows a muted placeholder line, so the Flow tab is never blank for an old npz
-    that recorded no flow."""
+
+class _FlowGraphEdgeModel(Protocol):
+    source_id: str
+    target_id: str
+    signal: str
+    shape: tuple[int, ...] | None
+    role: str
+
+
+@runtime_checkable
+class _FlowGraphModel(Protocol):
+    nodes: tuple[_FlowGraphNodeModel, ...]
+    edges: tuple[_FlowGraphEdgeModel, ...]
+
+
+class FlowGraphView(QtWidgets.QWidget):
+    """Paint a current :class:`FlowGraph` as a layered node-link diagram."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._graph: dict | None = None
+        self._graph: _FlowGraphModel | None = None
         # Laid-out geometry, rebuilt on every set_graph: node id -> QRectF (box), plus the edge list.
         self._boxes: dict[str, QtCore.QRectF] = {}
-        self._layout_nodes: dict[str, dict] = {}
-        self._layout_edges: list[dict] = []
+        self._layout_nodes: dict[str, _FlowGraphNodeModel] = {}
+        self._layout_edges: tuple[_FlowGraphEdgeModel, ...] = ()
         self._content = QtCore.QSize(scaled_px(320, minimum=200), scaled_px(120, minimum=90))
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.setMinimumSize(self._content)
@@ -93,10 +109,10 @@ class FlowGraphView(QtWidgets.QWidget):
         return scaled_px(34, minimum=26)
 
     @staticmethod
-    def _is_device(node: dict) -> bool:
-        return str(node.get("role")) == "device"
+    def _is_device(node: _FlowGraphNodeModel) -> bool:
+        return node.role == "device"
 
-    def _box_size(self, node: dict) -> tuple[int, int]:
+    def _box_size(self, node: _FlowGraphNodeModel) -> tuple[int, int]:
         """The (w, h) for a node's box -- the compact device size for a ``device`` leaf, the standard node
         size otherwise -- so a single layout routine sizes every box from its role (no per-kind branch at
         the call site)."""
@@ -119,35 +135,27 @@ class FlowGraphView(QtWidgets.QWidget):
         return f
 
     # ------------------------------------------------------------------ public
-    def set_graph(self, graph: object) -> None:
-        """Accept a ``{"nodes": [...], "edges": [...]}`` mapping (or ``None`` / anything malformed -> a blank
-        view, never a "no data-flow" message) and lay it out.  Tolerant of a stored dict whose lists came back from an npz as
-        object arrays -- it only reads ``id`` / ``name`` / ``role`` off each node and ``from`` / ``to`` /
-        ``signal`` / ``shape`` off each edge."""
-        self._graph = graph if self._valid(graph) else None
+    def set_graph(self, graph: _FlowGraphModel | None) -> None:
+        """Replace the graph; malformed archive mappings are rejected upstream."""
+
+        if graph is not None and not isinstance(graph, _FlowGraphModel):
+            raise TypeError("graph must implement the typed flow-graph model")
+        self._graph = graph
         self._relayout()
         self.update()
-
-    @staticmethod
-    def _valid(graph: object) -> bool:
-        return (isinstance(graph, Mapping)
-                and isinstance(graph.get("nodes"), Sequence)
-                and len(graph.get("nodes")) > 0)
 
     # ------------------------------------------------------------------ layout
     def _relayout(self) -> None:
         self._boxes = {}
         self._layout_nodes = {}
-        self._layout_edges = []
+        self._layout_edges = ()
         if self._graph is None:
             self._content = QtCore.QSize(scaled_px(320, minimum=200), scaled_px(120, minimum=90))
             self.setMinimumSize(self._content)
             return
 
-        nodes = {str(n.get("id")): dict(n) for n in self._graph.get("nodes", []) if isinstance(n, Mapping)}
-        edges = [dict(e) for e in self._graph.get("edges", []) if isinstance(e, Mapping)]
-        # Keep only edges whose endpoints both exist (a malformed npz never crashes the paint).
-        edges = [e for e in edges if str(e.get("from")) in nodes and str(e.get("to")) in nodes]
+        nodes = {node.node_id: node for node in self._graph.nodes}
+        edges = self._graph.edges
         self._layout_nodes = nodes
         self._layout_edges = edges
 
@@ -157,7 +165,7 @@ class FlowGraphView(QtWidgets.QWidget):
         # the top.  Equivalent: depth(n) = 0 if n has no outgoing edge, else 1 + max(depth(target)).
         out_targets: dict[str, list[str]] = {nid: [] for nid in nodes}
         for e in edges:
-            out_targets[str(e.get("from"))].append(str(e.get("to")))
+            out_targets[e.source_id].append(e.target_id)
 
         depth: dict[str, int] = {}
 
@@ -212,7 +220,7 @@ class FlowGraphView(QtWidgets.QWidget):
 
         # Content width fits the widest ROW of boxes AND the widest edge LABEL (so a signal-name plate has
         # room to sit near mid-height without being clipped by the canvas edge -- labels are often wider than
-        # a node box, e.g. ``frame_alpha (1×1×96×128)``).
+        # a node box, e.g. ``frame_alpha (1 × 1 × (96×128))``).
         fm = QtGui.QFontMetrics(self._small_font())
         widest_row = max((_row_w(order.get(l, [])) for l in range(n_layers)), default=self._node_w())
         widest_label = max((fm.horizontalAdvance(self._edge_label(e)) + scaled_px(8, minimum=6)
@@ -265,40 +273,48 @@ class FlowGraphView(QtWidgets.QWidget):
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
         if self._graph is None or not self._boxes:
-            # An unset / empty graph draws NOTHING -- never a "no data-flow" message (the figure viewer
-            # always synthesizes at least a raw-data->plot tree before showing this view, so a LOADED figure
-            # always has a graph; a bare unset widget just stays blank rather than printing that forbidden text).
+            # Absence is represented by an empty Flow surface, not by fabricated provenance.
             painter.end()
             return
         self._paint_edges(painter)
         self._paint_nodes(painter)
         painter.end()
 
-    def _edge_endpoints(self) -> list[tuple[dict, QtCore.QPointF, QtCore.QPointF]]:
+    def _edge_endpoints(
+        self,
+    ) -> list[tuple[_FlowGraphEdgeModel, QtCore.QPointF, QtCore.QPointF]]:
         """Every drawable edge as ``(edge, p1, p2)`` -- the fanned start point on the upstream box's bottom
         edge and the fanned end point on the downstream box's top edge.  Edges sharing ONE downstream target
         fan into DISTINCT points on its top edge (two parents do not both plug into the exact centre); edges
         sharing ONE source fan OUT of distinct points on its bottom edge -- so several signals from the SAME
         producer into the SAME plot read as a spread fan, not one overlapping line.  Shared by the paint and
         the label-placement passes (one source of edge geometry)."""
-        by_target: dict[str, list[dict]] = {}
-        by_source: dict[str, list[dict]] = {}
+        by_target: dict[str, list[_FlowGraphEdgeModel]] = {}
+        by_source: dict[str, list[_FlowGraphEdgeModel]] = {}
         for e in self._layout_edges:
-            by_target.setdefault(str(e.get("to")), []).append(e)
-            by_source.setdefault(str(e.get("from")), []).append(e)
+            by_target.setdefault(e.target_id, []).append(e)
+            by_source.setdefault(e.source_id, []).append(e)
 
-        def _fan_x(box: QtCore.QRectF, group: list, e: dict) -> float:
+        def _fan_x(
+            box: QtCore.QRectF,
+            group: list[_FlowGraphEdgeModel],
+            e: _FlowGraphEdgeModel,
+        ) -> float:
             k, n = group.index(e), max(1, len(group))
             return box.left() + box.width() * (0.2 + 0.6 * (k + 1) / (n + 1))
 
-        out: list[tuple[dict, QtCore.QPointF, QtCore.QPointF]] = []
+        out: list[tuple[_FlowGraphEdgeModel, QtCore.QPointF, QtCore.QPointF]] = []
         for e in self._layout_edges:
-            src = self._boxes.get(str(e.get("from")))
-            dst = self._boxes.get(str(e.get("to")))
-            if src is None or dst is None:
-                continue
-            p1 = QtCore.QPointF(_fan_x(src, by_source.get(str(e.get("from")), []), e), src.bottom())
-            p2 = QtCore.QPointF(_fan_x(dst, by_target.get(str(e.get("to")), []), e), dst.top())
+            src = self._boxes[e.source_id]
+            dst = self._boxes[e.target_id]
+            p1 = QtCore.QPointF(
+                _fan_x(src, by_source[e.source_id], e),
+                src.bottom(),
+            )
+            p2 = QtCore.QPointF(
+                _fan_x(dst, by_target[e.target_id], e),
+                dst.top(),
+            )
             out.append((e, p1, p2))
         return out
 
@@ -319,8 +335,8 @@ class FlowGraphView(QtWidgets.QWidget):
         """GLOBALLY non-overlapping label plates.  Every label starts at its edge's curve midpoint, then
         two passes make the whole set mutually disjoint -- independent of edge order / geometry:
 
-        * an ITERATIVE ALL-PAIRS push-apart relaxation (not the old greedy one-at-a-time-vs-already-placed
-          pass): each sweep resolves EVERY O(n²) plate pair together by the minimum-translation vector that
+        * an ITERATIVE ALL-PAIRS push-apart relaxation: each sweep resolves EVERY O(n²) plate pair together
+          by the minimum-translation vector that
           just separates it, split equally, so a plate that moved to dodge A cannot silently land on C
           without C pushing back -- this spreads the dense clusters apart cheaply and symmetrically;
         * a DETERMINISTIC guarantee pass that then walks every label (widest first, hardest to fit) and, for
@@ -466,7 +482,15 @@ class FlowGraphView(QtWidgets.QWidget):
             painter.drawText(plate, int(QtCore.Qt.AlignCenter), label)
 
     @staticmethod
+    def _edge_label(edge: _FlowGraphEdgeModel) -> str:
+        if not edge.signal:
+            return ""
+        if edge.shape is None:
+            return edge.signal
+        dimensions = "×".join(str(size) for size in edge.shape)
+        return f"{edge.signal} ({dimensions})" if dimensions else edge.signal
 
+    @staticmethod
     def _draw_arrow_head(self, painter: QtGui.QPainter, p1: QtCore.QPointF, p2: QtCore.QPointF) -> None:
         import math
         ang = math.atan2(p2.y() - p1.y(), p2.x() - p1.x())
@@ -483,12 +507,12 @@ class FlowGraphView(QtWidgets.QWidget):
     def _paint_nodes(self, painter: QtGui.QPainter) -> None:
         radius = scaled_px(6, minimum=4)
         for nid, box in self._boxes.items():
-            node = self._layout_nodes.get(nid, {})
-            role = str(node.get("role") or "node")
+            node = self._layout_nodes[nid]
+            role = node.role
             fill, border = _role_style(role)
             # A device-holding source gets a warm apparatus fill regardless of its measurement/task role,
             # so the reader spots where the hardware snapshot is attached.
-            if node.get("has_devices"):
+            if node.has_devices:
                 fill, border = _ROLE_STYLE["task"]
             painter.setBrush(QtGui.QColor(fill))
             pen = QtGui.QPen(QtGui.QColor(border))
@@ -506,7 +530,7 @@ class FlowGraphView(QtWidgets.QWidget):
                 dev_rect = QtCore.QRectF(box.x() + scaled_px(5), box.y(),
                                          box.width() - scaled_px(10), box.height())
                 painter.drawText(dev_rect, int(QtCore.Qt.AlignCenter),
-                                 self._elide(str(node.get("name") or "device"), dev_rect.width(), dev_font))
+                                 self._elide(node.name, dev_rect.width(), dev_font))
                 continue
 
             # Node NAME (primary line) -- white on the coloured fill for contrast.
@@ -516,12 +540,12 @@ class FlowGraphView(QtWidgets.QWidget):
             name_rect = QtCore.QRectF(box.x() + scaled_px(6), box.y() + scaled_px(4),
                                       box.width() - scaled_px(12), box.height() * 0.5)
             painter.drawText(name_rect, int(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignBottom),
-                             self._elide(str(node.get("name") or "node"), name_rect.width(), name_font))
+                             self._elide(node.name, name_rect.width(), name_font))
             # Role badge line beneath the name (the layer word), slightly muted.
             badge_font = self._small_font()
             painter.setFont(badge_font)
             painter.setPen(QtGui.QColor(255, 255, 255, 205))
-            badge = role if not node.get("has_devices") else f"{role} · device"
+            badge = role if not node.has_devices else f"{role} · device"
             role_rect = QtCore.QRectF(box.x() + scaled_px(6), box.center().y(),
                                       box.width() - scaled_px(12), box.height() * 0.5 - scaled_px(3))
             painter.drawText(role_rect, int(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop),

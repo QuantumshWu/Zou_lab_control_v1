@@ -26,10 +26,16 @@ from ..render import (
     DocumentPresentationStamp, ImagePanelPayload, PanelFrame,
     PanelPresentationIdentity,
     PulsePanelPayload, RasterBuffer, SiteMapPanelPayload, SourceIdentity)
+from ..figure_outputs import (
+    FigureAreaCommit,
+    FigureCrossCommit,
+    HistogramValueRangeSelection,
+    selector_axes_for_payload,
+)
 from ..selector import (
-    CurveRangeGesture, CurveViewportCommit, HistogramRangeGesture,
+    CrossGesture, CurveRangeGesture, CurveViewportCommit, HistogramRangeGesture,
     HistogramThresholdCommit, HistogramViewportCommit, ImageColorLimitsCommit,
-    ImageViewportCommit, PanelInteractionOrigin)
+    ImageViewportCommit, PanelInteractionOrigin, RectangleGesture)
 from .board import QtRasterBoard
 
 
@@ -37,8 +43,9 @@ class SinglePanelHost(QtWidgets.QWidget):
     """A QtRasterBoard hosting exactly one interactive panel.
 
     ``present_panel(raster, payload, ...)`` wraps the payload in a coherent
-    one-panel :class:`BoardFrame` (provenance, stamp, presentation identity all
-    derived from the caller's content key and revisions) and presents it.  The
+    one-panel :class:`BoardFrame` and presents it.  Dataset-backed payloads must
+    arrive with the evaluator's exact :class:`CoherenceStamp`; this display
+    adapter never invents run, epoch, or join identity.  The
     FIRST payload's type picks the gesture family -- pulse and curve speak the
     CURVE intent vocabulary, histogram its own -- and completed gestures come
     back as signals:
@@ -151,6 +158,86 @@ class SinglePanelHost(QtWidgets.QWidget):
             return self._board.visible_pulse_origin(self._panel_id)
         return None
 
+    def selection_for_rectangle_gesture(self, gesture):
+        """Resolve one IMAGE rectangle through this host's exact held front.
+
+        Gesture ownership and gesture-to-data conversion are one boundary.
+        Callers that publish Figure outputs must not reach through the host to
+        its private board, because doing so would make single and faceted
+        surfaces expose different selector-output routes.
+        """
+
+        if self._bound_kind != "image":
+            raise RuntimeError(
+                "rectangle selection requires an image interaction binding"
+            )
+        return self._board.selection_for_rectangle_gesture(gesture)
+
+    def selection_for_curve_range_gesture(self, gesture):
+        """Resolve one CURVE range through this host's exact held front."""
+
+        if self._bound_kind != "curve":
+            raise RuntimeError(
+                "curve selection requires a curve interaction binding"
+            )
+        return self._board.selection_for_curve_range_gesture(gesture)
+
+    def area_commit_for_range_gesture(
+        self,
+        gesture: CurveRangeGesture | HistogramRangeGesture,
+    ) -> FigureAreaCommit | None:
+        """Resolve a completed numeric Area against this exact painted front."""
+
+        if not isinstance(gesture, (CurveRangeGesture, HistogramRangeGesture)):
+            raise TypeError("numeric Area requires a curve or histogram gesture")
+        if gesture.x_span is None:
+            return None
+        if self.visible_interaction_origin() != gesture.origin:
+            raise RuntimeError("numeric Area gesture belongs to a stale front")
+        source_identity = gesture.origin.source_identity
+        if not isinstance(source_identity, SourceIdentity):
+            raise TypeError("numeric Area requires a dataset source")
+        selection = (
+            HistogramValueRangeSelection(*gesture.x_span)
+            if isinstance(gesture, HistogramRangeGesture)
+            else self.selection_for_curve_range_gesture(gesture)
+        )
+        return FigureAreaCommit(source_identity, selection)
+
+    def area_commit_for_rectangle_gesture(
+        self,
+        gesture: RectangleGesture,
+    ) -> FigureAreaCommit | None:
+        """Resolve a completed image Area against this exact painted front."""
+
+        if not isinstance(gesture, RectangleGesture):
+            raise TypeError("image Area requires RectangleGesture")
+        if gesture.normalized_bounds is None:
+            return None
+        selection = self.selection_for_rectangle_gesture(gesture)
+        return FigureAreaCommit(gesture.source_identity, selection)
+
+    def cross_commit_for_gesture(
+        self,
+        gesture: CrossGesture,
+    ) -> FigureCrossCommit | None:
+        """Resolve one locked Cross through the exact painted payload."""
+
+        if not isinstance(gesture, CrossGesture):
+            raise TypeError("Cross output requires CrossGesture")
+        if gesture.point is None:
+            return None
+        if self.visible_interaction_origin() != gesture.origin:
+            raise RuntimeError("Cross gesture belongs to a stale front")
+        source_identity = gesture.origin.source_identity
+        if not isinstance(source_identity, SourceIdentity):
+            raise TypeError("Cross output requires a dataset source")
+        front = self.front_frame
+        if front is None or len(front.panels) != 1:
+            raise RuntimeError("Cross output requires one exact painted panel")
+        axes = selector_axes_for_payload(front.panels[0].display_payload)
+        return FigureCrossCommit(source_identity, gesture.point, axes)
+
     def discard_pending_interaction(self, origin: PanelInteractionOrigin) -> bool:
         """Release only the exact failed display commit for this host."""
 
@@ -167,15 +254,16 @@ class SinglePanelHost(QtWidgets.QWidget):
         return False
 
     def present_panel(self, raster: RasterBuffer, payload, *,
+                      coherence_stamp: CoherenceStamp | None = None,
                       pixel_ratio: float = 1.0) -> tuple[int, int]:
         """Present one rendered panel as a coherent frame; returns the LOGICAL size.
 
-        Every identity fact is DERIVED from the payload itself.  Dataset panels
-        mint a :class:`CoherenceStamp`; a pulse-document panel mints a
+        Dataset panels require the evaluator's exact ``coherence_stamp``;
+        presentation code cannot derive a typed join or runtime lineage from a
+        display payload.  A pulse-document panel derives only its local
         :class:`DocumentPresentationStamp` and never fabricates dataset/run/
-        join/schema identity.  In both families the panel revision is the
-        viewport's display revision, so a window cannot hand the board a frame
-        whose identity disagrees with its payload.
+        join/schema identity.  In both families the panel revision is checked
+        against the viewport's display revision by :class:`PanelFrame`.
         ``pixel_ratio`` is the screen ratio the raster was rendered at: the
         widget pins to the LOGICAL size so the whole-cell blit lands 1:1 on
         device pixels.
@@ -202,6 +290,10 @@ class SinglePanelHost(QtWidgets.QWidget):
         if any(value <= 0 for value in logical):
             raise ValueError("pixel_ratio resolves the raster to an empty widget")
         if isinstance(payload, PulsePanelPayload):
+            if coherence_stamp is not None:
+                raise TypeError(
+                    "pulse document panels do not accept a dataset coherence stamp"
+                )
             source = payload.document_input
             presentation = PanelPresentationIdentity(
                 self._panel_id,
@@ -212,25 +304,13 @@ class SinglePanelHost(QtWidgets.QWidget):
             )
             stamp = DocumentPresentationStamp(source, (presentation,))
         else:
+            if not isinstance(coherence_stamp, CoherenceStamp):
+                raise TypeError(
+                    "dataset panels require the evaluator's exact coherence_stamp"
+                )
             provenance = payload.evaluated_input
             fingerprint = provenance.ref.schema_fingerprint
-            content_revision = int(provenance.ref.revision.value)
-            presentation = PanelPresentationIdentity(
-                self._panel_id,
-                self._group,
-                content_revision,
-                0,
-                display_revision,
-            )
-            stamp = CoherenceStamp(
-                self._group,
-                f"{self._panel_id}-epoch-{display_revision}",
-                f"{self._panel_id}-frame-{display_revision}",
-                fingerprint,
-                fingerprint,
-                (provenance,),
-                (presentation,),
-            )
+            stamp = coherence_stamp
             source = SourceIdentity(
                 provenance.dataset_id,
                 provenance.ref.block_id,

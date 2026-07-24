@@ -12,6 +12,7 @@ from zlc_frontend.encoded_raster import EncodedRasterDocument
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentLabel,
+    FluentScrollArea,
     FluentTabWidget,
     GREY,
     FrozenRasterView,
@@ -54,6 +55,9 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         self._cancelled = threading.Event()
         self._bundle: EncodedRasterDocument | None = None
         self._boards: tuple[FrozenRasterView, ...] = ()
+        self._tab_hosts: tuple[
+            tuple[FrozenRasterView, QtWidgets.QWidget], ...
+        ] = ()
         self._closing = False
         self._closed = False
         self._allow_close = False
@@ -137,15 +141,17 @@ class FrozenRasterWindow(QtWidgets.QWidget):
     def _build_boards(self, bundle: EncodedRasterDocument) -> tuple[FrozenRasterView, ...]:
         self._retire_tab_pages()
         boards = []
+        tab_hosts = []
         one_page = len(bundle.pages) == 1
         for page in bundle.pages:
+            scroll = FluentScrollArea(self._tabs)
+            scroll.setWidgetResizable(False)
+            scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
             board = FrozenRasterView(
                 f"{self._prefix}-{page.key}",
-                self._tabs,
+                scroll,
                 empty_text="Raster unavailable",
-                # A frozen report page is the ONE raster the operator cannot ask
-                # the system to re-render larger, so it must at least magnify.
-                zoomable=True,
             )
             board.setMinimumSize(320, 240)
             board.setObjectName(
@@ -153,16 +159,33 @@ class FrozenRasterWindow(QtWidgets.QWidget):
                 if one_page
                 else f"{self._prefix}Board_{page.key}"
             )
-            self._tabs.addTab(board, page.title)
+            scroll.setWidget(board)
+            self._tabs.addTab(scroll, page.title)
             boards.append(board)
+            tab_hosts.append((board, scroll))
+        self._tab_hosts = tuple(tab_hosts)
         self._tabs.tabBar().setVisible(not one_page)
         return tuple(boards)
+
+    def _tab_host_for_board(self, board: FrozenRasterView) -> QtWidgets.QWidget:
+        """Return the actual tab page that owns one encoded raster board.
+
+        Frozen pages are mounted inside non-resizing scroll areas.  Consumers
+        that temporarily switch away from an encoded page must therefore move
+        the scroll host, never detach its child raster and bypass scrolling.
+        """
+
+        for candidate, host in self._tab_hosts:
+            if candidate is board:
+                return host
+        raise ValueError("raster board does not belong to this window")
 
     def _retire_tab_pages(self) -> None:
         """Drop every old Qt front before admitting a replacement bundle."""
 
         old_boards = self._boards
         self._boards = ()
+        self._tab_hosts = ()
         for board in old_boards:
             board.clear()
         while self._tabs.count():
@@ -182,6 +205,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
             self._boards = boards
             for page, board in zip(bundle.pages, boards, strict=True):
                 board.present_encoded(page.png_bytes, image_format="PNG")
+                board.adjustSize()
         except BaseException as error:
             for board in boards:
                 board.clear()
@@ -224,6 +248,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         for board in self._boards:
             board.clear()
         self._boards = ()
+        self._tab_hosts = ()
 
     def shutdown(self) -> None:
         if self._closing or self._closed:
