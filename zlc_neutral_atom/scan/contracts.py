@@ -357,6 +357,14 @@ class ApiSlotSegmentedProgram:
             self.document,
             execution_name="API_SLOT segmented",
         )
+        # Resolve every row while the intent/request is still being built.  A
+        # sub-tick duration or out-of-range DAC is an authoring error, not a Run
+        # failure after camera/sequencer resources have already been admitted.
+        for row in self.table.rows:
+            resolve_api_segment_document(
+                self.document,
+                dict(zip(self.table.columns, row)),
+            )
 
     @cached_property
     def point_table(self) -> ScanPointTable:

@@ -33,7 +33,15 @@ class LogicNodeEditor(QtWidgets.QWidget):
     repeat; hardware configuration stays in DeviceManager instead of being
     duplicated in a Measurement form."""
 
-    def __init__(self, row: "LogicNodeRow", console: "TaskConsole", spec, parent=None):
+    def __init__(
+        self,
+        row: "LogicNodeRow",
+        console: "TaskConsole",
+        spec,
+        parent=None,
+        *,
+        signal_names_provider=None,
+    ):
         super().__init__(parent)
         self.row = row
         self.console = console
@@ -63,7 +71,11 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # editor renders exactly that form.  Deadlines remain internal Port/Run
         # mechanics, never generic Measurement inputs invented by the UI.
         acquisition = ()
-        names_provider = getattr(console, "_signal_names", None)
+        names_provider = (
+            signal_names_provider
+            if callable(signal_names_provider)
+            else getattr(console, "_signal_names", None)
+        )
         if row.node.kind == "processor" and callable(names_provider):
             # A reactive processor's source picker must not offer the node's OWN outputs -- picking
             # one is the self-feedback loop Processor.__init__ rejects loud at Start; hide it here

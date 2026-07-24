@@ -2600,8 +2600,15 @@ def snap_scan_table(
 from zlc_data.scan_template import ScanColumnSpec, scan_table_template
 
 
-def scan_column_spec(name: str, kind: str, *, nominal: float = 0.0, unit: str = "ns",
-                     signed_range: tuple[int, int] | None = None, time_step_ns: float = 20.0) -> ScanColumnSpec:
+def scan_column_spec(
+    name: str,
+    kind: str,
+    *,
+    nominal: float = 0.0,
+    unit: str = "ns",
+    signed_range: tuple[int, int] | None = None,
+    time_step_ns: float,
+) -> ScanColumnSpec:
     """Build a :class:`ScanColumnSpec` with a sensible per-kind default sweep.
 
     ``dac`` -> the bus's SIGNED code range (``signed_range``, else the default 10-bit ``+-512``).
@@ -2615,7 +2622,14 @@ def scan_column_spec(name: str, kind: str, *, nominal: float = 0.0, unit: str = 
     nom = max(0.0, float(nominal))
     lo = step_in_unit                                                # 1 tick minimum -- never 0
     hi = max(nom * 2.0, 100.0 * step_in_unit)                        # bracket the nominal, >= ~100 ticks
-    return ScanColumnSpec(name, float(lo), float(hi), is_dac=False, unit=str(unit or "ns"))
+    return ScanColumnSpec(
+        name,
+        float(lo),
+        float(hi),
+        is_dac=False,
+        unit=str(unit or "ns"),
+        quantum=float(step_in_unit),
+    )
 
 
 

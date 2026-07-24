@@ -200,6 +200,7 @@ def scan_column_specs(document: PulseDocument) -> tuple[ScanColumnSpec, ...]:
                 is_dac=False,
                 unit=parameter.unit,
                 label=display_label,
+                quantum=tick,
             )
         )
     return tuple(specs)
@@ -209,7 +210,10 @@ def default_scan_program(document: PulseDocument, kind: str = "column_stack") ->
     normalized = str(kind)
     if normalized not in ("column_stack", "grid"):
         raise ValueError("scan template kind must be column_stack or grid")
-    return scan_table_template(normalized, scan_column_specs(document))
+    columns = scan_column_specs(document)
+    if not columns:
+        return ""
+    return scan_table_template(normalized, columns)
 
 
 def execute_scan_program(document: PulseDocument, source: str) -> ScanCandidateResult:

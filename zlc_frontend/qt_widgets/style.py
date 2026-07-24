@@ -7,7 +7,15 @@ domain-specific QPainter surfaces composed by Workbench windows.
 
 from __future__ import annotations
 
-from ..typography import FONT_FAMILY
+from ..selector_visual import (
+    SELECTOR_ALPHA,
+    SELECTOR_COLOR,
+    SELECTOR_DOT_PX,
+    SELECTOR_FONT_FAMILY,
+    SELECTOR_FONT_PX,
+    SELECTOR_HANDLE_PX,
+    SELECTOR_LINE_PX,
+)
 
 
 ACCENT = "#77AADD"
@@ -29,22 +37,9 @@ GREY = "#A2A2A2"
 
 MUTED_LABEL_STYLE = f"color: {GREY}; background: transparent; border: none;"
 
-# ---- Selector overlay art: the REFERENCE's matplotlib selectors, verbatim ---- #
-# The reference (frontend/selectors.py) draws its area/cross selectors as GREY
-# SOLID lines at alpha 0.8 with white square handles (legend.fontsize/2 pt), a
-# lines.markersize pt crosshair dot, and UNBOXED coordinate labels at
-# legend.fontsize pt.  The pixel values below are those point sizes at the
-# panel's effective dpi (DESIGN_DPI 300 x PANEL_DISPLAY_SCALE 0.7 = 210 dpi;
-# px = pt x 210 / 72).  qt_widgets stays matplotlib-free (charter C12), so a
-# contract test pins these literals to the render-style rcParams instead of an
-# import -- the two layers cannot drift without a red test.
-SELECTOR_COLOR = "#808080"       # matplotlib 'grey'
-SELECTOR_ALPHA = 204             # alpha 0.8
-SELECTOR_LINE_PX = 2.9           # lines.linewidth   1.0 pt @ 210 dpi
-SELECTOR_FONT_FAMILY = FONT_FAMILY
-SELECTOR_FONT_PX = 19            # legend.fontsize   6.5 pt @ 210 dpi
-SELECTOR_HANDLE_PX = 9.5         # legend.fontsize/2 3.25 pt @ 210 dpi (square side)
-SELECTOR_DOT_PX = 6              # lines.markersize  2.0 pt @ 210 dpi (dot diameter)
+# Selector overlay art is imported from the backend-neutral Figure owner.
+# qt_widgets converts those design units into QPainter primitives but owns no
+# second colour/alpha/point-size declaration.
 # QFont's pixel size is its em size, not the painted line height.  These map to
 # 22 px / 19 px QFontMetrics line heights, matching Matplotlib's painted
 # 7.5 pt / 6.5 pt text in the established 210 dpi panel raster.  Feeding those

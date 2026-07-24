@@ -84,6 +84,7 @@ def _api_column_specs(document):
                 max(float(value) * 2.0, 100.0 * tick),
                 unit=parameter.unit,
                 label=parameter.parameter_id,
+                quantum=tick,
             )
         )
     return tuple(result)

@@ -18,8 +18,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from gui_user_flow import configure_offscreen_fast_path
 from zlc_frontend.qt_widgets import (
+    FluentTreeComboBox,
     coerce_short_labels,
+    ensure_qt_app,
     fill_grouped_signal_combo,
     grouped_signal_items,
     read_editable_combo,
@@ -120,3 +123,102 @@ def test_fill_grouped_signal_combo_is_re_exported_for_widget_callers():
         "zlc_frontend.qt_widgets.signal_picker"
     )
     assert callable(read_editable_combo)
+
+
+def test_nested_signal_selection_is_shared_by_fill_write_and_clear():
+    """Saved form values select a nested leaf, never a top-level producer."""
+
+    from zlc_frontend.qt_widgets.param_widgets import PARAM_WIDGETS
+
+    configure_offscreen_fast_path()
+    application = ensure_qt_app()
+    combo = FluentTreeComboBox()
+    fill_grouped_signal_combo(
+        combo,
+        names=("camera_frame", "fit_center"),
+        sources={
+            "camera_frame": ("Camera",),
+            "fit_center": ("Fit",),
+        },
+        formats={
+            "camera_frame": "(32, 32) uint16",
+            "fit_center": "scalar float64",
+        },
+        labels={
+            "camera_frame": "frame",
+            "fit_center": "center",
+        },
+        current="fit_center",
+    )
+
+    assert combo.current_signal() == "fit_center"
+    assert combo._display_text() == "Fit · center"
+    assert not combo.rootModelIndex().isValid()
+
+    PARAM_WIDGETS["signal"].write(combo, "camera_frame")
+    assert combo.current_signal() == "camera_frame"
+    assert combo._display_text() == "Camera · frame"
+    assert not combo.rootModelIndex().isValid()
+
+    PARAM_WIDGETS["signal"].write(combo, None)
+    assert combo.current_signal() == ""
+    assert combo.currentIndex() == -1
+    assert not combo.rootModelIndex().isValid()
+
+    combo.deleteLater()
+    application.processEvents()
+
+
+def test_nested_signal_leaf_is_selected_by_the_real_popup_click():
+    """The public tree must work through the same press/release path as a user."""
+
+    from PyQt5 import QtCore, QtTest, QtWidgets
+
+    configure_offscreen_fast_path()
+    application = ensure_qt_app()
+    body = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(body)
+    combo = FluentTreeComboBox(body)
+    layout.addWidget(combo)
+    fill_grouped_signal_combo(
+        combo,
+        names=("camera_frame",),
+        sources={"camera_frame": ("Camera",)},
+        formats={},
+        labels={"camera_frame": "frame"},
+        current="",
+    )
+    body.show()
+    application.processEvents()
+
+    QtTest.QTest.mouseClick(combo, QtCore.Qt.LeftButton)
+    application.processEvents()
+    view = combo.view()
+    parent = combo.model().index(0, 0)
+    QtTest.QTest.mouseClick(
+        view.viewport(),
+        QtCore.Qt.LeftButton,
+        pos=view.visualRect(parent).center(),
+    )
+    application.processEvents()
+    assert view.isExpanded(parent)
+    child = combo.model().index(0, 0, parent)
+    view.scrollTo(child)
+    application.processEvents()
+    clicked = QtTest.QSignalSpy(view.clicked)
+    picked = QtTest.QSignalSpy(combo.signalPicked)
+    position = view.visualRect(child).center()
+    assert view.indexAt(position) == child
+    QtTest.QTest.mouseClick(
+        view.viewport(),
+        QtCore.Qt.LeftButton,
+        pos=position,
+    )
+    application.processEvents()
+
+    assert len(clicked) == 1
+    assert len(picked) == 1
+    assert combo.current_signal() == "camera_frame"
+    body.close()
+    body.deleteLater()
+    application.processEvents()

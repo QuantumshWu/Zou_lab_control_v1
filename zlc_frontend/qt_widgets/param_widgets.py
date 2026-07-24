@@ -591,11 +591,7 @@ class SignalHandler(ParamWidgetHandler):
 
     def write(self, widget, value):
         cur = "" if value is None else str(value)
-        idx = widget.findData(cur)
-        if idx >= 0:
-            widget.setCurrentIndex(idx)
-        else:
-            widget.setCurrentText(cur)
+        widget.select_signal(cur)
 
     def is_empty(self, widget) -> bool:
         return not read_editable_combo(widget)

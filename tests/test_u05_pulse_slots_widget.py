@@ -32,6 +32,10 @@ from zlc_frontend.qt_widgets import MeasurementPanel, PulseSlotsWidget, ensure_q
 COLUMNS = (ScanColumnSpec(name="s0", lo=-512.0, hi=512.0, is_dac=True, unit=""),)
 API_ROWS = (("h0", "c0", "duration", "t_probe", "ns", "100"),
             ("h1", "c1", "duration", "t_hold", "ns", "50"))
+API_COLUMNS = (
+    ScanColumnSpec(name="c0", lo=1, hi=200, unit="ns", quantum=1),
+    ScanColumnSpec(name="c1", lo=1, hi=100, unit="ns", quantum=1),
+)
 SCAN_ROWS = (("c0", "dac", "s0", "", "s0"),)
 
 TEMPLATE = {"api": {"h0": 100.0, "h1": 50.0}, "sweep_kind": "scan_slot", "program": "col"}
@@ -43,7 +47,8 @@ def _built(seed=None, *, api=API_ROWS, scan=SCAN_ROWS, reconciles=1):
     if seed is not None:
         widget.seed_value(seed)
     for _ in range(reconciles):
-        widget.reconcile(api, scan, scan_columns=COLUMNS if scan else (),
+        widget.reconcile(api, scan, api_columns=API_COLUMNS if api else (),
+                         scan_columns=COLUMNS if scan else (),
                          hardware_program="col" if scan else "", program_id="tpl")
     return widget
 
@@ -86,6 +91,7 @@ def test_clean_program_source_updates_in_the_same_editor():
     widget.reconcile(
         API_ROWS,
         SCAN_ROWS,
+        api_columns=API_COLUMNS,
         scan_columns=COLUMNS,
         hardware_program="updated source",
         program_id="tpl",
@@ -133,12 +139,16 @@ def test_real_code_and_api_input_survive_slot_add_remove_move_and_update():
         SCAN_ROWS[0],
     )
     columns = (
-        ScanColumnSpec(name="c1", lo=1, hi=10, unit="ns"),
+        ScanColumnSpec(name="c1", lo=1, hi=10, unit="ns", quantum=1),
         COLUMNS[0],
     )
     widget.reconcile(
         api,
         scan,
+        api_columns=(
+            ScanColumnSpec(name="c2", lo=1, hi=10, unit="us", quantum=1),
+            ScanColumnSpec(name="c0", lo=1, hi=10, unit="us", quantum=1),
+        ),
         scan_columns=columns,
         hardware_program="replacement must not overwrite a local draft",
         program_id="tpl",
@@ -165,21 +175,32 @@ def test_path_typing_is_only_a_draft_and_commits_keep_slot_and_code_identity(mon
         calls.append(path)
         if len(calls) == 1:
             api_rows = API_ROWS
+            api_columns = API_COLUMNS
             scan_rows = SCAN_ROWS
             scan_columns = COLUMNS
         elif len(calls) == 2:
             api_rows = (API_ROWS[1], ("h2", "c2", "delay", "probe", "us", 9), API_ROWS[0])
+            api_columns = (
+                ScanColumnSpec(name="c1", lo=1, hi=10, unit="ns", quantum=1),
+                ScanColumnSpec(name="c2", lo=1, hi=10, unit="us", quantum=1),
+                ScanColumnSpec(name="c0", lo=1, hi=10, unit="us", quantum=1),
+            )
             scan_rows = (("c1", "duration", "1", "ns", "hold"), SCAN_ROWS[0])
             scan_columns = (
-                ScanColumnSpec(name="c1", lo=1, hi=10, unit="ns"),
+                ScanColumnSpec(name="c1", lo=1, hi=10, unit="ns", quantum=1),
                 COLUMNS[0],
             )
         else:
             api_rows = (("h2", "c2", "delay", "probe", "us", 9), API_ROWS[0])
+            api_columns = (
+                ScanColumnSpec(name="c2", lo=1, hi=10, unit="us", quantum=1),
+                ScanColumnSpec(name="c0", lo=1, hi=10, unit="ns", quantum=1),
+            )
             scan_rows = (SCAN_ROWS[0],)
             scan_columns = COLUMNS
         return PulseTemplateRows(
             api_rows=api_rows,
+            api_columns=api_columns,
             scan_rows=scan_rows,
             scan_columns=scan_columns,
             program="backend_program_must_not_replace_the_local_draft",

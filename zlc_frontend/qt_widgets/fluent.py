@@ -2268,51 +2268,87 @@ class FluentTreeComboBox(FluentComboBox):
         self.activated.emit(self.currentIndex())
         self.signalPicked.emit(self.current_signal())
 
+    def select_signal(self, bare_key) -> bool:
+        """Select one nested signal leaf by its bare ``UserRole`` key.
+
+        ``QComboBox.findData`` only searches the combo's current root.  Signal
+        leaves live below producer rows, so using ``findData`` to restore a
+        saved value silently misses every real signal.  This method is the one
+        programmatic-selection path for the tree: it walks all nested leaves,
+        temporarily scopes the combo to the matching leaf's parent, selects
+        the leaf row, restores the top-level root, and paints the collapsed
+        producer-qualified label immediately.
+
+        ``None`` and ``""`` clear the selection unless the model contains an
+        explicit empty leaf (the optional ``none_label`` row), in which case
+        that row is selected.  A non-empty key that is absent also leaves the
+        combo blank and returns ``False``; it never lands on a producer header.
+        """
+
+        key = "" if bare_key is None else str(bare_key).strip()
+        match = QtCore.QModelIndex()
+
+        def visit(parent: QtCore.QModelIndex) -> bool:
+            nonlocal match
+            for row in range(self._model.rowCount(parent)):
+                index = self._model.index(row, 0, parent)
+                item = self._model.itemFromIndex(index)
+                if item is None:
+                    continue
+                payload = item.data(QtCore.Qt.UserRole)
+                if payload is not None and str(payload).strip() == key:
+                    match = index
+                    return True
+                if item.hasChildren() and visit(index):
+                    return True
+            return False
+
+        found = visit(QtCore.QModelIndex())
+        try:
+            if found:
+                self.setRootModelIndex(match.parent())
+                self.setCurrentIndex(match.row())
+            else:
+                self.setRootModelIndex(QtCore.QModelIndex())
+                self.setCurrentIndex(-1)
+        finally:
+            # A temporary nested root is an implementation detail.  Leaving it
+            # installed makes the next popup expose only one producer subtree.
+            self.setRootModelIndex(QtCore.QModelIndex())
+        self.repaint()
+        return found
+
     def set_signal_tree(self, groups, *, current="", none_label=None) -> None:
         """Populate the tree from ``groups`` = ``[(producer, [(leaf_label, bare_name, full_label)])]``
         and select ``current`` (a bare signal name).  Parents are non-selectable + bold + collapsed;
         ``none_label`` adds a leading selectable empty row."""
         self._model.clear()
-        sel_parent_row = sel_child_row = None
         self._full_by_bare = {}                  # {bare -> producer-qualified label} for live _display_text
-        base = 0
         if none_label is not None:
             none_item = QtGui.QStandardItem(str(none_label))
             none_item.setData("", QtCore.Qt.UserRole)
             none_item.setData("", QtCore.Qt.UserRole + 1)
             none_item.setEditable(False)
             self._model.appendRow(none_item)
-            base = 1                                  # producers start one row below the none-row
-        for gi, (producer, leaves) in enumerate(groups):
+        for producer, leaves in groups:
             parent = QtGui.QStandardItem(str(producer))
             parent.setSelectable(False)
             parent.setEditable(False)
             font = parent.font(); font.setBold(True); parent.setFont(font)
-            for ci, (leaf_label, bare, full_label) in enumerate(leaves):
+            for leaf_label, bare, full_label in leaves:
                 child = QtGui.QStandardItem(str(leaf_label))
                 child.setData(str(bare), QtCore.Qt.UserRole)
                 child.setData(str(full_label), QtCore.Qt.UserRole + 1)
                 child.setEditable(False)
                 self._full_by_bare[str(bare)] = str(full_label)   # for the live collapsed-box label
-                if current and str(bare) == str(current):
-                    # the parent's FINAL model row is base+gi (parent.row() is -1 until appended)
-                    sel_parent_row, sel_child_row = base + gi, ci
                 parent.appendRow(child)
             self._model.appendRow(parent)
         view = self.view()
         if isinstance(view, QtWidgets.QTreeView):
             view.collapseAll()
-        if sel_parent_row is not None:
-            parent_index = self._model.index(sel_parent_row, 0)
-            self.setRootModelIndex(parent_index)
-            self.setCurrentIndex(sel_child_row)
-            self.setRootModelIndex(QtCore.QModelIndex())
-        elif none_label is not None:
-            self.setCurrentIndex(0)
-        # repaint() not update(): a rebuild while the Setting is open (a refresh after a pick) must show
-        # the producer-qualified label IMMEDIATELY, not on a deferred async paint that the Qt.Popup may
-        # not flush until it is closed + reopened (#1).  (A no-op on a not-yet-shown combo.)
-        self.repaint()
+        # Initial population and later saved-value restoration share the exact
+        # same nested-leaf selection semantics.
+        self.select_signal(current)
 
     def reconcile_signal_tree_metadata(self, groups) -> bool:
         """Update existing signal-leaf labels without rebuilding the tree.

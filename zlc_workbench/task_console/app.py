@@ -86,7 +86,12 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         OccupancyBindingIntent,
         ReactiveOccupancyNode,
     )
-    from .pulse_scan_binding import PulseScanBindingIntent
+    from .pulse_scan_binding import (
+        PULSE_SCAN_CAMERA_FRAME_SOURCE,
+        PULSE_SCAN_OCCUPANCY_SOURCE,
+        PulseScanBindingIntent,
+        classify_pulse_scan_producer,
+    )
     from .coupled_measurement_presenter import (
         GreyMolassesDetuningIntent,
         ReadoutDurationFidelityIntent,
@@ -189,11 +194,12 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 )
             raise TypeError("Pulse scan intent contains an unknown program")
 
-        if (
-            producer.definition_key == CAMERA_MEASUREMENT_KEY
-            and producer.output_name == "frame"
-            and isinstance(producer.request, CameraMeasurementRequest)
-        ):
+        if source.source_kind == PULSE_SCAN_CAMERA_FRAME_SOURCE:
+            if not isinstance(producer.request, CameraMeasurementRequest):
+                raise TypeError(
+                    "Pulse scan Camera source did not build a "
+                    "CameraMeasurementRequest"
+                )
             if producer.request.frames_per_cycle != 1:
                 raise ValueError(
                     "Pulse scan Camera y requires exactly one frame per scan cell"
@@ -202,17 +208,21 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 camera_role=producer.request.camera_ref.role
             ), (producer.run_node,)
 
-        if (
-            producer.definition_key == OCCUPANCY_STREAM_PROCESSOR_KEY
-            and producer.output_name in ("counts", "occupied")
-            and isinstance(producer.request, OccupancyBindingIntent)
-        ):
+        if source.source_kind == PULSE_SCAN_OCCUPANCY_SOURCE:
+            if not isinstance(producer.request, OccupancyBindingIntent):
+                raise TypeError(
+                    "Pulse scan Occupancy source did not build an "
+                    "OccupancyBindingIntent"
+                )
             camera = console[0].resolve_console_producer(
                 producer.request.camera_frame_signal
             )
             if (
-                camera.definition_key != CAMERA_MEASUREMENT_KEY
-                or camera.output_name != "frame"
+                classify_pulse_scan_producer(
+                    camera.definition_key,
+                    camera.output_name,
+                )
+                != PULSE_SCAN_CAMERA_FRAME_SOURCE
                 or not isinstance(camera.request, CameraMeasurementRequest)
             ):
                 raise ValueError(
@@ -249,10 +259,9 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 raise TypeError("Pulse scan intent contains an unknown program")
             return request, (producer.run_node, camera.run_node)
 
-        raise ValueError(
-            "selected Pulse scan y has no exact source builder; current exact "
-            "sources are Camera frame, Occupancy counts/occupied, and their "
-            "Figure Area data"
+        raise RuntimeError(
+            f"Pulse scan resolver returned unknown source kind "
+            f"{source.source_kind!r}"
         )
 
     def run_factory(spec, values):

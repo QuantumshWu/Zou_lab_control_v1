@@ -661,10 +661,9 @@ def test_curve_lifecycle_and_callback_fault_are_local() -> None:
 def test_selector_art_tokens_match_render_style_rcparams():
     """The reference draws selectors with matplotlib rcParams (grey, alpha 0.8,
     legend.fontsize text, lines.linewidth strokes, legend.fontsize/2 handles,
-    lines.markersize dot).  qt_widgets may not import matplotlib (charter C12),
-    so its SELECTOR_* tokens are literals -- this contract pins each literal to
-    the rcParams value at the panel's effective dpi so the two layers cannot
-    drift apart silently."""
+    lines.markersize dot).  The backend-neutral selector visual contract owns
+    those design units; this check pins its Qt pixel projection to the same
+    established Main rcParams values."""
 
     import matplotlib.colors
 
@@ -689,7 +688,7 @@ def test_selector_art_tokens_match_render_style_rcparams():
         DEFAULT_STYLE["lines.linewidth"] * px_per_pt, abs=0.05)
     assert SELECTOR_FONT_PX == round(
         DEFAULT_STYLE["legend.fontsize"] * px_per_pt)
-    assert SELECTOR_HANDLE_PX == round(
-        DEFAULT_STYLE["legend.fontsize"] / 2.0 * px_per_pt)
+    assert SELECTOR_HANDLE_PX == pytest.approx(
+        DEFAULT_STYLE["legend.fontsize"] / 2.0 * px_per_pt, abs=0.05)
     assert SELECTOR_DOT_PX == round(
         DEFAULT_STYLE["lines.markersize"] * px_per_pt)

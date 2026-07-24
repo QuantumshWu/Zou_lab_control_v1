@@ -337,7 +337,7 @@ def _pulse_scan_params() -> tuple[ParamDecl, ...]:
         ),
         ParamDecl(
             "y_signal",
-            "Exact signal (y)",
+            "Exact source (y)",
             "signal",
             required=True,
             tooltip=(
@@ -697,7 +697,10 @@ class ConsoleCatalogView:
                     ),
                 ),
                 build_request=build_scan,
-                default_panel=("scan", "1d"),
+                # The exact y may be scalar, site-valued, or a full spatial
+                # frame.  Its first real FINAL schema, not this catalog row,
+                # chooses the initial Figure intent.
+                default_panel=("scan", "auto"),
             )
         if item.key == OCCUPANCY_STREAM_PROCESSOR_KEY:
 

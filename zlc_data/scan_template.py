@@ -17,6 +17,9 @@ what is not.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
+from fractions import Fraction
+import math
 from typing import Sequence
 
 __all__ = ["ScanColumnSpec", "scan_table_template"]
@@ -36,6 +39,58 @@ class ScanColumnSpec:
     is_dac: bool = False
     unit: str = "ns"
     label: str = ""
+    quantum: float | None = None
+
+    def __post_init__(self) -> None:
+        for field in ("lo", "hi"):
+            value = getattr(self, field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError(f"ScanColumnSpec.{field} must be finite numeric")
+        if float(self.hi) < float(self.lo):
+            raise ValueError("ScanColumnSpec.hi must not be below lo")
+        if self.is_dac:
+            if self.quantum is not None:
+                raise ValueError("a DAC scan column cannot carry a time quantum")
+            return
+        quantum = self.quantum
+        if (
+            isinstance(quantum, bool)
+            or not isinstance(quantum, (int, float))
+            or not math.isfinite(float(quantum))
+            or float(quantum) <= 0.0
+        ):
+            raise ValueError(
+                "a duration scan column requires its positive native-unit quantum"
+            )
+        object.__setattr__(self, "quantum", float(quantum))
+
+
+def _duration_tick_bounds(spec: ScanColumnSpec) -> tuple[int, int]:
+    """Return exact integer bounds from domain-authored physical values."""
+
+    assert spec.quantum is not None
+    quantum = Fraction(str(spec.quantum))
+    ratios = tuple(Fraction(str(value)) / quantum for value in (spec.lo, spec.hi))
+    if any(ratio.denominator != 1 for ratio in ratios):
+        raise ValueError(
+            f"duration column {spec.name!r} bounds are not multiples of its quantum"
+        )
+    lo_ticks, hi_ticks = (ratio.numerator for ratio in ratios)
+    if lo_ticks < 1:
+        raise ValueError(f"duration column {spec.name!r} must start at one tick")
+    return lo_ticks, hi_ticks
+
+
+def _duration_decimal_places(spec: ScanColumnSpec) -> int:
+    """Digits needed to recover canonical decimal tick values after NumPy math."""
+
+    assert spec.quantum is not None
+    exponent = Decimal(str(spec.quantum)).normalize().as_tuple().exponent
+    return max(0, -int(exponent))
 
 
 def scan_table_template(kind: str, columns: Sequence[ScanColumnSpec]) -> str:
@@ -53,19 +108,36 @@ def scan_table_template(kind: str, columns: Sequence[ScanColumnSpec]) -> str:
     * ``grid``: every combination (outer product) of per-axis arrays.
     """
 
-    cols = list(columns) or [ScanColumnSpec("s0", 20.0, 200_000.0, is_dac=False, unit="ns")]
+    cols = list(columns)
+    if not cols:
+        raise ValueError(
+            "scan_table_template requires at least one domain-owned column"
+        )
     n = len(cols)
 
     def sweep(spec: ScanColumnSpec, size) -> str:
-        base = f"np.linspace({spec.lo:g}, {spec.hi:g}, {size})"
-        return f"{base}.round().astype(int)" if spec.is_dac else base
+        if spec.is_dac:
+            return f"np.linspace({spec.lo:g}, {spec.hi:g}, {size}).round().astype(int)"
+        lo_ticks, hi_ticks = _duration_tick_bounds(spec)
+        decimals = _duration_decimal_places(spec)
+        ticks = (
+            f"np.linspace({lo_ticks}, {hi_ticks}, {size})"
+            ".round().astype(np.int64)"
+        )
+        return f"np.round(({ticks}) * {spec.quantum!r}, {decimals})"
 
     def note(spec: ScanColumnSpec) -> str:
         subject = spec.name
         if str(spec.label).strip():
             subject = f"{subject} ({str(spec.label).strip()})"
-        return (f"{subject}: DAC code [{spec.lo:g}..{spec.hi:g}], 0 = 0 V"
-                if spec.is_dac else f"{subject}: duration [{spec.unit}], >= 1 tick")
+        return (
+            f"{subject}: DAC code [{spec.lo:g}..{spec.hi:g}], 0 = 0 V"
+            if spec.is_dac
+            else (
+                f"{subject}: duration [{spec.unit}], "
+                f"tick = {spec.quantum:g} {spec.unit}"
+            )
+        )
 
     if str(kind) == "grid":
         # A real N-D grid: ONE axis per slot, every combination (outer product).  Each axis is seeded

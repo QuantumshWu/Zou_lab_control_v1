@@ -887,6 +887,15 @@ class TaskConsole(QtWidgets.QWidget):
 
         return sorted(self._signal_topology())
 
+    def _pulse_scan_source_names(self) -> list[str]:
+        """Only event-bearing sources accepted by the Pulse Scan resolver."""
+
+        return [
+            name
+            for name in self._signal_names()
+            if self._pulse_scan_source_kind(name, set()) is not None
+        ]
+
     def _signal_formats(self) -> dict:
         """Describe every value present in the current immutable data front.
 
@@ -1081,16 +1090,8 @@ class TaskConsole(QtWidgets.QWidget):
             for output in getattr(spec, "declared_outputs", ()) or ()
         ]
 
-    def resolve_console_producer(self, signal_key: str):
-        """Resolve one selected output against exactly one row in this console.
-
-        This is the processor-binding boundary, not a signal-name search.  The
-        selected value must equal a catalog-declared producer/output key; no
-        prefix parsing, filesystem lookup, ``latest`` artifact lookup, or
-        cross-console fallback is permitted.
-        """
-
-        from .occupancy_binding import ConsoleProducerBinding
+    def _console_producer_match(self, signal_key: str):
+        """Return the unique row/spec/output declaration behind an exact key."""
 
         if type(signal_key) is not str or not signal_key:
             raise TypeError("console producer signal key must be a non-empty str")
@@ -1112,7 +1113,20 @@ class TaskConsole(QtWidgets.QWidget):
             raise RuntimeError(
                 f"{signal_key!r} resolves to more than one TaskConsole node"
             )
-        row, spec, output = matches[0]
+        return matches[0]
+
+    def resolve_console_producer(self, signal_key: str):
+        """Resolve one selected output against exactly one row in this console.
+
+        This is the processor-binding boundary, not a signal-name search.  The
+        selected value must equal a catalog-declared producer/output key; no
+        prefix parsing, filesystem lookup, ``latest`` artifact lookup, or
+        cross-console fallback is permitted.
+        """
+
+        from .occupancy_binding import ConsoleProducerBinding
+
+        row, spec, output = self._console_producer_match(signal_key)
         editor = self._logic_editors.get(id(row))
         if editor is None:
             values = dict(row.node.values or {})
@@ -1158,30 +1172,75 @@ class TaskConsole(QtWidgets.QWidget):
             ),
         )
 
-    def resolve_pulse_scan_source(self, signal_key: str):
-        """Resolve an exact scan source without reading the display data front.
+    def _pulse_scan_source_kind(
+        self,
+        signal_key: str,
+        active: set[str],
+    ) -> str | None:
+        """Classify one candidate without building another row's request."""
 
-        A logic output resolves to its frozen producer request.  Figure Area
-        data resolves to that same producer plus the Figure-owned named-axis
-        selection.  Cross coordinates, fit parameters, range labels, and other
-        static panel outputs are useful signals, but they are not one fresh
-        event per scan cell and therefore cannot masquerade as Pulse-scan y.
-        """
+        from .panel_outputs import AREA_DATA_OUTPUT
+        from .pulse_scan_binding import classify_pulse_scan_producer
+
+        current = str(signal_key)
+        if not current or current in active:
+            return None
+        try:
+            _row, spec, output = self._console_producer_match(current)
+        except LookupError:
+            pass
+        else:
+            return classify_pulse_scan_producer(
+                spec.key,
+                str(output.name),
+            )
+
+        for card in self.cards:
+            area_key = panel_signal_key(card.panel_id, AREA_DATA_OUTPUT)
+            if current != area_key:
+                continue
+            source_key = str(card.config.signal).strip()
+            _value, selection, _cross, _fit = card.frozen_figure_output_state()
+            if not source_key or selection is None:
+                return None
+            return self._pulse_scan_source_kind(
+                source_key,
+                {*active, current},
+            )
+        return None
+
+    def resolve_pulse_scan_source(self, signal_key: str):
+        """Resolve an exact scan source without reading the display data front."""
 
         from zlc_data import DataTransformSpec
 
         from .panel_outputs import AREA_DATA_OUTPUT
-        from .pulse_scan_binding import PulseScanSourceBinding
+        from .pulse_scan_binding import (
+            PulseScanSourceBinding,
+            classify_pulse_scan_producer,
+        )
 
         def resolve(current: str, active: set[str]):
             if current in active:
                 raise ValueError("Pulse scan source panels form a cycle")
             try:
-                producer = self.resolve_console_producer(current)
+                _row, spec, output = self._console_producer_match(current)
             except LookupError:
-                producer = None
-            if producer is not None:
-                return PulseScanSourceBinding(producer)
+                pass
+            else:
+                source_kind = classify_pulse_scan_producer(
+                    spec.key,
+                    str(output.name),
+                )
+                if source_kind is None:
+                    raise ValueError(
+                        "Pulse scan exact sources are Camera frame and Occupancy "
+                        "counts/occupied"
+                    )
+                return PulseScanSourceBinding(
+                    source_kind,
+                    self.resolve_console_producer(current),
+                )
 
             for card in self.cards:
                 area_key = panel_signal_key(card.panel_id, AREA_DATA_OUTPUT)
@@ -1206,6 +1265,7 @@ class TaskConsole(QtWidgets.QWidget):
                     else upstream.transform_spec.operations
                 )
                 return PulseScanSourceBinding(
+                    upstream.source_kind,
                     upstream.producer,
                     DataTransformSpec((*prior, selection)),
                 )
@@ -1732,7 +1792,18 @@ class TaskConsole(QtWidgets.QWidget):
             self.tabs.setCurrentWidget(existing)
             return
         spec = self._spec_for_logic(row.node)
-        editor = LogicNodeEditor(row, self, spec)
+        signal_names_provider = None
+        if spec is not None:
+            from zlc_neutral_atom.scan import PULSE_SCAN_MEASUREMENT_KEY
+
+            if spec.key == PULSE_SCAN_MEASUREMENT_KEY:
+                signal_names_provider = self._pulse_scan_source_names
+        editor = LogicNodeEditor(
+            row,
+            self,
+            spec,
+            signal_names_provider=signal_names_provider,
+        )
         # reflect the live run state on the form (a Started node reopened keeps Stop enabled)
         node = self._logic_nodes.get(id(row))
         editor.set_running(bool(getattr(node, "running", False)))
@@ -1863,8 +1934,18 @@ class TaskConsole(QtWidgets.QWidget):
             raise RuntimeError(
                 f"default panel output {output_name!r} is not declared"
             )
-        if declaration.run_scoped and self._tick_data.value(key) is None:
+        value = self._tick_data.value(key)
+        # A default panel represents a real typed result, never a promise made
+        # at Start.  This applies equally to run-scoped fronts and FINAL-only
+        # outputs, so a rejected/failed run cannot leave an empty viewer behind.
+        if value is None:
             return
+        if kind == "auto":
+            from .panel_types import automatic_panel_kind
+
+            kind = automatic_panel_kind(value.schema)
+            if kind is None:
+                return
         card = self._new_panel_card(
             PanelConfig(
                 kind=kind,
@@ -2204,6 +2285,11 @@ class TaskConsole(QtWidgets.QWidget):
                     projected = node.projected_final_signals
                     if projected is not None:
                         self._data.publish_final(node, projected)
+                        # FINAL publication is the real data boundary that can
+                        # admit a schema-driven default panel.  Promote it now;
+                        # do not wait for an unrelated display timer beat.
+                        self._promote_data_front(self._data.freeze())
+                        self._ensure_default_result_panel(row)
                     projection_error = node.final_projection_error
                     done_status = (
                         "done"
