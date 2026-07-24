@@ -24,7 +24,7 @@ from zlc_data import (
     Value,
     ValueSchema,
 )
-from zlc_neutral_atom.readout.occupancy import (
+from zlc_neutral_atom.logic_nodes.occupancy.processor import (
     _require_occupancy_output_schemas,
     _validate_sample_fields,
 )
@@ -223,13 +223,13 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
 
 
 def test_normal_committed_path_has_one_repository_compiler_owner():
-    from zlc_neutral_atom.readout.occupancy_repository import (
+    from zlc_neutral_atom.logic_nodes.occupancy.repository import (
         compile_occupancy_artifact_plan,
     )
-    import zlc_neutral_atom.readout.occupancy_repository as repository_module
+    import zlc_neutral_atom.logic_nodes.occupancy.repository as repository_module
 
     assert compile_occupancy_artifact_plan.__module__.endswith(
-        "readout.occupancy_repository"
+        "logic_nodes.occupancy.repository"
     )
     assert not hasattr(repository_module, "OccupancyCheckpoint")
     assert not hasattr(repository_module, "LegacyOccupancyProcessor")

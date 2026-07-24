@@ -10,19 +10,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from zlc_frontend.form import FormFieldProps, FormSpec
+from zlc_frontend.form import FormSpec
 from zlc_neutral_atom.installation_config import (
     InstallationConfigDocument,
-    RemotePulseInstallationConfig,
-    VirtualInstallationConfig,
+    default_installation_authoring_schema,
 )
 from zlc_storage import sha256_text
-
-
-_VIRTUAL = "virtual"
-_REMOTE_PULSE = "remote_pulse"
-_BACKENDS = frozenset((_VIRTUAL, _REMOTE_PULSE))
-_MIN_POSITIVE_FLOAT = float.fromhex("0x0.0000000000001p-1022")
+from zlc_workbench.form_projection import project_authoring_form
 
 
 def form_spec(
@@ -30,77 +24,16 @@ def form_spec(
 ) -> FormSpec:
     """Project one current config topology to the shared headless form contract."""
 
-    document: InstallationConfigDocument | None
     if isinstance(document_or_backend, InstallationConfigDocument):
-        document = document_or_backend
-        backend = document.backend
+        schema = document_or_backend.config.authoring_schema()
     elif isinstance(document_or_backend, str):
-        document = None
-        backend = _backend(document_or_backend)
+        schema = default_installation_authoring_schema(document_or_backend)
     else:
         raise TypeError(
             "document_or_backend must be InstallationConfigDocument or backend text"
         )
 
-    if backend == _VIRTUAL:
-        seed = (
-            7
-            if document is None
-            else _virtual_config(document).seed
-        )
-        return FormSpec(
-            (
-                FormFieldProps(
-                    "seed",
-                    "number",
-                    "Random seed",
-                    default=seed,
-                    required=False,
-                    minimum=0,
-                    description=(
-                        "Optional deterministic simulator seed; blank requests "
-                        "non-deterministic initialization."
-                    ),
-                ),
-            )
-        )
-
-    remote = None if document is None else _remote_config(document)
-    return FormSpec(
-        (
-            FormFieldProps(
-                "host",
-                "text",
-                "Host",
-                default="" if remote is None else remote.host,
-                required=True,
-                description="Pulse execution server host name or address.",
-            ),
-            FormFieldProps(
-                "port",
-                "int",
-                "Port",
-                default=18861 if remote is None else remote.port,
-                required=True,
-                minimum=1,
-                maximum=65535,
-            ),
-            FormFieldProps(
-                "transport_timeout_seconds",
-                "float",
-                "Transport timeout",
-                default=(
-                    120.0
-                    if remote is None
-                    else remote.transport_timeout_seconds
-                ),
-                required=True,
-                unit="s",
-                minimum=_MIN_POSITIVE_FLOAT,
-                description="Must be finite and greater than zero.",
-            ),
-        )
-    )
+    return project_authoring_form(schema)
 
 
 class DeviceConfigEditorSession:
@@ -200,11 +133,11 @@ class DeviceConfigEditorSession:
     def switch_backend(self, backend: str) -> bool:
         """Explicitly replace the config topology and seed its declared defaults."""
 
-        backend = _backend(backend)
+        form = form_spec(backend)
         if backend == self._backend:
             return False
         self._backend = backend
-        self._values = form_spec(backend).default_values()
+        self._values = form.default_values()
         return True
 
     def replace_new(self, backend: str) -> None:
@@ -217,7 +150,6 @@ class DeviceConfigEditorSession:
         presentation.
         """
 
-        backend = _backend(backend)
         values = form_spec(backend).default_values()
         self._backend = backend
         self._values = values
@@ -229,13 +161,9 @@ class DeviceConfigEditorSession:
     def candidate(self) -> InstallationConfigDocument:
         """Construct and authoritatively validate the current draft."""
 
-        values = self._values
-        if self._backend == _VIRTUAL:
-            return InstallationConfigDocument.virtual(seed=values["seed"])
-        return InstallationConfigDocument.remote_pulse(
-            host=values["host"],
-            port=values["port"],
-            transport_timeout_seconds=values["transport_timeout_seconds"],
+        return InstallationConfigDocument.from_parameters(
+            self._backend,
+            self._values,
         )
 
     def replace_loaded(
@@ -295,47 +223,12 @@ class DeviceConfigEditorSession:
 def _document_state(
     document: InstallationConfigDocument,
 ) -> tuple[str, dict[str, object]]:
-    config = document.config
-    if isinstance(config, VirtualInstallationConfig):
-        return _VIRTUAL, {"seed": config.seed}
-    if isinstance(config, RemotePulseInstallationConfig):
-        return _REMOTE_PULSE, {
-            "host": config.host,
-            "port": config.port,
-            "transport_timeout_seconds": config.transport_timeout_seconds,
-        }
-    raise TypeError("document contains an unsupported installation config")
-
-
-def _virtual_config(
-    document: InstallationConfigDocument,
-) -> VirtualInstallationConfig:
-    config = document.config
-    if not isinstance(config, VirtualInstallationConfig):
-        raise ValueError("document is not a virtual installation config")
-    return config
-
-
-def _remote_config(
-    document: InstallationConfigDocument,
-) -> RemotePulseInstallationConfig:
-    config = document.config
-    if not isinstance(config, RemotePulseInstallationConfig):
-        raise ValueError("document is not a remote_pulse installation config")
-    return config
+    return document.backend, document.config.to_parameters()
 
 
 def _require_document(value: object, field: str) -> None:
     if not isinstance(value, InstallationConfigDocument):
         raise TypeError(f"{field} must be InstallationConfigDocument")
-
-
-def _backend(value: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError("backend must be text")
-    if value not in _BACKENDS:
-        raise ValueError(f"unsupported installation backend {value!r}")
-    return value
 
 
 def _digest_or_none(value: str | None) -> str | None:

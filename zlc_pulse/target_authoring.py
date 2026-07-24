@@ -17,6 +17,42 @@ from .target import (
 
 
 @dataclass(frozen=True, slots=True)
+class PulseTargetPortWidthSpec:
+    """Typed width admission and new-row default for one editable port kind."""
+
+    minimum: int
+    default: int
+    maximum: int | None = None
+
+    def normalize(self, width: object) -> int:
+        if isinstance(width, bool) or not isinstance(width, int):
+            raise TypeError("target port width must be an integer")
+        if width < self.minimum:
+            raise ValueError(
+                f"target port width must be at least {self.minimum}"
+            )
+        if self.maximum is not None and width > self.maximum:
+            raise ValueError(
+                f"target port width must be at most {self.maximum}"
+            )
+        return width
+
+
+_DIGITAL_PORT_WIDTH = PulseTargetPortWidthSpec(1, 1, 1)
+_DAC_PORT_WIDTH = PulseTargetPortWidthSpec(2, 10)
+
+
+def pulse_target_port_width_spec(kind: str) -> PulseTargetPortWidthSpec:
+    """Return the sole editable-width declaration for a target port kind."""
+
+    if kind == PORT_DIGITAL:
+        return _DIGITAL_PORT_WIDTH
+    if kind == PORT_DAC:
+        return _DAC_PORT_WIDTH
+    raise ValueError("editable target ports must be digital or DAC")
+
+
+@dataclass(frozen=True, slots=True)
 class PulseTargetPortDraft:
     """One editable programmable port; a DAC owns its latch clock."""
 
@@ -48,13 +84,14 @@ class PulseTargetPortDraft:
             for value in endpoints
         ):
             raise ValueError("target endpoints must be non-empty canonical text")
+        width_spec = pulse_target_port_width_spec(self.kind)
         if self.kind == PORT_DIGITAL:
-            if len(endpoints) != 1:
+            if len(endpoints) != width_spec.default:
                 raise ValueError("a digital port requires exactly one endpoint")
             if self.clock_key is not None or self.clock_endpoint is not None:
                 raise ValueError("a digital port cannot own a latch clock")
-        elif self.kind == PORT_DAC:
-            if len(endpoints) < 2:
+        else:
+            if len(endpoints) < width_spec.minimum:
                 raise ValueError("a DAC port requires at least two data endpoints")
             clock_key = "" if self.clock_key is None else self.clock_key
             clock_endpoint = "" if self.clock_endpoint is None else self.clock_endpoint
@@ -66,8 +103,7 @@ class PulseTargetPortDraft:
                 raise ValueError("DAC latch-clock identity must be canonical text")
             object.__setattr__(self, "clock_key", clock_key)
             object.__setattr__(self, "clock_endpoint", clock_endpoint)
-        else:
-            raise ValueError("editable target ports must be digital or DAC")
+        width_spec.normalize(len(endpoints))
         object.__setattr__(self, "key", key)
         object.__setattr__(self, "signal", signal)
         object.__setattr__(self, "endpoints", endpoints)
@@ -455,9 +491,11 @@ __all__ = [
     "PulseTargetEditImpact",
     "PulseTargetEditResult",
     "PulseTargetPortDraft",
+    "PulseTargetPortWidthSpec",
     "build_pulse_target_manifest",
     "pulse_document_port_references",
     "pulse_target_port_drafts",
+    "pulse_target_port_width_spec",
     "restrict_pulse_document_to_manifest",
     "replace_pulse_document_target",
 ]

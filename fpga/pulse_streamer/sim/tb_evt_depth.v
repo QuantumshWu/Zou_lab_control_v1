@@ -8,7 +8,7 @@
 // bit0 carries the 16-toggle burst, bit1 the 18-toggle burst; both delayed by
 // d=200 so the whole burst is in flight at once.
 module tb_evt_depth;
-  localparam integer CH=8, EAW=12, TW=32, NS=1, CW=16, DTW=12, BUSC=4, BW=10;
+  localparam integer CH=8, EAW=12, TW=32, NS=1, CW=16, DTW=32, BUSC=4, BW=10;
   localparam integer NE=21;
   localparam integer NT=1200;
   localparam integer D=200;

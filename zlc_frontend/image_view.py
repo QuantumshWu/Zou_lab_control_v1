@@ -567,21 +567,47 @@ class ImageViewportTransform:
             min(1.0, max(0.0, (y - top) / (bottom - top))),
         )
 
-    def coordinate_rectangle_for_normalized_bounds(
+    def coordinate_rectangle_for_visible_bounds(
         self,
         bounds: NormalizedRectangle,
     ) -> tuple[float, float, float, float]:
-        """Map arbitrary display bounds to continuous axis coordinates.
+        """Map visible-window bounds to continuous axis coordinates.
 
-        Unlike :meth:`selection_for_normalized_bounds`, this method does not
-        require pixel-edge alignment and never creates data authority.  It is
-        the display-only coordinate bridge used while a rectangle is moving.
+        These bounds live in the currently painted axes square, where ``0..1``
+        describes the *visible window*.  They are deliberately not the same
+        coordinate space as a standing image selection, whose normalized
+        bounds describe the complete source raster and remain inside that
+        raster even when zoom or pan exposes axes background.
         """
 
         left, top, right, bottom = validate_normalized_rectangle(bounds)
 
         first_x, first_y = self.coordinate_for_visible_point((left, top))
         second_x, second_y = self.coordinate_for_visible_point((right, bottom))
+        x_low, x_high = sorted((first_x, second_x))
+        y_low, y_high = sorted((first_y, second_y))
+        return x_low, y_low, x_high, y_high
+
+    def coordinate_rectangle_for_full_bounds(
+        self,
+        bounds: NormalizedRectangle,
+    ) -> tuple[float, float, float, float]:
+        """Map complete-raster bounds to continuous axis coordinates.
+
+        A Figure Area is stored in this source-relative coordinate space so it
+        is invariant under later zoom/pan.  The viewport itself may extend
+        beyond the source, but an Area cannot: accepting unbounded viewport
+        bounds here would silently turn display background into data
+        authority.
+        """
+
+        left, top, right, bottom = validate_normalized_rectangle(bounds)
+        x_start, x_stop = self._cached_axis_edges(self.x_axis)
+        y_start, y_stop = self._cached_axis_edges(self.y_axis)
+        first_x = x_start + left * (x_stop - x_start)
+        second_x = x_start + right * (x_stop - x_start)
+        first_y = y_start + top * (y_stop - y_start)
+        second_y = y_start + bottom * (y_stop - y_start)
         x_low, x_high = sorted((first_x, second_x))
         y_low, y_high = sorted((first_y, second_y))
         return x_low, y_low, x_high, y_high
@@ -733,6 +759,34 @@ class ImageViewportTransform:
             (visible_left, visible_top, visible_right, visible_bottom)
         )
 
+    def clipped_full_bounds_for_visible_bounds(
+        self,
+        bounds: NormalizedRectangle,
+    ) -> NormalizedRectangle | None:
+        """Project a visible drag onto source data, or return no Area.
+
+        Visible axes may contain background after square padding, zoom-out, or
+        pan.  Rectangle gestures begin in that visible coordinate space, while
+        the retained Figure Area must stay in complete-raster ``[0, 1]``
+        coordinates.  This is the single semantic intersection between those
+        spaces; Qt paint code neither clamps nor guesses data bounds.
+        """
+
+        left, top, right, bottom = validate_normalized_rectangle(bounds)
+        full_left, full_top = self.full_point_for_visible_point((left, top))
+        full_right, full_bottom = self.full_point_for_visible_point(
+            (right, bottom)
+        )
+        clipped = (
+            max(0.0, full_left),
+            max(0.0, full_top),
+            min(1.0, full_right),
+            min(1.0, full_bottom),
+        )
+        if clipped[0] >= clipped[2] or clipped[1] >= clipped[3]:
+            return None
+        return validate_normalized_rectangle(clipped)
+
     def clipped_visible_bounds_for_full_bounds(
         self,
         bounds: NormalizedRectangle,
@@ -839,8 +893,8 @@ class ImageViewportTransform:
         when a consumer asks for selected values.
         """
 
-        x_low, y_low, x_high, y_high = (
-            self.coordinate_rectangle_for_normalized_bounds(bounds)
+        x_low, y_low, x_high, y_high = self.coordinate_rectangle_for_full_bounds(
+            bounds
         )
         return Selection(
             (

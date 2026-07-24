@@ -217,12 +217,6 @@ class _BusTimeline:
         object.__setattr__(self, "safe_value", safe)
 
 
-@dataclass(frozen=True)
-class _IndexPlan:
-    digital_rows: int
-    bus_rows: int
-
-
 class _Checkpoint:
     __slots__ = ("_callback", "_rows")
 
@@ -577,10 +571,10 @@ def build_physical_waveform_index(
         raise TypeError("ir must be TargetIR")
     callback = _callback(checkpoint, "checkpoint")
     callback()
-    plan = _index_plan(ir, checkpoint=callback)
+    digital_rows = _digital_index_row_count(ir, checkpoint=callback)
 
-    digital_ticks_mutable = np.empty(plan.digital_rows, dtype=_U64)
-    digital_masks_mutable = np.empty(plan.digital_rows, dtype=_U64)
+    digital_ticks_mutable = np.empty(digital_rows, dtype=_U64)
+    digital_masks_mutable = np.empty(digital_rows, dtype=_U64)
     terminal_tick = 0
     written = 0
     counter = _Checkpoint(callback)
@@ -589,7 +583,7 @@ def build_physical_waveform_index(
         digital_masks_mutable[written] = mask
         terminal_tick = tick
         written += 1
-    if written != plan.digital_rows:
+    if written != digital_rows:
         raise RuntimeError("physical digital counting/build passes diverged")
     digital_ticks = _freeze_u64(digital_ticks_mutable)
     digital_masks = _freeze_u64(digital_masks_mutable)
@@ -672,11 +666,11 @@ def build_physical_waveform_index(
     )
 
 
-def _index_plan(
+def _digital_index_row_count(
     ir: TargetIR,
     *,
     checkpoint: Callable[[], None] | None,
-) -> _IndexPlan:
+) -> int:
     _validate_supported_domain(ir)
     counter = _Checkpoint(checkpoint)
     counter.boundary()
@@ -684,11 +678,8 @@ def _index_plan(
         ir,
         checkpoint=counter.boundary,
     )
-    points = len(ir.scan_points) if ir.scan_points else 1
-    driven_buses = len({item.bus_index for item in ir.bus_segments})
-    bus_rows = points * len(ir.bus_segments) + driven_buses
     counter.boundary()
-    return _IndexPlan(digital_rows, bus_rows)
+    return digital_rows
 
 
 def _validate_supported_domain(ir: TargetIR) -> None:

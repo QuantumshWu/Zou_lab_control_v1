@@ -41,7 +41,7 @@ from zlc_frontend import RELIM_PARAM as _RELIM_PARAM
 from zlc_frontend.render_style import panel_display_size
 from zlc_storage.paths import display_path
 from .layout_repository import task_files_dir as _task_files_dir
-from .measurement_panel import MeasurementPanel
+from .logic_node_parameter_panel import LogicNodeParameterPanel
 
 
 FORM_WIDGET_HANDLERS = _qt_widgets.FORM_WIDGET_HANDLERS
@@ -130,11 +130,17 @@ class PanelEditor(QtWidgets.QWidget):
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = FluentScrollArea()
-        outer.addWidget(scroll)
+        self._scroll = FluentScrollArea()
+        outer.addWidget(self._scroll)
+        # Build the complete Edit page off-tree, then attach it atomically.
+        # Setting-row helpers deliberately return ordinary QWidget values;
+        # inserting them one by one into an already-visible scroll viewport can
+        # deliver a top-level Show event in the short interval before Qt reparents
+        # them.  That was the visible "small boxes" flash on Edit.  The model and
+        # handlers are shared with Setting, but each surface owns a stable widget
+        # tree from birth to teardown.
         page = QtWidgets.QWidget()
         page.setStyleSheet("background: transparent;")
-        scroll.set_width_bounded_widget(page)
         col = QtWidgets.QVBoxLayout(page)
         margin = scaled_px(10, minimum=6)
         col.setContentsMargins(margin, margin, margin, margin)
@@ -177,12 +183,12 @@ class PanelEditor(QtWidgets.QWidget):
                        if self._source_row is not None else None)
         if source_spec is not None:
             section("Source: %s" % source_spec.name)
-            self.source_form = MeasurementPanel(
+            self.source_form = LogicNodeParameterPanel(
                 [source_spec],
+                parent=page,
                 single=True,
                 controls=False,
                 runtime=console.form_runtime_for_logic(self._source_row),
-                pulse_template_reader=console._pulse_template_reader,
             )
             self.source_form.seed_values(self._source_row.node.values or {})
             col.addWidget(self.source_form)
@@ -198,12 +204,18 @@ class PanelEditor(QtWidgets.QWidget):
         # ---- Display: the same view knobs the Setting popup renders, through the card's
         # SHARED row emitter and writing the SAME config.params through the card's one
         # writer -- the two surfaces are views of one state and cannot drift.
-        self.ed_cmap = self.ed_relim = self.ed_unit_button = self.ed_fixed_row = None
+        self.ed_cmap = self.ed_relim = self.ed_unit_label = self.ed_fixed_row = None
         self.ed_fixed_lo = self.ed_fixed_hi = None
         self.ed_params = {}
         section("Display")
         display_specs = list(_panel_param_decls(card.config.kind)) + [_RELIM_PARAM]
-        self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, label_w)
+        self.ed_params = card._emit_param_rows(
+            display_specs,
+            col.addWidget,
+            self._edit_param,
+            label_w,
+            parent=page,
+        )
         card._mount_grid_row_inventory(
             self,
             col.addWidget,
@@ -211,10 +223,12 @@ class PanelEditor(QtWidgets.QWidget):
             param_apply=self._edit_param,
             label_w=label_w,
             form_widgets=self.ed_params,
+            parent=page,
         )
         self.repeat_mode_row, self.repeat_mode_combo = card._make_repeat_mode_row(
             self._edit_repeat_mode,
             label_w,
+            parent=page,
         )
         col.addWidget(self.repeat_mode_row)
         self.ed_cmap = self.ed_params.get("colormap")
@@ -223,14 +237,19 @@ class PanelEditor(QtWidgets.QWidget):
         # Limits; a second fixed lo/hi here would put two inputs on one source.
         if card.config.kind not in ("2d", "sites"):
             self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = card._make_fixed_lim_row(
-                self._edit_fixed_lim, label_w)
+                self._edit_fixed_lim,
+                label_w,
+                parent=page,
+            )
             col.addWidget(self.ed_fixed_row)
             # The row stays PERMANENTLY in the layout; only its inputs enable in fixed
             # mode.  A visibility toggle above the snapshot reflowed everything below it
             # by the row's height on every relim change -- the reported Edit-tab jump.
             self._sync_fixed_lim_enabled(card._relim())
-        unit_row, self.ed_unit_button, _ = card._make_unit_cycle_row(
-            self._edit_unit_cycle, label_w, with_label=False)
+        unit_row, self.ed_unit_label = card._make_unit_readout_row(
+            label_w,
+            parent=page,
+        )
         col.addWidget(unit_row)
 
         # ---- Processing: the frozen snapshot and its Refresh.
@@ -248,7 +267,10 @@ class PanelEditor(QtWidgets.QWidget):
 
         if card._fit_capable_kind():
             section("Fit")
-            self._fit_pane = card.make_fit_authoring_pane(page)
+            self._fit_pane = card.make_fit_authoring_pane(
+                page,
+                label_width=label_w,
+            )
             col.addWidget(self._fit_pane)
 
         # ---- Limits: the view-window pins.  A box holds the STORED pin (empty =
@@ -335,6 +357,9 @@ class PanelEditor(QtWidgets.QWidget):
         self.status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         col.addWidget(self.status)
         col.addStretch(1)
+
+        # Publish the fully constructed subtree in one ownership transition.
+        self._scroll.set_width_bounded_widget(page)
 
         # The host is permanent Edit chrome, even before the source has data.
         # TaskConsole supplies the tab stack as parent before construction, so
@@ -438,11 +463,10 @@ class PanelEditor(QtWidgets.QWidget):
         board.hide()
         shutdown = getattr(board, "shutdown", None)
         if callable(shutdown):
-            board.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
             shutdown()
-        else:
-            board.setParent(None)
-            board.deleteLater()
+        # Keep the host parented until deferred deletion.  Reparenting a QWidget
+        # to None makes it a transient top-level and can flash a second figure.
+        board.deleteLater()
 
     def _sync_snapshot_selectors(self, enabled: bool) -> None:
         if self._board is not None:
@@ -481,6 +505,7 @@ class PanelEditor(QtWidgets.QWidget):
         self.card._return_to_grid_overview()
 
     def _on_card_front_presented(self) -> None:
+        self._refresh_unit_readout()
         if not self._follow_next_front:
             return
         self._follow_next_front = False
@@ -569,9 +594,9 @@ class PanelEditor(QtWidgets.QWidget):
         self._follow_next_front = True
         self.card.apply_fixed_lims(lo, hi)
 
-    def _edit_unit_cycle(self) -> None:
-        if self.card is not None:
-            self.card._on_unit_cycle()
+    def _refresh_unit_readout(self) -> None:
+        if self.card is not None and self.ed_unit_label is not None:
+            self.ed_unit_label.setText(self.card._current_unit_text())
 
     def _commit_title(self) -> None:
         """Commit the Edit tab's local title draft once."""
@@ -614,6 +639,7 @@ class PanelEditor(QtWidgets.QWidget):
         card = self.card
         self._refresh_display_params()
         if card is not None:
+            self._refresh_unit_readout()
             card._sync_fit_authoring_from_presented(prepare_authoring=True)
             card._refresh_grid_control_surface(self)
             card._seed_repeat_mode_control(

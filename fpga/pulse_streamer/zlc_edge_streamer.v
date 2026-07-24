@@ -7,8 +7,9 @@
 // zlc_edge_streamer -- FINAL affine edge-table pulse streamer engine.
 //
 // Global edge-table playback with:
-//   * edge + scan tables in BLOCK RAM (thousands of edges + unbounded scan
-//     points); bus segment tables in LUTRAM (the bus/ramp engine reads them
+//   * edge + scan tables in BLOCK RAM (thousands of edges + a two-bank scan
+//     protocol; the qualified host uses the resident window); bus segment
+//     tables in LUTRAM (the bus/ramp engine reads them
 //     combinationally every tick, so they MUST stay async-read).
 //   * a depth-FIFO_DEPTH continuous PREFETCH of the next edges (one BRAM read per
 //     cycle, RD_LAT+1-cycle issue-to-data latency) + FIFO_DEPTH(=RD_LAT+2) edge SHADOWS
@@ -16,17 +17,14 @@
 //     (start / loop-rewind / scan-advance / repeat) reseed instantly and
 //     back-to-back **1-tick (20 ns) edges** play one per cycle.
 //   * a 2-bank PING-PONG scan window: the engine plays scan point 0..N-1,
-//     addressing bank (idx/BANK_SIZE)%2; the host refills the bank it just left
-//     (cursor + bank_ready handshake), so total scan points are UNBOUNDED.  A
-//     not-yet-refilled bank STALLS the engine (holds, flags STATUS underflow) --
-//     never emits a wrong point.
+//     addressing bank (idx/BANK_SIZE)%2.  The current host preloads both banks;
+//     refill handshakes remain available for later qualification.  A not-ready
+//     bank STALLS the engine and flags STATUS underflow rather than emitting a
+//     wrong point.
 //
 // PROVEN PRE-HARDWARE: this module's exact register transfers are mirrored
-// cycle-for-cycle by engine_model.rtl_mirror_play, which is byte-identical to
-// the combinatorial reference_play for every program shape (1-tick spacing
-// included) at read latency 1, 2 AND 3, over hand cases (b2b1/scan1tick/
-// loop1tick) + 400 fuzz programs.  The streaming ping-pong is proven by
-// streaming_scan_play.  On top of that, the xsim testbenches in sim/ run the
+// cycle-for-cycle by engine_model.rtl_mirror_play for the deployed RD_LAT=2
+// path, including 1-tick spacing and the boundary hand cases.  The xsim testbenches in sim/ run the
 // REAL RTL (and real block-RAM netlists where it matters).  See
 // test_final_engine_model_* / test_edge_streamer_rtl_mirror_* / sim/README.md.
 //
@@ -46,15 +44,13 @@
 // Edge fields are 3 PARALLEL BRAMs read in lockstep (tick / coeffs / mask) so a
 // whole edge arrives per access with no width padding; scan is one BRAM.
 //
-// OUTPUT DELAY -- a per-signal EVENT SCHEDULER (TTL channels AND DAC bits, same mechanism):
-//   when the undelayed level toggles at tick t the engine pushes {t + d - 1, level} into that
-//   signal's small event FIFO and pops it against a free-running global counter, so
-//   out_delayed[t] = out_undelayed[t-d].  Storage scales with TOGGLES IN FLIGHT (TTL <= EVT_DEPTH,
-//   each DA bit <= BUS_EVT_DEPTH; host-validated), NOT with delay length: the register field is
-//   32-bit (TTL_DELAY_WIDTH); the HOST enforces a conservative default cap of (1<<31)-1 ticks
-//   (~42.9 s at 20 ns), configurable via streamer_config.json ttl_delay_max_ticks.  d=0 is exact
-//   passthrough; d=1 is one register.
-//   Proven cycle-exact by engine_model.rtl_delay_line_mirror / rtl_bus_delay_line_mirror.
+// OUTPUT DELAY -- TTL channels queue value-change events; each DAC bus queues resolved segment
+//   descriptors and replays its ramp stepper after one shared delay.  Both implement
+//   out_delayed[t] = out_undelayed[t-d], but their storage contracts differ: TTL scales with
+//   toggles in flight (<= EVT_DEPTH), DAC with segments in flight per bus (<= BUS_EVT_DEPTH).
+//   Neither scales with delay length.  The 32-bit delay field is host-capped at (1<<31)-1 ticks
+//   (~42.9 s at 20 ns).  d=0 is passthrough; d=1 is one register.  Proven cycle-exact by
+//   engine_model.rtl_delay_line_mirror / rtl_bus_segment_delay_mirror.
 // =============================================================================
 
 module zlc_edge_streamer #(
@@ -63,7 +59,7 @@ module zlc_edge_streamer #(
     parameter integer CHANNEL_COUNT = `ZLC_CHANNEL_COUNT,
     parameter integer EDGE_ADDR_WIDTH = `ZLC_EDGE_ADDR_WIDTH,
     parameter integer SCAN_ADDR_WIDTH = `ZLC_SCAN_ADDR_WIDTH,   // = clog2(2*BANK_SIZE)
-    parameter integer SCAN_COUNT_WIDTH = 32,    // total scan points N (unbounded)
+    parameter integer SCAN_COUNT_WIDTH = 32,    // encoded total N; current host admits resident capacity
     parameter integer BANK_SIZE = `ZLC_BANK_SIZE,               // power of two; points per ping-pong bank
     parameter integer TICK_WIDTH = `ZLC_TICK_WIDTH,
     parameter integer NUM_SLOTS = `ZLC_NUM_SLOTS,
@@ -311,8 +307,7 @@ module zlc_edge_streamer #(
     reg [TICK_WIDTH+BUS_WIDTH:0] bus_ramp_accum [0:BUS_COUNT-1];
 
     // ----- per-bus SEGMENT-DESCRIPTOR delay capture (raised by zlc_bus_apply_segment) -------------
-    // The DAC delay is now INSTRUCTION-LEVEL: instead of the old per-DA-bit value-change FIFO
-    // (g_busdly, which buffered ~span events per delayed ramp), each RESOLVED segment the engine
+    // DAC delay is INSTRUCTION-LEVEL: each RESOLVED segment the engine
     // applies is captured as ONE descriptor and RE-RUN d ticks later by a per-bus delayed player
     // (g_busseg below), so buffer depth = segments-in-flight, INDEPENDENT of ramp density.  The apply
     // task pulses bus_seg_push[i] with the resolved descriptor in the DELAYED time base (emit = g_time
@@ -339,10 +334,7 @@ module zlc_edge_streamer #(
     // counter instead of shifting one bit per tick, so the TTL delay range is the 32b
     // TTL_DELAY_WIDTH register field (host-capped at a conservative default of (1<<31)-1 ticks
     // ~ 42.9 s, streamer_config.json ttl_delay_max_ticks) at a fraction of the old SRL cost.
-    // DAC: each DA BIT is now its OWN 1-bit EVENT-SCHEDULER channel, exactly like a TTL output
-    // (the earlier per-tick delay buffer is gone -- it capped d at a fixed ring depth and could
-    // not match the TTL 32-bit range, so a negative TTL delay's global shift G could push a bus
-    // past that cap and get rejected).  The DAC delay is now INSTRUCTION-LEVEL: each bus has a
+    // DAC delay is INSTRUCTION-LEVEL: each bus has a
     // per-bus SEGMENT-DESCRIPTOR FIFO (g_busseg below, BUS_EVT_DEPTH deep) + a delayed re-player;
     // the 10 bits of a bus SHARE the one per-bus d (del_bus_ticks[bus]), so the whole DAC value
     // shifts coherently, and buffer depth = segments-in-flight (density-independent).
@@ -378,7 +370,7 @@ module zlc_edge_streamer #(
     // FF + 256:1 read muxes and does not fit.  Per-slot 2D arrays each map to one simple-
     // dual-port LUTRAM (1 sync write @wr + 1 async read @rd).
     localparam integer EVT_ADDR = $clog2(EVT_DEPTH);
-    localparam integer BEVT_ADDR = $clog2(BUS_EVT_DEPTH);   // DA-bit FIFO address width
+    localparam integer BEVT_ADDR = $clog2(BUS_EVT_DEPTH);   // per-bus segment FIFO address width
     // Each slot drives ONLY its one owned channel bit (obit << evt_ch_of(slot)); evt_out is
     // their OR, so un-served channels read 0 (the un-driven / before-first-event level).
     wire [CHANNEL_COUNT-1:0] evt_out_contrib [0:NUM_DELAY_CH-1];
@@ -460,8 +452,7 @@ module zlc_edge_streamer #(
     assign out = (state_mask & ~delayed_mask) | delayed_out;
 
     // ----- per-bus SEGMENT-DESCRIPTOR OUTPUT delay (g_busseg) -- INSTRUCTION LEVEL ---------------
-    // bus_out[t] = bus_value_active[t - d_bus].  Instead of the old per-DA-bit value-change FIFO
-    // (one event per Bresenham step => ~span events per delayed ramp), the engine captures each
+    // bus_out[t] = bus_value_active[t - d_bus].  The engine captures each
     // RESOLVED segment it applies (bus_seg_* above) and a DELAYED RE-PLAYER re-runs the SAME ramp
     // stepper d ticks later.  So a delayed ramp costs ONE descriptor, not ~span events -- buffer
     // depth = segments-in-flight, INDEPENDENT of ramp density (a large POSITIVE delay on a dense

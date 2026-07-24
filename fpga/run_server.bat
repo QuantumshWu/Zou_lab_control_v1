@@ -76,7 +76,7 @@ echo Geometry/clock: fpga\board_config\streamer_config.json
 echo Bitstream policy: frozen; this launcher never synthesizes or programs hardware
 
 if "%ZLC_CHECK_ONLY%"=="1" (
-  %ZLC_PY_CMD% -c "from fpga.pulse_streamer.host.image import default_clock_hz,default_params,build_fingerprint; from zlc_pulse import load_pulse_target,pulse_target_manifest_from_xdc; from zlc_pulse.server_app import validate_deployed_target; t=load_pulse_target(r'%ZLC_PS_TARGET%'); m=pulse_target_manifest_from_xdc(t,r'%ZLC_PS_XDC%'); p=default_params(); validate_deployed_target(t,p); print('Target ABI:',t.abi_fingerprint); print('Published ports:',len(m.ports)); print('Raw lanes:',len(t.raw_lanes)); print('Clock Hz:',default_clock_hz()); print('Geometry fingerprint: 0x%%08X'%%build_fingerprint(p))"
+  %ZLC_PY_CMD% -c "from fpga.pulse_streamer.host.image import build_fingerprint; from zlc_pulse import load_pulse_target,pulse_target_manifest_from_xdc; from zlc_pulse.server_app import load_deployed_streamer_config,validate_deployed_target; t=load_pulse_target(r'%ZLC_PS_TARGET%'); m=pulse_target_manifest_from_xdc(t,r'%ZLC_PS_XDC%'); p,c,s=load_deployed_streamer_config(); validate_deployed_target(t,p); print('Target ABI:',t.abi_fingerprint); print('Published ports:',len(m.ports)); print('Raw lanes:',len(t.raw_lanes)); print('Clock Hz:',c); print('Geometry:',s); print('Geometry fingerprint:',hex(build_fingerprint(p)))"
   set "ZLC_STATUS=!ERRORLEVEL!"
   popd
   endlocal & exit /b !ZLC_STATUS!
@@ -133,6 +133,14 @@ if defined ZLC_FPGA_SERVER_PYTHON (
     set "ZLC_PY_CMD=%ZLC_FPGA_SERVER_PYTHON%"
   )
   goto zlc_python_found
+)
+if exist "%REPO_ROOT%\.zlc_python_path" (
+  set /p "ZLC_STORED_PY="<"%REPO_ROOT%\.zlc_python_path"
+  if exist "!ZLC_STORED_PY!" (
+    set "ZLC_PY_CMD=call "!ZLC_STORED_PY!""
+    goto zlc_python_found
+  )
+  echo Ignoring stale .zlc_python_path: !ZLC_STORED_PY!
 )
 where python >nul 2>nul
 if not errorlevel 1 set "ZLC_PY_CMD=python"

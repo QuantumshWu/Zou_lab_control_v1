@@ -2,7 +2,7 @@
 // DEFINITIVE: real zlc_edge_streamer + REAL tick & mask IP BRAMs (true synthesized latency),
 // preloaded with the user's EXACT uploaded edge table (scaled /500), then FIRE and watch emCCD.
 module tb_real_engine;
-  localparam integer CH=62, EAW=12, TW=32, NS=4, CW=16, DTW=12, BUSC=4, BW=10;
+  localparam integer CH=62, EAW=12, TW=32, NS=4, CW=16, DTW=32, BUSC=4, BW=10;
   reg clk=0, reset=0, start=0; always #10 clk=~clk;   // 50MHz
 
   reg [12:0] wa=0; reg [31:0] wd=0; reg [3:0] we=0; reg wen_t=0, wen_m=0;

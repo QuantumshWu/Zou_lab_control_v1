@@ -8,8 +8,6 @@ import math
 from numbers import Integral
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 from zlc_data import (
     DatasetSchema,
     FitResultBatch,
@@ -30,7 +28,6 @@ from .figure import (
     EvaluatedHistogram,
     EvaluatedImage,
     EvaluatedLayer,
-    EvaluatedMeter,
     FigureDocument,
     FigureEvaluator,
     FigureLayer,
@@ -116,8 +113,8 @@ def _validated_fit_result_mapping(
     source_schemas: tuple[tuple[DatasetId, DatasetSchema], ...],
     fit_results: Mapping[str, FitResultBatch] | None,
     *,
-    source_bindings_validated: bool = False,
-    selection_views_validated: bool = False,
+    source_refs=(),
+    source_and_view_validated: bool = False,
 ) -> tuple[tuple[str, FitResultBatch], ...]:
     """Validate overlays entirely from frozen schema/ref/evaluation facts."""
 
@@ -126,14 +123,19 @@ def _validated_fit_result_mapping(
         raise TypeError("fit_results keys must be non-empty layer ids")
     if any(not isinstance(value, FitResultBatch) for value in supplied.values()):
         raise TypeError("fit_results values must be FitResultBatch")
-    if (
+    if evaluated is not None and (
         document.document_id != evaluated.document_id
         or document.revision != evaluated.document_revision
     ):
         raise ValueError("document and evaluated data identities differ")
 
     layers = {layer.layer_id: layer for layer in document.layers}
-    evaluated_inputs = {item.dataset_id: item for item in evaluated.inputs}
+    evaluated_inputs = (
+        {}
+        if evaluated is None
+        else {item.dataset_id: item for item in evaluated.inputs}
+    )
+    refs = dict(source_refs)
     schemas = dict(source_schemas)
     fit_layers = {}
     for layer_id, result in supplied.items():
@@ -144,14 +146,17 @@ def _validated_fit_result_mapping(
                 f"fit overlay references unknown layer {layer_id!r}"
             ) from exc
         try:
-            evaluated_input = evaluated_inputs[layer.dataset_id]
             source_schema = schemas[layer.dataset_id]
+            source_ref = (
+                refs[layer.dataset_id]
+                if evaluated is None
+                else evaluated_inputs[layer.dataset_id].ref
+            )
         except KeyError as exc:
             raise ValueError("fit layer source metadata is absent") from exc
-        if (
-            result.spec.committed_transform is not None
-            and not selection_views_validated
-        ):
+        if not source_and_view_validated:
+            validate_fit_result_source_binding(result, source_ref, source_schema)
+        if result.spec.committed_transform is not None and not source_and_view_validated:
             try:
                 _validate_selection_fit_view(
                     source_schema,
@@ -163,13 +168,10 @@ def _validated_fit_result_mapping(
                     "transformed fit overlay is not faithfully displayable: "
                     f"{exc}"
                 ) from exc
-        if not source_bindings_validated:
-            validate_fit_result_source_binding(
-                result,
-                evaluated_input.ref,
-                source_schema,
-            )
         fit_layers[layer_id] = (layer, result)
+
+    if evaluated is None:
+        return tuple(sorted(supplied.items()))
 
     allowed_batch_roles = {
         AxisViewRole.BATCH,
@@ -209,42 +211,6 @@ def _validated_fit_result_mapping(
     return tuple(sorted(supplied.items()))
 
 
-def _validate_fit_result_sources_before_evaluation(
-    document: FigureDocument,
-    source_refs,
-    source_schemas: tuple[tuple[DatasetId, DatasetSchema], ...],
-    fit_results: Mapping[str, FitResultBatch] | None,
-) -> None:
-    """Validate sparse source lineage before Figure evaluation."""
-
-    supplied = {} if fit_results is None else dict(fit_results)
-    if not supplied:
-        return
-    layers = {layer.layer_id: layer for layer in document.layers}
-    refs = dict(source_refs)
-    schemas = dict(source_schemas)
-    for layer_id, result in supplied.items():
-        if not isinstance(layer_id, str) or not layer_id:
-            raise TypeError("fit_results keys must be non-empty layer ids")
-        if not isinstance(result, FitResultBatch):
-            raise TypeError("fit_results values must be FitResultBatch")
-        try:
-            layer = layers[layer_id]
-            source_ref = refs[layer.dataset_id]
-            source_schema = schemas[layer.dataset_id]
-        except KeyError as exc:
-            raise ValueError("fit layer source metadata is absent") from exc
-        validate_fit_result_source_binding(result, source_ref, source_schema)
-        if result.spec.committed_transform is not None:
-            try:
-                _validate_selection_fit_view(source_schema, result, layer.view)
-            except ValueError as exc:
-                raise ValueError(
-                    "transformed fit overlay is not faithfully displayable: "
-                    f"{exc}"
-                ) from exc
-
-
 class DataFigure:
     """Own one immutable, already-resolved notebook figure.
 
@@ -274,25 +240,22 @@ class DataFigure:
             raise TypeError("document must be FigureDocument")
         if not isinstance(datasets, ResolvedDatasetMap):
             raise TypeError("datasets must be ResolvedDatasetMap")
-        source_schemas = tuple(
-            (
-                descriptor.dataset_id,
-                datasets.resolve(descriptor.dataset_id).block.schema,
-            )
+        sources = tuple(
+            (descriptor.dataset_id, datasets.resolve(descriptor.dataset_id))
             for descriptor in document.datasets
         )
-
-        _validate_fit_result_sources_before_evaluation(
+        source_schemas = tuple(
+            (dataset_id, snapshot.block.schema) for dataset_id, snapshot in sources
+        )
+        source_refs = tuple(
+            (dataset_id, snapshot.ref) for dataset_id, snapshot in sources
+        )
+        _validated_fit_result_mapping(
             document,
-            tuple(
-                (
-                    descriptor.dataset_id,
-                    datasets.resolve(descriptor.dataset_id).ref,
-                )
-                for descriptor in document.datasets
-            ),
+            None,
             source_schemas,
             fit_results,
+            source_refs=source_refs,
         )
         evaluated = FigureEvaluator().evaluate(document, datasets)
         validated_fit_results = _validated_fit_result_mapping(
@@ -300,8 +263,7 @@ class DataFigure:
             evaluated,
             source_schemas,
             fit_results,
-            source_bindings_validated=True,
-            selection_views_validated=True,
+            source_and_view_validated=True,
         )
 
         self._datasets = datasets
@@ -351,19 +313,22 @@ class DataFigure:
         authority becomes reachable through ``DataFigure``.
         """
 
-        _validate_fit_result_sources_before_evaluation(
+        source_refs = tuple(
+            (item.dataset_id, item.ref) for item in self._evaluated.inputs
+        )
+        _validated_fit_result_mapping(
             self._document,
-            tuple((item.dataset_id, item.ref) for item in self._evaluated.inputs),
+            None,
             self._source_schemas,
             fit_results,
+            source_refs=source_refs,
         )
         validated = _validated_fit_result_mapping(
             self._document,
             self._evaluated,
             self._source_schemas,
             fit_results,
-            source_bindings_validated=True,
-            selection_views_validated=True,
+            source_and_view_validated=True,
         )
         clone = object.__new__(type(self))
         clone._datasets = self._datasets
@@ -394,8 +359,6 @@ class DataFigure:
             raise ValueError(
                 "focused typed panels currently support CURVE, HISTOGRAM, or IMAGE"
             )
-        if self._fit_results:
-            raise ValueError("focused typed display does not accept fit overlays")
         if (
             len(self._document.layers) != 1
             or len(self._evaluated.layers) != 1
@@ -560,7 +523,11 @@ class DataFigure:
         clone._datasets = self._datasets
         clone._document = focused_document
         clone._evaluated = focused_evaluated
-        clone._fit_results = ()
+        # A focused panel is a display-only projection of the same immutable
+        # Figure, not a new Fit result.  Retain the exact result owner so
+        # the focused typed host can resolve the matching batch row from the
+        # fixed resolutions above; never recompute or slice the Fit result.
+        clone._fit_results = self._fit_results
         clone._source_schemas = source_schemas
         return clone
 
@@ -727,7 +694,10 @@ class DataFigure:
 
         from .fit_image_projection import radial_gaussian_image_fit_panels
 
-        result = self._fit_result_for_layer(layer_id)
+        resolved_layer_id = canonical_text(layer_id, "fit layer_id")
+        result = dict(self._fit_results).get(resolved_layer_id)
+        if result is None:
+            raise ValueError(f"layer {resolved_layer_id!r} has no saved fit result")
 
         return radial_gaussian_image_fit_panels(
             self._document,
@@ -736,13 +706,6 @@ class DataFigure:
             layer_id,
             artifact_identity=artifact_identity,
         )
-
-    def _fit_result_for_layer(self, layer_id: str) -> FitResultBatch:
-        resolved = canonical_text(layer_id, "fit layer_id")
-        for candidate, result in self._fit_results:
-            if candidate == resolved:
-                return result
-        raise ValueError(f"layer {resolved!r} has no saved fit result")
 
     def single_panel_curve_fit_overlay_plan(
         self,

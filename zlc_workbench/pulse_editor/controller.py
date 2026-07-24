@@ -17,14 +17,14 @@ import threading
 from typing import Callable, Protocol
 from uuid import uuid4
 
-from zlc_neutral_atom.pulse_application import (
+from zlc_neutral_atom.devices.sequencer.application import (
     AppliedPulseSnapshot,
     PulseRunObservation,
     PulseRunRequest,
     PulseTargetDescriptor,
 )
 from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot
-from zlc_neutral_atom.timing.pulse import PulseScanProgress
+from zlc_neutral_atom.devices.sequencer.port import PulseScanProgress
 from zlc_pulse import (
     FIELD_DAC,
     FIELD_DELAY,
@@ -747,17 +747,12 @@ class PulseEditorController:
     def set_scan_sweep_count(self, count: int) -> int | None:
         """Commit the saved operator default; runtime remains request-explicit."""
 
-        if isinstance(count, bool) or not isinstance(count, int):
-            raise TypeError("scan sweep count must be an integer")
-        if count < 0:
-            raise ValueError("scan sweep count must be non-negative")
         document = self._editor.document
-        if count == document.scan_sweep_count:
+        candidate = replace(document, scan_sweep_count=count)
+        if candidate == document:
             return None
         base_revision = self._editor.revision
-        revision = self.replace_document(
-            replace(document, scan_sweep_count=count)
-        )
+        revision = self.replace_document(candidate)
         return revision if revision != base_revision else None
 
     def rename_period(
@@ -872,7 +867,7 @@ class PulseEditorController:
         self,
         port: str,
         value: int | float | None,
-        unit: str = "ns",
+        unit: str,
         *,
         cascade: bool = False,
     ) -> int | None:
@@ -951,14 +946,21 @@ class PulseEditorController:
         self,
         *,
         before_period_id: str | None = None,
-        duration: int | float = 1000,
-        unit: str = "ns",
+        duration: int | float | None = None,
+        unit: str | None = None,
         name: str = "",
         cascade: bool = False,
     ) -> int:
         document = self._editor.document
         base_revision = self._editor.revision
-        period = new_period(document, duration=duration, unit=unit, name=name)
+        period_options: dict[str, object] = {}
+        if duration is not None:
+            period_options["duration"] = duration
+        if unit is not None:
+            period_options["unit"] = unit
+        if name:
+            period_options["name"] = name
+        period = new_period(document, **period_options)
         result = insert_period(
             document,
             period=period,

@@ -1,4 +1,4 @@
-"""Bounded exact acquisition streams and non-blocking monitor taps."""
+"""Exact acquisition streams and ordered monitor taps."""
 
 from __future__ import annotations
 
@@ -688,19 +688,7 @@ class SchemaChanged(StreamError):
         )
 
 
-class StreamBackpressure(StreamError):
-    pass
-
-
-class RetentionOverrun(StreamError):
-    pass
-
-
 class SourceFailed(StreamError):
-    pass
-
-
-class ReservationCapacityExceeded(StreamError):
     pass
 
 
@@ -716,16 +704,6 @@ class ReservationState(str, Enum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     RELEASED = "RELEASED"
-
-
-class ProducerFlowControl(str, Enum):
-    BACKPRESSURE_CAPABLE = "BACKPRESSURE_CAPABLE"
-    NON_BACKPRESSURE_CAPTURED = "NON_BACKPRESSURE_CAPTURED"
-
-
-@dataclass(frozen=True)
-class _Stored(Generic[PayloadT]):
-    envelope: Envelope[PayloadT]
 
 
 class Delivery(Generic[PayloadT]):
@@ -770,7 +748,7 @@ class Delivery(Generic[PayloadT]):
 
 
 class ExactReservation(Generic[PayloadT]):
-    """One finite retention claim; acknowledgement is its only moving watermark."""
+    """One finite exact claim; acknowledgement is its only moving watermark."""
 
     def __init__(
         self,
@@ -780,7 +758,6 @@ class ExactReservation(Generic[PayloadT]):
         token: object,
         start_sequence: int,
         end_sequence: int,
-        max_inflight_events: int,
         trace_binding: TraceBinding,
     ) -> None:
         if authority is not _RESERVATION_TOKEN:
@@ -789,7 +766,6 @@ class ExactReservation(Generic[PayloadT]):
         self._token = token
         self.start_sequence = start_sequence
         self.end_sequence = end_sequence
-        self.max_inflight_events = max_inflight_events
         self.trace_binding = trace_binding
         self._ack_sequence = start_sequence
         self._state = ReservationState.RESERVED
@@ -813,6 +789,18 @@ class ExactReservation(Generic[PayloadT]):
         with self._stream._condition:
             return self._consumer_owner is not None
 
+    @property
+    def stream_id(self) -> StreamId:
+        """Stable identity of the stream generation covered by this authority."""
+
+        return self._stream.stream_id
+
+    @property
+    def stream_generation(self) -> StreamGenerationId:
+        """Generation identity paired with :attr:`stream_id`."""
+
+        return self._stream.generation
+
     def activate(self) -> "AcquisitionCursor[PayloadT]":
         with self._stream._condition:
             if self._state is not ReservationState.RESERVED:
@@ -826,6 +814,99 @@ class ExactReservation(Generic[PayloadT]):
                 reservation_token=self._token,
             )
             return self._cursor
+
+    def bind_consumer(
+        self,
+        consumer: object,
+        *,
+        source_contract_digest: str,
+        source_schedule_digest: str,
+        source_key_sequence_digest: str,
+        chain_contract_digest: str,
+        terminal: bool = False,
+        downstream: "ExactConsumerReadiness | None" = None,
+        owner_liveness: Callable[[], None] | None = None,
+        owner_completion: Callable[[float], object] | None = None,
+        owner_cancel: Callable[[str | None], bool] | None = None,
+        processor_stage: ProcessorStageProvenance | None = None,
+    ) -> "ExactConsumerReadiness":
+        """Bind this authority to its sole formal consumer.
+
+        Domain consumers operate through the reservation they were given; the
+        backing ``AcquisitionStream`` and its lock-level methods remain private
+        implementation details of this module.
+        """
+
+        return self._stream._claim_consumer(
+            self,
+            consumer,
+            source_contract_digest=source_contract_digest,
+            source_schedule_digest=source_schedule_digest,
+            source_key_sequence_digest=source_key_sequence_digest,
+            chain_contract_digest=chain_contract_digest,
+            terminal=terminal,
+            downstream=downstream,
+            owner_liveness=owner_liveness,
+            owner_completion=owner_completion,
+            owner_cancel=owner_cancel,
+            processor_stage=processor_stage,
+        )
+
+    def validate_delivery(
+        self,
+        delivery: Delivery[PayloadT],
+        consumer: object,
+    ) -> None:
+        """Validate one unacknowledged delivery for the bound consumer."""
+
+        self._stream._validate_consumer_delivery(self, delivery, consumer)
+
+    def acknowledge_delivery(
+        self,
+        delivery: Delivery[PayloadT],
+        consumer: object,
+    ) -> None:
+        """Advance this exact watermark for one validated delivery."""
+
+        self._stream._ack_consumer(self, delivery, consumer)
+
+    def validate_completion(
+        self,
+        eos: EndOfStream,
+        consumer: object,
+    ) -> None:
+        """Validate the source terminal receipt without changing state."""
+
+        self._stream._validate_consumer_completion(self, eos, consumer)
+
+    def complete_consumer(
+        self,
+        eos: EndOfStream,
+        consumer: object,
+    ) -> None:
+        """Complete this reservation from its bound consumer's terminal receipt."""
+
+        self._stream._complete_consumer(
+            self,
+            eos,
+            consumer,
+            lambda: None,
+        )
+
+    def abort_consumer(
+        self,
+        consumer: object,
+        *,
+        cancelled: bool = False,
+    ) -> None:
+        """Abort this reservation through its bound consumer authority."""
+
+        self._stream._abort_consumer(
+            self,
+            consumer,
+            lambda: None,
+            cancelled=cancelled,
+        )
 
     def complete(self) -> None:
         with self._stream._condition:
@@ -1304,7 +1385,7 @@ class AcquisitionCursor(Generic[PayloadT]):
                     self._inflight = Delivery(
                         _DELIVERY_TOKEN,
                         cursor=self,
-                        envelope=stored.envelope,
+                        envelope=stored,
                     )
                     return self._inflight
                 if self._next_sequence < self._stream._next_sequence:
@@ -1358,7 +1439,7 @@ class AcquisitionCursor(Generic[PayloadT]):
 
 @dataclass(frozen=True, slots=True)
 class MonitorUpdate(Generic[PayloadT]):
-    """One atomic delivery from a concrete tap, including local overwrite loss."""
+    """One atomic monitor delivery and any explicit ``latest()`` skips."""
 
     envelope: Envelope[PayloadT]
     missed: int
@@ -1370,35 +1451,29 @@ class MonitorUpdate(Generic[PayloadT]):
 
 
 class MonitorTap(Generic[PayloadT]):
-    """A bounded overwrite queue which never participates in exact retention."""
+    """An ordered delivery queue independent of exact acknowledgements."""
 
     def __init__(
         self,
         authority: object,
         *,
         stream: "AcquisitionStream[PayloadT]",
-        max_events: int,
     ) -> None:
         if authority is not _MONITOR_TOKEN:
             raise PermissionError("MonitorTap can only be minted by AcquisitionStream")
         self._stream = stream
-        self.max_events = _positive_int(max_events, "monitor max_events")
         self._condition = threading.Condition(threading.Lock())
-        self._queue: deque[_Stored[PayloadT]] = deque()
-        self._missed = 0
+        self._queue: deque[Envelope[PayloadT]] = deque()
         self._closed = False
         self._source_finished = False
         self._terminal_error: StreamError | None = None
         self._consumer_owner: object | None = None
 
-    def _offer(self, stored: _Stored[PayloadT]) -> None:
+    def _offer(self, envelope: Envelope[PayloadT]) -> None:
         with self._condition:
             if self._closed or self._source_finished:
                 return
-            while self._queue and len(self._queue) >= self.max_events:
-                self._queue.popleft()
-                self._missed += 1
-            self._queue.append(stored)
+            self._queue.append(envelope)
             self._condition.notify_all()
 
     def _claim_consumer(self, owner: object) -> None:
@@ -1454,13 +1529,13 @@ class MonitorTap(Generic[PayloadT]):
                     self._condition.wait()
             if self._consumer_owner is not owner:
                 raise PermissionError("monitor tap belongs to another consumer")
+            skipped = 0
             if latest:
-                while len(self._queue) > 1:
+                skipped = len(self._queue) - 1
+                for _ in range(skipped):
                     self._queue.popleft()
-                    self._missed += 1
-            stored = self._queue.popleft()
-            missed, self._missed = self._missed, 0
-            return MonitorUpdate(stored.envelope, missed)
+            envelope = self._queue.popleft()
+            return MonitorUpdate(envelope, skipped)
 
     def next(self, timeout: float | None = None) -> MonitorUpdate[PayloadT]:
         return self._take(None, latest=False, timeout=timeout)
@@ -1536,7 +1611,7 @@ class AcquisitionProducer(Generic[PayloadT]):
 
 
 class AcquisitionStream(Generic[PayloadT]):
-    """One finite generation with shared exact retention and monitor fan-out."""
+    """One generation with acknowledgement-owned records and monitor fan-out."""
 
     def __init__(
         self,
@@ -1545,8 +1620,6 @@ class AcquisitionStream(Generic[PayloadT]):
         stream_id: StreamId,
         generation: StreamGenerationId,
         payload_contract: PayloadContract[PayloadT],
-        flow_control: ProducerFlowControl,
-        retention_events: int,
         join_key_contract: JoinKeyContract | None = None,
     ) -> None:
         if authority is not _STREAM_TOKEN:
@@ -1555,8 +1628,6 @@ class AcquisitionStream(Generic[PayloadT]):
             raise TypeError("stream_id must be StreamId")
         if not isinstance(generation, StreamGenerationId):
             raise TypeError("generation must be StreamGenerationId")
-        if not isinstance(flow_control, ProducerFlowControl):
-            raise TypeError("flow_control must be ProducerFlowControl")
         try:
             payload_contract_fingerprint = payload_contract.fingerprint
         except AttributeError as exc:
@@ -1565,8 +1636,6 @@ class AcquisitionStream(Generic[PayloadT]):
         self.stream_id = stream_id
         self.generation = generation
         self.payload_contract_fingerprint = payload_contract_fingerprint
-        self.flow_control = flow_control
-        self.retention_events = _positive_int(retention_events, "retention_events")
         for method in ("snapshot", "validate", "digest"):
             if not callable(getattr(payload_contract, method, None)):
                 raise TypeError(f"payload_contract.{method} must be callable")
@@ -1577,7 +1646,7 @@ class AcquisitionStream(Generic[PayloadT]):
         self._payload_contract = payload_contract
         self._join_key_contract = join_key_contract
         self._condition = threading.Condition(threading.RLock())
-        self._records: dict[int, _Stored[PayloadT]] = {}
+        self._records: dict[int, Envelope[PayloadT]] = {}
         self._order: deque[int] = deque()
         self._next_sequence = 0
         self._reservations: dict[object, ExactReservation[PayloadT]] = {}
@@ -1602,8 +1671,6 @@ class AcquisitionStream(Generic[PayloadT]):
         stream_id: StreamId,
         payload_contract: PayloadContract[PayloadT],
         *,
-        flow_control: ProducerFlowControl,
-        retention_events: int,
         join_key_contract: JoinKeyContract | None = None,
     ) -> tuple["AcquisitionStream[PayloadT]", AcquisitionProducer[PayloadT]]:
         stream = cls(
@@ -1611,8 +1678,6 @@ class AcquisitionStream(Generic[PayloadT]):
             stream_id=stream_id,
             generation=StreamGenerationId(uuid.uuid4().hex),
             payload_contract=payload_contract,
-            flow_control=flow_control,
-            retention_events=retention_events,
             join_key_contract=join_key_contract,
         )
         producer = stream._producer_owner
@@ -1645,25 +1710,25 @@ class AcquisitionStream(Generic[PayloadT]):
         self,
         *,
         total_events: int,
-        max_inflight_events: int,
         trace_binding: TraceBinding,
     ) -> ExactReservation[PayloadT]:
         total = _positive_int(total_events, "total_events")
-        inflight_events = _positive_int(max_inflight_events, "max_inflight_events")
         if not isinstance(trace_binding, TraceBinding):
             raise TypeError("trace_binding must be TraceBinding")
-        if inflight_events > total:
-            raise ValueError("max_inflight_events cannot exceed total_events")
         with self._condition:
             if self._closed:
                 raise StreamEndedEarly("cannot reserve a closed stream")
             if self._reservations:
-                raise ReservationCapacityExceeded(
+                raise ReservationStateError(
                     "one stream generation has exactly one formal exact consumer"
                 )
             if self._formal_consumer_claimed:
-                raise ReservationCapacityExceeded(
+                raise ReservationStateError(
                     "this stream generation already had its formal exact consumer"
+                )
+            if self._next_sequence != 0:
+                raise ReservationStateError(
+                    "exact reservation must be admitted before the first publication"
                 )
             token = object()
             reservation = ExactReservation(
@@ -1672,7 +1737,6 @@ class AcquisitionStream(Generic[PayloadT]):
                 token=token,
                 start_sequence=self._next_sequence,
                 end_sequence=self._next_sequence + total,
-                max_inflight_events=inflight_events,
                 trace_binding=trace_binding,
             )
             self._reservations[token] = reservation
@@ -1691,11 +1755,10 @@ class AcquisitionStream(Generic[PayloadT]):
                 reservation_token=None,
             )
 
-    def monitor(self, *, max_events: int) -> MonitorTap[PayloadT]:
+    def monitor(self) -> MonitorTap[PayloadT]:
         tap = MonitorTap(
             _MONITOR_TOKEN,
             stream=self,
-            max_events=max_events,
         )
         with self._condition:
             if self._closed:
@@ -1735,6 +1798,7 @@ class AcquisitionStream(Generic[PayloadT]):
                     raise self._terminal_error
                 raise StreamEndedEarly("cannot emit after end-of-stream")
             sequence = self._next_sequence
+            retain_for_exact = False
             if self._formal_consumer_claimed or self._formal_rebind_required:
                 covering = tuple(
                     reservation
@@ -1750,6 +1814,7 @@ class AcquisitionStream(Generic[PayloadT]):
                         "covering the next sequence"
                     )
                 reservation = covering[0]
+                retain_for_exact = True
                 if (
                     self._formal_interval_start != reservation.start_sequence
                     or self._formal_interval_end != reservation.end_sequence
@@ -1794,40 +1859,6 @@ class AcquisitionStream(Generic[PayloadT]):
                 join_key=join_key,
                 join_key_schema_fingerprint=join_key_schema_fingerprint,
             )
-            try:
-                for reservation in self._reservations.values():
-                    if reservation._state not in (
-                        ReservationState.RESERVED,
-                        ReservationState.ACTIVE,
-                        ReservationState.DRAINING,
-                    ):
-                        continue
-                    if not reservation.start_sequence <= sequence < reservation.end_sequence:
-                        continue
-                    unacked_events = sequence - reservation._ack_sequence + 1
-                    if unacked_events > reservation.max_inflight_events:
-                        raise StreamBackpressure(
-                            "exact consumer exceeded its event backlog capacity"
-                        )
-                trim_removals = self._plan_trim_locked(extra_events=1)
-            except StreamBackpressure as error:
-                if self.flow_control is ProducerFlowControl.BACKPRESSURE_CAPABLE:
-                    raise
-                overrun = RetentionOverrun(
-                    "non-backpressure source exceeded frozen record capacity; "
-                    "the generation is permanently invalid"
-                )
-                self._terminal_error = overrun
-                for reservation in self._reservations.values():
-                    if reservation._state in (
-                        ReservationState.RESERVED,
-                        ReservationState.ACTIVE,
-                        ReservationState.DRAINING,
-                    ):
-                        reservation._state = ReservationState.FAILED
-                self._close_generation_locked(overrun)
-                raise overrun from error
-            stored = _Stored(envelope)
             committed_next_sequence = sequence + 1
             # This counter is the first authoritative mutation of publication.
             # Callers with the exclusive producer can therefore use its delta
@@ -1837,9 +1868,9 @@ class AcquisitionStream(Generic[PayloadT]):
             # pre-publication failure.
             try:
                 self._next_sequence = committed_next_sequence
-                self._apply_trim_locked(trim_removals)
-                self._records[sequence] = stored
-                self._order.append(sequence)
+                if retain_for_exact:
+                    self._records[sequence] = envelope
+                    self._order.append(sequence)
                 for reservation in self._reservations.values():
                     if (
                         reservation._state
@@ -1858,12 +1889,12 @@ class AcquisitionStream(Generic[PayloadT]):
                         ):
                             reservation._state = ReservationState.DRAINING
                 for monitor in tuple(self._monitors):
-                    monitor._offer(stored)
+                    monitor._offer(envelope)
                 self._condition.notify_all()
             except BaseException as error:
                 if self._next_sequence == sequence:
-                    # Every fallible preparation step, including the retention
-                    # plan and stored-record allocation, precedes the marker.
+                    # Every fallible envelope-preparation step precedes the
+                    # authoritative sequence marker.
                     # A failure to install the marker therefore leaves the
                     # generation byte-for-byte retryable.
                     raise
@@ -2057,7 +2088,7 @@ class AcquisitionStream(Generic[PayloadT]):
             raise ReservationStateError("Delivery was already acknowledged")
         envelope = delivery.envelope
         stored = self._records.get(envelope.sequence)
-        if stored is None or stored.envelope is not envelope:
+        if stored is not envelope:
             raise PermissionError("Delivery no longer names its retained stream event")
         reservation.trace_binding.validate(envelope.trace)
         return cursor
@@ -2328,7 +2359,7 @@ class AcquisitionStream(Generic[PayloadT]):
     def _earliest_retained_locked(self) -> int:
         return self._order[0] if self._order else self._next_sequence
 
-    def _protected_sequence_locked(self) -> int | None:
+    def _earliest_unacknowledged_sequence_locked(self) -> int | None:
         watermarks = [
             reservation._ack_sequence
             for reservation in self._reservations.values()
@@ -2337,35 +2368,14 @@ class AcquisitionStream(Generic[PayloadT]):
         ]
         return min(watermarks) if watermarks else None
 
-    def _plan_trim_locked(
-        self,
-        *,
-        extra_events: int = 0,
-    ) -> int:
-        protected = self._protected_sequence_locked()
-        prospective_count = len(self._order)
-        removal_count = 0
-        for oldest in self._order:
-            below_protected_watermark = protected is not None and oldest < protected
-            over_capacity = prospective_count + extra_events > self.retention_events
-            if not below_protected_watermark and not over_capacity:
-                break
-            if not below_protected_watermark and protected is not None:
-                raise StreamBackpressure("stream retention is pinned by an unacknowledged exact cursor")
-            prospective_count -= 1
-            removal_count += 1
-        if prospective_count + extra_events > self.retention_events:
-            raise StreamBackpressure("stream event retention capacity is exhausted")
-        return removal_count
-
-    def _apply_trim_locked(self, removal_count: int) -> None:
-        for _ in range(removal_count):
+    def _trim_locked(self) -> None:
+        earliest_unacknowledged = self._earliest_unacknowledged_sequence_locked()
+        while self._order and (
+            earliest_unacknowledged is None
+            or self._order[0] < earliest_unacknowledged
+        ):
             oldest = self._order.popleft()
             self._records.pop(oldest)
-
-    def _trim_locked(self, *, extra_events: int = 0) -> None:
-        removal_count = self._plan_trim_locked(extra_events=extra_events)
-        self._apply_trim_locked(removal_count)
 
 
 __all__ = [
@@ -2392,17 +2402,13 @@ __all__ = [
     "MonitorUpdate",
     "OrderedEventSpanHasher",
     "PayloadContract",
-    "ProducerFlowControl",
     "ProcessorStageProvenance",
     "processor_stage_provenance_from_tree",
     "processor_stage_provenance_to_tree",
-    "ReservationCapacityExceeded",
-    "RetentionOverrun",
     "ReservationState",
     "ReservationStateError",
     "SchemaChanged",
     "SourceFailed",
-    "StreamBackpressure",
     "StreamEndedEarly",
     "StreamError",
     "StreamGap",

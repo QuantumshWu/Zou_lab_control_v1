@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
 
-from zlc_storage import canonical_text as _canonical_text
+from zlc_storage import (
+    RepositoryRootLease,
+    RepositoryRootLeaseBorrow,
+    canonical_text as _canonical_text,
+)
+
+from ._failure import record_secondary_failure
 
 
 def _canonical_segment(value: str, field: str) -> str:
@@ -295,3 +301,56 @@ class ResourceArbiter:
                         f"one run cannot request resource {left.key} twice"
                     )
         return normalized
+
+
+def acquire_repository_borrows(
+    *leases: RepositoryRootLease,
+) -> tuple[RepositoryRootLeaseBorrow, ...]:
+    """Atomically acquire repository holds or roll back the acquired prefix."""
+
+    if any(type(lease) is not RepositoryRootLease for lease in leases):
+        raise TypeError("leases must contain exact RepositoryRootLease values")
+    held: list[RepositoryRootLeaseBorrow] = []
+    try:
+        for lease in leases:
+            held.append(lease.borrow())
+        return tuple(held)
+    except BaseException as primary:
+        try:
+            release_repository_borrows(tuple(held))
+        except BaseException as close_error:
+            record_secondary_failure(
+                primary,
+                "repository borrow rollback also failed",
+                close_error,
+            )
+        raise
+
+
+def release_repository_borrows(
+    borrows: tuple[RepositoryRootLeaseBorrow, ...],
+) -> None:
+    """Release every repository hold in reverse order without hiding failures."""
+
+    first: BaseException | None = None
+    for borrow in reversed(tuple(borrows)):
+        if type(borrow) is not RepositoryRootLeaseBorrow:
+            error: BaseException = TypeError(
+                "borrows must contain exact RepositoryRootLeaseBorrow values"
+            )
+        else:
+            try:
+                borrow.close()
+                continue
+            except BaseException as caught:
+                error = caught
+        if first is None:
+            first = error
+        else:
+            record_secondary_failure(
+                first,
+                "another repository borrow also failed to close",
+                error,
+            )
+    if first is not None:
+        raise first

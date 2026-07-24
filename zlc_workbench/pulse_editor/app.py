@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from zlc_neutral_atom.pulse_application import PulseTargetDescriptor
+from zlc_neutral_atom.devices.sequencer.application import PulseTargetDescriptor
 from zlc_pulse import (
     PulseDocument,
     load_deployed_pulse_target,

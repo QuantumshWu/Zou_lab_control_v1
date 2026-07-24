@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from zlc_neutral_atom.scan import OccupancyScanRequest, ScanRequest
+    from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import (
+        OccupancyScanRequest,
+        ScanRequest,
+    )
 
     from .application import ScanWorkbenchActions
 

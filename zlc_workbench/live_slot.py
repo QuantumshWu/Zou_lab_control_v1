@@ -11,14 +11,14 @@ import threading
 from typing import Callable, Mapping
 
 from zlc_frontend.figure import DatasetId
-from zlc_neutral_atom.monitor_application import CameraMonitorViewSpec
+from zlc_neutral_atom.logic_nodes.camera_measurement import CameraMonitorViewSpec
 from zlc_neutral_atom.dataset_output import (
     LiveDatasetOutput,
     LiveDatasetOutputOwner,
     LiveDatasetSnapshotSource,
 )
 from zlc_neutral_atom.runtime.dataset import MonitorDatasetSnapshot
-from zlc_neutral_atom.runtime.pipeline import CapturePreviewSpec
+from zlc_neutral_atom.logic_nodes.camera_capture.pipeline import CapturePreviewSpec
 from zlc_storage import canonical_text
 
 

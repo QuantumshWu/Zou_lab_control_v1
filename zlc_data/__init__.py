@@ -42,6 +42,10 @@ from .codec import (
     TypedCodecError,
 )
 from .layout import AxisLayout, AxisLayoutMode, PointLayout
+from .output_contract import (
+    AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID,
+    projected_dataset_output_contract_id,
+)
 from .schema import (
     DatasetSchema,
     ValueSchema,
@@ -163,6 +167,7 @@ def __dir__() -> list[str]:
     return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 __all__ = [
+    "AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID",
     "AxisId",
     "AxisLayout",
     "AxisLayoutMode",
@@ -273,6 +278,7 @@ __all__ = [
     "suggest_fit_draft",
     "point_layout_from_tree",
     "point_layout_to_tree",
+    "projected_dataset_output_contract_id",
     "data_transform_spec_from_tree",
     "data_transform_spec_to_tree",
     "selection_from_tree",

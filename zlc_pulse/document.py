@@ -35,8 +35,15 @@ from .target import (
 PULSE_DOCUMENT_SCHEMA = "zlc_pulse.PulseDocument"
 SCAN_TABLE_SCHEMA = "zlc_pulse.FrozenScanTable"
 SCAN_NORMALIZER_ID = "zlc-pulse-scan-freeze"
-TIME_UNITS = frozenset(("s", "ms", "us", "ns"))
-TIME_UNIT_TO_NS = {"s": 1e9, "ms": 1e6, "us": 1e3, "ns": 1.0}
+TIME_UNIT_CHOICES = ("ns", "us", "ms", "s")
+TIME_UNITS = frozenset(TIME_UNIT_CHOICES)
+TIME_UNIT_TO_NS = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
+DEFAULT_TIME_UNIT = TIME_UNIT_CHOICES[0]
+DEFAULT_PERIOD_DURATION = 1000
+DEFAULT_REPEAT_COUNT = 2
+MIN_REPEAT_COUNT = 2
+DEFAULT_SCAN_SWEEP_COUNT = 0
+MIN_SCAN_SWEEP_COUNT = 0
 FIELD_DURATION = "duration"
 FIELD_DAC = "dac"
 FIELD_DELAY = "delay"
@@ -68,6 +75,19 @@ def _time_unit(value: object, field: str) -> str:
     if unit not in TIME_UNITS:
         raise ValueError(f"{field} is unsupported")
     return unit
+
+
+def time_value_per_tick(time_step_ns: int | float, unit: str) -> int | float:
+    """Return one document clock tick expressed in an owner-declared time unit."""
+
+    step = _number(time_step_ns, "time step")
+    if float(step) <= 0:
+        raise ValueError("time step must be positive")
+    normalized_unit = _time_unit(unit, "time unit")
+    return _number(
+        float(step) / TIME_UNIT_TO_NS[normalized_unit],
+        "time value per tick",
+    )
 
 
 def _integral_code(value: object, field: str) -> int:
@@ -361,7 +381,11 @@ class RepeatRegion:
             "end_period_id",
             _identifier(self.end_period_id, "repeat end_period_id"),
         )
-        object.__setattr__(self, "count", _integer(self.count, "repeat count", minimum=2))
+        object.__setattr__(
+            self,
+            "count",
+            _integer(self.count, "repeat count", minimum=MIN_REPEAT_COUNT),
+        )
 
 
 @dataclass(frozen=True)
@@ -377,7 +401,7 @@ class PulseDocument:
     visible_ports: tuple[str, ...] = ()
     delays: tuple[OutputDelay, ...] = ()
     repeat: RepeatRegion | None = None
-    scan_sweep_count: int = 0
+    scan_sweep_count: int = DEFAULT_SCAN_SWEEP_COUNT
     _fingerprint: str | None = field(
         init=False,
         repr=False,
@@ -514,7 +538,7 @@ class PulseDocument:
             _integer(
                 self.scan_sweep_count,
                 "scan_sweep_count",
-                minimum=0,
+                minimum=MIN_SCAN_SWEEP_COUNT,
             ),
         )
 
@@ -1210,6 +1234,10 @@ __all__ = [
     "ANALOG_MODES",
     "ApiParameter",
     "AnalogStep",
+    "DEFAULT_PERIOD_DURATION",
+    "DEFAULT_REPEAT_COUNT",
+    "DEFAULT_SCAN_SWEEP_COUNT",
+    "DEFAULT_TIME_UNIT",
     "FIELD_DAC",
     "FIELD_DELAY",
     "FIELD_DURATION",
@@ -1226,8 +1254,11 @@ __all__ = [
     "SCAN_TABLE_SCHEMA",
     "ScanParameter",
     "ScanRecipeProvenance",
+    "TIME_UNIT_CHOICES",
     "TIME_UNITS",
     "TIME_UNIT_TO_NS",
+    "MIN_REPEAT_COUNT",
+    "MIN_SCAN_SWEEP_COUNT",
     "count_authored_digital_pulses",
     "frozen_scan_table_from_tree",
     "frozen_scan_table_to_tree",
@@ -1236,4 +1267,5 @@ __all__ = [
     "pulse_document_path",
     "pulse_document_to_tree",
     "save_pulse_document",
+    "time_value_per_tick",
 ]

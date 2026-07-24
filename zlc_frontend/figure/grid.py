@@ -315,9 +315,53 @@ def grid_facet_axes(
     )
 
 
+def suggest_default_grid_view(schema: DatasetSchema) -> ViewSuggestion:
+    """Suggest a schema-derived Grid view without naming a physical axis.
+
+    Only declared point axes, their roles, and Figure contract resolution enter
+    the choice.  Intent preference is stable frontend policy: an image cell is
+    preferred when the schema can supply its plane, followed by a curve and a
+    histogram.  Within the first resolvable intent, more than one legal point
+    facet is a real authoring ambiguity and remains ``NEEDS_INPUT``.
+    """
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    for intent in (
+        ViewIntent.IMAGE,
+        ViewIntent.CURVE,
+        ViewIntent.HISTOGRAM,
+    ):
+        candidates = tuple(
+            suggestion
+            for axis in schema.point_axes
+            if axis.size > 1
+            for suggestion in (
+                resolve_grid_view(schema, intent, axis.axis_id),
+            )
+            if suggestion.spec is not None
+        )
+        if not candidates:
+            continue
+        if len(candidates) == 1:
+            return candidates[0]
+        return _unresolved(
+            "AMBIGUOUS_DEFAULT_GRID_FACET",
+            (
+                "multiple declared point axes can facet the default Grid; "
+                "choose the physical axis in Setting"
+            ),
+        )
+    return _unresolved(
+        "NO_DEFAULT_GRID_VIEW",
+        "the DatasetSchema does not determine a complete Grid view",
+    )
+
+
 __all__ = [
     "GRID_INTENTS",
     "grid_facet_axes",
     "grid_facet_axis",
     "resolve_grid_view",
+    "suggest_default_grid_view",
 ]

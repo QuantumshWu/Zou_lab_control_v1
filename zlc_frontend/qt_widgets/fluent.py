@@ -1399,6 +1399,14 @@ class FluentSettingRow(QtWidgets.QWidget):
         parent=None,
     ):
         super().__init__(parent)
+        # A form row is a width consumer, never a width author.  Combo/path/error
+        # size hints can be arbitrarily long; the enclosing Setting/Edit viewport
+        # owns the available width and the control must contract inside it.
+        self.setMinimumWidth(0)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         h = QtWidgets.QHBoxLayout(self)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(scaled_px(6, minimum=4))
@@ -2949,6 +2957,7 @@ class FluentScrollArea(QtWidgets.QScrollArea):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(True)
+        self.setMinimumWidth(0)
         self.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.setStyleSheet(
             f"""
@@ -3222,6 +3231,10 @@ class ElidedLabel(QtWidgets.QLabel):
         self.setAlignment(align)
         self.setStyleSheet(f'QLabel {{ color: {TEXT}; font: {fluent_font_size()}pt "{FONT}"; background: transparent; }}')
         self.setMinimumWidth(scaled_px(8))
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         self.setText(str(text))
 
     def setText(self, text: str) -> None:  # noqa: N802 - Qt API name
@@ -3239,7 +3252,15 @@ class ElidedLabel(QtWidgets.QLabel):
     def _elide(self) -> None:
         metrics = self.fontMetrics()
         available = max(0, self.width() - scaled_px(2))
-        shown = metrics.elidedText(self._full, self._mode, available) if available > scaled_px(4) else self._full
+        # During construction/layout a label can briefly have width zero.  Do
+        # not put the full diagnostic/path back into QLabel in that state: its
+        # resulting size hint would make the very text being elided author the
+        # parent width.  The next resize paints the proper elision.
+        shown = (
+            metrics.elidedText(self._full, self._mode, available)
+            if available > scaled_px(4)
+            else ""
+        )
         super().setText(shown)
 
 

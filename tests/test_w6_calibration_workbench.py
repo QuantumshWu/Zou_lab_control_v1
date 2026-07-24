@@ -19,12 +19,13 @@ from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
 import Zou_lab_control.notebook as zlc
-from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
-from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
-from zlc_workbench.calibration import (
-    calibration_analysis_form,
-    calibration_analysis_from_form,
+from zlc_neutral_atom.logic_nodes.calibration.calibration import (
+    build_calibration_analysis_request_from_authoring,
+    calibration_analysis_authoring_schema,
 )
+from zlc_neutral_atom.logic_nodes.calibration.reference import CalibrationArtifactRef
+from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
+from zlc_workbench.form_projection import project_authoring_form
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,17 +68,24 @@ def _manifest_count(workspace: Path) -> int:
     return 0 if not root.exists() else len(tuple(root.glob("*.manifest")))
 
 
-def test_calibration_gui_public_imports_and_presenter_remain_headless() -> None:
+def test_calibration_owner_presenter_and_public_imports_remain_headless() -> None:
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             (
                 "import sys\n"
-                "import zlc_workbench.calibration\n"
+                "import zlc_neutral_atom.logic_nodes.calibration.calibration\n"
+                "import zlc_workbench.logic_node_presentations.calibration\n"
+                "import zlc_workbench.form_projection\n"
+                "for prefix in ('PyQt5', 'matplotlib', 'scipy'):\n"
+                "    assert not any(\n"
+                "        name == prefix or name.startswith(prefix + '.')\n"
+                "        for name in sys.modules\n"
+                "    ), prefix\n"
                 "import Zou_lab_control.notebook\n"
                 "import Zou_lab_control.workbench\n"
-                "for prefix in ('PyQt5', 'matplotlib', 'scipy'):\n"
+                "for prefix in ('PyQt5', 'matplotlib'):\n"
                 "    assert not any(\n"
                 "        name == prefix or name.startswith(prefix + '.')\n"
                 "        for name in sys.modules\n"
@@ -96,8 +104,11 @@ def test_calibration_form_round_trip_preserves_spatial_authority(
     calibration_product,
 ) -> None:
     request = calibration_product[2].report.request
-    form = calibration_analysis_form(request)
-    rebuilt = calibration_analysis_from_form(request, form.default_values())
+    form = project_authoring_form(calibration_analysis_authoring_schema(request))
+    rebuilt = build_calibration_analysis_request_from_authoring(
+        request,
+        form.default_values(),
+    )
     assert rebuilt == request
     assert rebuilt.layout == request.layout
     assert rebuilt.grid_shape_yx == request.grid_shape_yx
@@ -121,7 +132,7 @@ def test_calibration_form_round_trip_preserves_spatial_authority(
     for key in tuple(key for key in values if key.startswith("model.")):
         values[key] = False
     with pytest.raises(ValueError, match="default model must remain enabled"):
-        calibration_analysis_from_form(request, values)
+        build_calibration_analysis_request_from_authoring(request, values)
 
 
 def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
@@ -363,7 +374,7 @@ def test_stop_before_finalize_publishes_no_calibration(
         replace(computation.report.request, split_seed=19),
     )
     before = _manifest_count(workspace)
-    import zlc_neutral_atom.readout.analysis as analysis_module
+    import zlc_neutral_atom.logic_nodes.calibration.analysis as analysis_module
 
     original_analyze = analysis_module._analyze_calibration_resolved
     analyzed = threading.Event()

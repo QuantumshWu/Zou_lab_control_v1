@@ -24,20 +24,20 @@ Run the smallest check that proves the changed boundary still works.  Full `pyte
 Use these as starting points, then narrow `-k` to the behavior you touched.
 
 ```powershell
-# Neutral-atom API, pulse compilation, remote sequencer, qCMOS workflow
-pytest -q tests\test_neutral_atom_lightweight.py -k "pulse or sequencer or qcmos or readout"
+# Neutral-atom notebook API, qCMOS adapter and exact capture workflow
+pytest -q tests\test_notebook_experiment_facade.py tests\test_zlc_dcam_camera_adapter.py tests\test_triggered_capture_pipeline.py
 
 # Control-computer readout scan through the RPyC RemoteSequencer JSON protocol
-pytest -q tests\test_neutral_atom_lightweight.py -k "remote_detection_time_scan_uses_bound_pulse_controller_over_json_protocol"
+pytest -q tests\test_remote_sequencer_execution_endpoint.py tests\test_w3_api_segmented_scan.py
 
 # FPGA launcher/HDL/Tcl contracts + host image packer + AXI session, without opening Vivado
-pytest -q tests\test_neutral_atom_lightweight.py -k "repo_vivado_entrypoint_contract or xdc or image_solver or top_regions or vivado_axi_session"
+pytest -q tests\test_public_hardware_boundary.py tests\test_zlc_pulse_fpga_image.py tests\test_zlc_pulse_hardware_backend.py tests\test_zlc_pulse_transports.py
 
-# Frontend plotting, PDF rendering, notebook-template generation
-pytest -q tests\test_frontend_smoke.py -k "frontend or render_tex_pdf or notebook"
+# Frontend Figure contracts and the formal Qt host
+pytest -q tests\test_zlc_frontend_figure.py tests\test_zlc_single_panel_host.py tests\test_qt_app_single_entry.py
 
-# Pulse GUI behavior; requires PyQt5 and may skip when Qt canvas is unavailable
-pytest -q tests\test_frontend_smoke.py -k "pulse_gui"
+# Pulse GUI behavior through current composition paths
+pytest -q tests\test_pulse_gui_remote_connection.py tests\test_pulse_gui_scan_runtime_qt.py tests\test_pulse_schedule_view_contract.py
 ```
 
 For notebook edits, validate only the notebooks that changed:

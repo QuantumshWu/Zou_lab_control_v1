@@ -16,7 +16,7 @@
 // emCCD is bit 11.  Correct: on@2500 off@4500 (pulse1), on@12001 off@14001 (pulse2, 2000t).
 // 40ms bug = on@10001 off@14001 (pulse2 = 4000t, e7 dropped).
 module tb_edge_streamer;
-  localparam integer CH = 62, EAW = 12, TW = 32, NS = 4, CW = 16, DTW = 12, BUSC = 4, BW = 10;
+  localparam integer CH = 62, EAW = 12, TW = 32, NS = 4, CW = 16, DTW = 32, BUSC = 4, BW = 10;
   localparam integer EDGE_LAT  = `EDGE_LAT;
   localparam integer TICK_EXTRA = `TICK_EXTRA;
 

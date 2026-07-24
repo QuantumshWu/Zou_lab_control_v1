@@ -42,7 +42,7 @@ from .histogram_display import (
     HistogramDisplayState,
     HistogramFitMode,
     HistogramViewportTransform,
-    _WindowedHistogramProjection,
+    _windowed_histogram_projection,
     histogram_count_limits,
     histogram_home_x_limits,
 )
@@ -329,16 +329,13 @@ def _render_evaluated_figure(
             shared_histogram_analysis_edges = shared_histogram_edges
         else:
             low, high = _grid_histogram_value_range(panels)
-            shared_histogram_projection = _WindowedHistogramProjection(
+            (
+                shared_histogram_counts,
+                shared_histogram_edges,
+            ) = _windowed_histogram_projection(
                 histogram_samples,
                 histogram_display.bin_count,
                 visible_range=(low, high),
-            )
-            shared_histogram_edges = (
-                shared_histogram_projection.visible_bin_edges
-            )
-            shared_histogram_counts = (
-                shared_histogram_projection.visible_bin_counts
             )
             # A Grid's bounded fit is a DISPLAY-ONLY overlay of these exact
             # visible bars.  Fit the bins it annotates; a separate full-sample

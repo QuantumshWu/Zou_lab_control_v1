@@ -7,6 +7,8 @@ the application controller behind its signals.
 
 from __future__ import annotations
 
+import sys
+
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_frontend.qt_widgets import (
@@ -24,6 +26,7 @@ from zlc_frontend.qt_widgets import (
     FluentLabel,
     signals_blocked,
 )
+from zlc_pulse import DEFAULT_SCAN_SWEEP_COUNT, MIN_SCAN_SWEEP_COUNT
 
 from ._layout import px, row_height
 
@@ -147,9 +150,10 @@ class PulseScanView(QtWidgets.QWidget):
             allow_minus=False,
         )
         self.scan_repeats_spin.setDecimals(0)
-        self.scan_repeats_spin.setRange(0, 999)
-        self.scan_repeats_spin.setValue(0)
-        self._committed_repeats = 0
+        self.scan_repeats_spin.setMinimum(MIN_SCAN_SWEEP_COUNT)
+        self.scan_repeats_spin.setMaximum(sys.float_info.max)
+        self.scan_repeats_spin.setValue(DEFAULT_SCAN_SWEEP_COUNT)
+        self._committed_repeats = DEFAULT_SCAN_SWEEP_COUNT
         self.scan_repeats_spin.setFixedHeight(row_height())
         self.scan_repeats_spin.setToolTip(
             "How many WHOLE scan sweeps to play before stopping.  0 = sweep "

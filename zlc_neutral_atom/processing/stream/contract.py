@@ -20,7 +20,7 @@ from zlc_storage import (
 )
 
 from zlc_neutral_atom.catalog import (
-    StreamProcessorDefinition as _StreamProcessorDefinition,
+    ProcessorDefinition as _ProcessorDefinition,
 )
 from zlc_neutral_atom.runtime.streams import (
     ArtifactInputRef,
@@ -394,9 +394,9 @@ class BoundStreamProcessor:
     """Runtime binding of one definition to one trusted synchronous operator.
 
     Python cannot safely preempt arbitrary in-process code.  The composition root
-    therefore admits only reviewed top-level functions.  The worker measures every
-    invocation and rejects a result returned after the declared deadline; an operator
-    which never returns remains a violated trust boundary, not a cancellable task.
+    therefore admits only reviewed top-level functions.  Cancellation and expiry are
+    observed at worker checkpoints; an operator which never returns remains a violated
+    trust boundary, not a cancellable task.
 
     Declarative definition/config/artifact values are reconstructed into this
     binding's ownership.  Payload and join-key contracts remain deliberately shared
@@ -404,7 +404,7 @@ class BoundStreamProcessor:
     composition root must not expose reflective mutation of those owners.
     """
 
-    definition: _StreamProcessorDefinition
+    definition: _ProcessorDefinition
     config: object
     input_payload_contract: PayloadContract
     output_payload_contract: PayloadContract
@@ -412,16 +412,14 @@ class BoundStreamProcessor:
     output_stream_id: StreamId
     output_source_id: str
     operator: Callable[[object, object], object]
-    operator_deadline_seconds: float
-    terminal_wait_seconds: float
     artifact_inputs: tuple[ArtifactInputRef, ...] = ()
     _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.definition, _StreamProcessorDefinition):
-            raise TypeError("definition must be StreamProcessorDefinition")
+        if not isinstance(self.definition, _ProcessorDefinition):
+            raise TypeError("definition must be ProcessorDefinition")
         definition = _snapshot_binding_value(self.definition)
-        if not isinstance(definition, _StreamProcessorDefinition):
+        if not isinstance(definition, _ProcessorDefinition):
             raise TypeError("definition snapshot changed its declared type")
         definition_tree = _tree(definition)
         object.__setattr__(self, "definition", definition)
@@ -444,19 +442,6 @@ class BoundStreamProcessor:
         )
         config_tree = _tree(config)
         object.__setattr__(self, "config", config)
-        for field_name in (
-            "operator_deadline_seconds",
-            "terminal_wait_seconds",
-        ):
-            value = getattr(self, field_name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or float(value) <= 0
-            ):
-                raise ValueError(f"{field_name} must be finite and positive")
-            object.__setattr__(self, field_name, float(value))
         for name, contract in (
             ("input_payload_contract", self.input_payload_contract),
             ("output_payload_contract", self.output_payload_contract),
@@ -539,8 +524,6 @@ class BoundStreamProcessor:
                     "output_stream_id": output_stream_id.value,
                     "output_source_id": self.output_source_id,
                     "operator": f"{operator.__module__}.{operator.__qualname__}",
-                    "operator_deadline_seconds": self.operator_deadline_seconds,
-                    "terminal_wait_seconds": self.terminal_wait_seconds,
                     "artifact_inputs": [
                         item.fingerprint for item in self.artifact_inputs
                     ],

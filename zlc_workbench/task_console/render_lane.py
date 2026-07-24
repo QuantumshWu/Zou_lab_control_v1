@@ -119,12 +119,7 @@ class ConsoleRenderLane:
         requests: tuple[PanelRenderRequest, ...],
         reset_panel_ids: tuple[str, ...],
     ):
-        from zlc_frontend.site_map_render import (
-            CalibrationSiteMapView,
-            OccupancyCellView,
-            OccupancySummarySiteMapView,
-            SiteMapComposer,
-        )
+        from zlc_frontend.site_map_render import SiteMapComposer, SiteMapView
         from zlc_frontend.panel_render import PanelComposer, PanelRenderError
 
         for panel_id in reset_panel_ids:
@@ -169,14 +164,7 @@ class ConsoleRenderLane:
             try:
                 if request.kind == "sites":
                     presentation = getattr(request.value, "presentation", None)
-                    if not isinstance(
-                        presentation,
-                        (
-                            OccupancyCellView,
-                            CalibrationSiteMapView,
-                            OccupancySummarySiteMapView,
-                        ),
-                    ):
+                    if not isinstance(presentation, SiteMapView.__args__):
                         raise PanelRenderError(
                             "Site map requires one typed physical SiteMap view"
                         )

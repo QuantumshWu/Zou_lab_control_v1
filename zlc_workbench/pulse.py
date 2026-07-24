@@ -15,8 +15,8 @@ from zlc_pulse import (
     PulseTarget,
     PulseTimelineDocument,
     bind_pulse_document_target,
-    build_pulse_timeline,
-    compile_pulse_artifact,
+    build_authored_pulse_timeline,
+    compile_pulse_document,
     insert_period,
     load_pulse_document,
     new_period,
@@ -98,7 +98,7 @@ class PulseEditorSession:
             )
         document = insert_period(
             document,
-            period=new_period(document, duration=1000, unit="ns"),
+            period=new_period(document),
         ).document
         return cls(document)
 
@@ -233,7 +233,7 @@ def project_pulse_preview(
         if reference
         else PulseExecutionForm.STATIC_ONCE
     )
-    artifact = compile_pulse_artifact(
+    target_ir = compile_pulse_document(
         document,
         clock_hz=1e9 / document.time_step_ns,
         execution_form=execution_form,
@@ -244,9 +244,10 @@ def project_pulse_preview(
         if reference or document.api_parameters
         else "compiled static pulse"
     )
-    return build_pulse_timeline(
+    return build_authored_pulse_timeline(
         document,
-        artifact,
+        target_ir,
+        execution_form=execution_form,
         reference_label=label,
     )
 

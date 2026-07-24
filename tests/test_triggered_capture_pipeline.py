@@ -13,15 +13,14 @@ import numpy as np
 import pytest
 
 from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, REPEAT, SCAN_POINT
-from zlc_neutral_atom.bootstrap._installation import create_virtual_installation
-from zlc_neutral_atom.bootstrap._triggered_capture import (
+from zlc_neutral_atom.devices.simulation.installation import create_virtual_installation
+from zlc_neutral_atom.logic_nodes.camera_capture.binding import (
     TriggeredCameraLayout,
     bind_triggered_camera_acquisition,
 )
-from zlc_neutral_atom.runtime.cleanup import CleanupReport
-from zlc_neutral_atom.timing._coordination import (
+from zlc_neutral_atom.runtime.cleanup import CleanupReport, run_cleanup_steps
+from zlc_neutral_atom.logic_nodes.camera_capture.coordination import (
     execute_autonomous_single_fire,
-    run_cleanup_steps,
     validate_single_trigger_capture_binding,
 )
 from zlc_neutral_atom.timing.lineage import PulseCaptureBinding
@@ -488,7 +487,7 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
 
 
 def test_host_stepped_scan_is_not_reintroduced_as_a_capture_mode():
-    import zlc_neutral_atom.timing.capture as capture_module
+    import zlc_neutral_atom.logic_nodes.camera_capture.triggered as capture_module
 
     assert not hasattr(capture_module, "HOST_STEPPED_GROUP")
     assert not hasattr(capture_module, "HostSteppedCaptureSpec")

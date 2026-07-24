@@ -1,4 +1,4 @@
-"""Pure processing definitions and bounded runtime bindings."""
+"""Pure processing definitions and exact runtime bindings."""
 
 from .stream import (
     BoundStreamProcessor,

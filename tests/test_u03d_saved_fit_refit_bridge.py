@@ -150,7 +150,7 @@ def test_saved_fit_requires_explicit_cell_then_replays_exact_ref_for_refit(
             assert grid._reference == saved_ref
             assert grid._showing_page
             assert grid._current_selection is None
-            assert not grid._analyze_button.isEnabled()
+            assert not grid._fit_button.isEnabled()
             assert _retained_data_figure(application, grid) is None
             assert execute_sources == []
 
@@ -172,11 +172,11 @@ def test_saved_fit_requires_explicit_cell_then_replays_exact_ref_for_refit(
                 and not grid._showing_page
                 and grid._current_selection == projected.selection,
             )
-            assert grid._analyze_button.isEnabled()
+            assert grid._fit_button.isEnabled()
 
             grid._model.resolve_selection(projected.selection)
             QtTest.QTest.mouseClick(
-                grid._analyze_button,
+                grid._fit_button,
                 QtCore.Qt.LeftButton,
             )
             _until(
@@ -209,7 +209,7 @@ def test_saved_fit_requires_explicit_cell_then_replays_exact_ref_for_refit(
                     f"models={fit_window.fit_models!r}"
                 )
 
-            # Analyze opens the existing Fit host and prepares only; it does
+            # Fit opens the existing unified Figure Fit host and prepares only; it does
             # not solve until the user presses that host's explicit Fit button.
             assert execute_sources == []
             assert fit_window._fit_pane is not None
@@ -247,7 +247,7 @@ def test_saved_fit_requires_explicit_cell_then_replays_exact_ref_for_refit(
             grid._show_page()
             assert grid._showing_page
             assert grid._current_selection is None
-            assert not grid._analyze_button.isEnabled()
+            assert not grid._fit_button.isEnabled()
         finally:
             if fit_window is not None:
                 _close(application, fit_window)

@@ -259,6 +259,22 @@ class BoundDevice:
         return self._broker.validate_capability(proof, self)
 
 
+def require_current_endpoint_binding(
+    binding: object,
+    endpoint: str,
+    binding_instance_id: str | None,
+) -> None:
+    """Validate the broker binding currently owned by one concrete endpoint."""
+
+    if not isinstance(binding, BoundDevice):
+        raise TypeError(f"{endpoint} endpoint requires BoundDevice")
+    if (
+        binding_instance_id is not None
+        and binding.binding_instance_id != binding_instance_id
+    ):
+        raise RuntimeError(f"{endpoint} endpoint binding instance changed")
+
+
 def admit_bound_capability(
     attestation: VerifiedDeviceCapability,
     expected_snapshot_type: type[object],

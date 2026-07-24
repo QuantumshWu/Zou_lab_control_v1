@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from zlc_neutral_atom.timing.pulse import (
+from zlc_neutral_atom.devices.sequencer.port import (
     ContinuousPulseExecutionRequest,
     FinitePulseExecutionRequest,
     PulseTerminalAck,

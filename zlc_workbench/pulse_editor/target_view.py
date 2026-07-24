@@ -26,9 +26,15 @@ from zlc_pulse import (
     PulseTargetPortDraft,
     build_pulse_target_manifest,
     pulse_target_port_drafts,
+    pulse_target_port_width_spec,
 )
 
 from ._layout import px, row_height
+
+
+# QSpinBox stores a C++ int; this is a widget representation boundary, not a
+# Pulse-target width limit.
+_QT_SPINBOX_MAXIMUM = (1 << 31) - 1
 
 
 @dataclass
@@ -280,7 +286,7 @@ class PulseTargetView(QtWidgets.QWidget):
             row.clock_endpoint,
             row.remove_button,
         ):
-            widget.setParent(None)
+            widget.hide()
             widget.deleteLater()
 
     def _place_rows(self) -> None:
@@ -361,7 +367,15 @@ class PulseTargetView(QtWidgets.QWidget):
         endpoints.setFixedHeight(row_height())
 
         width = FluentSpinBox()
-        width.setRange(1 if draft.kind == PORT_DIGITAL else 2, 32)
+        width_spec = pulse_target_port_width_spec(draft.kind)
+        width.setRange(
+            width_spec.minimum,
+            (
+                _QT_SPINBOX_MAXIMUM
+                if width_spec.maximum is None
+                else width_spec.maximum
+            ),
+        )
         width.setValue(draft.width)
         width.setFixedSize(px(82, minimum=70), row_height())
         if draft.kind == PORT_DAC:
@@ -451,6 +465,7 @@ class PulseTargetView(QtWidgets.QWidget):
         field: FluentLineEdit,
         width: int,
     ) -> None:
+        width = pulse_target_port_width_spec(PORT_DAC).normalize(int(width))
         endpoints = list(self._endpoint_values(field.text()))
         if len(endpoints) < width:
             endpoints.extend(
@@ -528,7 +543,7 @@ class PulseTargetView(QtWidgets.QWidget):
             return
         key = self._allocate_key("dac")
         clock_key = self._allocate_key(f"{key}_clock")
-        width = 10
+        width = pulse_target_port_width_spec(PORT_DAC).default
         draft = PulseTargetPortDraft(
             key,
             PORT_DAC,

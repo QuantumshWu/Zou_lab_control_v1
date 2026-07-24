@@ -139,6 +139,53 @@ def test_target_package_has_no_reverse_imports(package, forbidden):
     assert not violations, "reverse package dependencies:\n" + "\n".join(violations)
 
 
+@pytest.mark.parametrize(
+    "relative_root",
+    (
+        Path("zlc_neutral_atom/runtime"),
+        Path("zlc_neutral_atom/devices"),
+        Path("zlc_workbench/task_console"),
+    ),
+)
+def test_framework_and_device_owners_do_not_import_concrete_logic_nodes(
+    relative_root,
+):
+    """Keep the skeleton/attachment direction mechanical across future moves."""
+
+    root = ROOT / relative_root
+    assert root.is_dir(), f"owner root moved without updating this ratchet: {relative_root}"
+    violations = []
+    for path in sorted(root.rglob("*.py")):
+        for imported in _imports(path):
+            if imported == "zlc_neutral_atom.logic_nodes" or imported.startswith(
+                "zlc_neutral_atom.logic_nodes."
+            ):
+                violations.append(f"{path.relative_to(ROOT)} imports {imported}")
+    assert not violations, (
+        "framework/device owners may consume only generic contracts or injected "
+        "attachments; concrete Task/Measurement/Processor implementations belong "
+        "to the composition direction:\n" + "\n".join(violations)
+    )
+
+
+def test_device_owners_do_not_depend_back_on_bootstrap_dispatch():
+    """Concrete attachments consume low-level installation owners, never dispatch."""
+
+    root = ROOT / "zlc_neutral_atom/devices"
+    assert root.is_dir(), "device owner root moved without updating this ratchet"
+    violations = []
+    for path in sorted(root.rglob("*.py")):
+        for imported in _imports(path):
+            if imported == "zlc_neutral_atom.bootstrap" or imported.startswith(
+                "zlc_neutral_atom.bootstrap."
+            ):
+                violations.append(f"{path.relative_to(ROOT)} imports {imported}")
+    assert not violations, (
+        "device attachments are inputs to config dispatch, not consumers of the "
+        "composition-private bootstrap package:\n" + "\n".join(violations)
+    )
+
+
 def test_zlc_data_import_does_not_initialize_storage_backends():
     code = """
 import sys
@@ -168,13 +215,13 @@ if 'zlc_storage.canonical' not in sys.modules:
 def test_occupancy_runtime_does_not_import_calibration_analysis_or_repository():
     code = """
 import sys
-import zlc_neutral_atom.readout.occupancy
+import zlc_neutral_atom.logic_nodes.occupancy.processor
 
 forbidden = (
     'scipy',
-    'zlc_neutral_atom.readout.analysis',
-    'zlc_neutral_atom.readout.calibration_codec',
-    'zlc_neutral_atom.readout.calibration_repository',
+    'zlc_neutral_atom.logic_nodes.calibration.analysis',
+    'zlc_neutral_atom.logic_nodes.calibration.codec',
+    'zlc_neutral_atom.logic_nodes.calibration.repository',
 )
 loaded = tuple(
     name for name in forbidden
@@ -468,6 +515,23 @@ def test_zlc_data_does_not_restore_unused_bulk_or_transform_history_surfaces():
     )
 
 
+READOUT_LOGIC_ROOTS = (
+    Path("zlc_neutral_atom/logic_nodes/calibration"),
+    Path("zlc_neutral_atom/logic_nodes/occupancy"),
+    Path("zlc_neutral_atom/logic_nodes/readout_common"),
+)
+
+
+def _readout_logic_sources():
+    missing = [root for root in READOUT_LOGIC_ROOTS if not (ROOT / root).is_dir()]
+    assert not missing, (
+        "readout Logic-node owner roots moved; update this ratchet in the same "
+        f"change instead of silently scanning nothing: {missing}"
+    )
+    for root in READOUT_LOGIC_ROOTS:
+        yield from sorted((ROOT / root).rglob("*.py"))
+
+
 def test_readout_artifacts_do_not_restore_edit_counter_metadata():
     forbidden = {
         "algorithm_id",
@@ -485,7 +549,7 @@ def test_readout_artifacts_do_not_restore_edit_counter_metadata():
         "OccupancyModelSelection",
     }
     violations = []
-    for source in (ROOT / "zlc_neutral_atom" / "readout").rglob("*.py"):
+    for source in _readout_logic_sources():
         relative = source.relative_to(ROOT)
         tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(relative))
         for node in ast.walk(tree):
@@ -556,8 +620,9 @@ def test_notebook_facade_has_no_implicit_current_calibration_state():
     )
 
 
-def test_readout_package_root_does_not_eagerly_aggregate_leaf_owners():
-    path = ROOT / "zlc_neutral_atom" / "readout" / "__init__.py"
+def test_readout_common_root_does_not_eagerly_aggregate_leaf_owners():
+    path = ROOT / "zlc_neutral_atom" / "logic_nodes" / "readout_common" / "__init__.py"
+    assert path.is_file(), "readout_common owner moved without updating this ratchet"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     imports = [
         node
@@ -565,8 +630,8 @@ def test_readout_package_root_does_not_eagerly_aggregate_leaf_owners():
         if isinstance(node, (ast.Import, ast.ImportFrom))
     ]
     assert not imports, (
-        "readout callers import the contracts/model/analysis/repository owner leaf; "
-        "the package root must not make a light contract import initialize SciPy"
+        "readout Logic nodes import the exact shared owner leaf; readout_common's "
+        "package root must not make a light contract import initialize SciPy"
     )
 
 
@@ -668,8 +733,8 @@ def test_content_ref_codec_and_cas_address_have_one_storage_owner():
                 )
 
     for relative in (
-        Path("zlc_neutral_atom/artifacts/capture.py"),
-        Path("zlc_neutral_atom/readout/calibration_repository.py"),
+        Path("zlc_neutral_atom/logic_nodes/camera_capture/artifact.py"),
+        Path("zlc_neutral_atom/logic_nodes/calibration/repository.py"),
     ):
         tree = ast.parse(
             (ROOT / relative).read_text(encoding="utf-8"),
@@ -704,8 +769,8 @@ def test_content_ref_codec_and_cas_address_have_one_storage_owner():
 def test_artifact_finalizers_do_not_replay_published_payload_digests():
     violations = []
     for relative in (
-        Path("zlc_neutral_atom/artifacts/capture.py"),
-        Path("zlc_neutral_atom/readout/occupancy_pipeline.py"),
+        Path("zlc_neutral_atom/logic_nodes/camera_capture/artifact.py"),
+        Path("zlc_neutral_atom/logic_nodes/occupancy/pipeline.py"),
     ):
         path = ROOT / relative
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -734,7 +799,7 @@ def test_calibration_numeric_versions_are_not_admission_authority():
         "_numeric_backend",
     )
     violations = []
-    for path in (ROOT / "zlc_neutral_atom" / "readout").rglob("*.py"):
+    for path in _readout_logic_sources():
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             if token in text:
@@ -745,7 +810,10 @@ def test_calibration_numeric_versions_are_not_admission_authority():
         + "\n".join(violations)
     )
 
-    analysis_path = ROOT / "zlc_neutral_atom" / "readout" / "analysis.py"
+    analysis_path = (
+        ROOT / "zlc_neutral_atom" / "logic_nodes" / "calibration" / "analysis.py"
+    )
+    assert analysis_path.is_file(), "Calibration analysis owner moved without this ratchet"
     source = analysis_path.read_text(encoding="utf-8")
     assert source.count("np.__version__") == 1
     assert source.count("scipy.__version__") == 1, (

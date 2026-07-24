@@ -2,7 +2,7 @@
 // Finite-bracket LOOP test: loop_count=3 over edges [loop_start..end], verify the loop body
 // fires the right edges each iteration (exercises the sh_ls0..ls4 reseed I changed).
 module tb_loop;
-  localparam integer CH=62, EAW=12, TW=32, NS=4, CW=16, DTW=12, BUSC=4, BW=10, NE=8;
+  localparam integer CH=62, EAW=12, TW=32, NS=4, CW=16, DTW=32, BUSC=4, BW=10, NE=8;
   reg clk=0, reset=0, start=0; always #10 clk=~clk;
   reg [12:0] wa=0; reg [31:0] wd=0; reg [3:0] we=0; reg wt=0, wm=0;
   wire [EAW-1:0] edge_raddr; wire [TW-1:0] edge_tick_rdata; wire [63:0] mrd;

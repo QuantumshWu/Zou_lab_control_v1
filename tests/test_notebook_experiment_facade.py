@@ -17,14 +17,14 @@ import Zou_lab_control.notebook as zlc
 import Zou_lab_control.notebook.facade as facade_impl
 from zlc_data import FitNumericPolicy, SPATIAL_X, SPATIAL_Y, encode_fit_result_batch
 from zlc_neutral_atom.artifacts import (
-    CaptureArtifactRef,
-    CaptureRepository,
     FitResultArtifactRef,
     FitResultRepository,
 )
+from zlc_neutral_atom.logic_nodes.camera_capture.artifact import CaptureRepository
+from zlc_neutral_atom.logic_nodes.camera_capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.readout.calibration_repository import CalibrationRepository
-from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
+from zlc_neutral_atom.logic_nodes.calibration.repository import CalibrationRepository
+from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.runtime.ports import BoundDevice
 from zlc_neutral_atom.runtime.run import RunPlan
 from zlc_pulse import FrozenScanTable, RepeatRegion, load_pulse_document

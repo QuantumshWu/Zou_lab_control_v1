@@ -53,6 +53,12 @@ bitstream is fixed; every
 `axi_bram_ctrl`, then drives the CTRL mailbox. One edge row means "at this
 absolute FPGA tick, set all outputs to this mask".
 
+JTAG-to-AXI is the current default transport.  The optional UART path is for a
+controlled repository host: its encoder splits every request to at most 256
+words.  The frozen UART RTL does not independently reject a malicious or
+otherwise invalid wire `COUNT > 256`, so it is not an untrusted transport and
+must not be described as one.
+
 Scans use named slots: each edge row stores a base tick plus `NUM_SLOTS`
 fixed-point coefficients, and the FPGA computes
 `effective_tick = base + (sum_j coeff_j * slot_j) >>> COEFF_FRAC_BITS` while

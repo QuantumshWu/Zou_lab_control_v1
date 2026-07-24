@@ -35,7 +35,13 @@ from .evaluate import (
     ResolvedDataset,
     ResolvedDatasetMap,
 )
-from .grid import GRID_INTENTS, grid_facet_axes, grid_facet_axis, resolve_grid_view
+from .grid import (
+    GRID_INTENTS,
+    grid_facet_axes,
+    grid_facet_axis,
+    resolve_grid_view,
+    suggest_default_grid_view,
+)
 from .model import (
     DATASET_VIEW_INTENTS,
     AxisAddress,
@@ -95,6 +101,6 @@ __all__ = [
     "ViewAlternative", "ViewContract", "ViewIntent", "ViewPreferences", "ViewSpec",
     "ViewSuggestion", "contract_for", "dataset_contract_for", "dataset_axes", "display_axis_indices", "fit_single_panel_presentation", "decode_figure_document",
     "decode_view_spec", "encode_figure_document", "encode_view_spec",
-    "GRID_INTENTS", "figure_document_from_tree", "figure_document_to_tree", "grid_facet_axes", "grid_facet_axis", "resolve_grid_view", "suggest_fit_view", "suggest_view",
+    "GRID_INTENTS", "figure_document_from_tree", "figure_document_to_tree", "grid_facet_axes", "grid_facet_axis", "resolve_grid_view", "suggest_default_grid_view", "suggest_fit_view", "suggest_view",
     "selection_fit_view_projection", "validate_view_spec", "view_spec_from_tree", "view_spec_to_tree",
 ]

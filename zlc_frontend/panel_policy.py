@@ -12,8 +12,6 @@ from .form import FormChoice, FormFieldProps
 
 
 VIEW_SPEC_PARAM = "view_spec"
-DEFAULT_GRID_INTENT_PARAM = "default_grid_intent"
-DEFAULT_GRID_FACET_AXIS_PARAM = "default_grid_facet_axis"
 HISTOGRAM_THRESHOLDS_PARAM = "histogram_thresholds"
 HISTOGRAM_CELL_THRESHOLDS_PARAM = "histogram_cell_thresholds"
 RELIM_MODES = ("tight", "normal", "fixed")
@@ -108,8 +106,6 @@ def repeat_mode_label(mode) -> str:
 
 
 __all__ = [
-    "DEFAULT_GRID_FACET_AXIS_PARAM",
-    "DEFAULT_GRID_INTENT_PARAM",
     "HISTOGRAM_CELL_THRESHOLDS_PARAM",
     "HISTOGRAM_THRESHOLDS_PARAM",
     "RELIM_MODES",

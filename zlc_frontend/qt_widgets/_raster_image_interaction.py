@@ -8,7 +8,6 @@ from typing import Callable
 
 from PyQt5 import QtCore, QtGui
 
-from ..image_view import validate_normalized_rectangle
 from ..render import (
     BoardFrame,
     ImagePanelPayload,
@@ -634,18 +633,13 @@ def _normalized_point(
 
 
 def _image_bounds_for_rectangle_drag(
-    binding: _ImagePanelBinding,
+    viewport: ImageViewportTransform,
     visible_bounds: NormalizedRectangle,
-) -> NormalizedRectangle:
-    viewport = binding.viewport
-    full_left, full_top = viewport.full_point_for_visible_point(
-        (visible_bounds[0], visible_bounds[1])
-    )
-    full_right, full_bottom = viewport.full_point_for_visible_point(
-        (visible_bounds[2], visible_bounds[3])
-    )
-    return validate_normalized_rectangle(
-        (full_left, full_top, full_right, full_bottom)
+) -> NormalizedRectangle | None:
+    """Resolve one visible-window drag through its exact painted viewport."""
+
+    return viewport.clipped_full_bounds_for_visible_bounds(
+        visible_bounds
     )
 
 
@@ -720,13 +714,13 @@ def _selection_endpoint_label(
     bounds: NormalizedRectangle,
 ) -> str:
     selected_x_low, selected_y_low, selected_x_high, selected_y_high = (
-        viewport.coordinate_rectangle_for_normalized_bounds(bounds)
+        viewport.coordinate_rectangle_for_full_bounds(bounds)
     )
-    visible_x_low, visible_y_low, visible_x_high, visible_y_high = (
-        viewport.coordinate_rectangle_for_normalized_bounds(
-            viewport.visible_bounds
-        )
-    )
+    # Label precision follows the physical window under the pointer.  Do not
+    # feed ``visible_bounds`` back into a normalized-selection API: those
+    # source-relative values are intentionally unbounded after a legal pan.
+    visible_x_low, visible_x_high = viewport.x_limits
+    visible_y_low, visible_y_high = viewport.y_limits
 
     def precision(span: float) -> int:
         gap = abs(float(span)) / 1000.0 if span else 0.01

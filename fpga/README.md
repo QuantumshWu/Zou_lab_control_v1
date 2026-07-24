@@ -46,11 +46,14 @@ The camera-imaging preset and default trigger inference use `ch11/emCCD/M13`;
 ## Normal Use
 
 ```powershell
-.\fpga\build_and_program.bat --check    # no-board HDL + capacity self-check
-.\fpga\build_and_program.bat            # build + program (create_project.tcl -> program_fpga.tcl)
 .\fpga\run_server.bat --check-config    # print resolved project/bit/ltx/xdc/channels/clock/capacity
 .\fpga\run_server.bat                    # start the persistent server (host 0.0.0.0, port 18861)
 ```
+
+`build_and_program.bat` is not a normal-use command. It is retained only for a
+separately approved, evidence-driven recovery after an actual RTL/deployment
+defect has been established; that workflow must close routed setup/hold timing
+and requalify the image before it may replace the frozen bitstream.
 
 Default clock is 50 MHz (20 ns tick); the minimal pulse width and resolution are
 1 tick. The qualified deployment has 4096 edge rows and two 2048-point scan

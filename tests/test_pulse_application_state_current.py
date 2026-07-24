@@ -7,7 +7,7 @@ import pytest
 
 from Zou_lab_control.notebook import PulseFacade, connect
 from Zou_lab_control.notebook.facade import _service_guard
-from zlc_neutral_atom.pulse_application import (
+from zlc_neutral_atom.devices.sequencer.application import (
     PulseApplicationOwner,
     prepare_pulse_execution,
 )

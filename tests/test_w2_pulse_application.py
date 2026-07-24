@@ -8,7 +8,7 @@ import pytest
 
 from Zou_lab_control.notebook import PulseRunResult, connect
 from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.pulse_application import PulseRunRequest
+from zlc_neutral_atom.devices.sequencer.application import PulseRunRequest
 from zlc_neutral_atom.runtime.run import CancelOutcome, RunState
 from zlc_pulse import (
     DAC_OFFSET_BINARY,

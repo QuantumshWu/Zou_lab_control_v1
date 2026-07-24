@@ -56,7 +56,8 @@ class ConsoleRunNode:
         prepare: Callable[[object], object],
         request_owner_wake: Callable[[], None],
         frozen_request: object = _BUILD_REQUEST,
-        final_presentation_owner: object | None = None,
+        materialize_final_presentations: Callable[[object, object, object], object]
+        | None = None,
     ) -> None:
         if not callable(prepare):
             raise TypeError("prepare must be callable")
@@ -86,18 +87,11 @@ class ConsoleRunNode:
         # cardinality is application-owned request state, never re-derived from
         # form values or a later Dataset revision.
         self._output_declarations = tuple(spec.outputs_for(self._request))
-        if final_presentation_owner is not None and not callable(
-            getattr(
-                final_presentation_owner,
-                "materialize_final_presentations",
-                None,
-            )
+        if materialize_final_presentations is not None and not callable(
+            materialize_final_presentations
         ):
-            raise TypeError(
-                "final_presentation_owner must expose "
-                "materialize_final_presentations()"
-            )
-        self._final_presentation_owner = final_presentation_owner
+            raise TypeError("materialize_final_presentations must be callable")
+        self._materialize_final_presentations = materialize_final_presentations
         self._prepared_command = None
         self._handle = None
         self._start_future: Future | None = None
@@ -509,14 +503,16 @@ class ConsoleRunNode:
                             and not self._final_outputs_submitted
                         ):
                             result = self._final_result
-                            presentation_owner = self._final_presentation_owner
+                            materialize_presentations = (
+                                self._materialize_final_presentations
+                            )
 
                             def materialize_final_outputs():
                                 outputs = outputs_factory(result)
                                 presentations = (
                                     {}
-                                    if presentation_owner is None
-                                    else presentation_owner.materialize_final_presentations(
+                                    if materialize_presentations is None
+                                    else materialize_presentations(
                                         command,
                                         result,
                                         outputs,

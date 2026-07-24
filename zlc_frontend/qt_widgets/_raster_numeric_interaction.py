@@ -185,14 +185,6 @@ def _numeric_viewport_for_presented_panel(
     return candidate
 
 
-@dataclass(frozen=True, slots=True)
-class _NumericCross:
-    """One arbitrary continuous numeric cursor, never a snapped sample."""
-
-    x: float
-    y: float
-
-
 @dataclass(slots=True)
 class _NumericPanelBinding:
     """The sole mutable state for one bound numeric panel."""
@@ -217,7 +209,7 @@ class _NumericPanelBinding:
     pan_anchor: float | None = None
     pan_origin: _NumericViewport | None = None
     pan_candidate: tuple[float, float] | None = None
-    cross: _NumericCross | None = None
+    cross: tuple[float, float] | None = None
     fault: RuntimeError | None = None
 
 
@@ -668,8 +660,9 @@ def _paint_numeric_overlays(
 
             cross = binding.cross
             if cross is not None:
+                cross_x, cross_y = cross
                 selector_color = selector_pen_color()
-                point = widget_point(cross.x, cross.y)
+                point = widget_point(cross_x, cross_y)
                 dx = selector_precision(
                     viewport.x_limits[1] - viewport.x_limits[0]
                 )
@@ -683,7 +676,7 @@ def _paint_numeric_overlays(
                     painter,
                     plot,
                     point,
-                    f"({cross.x:.{dx}f}, {cross.y:.{dy}f})",
+                    f"({cross_x:.{dx}f}, {cross_y:.{dy}f})",
                     color=selector_color,
                 )
 

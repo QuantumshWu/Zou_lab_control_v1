@@ -613,6 +613,48 @@ def test_qt_raster_board_holds_only_the_interacting_panel_while_latest_board_adv
     application.processEvents()
 
 
+def test_qt_raster_board_paints_area_after_unbounded_pan() -> None:
+    """Area label/paint consumes physical viewport limits, not bounded Area input."""
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+
+    application = ensure_qt_app()
+    board = QtRasterBoard(("image",), columns=1)
+    board.resize(240, 180)
+    board.present(
+        _raster_board_frame(
+            ("image",),
+            layout_generation=0,
+            sequence=1,
+            raster_size=(8, 6),
+        )
+    )
+    viewport = _image_viewport(width=8, height=6).panned_by_pixels(
+        (20.0, -10.0),
+        (200, 100),
+    )
+    assert any(value < 0.0 or value > 1.0 for value in viewport.visible_bounds)
+    board.bind_rectangle_selector(
+        "image",
+        viewport,
+        lambda _gesture: None,
+        enabled=True,
+    )
+    board.set_selector_applied_selection(
+        viewport.selection_for_normalized_bounds(
+            (0.25, 1 / 6, 0.75, 5 / 6)
+        ),
+        panel_id="image",
+    )
+
+    painted = _render_qt_widget(board)
+    assert not painted.isNull()
+    board.close()
+    application.processEvents()
+
+
 def test_qt_raster_board_cancels_a_hold_when_panel_semantics_change() -> None:
     from PyQt5 import QtCore, QtTest
 

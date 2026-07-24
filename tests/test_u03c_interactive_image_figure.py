@@ -26,7 +26,6 @@ from zlc_data import (  # noqa: E402
     AxisId,
     AxisSpec,
     BlockId,
-    CellValidity,
     ComponentValidity,
     CoordinateFrameId,
     DataBlock,
@@ -37,8 +36,6 @@ from zlc_data import (  # noqa: E402
     StreamGenerationId,
     ValidityContract,
     ValueSchema,
-    bind_fit,
-    fit_spec_for,
 )
 from zlc_frontend import (  # noqa: E402
     DataFigure,
@@ -54,7 +51,6 @@ from zlc_frontend.figure import (  # noqa: E402
     ResolvedDataset,
     ResolvedDatasetMap,
     ViewIntent,
-    suggest_fit_view,
     suggest_view,
 )
 from zlc_frontend.image_display import ImageColormap  # noqa: E402
@@ -115,7 +111,6 @@ def _image_figure(
     x_coordinates: tuple[float, ...] = (10.0, 12.0, 14.0, 16.0, 18.0),
     y_coordinates: tuple[float, ...] = (20.0, 22.0, 24.0, 26.0),
     coordinate_frame: CoordinateFrameId | None = CoordinateFrameId("u03c-camera"),
-    with_fit: bool = False,
     figure_class=DataFigure,
 ) -> DataFigure:
     repeat = AxisSpec(AxisId("u03c.repeat"), "Repeat", REPEAT, 2, (0, 1))
@@ -173,15 +168,7 @@ def _image_figure(
         block,
     )
     dataset_id = DatasetId("u03c-image-dataset")
-    result = None
-    if with_fit:
-        result = bind_fit(
-            fit_spec_for(schema, "radial_gaussian_center"),
-            schema,
-        ).run(snapshot)
-        suggestion = suggest_fit_view(schema, result)
-    else:
-        suggestion = suggest_view(schema, ViewIntent.IMAGE)
+    suggestion = suggest_view(schema, ViewIntent.IMAGE)
     assert suggestion.spec is not None
     document = FigureDocument(
         "u03c-image-document",
@@ -192,7 +179,6 @@ def _image_figure(
     return figure_class(
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
-        fit_results=None if result is None else {"image": result},
     )
 
 
@@ -372,10 +358,6 @@ def test_image_front_preserves_exact_axes_validity_and_all_display_interactions(
         (
             _image_figure(x_coordinates=(0.0, 1.0, 3.0, 4.0, 5.0)),
             "not exactly regular",
-        ),
-        (
-            _image_figure(with_fit=True),
-            "exactly one layer, cell, and input",
         ),
     ),
 )

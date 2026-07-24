@@ -8,22 +8,24 @@ import threading
 import numpy as np
 import pytest
 
-from zlc_neutral_atom.acquisition import (
+from zlc_neutral_atom.devices.camera.contract import (
     CameraAcquisitionMode,
     CameraCaptureSpec,
     freeze_camera_capture_spec,
 )
-from zlc_neutral_atom.adapter_sdk import (
+from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureTerminalRecord,
     CameraFrameRecord,
     CameraWorkingPoint,
 )
-from zlc_neutral_atom.bootstrap._camera_endpoint import CameraCaptureEndpoint
-from zlc_neutral_atom.runtime.capture import (
+from zlc_neutral_atom.devices.camera.endpoint import CameraCaptureEndpoint
+from zlc_neutral_atom.devices.camera.capture_port import (
     CompleteCaptureCommand,
     PrepareCaptureCommand,
     ReadCaptureCommand,
     StartCaptureCommand,
+)
+from zlc_neutral_atom.devices.camera.contract import (
     camera_capability_evidence_from_tree,
     camera_capability_evidence_to_tree,
 )
@@ -41,7 +43,6 @@ from zlc_storage import canonical_digest
 
 
 class _Camera:
-    max_pending_records = 2
     timeout = 1.0
 
     def __init__(
@@ -97,12 +98,12 @@ class _Camera:
         frames: int,
         *,
         source_group_sizes: tuple[int, ...] | None,
-        max_inflight_frames: int,
+        buffer_frame_count: int,
         timeout: float,
     ) -> None:
         assert source_group_sizes is not None
         assert sum(source_group_sizes) == frames
-        assert max_inflight_frames == 2
+        assert buffer_frame_count == frames
         assert timeout > 0
         self.arm_entered.set()
         if self.block_arm and not self.release_arm.wait(2.0):

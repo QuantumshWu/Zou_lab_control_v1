@@ -37,8 +37,8 @@ from zlc_data import (
     ValidityContract,
     ValueSchema,
 )
-from zlc_neutral_atom.readout.sitemap import load_packaged_sitemap_pulse
-from zlc_neutral_atom.scan import AutonomousScanExecution
+from zlc_neutral_atom.logic_nodes.calibration.sitemap import load_packaged_sitemap_pulse
+from zlc_neutral_atom.logic_nodes.pulse_scan import AutonomousScanExecution
 from zlc_pulse import FrozenScanTable, RepeatRegion, ScanParameter
 from zlc_frontend import CurvePanelPayload, DataFigure
 from zlc_frontend.curve_display import (
@@ -672,7 +672,7 @@ def test_public_autonomous_occupancy_scan_opens_exact_curve_grid(
                     source_series.data.validity,
                 )
             assert payload.evaluated_input.ref == expected_figure.evaluated.inputs[0].ref
-            assert not window._analyze_button.isVisible()
+            assert not window._fit_button.isVisible()
             assert "display projection" in window._diagnostic.text()
             assert "axis-complete source view" in window._diagnostic.text()
         finally:

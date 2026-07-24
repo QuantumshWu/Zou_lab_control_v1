@@ -512,7 +512,7 @@ def test_public_occupancy_counts_entry_opens_the_histogram_grid(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    from zlc_neutral_atom.readout.sitemap import load_packaged_sitemap_pulse
+    from zlc_neutral_atom.logic_nodes.calibration.sitemap import load_packaged_sitemap_pulse
 
     owner_thread = threading.get_ident()
     calls = []

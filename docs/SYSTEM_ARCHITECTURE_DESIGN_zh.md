@@ -7,7 +7,7 @@
 目标不是把当前类机械搬进新目录，而是建立以下不变量：
 
 1. data kernel、pulse/FPGA、neutral_atom、frontend 和 composition app 的职责与依赖方向唯一。
-2. Task、Measurement、StreamProcessor、Analysis 的语义清晰且不能互相冒充。
+2. Task、Measurement、Processor、Analysis 的语义清晰且不能互相冒充；stream/latest-only/exact 只描述执行或交付策略，不产生第二种领域 Processor。
 3. 多维数据、validity、axis、lineage 在采集、处理、拟合、显示和保存过程中不丢失。
 4. 正式采集、实时监视、控制状态和运行事件使用不同通信语义。
 5. 正式 PulseScan 的软件 reservation/cursor/processor/materializer 链端到端 exact；物理 frame↔trigger 关联由 `ORDERED_END_ATTESTED_RUN` 的 Q0 qualification envelope、冻结 schedule 与整 run 对账成立，并显式保存当前硬件下无法排除的剩余风险。
@@ -68,8 +68,8 @@ formal_fire_allowed :=
   and frozen compiled schedule/settings/expected frame count 完整
   and 每个 formal physical source 的 qualification/capability 精确覆盖本设备、软件版本与冻结设置
       （若 source 是 qCMOS：active Q0 还必须覆盖 camera settings 与 trigger interval margin）
-  and source-specific硬件/驱动记录容量与冻结事件数量相容
-      （若 source 是 qCMOS：driver ring 按相机工作模式与 max-inflight 配置，不把 total frames 当成driver buffer数）
+  and source-specific硬件/驱动几何与冻结事件数量相容
+      （若 source 是 qCMOS：finite driver ring 的 buffer_frame_count 等于完整 expected_frames）
   and exact reservation/cursor/owner claims 已建立
   and（若为API_SLOT_SEGMENTED_EXISTING：整run camera authorization已在首次FIRE前固定，
       首cell已满足arm-ready/first-edge margin；后续cell的上一camera event与physical pulse terminal已完成，
@@ -99,7 +99,7 @@ hardware_change_review_allowed :=
 - 仍通过 `task_console.bat`、`pulse_gui.bat` 和 notebook 启动系统；
 - PulseGUI 仍保留 Edit、Preview、Scan 三个主要工作区；
 - TaskConsole 仍使用 Add Panel、Setting、Edit、Start、Stop、Save/Load；
-- Measurement、Processor、Task 仍可从 catalog 选择并连接；其中 UI 中的 `Processor` 明确对应在线 `StreamProcessor`。用户可见拟合一律命名为 `Fit`；Calibration/Report 保持各自领域名称，不建立泛化的 `Analysis` 菜单或节点；
+- Measurement、Processor、Task 仍可从 catalog 选择并连接；`Processor` 是唯一产品与领域名称，在线 latest-only 与 formal exact 只是它在不同 host 中的执行策略。用户可见拟合一律命名为 `Fit`；Calibration/Report 保持各自领域名称，不建立泛化的 `Analysis` 菜单或节点；
 - live image、rolling plot、histogram、site map、fit overlay 的视觉语言保持一致；
 - virtual 与 real 仍只替换最低层设备 adapter；
 - pulse prepare/fire/safe、camera arm/read/terminal-drain/disarm 的用户操作流程保持；内部会把旧的“stop后立即release”纠正为可验证的terminal recipe。
@@ -110,11 +110,11 @@ hardware_change_review_allowed :=
 - 非标量数据会自动得到一个可见、可改的默认视图；当选择或降维要进入 fit、scan y 或派生 artifact 等权威结果时，必须冻结为 CommittedTransform，不再暗中取第 0 项；
 - history gap、schema change、缺帧和硬件 mismatch 会明确失败，不再显示拼接结果；
 - qCMOS只有在当前adapter版本的Q0 qualification对目标工作点有效、preflight trigger余量通过且整run EndAttestation一致时才可产出Formal ScanArtifact；否则只能monitor或整run INVALID；
-- qCMOS autonomous与API segmented正式扫描都一次arm整个run session、用按max-inflight定容的driver ring持续排空全部帧；正常SCAN_SLOT把完整逻辑scan table在fire前冻结，resident能力在fire前上传全部物理rows，条件refilled能力只供应冻结chunk，二者都由FPGA自主执行微观时序；仅API-slot值无法无缝更新时沿用既有segmented路径，按R-major/P-fast执行独立`STATIC_ONCE` pulse session并在segment间保留显式host gap，但相机不重复arm/stop且只做整run aggregate attestation；SCAN_SLOT/MOT不允许退化为逐cell host stepping；
+- qCMOS autonomous与API segmented正式扫描都一次arm整个run session、按完整`expected_frames`分配driver ring并持续排空全部帧；正常SCAN_SLOT把完整逻辑scan table在fire前冻结，resident能力在fire前上传全部物理rows，条件refilled能力只供应冻结chunk，二者都由FPGA自主执行微观时序；仅API-slot值无法无缝更新时沿用既有segmented路径，按R-major/P-fast执行独立`STATIC_ONCE` pulse session并在segment间保留显式host gap，但相机不重复arm/stop且只做整run aggregate attestation；SCAN_SLOT/MOT不允许退化为逐cell host stepping；
 - Stop 后若设备尚未确认退出，UI 显示 `CANCELLING`，不会提前宣称已停止；
 - 同一个 TaskConsole 内的新 Logic run 若与另一行发生 typed resource conflict，shell 用 runtime 返回的 exact conflicting RunId 停止那一行，等待其真实 terminal 后自动重试原冻结请求；复合 Task 必须把 child admission rejection 作为 typed `ResourceBusy` 随 `RunSnapshot` 原样带回，shell 只归一化 direct/composite 两条 typed 路径，禁止解析错误文本；外部窗口/进程 owner 仍明确拒绝，runtime 错误与 admission 逻辑不被绕过；
 - 保存文件只接受当前 artifact schema；历史数据通过独立离线转换工具处理；
-- monitor 可能跳过中间帧以保持实时，但一次画面中的相关信号不会来自不同 shot；
+- frontend render 可以用新revision替换尚未开始的display工作以保持实时，但monitor数据交付不跳帧，一次画面中的相关信号也不会来自不同 shot；
 - 重型 grid/多 panel board 由 worker raster 后整板 coherent present，视觉与交互保持，但内部不再让 GUI/worker 无确认共享 Figure；
 - Pulse prepare/upload、长 fit 和 calibration 不再阻塞 GUI thread。
 
@@ -251,13 +251,13 @@ validity 不能只停在 `(R,P)`：readout fidelity 已经产生 `(group,site)` 
 - TaskOutput 构成第二套 mutable 数据通道；
 - final y 的 reservation 不能自动保证上游 camera -> processor 每条边都 exact。
 
-当前 finite CameraMeasurement 每来一帧重新发布累计 `(1..K)` repeat block，TensorStore full publish 又把整个 repeat-capacity current state复制进 journal；已删除的旧 `OccupancyProcessor` 还曾从头遍历所有已累计 R/P，因此实测 journal payload 随 K² 增长。删除旧 processor 并没有消除 camera/materializer 的根因。把 camera pending queue 改成 O(1)、有界且 overrun-fatal 也只能解决 adapter 边界的保留与覆写问题，不会自动消除上层的累计重发布。根因是 sample event、mutable materializer 与 immutable dataset 被同一个“signal tensor update”冒充；目标实现必须一次只处理一个 sample、builder 私有增量写、UI 按 revision 请求 snapshot，而不是只把 history size 调小。
+当前 finite CameraMeasurement 每来一帧重新发布累计 `(1..K)` repeat block，TensorStore full publish 又把整个repeat current state复制进journal；已删除的旧 `OccupancyProcessor` 还曾从头遍历所有已累计 R/P，因此实测 journal payload 随 K² 增长。删除旧 processor 并没有消除 camera/materializer 的根因。根因是 sample event、mutable materializer 与 immutable dataset 被同一个“signal tensor update”冒充；目标实现必须一次只处理一个 sample、builder 私有增量写、UI 按 revision 请求 snapshot，不能以缩小队列或历史长度掩盖累计重发布。
 
 多 signal `next_coherent_update` 当前会寻找下一个共同 provenance 并推进掉更快流的 unmatched 更新；这对 coherent monitor 可以接受，却不能自动代表 formal EXACT_KEY。JoinPolicy 必须在 pipeline 合同中显式区分“允许跳过并计数”与“缺 key 立即失败”。
 
-真 qCMOS 的 capture `nFrameCount` 是产出帧累计数；DCAM SDK 与迁移前旧实现还能读取 `nNewestFrameIndex`、framestamp/camerastamp/timestamp。这些旧实现及 fake-driver 测试只是最终 adapter 的物理/算法 oracle，不是 current 交付状态：当前 target tree 已有 immutable `CameraFrameRecord`、`CameraAdapter` Protocol 和 generic `CameraCaptureEndpoint`，但 concrete adapter 只有 `VirtualCamera`；production DCAM driver/adapter、backend physical-owner proof、live hardware identity/AssetMap 与 local qCMOS + remote pulse composition 都尚未交付。最终 target-owned DCAM adapter 必须重新实现并用 current contract kit 验证以下合同：exact 路径中 `cap_transferinfo()` 失败、负数或计数倒退均立即失败；每次先读累计 count，有已存在 backlog 就直接排空，只有 count 与 drained cursor 相等才等待新 ready event；ring 槽位由同一次 snapshot 的 `nNewestFrameIndex` 反推，不得假设 `source_ordinal % ring_size`；每帧复制后重读 count，复制期间可能被 ring 覆盖则整次采集失败；wait 与 backlog copy 共用同一总 deadline，帧间检查 Stop；同一有界 pending record queue 保留 produced count、frame/camera stamp、timestamp 与实际 driver ring index。driver ring 只按经资格化的 max-inflight burst 定容，完整 run 保留属于 host exact stream/dataset，不按 `total_frames` 重复分配同样大的相机 ring。
+真 qCMOS 的 capture `nFrameCount` 是产出帧累计数；DCAM SDK 与迁移前旧实现还能读取 `nNewestFrameIndex`、framestamp/camerastamp/timestamp。这些旧实现及 fake-driver 测试只是最终 adapter 的物理/算法 oracle，不是 current 交付状态：当前 target tree 已有 immutable `CameraFrameRecord`、`CameraAdapter` Protocol 和 generic `CameraCaptureEndpoint`，但 concrete adapter 只有 `VirtualCamera`；production DCAM driver/adapter、backend physical-owner proof、live hardware identity/AssetMap 与 local qCMOS + remote pulse composition 都尚未交付。最终 target-owned DCAM adapter 必须重新实现并用 current contract kit 验证以下合同：exact 路径中 `cap_transferinfo()` 失败、负数或计数倒退均立即失败；每次先读累计 count，有已存在 backlog 就直接排空，只有 count 与 drained cursor 相等才等待新 ready event；ring 槽位由同一次 snapshot 的 `nNewestFrameIndex` 反推，不得假设 `source_ordinal % ring_size`；每帧复制后重读 count，复制期间可能被 ring 覆盖则整次采集失败；wait 与 backlog copy 共用同一总 deadline，帧间检查 Stop；每条owned record保留 produced count、frame/camera stamp、timestamp 与实际 driver ring index。finite driver ring 的`buffer_frame_count`等于完整`expected_frames`；monitor则等于`history_cycles * frames_per_cycle`，endpoint不再派生第二个软件上限。
 
-上述合同即使在最终 adapter 中实现，也只会关闭 host retention、槽位映射和已观察 overrun 的静默错位，并不自动证明 max-inflight 数值或外触发工作区间内“一触发一帧、按序、无漏帧”。当前不存在可组成的真实 qCMOS adapter，更不存在可激活的真机 qualification；generic endpoint 在 qualification digest 为 `None` 时会于 arm 前拒绝 exact prepare，当前只有 virtual installation 组成了 deterministic source 并可放行。旧 `read_frames()/acquire()` array-only consumer仍会在record边界后丢掉metadata；若旧上层继续取latest或累计重发布，软件仍可能形成第二套真相源。近期完成路径不改变冻结bitstream：E0a先用现有系统探索目标 exposure/ROI/readout/触发间距，S1/H1稳定后Q0再用最终adapter、CaptureSession与buffer/drain policy建立可发布的经验性ordered-trigger qualification，并把worst-case outstanding、单帧复制/排空延迟、ring覆盖余量与完整call bound写进同一个envelope；preflight用编译后trigger schedule与该qualification envelope的最小帧间隔+安全余量拒绝过快scan。autonomous与API segmented都只arm一次完整run camera session。autonomous由唯一I/O owner读取现有raw FPGA STATUS/CURSOR证明冻结table logical terminal；API则按R-major/P-fast保存每个独立STATIC_ONCE PulseSession的physical terminal，只有全部R×P cell完成后才terminalize同一个camera capture。两者最终都用一个run级CameraRunEvidence，把expected trigger total与按Q0 reset/rollover语义计算的本session相机产出增量、完整frame/camera stamp/timestamp连续性及exact coverage一次对账。任一不符使整个run INVALID，重跑只能由用户或显式有限RetryPolicy发起。该合同不能像逐沿硬件tag那样定位具体错误，也不能绝对排除漏一帧同时多一帧的等量抵消；这是冻结硬件约束下明确接受的剩余风险，不能在文档中伪装成同等证明强度。
+上述合同即使在最终 adapter 中实现，也只会关闭host所有权、槽位映射和已观察真实覆盖的静默错位，并不自动证明外触发工作区间内“一触发一帧、按序、无漏帧”。当前不存在可组成的真实 qCMOS adapter，更不存在可激活的真机 qualification；generic endpoint 在 qualification digest 为 `None` 时会于 arm 前拒绝 exact prepare，当前只有 virtual installation 组成了 deterministic source 并可放行。旧 `read_frames()/acquire()` array-only consumer仍会在record边界后丢掉metadata；若旧上层继续取latest或累计重发布，软件仍可能形成第二套真相源。近期完成路径不改变冻结bitstream：E0a先用现有系统探索目标 exposure/ROI/readout/触发间距，S1/H1稳定后Q0再用最终adapter、CaptureSession及固定的`buffer_frame_count`派生式建立可发布的经验性ordered-trigger qualification，并把单帧复制/排空延迟、真实ring覆盖检测与完整call bound写进同一个envelope；preflight用编译后trigger schedule与该qualification envelope的最小帧间隔+安全余量拒绝过快scan。autonomous与API segmented都只arm一次完整run camera session。autonomous由唯一I/O owner读取现有raw FPGA STATUS/CURSOR证明冻结table logical terminal；API则按R-major/P-fast保存每个独立STATIC_ONCE PulseSession的physical terminal，只有全部R×P cell完成后才terminalize同一个camera capture。两者最终都用一个run级CameraRunEvidence，把expected trigger total与按Q0 reset/rollover语义计算的本session相机产出增量、完整frame/camera stamp/timestamp连续性及exact coverage一次对账。任一不符使整个run INVALID，重跑只能由用户或显式有限RetryPolicy发起。该合同不能像逐沿硬件tag那样定位具体错误，也不能绝对排除漏一帧同时多一帧的等量抵消；这是冻结硬件约束下明确接受的剩余风险，不能在文档中伪装成同等证明强度。
 
 ### 3.6 UI 与 render 所有权不清
 
@@ -298,13 +298,21 @@ streamed scan 的 inactive bank 目前依赖host写data -> chunk id -> ready的�
 ```text
 zlc_data           通用 Value/DataBlock、axis/validity、Selection 语义、transform/reduction/fit
 zlc_pulse          Pulse 文档、FPGA target/compiler、host、transport、RTL 和 build
-zlc_neutral_atom   实验 runtime、设备 port、Task/Measurement/StreamProcessor/领域 Analysis
+zlc_neutral_atom   实验 framework 骨架，以及显式挂接的 devices / logic_nodes 附件
 zlc_frontend       View/Figure/DataFigure、render、selector controller 和 Qt 组件
 zlc_storage        canonical bytes/digest + content-addressed blob 与 atomic manifest 存储引擎
 zlc_workbench      只接显式应用端口的桌面/Qt 产品实现
 Zou_lab_control.workbench  把已建立的 Experiment 拆成逐窗口端口的桌面 composition adapter
 Zou_lab_control.notebook  headless composition 与薄 Experiment 门面
 ```
+
+`zlc_neutral_atom` 的内部目录不是按历史调用阶段横切，而是固定为“骨架 + 两类附件”。骨架只包含 catalog/authoring/input-output contract、installation/composition、generic Run/stream/resource runtime 与跨节点确有复用的最小协议；`devices/` 包含具体设备 Port/adapter/SDK glue/endpoint、真实连接与 virtual physical implementation；`logic_nodes/` 包含具体 Task/Measurement/Processor 的 Definition、typed Request/Config、input specs、output declarations、prepare/evaluate/materialize、专用 timing 与 artifact。framework 可以依赖抽象设备 Port，logic-node 可以依赖 framework 与设备 Port；logic-node 不得依赖 concrete adapter，设备实现不得反向依赖 readout/calibration/MOT 等 logic-node 语义。
+
+当前 catalog 只有八个一等 capability，而不是一个可扫描插件宇宙：`camera_measurement`、`pulse_scan`、`calibration`、`mot_field`、`occupancy`、`temperature_release_recapture`、`readout_duration_fidelity`、`grey_molasses_detuning`。每个 capability 在 `logic_nodes/<capability>/` 内闭合自己的 Definition→authoring→request→binding→application→outputs；真实存在的共享物理语义只允许进入具名 `logic_nodes/readout_common/`、`logic_nodes/release_recapture_common/` 或 `logic_nodes/camera_capture/`，不能退化成 `common/utils/core`。删除某个 capability 时，除一处显式 composition 清单及确有消费者的共享 owner 外，其目录应可整体删除。
+
+`Processor` 是唯一的 catalog、领域和产品类型。`latest-only` 只是当前 live source 的内部 delivery policy，`exact/finite` 只是其它执行策略；它们不得产生 `MonitorProcessor`、第二套 Definition/form/binding/node 或 public hierarchy。TaskConsole 可以用一条私有 latest-only lane 执行已经 prepared 的 Processor，但 lane 只拥有排队、pending revision 替换与 owner-thread handoff，不认识 Occupancy 或任何领域 output，更不得把处理器未执行的中间 revision 写成生产者的采集 gap。
+
+concrete capability 通过普通 import 和 composition root 的一个显式 immutable attachment tuple 接入：每项只连接 `Definition -> owner builder/preparer -> optional presentation adapter`；稳定路由身份仍取该 Definition 的 `DefinitionKey`。这不是动态 registry：无包扫描、无 entry point、无 FQCN、无运行期注册/替换；Definition 本身仍是纯声明值，不能持 callable。反过来 composition root 也不能重述 Occupancy 需要 Camera 哪个字段、Calibration 哪个 signal、PulseScan 哪个 binding key：input specs 与 request binding 均由 capability owner提供，通用 host只机械解析。新增一个普通节点最多新增其 attachment 目录并在该显式 tuple 加一项，不能再修改 `task_console/app.py/catalog_bridge.py/window.py` 的具名分支。
 
 `zlc_data` 不是新的 `common/utils`：它只容纳领域中立、headless、可序列化的数据语义和值上的纯算法。它拥有 Value/DataBlock、Axis/Validity/PointLayout、Selection/CommittedTransform、Reduction、FitSpec/BoundFit/FitResultBatch、closed model catalog 与同步 solver；`FitProblem` 只是包内瞬时 packing 值，唯一公开执行入口是 `BoundFit.run()`。它不知道 Hub、Run、Device、neutral artifact、Figure、Qt 或 Matplotlib。
 
@@ -359,6 +367,8 @@ Zou_lab_control.notebook[workbench] -> Zou_lab_control.workbench -> zlc_workbenc
 - frontend 导入 neutral_atom、pulse 或 workbench；
 - pulse 导入 data、frontend、neutral_atom 或 workbench；
 - neutral_atom domain/runtime 导入 frontend 或 workbench；
+- neutral_atom framework/runtime 导入任一 concrete logic-node 算法或 concrete device adapter；
+- `devices/` 导入 `logic_nodes/`，或 `logic_nodes/` 直接导入 DCAM/remote/virtual concrete attachment；logic-node 只能消费设备 Port/descriptor；
 - zlc_workbench 导入 Zou_lab_control.notebook、调用 connect、接收或保存 Experiment；
 - composition root 以外实例化 concrete adapters。
 
@@ -370,7 +380,7 @@ Zou_lab_control.notebook[workbench] -> Zou_lab_control.workbench -> zlc_workbenc
 - `Zou_lab_control.workbench.open_*(Experiment, ...)`与standalone launcher：desktop adapter，只把一个已建立installation拆成逐窗口显式端口；`zlc_workbench.open_*`仅组装对应Qt产品，不建立installation；
 - `zlc_pulse.server_app` 与 FPGA launcher：可独立部署的 current pulse server 根。
 
-`zlc_neutral_atom.bootstrap` 是 composition-private implementation package，包根 `__init__` 不导出构造器；当前 notebook root 只在 `connect()` 内惰性调用私有 installation factory。不存在 public `create_domain_experiment`、第二个 headless session root或顶层 `Zou_lab_control.connect` 转发。这样用户只有 `Zou_lab_control.notebook` 一个 canonical connect，领域包之间也不会多出 notebook 依赖层；若仓库保留独立 launcher，它只能调用上述 application root，不能形成第二套 facade/API 名称。
+`zlc_neutral_atom.bootstrap` 是 composition-private config dispatch package，包根 `__init__` 不导出构造器；它只校验 config 类型并明确分派到一个 concrete installation factory。machine AssetMap/adapter identity facts 属于更低层的 `installation_assets.py`，connection-lifetime runtime/catalog/graph 与逆序 close 属于 `installation_runtime.py`；具体 graph assembly 由 `devices/<kind>/installation.py` 消费这些低层 owner 完成，因此 devices 绝不反向 import bootstrap。bootstrap 不保存 DCAM/remote/virtual 类、物理 wiring、Measurement binder 或默认参数副本。当前 notebook root 只在 `connect()` 内惰性调用私有 installation factory。不存在 public `create_domain_experiment`、第二个 headless session root或顶层 `Zou_lab_control.connect` 转发。这样用户只有 `Zou_lab_control.notebook` 一个 canonical connect，领域包之间也不会多出 notebook 依赖层；若仓库保留独立 launcher，它只能调用上述 application root，不能形成第二套 facade/API 名称。
 
 可复用 library 内禁止通过 FQCN、包扫描或 service locator 动态构造依赖。
 
@@ -434,7 +444,7 @@ ResourceArbiter 不提供 connection-establishment lease：正常 open/bind 发�
 
 当前virtual graph直接消费 `zlc_pulse.load_deployed_pulse_target()`，不再把旧 `PortCatalog` 投影成第二份拓扑；canonical clock来自同一checked-in FPGA config。标准模拟接线只有实际被物理模型消费的cooling `ch00/ch01`、probe `ch03`、trap `ch09`、camera trigger `ch11`，以及`VirtualMonitorCamera`消费的`da_bias_x/y/z`三根MOT DAC（每根连同自己的latch clock）；其它deployed lane虽仍属于sequencer执行ABI，却不冒充模拟器能力、不进入virtual operator manifest。trap只作为camera背后的私有物理模型，不进入public catalog；public catalog只含camera/sequencer immutable `DeviceInfo`，关闭顺序固定camera→sequencer→trap。
 
-这里“virtual=real”指两者共享`PulseTarget`执行模型与同一Run/compile路径，不指两者暴露相同数量的operator port。`PulseTarget`只拥有stable internal port key到ordered raw lane的执行ABI；该key只服务引用与原子重映射，**不是操作者channel name且不得作为界面首列**。可编辑`label/signal`才是operator-visible逻辑通道名，改名保持stable key从而不错误断开既有pulse引用。`zlc_pulse.PulseTargetManifest`把一个backend实际暴露的port子集绑定到lane-aligned operator endpoint，并作为`SequencerCapabilitySnapshot/PulseTargetDescriptor`的一部分进入capability fingerprint。manifest是唯一endpoint来源，UI不得按rank、lane序号或本机文件猜测。`PulseDocument.visible_ports`只保存Offline authoring偏好；Virtual/Remote各自的当前显示集合是controller-owned view state并受各自manifest约束，Show All/Hide Off不得反写文档、制造dirty或覆盖Offline选择。切换manifest时Edit页一次投影对应集合；channel区域永久预留同一Fluent scrollbar gutter，内容从未溢出变成溢出也不能横向推动整块布局。
+这里“virtual=real”指两者共享`PulseTarget`执行模型与同一Run/compile路径，不指两者暴露相同数量的operator port。`PulseTarget`只拥有stable internal port key到ordered raw lane的执行ABI；该key只服务引用与原子重映射，**不是操作者channel name且不得作为界面首列**。可编辑`label/signal`才是operator-visible逻辑通道名，改名保持stable key从而不错误断开既有pulse引用；正因为它可编辑，领域代码也不得用`label == "probe"`、key字符串或lane序号猜物理角色。具体Measurement必须从冻结request的显式binding，或从已冻结waveform与设备/Calibration事实唯一推导角色并交叉验证，执行时只保留stable key/endpoint identity。`zlc_pulse.PulseTargetManifest`把一个backend实际暴露的port子集绑定到lane-aligned operator endpoint，并作为`SequencerCapabilitySnapshot/PulseTargetDescriptor`的一部分进入capability fingerprint。manifest是唯一endpoint来源，UI不得按rank、lane序号或本机文件猜测。`PulseDocument.visible_ports`只保存Offline authoring偏好；Virtual/Remote各自的当前显示集合是controller-owned view state并受各自manifest约束，Show All/Hide Off不得反写文档、制造dirty或覆盖Offline选择。切换manifest时Edit页一次投影对应集合；channel区域永久预留同一Fluent scrollbar gutter，内容从未溢出变成溢出也不能横向推动整块布局。
 
 Remote server启动时同时读取canonical target与**server-side** XDC，逐lane验证XDC signal、DAC bit order、latch clock与target完全一致，随后在current RPC snapshot发布含package pins的manifest；客户端绝不读取自己的XDC覆盖远端authority，缺失/不一致在socket开放前失败。Virtual manifest只由installation-owned simulator wiring构造，因而精确发布5个digital与3个MOT DAC；它不维护fake XDC。package pin/simulator endpoint不进入PulseDocument或wire ABI，但PulseGUI Edit左列只显示当前manifest endpoint（如`F15`或`SIM:C0`），右列显示文档signal label，内部`chNN`不再冒充operator hardware name；Show All也只能在manifest公开集合内工作。
 
@@ -493,7 +503,7 @@ baseline 没有在同一active runtime内替换config/device/virtual-real，也�
 
 #### 4.2.3 adapter 作者、测试与 simulation 的命名空间
 
-普通 `Zou_lab_control.neutral_atom`/`Zou_lab_control` umbrella 不导出 adapter base、concrete adapter、DeviceSet、loader、server bootstrap 或 raw pulse helper。adapter 作者使用明确的 `zlc_neutral_atom.adapter_sdk` 合同与 parameterized contract kit；virtual/fault-injection 测试使用 `zlc_neutral_atom.testing`/`simulation`；真实 server 使用自己的 application/CLI bootstrap。adapter SDK 可以公开最小生命周期/Port 实现合同，但不能成为普通 Experiment 对象图的一部分，也不能提供 `lookup=globals()`、包扫描或运行时任意注册逃生口。真实adapter的构造/open/drive还必须消费composition owner签发的不可伪造owner capability并绑定owner lane；仅从owner module导入类不能得到可运行的真实硬件对象。Python反射不作为恶意安全沙箱，但普通协作代码绕过authority必须在构造或第一次drive前fail closed。
+普通 `Zou_lab_control.neutral_atom`/`Zou_lab_control` umbrella 不导出 adapter base、concrete adapter、DeviceSet、loader、server bootstrap 或 raw pulse helper。adapter 作者只使用对应 `zlc_neutral_atom.devices.<kind>.contract` 与 parameterized contract kit；virtual/fault-injection 使用 `zlc_neutral_atom.devices.simulation`/`testing`，真实 server 使用自己的 application/CLI bootstrap。device contract 可以公开最小生命周期/Port 实现合同，但不能成为普通 Experiment 对象图的一部分，也不能提供 `lookup=globals()`、包扫描或运行时任意注册逃生口。真实adapter的构造/open/drive还必须消费composition owner签发的不可伪造owner capability并绑定owner lane；仅从owner module导入类不能得到可运行的真实硬件对象。Python反射不作为恶意安全沙箱，但普通协作代码绕过authority必须在构造或第一次drive前fail closed。
 
 ### 4.3 Data 与 Frontend 内部层次
 
@@ -546,7 +556,7 @@ neutral_atom 只依赖 `zlc_data`，不依赖 frontend 的任何层。
 
 这道门必须产生一张随切片提交的机械矩阵，而不是只写“已参考旧实现”：`legacy symbol -> 当前全部consumer -> import/状态依赖 -> 保留的行为合同 -> MOVE/ADAPT/RETIRE -> current owner -> last-consumer删除切片`。只要一个consumer、依赖或删除切片未知，就不能重写或删除。尤其“新窗口已经能显示”不能证明旧composite可删；必须证明它的参数域、动态刷新、commit/rollback、精度、快捷键、生命周期和全部产品面都已有current替代。
 
-首轮库存不是只有基础控件，后续纵切至少要逐项核验以下已挣得结构：Pulse侧的`PulseStateUIManager/PeriodCard/PulseDragContainer/RepeatBracket/ChannelNamesPanel/ChannelPanel`；TaskConsole侧的`MeasurementPanel` form loop、`LogicNodeEditor`的Setting/Edit同源、grouped signal tree helpers、`PanelConfig + pack/drop_index + _PanelBoard`以及`PanelCard/PanelEditor`的单writer同步；figure侧的`BaseLivePlot/GridPlot/GridCell`增量artist与grid focus、`selectors.py`的ROI/cross/zoom/disconnect、`DataFigure/SavedFigure`交互与重放、`calibration_report.py`的site histogram/PSF/site-map布局、`figure_viewer.py`的artifact浏览壳，以及DeviceManager的统一handler/readback/限流。旧`AnalysisControls/_FitFixSeedEditor`已核验为Hub时代的第二份FitRequest/solver lifecycle，不能表达current named-axis FitSpec，故已删除且不再是salvage候选；Fit界面只复用current DataFigure的Fit authoring owner。这个清单是salvage入口，不是要求整类照搬：纯presentation或纯layout算法优先MOVE；携带旧Hub、LogicNode、mutable config、raw hardware或旧artifact状态的类必须拆出已验证的view/interaction算法，再接到current typed owner与EditorSession。每个未来monitor/rolling/calibration/fit/selector窗口在写新widget前都要先给这张库存追加真实consumer和裁决，不能等窗口写完再做“复用清理”。
+首轮库存不是只有基础控件，后续纵切至少要逐项核验以下已挣得结构：Pulse侧的`PulseStateUIManager/PeriodCard/PulseDragContainer/RepeatBracket/ChannelNamesPanel/ChannelPanel`；TaskConsole侧由旧`MeasurementPanel`提炼出的current `LogicNodeParameterPanel` form loop、`LogicNodeEditor`的Setting/Edit同源、grouped signal tree helpers、`PanelConfig + pack/drop_index + _PanelBoard`以及`PanelCard/PanelEditor`的单writer同步；figure侧的`BaseLivePlot/GridPlot/GridCell`增量artist与grid focus、`selectors.py`的ROI/cross/zoom/disconnect、`DataFigure/SavedFigure`交互与重放、`calibration_report.py`的site histogram/PSF/site-map布局、`figure_viewer.py`的artifact浏览壳，以及DeviceManager的统一handler/readback/限流。旧`AnalysisControls/_FitFixSeedEditor`已核验为Hub时代的第二份FitRequest/solver lifecycle，不能表达current named-axis FitSpec，故已删除且不再是salvage候选；Fit界面只复用current DataFigure的Fit authoring owner。这个清单是salvage入口，不是要求整类照搬：纯presentation或纯layout算法优先MOVE；携带旧Hub、LogicNode、mutable config、raw hardware或旧artifact状态的类必须拆出已验证的view/interaction算法，再接到current typed owner与EditorSession。每个未来monitor/rolling/calibration/fit/selector窗口在写新widget前都要先给这张库存追加真实consumer和裁决，不能等窗口写完再做“复用清理”。
 
 **W-UI1声明式表单抢救是后续窗口按consumer分段通过的硬前置，不是末尾清理，也不是一次预造旧全集。** W-UI0只完成Fluent primitive、style、render与window lifecycle owner；它没有完成旧树早已存在的“字段声明 -> 单一handler registry -> Setting/Edit共用”机制。W-UI1a先交付W3已经消费的static scalar/typed choice/exact populate；W-UI1b必须在monitor/Measurement/Processor出现动态stream/device选项前交付typed option snapshot + revision + stale-draft拒绝。真实live-control出现时，由该consumer自己的command合同声明提交节奏与teardown语义；没有consumer时不得先造通用throttle/debounce包装。某一段没有真实current consumer时不得为“完整”提前搬JSON、Hub expression或万能schema，但对应产品纵切也不得先写一份临时控件绕过门。
 
@@ -573,7 +583,11 @@ Workbench EditorSession -> typed Request/Intent constructor -> owner validator
   -> base_revision检查 -> atomic Apply
 ```
 
-这里以§10的轻量Definition规则为准：`TaskDefinition/MeasurementDefinition/StreamProcessorDefinition`只保存catalog identity与`request/config_schema_id`等稳定身份，不复制字段默认值或GUI schema。字段语义在对应typed Request/Config owner旁边有且只有一份声明；Workbench通过显式owner函数取得并投影，不能凭dataclass signature/AST反射，也不能把schema-id变成service locator。`FormSpec`是一次界面投影，不持久化、不参与artifact/config fingerprint、不成为第二validator；projector必须机械证明key全集、默认值、range和choices与owner声明逐项相等。
+这里以§10的轻量Definition规则为准：`TaskDefinition/MeasurementDefinition/ProcessorDefinition`只保存catalog identity与`request/config_schema_id`等稳定身份，不复制字段默认值或GUI schema。字段语义在对应typed Request/Config owner旁边有且只有一份声明；Workbench通过显式owner函数取得并投影，不能凭dataclass signature/AST反射，也不能把schema-id变成service locator。`FormSpec`是一次界面投影，不持久化、不参与artifact/config fingerprint、不成为第二validator；projector必须机械证明key全集、默认值、range和choices与owner声明逐项相等。
+
+这里的“字段语义”包括 LogicNode 的输入需求，不只包括普通 scalar。领域 owner 用当前已经挣得的两个封闭输入值声明 `DatasetInputSpec` 与 `ArtifactInputSpec`：前者声明接受的稳定 output-contract id 与 delivery/authority 要求，后者声明 typed artifact-ref schema、是否允许成功 FINAL producer、是否允许显式 saved pointer 及 owner 默认来源。producer owner 为每个 public output 声明稳定 output-contract id；动态 `frame_i` 仍共享同一个 Camera-frame contract，不能由 GUI 解析名字前缀、DefinitionKey、shape 或 rank 猜类型。Workbench 只有一套机械 input projector、兼容 output 过滤器和 resolver；它把用户选择解析成 typed binding 后调用 owner builder，不定义某个 Processor/Measurement 需要哪些输入。
+
+因此新增一个普通 Task/Measurement/Processor 的机械扩展测试是：除 composition root 显式登记该领域 builder/prepare command 外，不得新增或修改 TaskConsole 的 per-node form/editor/binding-intent owner、`DefinitionKey + field key` picker 分支或 request fallback；把文件改名为 binding/editor 也不能改变 owner。Calibration/MOT/coupled measurement 的普通 path/choice/range 同样由各自 request/intent owner 声明。只有 Pulse program/slot/table、真正的多行结构化 authoring 等不能由字段集合表达的结构可以保留显式 presenter，但其中的普通 path、signal/artifact leaf 仍由 owner schema 注入，presenter不得复制其默认值、约束或兼容来源。
 
 旧`ParamDecl`本身不作为跨包终态公共基类，因为它混合了领域语义、`display/segmented/path dialog/depends_on`等presentation选择，以及`$device:`、全局Hub signal和旧`pulse_slots`等专用种类。复用按下表裁决：
 
@@ -585,7 +599,7 @@ Workbench EditorSession -> typed Request/Intent constructor -> owner validator
 | `AxisRangeHandler` | 暂留legacy island，出现current同义consumer再迁 | Formal scan继续使用具名`ScanPointTable`，不得退回匿名`(min,max,points)` |
 | `DeviceRefHandler`/`$device:` | RETIRE | current设备选择只经typed `DeviceBindingResolver`/role projection，GUI不保存DeviceRef或service locator |
 | `PulseSlotsHandler/_PulseSlotsWidget` | 不再是generic param kind | PulseDocument、W2 Scan/API authoring与W3 program presenter各自使用current owner contract |
-| `MeasurementPanel/PanelCard/PanelEditor` | 类不整体搬；提取已验证的form loop/state合同 | 领域Run/Hub依赖留在相应纵切；旧`AnalysisControls`不迁，fit/selector分别使用current `FitSpec/Selection` owner |
+| `LogicNodeParameterPanel/PanelCard/PanelEditor` | 旧MeasurementPanel不整体搬；提取已验证的form loop/state合同 | 领域Run/Hub依赖留在相应纵切；旧`AnalysisControls`不迁，fit/selector分别使用current `FitSpec/Selection` owner |
 
 迁移期间为了不复制实现，通用handler内核只允许有一个current owner；尚有真实consumer的legacy专用handler可留在明确的legacy adapter island并依赖该内核，但不得从旧路径re-export形成shim。最后consumer迁走时连adapter island与旧symbol一起物理删除。`zlc_frontend.form`和`qt_widgets`都不得导入neutral/workbench/旧`Zou_lab_control`；Workbench作为唯一双向composition层完成投影。
 
@@ -656,7 +670,7 @@ zlc_workbench.project_pulse_preview(PulseDocument)
 
 Pulse front 不得借 dataset provenance 过桥。`zlc_pulse` 为完整 timeline 内容提供单向 fingerprint（覆盖row activity、segments、annotations、reference与时钟）；Workbench 投影成 frontend-owned `DocumentInputIdentity(document_id, document_revision, content_digest)`，renderer 只携带该输入身份。host 在 panel/layout facts 已知后才补 `DocumentPresentationStamp(source, presentations)`。这是输入冻结与present冻结两个时点所必需的最小两层，不增加run/schema/block字段。`PanelFrame`、interaction origin与coherence group必须同族：dataset和document不能混组；pulse range始终只是带Document origin的display gesture。当前任何`DatasetId("pulse.preview")`、假`DatasetRevisionRef`、第二套QPainter timeline或pulse→DataBlock适配器都是待最后consumer迁走即物理删除的残余。
 
-Pulse Preview 的selector手感继续以正式旧界面为权威：wheel与middle-drag在每个鼠标motion产生display-only viewport intent，不能只在release更新。worker仍保持capacity-one/latest追赶，但同一immutable document、同一gesture中已经完成且revision单调前进的中间raster必须立即present，不能因其已非“绝对最新”而全部丢掉；最新pending仍保留并最终收敛。失败只撤销exact pending intent，已经消费的display revision不得回退复用，且整个路径不得改变`PulseDocument`、editor revision、dirty、scan request或artifact。Pulse plot恢复正式`FigureSpec + Divider`的固定几何语义：size/kind token一次决定data box与margin，viewport只改xlim；禁止每帧用`constrained_layout/tight_layout`让tick文字或scan badge反向移动axes、title与row labels。
+Pulse Preview 的selector手感继续以正式旧界面为权威：wheel与middle-drag在每个鼠标motion产生display-only viewport intent，不能只在release更新。worker仍以单worker latest-state方式追赶，但同一immutable document、同一gesture中已经完成且revision单调前进的中间raster必须立即present，不能因其已非“绝对最新”而全部丢掉；最新pending仍保留并最终收敛。失败只撤销exact pending intent，已经消费的display revision不得回退复用，且整个路径不得改变`PulseDocument`、editor revision、dirty、scan request或artifact。Pulse plot恢复正式`FigureSpec + Divider`的固定几何语义：size/kind token一次决定data box与margin，viewport只改xlim；禁止每帧用`constrained_layout/tight_layout`让tick文字或scan badge反向移动axes、title与row labels。
 
 Preview 的repeat标注由一个纯presentation policy从authored period span派生，Edit摘要与Preview不得各写一套判断：没有有限bracket时完整物理frame显示外层`×∞`；有限bracket只覆盖部分period时显示外层`×∞`与内层`×N`；有限bracket覆盖完整period table时只显示`×N`。外层frame必须包含延迟输出tail，内层仍严格停在authored period边界。关闭“show off”且全部digital row均为off时，仍保留第一条digital baseline作为空间参考；这是非权威显示fallback，不能把该row标成active、修改`PulseDocument`或影响编译/执行。
 
@@ -682,7 +696,7 @@ Experiment                         # notebook/application facade，不含领域�
   .figure_gui(source=None, occupancy_output=None)        # 无source打开Saved Figure；path直开current .npz；typed source保持交互查看语义
   .readout.prepare_calibration_task(intent) / .prepare_mot_field_task(intent)
   .readout.prepare_*_application(intent, calibration_ref) # coupled measurements
-  .readout.prepare_saved_reactive_occupancy_monitor(...)  # 显式saved calibration ref
+  .readout.prepare_occupancy_processor(config, inputs) # Camera Dataset + 显式saved/Task calibration
   .readout.load_calibration_computation(calibration_ref) # 同次decode返回artifact+report
   .readout.calibration_report_gui(calibration_ref)       # 懒加载冻结标定报告，只读显示
   .readout.calibration_gui(calibration_request)           # 编辑显式request，成功即原子FINAL commit
@@ -706,7 +720,7 @@ Notebook 的 Pulse 窗口是 Experiment-owned singleton：第一次 `exp.pulse_g
 
 `Experiment.figure_gui()`的无参数形态是session-independent的正式FigureViewer入口；传入`.npz`路径则直接打开该文件，传入`.png/.jpg/.jpeg`只解析同stem的`.npz`，绝不从像素或数组rank反猜数据语义。传入typed source/ref仍走既有DataFigure/fit/grid分派，不能因为增加文件入口而改写其行为。FigureViewer沿用`main`正式窗口的File/Info外壳，但右侧嵌入唯一`DataFigureWindow`交互owner；不得恢复旧`LoadedFigureNode`、伪Hub/RunId、TaskConsole重放或另一套plot/selector实现。路径输入仅在Browse结果或`editingFinished`提交时做一次I/O；普通文字输入、viewport、selector、Setting/Edit不产生全局snapshot或重建窗口。候选文件必须在worker中完整解码和验证，成功后才原子替换当前pane；失败保留上一幅有效Figure及Info并给出完整错误。已载入archive的显式Fit/Refit仍在这个pane中执行；Save用`DataFigure.with_fit_results(...)`重建同一冻结figure、原子写回current archive并从`LoadedFigureArchive`重开，绝不伪造neutral artifact ref。
 
-W4b在这个边界上交付`.readout.load_calibration_computation(ref)`与`.readout.calibration_report_gui(ref)`：repository一次解码并成对返回已经互相校验的`CalibrationArtifact + CalibrationReport`，worker只投影和绘制已经保存的site、threshold、fidelity、validity与empirical PSF事实，Qt只接收多页owned immutable PNG。报告不重新拟合、不重新阈值化、不把canonical site向量reshape成二维数据，也不为了复用DataFigure而伪造`DatasetSchema`。它与W4a共用一个capacity-one frozen-raster executor、同一Qt window lifecycle和同一encoded-page DTO；关闭窗口只撤销未开始/阶段间工作，已进入repository或Agg的调用诚实排空且不发布stale结果。该窗口只是static frozen calibration report；大阵列的交互focus/zoom/export、live site-map/gridplot仍属于后续明确consumer，不能用本纵切的静态PNG冒充已交付。W6已在同一paired loader/renderer上补交显式request edit/recalibrate，仍不把静态PNG冒充live grid或几何selector。
+W4b在这个边界上交付`.readout.load_calibration_computation(ref)`与`.readout.calibration_report_gui(ref)`：repository一次解码并成对返回已经互相校验的`CalibrationArtifact + CalibrationReport`，worker只投影和绘制已经保存的site、threshold、fidelity、validity与empirical PSF事实，Qt只接收多页owned immutable PNG。报告不重新拟合、不重新阈值化、不把canonical site向量reshape成二维数据，也不为了复用DataFigure而伪造`DatasetSchema`。它与W4a共用一个串行latest-state frozen-raster executor、同一Qt window lifecycle和同一encoded-page DTO；关闭窗口只撤销未开始/阶段间工作，已进入repository或Agg的调用诚实排空且不发布stale结果。该窗口只是static frozen calibration report；大阵列的交互focus/zoom/export、live site-map/gridplot仍属于后续明确consumer，不能用本纵切的静态PNG冒充已交付。W6已在同一paired loader/renderer上补交显式request edit/recalibrate，仍不把静态PNG冒充live grid或几何selector。
 
 W4c把current `OccupancyArtifactRef`接入同一个Figure产品面，但一个Figure只选择artifact中一个真实输出块：`occupancy_output=None/"occupied"`默认选择分类结果，`"counts"`显式选择读出计数；非occupancy source携带该参数立即拒绝。`figure_document()`只读取FINAL metadata中的exact DatasetSchema，`figure()`直接取artifact已有的`occupied_snapshot`或`counts_snapshot`，不创建第三个DataBlock、不堆成伪COMPONENT轴，也不借source capture冒充occupancy lineage。无scan/spectral/history轴的occupied默认是SITE facet的METER，repeat使用可见的display-only mean；有声明x轴时为CURVE；counts沿既有role规则选择HISTOGRAM/CURVE。SITE永不自动reduce，ComponentValidity继续逐component消费；bool histogram固定使用`false/true`两个类别，避免NumPy auto bins把0/1静默合并。GUI只把output/view转发给W4a现有worker，不新增窗口、executor或renderer。该能力是canonical site index上的冻结显示，不包含Calibration SiteMap的物理XY/GridOrder overlay，也不宣称live gridplot/selector/focus/zoom/export已完成。
 
@@ -716,7 +730,7 @@ W4d补上一个更窄但物理完整的冻结产品面：`.readout.occupancy_cel
 
 W4e只补W4d已有exact-address产品的离散cell导航，不把它扩成live grid或图形selector。窗口先在同一个shared frozen-raster lane异步读取metadata-only `OccupancyCellNavigation`：content-addressed artifact target、occupied schema fingerprint、generation、完整repeat/point `AxisSpec`、`PointLayout`与schema-owned `cell_layout`。换cell前先清旧PNG/QImage front。每根非singleton轴保持显式“未选择”，绝不默认first/latest；只有singleton可自动取0。控件只按轴数建立spin/index editor并即时显示coordinate/unit，不按axis size建立item列表。Load把全部repeat/point轴冻结为具名`IndexSelection`；Previous/Next沿`cell_layout`的repeat-major physical storage order移动，因此EXPLICIT sparse hole天然跳过且不wrap。
 
-同一窗口在全局唯一capacity-one lane上至多有一个已提交job和一个可覆盖的latest pending selection；每个结果同时校验UI request revision、artifact/schema/generation identity与canonical Selection，stale success/error/cancellation一律不能改status、summary或front。旧Future/PNG在当前owner callback真正退栈后，下一次queued owner turn才启动pending，避免两次大图生命周期重叠。Close只清pending/front、置cooperative cancellation并立即返回；已进入repository/Agg的工作诚实排空但永不发布。W4e当时只完成离散 exact-address 导航，尚无`ViewportTransform`、鼠标selector/ROI、zoom、export或live source；“永久 `DISPLAY ONLY`”这一产品能力上限现已废止。artifact/source仍不可原地修改，但该查看面必须在U0纠正3或通用viewer切片复用统一interaction owner补齐旧行为。
+同一窗口在全局唯一串行latest-state lane上至多有一个已提交job和一个可覆盖的latest pending selection；每个结果同时校验UI request revision、artifact/schema/generation identity与canonical Selection，stale success/error/cancellation一律不能改status、summary或front。旧Future/PNG在当前owner callback真正退栈后，下一次queued owner turn才启动pending，避免两次大图生命周期重叠。Close只清pending/front、置cooperative cancellation并立即返回；已进入repository/Agg的工作诚实排空但永不发布。W4e当时只完成离散 exact-address 导航，尚无`ViewportTransform`、鼠标selector/ROI、zoom、export或live source；“永久 `DISPLAY ONLY`”这一产品能力上限现已废止。artifact/source仍不可原地修改，但该查看面必须在U0纠正3或通用viewer切片复用统一interaction owner补齐旧行为。
 
 **术语裁决（覆盖本节以上 W4/W7 现态摘要及后文历史 checkpoint）：** `DISPLAY_ONLY` 以后只允许表示 ViewSpec/viewport/display reducer/export raster 不能静默升级成 FitSpec、ScanOutputContract、CommittedTransform 或修改 source artifact；绝不表示真正交互图可以永久缺少 zoom/pan/selector/re-fit/export。W4a/W4d/W4e 仍保留已证明的 immutable source、单 render owner、cancel/close 与 revision-check 不变量，但其产品能力上限已撤销。W4b calibration 多页报告是 frozen raster 的合法例外：按原生像素呈现并滚动浏览，不重采样 bitmap；其 site/grid focus/export 是否适用按规则 9 salvage。W7 exact-result replay 继续禁止**隐式** solver/rewrite；用户显式 `Fit` 必须从 exact source ref + SelectionCandidate 新建 authority draft/result/ref，绝不原地改旧 artifact。
 
@@ -724,7 +738,7 @@ U0.3d 已把 W5/W8b 的独立 Fit host 物理删除并并入唯一 `DataFigureWi
 
 DataFigure窗口中唯一未保存的opaque execution与`FitResultBatch`由headless `FitDraftAuthority`独占；Qt只得到不可保存的`FitDraftResult`与immutable typed front。Capture/Scan路径的opaque value是`FitExecution`，本地archive路径则是同一个`BoundFit.run(snapshot)`返回的result；authority不知道两种持久化格式。draft overlay把结果与窗口冻结的exact source重新绑定，并在物化前验证source revision/schema/fit axes/batch layout。只有显式Save才持久化：Capture/Scan通过composition lifecycle gate发布neutral-owned `FitResultArtifactRef`并从exact ref重开；本地Figure写archive并从exact `LoadedFigureArchive`重开。TaskConsole的`PanelFitLane`没有Save capability：每次只接受仍与可见source ref及request revision相同的结果，source推进就撤旧overlay/output并按active spec追随；Clear只撤该panel的spec、overlay与`fit.*`输出。两条路径都不建立workflow/lease/async engine；cancel在lane等待、solver batch之间和Qt接纳处诚实检查，已进入的bounded work只排空而不伪称已中止。
 
-M1在同一门面上交付第一个真正continuous的raw monitor产品。`camera_monitor_request()`只冻结显式camera role与数据/视图语义；adapter I/O deadline属于安装时验证的Port capability，不能成为Measurement参数、被TaskConsole显示、随实验保存或由用户放宽。`inspect_camera_monitor()`只返回free-running capability、working point与精确输出schema，均不arm设备。`camera_monitor_gui()`只把one-shot `PreparedCameraMonitor` factory交给Workbench，不把Experiment、RunPlan、Port、DeviceBindingResolver或raw camera交给窗口。窗口每次Start都由RunController取得排他资源；Stop/Close只cancel同一个RunHandle并异步reap，清理完成且设备证明SAFE后source terminal才撤下front。重新Start必须取得新的BlockId、stream generation和Run identity，不能延续上次“latest”。该入口目前只承诺raw IMAGE：ROI、scalar meter、rolling curve、histogram、multipanel coherence和selector明确留给M2，不能把capacity-one raw view称为完整rolling/gridplot迁移。
+M1在同一门面上交付第一个真正continuous的raw monitor产品。`camera_monitor_request()`只冻结显式camera role与数据/视图语义；adapter I/O deadline属于安装时验证的Port capability，不能成为Measurement参数、被TaskConsole显示、随实验保存或由用户放宽。`inspect_camera_monitor()`只返回free-running capability、working point与精确输出schema，均不arm设备。`camera_monitor_gui()`只把one-shot `PreparedCameraMonitor` factory交给Workbench，不把Experiment、RunPlan、Port、DeviceBindingResolver或raw camera交给窗口。窗口每次Start都由RunController取得排他资源；Stop/Close只cancel同一个RunHandle并异步reap，清理完成且设备证明SAFE后source terminal才撤下front。重新Start必须取得新的BlockId、stream generation和Run identity，不能延续上次“latest”。该入口目前只承诺raw IMAGE：ROI、scalar meter、rolling curve、histogram、multipanel coherence和selector明确留给M2，不能把单帧raw view称为完整rolling/gridplot迁移。
 
 上段“只有真正执行calibration analysis时进入SciPy”在W4b之后还包括用户显式调用paired diagnostic load/report GUI，因为`CalibrationReport`的owner就是analysis extra；普通`import Zou_lab_control.notebook/workbench/zlc_frontend`和runtime-only calibration load仍不导入SciPy、Matplotlib或Qt。
 
@@ -746,7 +760,7 @@ fit_ref = fit.save()  # neutral-owned FitResultArtifactRef；有界默认且不�
 saved = exp.load_fit(fit_ref)
 ```
 
-当前显式校准底座同样不暴露Port/RunPlan：用户可先构造带具名event layout和独立空间意图的`CalibrationAnalysisRequest`，再经`exp.readout.calibration_request(capture_ref, analysis)`冻结实际`ReadoutBindingKey`并调用`calibrate(request)`；它不会按shape/rank猜事件轴，也不会用本次detector输出自证expected centers。已交付的virtual/offline短`exp.readout.sitemap(...)`只在application facade顺序执行“capture提交raw ref -> calibration提交calibration ref”，从installation-owned grid/profile预填空间意图，并让FPGA pulse repeat包围完整long-short-long组；第二步普通失败通过`SitemapCalibrationFailed.source_capture_ref`、notebook中断通过仍属于`KeyboardInterrupt`的`SitemapCalibrationInterrupted.source_capture_ref`返回第一步raw ref。它不嵌套child plan、不回滚第一个artifact，也不引入隐式`current/latest calibration`。
+当前显式校准底座同样不暴露Port/RunPlan：用户可先构造带具名event layout和独立空间意图的`CalibrationAnalysisRequest`，再经`exp.readout.calibration_request(capture_ref, analysis)`冻结实际`ReadoutBindingKey`并调用`calibrate(request)`；它不会按shape/rank猜事件轴，也不会用本次detector输出自证expected centers。已交付的virtual/offline短`exp.readout.sitemap(...)`只在application facade顺序执行“capture提交raw ref -> calibration提交calibration ref”：installation/device层只发布不含Port、pulse recipe或Calibration语义的typed `ReadoutApparatusFacts`（camera/sequencer role、frame/grid/site几何与trigger channel）；顶层notebook composition把它与该runtime已经绑定的精确Camera/Sequencer Port交给`logic_nodes.calibration.installation`，一次性得到并持有immutable sitemap profile mapping，再用该profile预填空间意图。FPGA pulse repeat仍包围完整long-short-long组；第二步普通失败通过`SitemapCalibrationFailed.source_capture_ref`、notebook中断通过仍属于`KeyboardInterrupt`的`SitemapCalibrationInterrupted.source_capture_ref`返回第一步raw ref。bootstrap runtime不缓存、不验证也不暴露Calibration profile；它不嵌套child plan、不回滚第一个artifact，也不引入隐式`current/latest calibration`。
 
 同一组代码换成 real adapter 只改 `connect` 参数。契约 E2E 固定“connect virtual -> capture -> 1D fit -> save”和“sitemap -> calibration ref -> detect”均为少量 notebook 语句；不得要求用户手工 bind Port、构造 PipelineSpec、解析 PipelineResult 或 resolve artifact ref。门面在最早 vertical slice 与 RunController/Repository 一起交付，不能拖到剩余 helper 收尾阶段。
 
@@ -802,7 +816,7 @@ saved = exp.load_fit(fit_ref)
 |---|---|
 | 数据不变量 | frozen value object + constructor validator |
 | 设备调用/virtual-real实现边界 | consumer-owned Protocol；实现选择只在新进程composition时发生 |
-| Task/Measurement/StreamProcessor/领域 Analysis 元数据 | frozen Definition；通用数据 Analysis 使用 zlc_data-owned descriptor/spec |
+| Task/Measurement/Processor/领域 Analysis 元数据 | frozen Definition；通用数据 Analysis 使用 zlc_data-owned descriptor/spec |
 | 线程和生命周期 | final concrete runner/state machine |
 | 资源排他 | ResourceClaim + ResourceArbiter |
 | axis 变换 | typed transform value + validator |
@@ -1068,8 +1082,8 @@ JoinKey 是 frozen、可序列化的领域值（例如 TriggerKey/ScanCellKey/Sh
 
 | 原语 | 语义 | 用途 |
 |---|---|---|
-| AcquisitionStream | ordered、exact、cursor、gap-fatal | 正式 scan/capture |
-| MonitorTap + MonitorDataset | bounded backlog、latest/ordered、missed + sequence-owned window | live UI |
+| AcquisitionStream | ordered、exact、cursor、gap-fatal；未ack事件自然保留 | 正式 scan/capture |
+| MonitorTap + MonitorDataset | ordered delivery；Dataset只保存请求声明的rolling window | live UI |
 | ControlTopic[T] | typed、revisioned、ack | ROI、threshold、run command |
 | EventStream[T] | progress/transition notification | UI/headless status |
 
@@ -1083,7 +1097,7 @@ EventStream 中 progress 可以 coalesce，transition 必须按 run revision 有
 
 ### 7.3 Exact reservation
 
-Reservation 是对以下区间未 ack 数据的 retention pin：
+Reservation 是对以下区间的唯一 formal-consumer authority 与 ack watermark；它不是内存配额：
 
 ```text
 (stream_id, generation, [start_sequence, end_sequence))
@@ -1099,28 +1113,20 @@ PLANNED -> RESERVED -> ACTIVE -> DRAINING -> COMPLETED -> RELEASED
 
 必须满足：
 
-- fire前按expected event count、实际硬件/driver record capacity与exact reservation原子验证；
+- fire前按expected event count、物理采集计划与exact reservation原子验证；
 - `AcquisitionProducer` 是 source owner lane 独占的 write/terminal capability；普通 pipeline 只拿 read-side stream/reservation，不能提前 mint EOS；
 - cursor、Delivery、EndOfStream 都是 owner-minted opaque capability，不能用公开构造器或“is_exact=True”伪造；
 - cursor 不跨 generation；
-- baseline 每个 stream generation 只允许一个 formal exact materializer，monitor fan-out 不 pin exact retention；出现第二个真实 required-exact consumer 前不引入多 reservation watermark 机器；
+- baseline 每个 stream generation 只允许一个 formal exact materializer，monitor fan-out 不延长formal未ack事件的所有权；出现第二个真实 required-exact consumer 前不引入多 reservation watermark 机器；
 - reservation 绑定 `TraceBinding(run_id, source_id)`；同一区间混入另一 run/source 的 event 在写 DatasetBuilder 前失败；
 - DatasetBuilder 构造时独占 claim reservation completion/abort authority；`commit cell + ack` 在同一个 stream authority 临界区完成，失败不能留下可 seal 的半 revision；raw reservation 不再提供与 builder owner 冲突的 context-manager cleanup，统一由 DatasetBuilder/session teardown；
 - frozen join schedule、Envelope key、sequence 与 destination cell 四者逐项一致后才写入；
 - exact path 不自动 retry hardware run；
-- 无 reservation 的慢消费者获得 typed Gap，不回 latest。
+- formal cursor逐event有序消费；未ack事件由producer自然持有，内存不足按普通分配失败结束run，不能提前预算、覆盖或伪装成专用容量异常。非formal显示端是否latest-only由host delivery policy单独决定，并把skipped revisions记录为presentation telemetry，不能修改source coverage。
 
-正式exact run必须是有限Run并有确定的`end_sequence`。完整性总量与同时在途record数是两个不同合同：
+正式exact run必须是有限Run并有确定的`end_sequence/total_expected`，该数字只证明EOS/coverage完整性，不生成任何软件内存配额。producer把每个owned immutable event追加到当前generation；formal consumer ack后即可释放对应前缀，consumer慢时未ack集合自然增长。系统不根据预测速率、frame bytes或“安全预算”预先拒绝合法run，也不以软件ring覆盖未ack数据；真实分配失败明确使run FAILED。连续Measurement使用`MonitorTap -> MonitorDataset`，其中`history_cycles`是可见Dataset的声明轴长度，而非全局内存上限；host的latest-only展示可coalesce尚未开始的工作，但只能记录独立presentation telemetry，不能修改source coverage或倒推改变source对已交付事件的所有权。
 
-```text
-total_expected/max_events        # EOS/coverage 完整性
-max_inflight_events              # 未ack record容量
-max_source_burst + backpressure capability
-```
-
-RunController根据source最大burst/速率、最慢required consumer、ack边界和是否可backpressure确定最大在途record数；reservation只pin未ack区间，ack后立即释放。不能因为run有N点就无条件长期保留N个大帧，也不能在不可backpressure的相机上假设consumer平均够快。若driver或协议的实际record容量不足，就选择流式artifact sink、更慢trigger或在preflight拒绝。连续Measurement在baseline中只使用`MonitorTap -> MonitorDataset`，不建立infinite reservation、continuous-exact epoch或durable spool。未来只有出现必须连续、不可丢且无法切成普通有限Run的真实生产用例，才单独设计持久spool/epoch协议。
-
-source contract 必须声明 `BACKPRESSURE_CAPABLE` 或 `NON_BACKPRESSURE_CAPTURED`。前者的 publish 可在零状态变化后返回 `StreamBackpressure` 并由真实 producer 稍后重试；后者表示调用 publish 时物理帧已经不可撤回，第一次record retention miss 必须在同一临界区把 generation、reservation 与所有 formal consumer 永久置为 `RetentionOverrun/FAILED`，后续 frame 绝不能占用失败帧原本的 sequence，emit/finish/seal 全部拒绝。qCMOS 属于后者。retention 之外任何发生在物理 capture **之后**的 decode/copy/schema/metadata/key/publish 异常也必须由 CaptureSession 统一转成 `producer.fail(SourceFailed)` 并继续做硬件安全 drain；禁止 catch 后继续 formal collection。
+软件数据面不定义生产流控、积压毒化或容量异常状态机。物理采集完成后的decode/copy/schema/metadata/key/publish异常仍由CaptureSession统一转成`SourceFailed`并完成设备cleanup；ordinal/stamp gap、driver报告真实覆盖或实际帧数与冻结计划不符同样使当前run失败，但原因是观测到的物理不一致，不是软件预算被用完。
 
 camera adapter 边界使用一种不可变的 `CameraFrameRecord`，而不是一条 ndarray queue 加另一条 metadata queue：
 
@@ -1138,11 +1144,11 @@ CameraFrameRecord:                       # adapter_sdk owner，不是 artifact s
 
 record 构造时就必须取得图像 bytes 的 ownership 并冻结 metadata；driver 之后复用 ring slot 不得改变已发布 record。`source_ordinal` 在每次 arm epoch 从0连续增加，duplicate/gap/超出expected count 立即失败；它是 host adapter 的排空顺序，不是 FPGA emitted-edge receipt。`produced_count` 是读取该帧时观察到的 source 累计快照，batch drain 时可在多个 record 中相同；禁止把它伪造成逐帧 +1 counter。qCMOS adapter 必须从同一次 `buf_getframedata` 保留 `framestamp/camerastamp/timestamp`，并把同一 drain 观察点的 `cap_transferinfo().nFrameCount` 写入 `produced_count`。
 
-`adapter_sdk.CameraWorkingPoint`只冻结adapter从硬件/模拟器读取的物理工作点与由adapter唯一计算的settings fingerprint；它不携带、也无权自铸exact qualification。`CameraCaptureEndpoint`只把这些primitive facts一次转换成neutral-owned `ValueSchema/CameraPhysicalFacts`，不认识Virtual/DCAM concrete type；可信installation composition另行注入qualification。当前virtual composition注入与原实现相同的deterministic in-process trigger-wire digest；real composition只能注入由active Q0 authority解析并pin的资格，raw adapter返回任意字符串不能放行FIRE。该结构化SPI只解除concrete-type反向依赖，不证明hardware identity、thread affinity或Q0资格。
+`devices.camera.contract.CameraWorkingPoint`只冻结adapter从硬件/模拟器读取的物理工作点与由adapter唯一计算的settings fingerprint；它不携带、也无权自铸exact qualification。`CameraCaptureEndpoint`只把这些primitive facts一次转换成neutral-owned `ValueSchema/CameraPhysicalFacts`，不认识Virtual/DCAM concrete type；可信installation composition另行注入qualification。当前virtual composition注入与原实现相同的deterministic in-process trigger-wire digest；real composition只能注入由active Q0 authority解析并pin的资格，raw adapter返回任意字符串不能放行FIRE。该结构化SPI只解除concrete-type反向依赖，不证明hardware identity、thread affinity或Q0资格。
 
-SPI中的`max_pending_records`是adapter在一次arm内可能持有的owned record硬上界，不是GUI recent/history长度；endpoint的`max_source_burst_events`不得超过它，adapter的`arm(max_inflight_frames=...)`也必须拒绝越界。当前endpoint terminal边界有一个明确而窄的两阶段合同：bounded terminal worker可先调用`finish_record_capture()`解除并发blocked read、stop/drain/join并冻结terminal record，随后arm-owner再次调用以完成owner-affine teardown，两个调用必须线程安全、幂等且返回同一record。VirtualCamera与contract fake满足此合同；不能满足的DCAM/thread-affine adapter必须等待camera owner lane/host交付，不能因Python Protocol结构匹配就宣称real READY。
+camera arm只接受物理采集所需的`buffer_frame_count`：finite capture等于冻结的完整`expected_frames`；continuous monitor等于其声明的`history_cycles * frames_per_cycle`。这是DCAM `dcambuf_alloc()`/driver ring的本次采集几何，不是可调内存预算；endpoint不得再施加第二个上限或取较小值。adapter drain得到owned record后source stream自然追加；driver在host取得ownership前发生真实覆盖、stamp/ordinal不连续或finite count越界时返回`CameraBufferOverrun`并使当前run`SourceFailed`。monitor Dataset只在owner已接纳record后按声明的rolling window替换可见slot；这不会删除source的formal未ack事件，也不等于MonitorTap隐式丢数据。
 
-arm 时冻结物理记录合同：finite capture 使用声明的 expected/max frame count，continuous capture 使用 adapter/profile 证明的 max-inflight frame count。adapter pending queue 在两种模式下都不 overwrite 尚未被唯一 capture owner 排空的物理帧；monitor 的 overwrite/missed 只发生在 owner 已将 record 转交给 broker 之后的 bounded monitor tap。记录槽不足、ordinal 不连续或超过 expected frame count 返回 typed `CameraBufferOverrun`，formal CaptureSession 将其上升为 `SourceFailed/RetentionOverrun`；monitor run 也必须明确停止/重建 capture session 并报错，不能在 adapter queue 内悄悄丢帧后只增加 UI missed count。迁移期的 `read_frames()` 只能解包同一 record queue 的 `image`，不得维持第二份排队、ordinal 或 metadata 真相源；array-only reader 只在**最后一个 legacy camera consumer 所在的 dependency-closed 切片**删除，不能把时点写死为 S3。当前 consumer matrix 仍包含 ROI、monitor、temperature 与剩余 legacy measurement/UI，预计随 S5 收口。终态 adapter contract 只交付 record。CaptureSession 在 owner lane 把 record 一次转换为neutral-owned `CameraSample(Value, metadata)`；`CameraFrameRecord` 不穿过 bounded-context 边界进入 zlc_data、processor、UI 或持久 artifact。
+endpoint terminal边界仍是一个窄的两阶段合同：terminal worker可先调用`finish_record_capture()`解除并发blocked read、stop/drain/join并冻结terminal record，随后arm-owner再次调用以完成owner-affine teardown；两个调用必须线程安全、幂等且返回同一record。迁移期array-only reader在最后consumer迁走时删除；终态adapter只交付record，CaptureSession在owner lane一次转换为neutral-owned`CameraSample(Value, metadata)`。
 
 stream_generation/payload contract fingerprint 改变时，旧 exact cursor 终止为 typed SchemaChanged。schema-affecting reconfigure 不是“原地改参数”，而是 generation migration：owner 在 transaction boundary 终止旧 generation、对所有 pending Control revision 发 terminal ack，为每个绑定的 exact DatasetBuilder 或 live MonitorDataset 创建新 block_id/DatasetSchema/generation，再在新 generation 首次 publication 前完成 tap/materializer rebind。旧 pending view/fit 结果 stale，CommittedTransform 因 DatasetSchema fingerprint 改变一律失效，不能按 index 偷迁移。稳定 AxisId 只帮助迁移 workspace preference 的候选匹配，仍须完整 schema/coordinate/validity 校验。正式 finite Run 默认拒绝 schema-affecting reconfigure；value-only 且 schema 不变的参数才可按运行合同在边界 APPLIED。
 
@@ -1171,30 +1177,32 @@ INDEPENDENT_LATEST_MONITOR
 
 一个 physical CaptureSession 是 camera 的唯一 owner。它产生一次 AcquiredSample，broker 分发到：
 
-- exact subscribers：受 reservation/backpressure 保护；
-- monitor tap：按记录数 bounded overwrite，记录 missed，不反压 exact。
+- formal materializer：通过唯一 reservation 有序消费并逐项 ack；
+- monitor tap：有序消费同一 immutable event，不覆盖或跳过尚未消费的record。
 
-二者共享 event_id/trace，但拥有不同 QoS 与 buffer。
+二者共享 event_id/trace 与同一个payload ownership事实。formal路径的未ack record自然保留；monitor tap读取后即可释放自己的引用。只有frontend明确声明的latest-only展示工作可以在开始渲染前用新revision替换旧revision，而且该显示跳过必须作为presentation telemetry报告，不能回写source、fit、scan、calibration或artifact。
 
-broker 只分发 immutable payload/ref；driver 会复用 DMA/frame buffer 时，在第一次发布前复制或转移 ownership。exact retention、monitor current ref 和每个 consumer 各自持有明确 lifetime；monitor overwrite 只能释放自己的引用，不能使 exact consumer 看到被复用的存储。
+broker 只分发 immutable payload/ref；driver 会复用 DMA/frame buffer 时，在第一次发布前复制或转移 ownership。formal未ack record、monitor current ref 和每个 consumer 各自持有明确 lifetime，任何consumer释放自己的引用都不能使其它consumer看到被复用的存储。
 
-### 7.6 Buffer ownership 与记录容量
+### 7.6 Buffer ownership 与采集 cardinality
 
-Measurement output contract 声明 `max_burst_events`、finite run 的 expected/max total events、生产速率/停顿边界与是否能 backpressure；StreamProcessorDefinition 声明 cardinality、最大并发处理与 ack 点；DatasetBuilder/sink 声明 exact backlog 与 chunk/flush；`LiveDatasetSlotSpec` 单独声明可见 window 的记录数。RunController 从这些语义合同派生 exact edge 数、MonitorTap 暂时来不及 ingest 的记录数，以及 MonitorDataset 已 ingest 的可见历史长度；三者不能用一个 “buffer size” 冒充。
+Measurement output contract 只声明真实数据 cardinality：finite run 的完整`expected_frames`，或continuous monitor的`history_cycles`与`frames_per_cycle`。Processor 的 bound execution contract 声明输入/输出cardinality与ack点；DatasetBuilder/sink声明完整schedule与commit边界。运行时不得从生产速率、预计停顿、frame bytes或drain延迟派生另一个软件容量数字。
 
-MonitorTap 可以请求小 backlog（例如 image 2–8 帧），其合同就是允许 overwrite 并报告 missed；可见 rolling history长度由下游MonitorDataset决定，LiveDatasetSlot只共享handle/revision并coalesce通知，绝不能再持第二份window/buffer。同一source的多个panel默认共享一个slot，再用ViewSpec取`<= capacity`的窗口，而不是各自动态attach大帧ring。正式采集不能靠“把history设成full size”保证完整：RunController必须沿source -> processor -> sink exact chain冻结事件数量、顺序、ack与EOS，并在FIRE前完成reservation。MonitorTap与其唯一materializer都必须在首次publication前绑定；execute中或panel打开时不得新增raw tap/window。
+camera adapter的`buffer_frame_count`只有一条派生规则：finite capture等于完整`expected_frames`；continuous monitor等于`history_cycles * frames_per_cycle`。DCAM按该数值执行本次`dcambuf_alloc()`；virtual adapter遵守同一SPI但不另设固定队列上限。分配失败由SDK/Python原样使本次操作失败，不重试、降采样、丢轴、降低精度或缩短历史。driver在host取得ownership前发生的真实ring覆盖仍是`CameraBufferOverrun`。
 
-M1已把这条规则接到一个真实free-running Workbench：拓扑固定为`FREE_RUNNING camera -> AcquisitionStream -> MonitorTap -> MonitorDataset.append_window -> LiveDatasetSlot`，首次publication后不能attach新window。窗口容量只按记录数表达。分配失败或后端无法取得存储时必须作为当前操作的显式失败返回，不能静默缩帧、丢轴、降精度或减少历史。
+正式采集的完整性来自source -> processor -> sink exact chain冻结的事件数量、顺序、ack与EOS，不来自把某个history或queue参数设大。MonitorTap与其唯一materializer必须在首次publication前绑定；execute中或panel打开时不得新增raw tap。可见rolling history只由下游MonitorDataset的声明shape决定，LiveDatasetSlot只共享handle/revision并coalesce无payload通知，绝不能再持第二份window。同一source的多个panel默认共享一个slot，再用ViewSpec读取同一atomic snapshot。
+
+M1已把这条规则接到一个真实free-running Workbench：拓扑固定为`FREE_RUNNING camera -> AcquisitionStream -> MonitorTap -> MonitorDataset.append_window -> LiveDatasetSlot`，首次publication后不能attach新window。`history_cycles`是Dataset的具名轴长度，不是host内存上限。
 
 当前 finite exact-capture preview 只交付一个更窄的本地合同：`CapturePreviewSpec` 从 exact cell schema 派生 `(R=1, MONITOR_HISTORY=1, *data_shape)`；compiler attach 边界唯一核对它与本次 exact capture 共享同一个 cell-schema owner 和 event-adapter owner，不能把 capture A 的 projection 接到 capture B。运行中 preview bind/ingest/evaluate/raster 失败只撤下 preview，不能改变 exact result、CaptureArtifact 或 hardware cleanup；它不建立第二套资源策略。
 
 ### 7.7 Finite dataset 与 rolling monitor
 
-三个 owner 明确分责，不允许一个双模式 builder 同时背 exact seal、broker backlog 与 GUI rolling：
+三个 owner 明确分责，不允许一个双模式 builder 同时背 exact seal、stream delivery 与 GUI rolling：
 
 ```text
 AcquisitionStream -> MonitorTap
-  按记录数有界的event backlog；overwrite/missed；不参与 exact retention/backpressure
+  ordered event delivery；next不丢record；不改变formal未ack事件所有权
 
 ExactReservation -> DatasetBuilder
   完整 sequence -> DatasetCellAddress 排列；ack/EOS/seal；只能 finite exact
@@ -1205,17 +1213,17 @@ MonitorTap -> MonitorDataset
   两者都只产生 MonitorDatasetSnapshot，绝不 seal
 ```
 
-`MonitorDatasetSnapshot` 在同一临界区冻结 DataBlock、cell-aligned EventRefs、head 与 `MonitorCoverage`；controller 的 current selection 只来自该 snapshot，不拼接可能过期的 progress。append history 的目标 shape 必须是 `(R=1,P=history,*data_shape)`，且 P 只能是一条 `MONITOR_HISTORY`、dense `RECT_C`、坐标严格为 `0..capacity-1` 的 newest-first slot 轴；slot 0 表示本次 snapshot 中最新的 retained event，遇到 gap 时 slot n 不等于物理上的“n shots ago”，真实 source sequence 只能读取 aligned EventRef。任意二维/多维 `data_shape` 原样保留，绝不能借用 SCAN_POINT/READOUT_EVENT、塞进匿名 `(repeat,data_points,data_dim)` 三项容器或 `reshape(...)[0]`。正常 ring eviction 不计为 loss；`MonitorCoverage.missed_events` 是 lifetime telemetry，`current_gap` 只描述当前可见窗口，gap 滚出后 coverage 可以恢复 complete。formal `DatasetCoverage` 只保存 written/total；exact loss 已由 reservation sequence、cursor ack、完整 schedule 与 owner EOS fail-closed 证明，不保留一个生产中永远为 0 的旧 monitor 字段。keyed cycle 的 complete 只描述当前 sweep，绝不混入上一 sweep 的仍 valid cell。
+`MonitorDatasetSnapshot` 在同一临界区冻结 DataBlock、cell-aligned EventRefs、head 与 `MonitorCoverage`；controller 的 current selection 只来自该 snapshot，不拼接可能过期的 progress。append history 的目标 shape 必须是 `(R=1,P=history_cycles,*data_shape)`，且 P 只能是一条 `MONITOR_HISTORY`、dense `RECT_C`、坐标严格为 `0..history_cycles-1` 的 newest-first slot 轴；slot 0 表示本次 snapshot 中最新的 retained event，遇到真实source sequence gap时slot n不等于物理上的“n shots ago”，真实sequence只能读取aligned EventRef。任意二维/多维 `data_shape` 原样保留，绝不能借用 SCAN_POINT/READOUT_EVENT、塞进匿名 `(repeat,data_points,data_dim)` 三项容器或 `reshape(...)[0]`。按声明history滚出旧slot是数据产品的正常更新，不是source丢帧；`MonitorCoverage`只报告真实source/sequence gap。formal `DatasetCoverage`只保存written/total；exact loss已由reservation sequence、cursor ack、完整schedule与owner EOS fail-closed证明。keyed cycle的complete只描述当前sweep，绝不混入上一sweep的仍valid cell。
 
 交互 Fit/Save 若要使用 live 数据，必须把一个原子 snapshot 冻结为新的 owned finite diagnostic input并记录 event range、head、missed/coverage；不能把“当前 window”冒充从运行开始至今的完整 dataset。同一交互目标至多保留一个尚未开始的请求并以新revision替换旧请求；已完成的 diagnostic input 由其显式用户引用决定生命周期。
 
-finite preview 的唯一顺序是 `capture_next -> exact DatasetBuilder.consume/ack -> MonitorDataset.ingest_latest -> no-payload change notice`；显示永远由 worker 随后直接 `materialize(None)` 冻结当时的原子 snapshot，通知中的 ref 不会被保存后再延迟解析。`CapturePreviewPort.bind()` 原子把 MonitorDataset lifetime 转给 Workbench slot，runtime 此后只留 non-owning ingest handle；失败由 slot 唯一关闭，进入 exact allocation 后即使在 bind 前发生 open/reservation/builder 失败也会终止该 slot。只有整个 direct cleanup 或 pulse+camera aggregate cleanup 没有 primary error、cleanup error 或 UNSAFE decision时才发布正常 source terminal并把最终 capacity-one snapshot保留到 panel close；否则走同一个 `fail -> owner wake -> invalidate/clear`，不能让失败 Run 的最后front继续冒充有效。它不是第二份 finite truth、不会 seal，也不进入 artifact lineage。
+finite preview 的唯一顺序是 `capture_next -> exact DatasetBuilder.consume/ack -> MonitorDataset.ingest_latest -> no-payload change notice`；显示永远由 worker 随后直接 `materialize(None)` 冻结当时的原子 snapshot，通知中的 ref 不会被保存后再延迟解析。`CapturePreviewPort.bind()` 原子把 MonitorDataset lifetime 转给 Workbench slot，runtime 此后只留 non-owning ingest handle；失败由 slot 唯一关闭，进入 exact allocation 后即使在 bind 前发生 open/reservation/builder 失败也会终止该 slot。只有整个 direct cleanup 或 pulse+camera aggregate cleanup 没有 primary error、cleanup error 或 UNSAFE decision时才发布正常 source terminal并把最终单帧snapshot保留到 panel close；否则走同一个 `fail -> owner wake -> invalidate/clear`，不能让失败 Run 的最后front继续冒充有效。它不是第二份 finite truth、不会 seal，也不进入 artifact lineage。
 
 产品状态也沿这条authority边界分开：只有`RunSnapshot.state == SUCCEEDED && final_committed`能把Capture标为`FINAL`；preview失败、board present失败或preview close重试都不能阻塞该snapshot的reconcile、result/reap或改变artifact。preview始终标`DISPLAY ONLY / latest rendered raw frame`，不能仅因Run已FINAL就声称当前raster必然是最后采集帧；FAILED/CANCELLED时旧front先退场，若presenter clear暂时失败则保留同一controller重试，而不是丢owner或把旧front重新标成PROVISIONAL。
 
-M1 continuous monitor与finite preview共享数据面但不共享终态语义。配置为`FREE_RUNNING`的独立`monitor_camera`一次arm后由传感器曝光时钟产生frame；host循环只排空有界record queue，不用sleep或GUI刷新节奏调度曝光。每个record先进入稳定StreamId的fresh generation，再由capacity-one tap/materializer原子冻结`(R=1, MONITOR_HISTORY=1, SPATIAL_Y, SPATIAL_X)`、BlockId、head、aligned EventRefs与MonitorCoverage；IMAGE view用具名MONITOR_HISTORY AxisId显式选slot 0，不使用LatestNonempty、flatten或隐式data-axis reduce。该路径没有ExactReservation、seal、artifact、权威Fit/Save或formal capture含义。
+M1 continuous monitor与finite preview共享数据面但不共享终态语义。配置为`FREE_RUNNING`的独立`monitor_camera`一次arm后由传感器曝光时钟产生frame；其`buffer_frame_count`严格等于声明的`history_cycles * frames_per_cycle`，host循环持续排空adapter交付的record，不用sleep或GUI刷新节奏调度曝光。每个record先进入稳定StreamId的fresh generation，再由tap/materializer原子冻结`(R=1, MONITOR_HISTORY=1, SPATIAL_Y, SPATIAL_X)`、BlockId、head、aligned EventRefs与MonitorCoverage；IMAGE view用具名MONITOR_HISTORY AxisId显式选slot 0，不使用LatestNonempty、flatten或隐式data-axis reduce。该路径没有ExactReservation、seal、artifact、权威Fit/Save或formal capture含义。
 
-adapter queue内的overflow、source ordinal/produced-count不连续或设备worker失败属于pre-broker source failure，必须终止Run并撤下front；只有record已经交给broker以后，MonitorTap overwrite和render coalescing才记为可见`missed_events/current_gap`，不能把前者伪装成UI落后。正常Stop也不保留最后一帧：先cancel并完成session-specific stop/join/SAFE verification，再`source_terminal`撤销publish authority和front；并发真实source error不能被稍后的用户cancel洗成CANCELLED。当前virtual role恢复main的MOT行为oracle：1920×1200 Mono8、free-running sensor clock、读取同一current sequencer的compiled/held三轴DAC输出、SAFE零场以及coil-space Gaussian fluorescence；移动高斯临时源不保留。real Pylon的`LatestImageOnly`若会在record owner之前跳帧，则在adapter能显式报告skip并完成contract qualification前保持NO-GO，不能用virtual严格队列外推真机正确性。
+driver真实ring覆盖、source ordinal/produced-count不连续或设备worker失败属于pre-broker source failure，必须终止Run并撤下front；record交给broker以后MonitorTap不再覆盖。frontend render coalescing只记录display-skipped revision，不能伪装成source gap或回流权威路径。正常Stop也不保留最后一帧：先cancel并完成session-specific stop/join/SAFE verification，再`source_terminal`撤销publish authority和front；并发真实source error不能被稍后的用户cancel洗成CANCELLED。当前virtual role恢复main的MOT行为oracle：1920×1200 Mono8、free-running sensor clock、读取同一current sequencer的compiled/held三轴DAC输出、SAFE零场以及coil-space Gaussian fluorescence；移动高斯临时源不保留。real Pylon的`LatestImageOnly`若会在record owner之前跳帧，则在adapter能显式报告skip并完成contract qualification前保持NO-GO，不能用virtual严格交付外推真机正确性。
 
 ## 8. 同步执行与线程托管
 
@@ -1277,14 +1285,14 @@ RunController.start(plan) -> RunHandle   # 后台，workbench
 ```text
 task owner builder(TaskDefinition key, request, immutable bindings) -> RunPlan[Result]
 resolve MeasurementDefinition metadata + domain composition binder -> BoundMeasurement
-processor owner binder(StreamProcessorDefinition key, config, contracts) -> BoundStreamProcessor
+processor owner binder(ProcessorDefinition key, config, contracts) -> BoundStreamProcessor
 domain analysis owner builder(typed request, immutable artifact refs) -> flat RunPlan[Result]
 zlc_data.bind_fit(FitSpec, expected DatasetSchema) -> BoundFit
 ```
 
 Measurement 与 StreamProcessor 都不是独立 lifecycle owner，不直接返回 RunPlan；它们由静态 PipelineSpec 编译进一个顶层 RunPlan。用户“单独 Start Measurement”也编译成一个 source + DatasetBuilder/明确 sink 的最小 PipelineSpec，而不是特殊启动路径。已提交 artifact 上的 calibration/detection 等领域 Analysis 由自己的 typed request 直接编译成一个 flat RunPlan；generic post-materialization AnalysisStep 不是当前 baseline。这样不会为了统一方法签名而让不同语义冒充 Task，也不会为一个UI入口预建第二套生命周期。
 
-MeasurementDefinition只含DefinitionKey、title、request/binding schema id与capture-spec owner fingerprint等递归声明式字段；动态output schema/cardinality与实际record capacity 只属于 BoundMeasurement 的 capture contract。StreamProcessorDefinition同样只含DefinitionKey、title与config schema id；input/output/join contracts、operator、deadlines与artifact inputs全部属于BoundStreamProcessor并进入其fingerprint。DefinitionCatalog机械拒绝callback、raw driver、mutable cache或其它非声明式field。generic runtime不调用Definition.bind，也不接收任意`request: object/bindings: object`；各领域composition在自己的typed request/typed bindings边界完成纯验证并直接构造Bound值，bindings只含Bound Port和immutable config。compile_pipeline 是无硬件 I/O 的确定性构造，可做schema、owner、完整schedule、expected counts和record-capacity校验。Notebook 可以在调用线程直接构造；Workbench 把同一个同步函数投递给其普通 application worker，结果再交给 RunController.start。runtime 不定义专用 command/build lane、第二套队列协议或额外 Service；若 profiling 证明某个编译器本身很重，只把该纯函数放入现有 CPU worker，不改变领域合同。RunController.start 只接收已经构造好的 RunPlan，因此不会持有 ResourceClaims 等待纯编译。
+MeasurementDefinition只含DefinitionKey、title、request/binding schema id与capture-spec owner fingerprint等关闭字段；动态output schema/cardinality与camera `buffer_frame_count`派生只属于BoundMeasurement的capture contract。ProcessorDefinition同样只含DefinitionKey、title与config schema id；input/output/join contracts、operator、deadlines与artifact inputs全部属于BoundStreamProcessor并进入其fingerprint。三个Definition dataclass各自在构造器验证自己的精确字段类型与canonical值，且不存在开放metadata map，所以callback、raw driver、mutable cache没有可写入的字段；不再为这三个关闭值保留一个零生产消费者的递归声明式检查器或聚合Catalog class。generic runtime不调用Definition.bind，也不接收任意`request: object/bindings: object`；各领域composition在自己的typed request/typed bindings边界完成纯验证并直接构造Bound值，bindings只含Bound Port和immutable config。compile_pipeline 是无硬件 I/O 的确定性构造，可做schema、owner、完整schedule、expected counts和固定`buffer_frame_count`派生校验；真实分配只在driver prepare/arm时发生。Notebook 可以在调用线程直接构造；Workbench 把同一个同步函数投递给其普通 application worker，结果再交给 RunController.start。runtime 不定义专用 command/build lane、第二套队列协议或额外 Service；若 profiling 证明某个编译器本身很重，只把该纯函数放入现有 CPU worker，不改变领域合同。RunController.start 只接收已经构造好的 RunPlan，因此不会持有 ResourceClaims 等待纯编译。
 
 `RunPlan` 是扁平静态计划：
 
@@ -1302,7 +1310,7 @@ RunPlan[Prepared, Executed, Final]:
   requires_final_commit: bool
 ```
 
-generic runtime 不保存领域 request/bindings 容器、execution mode 或 event/grouping 等领域字段。有限 exact 与 continuous monitor 的完整性、record capacity和overwrite 语义属于 Measurement/Pipeline/Dataset contract；领域 composition 先冻结 typed request/bindings，再用不可变输入构造上述 callbacks。Measurement/Calibration request、Definition、实验保存格式与TaskConsole/CalibrationWorkbench表单一律不含通用`input_timeout/io_timeout/timeout`：阻塞硬件调用的deadline由adapter/installation policy拥有并经Port capability冻结，runtime hosting/等待API若需要deadline也只属于调用生命周期，不能反向传播成物理实验参数。已提交capture上的calibration/detection若需要host execution deadline，只允许各自application模块的私有policy在`prepare_*_plan()`调用repository compiler时注入`RunPlan.timeout_seconds`；它不进入`CalibrationArtifactRequest`、`DetectionRequest`、`SitemapCalibrationRequest`、Notebook facade、可编辑request或FormSpec。所有内部 timeout 必须 finite、非负且只用 monotonic clock；artifact timestamp 才使用 wall clock。
+generic runtime 不保存领域 request/bindings 容器、execution mode 或 event/grouping 等领域字段。有限 exact 与 continuous monitor 的完整性、事件cardinality和rolling数据语义属于 Measurement/Pipeline/Dataset contract；领域 composition 先冻结 typed request/bindings，再用不可变输入构造上述 callbacks。Measurement/Calibration request、Definition、实验保存格式与TaskConsole/CalibrationWorkbench表单一律不含通用`input_timeout/io_timeout/timeout`：阻塞硬件调用的deadline由adapter/installation policy拥有并经Port capability冻结，runtime hosting/等待API若需要deadline也只属于调用生命周期，不能反向传播成物理实验参数。已提交capture上的calibration/detection若需要host execution deadline，只允许各自application模块的私有policy在`prepare_*_plan()`调用repository compiler时注入`RunPlan.timeout_seconds`；它不进入`CalibrationArtifactRequest`、`DetectionRequest`、`SitemapCalibrationRequest`、Notebook facade、可编辑request或FormSpec。所有内部 timeout 必须 finite、非负且只用 monotonic clock；artifact timestamp 才使用 wall clock。
 
 `preflight` 的返回值就是领域私有的 typed prepared value，不再套公共运行包装对象。它可以携带 resolved schemas、reservations、cursors 和其它准备结果；`execute` 只能收到这一个值与 `RunContext`，不能从 session、global registry 或 service locator 找回未声明 Port。不包含 child run、递归 DAG 或运行中新增资源。
 
@@ -1441,28 +1449,32 @@ claims在bind时声明完整superset，并一直持有到本Run的全部worker�
 
 capability probe一次返回完整frozen snapshot，camera/sequencer descriptor只能从该snapshot纯函数投影；probe结束后不存在仍可读取raw connection的裸callback。active Run内binding失效后不透明重连；关闭旧runtime后可以在同一application process建立全新runtime，且必须重新live握手。
 
-## 10. Task、Measurement、StreamProcessor 与 Analysis
+## 10. Task、Measurement、Processor 与 Analysis
 
 ### 10.1 Definition 原则
 
-Definition 是递归声明式 frozen metadata，不含 callable、Port、Repository、GUI、mutable config 或 binding generation 事实，也不需要每类再建立 Handler Protocol 和公共 ABC。`DefinitionCatalog` 机械拒绝 callable；领域 owner 的 builder/operator 仍是具名 top-level 函数，由 composition 通过普通 import 显式调用，不以字符串 dispatch、隐藏 registry 或 Definition field 形成第二套执行真相源。所有运行依赖必须出现在 typed request 与领域私有 immutable bindings，所有可变参数必须进入 config revision。
+Definition 是关闭字段的 frozen metadata，不含 callable、Port、Repository、GUI、mutable config 或 binding generation 事实，也不需要每类再建立 Handler Protocol 和公共 ABC。`TaskDefinition/MeasurementDefinition/ProcessorDefinition` 的构造器分别验证其精确字段；因为没有开放metadata容器，行为对象在类型结构上就无处可写，不需要另建递归对象图检查器。领域 owner 的 builder/operator 仍是具名 top-level 函数，由 composition 通过普通 import 显式调用，不以字符串 dispatch、隐藏 registry 或 Definition field 形成第二套执行真相源。所有运行依赖必须出现在 typed request 与领域私有 immutable bindings，所有可变参数必须进入 config revision。
 
 只有会出现在 catalog/UI/API 的能力需要 Definition；Task 内部私有算法保持普通函数。
 
-Definition 发现不依赖 global mutable registry、包扫描或 entry point：
+能力 composition 不依赖 global mutable registry、包扫描或 entry point：
 
 ```text
 DefinitionKey:
   owner_package
   stable_definition_id
 
-DefinitionCatalog:
-  definitions: immutable tuple
+ConsoleCapabilityAttachment:
+  definition: TaskDefinition | MeasurementDefinition | ProcessorDefinition
+  owner preparer + optional presenter
+
+TaskConsoleApplicationPorts:
+  attachments: immutable tuple[ConsoleCapabilityAttachment]
 ```
 
-`zlc_neutral_atom` 拥有 DefinitionKey/DefinitionCatalog，各领域模块显式导出 definitions tuple；composition root 通过普通 import 组装 catalog，重复的 `(owner_package, stable_definition_id)` 启动即失败。Definition 没有平行 schema 版本；定义的声明字段改变后，全套当前软件原子部署。Workbench 用本地 adapter 将它们映射为 CatalogView；排序、分组、图标和可见性只存在于 CatalogView，不反向写进领域 Definition。zlc_data/zlc_pulse/frontend 不为了进入 UI catalog 而依赖 neutral_atom 的 Definition 类型，也不建立跨 bounded-context universal Definition base。
+`zlc_neutral_atom` 只拥有 DefinitionKey 与三个关闭 Definition dataclass；每个领域模块显式导出自己的具名 Definition 常量。桌面 composition root 通过普通 import 构造一个 immutable attachment tuple，每项把该 Definition 与其 owner preparer、可选 presenter接起来；`TaskConsoleApplicationPorts`在唯一真实聚合边界建立DefinitionKey索引并让重复的 `(owner_package, stable_definition_id)` 启动即失败。不存在先聚合Definitions、再投影attachments的中间Catalog对象。Definition 没有平行 schema 版本；定义的声明字段改变后，全套当前软件原子部署。Workbench 将同一attachment tuple机械映射为只读`ConsoleCatalogView`；排序、分组、图标和可见性只存在于该view，不反向写进领域 Definition。zlc_data/zlc_pulse/frontend 不为了进入 UI catalog 而依赖 neutral_atom 的 Definition 类型，也不建立跨 bounded-context universal Definition base。
 
-Catalog composition 对每个 DefinitionKey 必须产生一个显式 visible mapping 或 hidden reason；未处理 definition 使 architecture/E2E失败，避免新领域能力已经注册却在 UI 静默消失。迁移期 CatalogRouter 用同一规则保证一个 use case只有 legacy 或 new入口可见，不制造双启动按钮。
+Attachment composition 对每个 DefinitionKey 必须产生一个显式 visible mapping 或 hidden reason；未接入 definition 使 architecture/E2E失败，避免新领域能力已经存在却在 UI 静默消失。每个可见项本身就是其唯一mapping，不再维护第二份definitions tuple或动态registry。
 
 ### 10.2 Task
 
@@ -1472,7 +1484,7 @@ TaskDefinition[Request, Result]:
   parameter/request schema
 ```
 
-Task 是 one-shot use case，可以同步组合 CaptureSession、纯 operator 和 typed Repository。Definition 只声明 catalog identity/request schema；owner/composition 的显式 builder 才把 typed request 与 bindings 构造成 `RunPlan[Result]`。它不继承 Measurement/StreamProcessor/Analysis，不发布 measurement signal，不拥有 QWidget。
+Task 是 one-shot use case，可以同步组合 CaptureSession、纯 operator 和 typed Repository。Definition 只声明 catalog identity/request schema；owner/composition 的显式 builder 才把 typed request 与 bindings 构造成 `RunPlan[Result]`。它不继承 Measurement/Processor/Analysis，不发布 measurement signal，不拥有 QWidget。
 
 Task 不一定产生 artifact；普通控制/查询 Task 可返回 immutable result，需要持久化时返回本包 typed ref。
 
@@ -1506,10 +1518,10 @@ DeviceCapabilitySnapshot 是 connection generation health handshake 后得到的
 
 领域composition构造 immutable BoundMeasurement/FrozenCaptureSpec；runtime只验证owner fingerprint与canonical bytes SHA-256，不执行任意spec snapshot/validate/digest回调，也不会在session中二次freeze。Pipeline Run preflight只建立software CaptureSession/reservation/materializer，execute才在owner I/O lane发送prepare/start。Task 若需要同一种采集，复用同一FrozenCaptureSpec构造器/CaptureSession，而不是启动一个 child Measurement Run。
 
-### 10.4 StreamProcessor
+### 10.4 Processor
 
 ```text
-StreamProcessorDefinition:
+ProcessorDefinition:
   stable DefinitionKey
   title
   config_schema_id
@@ -1527,13 +1539,13 @@ BoundStreamProcessor:
 output = operator(joined_inputs, config)
 ```
 
-StreamProcessor 只处理当前 Envelope payload 或声明的完整 key group，不访问设备、Hub 私有状态、latest、累计 DataBlock、Repository 或 QWidget，也不创建 Envelope。`StreamProcessorWorker` 负责 subscription、join、validation 和 publish。
+Processor 只处理当前 Envelope payload 或声明的完整 key group，不访问设备、Hub 私有状态、latest、累计 DataBlock、Repository 或 QWidget，也不创建 Envelope。`BoundStreamProcessor` 与 `ExactStreamProcessorWorker` 是 Processor 在 formal event-stream 路径上的内部 binding/host 类型；它们负责合同冻结、subscription、join、validation 和 publish，不是另一种 Definition、catalog kind 或产品节点。当前 TaskConsole 的 latest-only lane 同理只是内部 host policy。
 
 `BoundStreamProcessor` 在 bind 边界由一个递归 owner 同时完成 config admission 与 owner snapshot，再从已准入值投影一次 canonical tree/fingerprint；之后读取 lineage 只返回缓存 fingerprint，不能为了防反射篡改而在每次属性访问重新遍历/哈希大 ndarray。当前 config dataclass 的获批基线是 stable module-owned、直接继承 `object`、exact frozen、只含声明字段的 plain dataclass；不预建继承/C-extension/container-backed config 体系，`replace()` 重建后必须保持 exact type并复核全部最终字段。Enum 与 operator 的 module+qualname 必须解析回当前 exact class/function。finite float、cycle、canonical string key、显式little-endian dtype、canonical C strides 与 ndarray 都由同一 owner处理；MappingProxy owner-copy按 canonical key order重建，ndarray owner以独立header直接重基到长度恰好相等的终端immutable `bytes`，不能把caller header、可逆readonly view、hidden slice或额外backing带入bound值。snapshot与canonical projection的memo都强持有`(source, result)`，不能用裸整数id让临时validity/array释放后的id复用污染另一个字段；显式typed generation owner identity与dataclass构造器确定建立的derived alias仍保留。
 
 config/fingerprint 的语义域是声明类型、字段值与canonical layout。普通Python `id`、caller alias topology、ndarray base/address以及frozenset的hash-table iteration order都不是配置语义；有顺序需求必须声明tuple，reviewed operator不得从这些表示细节派生结果，也不得修改bound config。Enum member/class、operator函数或module binding的运行中monkeypatch属于软件代码热修改，不是config content lineage；获批运行假设同一进程的软件定义保持不变，operator只使用声明的Enum/字段语义。`ExactStreamProcessorWorker` 在claim input consumer前一次验证bound、reservation/cursor、FrozenDatasetEdge、input/output contract、downstream与deadline/cancellation的真实owner graph；不叠加没有production issuer/consumer的可选callback guard。物理capture authority继续由CaptureSession/`CaptureProcessorInputBinding`领域边界拥有，不能伪装成通用processor hook。
 
-每个 StreamProcessor invocation 原则上发布一个 frozen typed payload。多个同 shot 结果组成一个 record，例如 `OccupancySample(occupied, counts, source_metadata)`；UI/下游通过 field projection 读取字段，不把同一物理结果拆成多个需要分布式原子提交的 signal。只有字段具有不同 cardinality、key 或生命周期时才拆成独立节点。
+每个 Processor invocation 原则上发布一个 frozen typed payload。多个同 shot 结果组成一个 record，例如 `OccupancySample(occupied, counts, source_metadata)`；UI/下游通过 field projection 读取字段，不把同一物理结果拆成多个需要分布式原子提交的 signal。只有字段具有不同 cardinality、key 或生命周期时才拆成独立节点。
 
 operator 不读 wall clock、module global config 或 global RNG；需要随机算法时 seed/RNG algorithm 是 immutable config 与 lineage 的一部分。相同 input/config/immutable model identity 必须可重放，允许的浮点容差由 operator contract 声明。
 
@@ -1543,7 +1555,7 @@ cardinality contract明确`1:1`、固定/有界fan-out、`group K:1`或intention
 
 output payload schema 必须只依赖 input contracts/config，不能读第一帧后改变 axis 数量或 record fields。站点发现、模型选择等 data-dependent schema discovery 属于 finite Task/Analysis/artifact 构造；其结果若要进入 formal pipeline，先以 SiteMap/CalibrationArtifact 等 immutable input 固定 schema，再 bind RunPlan。
 
-需要跨 event group 状态的在线算法使用明确 StreamReducer；普通 StreamProcessor 不带可选 start/update/finish/reset。对完整 scan/capture 数据集做 fit、calibration 或 report 的算法属于 Analysis，不使用 StreamReducer 模拟 batch analysis。
+需要跨 event group 状态的在线算法使用明确 StreamReducer；普通 Processor 不带可选 start/update/finish/reset。对完整 scan/capture 数据集做 fit、calibration 或 report 的算法属于 Analysis，不使用 StreamReducer 模拟 batch analysis。
 
 StreamReducerDefinition 必须提供 state factory 与 update/finalize contract；每个 `StreamProcessorWorker`/RunHandle 创建独立 state，不能复用 module singleton 或上一次 run 的缓存。state 的 schema/config revision 固定，EOS incomplete/cancel 时不得把 partial finalize 结果发布成成功输出。
 
@@ -1565,7 +1577,7 @@ DomainAnalysisRequest[Result]:         # 仅在领域物理语义需要时定义
   compile -> one flat RunPlan[Result]
 ```
 
-离线/权威数据计算不访问 Device、Hub/latest、QWidget 或 mutable DatasetBuilder。它消费携 exact DatasetRevisionRef 的 OwnedSnapshot或immutable artifact，产生 FitResultBatch、CalibrationArtifact、report 等 typed result。`FitSpec/BoundFit/FitResultBatch` 与 `BoundFit.run()` 全部由 zlc_data 拥有；Calibration/ReadoutFidelity 等带 neutral 物理语义的算法使用自己的typed request/compiler，不以generic Fit wrapper冒充领域判断。neutral 的 DefinitionCatalog不重新注册或包装通用Fit；Workbench只在Figure已有的`Fit` surface投影这项capability。
+离线/权威数据计算不访问 Device、Hub/latest、QWidget 或 mutable DatasetBuilder。它消费携 exact DatasetRevisionRef 的 OwnedSnapshot或immutable artifact，产生 FitResultBatch、CalibrationArtifact、report 等 typed result。`FitSpec/BoundFit/FitResultBatch` 与 `BoundFit.run()` 全部由 zlc_data 拥有；Calibration/ReadoutFidelity 等带 neutral 物理语义的算法使用自己的typed request/compiler，不以generic Fit wrapper冒充领域判断。neutral 的 Definition 词汇不重新注册或包装通用Fit；Workbench只在Figure已有的`Fit` surface投影这项capability。
 
 当前有两个挣得起的hosting路径：interactive/offline adapter把已冻结snapshot交给同一个BoundFit；需要durable领域artifact的typed request从已提交输入编译一个flat RunPlan并拥有自己的一次FinalCommit。二者都不是StreamProcessor，也不通过伪造“累计DataBlock event”接入sample stream。
 
@@ -1588,7 +1600,9 @@ PipelineSpec:
 compile_pipeline(spec, immutable bindings) -> RunPlan[PipelineResult]
 ```
 
-这里区分formal exact pipeline与monitor-only reactive leaf，但两者遵守同一所有权。formal Measurement/Task在Start边界由neutral prepared command编译上述flat RunPlan；TaskConsole不展开program/request字段，也不在Run成功后用GUI callback重建Dataset。monitor-only Camera→Occupancy不为每个Logic node建立executor、自订阅latest或自行freeze DataPlane：TaskConsole DataPlane只有一个共享monitor worker lane，在owner线程接纳某个明确`ConsoleSignalValue` revision后，把其`OwnedSnapshot + typed coverage + event digest`交给已经prepared的neutral application `evaluate()`；neutral application返回同一revision的完整`counts/occupied/rate`事务，owner线程再原子发布。busy时该monitor lane可以按声明的latest-only QoS覆盖尚未开始的旧revision，但必须保存missed/gap事实；它不能进入exact/fit/calibration authority。Processor node本身只持binding/lifecycle/presentation，不持subscription、executor、shape算法或repository callback。
+这里区分formal exact pipeline与live latest-only leaf，但两者遵守同一所有权。formal Measurement/Task在Start边界由neutral prepared command编译上述flat RunPlan；TaskConsole不展开program/request字段，也不在Run成功后用GUI callback重建Dataset。Camera→Occupancy不为每个Logic node建立executor、自订阅latest或自行freeze DataPlane：TaskConsole DataPlane只有一个私有 latest-only lane，在owner线程接纳某个明确`ConsoleSignalValue` revision后，把其`OwnedSnapshot + 生产者原始 typed coverage + event digest`交给已经prepared的neutral application `evaluate()`；neutral application返回同一revision的完整`counts/occupied/rate`事务，owner线程再原子发布。busy时该lane可用新revision替换尚未开始的旧revision；这是host调度选择，绝不能合入source `MonitorCoverage`、`missed_events`或`current_gap`，也不能进入exact/fit/calibration authority。只有实际UI消费者需要时才可增加独立host调度遥测，不预建无消费者的`processor_skipped_revisions`机制。`ConsoleProcessorNode`只持由`DatasetInputSpec/ArtifactInputSpec`机械解析出的typed binding、lifecycle和一个窄result→presentation adapter，不持subscription、executor、shape算法、repository callback或某个Processor专用binding intent；Occupancy的Camera/Calibration需求以及PulseScan/coupled Measurement的输入需求只能来自各自owner声明，不能在`window.py/app.py`按DefinitionKey和字段名重述。
+
+`PulseScan`本身是一个具体的复合logic-node，不是framework host；因此它可以在自己的`source_binding/application`边界显式依赖当前已证明的Camera与Camera→Occupancy两条physical pipeline。这个依赖必须消费Camera/Occupancy owner发布的request、output contract和prepared pipeline，不能复制字段或算法。将来另一种Processor成为scan source时，只有它的exact物理执行、终端证据和输出合同都出现真实用例后，才增加一条同样显式的joint adapter；不以动态registry/service locator或“任意Processor都能scan”接口预造无法兑现的物理能力。
 
 编译阶段完成：DefinitionKey/descriptor binding、event payload/schema/axis 校验、无环校验、ResourceClaims 并集、exact/monitor edge 分类、expected event/cardinality与ack边界、JoinPolicy、DatasetBuilder key coverage、criticality 和 terminal propagation。当前不支持 feedback data cycle；需要反馈控制时使用 revisioned ControlTopic，不把回路伪装成数据边。
 
@@ -1596,7 +1610,7 @@ REQUIRED source/processor/sink failure 使整个 Run 失败。BEST_EFFORT_MONITO
 
 编译结果仍是一个扁平顶层 RunPlan：一个 RunHandle 依次拥有 online acquisition graph、DatasetBuilder finalization、artifact commit 和 cleanup。节点不能嵌套 start Run、动态新增边或各自成为 terminal-state owner。PipelineSpec 是静态阶段合同，不是 child-plan workflow DAG。未来真实consumer若挣得post-materialization Analysis，也必须先解决同一commit结果与ambiguous recovery，而不能把callback塞到finalize之后假装原子。
 
-F0/S1 的首个 compiler 只接受 `1 BoundMeasurement -> 1 DatasetMaterializerSpec -> opaque in-memory PipelineResult`：没有 processor、analysis、feedback、持久sink callback、可选 child 或通用 node/edge DSL。它在 `RunController.start()` 取得 claim 之前完成 DefinitionKey、FrozenCaptureSpec owner、payload/adapter/schema、完整cell permutation、expected event count与实际hardware/driver record capacity校验；RunPlan.preflight只用真实run_id创建software TraceBinding、CaptureSession、唯一exact reservation、cursor和DatasetBuilder，不发送任何device command；execute在prepared state完整返回后才prepare/start。CaptureSession自己从冻结`expected_cells[source_ordinal]`派生join key，不接受execute层传入另一个key；只有该reservation已经ACTIVE且持有绑定schema/adapter/完整schedule的ExactDatasetReadiness后，start才可触达设备。
+F0/S1 的首个 compiler 只接受 `1 BoundMeasurement -> 1 DatasetMaterializerSpec -> opaque in-memory PipelineResult`：没有 processor、analysis、feedback、持久sink callback、可选 child 或通用 node/edge DSL。它在 `RunController.start()` 取得 claim 之前完成 DefinitionKey、FrozenCaptureSpec owner、payload/adapter/schema、完整cell permutation与expected event count校验，并为camera派生唯一物理`buffer_frame_count`（finite为完整`expected_frames`，monitor为`history_cycles * frames_per_cycle`）；RunPlan.preflight只用真实run_id创建software TraceBinding、CaptureSession、唯一exact reservation、cursor和DatasetBuilder，不发送任何device command；真实driver分配在prepare/arm时失败就使本次run失败。execute在prepared state完整返回后才prepare/start。CaptureSession自己从冻结`expected_cells[source_ordinal]`派生join key，不接受execute层传入另一个key；只有该reservation已经ACTIVE且持有绑定schema/adapter/完整schedule的ExactDatasetReadiness后，start才可触达设备。
 
 `BoundCapturePort`只接受DeviceBroker针对当前BoundDevice/binding/generation执行endpoint-owned capability probe后mint的opaque attestation，不能把普通`CaptureCapabilitySnapshot`拼到真实设备上；probe全程持有broker probing token并与Run open、binding invalidation互斥，跨过任何activity epoch的结果不得发布。FrozenCaptureSpec在进入runtime前已由领域owner生成canonical bytes，runtime自行重算SHA-256并要求definition/contract/capability/spec owner fingerprint四者一致，prepare阶段没有替换或回调入口。CaptureSession创建线程就是其owner I/O lane，prepare/start/read/complete/termination/cleanup跨线程调用一律拒绝。普通整数、字符串或任意格式正确的digest不构成物理证明；正常terminal必须同时核对generation、spec/settings/capability binding、全部source ordinal、produced/drained、ordered metadata digest、source stopped、no-more-frame和真实join，才可mint不可伪造的CaptureCompletion。取消后普通execution capability会被撤销，因此BoundCapturePort必须提供thread-safe ABORT/DISARM与有限blocking-call bound；该bound写入每个prepare/start/read/complete/session-close command，adapter必须把它交给SDK wait/poll或自己的有界等待，不能只把它留作描述字段。cleanup phase发送绑定本session的`SessionCloseCommand`；wrong-session、stop/drain/join未知或超时都使当前run失败，不能靠safe-state布尔值跳过join。formal compiler只消费该session拥有的CaptureCompletion，再取其中EOS交给DatasetBuilder seal，并交叉验证sealed artifact与terminal的metadata fingerprint/digest；PipelineResult由compiler私有authority mint并再次核对coverage/count/digest，调用方不能拼接另一个terminal伪造成功。裸EOS不构成pipeline成功。DatasetBuilder是exact reservation teardown的唯一owner：success seal、preflight/execute/cancel失败都在独立finally中close，最终reservation必须RELEASED且registry为空，前一步cleanup失败不能阻止它。finalize阶段的persistent sink只接受storage-owned staged FinalCommit，不接受“任意 callback + requires_commit bool”。后续S3/S4只为已存在的processor或领域typed Analysis扩展静态合同；generic post-materialization Analysis仍受§10.5 consumer/commit门槛，不把这个最小直线偷偷演化成递归工作流引擎。
 
@@ -1956,7 +1970,7 @@ selector/board发出的commit必须保留完整`PanelInteractionOrigin`直到Wor
 
 ### 11.12 Analysis 不建立 god processor
 
-纯算法只有一层命名：`zlc_data.apply_transform`、`reduce_data`、private `build_fit_problem`、`bind_fit` 与唯一公开执行入口 `BoundFit.run()`。interactive、offline/artifact以及未来挣得的formal路径都执行同一个BoundFit；neutral当前不定义generic AnalysisStep或任何Fit-named class。`OccupancyStreamProcessorDefinition` 属于 neutral_atom，因为它包含逐帧领域物理语义；Calibration/ReadoutFidelity等完整dataset/artifact算法的typed request与compiler属于neutral_atom，因为它们承担领域物理判断。简单的、无领域语义的逐event变换若确需进入在线图，可由zlc_data提供纯函数，neutral pipeline在composition时绑定为普通StreamProcessor operator，但不复制实现。
+纯算法只有一层命名：`zlc_data.apply_transform`、`reduce_data`、private `build_fit_problem`、`bind_fit` 与唯一公开执行入口 `BoundFit.run()`。interactive、offline/artifact以及未来挣得的formal路径都执行同一个BoundFit；neutral当前不定义generic AnalysisStep或任何Fit-named class。`OccupancyProcessorDefinition` 属于 neutral_atom，因为它包含逐帧领域物理语义；Calibration/ReadoutFidelity等完整dataset/artifact算法的typed request与compiler属于neutral_atom，因为它们承担领域物理判断。简单的、无领域语义的逐event变换若确需进入在线图，可由zlc_data提供纯函数，neutral pipeline在composition时绑定到内部 streaming operator，但不复制实现、也不形成第二种公开 Processor。
 
 zlc_data 的 solver 是同步纯调用，不注册 frontend 提供的 GUI-thread guard、不读取环境变量来判断调用线程，也不持有 executor。是否在 GUI thread 之外执行是 frontend/neutral hosting adapter 的合同，并由真实入口测试证明；把线程策略注入数学 kernel 会形成隐藏全局反向依赖。
 
@@ -2091,7 +2105,7 @@ baseline 的 `LiveFigureBinding.resolve(DatasetRevisionRef, SnapshotQuery) -> Ow
 
 统一的是四条互不混名的边界，而不是一个万能SettingsEngine：typed Request/Config owner的字段语义、§4.3.1的headless FormSpec与closed Qt handler、Workbench EditorSession的`base_revision + draft/apply/cancel`、以及最终领域validator/typed command。普通scalar、bool、enum、bounded number、unit value、简单path和静态list可由FormSpec自动生成；Setting与Edit必须消费同一个FormSpec和同一个committed state，但拥有各自widget instance与开始编辑时的base revision。
 
-Definition只标识catalog项及其request/config schema identity；它不复制字段默认值，也不携带FormSpec、Qt hint或projector callback。字段的type、required、default、unit、range、static choices和semantic description属于typed Request/Config schema owner。Workbench为已知use case通过普通import调用明确的schema projector，把这些事实逐项投影成`zlc_frontend.form.FormSpec`，并只在这里增加group/order/label/widget/layout/file-dialog/dynamic-enable等presentation信息。frontend不认识Definition，领域包也不导入frontend；schema-id不用于动态查找builder。
+Definition只标识catalog项及其request/config schema identity；它不复制字段默认值，也不携带FormSpec、Qt hint或projector callback。字段的key、stable operator label、type、required、default、unit、range、static choices和semantic description属于typed Request/Config schema owner。Workbench为已知use case通过普通import调用明确的schema projector，把这些事实逐项投影成`zlc_frontend.form.FormSpec`，并只在必要时增加group/order/widget/layout/file-dialog/dynamic-enable等presentation信息；它不能为了生成普通表单再次逐字段填写label/default/range。frontend不认识Definition，领域包也不导入frontend；schema-id不用于动态查找builder。
 
 以下继续使用显式presenter/view，不强行自动生成：Pulse editor与PulseDocument/API table、ROI/selector、fit axis/batch/reduction、CalibrationArtifactRef与calibration workflow、device connection、authoritative DataTransform、resource conflict和安全确认。显式presenter内部的普通叶字段仍优先取公共handler，但复杂对象的commit、rollback、validation和lifecycle不能交给generic form。`FluentParameterForm`不递归、不持久化、不做domain validation，也不拥有Apply按钮。
 
@@ -2124,7 +2138,7 @@ Setting 与 Edit 使用同一个 `ScanIntentForm` 类和同一个 card-owned `Sc
 2. `WORKER_RASTER_LIVE`：高成本 2D、grid 和多 panel board；render worker 永久拥有独立 Agg Figure 或纯 raster backend，GUI 只接 immutable front QImage/texture + coordinate transform，并用 Qt overlay 处理 Area、locked Cross、selection 与 drag handles；无 pointer-motion 数据 hover；
 3. `WORKER_HEADLESS_EXPORT`：export worker 永久拥有独立 Figure，只返回 immutable image/file artifact。
 
-冻结Figure报告路径的唯一capacity-one lane先调用notebook提供的窄`.figure` callable，再用串行Agg owner合成整个board PNG；Qt owner只通过`FrozenRasterView.present_encoded()`原子换front。它只负责没有持续source、overlay、ViewportTransform或交互selector的报告页；通用 figure/archive 查看路径必须通过 typed panel 恢复 `main` 的 zoom/pan/re-fit/export。关闭仍须立即置cooperative cancellation并撤销发布，尚未开始及repository/Agg阶段之间的工作直接终止，已经进入不可安全强杀的repository/Agg调用则由共享lane诚实排空，GUI不等待且最终丢弃返回值，绝不发布stale front。
+冻结Figure报告路径的唯一串行latest-state lane先调用notebook提供的窄`.figure` callable，再用串行Agg owner合成整个board PNG；Qt owner只通过`FrozenRasterView.present_encoded()`原子换front。它只负责没有持续source、overlay、ViewportTransform或交互selector的报告页；通用 figure/archive 查看路径必须通过 typed panel 恢复 `main` 的 zoom/pan/re-fit/export。关闭仍须立即置cooperative cancellation并撤销发布，尚未开始及repository/Agg阶段之间的工作直接终止，已经进入不可安全强杀的repository/Agg调用则由共享lane诚实排空，GUI不等待且最终丢弃返回值，绝不发布stale front。
 
 `WORKER_RASTER_LIVE` 是复合板的正式性能路径，不是把每个 panel 退回 GUI compose。worker 可一次 compose 整个 board 或一组共享布局，并通过 double/triple buffer 发布：
 
@@ -2148,7 +2162,7 @@ CoherenceStamp:
 
 同一 coherence group 的 panel 必须从同一个 causation domain 与完整 CoherenceStamp 求值，并在一次 GUI transaction 中 `present(BoardFrame)`；裸 `JoinKey==7` 或裸 `revision==5` 在不同 run/block/generation/schema 间不具有可比性。不能让 per-panel latest-only 各自成功后拼成看似同 shot 的 board。互相独立的 monitor 可以带不同 revision，但 BoardFrame 必须显式标出它们不是 coherent group。强像素级 coherence 使用一个 parent raster/front-buffer 原子换页；多个独立 QWidget surface 最多声明 model transaction coherent，不能声称 OS paint 同一时刻完成。后台慢时丢弃未开始的旧 board revision，不能逐 panel 呈现半新半旧状态。
 
-单 source、单 DatasetId/layer、单 panel/coherence group 的正式链是 `MonitorDatasetSnapshot -> FigureEvaluator -> worker-owned Agg -> immutable RGBA BoardFrame -> SinglePanelHost/QtRasterBoard`；Qt leaf 只从 curated public facade 加载。owner thread先以`BoardPublishPort.admit(sequence, group->exact stamp)`冻结完整期望向量并签发一次性work token，worker只可用该token提交完全匹配的`BoardFrame`；新admit、source invalidation、reconfigure、port replacement或close会使旧token失效，首次成功publish即消费token。admit与present都在owner thread线性化，worker只替换一个capacity-one pending whole-board mailbox。上游多 source/per-group join与公平render lane由Workbench scheduler拥有，不能把这个单 panel coalescer误写成第二个scheduler。
+单 source、单 DatasetId/layer、单 panel/coherence group 的正式链是 `MonitorDatasetSnapshot -> FigureEvaluator -> worker-owned Agg -> immutable RGBA BoardFrame -> SinglePanelHost/QtRasterBoard`；Qt leaf 只从 curated public facade 加载。owner thread先以`BoardPublishPort.admit(sequence, group->exact stamp)`冻结完整期望向量并签发一次性work token，worker只可用该token提交完全匹配的`BoardFrame`；新admit、source invalidation、reconfigure、port replacement或close会使旧token失效，首次成功publish即消费token。admit与present都在owner thread线性化，worker只保留一个可替换的pending whole-board latest state。上游多 source/per-group join与公平render lane由Workbench scheduler拥有，不能把这个单 panel coalescer误写成第二个scheduler。
 
 M1是`WORKER_RASTER_LIVE`的第一个continuous单panel产品，不是第四种render模式。Run worker只负责camera record -> stream -> MonitorDataset；live render worker从同一原子snapshot冻结block/head/EventRefs/coverage，FigureEvaluator和GRAY8 raster都不在Qt线程，Qt只接受immutable BoardFrame front。coverage只在对应front成功publish时一起更新，不能把后来的missed计数贴到旧图。source failure或normal terminal都先使publish port失效再clear，因此已排队worker结果不能在撤源后复活旧front。capture与monitor复用同一个窄Qt Run-owner/mailbox管理Future、generation、cancel/reap和close顺序；finite capture的FINAL front保留、monitor Stop撤屏/重新prepare仍留在各产品controller，禁止抽成可配置“成功策略”或通用workflow窗口。
 
@@ -2169,7 +2183,7 @@ LiveRasterFrame:
 
 Qt终态只有两种不冒充彼此的画面：`QtRasterBoard`是typed语义交互面，`FrozenRasterView`是报告/encoded整板的原生像素浏览面。后者只由 `FluentScrollArea` 提供滚动，不做 bitmap zoom/pan，也没有数据坐标、selector、Fit或ROI；需要这些能力的Edit、live viewer和panel card必须进入前者，由 `ViewportTransform + worker re-render` 完成交互，不能因为已有PNG就降级。`SinglePanelHost`只是单panel的identity/binding facade，不是第二个board；它转发完整typed DTO并由两个以上window复用。
 
-TaskConsole终态不保留`plot_bridge*.py`职责袋。`app.py + application_ports.py`只做desktop composition与最窄应用端口；`console_records.py + console_state.py + layout_repository.py`唯一拥有产品记录、current codec与原子文件发布；`catalog_bridge.py`及各具名form模块只把domain Definition/request投影成可见表单，不定义物理output；`run_bridge.py + occupancy_binding.py + data_plane.py`只托管已经prepared的Run/live output与实例namespace；`render_lane.py`唯一拥有`PanelComposer/Agg`；`panel_board.py + panel_card.py + panel_editor.py`及Logic editor/row只是稳定Qt表面；`window.py`组织tabs/cards与owner-thread lifecycle。不存在通用`state.py/panel_types.py/panel_controller.py`影子层，也不新增RenderCoordinator。迁移按IMAGE→CURVE/monitor→HISTOGRAM+current fit→SITES/GRID逐kind闭合；每个kind必须先把`main`真实Figure/Divider/artist owner迁入同一个render surface，再接current typed payload，不能在Qt板、live renderer、archive renderer各留一份近似实现。`zlc_frontend.panel_params`只声明当前renderer直接消费的显示参数，Fit只通过DataFigure的具名轴`FitSpec/BoundFit/FitResultBatch`路径进入，不把显示参数伪装成Analysis；在真实payload/renderer、main像素oracle与适用selector未闭合前该kind不得标addable。`zlc_frontend.qt_widgets.board`与`zlc_frontend.matplotlib_render`只按已有职责机械拆文件（frozen presenter、owner wake、image/numeric gesture、dataset/pulse/bytes encoder），不以mixins、registry、路径I/O或转发class隐藏god object。
+TaskConsole终态不保留`plot_bridge*.py`职责袋。`app.py + application_ports.py`只做desktop composition与最窄应用端口；`console_records.py + console_state.py + layout_repository.py`唯一拥有产品记录、current codec与原子文件发布；`catalog_bridge.py`机械组合domain Definition、owner authoring schema、不可拆分的`DatasetOutputDeclaration(name, contract_id)`与presentation metadata，不能分别配对name/contract，也不能为每种Definition建立具名form/binding模块；neutral的`LiveDatasetOutput/FinalDatasetOutput`必须携带同一个owner declaration value，`data_plane.py`按完整value交叉验证，GUI单独改name或contract都不能通过。通用`input_binding.py + run_bridge.py + data_plane.py`只解析声明过的typed inputs、托管已经prepared的Run/live output与实例namespace，不能含Occupancy/PulseScan/coupled等DefinitionKey或字段名分支；`render_lane.py`唯一拥有`PanelComposer/Agg`；`panel_board.py + panel_card.py + panel_editor.py`及Logic editor/row只是稳定Qt表面；`window.py`组织tabs/cards与owner-thread lifecycle。不存在通用`state.py/panel_types.py/panel_controller.py`影子层，也不新增RenderCoordinator。迁移按IMAGE→CURVE/monitor→HISTOGRAM+current fit→SITES/GRID逐kind闭合；每个kind必须先把`main`真实Figure/Divider/artist owner迁入同一个render surface，再接current typed payload，不能在Qt板、live renderer、archive renderer各留一份近似实现。`zlc_frontend.panel_params`只声明当前renderer直接消费的显示参数，Fit只通过DataFigure的具名轴`FitSpec/BoundFit/FitResultBatch`路径进入，不把显示参数伪装成Analysis；在真实payload/renderer、main像素oracle与适用selector未闭合前该kind不得标addable。`zlc_frontend.qt_widgets.board`与`zlc_frontend.matplotlib_render`只按已有职责机械拆文件（frozen presenter、owner wake、image/numeric gesture、dataset/pulse/bytes encoder），不以mixins、registry、路径I/O或转发class隐藏god object。
 
 TaskConsole 的 data seam 进一步固定为“消费领域已经命名的 typed outputs”，而不是“取得原始 snapshot 后由 GUI 决定怎样拆”。`zlc_data` 唯一拥有 `(R,P,*data_shape)`、scalar `(R,P,1)`、axis/layout/validity 与通用 selection/Fit 派生 carrier 的构造规则；具体 Measurement/Task/Processor application 唯一拥有自己的物理输出集合、输出名顺序、具名轴拆分和 artifact materialization，例如 Camera application 才能把声明的 `READOUT_EVENT` 拆成 `frame_i`，Calibration/MOT/Occupancy/PulseScan 的 output constants 也都由各自 domain owner 公布。Catalog 只能引用这些常量添加 short label、axis label、description 与 default panel；**unit 也不能由 Catalog 重打字面量**，只能从实际 `DatasetSchema/AxisSpec` 读取。GUI 不能把一组 output names 反向传给领域 materializer 决定“这次生成哪些结果”。它们分别交付 `LiveDatasetOutput(name,snapshot,coverage,join_digest)` 或 `FinalDatasetOutput(name,snapshot,join_digest)`；这个 concrete type 就是 RUN/FINAL 边界的唯一真相源，Catalog declaration 不含 `unit`、`run_scoped`、stage 或 completeness 规则。Workbench 只拒绝领域输出中不存在于当前可见 vocabulary 的未知名字，不能反过来用 UI 声明裁剪输出、要求某个阶段出现哪些名字或判断结果是否完整；live front 是否随 producer 撤下也由实际接纳的 `LiveDatasetOutput` 记录，不由 Catalog 预测。多输入显示需要的领域事实另用最窄 typed context 交给 composition seam，neutral 不反向依赖 frontend。Frontend 只拥有 Figure/selector/Fit 的用户意图、派生 signal 名称、presentation metadata 与 renderer；其需要发布的 Area/Cross/Fit 数据必须调用 `zlc_data` 的通用 materializer，不能自行拼 `DataBlock/DatasetSchema`。Workbench 只加 node/panel namespace、维持 lifecycle 和把 immutable front 送入 frontend；禁止在 `task_console` 下构造 `DataBlock/DatasetSchema`、按 shape/rank/singleton 推断物理语义、直接调用 repository materializer、保存开放的 snapshot-projector callback，或以 forwarding wrapper 把上述任一职责改名藏起来。`zlc_workbench/task_console/app.py` 是 C10/C20 所允许的桌面 composition root：它可以把 public typed application command、Run owner、live sink 与窗口接起来，但不能实现或复制 Measurement/Task/Processor 的物理变换、输出 schema、算法或 artifact materialization；其余 Qt/controller 文件更没有这项权力。
 
@@ -2179,7 +2193,7 @@ Task的默认可视化不是专用viewer或领域stage状态机。Catalog只可�
 
 Workbench 与 notebook 也不使用 `_prepare_*_for_workbench` 一类私有 friend seam。`Experiment.prepare_capture`、`ReadoutFacade.prepare_camera_measurement/prepare_occupancy_scan/prepare_mot_field_scan` 是相同的公开 application command 边界：输入冻结的 typed request，返回不泄漏 raw device/service graph 的 `Prepared*` command。Notebook 和 GUI composition root 消费同一入口；Workbench 不借私有函数穿透 facade，facade 也不为某一个 GUI 保存专用 wrapper。
 
-`DefinitionCatalog` 是产品能力词汇，不是当前 installation 的设备探针。已 composition 的 Task/Measurement/Processor 必须始终出现在 Logic 菜单；当前缺少 compatible Port 时，Form 以通用 disabled/unavailable field 明示缺口且不伪造 device value，Start 在 typed binding/preflight 返回具名 capability rejection。不得用 `_supported` 一类 GUI 过滤器静默隐藏 Calibration、MOT、PulseScan 或其它 Definition。`FormSpec` 只拥有 label、排列、widget kind、显示单位/范围与当前可选 binding 的 presentation；物理默认、请求不变量、单位换算和最终 validation 仍由对应 neutral request/intent owner 唯一实现。
+显式 immutable attachment tuple 是产品能力词汇，不是当前 installation 的设备探针。已 composition 的 Task/Measurement/Processor 必须始终出现在 Logic 菜单；当前缺少 compatible Port 时，Form 以通用 disabled/unavailable field 明示缺口且不伪造 device value，Start 在 typed binding/preflight 返回具名 capability rejection。不得用 `_supported` 一类 GUI 过滤器静默隐藏 Calibration、MOT、PulseScan 或其它 Definition。`FormSpec` 只拥有 label、排列、widget kind、显示单位/范围与当前可选 binding 的 presentation；物理默认、请求不变量、单位换算和最终 validation 仍由对应 neutral request/intent owner 唯一实现。
 
 上述机械拆分已经落地且不改变 public surface：`matplotlib_render.py` 是 curated facade，实际
 Figure/Divider/artist 代码按 common、curve、histogram、image/sites、pulse、grid、document 与 live
@@ -2255,9 +2269,9 @@ reject new commands for the old runtime
 新连接不复用旧runtime、binding、capability或软件判定；它重新取得physical-owner proof，重新读取live identity，重新执行当前硬件SAFE初始化并生成新的runtime/binding id。若这些实时步骤失败，本次新连接拒绝。queued result通过application lifetime token + run/panel revision双重检查后丢弃，不能更新已销毁或id被复用的新panel。
 ## 13. Calibration
 
-Calibration 是 `neutral_atom.readout.calibration` 的内建 feature，不使用 plugin、entry point、包扫描或动态 registry 覆盖。
+Calibration 是 `zlc_neutral_atom.logic_nodes.calibration` 的内建 feature，不使用 plugin、entry point、包扫描或动态 registry 覆盖。
 
-`zlc_neutral_atom.readout` 包根不重导出 contracts、codec、analysis、repository 的宽 API；调用方必须从语义 owner 子模块导入。追溯整改实测旧包根的 122 个 eager re-export 会让单独导入 `readout.contracts` 也加载 SciPy，冷导入约 0.86 s、tracemalloc 峰值约 51.8 MiB。删除包根聚合后，同一探针不再加载 SciPy（当前机器约 0.35 s、10 MiB，主要为 NumPy/zlc_data 基础值）。这不是 lazy `__getattr__` 兼容表：本项目没有需要维护的旧公共格式，重复出口清单只会形成第二个 owner；稳定公共用户面由 notebook/workbench facade 组合，领域实现直接依赖 leaf owner。
+`zlc_neutral_atom.logic_nodes.readout_common` 只容纳至少两个读出 Logic node 真正共享的窄合同，而且包根不重导出 contracts、codec、analysis、repository 的宽 API；Calibration 与 Occupancy 的算法、artifact 和 repository 各自从自己的语义 owner leaf 导入。追溯整改实测旧 `readout` 包根的 122 个 eager re-export 会让单独导入轻量合同也加载 SciPy，冷导入约 0.86 s、tracemalloc 峰值约 51.8 MiB。删除包根聚合后，同一探针不再加载 SciPy（当前机器约 0.35 s、10 MiB，主要为 NumPy/zlc_data 基础值）。这不是 lazy `__getattr__` 兼容表：本项目没有需要维护的旧公共格式，重复出口清单只会形成第二个 owner；稳定公共用户面由 notebook/workbench facade 组合，领域实现直接依赖 leaf owner。
 
 ### 13.1 Artifact
 
@@ -2318,7 +2332,7 @@ SiteMap:
   component validity
 ```
 
-Camera geometry、ROI/binning 整除、output shape、spatial axis 与 real-count dtype 的纯规则只由 `zlc_neutral_atom.readout.contracts` 拥有；`CameraCaptureDescriptor`、`FrameContract` 与 runtime `CameraPhysicalFacts` 各自仍验证本对象的完整合同，但必须委托同一组规则，不能复制第二套物理公式。
+Camera geometry、ROI/binning 整除、output shape、spatial axis 与 real-count dtype 是设备物理事实，只由 `zlc_neutral_atom.devices.camera.contract` 拥有。`CameraCaptureDescriptor`、`CameraPhysicalFacts`、capability evidence 与它们的 canonical codec 都在同一设备 owner；读出层的 `FrameContract` 与 `CalibrationCaptureLayout` 只增加 Calibration/Occupancy 所需的光路、事件布局和适用性语义，并委托 Camera owner 序列化嵌入的相机值，不能复制第二套物理公式或让 device/runtime 反向依赖 Logic node。
 
 Calibration layout owner 是 READOUT_EVENT 与全部其它 named logical context 做稀疏 join 的唯一实现；它返回包内 `_CalibrationCaptureJoin`，只保存 point-context 与按 `(reference events..., readout event)` 排列的 physical rows，repeat 只在取帧/生成 report context 时惰性展开。它不是公开 DTO、持久格式或缓存层。FrameContract 先完成廉价的 descriptor/AxisId/schema admission，再调用 layout owner；任一 selected event 缺失或 context 不成套都 fail-closed。formal preflight直接对source执行一次FINAL `admit()`并解析一次`_ResolvedCalibrationSource(source binding + FrameContract + physical context + join)`；不存在先造一份inspection/summary再重复admit的平行读取面。execute只消费这份prepared resolution。`CalibrationAnalysisResult`同时保留exact `AdmittedCapture`与同一resolution，final commit只复核process-local token、artifact与resolution字段、以及join对report contexts的匹配，不重新decode capture、不重建physical index，也不产生第二份join。整个flat RunPlan从preflight到finalize持有capture与calibration repository root borrow；close要么在preflight前获胜，要么明确失败并等待该run释放，不能在lazy frame读取或CAS staging中途使authority失效。不存在只为测试服务的`from_schema`、raw-row diagnostic list、公开bracket type或witnessed-layout wrapper。Workbench mint descriptor后由紧邻的`CaptureStreamContract`构造边界完成一次schema admission，mint helper不提前做相同全表校验。
 
@@ -2446,7 +2460,7 @@ ScanPlan:
   expected event/cardinality contracts
 ```
 
-`BoundSourceAssociationContract`逐source冻结`source_id`、expected input/output keys与grouping、qualification或capability ref、terminal recipe id/version、required proof class和source-specific expected events与实际record capacity；它不是插件registry，也不把qCMOS字段强塞给其它Measurement。scan owner 的具名 builder 以静态 TaskDefinition key、typed request和bindings构造`RunPlan[ScanArtifactRef]`，完成纯 request/port/claim 绑定；preflight 在正确 I/O lanes 解析硬件 capability、schema、counter mode、compiled pulse compatibility 与全部expected counts/record capacities，返回领域私有的 ScanPlan 作为该RunPlan的prepared value。ScanPlan 一旦生成不可被 GUI/ControlTopic 修改，也不包含 child RunPlan。
+`BoundSourceAssociationContract`逐source冻结`source_id`、expected input/output keys与grouping、qualification或capability ref、terminal recipe id/version、required proof class和source-specific expected events；camera source另冻结由cardinality唯一派生的`buffer_frame_count`。它不是插件registry，也不把qCMOS字段强塞给其它Measurement。scan owner 的具名 builder 以静态 TaskDefinition key、typed request和bindings构造`RunPlan[ScanArtifactRef]`，完成纯 request/port/claim 绑定；preflight 在正确 I/O lanes 解析硬件 capability、schema、counter mode、compiled pulse compatibility 与全部expected counts，返回领域私有的 ScanPlan 作为该RunPlan的prepared value。ScanPlan 一旦生成不可被 GUI/ControlTopic 修改，也不包含 child RunPlan。
 
 point_axes/PointLayout 决定 logical cell 顺序，trigger schedule 明确每个 ScanCellKey 期望的 TriggerKeys。`slot_binding` 是用户/模板的参数语义；`execution_mode` 只描述物理装载/执行方式。`AUTONOMOUS_RESIDENT`和`AUTONOMOUS_REFILLED`共同属于现有bitstream的`AUTONOMOUS_STREAMED`方式族：SCAN_SLOT/MOT 的**完整逻辑 finite table**必须在fire前冻结、编译并digest，FPGA在一次fire后自主决定微观时序。resident模式在fire前上传全部物理table；只有显式通过§15.4强证明的refilled capability才预装初始banks并在运行中按已冻结table的immutable chunks补充，host不得选择下一point或调度edge。只有 selected=API_SLOT 且 adapter明确证明该 API值无法在一次自主 sweep中更新时，才允许既有 `API_SLOT_SEGMENTED_EXISTING` 路径；它在preflight先冻结P个唯一point document/STATIC_ONCE artifact、R×P的R-major/P-fast cell schedule和整run expected camera frame count，只在显式host boundary按该冻结顺序执行，不能反向成为 SCAN_SLOT fallback。任一数量、slot、所需source qualification/capability、schema或 output contract无法在第一次arm前解析，preflight失败且不 arm；实现只解析/编译P个唯一point，不先构造R×P份document/artifact。类型模型允许未来多个source-specific合同，但近期S4 Formal enablement只开放**恰好一个Q0-qualified qCMOS physical source**；多physical source或非camera source在其association/terminal contract、contract kit和真实用例完成前typed NO-GO，不能借source-neutral接口自动获得Formal资格。
 
@@ -2528,7 +2542,7 @@ ScanCellKey 对应最终 DataBlock 的一个 `(R,P)` cell。`point_index` 与 Sc
 
 这些epoch类型由neutral Formal Scan领域拥有，不进入zlc_data或frontend.figure codec。EndAttestation不能原地把旧DataBlock字段从PROVISIONAL改成VALID，而是原子发布一个独立immutable EpochValidationRecord；Workbench的LiveDatasetBinding把EpochBoundDatasetRef解析成snapshot和presentation-only integrity badge，ArtifactController/Fit input adapter则在调用zlc_data/frontend owner codec之前检查authority eligibility。PROVISIONAL可以带明显状态live显示，但不能作为CommittedTransform的权威输入，不能提交正式/interactive source-specific authoritative fit artifact、FigureArtifact或其它derived artifact；显式排障保存只能生成`DIAGNOSTIC_PROVISIONAL`。INVALID时workbench递增epoch lifetime token，使queued BoardFrame/fit/save stale并清除或持续标红旧视图。API segmented的单segment通过仍是run-level PROVISIONAL，只有aggregate EndAttestation才产生VALID record。
 
-qCMOS adapter在匹配有效Q0 qualification envelope时按冻结schedule为第i个按序frame生成**provisional TriggerKey[i]**；需要多帧/多source的StreamProcessorDefinition声明grouping与join-key transform，在完整输入到达后产生恰好一个provisional ScanCellKey typed result。scan DatasetBuilder只接受ScanCellKey并验证计划内每个cell恰好一次；整个epoch只有EndAttestation后才转VALID，不能在验证前提交，也不能从monitor/latest路径填“下一个cell”。
+qCMOS adapter在匹配有效Q0 qualification envelope时按冻结schedule为第i个按序frame生成**provisional TriggerKey[i]**；需要多帧/多source的Processor bound contract声明grouping与join-key transform，在完整输入到达后产生恰好一个provisional ScanCellKey typed result。scan DatasetBuilder只接受ScanCellKey并验证计划内每个cell恰好一次；整个epoch只有EndAttestation后才转VALID，不能在验证前提交，也不能从monitor/latest路径填“下一个cell”。
 
 sequencer terminal evidence按execution mode使用两个互斥值类型，不能用一个全optional结构或UI progress猜测：
 
@@ -2553,7 +2567,7 @@ ApiSegmentEvidence:
 Q0 CameraExternalTriggerQualification
   冻结 qCMOS model/serial/firmware、SDK/driver/adapter version、
   trigger mode/polarity、ROI/binning、exposure/global-exposure/readout mode、
-  buffer policy与counter/stamp/timestamp语义版本、位宽、signedness、modulus、reset epoch，
+  buffer_frame_count派生式与实际分配结果、counter/stamp/timestamp语义版本、位宽、signedness、modulus、reset epoch，
   arm-ready/status ack语义、arm-ready到第一沿的最小余量、最小active/inactive pulse width、
   最后一沿到driver可见frame的最坏延迟与terminal quiet-window
   在声明的完整物理trigger waveform与trigger_interval_min + safety_margin工作区间内实测：
@@ -2566,7 +2580,7 @@ Preflight
   对compiler展开delay、polarity与相邻高段merge后的实际物理waveform逐项验证：
     arm-ready ack成立，arm-ready到第一沿余量通过，active/inactive width通过，
     每个相邻有效 trigger间距 >= minimum + configured margin
-  验证driver ring的max_inflight×frame_bytes满足Q0 drain bound；另行验证
+  验证finite driver ring的buffer_frame_count等于完整expected_frames并成功分配；另行验证
   expected events已由exact reservation完整覆盖，consumer与artifact sink使用同一冻结schedule
   若table超过resident window，要求§15.4完整AUTONOMOUS_REFILLED capability：单I/O owner、
   refill transaction保守硬上界，以及对每个潜在seam（含无camera edge区段和tail seam）
@@ -2578,7 +2592,7 @@ Preflight
 
 Autonomous Run
   camera一次 arm整个 scan session；capture expected frame count随run冻结，
-  driver ring只按max_inflight定容并由dedicated drain持续排空
+  driver ring按完整expected_frames分配并由dedicated drain持续排空
   cap_start/arm-ready后、FIRE前按Q0 reset epoch读取session_counter_baseline；
   若counter或per-frame stamp只在首帧可读，则Q0必须定义implicit initial/first-snapshot
   与first-frame successor rule，否则该工作点不具备Formal capability
@@ -2602,7 +2616,7 @@ EndAttestation
 
 这里的“重跑”始终创建新的 `run_id/attempt_id`，重新执行 preflight、qualification FIRE gate、arm/FIRE、采集与 EndAttestation；失败 attempt 的 RunFailureRecord 和原始诊断 provenance 必须保留。禁止在原 attempt 中从失败位置续接、只补缺失 point、复用旧 authorization，或由 UI/adapter 在未声明 RetryPolicy 时静默重跑。即使 RetryPolicy 允许自动重试，也必须声明最大次数与deadline，且只有某个完整新 attempt 独立通过全部 commit 条件时才产生成功 ScanArtifact。
 
-通过 Q0 后，`frame[i] -> frozen trigger schedule[i] -> TriggerKey` 是该 qCMOS/工作区间的adapter contract。Q0是对一组冻结设备身份、firmware/SDK/driver/adapter、采集设置、buffer policy、arm/pulse/interval/camera-tail envelope以及counter/stamp/timestamp reset/modulus语义的**经验性发布资格**，保存有限样本、统计上界和PI明确接受的残余风险，不要求每个run重做长时间统计实验；每个run只验证自己仍落在该envelope并执行EndAttestation。上述任一身份/版本/语义字段改变、设置超出已批准集合、或归因完成后确认一次camera-envelope合同违例，都使该qualification对相应工作点失效，恢复Formal capability前必须重新Q0 qualification。这里依赖的是经真机资格化的ordered external-trigger contract，不是数学上的确定性证明、运行时“取latest”或两个自由流按N zip；只有frozen compiled schedule本身可称为确定性展开，host侧reservation/cursor则保证相机已交付的每帧不会在软件缓冲中静默跳过。
+通过 Q0 后，`frame[i] -> frozen trigger schedule[i] -> TriggerKey` 是该 qCMOS/工作区间的adapter contract。Q0是对一组冻结设备身份、firmware/SDK/driver/adapter、采集设置、`buffer_frame_count`派生与分配结果、arm/pulse/interval/camera-tail envelope以及counter/stamp/timestamp reset/modulus语义的**经验性发布资格**，保存有限样本、统计上界和PI明确接受的残余风险，不要求每个run重做长时间统计实验；每个run只验证自己仍落在该envelope并执行EndAttestation。上述任一身份/版本/语义字段改变、设置超出已批准集合、或归因完成后确认一次camera-envelope合同违例，都使该qualification对相应工作点失效，恢复Formal capability前必须重新Q0 qualification。这里依赖的是经真机资格化的ordered external-trigger contract，不是数学上的确定性证明、运行时“取latest”或两个自由流按N zip；只有frozen compiled schedule本身可称为确定性展开，host侧reservation/cursor则保证相机已交付的每帧不会在软件缓冲中静默跳过。
 
 `CameraExternalTriggerQualification`是neutral camera/scan领域拥有的immutable artifact，blob/manifest由zlc_storage canonical repository保存；它包含qualification id/revision/digest、设备与软件身份、批准工作点集合、统计证据、margin、PI批准和创建时间。installation级`CameraQualificationIndex`是`ACTIVE | SUSPENDED_PENDING_ATTRIBUTION | SUSPENDED_PENDING_RECORD | REVOKED`状态的唯一权威，使用append-only activation/suspension/exoneration/revocation records并跨重启恢复，不能靠覆盖artifact或删除文件撤销。record必须绑定qualification revision、device identity、工作点、effective scope/time和具名evidence；只有`ACTIVE`可进入Formal FIRE gate。
 
@@ -2622,7 +2636,7 @@ raw terminal也不能证明内部delay scheduler已经排空。`CompiledPulseArt
 
 对 SCAN_SLOT/MOT，`HOST_STEPPED_GROUP`、逐 cell arm/fire/wait、single-cell fire gate、per-cell `PHYSICAL_DONE` receipt 均不属于 baseline，也不能作为 qCMOS 首光、容量或证明 fallback。SCAN_SLOT/MOT 必须使用现有 FPGA 的完整逻辑table自主执行：近期无缝装载方式baseline为`AUTONOMOUS_RESIDENT`全量预装，`AUTONOMOUS_REFILLED`只有经§15.4强证明后才可成为条件execution capability。唯一非自主例外是既有adapter确实不能在一次自主sweep中更新API值时的`API_SLOT_SEGMENTED_EXISTING`；它必须以execution mode、canonical rationale与冻结cell schedule如实表明显式host boundary，且每cell只等待pulse physical terminal与同一armed camera transaction中的下一个exact event，不能称为autonomous，也不能泛化成可供SCAN_SLOT复用的host-stepped mode。Formal eligibility仍由Q0、exact链、association proof与整runaggregate EndAttestation联合决定。架构不得为了获得逐cell证明而要求新bitstream。
 
-`AUTONOMOUS_STREAMED` 是当前冻结bitstream的正式执行方式族，`AUTONOMOUS_RESIDENT`是不依赖下述增强的近期装载方式baseline；refilled的条件门见§15.4。只有 E0a/Q0 在批准工作余量内、正确camera配置和充分软件reservation下仍实测发现丢帧/乱序，且已经证明camera设置、软件保留/排空策略、降低trigger rate与扩大margin均不能修正；或发现现有 RTL 真 bug/与既定设计不符时，才可提出证据驱动的 bitstream变更。仅仅metadata语义不清、样本量不足、一次未归因异常或无法建立qualification时，结果是不开启Formal capability，不构成硬件修改授权。届时可选增强之一是在真正 camera-trigger输出沿记录：
+`AUTONOMOUS_STREAMED` 是当前冻结bitstream的正式执行方式族，`AUTONOMOUS_RESIDENT`是不依赖下述增强的近期装载方式baseline；refilled的条件门见§15.4。只有 E0a/Q0 在批准工作余量内、正确camera配置、finite完整`expected_frames`分配成功且按合同排空时仍实测发现丢帧/乱序，并且已经证明降低trigger rate与扩大margin均不能修正；或发现现有 RTL 真 bug/与既定设计不符时，才可提出证据驱动的 bitstream变更。仅仅metadata语义不清、样本量不足、一次未归因异常或无法建立qualification时，结果是不开启Formal capability，不构成硬件修改授权。届时可选增强之一是在真正 camera-trigger输出沿记录：
 
 ```text
 HardwareTriggerStamp:
@@ -2637,13 +2651,13 @@ HardwareTriggerStamp:
 
 未来若证据触发逐沿 FIFO方案，其容量、overflow sticky fatal与排空带宽必须共同设计和真机验证，不能先写架构再要求重烧。未触发时不实现、不预留、不把它列为当前 Formal Scan gate；当前 UART/JTAG也不被假定具有尚不存在的高带宽 telemetry能力。
 
-最终 qCMOS adapter 必须每帧保留 DCAMBUF_FRAME 的 `framestamp`、`camerastamp`、`timestamp`，并把`cap_transferinfo().nFrameCount/nNewestFrameIndex`作为同一读取时刻的累计count与ring位置快照。当前 `CameraFrameRecord` 值类型能无损承载这些metadata，但 current tree 没有向它生产真实 DCAM record 的 concrete adapter；迁移前旧 DCAM 实现的count-first、newest-index反推槽位、已报告backlog完整排空、exact count失败/倒退、复制期覆盖fail-closed与共享deadline只作为迁移oracle，最终adapter必须重建并验证这些合同。S1仍必须让最终 CameraPort/CaptureSession、exact retention、typed Q0与EndAttestation端到端消费同一record语义，并由Q0实测决定max-inflight与drain/copy余量；任何live `recent_capacity`或constructor默认值都不能冒充真机资格化结果。会解包成纯ndarray的旧 public consumer只在其最后一个legacy consumer迁走的dependency-closed切片删除，不能无条件写成S3，也不能重新退化为array-only路径或把累计`nFrameCount`伪装成per-frame metadata。这些字段的语义必须按具体qCMOS型号实测，字段存在和host排空正确本身都不等于TAGGED或ordered-trigger qualification。
+最终 qCMOS adapter 必须每帧保留 DCAMBUF_FRAME 的 `framestamp`、`camerastamp`、`timestamp`，并把`cap_transferinfo().nFrameCount/nNewestFrameIndex`作为同一读取时刻的累计count与ring位置快照。当前 `CameraFrameRecord` 值类型能无损承载这些metadata，但 current tree 没有向它生产真实 DCAM record 的 concrete adapter；迁移前旧 DCAM 实现的count-first、newest-index反推槽位、已报告backlog完整排空、exact count失败/倒退、复制期覆盖fail-closed与共享deadline只作为迁移oracle，最终adapter必须重建并验证这些合同。S1仍必须让最终 CameraPort/CaptureSession、未ack事件所有权、typed Q0与EndAttestation端到端消费同一record语义；finite arm固定分配完整`expected_frames`，monitor arm固定分配`history_cycles * frames_per_cycle`，Q0只实测driver交付、覆盖检测与drain/copy时序，不派生另一个软件上限。会解包成纯ndarray的旧 public consumer只在其最后一个legacy consumer迁走的dependency-closed切片删除，不能无条件写成S3，也不能重新退化为array-only路径或把累计`nFrameCount`伪装成per-frame metadata。这些字段的语义必须按具体qCMOS型号实测，字段存在和host排空正确本身都不等于TAGGED或ordered-trigger qualification。
 
 每个run的camera start boundary也是关联合同的一部分：adapter必须在arm前排空/拒绝旧software pending与driver residual并保存`pre_arm_residual_observation`；随后在`cap_start`/arm-ready后、FIRE前按Q0 reset epoch建立`session_counter_baseline`。若counter或stamp只在首帧存在，Q0必须定义implicit initial、first-snapshot与first-frame successor rule，否则该工作点不具备Formal capability。必须证明arm本身是否可能产生frame，禁止跨cap_start reset把旧epoch绝对值带入delta。任何未声明的pre-fire frame、reset epoch不符、首帧不满足规则或stop后late frame都使整个epoch INVALID；不能只依赖“最终总数恰好相等”来掩盖开头混入旧帧、末尾少一帧的错位。
 
 ScanArtifact 的 provenance manifest 分别保存 `execution_mode`（`AUTONOMOUS_RESIDENT`/`AUTONOMOUS_REFILLED`/`API_SLOT_SEGMENTED_EXISTING`）、EpochValidationRecord的`achieved_association_proof=ORDERED_END_ATTESTED_RUN`、ProgrammedImageDeploymentRecordRef revision/digest、全部BoundSourceAssociationContracts及其qualification/capability refs、formal eligibility record、冻结source settings readback、compiled trigger schedule/tail-bound digest、mode-specific pulse evidence与H1 terminal recipe版本、`expected_trigger_total_from_completed_schedule`、camera pre-arm observation、session baseline/final、counter/stamp width/signedness/modulus/reset/rollover语义与`camera_produced_delta`、owner-minted ordered-metadata digest、source event span、source schedule/frame-index -> TriggerKey mapping digest，以及aggregate end-attestation结果。逐帧metadata与frame payload仍由source DatasetArtifact拥有，ScanArtifact不复制第二份列表。两种模式都只保存一个绑定整run唯一arm spec、source event span、schedule digest与aggregate CaptureTerminalAck的`CameraRunEvidence`。autonomous mode另保存单个run级`QualificationFireAuthorization`与`AutonomousTableTerminalEvidence`；API segmented保存同一个run级camera authorization、canonical `segmentation_rationale`、P个point-indexed compiled artifact identities、R-major/P-fast的R×P个`ApiSegmentEvidence`；execution mode+rationale+有序evidence已经显式表达host boundary，不另存逐boundary时刻，也不保存逐segment camera authorization、camera settings副本、camera EndAttestation或伪造的camera terminal。加载时这些记录与ScanPlan的required proof、TriggerKey coverage、deployment revision和revocation effective scope一起验证；不能只保存 `mode="ordered"`、计划要求值或一个混合Formal资格的执行字符串。
 
-`AUTONOMOUS_RESIDENT/AUTONOMOUS_REFILLED`的正常运行闭环是：camera一次arm整个session并冻结expected total（driver ring仍只按max-inflight定容）-> 等待Q0声明的arm-ready/status ack并验证first-edge margin -> 建立本session counter baseline/first-frame rule -> FPGA一次fire完整逻辑scan table -> exact queue按序保存所有frame+metadata -> 唯一I/O owner读取raw FPGA terminal/cursor并按H1规则确认完整logical table terminal -> **camera仍保持capturing且dedicated drain继续运行**，从观察terminal的monotonic起点完整等待CompiledPulseArtifact/H1给出的保守physical output-tail bound并生成`PostTerminalTailEvidence` -> 再持续到expected metadata齐全并经历Q0-qualified terminal quiet-window -> 冻结final counter/stamps -> `cap_stop` -> 复核capture/transfer状态稳定 -> 最后才release driver buffer -> 完成processor/DatasetBuilder最终EOS -> 执行EndAttestation -> VALID后才commit。raw STATUS/CURSOR自身不证明delayed-output tail settle；这里“停止/disable trigger”只指logical engine已经terminal/safe并且后续tail recipe完成，绝不指在drain前调用camera `cap_stop/disarm`。现有`_disarm()`中`cap_stop`后立即`buf_release`的路径不能复用于Formal CaptureSession termination。H1 output-tail bound和Q0 camera tail latency/drain deadline/quiet-window都是经contract/qualification获得的有限运行合同，不伪装成数学上的逐沿no-more-frame证明，§14.5声明的剩余风险仍然存在。abort路径先用现有abort/safe阻止新logical edge入队，再按H1 safe/abort tail bound保持camera capturing并drain，随后才final metadata -> cap_stop -> stable check -> release；无法确认logical terminal、tail evidence或camera终态时整run INVALID并返回本次run失败。
+`AUTONOMOUS_RESIDENT/AUTONOMOUS_REFILLED`的正常运行闭环是：camera一次arm整个session并冻结expected total（driver ring按完整`expected_frames`分配）-> 等待Q0声明的arm-ready/status ack并验证first-edge margin -> 建立本session counter baseline/first-frame rule -> FPGA一次fire完整逻辑scan table -> source stream按序保留所有frame+metadata直至相应ack -> 唯一I/O owner读取raw FPGA terminal/cursor并按H1规则确认完整logical table terminal -> **camera仍保持capturing且dedicated drain继续运行**，从观察terminal的monotonic起点完整等待CompiledPulseArtifact/H1给出的保守physical output-tail bound并生成`PostTerminalTailEvidence` -> 再持续到expected metadata齐全并经历Q0-qualified terminal quiet-window -> 冻结final counter/stamps -> `cap_stop` -> 复核capture/transfer状态稳定 -> 最后才release driver buffer -> 完成processor/DatasetBuilder最终EOS -> 执行EndAttestation -> VALID后才commit。raw STATUS/CURSOR自身不证明delayed-output tail settle；这里“停止/disable trigger”只指logical engine已经terminal/safe并且后续tail recipe完成，绝不指在drain前调用camera `cap_stop/disarm`。现有`_disarm()`中`cap_stop`后立即`buf_release`的路径不能复用于Formal CaptureSession termination。H1 output-tail bound和Q0 camera tail latency/drain deadline/quiet-window都是经contract/qualification获得的有限运行合同，不伪装成数学上的逐沿no-more-frame证明，§14.5声明的剩余风险仍然存在。abort路径先用现有abort/safe阻止新logical edge入队，再按H1 safe/abort tail bound保持camera capturing并drain，随后才final metadata -> cap_stop -> stable check -> release；无法确认logical terminal、tail evidence或camera终态时整run INVALID并返回本次run失败。
 
 API segmented不使用上述“一次FIRE完整table”描述，但**仍使用一次arm完整camera run**。它按§14.7逐cell执行独立STATIC_ONCE pulse session，在每个physical pulse terminal后才进入下一segment；camera与dedicated drain从首次FIRE前一直保持同一session，全部R×P完成后才aggregate complete/stop/join并执行一次EndAttestation。未验证前每个Envelope携带run-scoped provenance_epoch_id且formal sink只暂存；任一pulse terminal、count、stamp、timestamp、coverage、timeout或hardware error不符使整个epoch INVALID并丢弃，不能提交前半段。
 
@@ -2651,7 +2665,7 @@ API segmented不使用上述“一次FIRE完整table”描述，但**仍使用�
 
 INVALID必须形成可查询的RunFailureRecord，保存失败原因、工作点、counter/stamp摘要和累计失败率。系统不得无限或静默自动重试直到“碰巧成功”；重试只能由用户发起，或由request中显式、有限、可审计的RetryPolicy发起，每次attempt具有独立run_id/provenance，最终artifact记录失败attempt refs。这样reject-and-redo不会掩盖硬件不稳定或造成不可见的选择偏差。
 
-只有 E0a/Q0 在目标工作余量、正确camera配置和充分软件reservation下观察到真实丢帧/乱序，且软件保留/排空、camera设置、trigger rate与margin调整均无法修正；或代码/RTL证据证明现有实现与既定设计不符，才重开bitstream评估。候选可以是bug fix、HardwareTriggerStamp、trigger-return或其它最小修复；先证明问题与候选改动之间的因果关系，不能因为相机侧异常就默认修改FPGA。触发条件、证据、替代的软件/相机配置方案和重烧风险必须单独评审，不能由本架构自动授权。
+只有 E0a/Q0 在目标工作余量、正确camera配置、finite完整`expected_frames`已分配并按合同排空时观察到真实丢帧/乱序，且camera设置、trigger rate与margin调整均无法修正；或代码/RTL证据证明现有实现与既定设计不符，才重开bitstream评估。候选可以是bug fix、HardwareTriggerStamp、trigger-return或其它最小修复；先证明问题与候选改动之间的因果关系，不能因为相机侧异常就默认修改FPGA。触发条件、证据、替代的相机配置方案和重烧风险必须单独评审，不能由本架构自动授权。
 
 ### 14.6 非标量 y
 
@@ -2829,7 +2843,7 @@ PREPARE_AUTONOMOUS(run_id, artifact_digest, frozen full finite logical scan tabl
 
 FIRE_AUTONOMOUS(PreparedProgramRef)
   camera session is already armed with frozen expected_total；driver ring depth
-  remains the separately-proven max_inflight, not total_frames
+  equals the complete expected_frames for this finite run
   current FPGA executes the complete logical autonomous table once；refill若获准
   只供应预定chunk，不决定point、slot value或edge timing
 
@@ -2876,7 +2890,7 @@ SAFE/RESET/connection loss
 
 expected trigger count/schedule 来自compiler对实际配置的唯一camera output channel、active polarity、clock mux、相邻高段合并、channel delay和全部合法slot values的确定性展开；camera channel不能同时配置为clk_enable。该schedule用于preflight间距与末端映射，不声称是运行时逐沿回读。
 
-当前冻结硬件的近期**无条件 Formal 容量线**只有`AUTONOMOUS_RESIDENT`：table不超过`2 * scan_bank_size`（当前默认4096行），全部物理数据fire前resident，硬件时序不依赖host。这里的“无条件容量线”只裁决何时可以授予Formal资格，不把用户的正常扫描改成host stepping，也不否认当前bitstream已经具备ping-pong refill。`AUTONOMOUS_REFILLED`是同一冻结bitstream上的自主流式执行能力，而不是未来硬件；它默认尚未取得Formal资格，物理执行仍须一次fire完整冻结逻辑table、绝不host-step。它要求一个final `FiniteScanStreamer` I/O owner同时负责status、cursor、bank refill、progress、cancel与completion，删除monitor thread和`wait_done()`争用同一transport的双owner；但“measured worst refill + Windows/Python scheduler allowance”不是确定性上界，当前RTL的UNDERFLOW又会在bank恢复后清零而非保留sticky history，所以仅有平均/p99/worst-observed admission、最终DONE或部分camera timestamp都不足以发布该mode。即使mode已发布，单次run的Formal eligibility仍需独立满足Q0、association proof、exact链和EndAttestation。
+当前冻结硬件的近期**无条件 Formal 容量线**只有`AUTONOMOUS_RESIDENT`：table不超过`2 * scan_bank_size`（当前默认4096行），全部物理数据fire前resident，硬件时序不依赖host。这里的“无条件容量线”只裁决何时可以授予Formal资格，不把用户的正常扫描改成host stepping，也不否认当前bitstream已经具备ping-pong refill。`AUTONOMOUS_REFILLED`是同一冻结bitstream上的潜在自主流式执行能力，而不是未来硬件；当前产品没有隐藏开关、半成品streamer或“通常及时”的非正式路径，超过resident window在FIRE前typed拒绝。若未来资格化通过，才实现一个final `FiniteScanStreamer` I/O owner同时负责status、cursor、bank refill、progress、cancel与completion，删除monitor thread和`wait_done()`争用同一transport的双owner；完整逻辑table仍须在fire前冻结、一次fire、绝不host-step。但“measured worst refill + Windows/Python scheduler allowance”不是确定性上界，当前RTL的UNDERFLOW又会在bank恢复后清零而非保留sticky history，所以仅有平均/p99/worst-observed admission、最终DONE或部分camera timestamp都不足以发布该mode。即使mode未来发布，单次run的Formal eligibility仍需独立满足Q0、association proof、exact链和EndAttestation。
 
 只有contract kit证明所有潜在bank seam均有足够分辨率、语义明确且覆盖stall影响区间的硬件时间观测，并能把每个seam与完整compiled schedule做residual attestation，同时证明refill transaction的保守硬上界时，才可为该设备/transport/workload发布`AUTONOMOUS_REFILLED` execution capability。没有camera edge的区段、最后一个trigger后的seam或任何不可观察stall都会使该能力不可发布；preflight返回`FormalScanCapacityExceeded(resident_limit, capability_unavailable_reason)`并拒绝大表。软件记录chunk seq/count/digest并在现有可读状态范围内fail closed，但不得把非sticky UNDERFLOW、DONE、camera局部timestamp或尚不存在的CRC verifier/BANK_VERIFIED当作“从未stall”的证明。真实实验对更大容量或更高性能的需求本身不构成H2解锁条件；仍必须命中E0a/Q0在批准工作余量内发现无法由软件、相机配置和margin修正的真实loss/reorder，或证明现有RTL bug/既定设计偏离，才可按H2评估最小硬件修复。
 
@@ -2888,7 +2902,7 @@ expected trigger count/schedule 来自compiler对实际配置的唯一camera out
 - upload/fire沿用当前已工作的UART/AXI/JTAG协议。host/server通过PreparedProgramRef、connection generation、artifact/table digest防止软件层旧程序误触发；若transport error或readback异常，禁止提交并按现有safe/reset路径处理；
 - RemoteSequencer通过现有软件/transport能力提供bounded timeout、cancel/abort和safe调用；共享backend的第二socket不冒充硬件独立性。无法确认safe时当前run失败，但baseline不因此要求新增watchdog/SAFE寄存器；
 - runtime identity近期只要求现有`image.build_fingerprint`/几何/ABI握手一致；installation-owned deployment record可以保存已批准`.bit`文件的content digest与release/timing记录作为SOP provenance，但它不证明endpoint此刻实际运行的内容。需要新RTL才能提供的runtime `design_build_id`、timing-signoff ROM或programmed-bitstream content attestation均不是baseline；
-- 逐沿counter/FIFO、per-fire count、PHYSICAL_DONE、BANK_VERIFIED/RTL CRC等均不作为当前合同。只有E0a/Q0/故障注入在已批准工作余量、正确camera配置和充分软件reservation下证实真实loss/reorder且非硬件替代方案均不能修正，或现有RTL偏离既定设计时，才提出与已证实根因有因果关系的最小硬件修复；
+- 逐沿counter/FIFO、per-fire count、PHYSICAL_DONE、BANK_VERIFIED/RTL CRC等均不作为当前合同。只有E0a/Q0/故障注入在已批准工作余量、正确camera配置、finite完整`expected_frames`已分配并按合同排空时证实真实loss/reorder且非硬件替代方案均不能修正，或现有RTL偏离既定设计时，才提出与已证实根因有因果关系的最小硬件修复；
 - 若未来合法重建bitstream，build仍必须满足unconstrained paths=0、WNS>=0、TNS>=0，并审查generated clocks、CDC、IP property和critical warnings；这约束未来修复质量，不授权为架构偏好重烧。
 
 ## 16. Artifact 与持久化
@@ -2994,17 +3008,11 @@ FigureArtifact 保存 ViewSpec、当次 EvaluatedFigureData 的 input revision/r
 
 ## 17. 性能约束
 
-### 17.1 Camera exact queue
+### 17.1 Camera event ownership
 
-CaptureSession queue 禁止 list `pop(0)` 的 O(n²) 路径，使用 deque/ring，实现：
+CaptureSession 的有序record容器禁止 list `pop(0)` 的 O(n²) 路径；使用摊销 O(1) 的append/popleft结构，但不设置软件容量上限。formal事件在ack前自然保留，monitor `next()`有序交付且不覆盖；exact与monitor fan-out共享immutable payload/ref，不复制不必要的大帧。内存分配失败使本次run明确FAILED，不能在压力下静默减少数据。
 
-- enqueue/dequeue 摊销 O(1)；
-- bounded capacity；
-- exact overflow/backpressure 显式；
-- monitor overwrite/missed count；
-- exact 与 monitor fan-out 不复制不必要的大帧。
-
-driver ring 的数量与SDK/硬件工作模式一致；exact transport、DatasetBuilder、monitor 与renderer各自明确谁持有引用、何时释放以及失败时如何撤销。真实profile若发现重复快照、长期引用或无界历史，直接修正ownership/copy路径，不能在压力下静默减少数据。
+finite driver ring 的`buffer_frame_count`固定为完整`expected_frames`；continuous monitor固定为`history_cycles * frames_per_cycle`。exact transport、DatasetBuilder、monitor与renderer各自明确谁持有引用、何时释放以及失败时如何撤销。真实profile若发现重复快照或不必要的长期引用，应修正ownership/copy路径，但不得据此重新引入软件预算、拒绝或隐式覆盖。
 
 ### 17.2 Scan compile
 
@@ -3018,12 +3026,12 @@ driver ring 的数量与SDK/硬件工作模式一致；exact transport、Dataset
 
 优化后 target IR/wire image 必须保持等价，时间与实际存储增长对点数近似线性。
 
-Formal Scan仍必须满足实际硬件容量：qCMOS driver ring按`max_inflight`与实测drain latency配置，不能把总帧数误当driver buffer数；超过resident FPGA scan window默认拒绝，只有§15.4要求的每个潜在seam全可观察、完整schedule residual与保守refill硬上界全部证明后才开放条件能力。不能依靠运行时stall、非sticky underflow、swap或丢帧维持表面可运行。
+Formal Scan仍必须满足实际硬件容量：qCMOS finite driver ring按完整`expected_frames`分配，SDK/系统内存分配失败就拒绝本次run；超过resident FPGA scan window默认拒绝，只有§15.4要求的每个潜在seam全可观察、完整schedule residual与保守refill硬上界全部证明后才开放条件能力。不能依靠运行时stall、非sticky underflow、swap或丢帧维持表面可运行。
 
 ### 17.3 UI 与 analysis
 
 - monitor 由 UI refresh rate 限制，不降低 acquisition rate；
-- 独立 panel view-evaluation latest-only；同一 coherence group 由 board evaluator 选同一 JoinKey/revision并原子 present，Fit executor 队列 bounded，三者不互相阻塞；
+- 独立 panel view-evaluation latest-only；同一 coherence group 由 board evaluator 选同一 JoinKey/revision并原子 present，尚未开始的display/fit请求由更新revision替换而不积累历史队列，三者不互相阻塞；
 - revision coalescing；
 - stale fit/render result 丢弃；
 - exact pipeline 的必要 StreamProcessor/DatasetBuilder 不与可丢弃 UI fit 共用一个拥塞队列；
@@ -3088,7 +3096,7 @@ Data：
 - 多 point-axis 的自动 FixedIndex 来自同一个真实 PointLayout storage row；EXPLICIT hole、Selection 后无物理 row、手写/解码得到的不存在 fixed tuple 均失败；
 - suggestion 不修改 DataBlock，所有有损 binding/operation 均可从 ViewSpec 派生并出现在 panel 摘要；
 - FixedIndex/LatestNonempty navigation 每个 input revision 都解析为带 coordinate record 的 EvaluatedFigureData；LatestNonempty 只允许 repeat 且只表示最大非空逻辑 index；display navigation 不能进入 CommittedTransform；
-- rolling overwrite/wrap 的 current cell 由 EventRef/progress 驱动、覆盖 repeat 与全部 point axes 的显式 Selection 给出；最高 nonempty axis index 不得冒充最后发布事件；
+- rolling replacement/wrap 的 current cell 由 EventRef/progress 驱动、覆盖 repeat 与全部 point axes 的显式 Selection 给出；最高 nonempty axis index 不得冒充最后发布事件；
 - `NEEDS_INPUT` 不能转换为 CommittedTransform；
 - CommittedTransform 在 schema fingerprint 变化时失效；
 - ViewSpec display mean/latest 不能被 commit；Fit/Scan draft 不读取任何 ViewSpec 权威字段，并从各自 spec/policy 重派生 reduction/batch/output axes；
@@ -3110,7 +3118,7 @@ Architecture：
 - zlc_data `BoundFit` 不引用neutral runtime slot或artifact owner；当前不存在neutral-side generic AnalysisStep/slot adapter，artifact Fit由现有repository host，领域Analysis由各自typed request编译flat RunPlan；baseline不存在DataAnalysisDescriptor/Program registry；
 - zlc_data solver 不含 Qt/thread guard 注册、executor、环境变量线程策略或 callable/FQCN 序列化；frontend/neutral 各自在 hosting contract test 中证明 fit 不运行于 GUI/I/O lane；
 - ViewContract 只有一套，plot/render 不复制 role/repeat 判断表；
-- DefinitionCatalog 只由显式 imports 组装，重复 id fail，禁止 package scan/global registry；
+- TaskConsole只消费composition root显式import组装的immutable attachment tuple；`TaskConsoleApplicationPorts`对重复DefinitionKey启动即失败，禁止第二份definitions聚合、package scan/global registry；
 - catalog Definition 不含 callable；owner top-level binder/operator 无 hidden closure/device/session/global mutable dependency；
 - PipelineSpec 编译成唯一顶层 RunPlan，节点不能 start child run 或自行拥有 terminal state；
 - bind claim superset 完整，preflight/execute 尝试新增 ResourceKey 失败；
@@ -3130,14 +3138,13 @@ Stream：
 
 - reservation 在 fire 前；
 - history=8 + burst=20 在 reservation 下完整消费；
-- 无 reservation 产生 Gap；
+- formal consumer无reservation时在读取前拒绝；
 - schema generation 改变终止旧 cursor；
 - monitor rebind 新 generation 创建新 block_id，旧 evaluation/borrow/CommittedTransform 不可复用；
-- 同一 generation 第二个 formal reservation 被拒；一个 exact DatasetBuilder + bounded monitor fan-out 不重复 pin payload；
-- expected event count 或真实硬件/driver record capacity不足时preflight拒绝；
-- total expected events 与 max-inflight record count 分开计算；ack 后保留record数下降，不可 backpressure burst 使用最坏 backlog 而非平均率；
-- NON_BACKPRESSURE_CAPTURED 在第一处 backlog/retention miss 永久 RetentionOverrun poison；后续物理帧不能顶替失败 sequence，emit/finish/cursor/seal 全部失败；
-- candidate Envelope/contract/key/timestamp 验证或容量 preflight 失败时不先 trim 已有 record，rejected publish 对 stream 状态零副作用；
+- 同一 generation 第二个 formal reservation 被拒；一个 exact DatasetBuilder + monitor fan-out 共享immutable payload/ref而不重复复制；
+- finite camera arm把`buffer_frame_count=expected_frames`传给driver；continuous monitor传`history_cycles * frames_per_cycle`；SDK/系统内存真实分配失败使本次操作失败；
+- ack 后已释放前缀不再由stream持有；slow consumer的未ack集合自然增长，不触发软件配额拒绝或覆盖；
+- candidate Envelope/contract/key/timestamp 验证失败时不先释放已有record，rejected publish 对 stream 状态零副作用；
 - broker-minted generation 使两个同 StreamId/BlockId/schema、不同内容的 capture 得到不同 DatasetRevisionRef；
 - PayloadContract统一snapshot/validate，ComponentValidity mask与per-event schema metadata均必须接受同一owner校验；
 - exact Delivery 必须属于 builder 绑定的具体 source+reservation；同名 source、伪 cursor/Delivery/EOS、跨 tap MonitorUpdate 均被拒；
@@ -3148,14 +3155,14 @@ Stream：
 - StreamProcessor cardinality无法证明或formal path含未解释filter时preflight拒绝；
 - StreamProcessor output contract 依赖首帧数值或运行中改变 record fields/axis 时不能编入 formal pipeline；
 - continuous Measurement 只能使用 admitted MonitorTap/MonitorDataset；exact request 必须有限且可完整 reservation；
-- MonitorTap backlog 与 MonitorDataset window 固定容量、报告 lifetime missed 与 current gap，只产生 provisional atomic snapshot；若要成为 formal input，必须显式冻结新的 finite diagnostic input或启动 finite exact capture，不能给 live snapshot 改名；
+- MonitorTap `next()`有序交付且不丢record；MonitorDataset按声明`history_cycles`维护rolling data cardinality并只产生provisional atomic snapshot；若要成为formal input，必须显式冻结新的finite diagnostic input或启动finite exact capture，不能给live snapshot改名；
 - 单个 typed output record 的 ack 只在 publish 与所有 required downstream 接收成功后；不同 cardinality/key/lifecycle 的结果必须建独立节点，不能伪装为一次多-output transaction；
 - exact/monitor 同源 event_id；
 - EventSpanRef digest/count 等价于显式 ordered events，lineage 不随累计输出 O(N²) 增长；
-- driver buffer 重用与 monitor overwrite 不破坏 exact payload lifetime；
+- driver buffer 重用与MonitorDataset正常滚动不破坏formal payload lifetime；
 - `CameraFrameRecord` 构造即拥有并冻结图像 bytes；driver ring slot、原 ndarray 和 metadata wrapper 随后改写都不改变 record，非整数/bool ordinal、负值、非法 microseconds 和无效 host receive time 在进队前拒绝；
 - qCMOS fake/contract kit 验证同一 `buf_getframedata` 的 frame/camera stamp、timestamp、driver buffer index 与同一 drain 观察点的 `nFrameCount` 原样进入 record；同一batch的 `produced_count` 允许重复，不被改写为伪逐帧counter；
-- `read_frame_records()` 与迁移期 `read_frames()` 消费同一 armed-session queue，不重复交付、不分岔 ordinal/metadata；finite expected/max frame count、pending max-inflight record count、duplicate/gap 任一越界都在原子入队前返回 `CameraBufferOverrun`，不部分保留该batch；
+- `read_frame_records()` 与迁移期 `read_frames()` 消费同一 armed-session record source，不重复交付、不分岔 ordinal/metadata；finite count越过`expected_frames`或发生duplicate/gap时在原子发布前返回`CameraBufferOverrun`，不部分保留该batch；
 - coherent monitor 永不混 shot，INDEPENDENT_LATEST_MONITOR 不可用于相关 expression；
 - EXACT_KEY/coherent monitor 对 join_key type/schema mismatch 或 missing key fail closed；
 - 独立设备 ZIP_SEQUENCE 被拒绝；
@@ -3163,8 +3170,8 @@ Stream：
 - Q0 artifact保存样本量、观察loss/reorder率与统计上界；未达到PI批准的样本量/上界/margin不能activate qualification；版本/设置变化、显式revocation、重启恢复和并发preflight pin均有contract test；
 - preflight对compiler展开delay、polarity与相邻高段merge后的完整物理waveform验证arm-ready、first-edge margin、active/inactive width和所有相邻trigger间距，要求`interval >= camera minimum + configured margin`；边界内/外、过窄pulse、过早首沿、delay/polarity、merge与重复trigger edge均有测试；
 - repeat axis确定性展开进finite table；Formal program强制`repeat_forever=False, scan_repeats=0`，任何`scan_repeats>0`/cursor-wrap stop在compile/preflight被拒绝；repeat/point/TriggerKey round-trip覆盖多repeat；
-- qCMOS autonomous与API segmented都一次arm整个scan session；API按R-major/P-fast执行R×P个独立STATIC_ONCE pulse session，segment boundary期间camera保持同一armed/draining transaction，全部cell后只生成一个aggregate camera terminal；driver ring按max-inflight定容，expected frame count由exact reservation与artifact schedule完整覆盖；实际driver/hardware record容量不足时在arm/fire前拒绝；frame[i]只在匹配active Q0 qualification envelope时映射frozen TriggerKey[i]；
-- qCMOS stream声明NON_BACKPRESSURE_CAPTURED；故障注入证明物理帧B publish失败后generation立即RetentionOverrun，物理帧C不能占B的sequence，任何capture后的decode/copy/schema/trace/key/publish异常统一SourceFailed且不可继续formal collection；
+- qCMOS autonomous与API segmented都一次arm整个scan session；API按R-major/P-fast执行R×P个独立STATIC_ONCE pulse session，segment boundary期间camera保持同一armed/draining transaction，全部cell后只生成一个aggregate camera terminal；driver ring按完整`expected_frames`分配，expected frame count由exact reservation与artifact schedule完整覆盖；真实分配失败时arm失败；frame[i]只在匹配active Q0 qualification envelope时映射frozen TriggerKey[i]；
+- 故障注入证明物理帧B publish失败后generation立即`SourceFailed`，物理帧C不能占B的sequence；任何capture后的decode/copy/schema/trace/key/publish异常统一失败且不可继续formal collection；
 - BoundCapturePort拒绝普通/伪造/stale capability值，只接受DeviceBroker对同一BoundDevice generation mint的attestation；prepare/terminal必须回显并匹配spec/settings/capability digests；
 - MeasurementDefinition/catalog fields递归只允许declarative values，runtime不执行Definition.bind或spec codec；FrozenCaptureSpec payload/digest篡改、owner/schema mismatch在claim前拒绝；
 - CaptureSession start在没有自己mint的ACTIVE exact reservation、没有唯一DatasetBuilder claim、reservation已失败/释放或来自其它stream时均不得触达设备；join key只由`expected_cells[source_ordinal]`派生，delivered达到expected count后额外read在I/O前拒绝；
@@ -3378,7 +3385,7 @@ producer/adapter
 
 #### U0.1 实现 checkpoint：revisioned downstream control 与 source Run 连续性闭合
 
-当前 camera monitor 只在启动时建立一个 raw producer、raw `MonitorDataset` 与固定 processor ingress tap；此后 rectangle release、reducer 改变、首个 ROI、Clear 与候选失败都不再创建或取消 source Run。已有同输出 schema 的 retarget 使用同一 downstream generation/block，并在旧 history 仍可读时先对同一个 raw event 完成 payload snapshot、project、validate与 shadow cell write；这些可失败工作全部发生在 downstream publish 前。stream retention 只在 marker 前计算 eviction count，不复制 retained backlog、不提前删除旧 record；同一锁内在 marker 后才应用该 count，因此无 eviction 的 publish 为 O(1)，临时空间也是 O(1)。`AcquisitionStream.next_sequence` 是 publish 的第一处权威 mutation：未推进时才能丢弃 shadow、`REJECTED` candidate并由旧 binding 消费同一 raw event；一旦推进，任何 publish/monitor-offer/finalize 异常都 terminalize 该 scalar generation、降为带精确原因的 raw-only state，绝不伪造旧 binding 的 N+2 fallback。terminal fanout 逐 tap 隔离并在 `finally` 唤醒 stream waiter，单个 tap 的通知边界损坏不能让其它 tap 永久等待。正常 publish 后只绑定 exact envelope、交换预写 owner，再连续更新 binding/control state 与 `APPLIED`。跨 schema 创建新 downstream generation，Clear 只终止 downstream；所有路径都保持 source `RunId`、raw block/generation、固定 tap topology与单调 raw sequence。
+当前 camera monitor 只在启动时建立一个 raw producer、raw `MonitorDataset` 与固定 processor ingress tap；此后 rectangle release、reducer 改变、首个 ROI、Clear 与候选失败都不再创建或取消 source Run。已有同输出 schema 的 retarget 使用同一 downstream generation/block，并在旧 history 仍可读时先对同一个 raw event 完成 payload snapshot、project、validate与 shadow cell write；这些可失败工作全部发生在 downstream publish 前。stream对未ack record自然保留，不计算或应用eviction；`AcquisitionStream.next_sequence` 是 publish 的第一处权威 mutation：未推进时才能丢弃 shadow、`REJECTED` candidate并由旧 binding 消费同一 raw event；一旦推进，任何 publish/monitor-offer/finalize 异常都 terminalize 该 scalar generation、降为带精确原因的 raw-only state，绝不伪造旧 binding 的 N+2 fallback。terminal fanout 逐 tap 隔离并在 `finally` 唤醒 stream waiter，单个 tap 的通知边界损坏不能让其它 tap 永久等待。正常 publish 后只绑定 exact envelope、交换预写 owner并ack已消费输入，再连续更新 binding/control state 与 `APPLIED`。跨 schema 创建新 downstream generation，Clear 只终止 downstream；所有路径都保持 source `RunId`、raw block/generation、固定 tap topology与单调 raw sequence。
 
 `ControlTopic` 是无自有线程的 bounded latest-wins 原语：至多一个 inflight 与一个 latest pending；每个已接受 revision 恰有一个 `APPLIED | REJECTED | SUPERSEDED | TERMINATED` 终态。candidate snapshot 在接受 revision 前完成；processor 只在 source-shot 事务边界 claim 并 ACK。cancellation 可以在 projection/shadow 完成后、权威 publish 前获胜；一旦 publish/finalize 成功，binding、control state 与 `APPLIED` 构成同一个不可取消段，稍后到达的 Stop 只能在下一 checkpoint 取消 source Run，不能产生“candidate metadata 已提交但 receipt 却 TERMINATED”的半事务。GUI 的终态 receipt 无论展示成功与否都只 fold 一次；Stop 恰好落在 data-plane `APPLIED` 与 owner-thread drain 之间时，detach 前会从 receipt 与缓存 state 恢复最新 authority request，下一次 prepare 不退回旧 ROI。新 Run attachment 的 initial receipt drain 还受 slot dataset-bound gate 约束，不能把 attachment-before-bind 的正常窗口记录成假故障。
 
@@ -3460,7 +3467,7 @@ Rule-6以parent `2951ec6`的13个实际production owner机械计数：`6710 -> 1
 | relim / limits | y不是viewport轴；只由共享closed `RelimMode(TIGHT/NORMAL/FIXED)`管理。tight=`min/max ±10% span`，常量5=`4.5..5.5`、常量0=`-0.1..0.1`；normal全非负=`0..1.2*max`且全零=`0..1`，出现负值使用tight数值但保留normal mode；fixed进入时冻结exact painted y limits。所有series的valid finite union共同决定y，空/invalid不伪造0、不回退旧样本；deadband baseline只在对应BoardFrame真正publish成功后推进，ROI同generation retarget也按document/control semantic identity重置 | Monitor 与 SCAN_POINT 均 `MATCHED` |
 | worker / geometry | Figure/Axes/Artist继续只属render worker。worker严格按“更新全部series artist → 计算/应用x与y → draw → 冻结最终Agg axes bbox与actual limits → immutable raster+payload”执行；Qt使用draw后的axes bbox从Matplotlib bottom-origin换算到raster top-origin，不能把带标题/刻度/legend margin的整panel当plot rect | Monitor 与 SCAN_POINT 均 `MATCHED` |
 | per-panel hold | 任一curve area/pan只保留该panel的immutable RGBA front、exact origin和同front evaluated arrays；底层完整BoardFrame、source和siblings照常前进，release直接露出latest retained dataset，不回放display frame。source/layout/presentation/axis/geometry/revision/fault/disable/hide/close都释放；同一时刻只允许一个pointer hold | Monitor 与 SCAN_POINT 均 `MATCHED` |
-| Setting / Edit | curve唯一authored value是`CurveDisplayState(revision, relim_mode, x_view, fixed_y_limits)`；history capacity不在display state，扩大retention必须走source request。Image与Curve只共享已出现第二consumer的有限数值range/relim纯函数，以及一个参数化的revisioned Fluent form widget；不建立generic DisplayState、Viewport protocol、InteractionManager、payload plugin registry或RangePolicy类族。Setting/Edit各实例投影同一owner，dirty/stale/CAS与runtime placeholder不互抄状态 | Monitor 与 SCAN_POINT 均 `MATCHED` |
+| Setting / Edit | curve唯一authored value是`CurveDisplayState(revision, relim_mode, x_view, fixed_y_limits)`；`history_cycles`不在display state，只能作为source request的声明数据轴长度修改。Image与Curve只共享已出现第二consumer的有限数值range/relim纯函数，以及一个参数化的revisioned Fluent form widget；不建立generic DisplayState、Viewport protocol、InteractionManager、payload plugin registry或RangePolicy类族。Setting/Edit各实例投影同一owner，dirty/stale/CAS与runtime placeholder不互抄状态 | Monitor 与 SCAN_POINT 均 `MATCHED` |
 | 多维与多series | FigureEvaluator已解析的每个series/batch轴全部保留；禁止flatten、series 0、隐式mean或把trailing data axes塞成单个`data_dim`。交互curve要求全部series共享逐值相同的x axis，否则fail-closed；relim使用全部series，panel派生signal保留series/batch轴 | Monitor 与 SCAN_POINT 均 `MATCHED` |
 | Monitor coherence | camera current/curve/histogram/meter仍来自同一个scalar DatasetRevisionRef；latest invalid明确显示invalid，不回退；gap/coverage可见且curve不伪造timestamp或猜补点。show-dist/history/relim/selector/display改变都不能清空或追加rolling dataset | Monitor `MATCHED` |
 
@@ -3468,7 +3475,7 @@ Rule-6以parent `2951ec6`的13个实际production owner机械计数：`6710 -> 1
 
 数据合同保持axis-total：`EvaluatedAxis`携owner声明的`axis_id/name/role/unit/indices/coordinates`，`EvaluatedCurve`保留value unit、逐sample validity与完整batch series；底层仍是`(R,P,*data_shape)`与对齐的`ComponentValidity`。CURVE evaluator若仍有未处理的cell/data axis就fail-closed，绝不使用rank、singleton或length猜role，也没有flatten、`reshape(...)[0]`、series-0显示或隐式mean。progressive默认以声明的`SCAN_POINT`作x，repeat按明确view reduction处理；全部batch series都保留并可由显式select/facet/page视图导航，不能按数量静默截断或自动把第一个series当权威结果。其它有信息的component轴同样必须显式select，完整多维source与validity仍留在exact preview/final artifact。交互producer要求全部series共享exact x axis与value unit；x/y单位进入locked Cross与panel派生signal。有限numeric且严格单调递增/递减的轴进入interactive path；非numeric或非单调轴仍由同一renderer静态显示，并带明确unavailable reason、无空壳interaction handle、不猜index轴。
 
-progressive renderer有一条专用capacity-one preview lane，而不是通用async execution engine：exact slot可连续发布，worker只保留latest candidate；candidate ownership一直占用到GUI owner真正完成`present_pending()`，不能在publish与present之间提前释放并让下一revision覆盖。worker缓存最新`EvaluatedFigureData`，display-only r0→r1在同一renderer、同一Run与同一source identity上重画，不重新freeze source、不重新transform、不重启实验；terminal同revision仍可提交最后一张完整front。FINAL raster只有在preview source terminal、worker close、candidate/front release与board retirement完成后才替换provisional面。general executor即使只有一个worker也不会被长驻preview watcher饿死；cancel-before-start、close、render fault与finalization failure均使slot/worker/view model收敛到typed terminal。
+progressive renderer有一条专用单worker latest-state preview lane，而不是通用async execution engine：exact slot可连续发布，worker只保留latest candidate；candidate ownership一直占用到GUI owner真正完成`present_pending()`，不能在publish与present之间提前释放并让下一revision覆盖。worker缓存最新`EvaluatedFigureData`，display-only r0→r1在同一renderer、同一Run与同一source identity上重画，不重新freeze source、不重新transform、不重启实验；terminal同revision仍可提交最后一张完整front。FINAL raster只有在preview source terminal、worker close、candidate/front release与board retirement完成后才替换provisional面。general executor即使只有一个worker也不会被长驻preview watcher饿死；cancel-before-start、close、render fault与finalization failure均使slot/worker/view model收敛到typed terminal。
 
 交互合同继续区分board-wide用户意图、per-family binding health与exact painted provenance readiness。Scan Workbench把A/C/Z/H、range candidate、Setting/Edit commit都绑定到当前`run_id + source ref + panel revision`；pending revision先disarm，replacement front paint后恢复。callback异常由`QtRasterBoard`本地detached并锁存，W3下一owner cycle强制取消checked Selector、关闭Setting popup、禁用两份editor并显示diagnostic/tooltip，异常不逃出Qt event loop；新Run/application replacement才建立新binding。完整application替换同时显式开启新的editor revision domain，故旧rN dirty draft、旧scan单位与runtime placeholder不能倒退冲突或串入新r0；普通同owner观察仍保持revision单调、dirty/stale/CAS。final/static/reconfigure/close都会清pending/range/popup/switch并unbind。小屏presentation不另造layout owner：scan两块board的正常最小值仍为`320×240`，只经既有Fluent scale在`800×600`降到`240×160`下限，使嵌入TaskConsole的完整控件保持屏内可达。
 
@@ -3498,15 +3505,15 @@ rolling Monitor提交自身的历史Rule-6仍按parent `caf7f7e`的17个实际pr
 | Setting / Edit | 两者消费同一`image_display_form_spec`、同一revision/CAS/placeholder owner；Sites不另造display state、parser或widget library。普通curve Fit不适用于Sites；未来Analysis ROI由TaskConsole composition映射 | `MATCHED_EXACT_VIEWER` |
 | 更新与结构失效 | 同一候选内先冻结new frame再计算hist/clim，不能落后一帧；结构签名必须包含两input refs、source/schema/generation、calibration/centers identity、site axis/geometry、frame shape/dtype/validity、显式repeat/cell与display revision，不能只看occupancy shape | `MATCHED_EXACT_VIEWER` |
 
-最小dependency-closed纵切先升级现有public `occupancy_cell_gui`，建立后续live Sites复用的唯一交互owner：`DisplayPayload` closed union增加且只增加`SiteMapPanelPayload(background: ImagePanelPayload, occupancy_input, site_axis, owned centers/occupied/site_validity)`；payload在worker构造期一次推导并冻结all-pairs radius、完整raster normalized centers与当前viewport ring span，render worker不逐revision重扫坐标轴或重算半径。`PanelFrame.source_identity`指向occupied source，coherence stamp同时冻结frame与occupied exact refs并携calibration/geometry identity；main-equivalent Agg owner把background、rings与完整plot chrome一次画入front，Qt复用同一个`QtRasterBoard`的IMAGE A/C/Z/H、hold、typed commits与Setting/Edit，只叠加瞬时交互overlay。exact交互窗口直接拥有`QWidget + QtRasterBoard`，不得继承报告专用`FrozenRasterWindow`或继续把PNG当产品语义；它与真实冻结报告只共享语义中性的capacity-one raster worker executor、Qt wake/launcher生命周期，不共享PNG bundle。all-pairs radius、style与immutable site-state约束归headless frontend唯一owner；Qt不得再派生另一套ring/chrome paint masks。该exact FINAL consumer闭合后只能标`MATCHED_EXACT_VIEWER`，不能把U0.2 live Sites写成`MATCHED`；真正live完成仍要求current product port原子发布same-event frame+occupied+calibration identity，不能用counts preview或latest/latest替代。
+最小dependency-closed纵切先升级现有public `occupancy_cell_gui`，建立后续live Sites复用的唯一交互owner：`DisplayPayload` closed union增加且只增加`SiteMapPanelPayload(background: ImagePanelPayload, occupancy_input, site_axis, owned centers/occupied/site_validity)`；payload在worker构造期一次推导并冻结all-pairs radius、完整raster normalized centers与当前viewport ring span，render worker不逐revision重扫坐标轴或重算半径。`PanelFrame.source_identity`指向occupied source，coherence stamp同时冻结frame与occupied exact refs并携calibration/geometry identity；main-equivalent Agg owner把background、rings与完整plot chrome一次画入front，Qt复用同一个`QtRasterBoard`的IMAGE A/C/Z/H、hold、typed commits与Setting/Edit，只叠加瞬时交互overlay。exact交互窗口直接拥有`QWidget + QtRasterBoard`，不得继承报告专用`FrozenRasterWindow`或继续把PNG当产品语义；它与真实冻结报告只共享语义中性的串行latest-state raster worker、Qt wake/launcher生命周期，不共享PNG bundle。all-pairs radius、style与immutable site-state约束归headless frontend唯一owner；Qt不得再派生另一套ring/chrome paint masks。该exact FINAL consumer闭合后只能标`MATCHED_EXACT_VIEWER`，不能把U0.2 live Sites写成`MATCHED`；真正live完成仍要求current product port原子发布same-event frame+occupied+calibration identity，不能用counts preview或latest/latest替代。
 
 Rule-6开工包络以main中Sites特有`LiveSiteMap + _sites_aux`约232 physical LOC为严格参考，约696行触发3倍压缩审查；目标新增production class最多两个（payload与只有真实第二owner才允许的窄controller），新增enum/protocol/registry为零。独立oracle至少覆盖错位refs/calibration、交错latest、三态validity、`(R=2,P=3,H,W)+(R=2,P=3,SITE)`显式cell、亚像素/descending/ROI坐标、physical aspect/向西锚定、A/C/Z/H、clim、Setting/Edit、hold/stale/fault/close。
 
 实际收口没有新增通用Sites intent、renderer、scheduler、registry或controller类族。`SiteMapPanelPayload`是closed `DisplayPayload` union中唯一新class；它只持owned immutable background、两条`EvaluatedInput`、SITE axis、centers、bool occupancy、component validity与calibration/cell identity。geometry/join digest在worker构造期一次缓存，但轴、ref与array canonicalization分别委托`zlc_data`公开codec/immutable owner，不在frontend复制公式。`OccupancyCellView.cell_selection`携带canonical全outer-axis exact `Selection`，cell worker在任何raster/stamp/present前用同一`OccupancyCellNavigation`重新解析并逐值比较，loader返回相邻cell不能再被请求wrapper静默改名。
 
-Site map由worker调用从`main`迁入的同一IMAGE/Sites FigureSpec、Divider、distribution/colorbar与ring artist policy，发布完整不可变RGBA plot raster及其ViewportTransform；三态site事实和exact image plane保留在同一个typed payload中。QtRasterBoard只一对一present该front并画Area/locked Cross/Zoom/Pan/clim与drag handles；physical equal aspect/west anchor、六种cmap、clim和Setting/Edit仍消费同一typed display owner。空间rectangle只保留normalized `DISPLAY_ONLY` candidate并可投影为panel派生signal；不能伪造连续SITE Selection或反向修改Measurement。exact窗口是直接`QWidget + QtRasterBoard`，不继承报告语义的`FrozenRasterWindow`。已有第二consumer的capacity-one executor、Qt launcher、error formatting、raster-bundle load与atomic display export统一归语义中性的`window_runtime`；不得保留Qt chrome/rings与Agg chrome/rings两个可见owner，也不得保留旧私有转发名或alias。
+Site map由worker调用从`main`迁入的同一IMAGE/Sites FigureSpec、Divider、distribution/colorbar与ring artist policy，发布完整不可变RGBA plot raster及其ViewportTransform；三态site事实和exact image plane保留在同一个typed payload中。QtRasterBoard只一对一present该front并画Area/locked Cross/Zoom/Pan/clim与drag handles；physical equal aspect/west anchor、六种cmap、clim和Setting/Edit仍消费同一typed display owner。空间rectangle只保留normalized `DISPLAY_ONLY` candidate并可投影为panel派生signal；不能伪造连续SITE Selection或反向修改Measurement。exact窗口是直接`QWidget + QtRasterBoard`，不继承报告语义的`FrozenRasterWindow`。已有第二consumer的串行latest-state executor、Qt launcher、error formatting、raster-bundle load与atomic display export统一归语义中性的`window_runtime`；不得保留Qt chrome/rings与Agg chrome/rings两个可见owner，也不得保留旧私有转发名或alias。
 
-此前“Qt直接绘制background/rings”的paint profile因违反main像素合同而作废，不能作为保留第二painter的理由。仍有效的纯数据证据只有all-pairs分块半径在100/1000/4096 sites的中位耗时约`0.036/1.519/18.986 ms`，真实约100-site使用面无需再造空间索引；main-equivalent worker Agg路径必须在相同fixture上重新记录compose与present耗时，并证明capacity-one/latest-only下GUI手势持续响应，不能以性能名义回退可见算法。
+此前“Qt直接绘制background/rings”的paint profile因违反main像素合同而作废，不能作为保留第二painter的理由。仍有效的纯数据证据只有all-pairs分块半径在100/1000/4096 sites的中位耗时约`0.036/1.519/18.986 ms`，真实约100-site使用面无需再造空间索引；main-equivalent worker Agg路径必须在相同fixture上重新记录compose与present耗时，并证明串行latest-state渲染下GUI手势持续响应，不能以性能名义回退可见算法。
 
 此前Rule-6计数仍可解释typed多轴、lineage、validity、lifecycle与交互成本，但其中“删除Agg而保留Qt plot painter”的取舍已被main像素oracle推翻，不能继续当终态证据。收口后的Rule-6必须把从main实际迁入的共享FigureSpec/Divider/artist owner计作替代现有Qt chrome/rings与近似renderer，而不是新增第三套路径；同一提交删除被替代的paint函数、常量和测试。只有typed payload、exact provenance、ComponentValidity、latest-only与Qt瞬时overlay属于current架构增量。
 
@@ -3525,7 +3532,7 @@ Site map由worker调用从`main`迁入的同一IMAGE/Sites FigureSpec、Divider�
 
 唯一bin owner是headless `HistogramBinProjection`：构造器只接受exact immutable samples与authored bin count并一次生成counts/edges；projection保留每根原sample的对象identity，`HistogramPanelPayload`再次验证sample identity、全样本计数和bin count，Agg与Qt只读取同一个projection，不允许调用者注入“总数相同但分布错误”的伪counts，也不二次binning。`HistogramViewportTransform`同时冻结draw后坐标、`relim_mode/x_limits_are_auto/bin_count`和display revision，使同revision的自动派生变化与authored state漂移可区分。Curve与Histogram共用的只是已有`_NumericPanelBinding`交互生命周期；nullable typed range gesture同时修复两者的area clear，不新增Clear enum、wrapper或第二renderer。
 
-offscreen profile交叉验证：300 samples、500 bins、2000次projection的median约`0.0411 ms`、p95约`0.0521 ms`；800×520 live Histogram Agg完整worker render的median约`41.396 ms`、p95约`50.201 ms`；同一四panel Qt board整板present的median约`1.555 ms`、p95约`2.009 ms`。瓶颈仍是既有worker-thread Agg compose/draw，不是binning或GUI paint；capacity-one/latest-only worker保持GUI响应，因此不为H1另造renderer、缓存层或executor。
+offscreen profile交叉验证：300 samples、500 bins、2000次projection的median约`0.0411 ms`、p95约`0.0521 ms`；800×520 live Histogram Agg完整worker render的median约`41.396 ms`、p95约`50.201 ms`；同一四panel Qt board整板present的median约`1.555 ms`、p95约`2.009 ms`。瓶颈仍是既有worker-thread Agg compose/draw，不是binning或GUI paint；串行latest-state worker保持GUI响应，因此不为H1另造renderer、缓存层或executor。
 
 Rule-6按12个实际production owner相对parent机械计数：`13956 -> 16079 physical`、`12975 -> 14960 nonblank`，净`+2123/+1985`；classes`84 -> 94`、dataclasses`61 -> 70`、enums`7 -> 8`、functions/methods`441 -> 499`，整个closure为`1.152x/1.153x`。main严格窄UX包络 `HistogramFigure + AreaSelector + CrossSelector + ZoomPan` 为`836 physical / 775 nonblank`，净增量为`2.54x/2.56x`，低于约3倍；该分母还未包含旧BaseLivePlot/TaskConsole/monitor glue，故是保守比较。最大既有owner `board.py` 为`3424 -> 3940 physical (1.151x)`，新`histogram_display.py`为636 physical；没有单文件约3倍、单成员enum、manager、plugin、registry、通用processor框架、兼容wrapper、第二stream/dataset/executor/renderer。提交前机械审查继续删除两个零consumer binning便捷wrapper及其package-root exports、零调用binding helper、test-only dropped-count convenience property和Curve/Histogram旧测试兼容seam；测试直接消费运行时shared numeric owner，生产只保留computed-only projection这一条binning入口。其余新增值对象分别承担closed count scale、唯一authored state、exact draw transform、不可伪造projection、跨worker/Qt payload和两种不同authority的typed intent，删除任一组都会恢复字符串分派、多owner、伪bin、stale intent或display→authority泄漏。
 
@@ -3553,7 +3560,7 @@ capture-only桌面窗口在Camera纵切进入TaskConsole并复用统一panel/Fig
 9. Z0 零残余；`Zou_lab_control/workbench` 与 notebook 是新产品面，不作为旧树删除；
 10. 全分支一次独立对抗终审：P0=0、P1=0、活动白名单完整实跑全绿，并交付 UX 偏离账本、迁移完成报告与真机 bring-up runbook。
 
-`AUTONOMOUS_STREAMED` 的 9999 点级实验不是清单外便利能力。近期 resident 上限不足时，`AUTONOMOUS_REFILLED` 仍须满足 §15.4/H1 的冻结 bitstream 强证明；实现必须保留明确的 >4096/9999 host refill 启用路径。若只有真机资格化才能最终开放，软件先以 typed fail-closed 交付，runbook 必须逐条写明资格化实验、启用配置、命令、判据、回退与如何证明 host 只供应冻结 chunk、不参与硬件 edge 时序。
+`AUTONOMOUS_STREAMED` 的 9999 点级实验不是清单外便利能力。近期 resident 上限不足时，`AUTONOMOUS_REFILLED` 仍须满足 §15.4/H1 的冻结 bitstream 强证明；设计与runbook必须保留明确的 >4096/9999 资格化和启用路径，但当前production不得为它保留不可达streamer、feature flag或降级执行残余。真机资格化尚未开放时，软件只交付 typed fail-closed；runbook逐条写明资格化实验、未来启用配置、命令、判据、回退与如何证明 host 只供应冻结 chunk、不参与硬件 edge 时序。
 
 依赖关系是：
 
@@ -3574,8 +3581,8 @@ S1/S2/S3/S4 -> S5 remaining use cases -> Z0 zero-residual audit
 - **GO NOW**：E0a中的代码/metadata只读探测、离线分析与profile、import-DAG ratchet、F0绿地data/storage/stream/catalog、S0.5 Workbench三surface与三个legacy containment bridge可立即开始。E0a主动真机触发实验不是“只读”，只能通过已批准的现有实验SOP与唯一设备owner执行，或等待F0最小safety spine后执行。
 - **GO PER DEPENDENCY-CLOSED SLICE**：S1/S2/S3 只有在 LegacyRuntimeFence 生效、consumer matrix确认且每个切片不提前删除共享 producer时开始。
 - **GO FOR S4 IMPLEMENTATION**：H1 current-bitstream合同、S1 exact acquisition与S3 processor/materializer接口稳定后可以实现S4；这不等于用户可启用Formal。
-- **GO FOR FORMAL ENABLEMENT**：必须再有当前最终adapter/driver/buffer policy上的active Q0 qualification、active ProgrammedImageDeploymentRecordRef、compiled physical waveform/arm/edge/camera-tail margin、对应execution mode的现有bitstream terminal语义与稳定读规则、adapter-specific SafeStateContract、deployment-bound compiled/H1 physical-terminal recipe及所需`PostTerminalTailEvidence`、全部BoundSourceAssociationContracts、exact链与EndAttestation E2E。近期只评估恰好一个Q0-qualified qCMOS source，并先开放`AUTONOMOUS_STREAMED`方式族中的`AUTONOMOUS_RESIDENT`装载形态；refilled仅在§15.4条件能力发布后评估。API segmented按§14.7单独资格化“整run一次camera arm/aggregate terminal + R×P个STATIC_ONCE physical pulse terminal”的组合合同，而不是逐段camera qualification。contract kit、deployment record与qualification本身不要求新RTL，但若冻结硬件证据不能通过任一gate，Formal capability继续NO-GO，不能以软件state补证，也不因此自动授权重烧。
-- **HARDWARE CHANGE NO-GO BY DEFAULT**：HardwareTriggerStamp、新ROM attestation、per-fire counter/PHYSICAL_DONE、trigger-return、watchdog或RTL CRC均不得由路线图自动启动。只有E0a/Q0在已批准工作余量、正确camera配置和充分软件reservation下仍测得真实丢帧/乱序，且已经证明无法通过camera设置、软件保留/排空策略、降低trigger rate或扩大时序margin修正；或现有RTL bug/设计偏离被证实，才进入H2评审。发现一次异常、qualification证据不足或架构希望获得更强证明，都不满足该条件。
+- **GO FOR FORMAL ENABLEMENT**：必须再有当前最终adapter/driver及固定`buffer_frame_count`派生式上的active Q0 qualification、active ProgrammedImageDeploymentRecordRef、compiled physical waveform/arm/edge/camera-tail margin、对应execution mode的现有bitstream terminal语义与稳定读规则、adapter-specific SafeStateContract、deployment-bound compiled/H1 physical-terminal recipe及所需`PostTerminalTailEvidence`、全部BoundSourceAssociationContracts、exact链与EndAttestation E2E。近期只评估恰好一个Q0-qualified qCMOS source，并先开放`AUTONOMOUS_STREAMED`方式族中的`AUTONOMOUS_RESIDENT`装载形态；refilled仅在§15.4条件能力发布后评估。API segmented按§14.7单独资格化“整run一次camera arm/aggregate terminal + R×P个STATIC_ONCE physical pulse terminal”的组合合同，而不是逐段camera qualification。contract kit、deployment record与qualification本身不要求新RTL，但若冻结硬件证据不能通过任一gate，Formal capability继续NO-GO，不能以软件state补证，也不因此自动授权重烧。
+- **HARDWARE CHANGE NO-GO BY DEFAULT**：HardwareTriggerStamp、新ROM attestation、per-fire counter/PHYSICAL_DONE、trigger-return、watchdog或RTL CRC均不得由路线图自动启动。只有E0a/Q0在已批准工作余量、正确camera配置、finite完整`expected_frames`已分配并按合同排空时仍测得真实丢帧/乱序，且已经证明无法通过camera设置、降低trigger rate或扩大时序margin修正；或现有RTL bug/设计偏离被证实，才进入H2评审。发现一次异常、qualification证据不足或架构希望获得更强证明，都不满足该条件。
 
 ### E0a：迁移前 characterization，不授予发布资格
 
@@ -3588,7 +3595,7 @@ E0a用于取得会改变架构选择、硬件容量判断和真机工作点的�
 4. 固定 camera queue、journal/materializer、fit batch、scan compile、artifact 和 UI benchmark matrix；保存基线 profile artifact。
 5. 建 import-DAG ratchet，立即禁止新增 data -> 其它 bounded context、frontend -> neutral/pulse、pulse -> neutral/frontend/data 的反向边。
 
-E0a报告是S1/H1设计、Q0测试矩阵与preflight margin候选的输入。报告必须包含样本规模、持续时间、工作点、最坏间隔、观察到的loss/reorder率及其统计上界、设备/driver/旧adapter版本；当观察为零时也用样本量给出可解释的upper confidence bound。E0a证据在S1重写adapter或buffer/drain policy后不得直接授予Formal capability。
+E0a报告是S1/H1设计、Q0测试矩阵与preflight margin候选的输入。报告必须包含样本规模、持续时间、工作点、最坏间隔、观察到的loss/reorder率及其统计上界、设备/driver/旧adapter版本；当观察为零时也用样本量给出可解释的upper confidence bound。E0a证据在S1重写adapter或改变固定`buffer_frame_count`派生/driver ownership后不得直接授予Formal capability。
 
 ### F0：最小架构脊柱
 
@@ -3597,9 +3604,9 @@ E0a报告是S1/H1设计、Q0测试矩阵与preflight margin候选的输入。报
 1. lifecycle spine：connection-lifetime InstallationRuntime、RunController/RunHandle、单一进程内ResourceArbiter、DeviceBroker/BoundDevice、immutable InstallationDeviceGraph、adapter owner、真实termination acknowledgement与每领域唯一`close_session`；用阻塞fake/virtual camera证明interrupt/join未完成不发布terminal或释放claim、正常close不重复SAFE、关闭失败不永久阻塞后续实时连接。
 2. zlc_data：AxisId/AxisSpec、ValueSchema/DatasetSchema、Value/DataBlock、Validity、PointLayout、ValuePayloadContract 和 canonical codec；它是这些通用数据类型、数值 snapshot/byte-accounting 合同的唯一 owner。
 3. zlc_storage：canonical primitive encoder/digest、BlobStore/ManifestCommitter/atomic probe；各 owner 保留 typed Repository/schema codec，并从第一天用 cross-package golden/property test 锁定 canonical bytes。
-4. neutral stream：broker-minted generation、AcquisitionProducer/read-side stream、Payload/JoinKey contracts、opaque Delivery/EOS、single-formal reservation/ack、TraceBinding、BACKPRESSURE_CAPABLE/NON_BACKPRESSURE_CAPTURED、RetentionOverrun poison，以及 exact `DatasetBuilder/DatasetProgress/DatasetPreviewSnapshot/SealedDatasetArtifact` 与 bounded `MonitorTap/MonitorDataset/MonitorDatasetSnapshot`；不发布累计 DataBlock，live owner 在 S5 aggregate admission 完成前不接真实 Workbench。
-5. explicit DefinitionCatalog、PipelineSpec -> flat RunPlan compiler；此时只支持 S1 所需的 Measurement、DatasetBuilder 与 sink，不预建递归 plan 或通用 workflow DSL。
-6. camera exact queue 改为 O(1)，明确 driver buffer ownership。
+4. neutral stream：broker-minted generation、AcquisitionProducer/read-side stream、Payload/JoinKey contracts、opaque Delivery/EOS、single-formal reservation/ack、TraceBinding，以及exact `DatasetBuilder/DatasetProgress/DatasetPreviewSnapshot/SealedDatasetArtifact`与ordered `MonitorTap/MonitorDataset/MonitorDatasetSnapshot`；formal未ack事件自然保留，MonitorDataset只按声明`history_cycles`滚动，不发布累计 DataBlock，live owner 在 S5 aggregate admission 完成前不接真实 Workbench。
+5. explicit Definition/attachment tuple、PipelineSpec -> flat RunPlan compiler；此时只支持 S1 所需的 Measurement、DatasetBuilder 与 sink，不预建递归 plan 或通用 workflow DSL。
+6. camera record容器使用摊销O(1)的有序操作且不设置软件上限，明确driver buffer ownership。
 
 F0 只有 contract/unit tests，不作为长期“基础设施里程碑”单独宣称产品完成；完成标准是立刻进入 S0.5/S1。
 
@@ -3723,9 +3730,9 @@ Run 失败且不发布结果。不存在 GUI timer、host 逐点写值、逐点 
 修改 RTL/bitstream；real installation 没有这一 Port 时 Definition 仍可见，但 Start 必须以具名
 capability gap 拒绝。catalog 表单不再暴露通用 input-timeout 字段。
 
-finite Camera 的 capacity-one preview 只是单cell布局可选的显示支路，不是Measurement成功条件；
+finite Camera 的单帧preview只是单cell布局可选的显示支路，不是Measurement成功条件；
 实际prepared command不满足preview contract时直接执行同一有限采集，FINAL仍发布完整
-`(R,P,*data_shape)`。同一个Camera Definition的live与finite运行都可在运行期发布typed capacity-one
+`(R,P,*data_shape)`。同一个Camera Definition的live与finite运行都可在运行期发布typed current-cycle
 current-cycle view。Camera request 的 `frames_per_cycle=N` 唯一决定具名输出 `frame_0…frame_(N-1)`；一次
 原子Dataset沿声明的`READOUT_EVENT`轴逐项投影，repeat、MONITOR_HISTORY/其它point轴、完整data shape、
 ComponentValidity、revision与generation不变。Occupancy只接受其中一条带`MonitorCoverage`语义的
@@ -3789,7 +3796,7 @@ S0.6完成时目标composition已经只使用InstallationDeviceGraph。旧`Devic
 
 ### S1：Camera -> Value event -> Dataset -> live/save/notebook
 
-1. 迁 CameraPort、BoundMeasurement、CaptureSpec/CaptureSession 与 owner I/O lane。DeviceBroker对当前binding/generation的真实readback mint capability attestation；CaptureSession冻结CaptureSpec owner digest、创建唯一exact reservation并在DatasetBuilder claim后才能start，ordinal到cell的映射只来自冻结schedule。`AcquisitionProducer` 只能封装在 CaptureSession owner 内，普通 Measurement/processor/UI 不可见；CaptureSession 对 qCMOS 固定使用 `NON_BACKPRESSURE_CAPTURED`。
+1. 迁 CameraPort、BoundMeasurement、CaptureSpec/CaptureSession 与 owner I/O lane。DeviceBroker对当前binding/generation的真实readback mint capability attestation；CaptureSession冻结CaptureSpec owner digest、创建唯一exact reservation并在DatasetBuilder claim后才能start，ordinal到cell的映射只来自冻结schedule。`AcquisitionProducer`只能封装在CaptureSession owner内，普通Measurement/processor/UI不可见；qCMOS capture后的任意decode/copy/schema/key/publish失败统一使source失败，不允许后续frame补占sequence。
 2. qCMOS/DCAM 边界先产生§7.3定义的单一 immutable `CameraFrameRecord`，保留 `source_ordinal/produced_count/framestamp/camerastamp/timestamp/driver_buffer_index`；CaptureSession 在 owner lane 把每条 record 一次转为 `CameraSample(image: Value, metadata)`。payload contract 必须把 driver ndarray 复制/转移为 owned immutable Value并冻结所有metadata；旧 ndarray reader只是同一 record queue的迁移期解包视图，不得形成平行缓冲真相源。DatasetBuilder 根据冻结计划 key 写私有 current storage，只发轻量 DatasetProgress；UI 按 refresh cadence 请求 SliceSpec/current-frame 或节流的 DatasetPreviewSnapshot，禁止每帧 full DataBlock fan-out。
 3. 交付 IMAGE ViewContract/ViewSpec/FigureEvaluator、2D live raster+Qt overlay、Workbench LiveDatasetBinding；验证 GUI/worker owner 和 driver buffer reuse。
 4. 交付 CaptureArtifact Repository 和 crash-safe commit；live/save 冻结用户所见 revision。qCMOS EOS 的唯一合法顺序是：唯一I/O owner先读取execution-mode-specific raw terminal evidence或abort/safe ack，只确认对应logical table/segment terminal -> **camera保持capturing、dedicated drain继续运行**，从该观察点完整等待deployment-bound CompiledPulseArtifact/H1 physical output-tail bound并生成`PostTerminalTailEvidence` -> 再在Q0-qualified quiet-window/保守deadline内排空 driver residual -> 读取并冻结最终 counter/stamp -> camera `cap_stop` -> capture/transfer状态稳定复核 -> buffer release -> capture thread/session 真实termination/join ack -> 才调用 producer.finish。任何raw terminal evidence都不证明delay tail idle；固定tail/drain deadline只在H1/Q0合同内构成有限运行保证，不声称逐沿数学证明，也不参与edge调度。正常complete与取消/异常cleanup共享同一个session termination语义；取消先走thread-safe interrupt解除阻塞，再由cleanup-capable、session-specific close command完成tail wait/drain/join，而不是调用已撤销的普通execute command。任何 extra/late/count mismatch、wrong-session/join unknown或物理 capture 后的 decode/schema/key/publish 异常先 `producer.fail`，因此不能生成 SealedDatasetArtifact；仅“已经收到 N 帧”绝不是 EOS 证明。
@@ -3820,9 +3827,9 @@ qCMOS要求同identity/generation的capture terminal、DCAM status、buffer/sess
 
 ### Q0：最终版本的 qCMOS release qualification
 
-Q0只能在F0 safety spine、S1最终CameraPort/CaptureSession/driver-buffer ownership与drain policy、H1 compiled trigger schedule语义稳定后执行。它复用E0a选出的工作点，但必须用将要发布的真实adapter、SDK/driver和buffer policy重新跑qualification；E0a报告不能被重命名或复制成Q0 artifact。
+Q0只能在F0 safety spine、S1最终CameraPort/CaptureSession/driver-buffer ownership与固定`buffer_frame_count`派生式、H1 compiled trigger schedule语义稳定后执行。它复用E0a选出的工作点，但必须用将要发布的真实adapter、SDK/driver和该固定派生式重新跑qualification；E0a报告不能被重命名或复制成Q0 artifact。
 
-1. 对每个发布工作点生成immutable `CameraExternalTriggerQualification`，保存设备/firmware/SDK/driver/adapter identity及其evidence kind/receipt digest/AssetMap revision、ProgrammedImageDeploymentRecordRef revision、camera readback、buffer/drain policy、arm-ready/first-edge、active/inactive width、trigger interval/margin、last-edge-to-driver tail/quiet-window，以及nFrameCount累计快照与per-frame stamp/timestamp各自的width/signedness/modulus/reset/rollover/first-frame语义、样本规模/持续时间、loss/reorder统计上界和PI批准。
+1. 对每个发布工作点生成immutable `CameraExternalTriggerQualification`，保存设备/firmware/SDK/driver/adapter identity及其evidence kind/receipt digest/AssetMap revision、ProgrammedImageDeploymentRecordRef revision、camera readback、`buffer_frame_count`派生与分配结果、driver交付/覆盖检测、arm-ready/first-edge、active/inactive width、trigger interval/margin、last-edge-to-driver tail/quiet-window，以及nFrameCount累计快照与per-frame stamp/timestamp各自的width/signedness/modulus/reset/rollover/first-frame语义、样本规模/持续时间、loss/reorder统计上界和PI批准。
 2. `CameraQualificationIndex`必须加入camera所在的同一installation authority，并与FIRE共享一个跨进程可验证的physical-owner/linearization gate后才能原子activate revision；不得在ResourceArbiter旁建立平行控制authority。旧revision保留但不再active。version/identity/设置集合改变、合理疑似camera违例或已归因的`CAMERA_ENVELOPE_VIOLATION`分别追加suspension/revocation，重启后仍不可用。
 3. contract tests覆盖activation、version mismatch、setting越界、explicit suspension/revocation/exoneration、journal lost-ack/failure、crash/restart replay、两个preflight pin旧/新revision、revocation-vs-FIRE gate竞态、历史effective scope，以及processor/EOS失败不会误撤销camera qualification。
 4. Q0通过只说明相机在批准envelope内具备关联前提；它不单独授予Formal ScanArtifact。S4仍须逐run满足execution mode、exact pipeline、association proof、EndAttestation和authority commit。
@@ -3849,7 +3856,7 @@ H2默认不排期。只有以下任一证据成立才可创建提案：
 
 1. 在已工作的 camera event 上加入最小 `StreamProcessorWorker`、typed record、join/cardinality 和 exact propagation；不让 StreamProcessor 读取累计 DataBlock。
 2. 完成 CaptureArtifact -> CalibrationAnalysis -> CalibrationArtifact 的 live/offline 同路算法，以及 FrameContract/SiteMap/ReadoutModel。
-3. 迁 `OccupancyStreamProcessor`，输出单个 `OccupancySample(occupied, counts, metadata)` typed record，并显式绑定 CalibrationArtifactRef/model。
+3. 迁 `OccupancyProcessor`，输出单个 `OccupancySample(occupied, counts, metadata)` typed record，并显式绑定 CalibrationArtifactRef/model；live/exact 是 host policy，不产生另一种领域 Processor。
 4. DatasetBuilder 把 occupancy events 物化为 dataset；frontend Figure 与 zlc_data Fit 直接消费该冻结 dataset，证明四平面边界贯通。
 5. integration 通过后删除已经被 current Calibration/Occupancy slice 覆盖的旧 readout-specific fallback、filesystem search、拆散 scalar signals 与会碰硬件的旧 Processor。generic camera producer/LogicNode、`read_frames()/acquire()` array-only reader及其测试只有在 ROI、monitor、temperature、remaining legacy measurement/UI 的 consumer matrix 清零时才能随最后消费者所在切片一起删除；不得为了让 S3 “看起来完成”而提前切断 S5 能力。保留的只有 notebook/workbench composition 在 request 构造时按 ReadoutBindingKey 冻结显式 CalibrationArtifactRef/model 的可见 convenience pointer。
 
@@ -3858,10 +3865,10 @@ H2默认不排期。只有以下任一证据成立才可创建提案：
 S4代码实现可在H1冻结bitstream合同、S1 exact acquisition与S3 StreamProcessor/DatasetBuilder接口通过后开始；任何真实用户Formal capability必须等当前版本Q0 qualification active后才能enable：
 
 1. bind declared ExactSourcePipeline，fire 前建立全链 reservation/cursor/expected-count/ack；不得借用 monitor worker。
-2. repeat轴展开进`repeat_forever=False, scan_repeats=0`的finite logical table；preflight冻结camera readback与compiled physical trigger waveform/tail bound，验证Q0 arm/edge/pulse-width/interval/tail envelope、expected frame count与camera max-inflight record ring。近期默认只启用`AUTONOMOUS_RESIDENT`；大表仅在§15.4的单I/O owner、refill硬上界和每seam硬件时间观测/完整schedule residual capability全部发布后使用`AUTONOMOUS_REFILLED`，否则typed拒绝。autonomous mode下camera一次arm整个run session、FPGA一次fire并自主执行；获准refill的host只供应冻结chunk，不逐point调度。
+2. repeat轴展开进`repeat_forever=False, scan_repeats=0`的finite logical table；preflight冻结camera readback与compiled physical trigger waveform/tail bound，验证Q0 arm/edge/pulse-width/interval/tail envelope，并要求camera `buffer_frame_count=expected_frames`且driver分配成功。近期默认只启用`AUTONOMOUS_RESIDENT`；大表仅在§15.4的单I/O owner、refill硬上界和每seam硬件时间观测/完整schedule residual capability全部发布后使用`AUTONOMOUS_REFILLED`，否则typed拒绝。autonomous mode下camera一次arm整个run session、FPGA一次fire并自主执行；获准refill的host只供应冻结chunk，不逐point调度。
 3. autonomous mode的preflight pin active Q0 qualification revision/digest与ProgrammedImageDeploymentRecordRef，单次FIRE通过与qualification/deployment mutation串行的`pin_for_fire` gate取得run级QualificationFireAuthorization；adapter按Q0-qualified delivery-order contract将frame[i]映射为frozen TriggerKey[i]，全链数据保持PROVISIONAL。ScanPlan只声明`required_association_proof`；run末端用唯一I/O owner按H1规则读取的AutonomousTableTerminalEvidence、绑定compiled/H1/deployment revisions的`PostTerminalTailEvidence`、`expected_trigger_total_from_completed_schedule`、按Q0 reset/rollover语义唯一unwrap的`camera_produced_delta`、frame/camera stamps、timestamp容差、coverage/EOS完成EndAttestation后，EpochValidationRecord才写`achieved_association_proof`。
 4. 迁scan-slot/API-slot request、ScanOutputContract、multidimensional y和ScanArtifact Repository；MOT只允许SCAN_SLOT/AUTONOMOUS_STREAMED，不加API或host-stepped fallback。API_SLOT无法无缝更新时仅沿用`API_SLOT_SEGMENTED_EXISTING`，且program必须直接保存canonical非空`segmentation_rationale`说明为何允许段间host gap；只有接受任意可变非负gap的实验可用，连续物理演化、段间状态不可重建、最大gap、精确settle/re-equilibration或gap-dependent physics一律typed拒绝，不建立单字段policy wrapper。API只解析/编译P个唯一point artifacts，并冻结R-major/P-fast的R×P执行schedule；整run一次arm camera并冻结aggregate expected-frame count，按R-major/P-fast为每cell建立独立STATIC_ONCE PulseSession/physical terminal，相邻segment只做camera required interval的deadline/cancel-aware保守最小等待，全部cell后才做一次camera complete和aggregate EndAttestation。任何pulse terminal或aggregate camera evidence失效都阻止下一次FIRE并使整run INVALID。artifact记录execution_mode、一个run级camera authority/CameraRunEvidence、有序ApiSegmentEvidence、segmentation_rationale、required/achieved proof和formal eligibility；baseline不保存per-boundary timing，也不保存per-segment camera authorization/terminal/attestation。
-5. 对drop/reorder/duplicate/short read/counter reset/timestamp gap、pre-arm/session-baseline混用、camera max-inflight record ring不足、raw DONE早于delay tail、tail bound/version/evidence缺失、refill证明缺失、旧`scan_repeats`多发point、schema generation、component invalidity、RemoteSequencer abort与provisional epoch做整run reject-and-redo真机测试；重试默认手动，自动策略必须显式有界并保存失败attempt。
+5. 对drop/reorder/duplicate/short read/counter reset/timestamp gap、pre-arm/session-baseline混用、完整`expected_frames`分配失败或真实driver ring覆盖、raw DONE早于delay tail、tail bound/version/evidence缺失、refill证明缺失、旧`scan_repeats`多发point、schema generation、component invalidity、RemoteSequencer abort与provisional epoch做整run reject-and-redo真机测试；重试默认手动，自动策略必须显式有限并保存失败attempt。
 6. E2E 后删除 positional zip、latest fallback、旧 PulseScan 与 neutral key 泄漏进 FPGA 的类型。
 
 W3d/W3e兑现S4中不依赖Q0/real composition的source-neutral软件纵切与current TaskConsole PulseScan入口：PulseScan作为一个Measurement只编辑一份pulse program（template加SCAN_SLOT或既有API_SLOT）并选择一条外部精确`Signal(y)`。当前direct-camera与camera→occupancy复用现有一次arm/一次autonomous FIRE exact pipeline，在同一Run提交唯一ScanArtifact；Figure Area只把显式named-axis transform附着到同一producer，不能读取panel raster、displayed/latest front或另建采集。开始scan前GUI owner先停止并join正在服务该exact producer的monitor节点，scan worker只等待其线程安全Future/RunHandle，绝不跨线程调用GUI-owned `poll()`；随后由dedicated exact pipeline取得硬件所有权。`(R,P,*data_shape)`、PointLayout、ComponentValidity和processor/calibration lineage完整保留，不做flatten、首项选择或隐式mean。direct-camera Qt仍FINAL-only；occupancy Qt可从同一exact builder的只读revision reader显示cleanup完成前明确标注的PROVISIONAL curve，释放worker-owned Agg/board后再从唯一artifact独立投影FINAL。真实hardware/Q0/terminal evidence gate仍NO-GO；旧PulseScanNode/TaskConsole宿主因其它panel最后consumer尚在而不能提前删除。
@@ -3928,32 +3935,59 @@ packages/
     fpga/sim/
 
   zlc_neutral_atom/
-    catalog/
-    installation/
-      runtime/
-      graph/
-      bootstrap/
-      recovery/
-      device_catalog/
-    runtime/run/
-    runtime/pipeline/
-    runtime/streams/
-    runtime/materialization/
-    runtime/analysis/
-    runtime/resources/
-    acquisition/
-    processing/stream/
-    analysis/
-    artifacts/
-    devices/ports/
-    devices/adapters/        # composition私有concrete adapters/raw graph
-    adapter_sdk/             # adapter作者合同，不从Experiment可达
-    testing/                 # contract kits/fault fixtures
-    simulation/              # 显式virtual环境，不经notebook umbrella导出raw类
-    scan/
-    readout/calibration/
-    readout/occupancy/
-    experiments/
+    catalog.py              # DefinitionKey与三个关闭Definition dataclass；无聚合registry
+    authoring.py
+    input_spec.py
+    dataset_output.py
+    installation.py         # typed DeviceRef/DeviceCatalogView
+    installation_assets.py  # machine AssetMap/adapter identity facts；位于 bootstrap 与 devices 之下
+    installation_config.py
+    installation_plan.py
+    installation_runtime.py # connection-lifetime runtime/catalog/graph 的骨架低层 owner
+    bootstrap/              # 只做 installation config 类型 dispatch；不拥有 runtime/device/logic-node
+    runtime/
+      run.py
+      streams.py
+      dataset.py
+      resources.py
+      ports.py
+      commit.py
+      cleanup.py
+      preview.py             # 唯一 Camera-free 的 provisional Dataset view 协议
+    processing/stream/       # 通用 Processor worker/contract，不含具体算法
+    timing/                  # 只保留跨节点时钟、lineage、协调协议
+    devices/
+      camera/
+        contract.py         # 物理相机值、sample/schema 与 canonical codecs
+        capture_port.py     # finite capture command/ack 与 typed physical Port
+        monitor.py          # hardware-paced monitor command/ack 与 Port
+        endpoint.py         # concrete adapter 到 camera physical Port 的窄 bridge
+        dcam.py             # concrete qCMOS attachment
+        _dcam_driver.py
+      sequencer/
+        port.py              # command/ack/capability/BoundPulsePort/PulseSession唯一 owner
+        application.py       # declarative PulseRun request、prepare与application authority
+        endpoint.py
+        remote_pulse.py     # 只消费 zlc_pulse public client
+      rf.py                 # 当前 typed RF Port；不预造不存在的真实 adapter
+      simulation/
+        apparatus.py        # atom/camera/MOT 的一条真实协作模型
+        sequencer_endpoint.py
+        rf_endpoint.py
+        installation.py
+    logic_nodes/
+      camera_measurement/
+      camera_capture/       # exact session/pipeline/triggered binding/artifact 唯一 owner
+      pulse_scan/
+      calibration/
+      mot_field/
+      occupancy/
+      temperature_release_recapture/
+      readout_duration_fidelity/
+      grey_molasses_detuning/
+      readout_common/       # 仅保留标定/读出真实共享的 FrameContract 等领域语义
+      release_recapture_common/
+    testing/                # contract kits/fault fixtures，不导出 raw runtime graph
 
 apps/
   zlc_notebook/
@@ -3970,12 +4004,17 @@ apps/
     devices/
     figure/
       live_binding/
+    logic_node_presentations/  # 只含领域结果到 frontend DTO 的窄产品适配
     composition/
 ```
 
 这些是 import/ownership namespace，不等于第一天必须发布五个 wheel。仓库可先用一个 distribution 的多个顶层 namespace，并用 architecture tests 保证 DAG；只有 FPGA server、Qt extras 或部署体积确实需要时再拆 wheel，公开 import path 与所有权不变。
 
 不建立新的 `common`、`shared`、`utils` 或跨领域 `core` 杂物包。
+
+这里的 `devices/` 与 `logic_nodes/` 是所有权约束，不是把旧文件机械塞进新文件夹：`bootstrap` 中具体 virtual/remote/DCAM 实现必须迁出，只留下 installation dispatch；Camera Measurement binding 从 concrete endpoint 迁回 `logic_nodes/camera_measurement`，跨设备 triggered capture 进入对应 logic-node/shared timing owner；simulation 只依赖低层 imaging/port facts，禁止 import Calibration/SiteMap owner。相反，`zlc_pulse` 的 FPGA model/compiler/host/transport/server/RTL 保持自己的 bounded context，不搬入 neutral devices。
+
+物理迁移按 dependency-closed group 完成并立刻删掉旧路径：Camera/device attachment；Sequencer+simulation attachment；readout-common+Camera split；Calibration；Occupancy；PulseScan；MOT；三个 coupled Measurement 及其 release-recapture shared owner。每组同时更新普通 imports、canonical type/FQCN、installation plan、composition 与 current tests；禁止 re-export、alias、兼容 shim 或“新旧路径都能用”的迁移态。
 
 ## 21. 删除清单
 
@@ -3993,7 +4032,7 @@ apps/
 - UnitSpec/CoordinateFrame 图代数；只保留 canonical unit id、opaque frame id 与显式转换；
 - snapshot lease/pin/borrow manager；当前只使用普通 immutable owned value；
 - node-owned worker/thread/terminal state 与运行中动态 pipeline edge；
-- public Task/Measurement/StreamProcessor/Analysis god base hierarchy；
+- public Task/Measurement/Processor/Analysis god base hierarchy；
 - TaskOutput 和 `__task_frame__`；
 - per-signal gap -> latest fallback；
 - 独立设备按 sequence zip、自由运行无 tag 的位置式 trigger ledger；
@@ -4053,6 +4092,6 @@ apps/
 
 近期最重要的落地顺序不是先拆完五个namespace，而是先让lifecycle/resource状态诚实、建立Workbench/render宿主、跑通Camera event -> DatasetBuilder -> live/save，并用E0a真qCMOS characterization确定工作点；S1最终adapter与H1 schedule语义稳定后重新执行Q0 release qualification。随后在冻结bitstream上以`AUTONOMOUS_RESIDENT`运行近期无缝装载方式基线，用active qualification + preflight margin + ordered metadata + per-run EndAttestation共同授予Formal eligibility；refilled仍默认拒绝。逐沿stamp、新ROM、trigger-return等只有§1.1/H2的证据条件、根因因果关系和独立批准全部满足后才评估。
 
-终版GO/NO-GO裁决分开写：顶层架构与E0a只读/离线部分、F0、S0.5 **GO**；S0.6的connection-lifetime InstallationRuntime、immutable InstallationDeviceGraph、startup/claim-first recovery/shutdown、内部consumer与frontend窄port迁移 **GO**，但新增任何普通用户真实设备入口在public object-graph/umbrella/docs gates清零前 **NO-GO**；S1-S3按dependency-closed cut **GO**；S4代码实现于H1/S1/S3接口稳定后 **GO**。除§19明文限定的H1前`DIAGNOSTIC_CHARACTERIZATION`迁移例外（批准legacy SOP、唯一owner、现有fingerprint/ABI、observed live identity/endpoint与旧SOP safety evidence齐全，且绝不产生target runtime/AssetMap/Q0/Formal authority）外，任何target runtime或普通实验真实设备drive capability在installation AssetMap（canonical内容digest、exact adapter kind、expected live matcher）生效、该adapter的identity/disconnect/SafeStateContract真机recipe通过前均为 **NO-GO**；Pylon尤其必须通过removed+live readback拔线测试，不能以`IsOpen/IsGrabbing/GetDeviceInfo`缓存组合放行。用户可用Formal PulseScan capability仍为 **NO-GO**，直到current deployment有active ProgrammedImageDeploymentRecordRef、当前最终adapter的Q0 qualification active、完整physical waveform/arm/edge/camera-tail margin、mode-specific raw terminal稳定读语义、adapter-specific SafeStateContract、deployment-bound compiled/H1 post-terminal output-tail bound与`PostTerminalTailEvidence`、近期单qCMOS BoundSourceAssociationContract、软件exact链和EndAttestation E2E全部通过。deployment record/H1/Q0/contract-kit评估本身不要求重烧，也不冒充runtime content attestation；冻结硬件最终能否通过这些gate由真机证据决定，不能预先承诺。硬件改变默认 **NO-GO**；唯一解锁条件是E0a/Q0在已批准余量、正确camera配置和充分软件reservation下仍实测loss/reorder，并且camera设置、软件保留/排空、trigger rate与margin调整均无法修正；或现有RTL bug/既定设计偏离被证实；之后仍须PI/硬件owner单独批准。
+终版GO/NO-GO裁决分开写：顶层架构与E0a只读/离线部分、F0、S0.5 **GO**；S0.6的connection-lifetime InstallationRuntime、immutable InstallationDeviceGraph、startup/claim-first recovery/shutdown、内部consumer与frontend窄port迁移 **GO**，但新增任何普通用户真实设备入口在public object-graph/umbrella/docs gates清零前 **NO-GO**；S1-S3按dependency-closed cut **GO**；S4代码实现于H1/S1/S3接口稳定后 **GO**。除§19明文限定的H1前`DIAGNOSTIC_CHARACTERIZATION`迁移例外（批准legacy SOP、唯一owner、现有fingerprint/ABI、observed live identity/endpoint与旧SOP safety evidence齐全，且绝不产生target runtime/AssetMap/Q0/Formal authority）外，任何target runtime或普通实验真实设备drive capability在installation AssetMap（canonical内容digest、exact adapter kind、expected live matcher）生效、该adapter的identity/disconnect/SafeStateContract真机recipe通过前均为 **NO-GO**；Pylon尤其必须通过removed+live readback拔线测试，不能以`IsOpen/IsGrabbing/GetDeviceInfo`缓存组合放行。用户可用Formal PulseScan capability仍为 **NO-GO**，直到current deployment有active ProgrammedImageDeploymentRecordRef、当前最终adapter的Q0 qualification active、完整physical waveform/arm/edge/camera-tail margin、mode-specific raw terminal稳定读语义、adapter-specific SafeStateContract、deployment-bound compiled/H1 post-terminal output-tail bound与`PostTerminalTailEvidence`、近期单qCMOS BoundSourceAssociationContract、软件exact链和EndAttestation E2E全部通过。deployment record/H1/Q0/contract-kit评估本身不要求重烧，也不冒充runtime content attestation；冻结硬件最终能否通过这些gate由真机证据决定，不能预先承诺。硬件改变默认 **NO-GO**；唯一解锁条件是E0a/Q0在已批准余量、正确camera配置、finite完整`expected_frames`已分配并按合同排空时仍实测loss/reorder，并且camera设置、trigger rate与margin调整均无法修正；或现有RTL bug/既定设计偏离被证实；之后仍须PI/硬件owner单独批准。
 
 最终实现应让用户继续使用熟悉的TaskConsole、PulseGUI和notebook工作流；重型board保持下线程raster性能，notebook保持短路径，MOT保持SCAN_SLOT自主扫描。resident/refilled只标记同一`AUTONOMOUS_STREAMED`方式族下的装载方式，不能单独授予Formal资格；只有active Q0 qualification、exact链、`ORDERED_END_ATTESTED_RUN`和本run EndAttestation共同通过时才标记Formal eligible。内部消除软件缓冲跳帧、线程竞态、隐式降维和重复算法；相机↔point的物理保证明确采用整run末端证明而非逐沿硬件tag，任何不一致整run拒绝，所有迁移bridge在Z0物理删除。

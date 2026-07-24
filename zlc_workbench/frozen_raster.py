@@ -193,7 +193,7 @@ class FrozenRasterWindow(QtWidgets.QWidget):
             self._tabs.removeTab(0)
             if isinstance(widget, FrozenRasterView):
                 widget.clear()
-            widget.setParent(None)
+            widget.hide()
             widget.deleteLater()
         if self._placeholder is not None:
             self._placeholder = None

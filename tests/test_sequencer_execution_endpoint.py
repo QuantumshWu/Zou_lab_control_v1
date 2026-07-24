@@ -8,10 +8,10 @@ from pathlib import Path
 import pytest
 
 from fpga.pulse_streamer.host.image import StreamerParams
-from zlc_neutral_atom.bootstrap._sequencer_endpoint import (
+from zlc_neutral_atom.devices.simulation.sequencer_endpoint import (
     VirtualSequencerExecutionEndpoint,
 )
-from zlc_neutral_atom.bootstrap._virtual_hardware import VirtualSequencer
+from zlc_neutral_atom.devices.simulation.apparatus import VirtualSequencer
 from zlc_neutral_atom.runtime.ports import (
     DeviceBroker,
     SafetyOperation,
@@ -22,7 +22,7 @@ from zlc_neutral_atom.runtime.resources import (
     PhysicalDeviceIdentity,
     ResourceKey,
 )
-from zlc_neutral_atom.timing.pulse import (
+from zlc_neutral_atom.devices.sequencer.port import (
     CompletePulseCommand,
     ContinuousPulseExecutionRequest,
     FinitePulseExecutionRequest,

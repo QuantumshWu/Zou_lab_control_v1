@@ -93,7 +93,6 @@ class TaskConsole(QtWidgets.QWidget):
         catalog_view: object | None = None,
         run_factory=None,
         data_plane=None,
-        pulse_template_reader=None,
         scale: float | None = None,
         window_ratio: float = WINDOW_SCREEN_FRACTION,
         window_px: tuple[int, int] | None = None,
@@ -136,15 +135,10 @@ class TaskConsole(QtWidgets.QWidget):
         if run_factory is not None and not callable(run_factory):
             raise TypeError("run_factory must be callable or None")
         self._run_factory = run_factory
-        if pulse_template_reader is not None and not callable(
-            pulse_template_reader
-        ):
-            raise TypeError("pulse_template_reader must be callable or None")
-        self._pulse_template_reader = pulse_template_reader
         self._panel_teardown_phases: dict[int, set[str]] = {}
         # CATALOG SEAM: the one capability vocabulary this window offers.
-        # ``ConsoleCatalogView`` projects the domain DefinitionCatalog into addable
-        # entries -- camera / measurement / processor / task -- each carrying its own
+        # ``ConsoleCatalogView`` projects the composition root's closed attachment
+        # tuple into addable Measurement / Processor / Task entries, each carrying its own
         # parameter form, declared outputs and typed-request builder.  Without a view
         # the window is plot-kinds only (a layout you can open with no session).
         self._catalog = catalog_view
@@ -307,7 +301,7 @@ class TaskConsole(QtWidgets.QWidget):
         # The node layers come directly from the catalog view.  Every entry
         # carries its own display label and DefinitionKey; Camera is an ordinary
         # catalog entry rather than a window-owned special case.
-        for kind, layer in (("camera", "Measurement"), ("measurement", "Measurement"),
+        for kind, layer in (("measurement", "Measurement"),
                             ("processor", "Processor"), ("task", "Task")):
             for spec in self._catalog_specs(kind):
                 self.kind_combo.addItem(
@@ -396,6 +390,8 @@ class TaskConsole(QtWidgets.QWidget):
         dash_layout.setContentsMargins(0, 0, 0, 0)
         self.scroll = FluentScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.board = PanelBoard()
         self.scroll.setWidget(self.board)
         dash_layout.addWidget(self.scroll, 1)
@@ -453,14 +449,16 @@ class TaskConsole(QtWidgets.QWidget):
         # the current parameter values even when the node was never started (a
         # layout persists Edit params, not just geometry).  Plot params already write
         # through to ``card.config.params`` live, so panels need no flush.
+        drafts = []
         for row in self.logic_nodes:
             editor = self._logic_editors.get(id(row))
             if editor is None:
                 continue
-            # collect_values() is the form's atomic validation boundary.  Save
-            # must fail visibly rather than persist stale values behind invalid
-            # text currently shown to the operator.
-            row.node.values = editor.collect_values()
+            # Validate every open draft before mutating any authored config, so
+            # one invalid tab cannot leave a half-committed Save attempt.
+            drafts.append((row, editor.collect_values()))
+        for row, values in drafts:
+            self._commit_logic_authored_values(row, values=values)
         return TaskConsoleState(
             name=self.name_edit.text().strip() or "task",
             interval_ms=self.state.interval_ms,
@@ -493,7 +491,7 @@ class TaskConsole(QtWidgets.QWidget):
                     "TaskConsole layout references an unknown or wrong-kind "
                     "DefinitionKey"
                 )
-            unknown = set(node.values) - set(spec.form.keys)
+            unknown = set(node.values) - set(spec.editor_keys)
             if unknown:
                 raise ValueError(
                     f"{node.title!r} contains fields absent from its selected "
@@ -699,15 +697,63 @@ class TaskConsole(QtWidgets.QWidget):
         """
         if self._task_locked:
             return False
-        row.node.values = dict(values)
-        editor = self._logic_editors.get(id(row))
-        if editor is not None:
-            editor.form.seed_values(values)               # keep the node's own Edit consistent
+        self._commit_logic_authored_values(row, values=values)
         node = self._logic_nodes.get(id(row))
         if node is None:
             return True                                    # not running -> values remembered for next Start
         self._start_logic_node(row)
         return True
+
+    def _commit_logic_authored_values(
+        self,
+        row: "LogicNodeRow",
+        *,
+        editor: "LogicNodeEditor | None" = None,
+        values: dict | None = None,
+    ) -> dict:
+        """Cross the sole Logic-form draft -> authored-config boundary.
+
+        Widgets remain local drafts while the operator types.  Apply, Start,
+        Save, and tab close all arrive here, validate one complete form value,
+        update ``LogicNodeConfig.values`` atomically, keep any second visible
+        editor in sync, and mark the layout dirty exactly when authored values
+        changed.  This is a UI-state commit only; it never starts a Run or
+        creates a worker snapshot.
+        """
+
+        if row not in self.logic_nodes:
+            raise ValueError("Logic row is no longer attached to this console")
+        if editor is not None and values is not None:
+            raise ValueError("supply either a Logic editor or explicit values")
+        active_editor = self._logic_editors.get(id(row))
+        source_editor = active_editor if editor is None else editor
+        if editor is not None and active_editor is not editor:
+            raise ValueError("Logic editor is not attached to this row")
+        if values is not None:
+            candidate = dict(values)
+        elif source_editor is not None:
+            candidate = source_editor.collect_values()
+        else:
+            candidate = dict(row.node.values or {})
+        spec = self._spec_for_logic(row.node)
+        if spec is not None:
+            expected = set(spec.editor_keys)
+            actual = set(candidate)
+            if actual != expected:
+                raise ValueError(
+                    "Logic authored values differ from the Definition form; "
+                    f"missing={tuple(sorted(expected - actual))}, "
+                    f"extra={tuple(sorted(actual - expected))}"
+                )
+        changed = candidate != dict(row.node.values or {})
+        if changed:
+            row.node.values = dict(candidate)
+            self._mark_dirty()
+        if active_editor is not None and (
+            values is not None or active_editor is not source_editor
+        ):
+            active_editor.form.seed_values(candidate)
+        return candidate
 
     @staticmethod
     def _node_label(node) -> str:
@@ -850,6 +896,7 @@ class TaskConsole(QtWidgets.QWidget):
         # They are ordinary picker signals, but their stable producer identity
         # is the persisted panel_id rather than its editable title.
         from .catalog_bridge import ConsoleSignalDecl
+        from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
         from zlc_frontend.figure_outputs import (
             AREA_DATA_OUTPUT,
             CROSS_X_OUTPUT,
@@ -857,6 +904,7 @@ class TaskConsole(QtWidgets.QWidget):
             FIT_OUTPUT_PREFIX,
             FitParameterMetadata,
             SelectorAxisMetadata,
+            figure_output_contract_id,
         )
 
         for card in self.cards:
@@ -889,13 +937,20 @@ class TaskConsole(QtWidgets.QWidget):
                     )
                 else:
                     short = output_name
+                source = topology.get(str(card.config.signal or ""))
+                declaration = None if source is None else source["declaration"]
+                source_contract = getattr(declaration, "contract_id", None)
+                contract_id = figure_output_contract_id(
+                    output_name,
+                    source_contract_id=source_contract,
+                )
                 add(
                     panel_signal_key(card.panel_id, output_name),
                     state="retained-view",
                     label=str(card.config.title or PANEL_KINDS[card.config.kind]),
                     node=card,
                     declaration=ConsoleSignalDecl(
-                        output_name,
+                        DatasetOutputDeclaration(output_name, contract_id),
                         short,
                         short,
                         "Figure-derived signal",
@@ -927,80 +982,15 @@ class TaskConsole(QtWidgets.QWidget):
 
         return sorted(self._signal_topology())
 
-    def _pulse_scan_source_names(self) -> list[str]:
-        """Only event-bearing sources accepted by the Pulse Scan resolver."""
+    def _input_signal_names(self, input_spec) -> list[str]:
+        """Filter every candidate solely by its stable output contract id."""
 
-        return [
-            name
-            for name in self._signal_names()
-            if self._pulse_scan_source_kind(name, set()) is not None
-        ]
-
-    def _declared_output_names(self, definition_key, output_name: str) -> list[str]:
-        """Exact signals owned by one catalog definition/output pair."""
-
-        accepted: list[str] = []
-        for name in self._signal_names():
-            try:
-                _row, spec, output = self._console_producer_match(name)
-            except LookupError:
-                continue
-            if spec.key == definition_key and str(output.name) == str(output_name):
-                accepted.append(name)
-        return accepted
-
-    def _camera_frame_signal_names(self, definition_key) -> list[str]:
-        """All canonical frame_i outputs of Camera rows in this console."""
-
-        from zlc_neutral_atom.camera_measurement import camera_frame_output_index
-
-        accepted: list[str] = []
-        for name in self._signal_names():
-            try:
-                _row, spec, output = self._console_producer_match(name)
-                camera_frame_output_index(str(output.name))
-            except (LookupError, TypeError, ValueError):
-                continue
-            if spec.key == definition_key:
-                accepted.append(name)
-        return accepted
-
-    def _signal_input_names(self, definition_key, parameter_key: str) -> list[str]:
-        """Project one request field's declared producer contract into its picker."""
-
-        from zlc_neutral_atom.acquisition.camera import CAMERA_MEASUREMENT_KEY
-        from zlc_neutral_atom.readout.coupled_measurements import (
-            GREY_MOLASSES_DETUNING_KEY,
-            READOUT_DURATION_FIDELITY_KEY,
-            TEMPERATURE_RELEASE_RECAPTURE_KEY,
+        accepted = set(input_spec.accepted_output_contract_ids)
+        return sorted(
+            key
+            for key, entry in self._signal_topology().items()
+            if getattr(entry["declaration"], "contract_id", None) in accepted
         )
-        from zlc_neutral_atom.readout.occupancy import (
-            OCCUPANCY_STREAM_PROCESSOR_KEY,
-        )
-        from zlc_neutral_atom.readout.sitemap import SITEMAP_CALIBRATION_TASK_KEY
-        from zlc_neutral_atom.scan import PULSE_SCAN_MEASUREMENT_KEY
-
-        key = str(parameter_key)
-        if definition_key == PULSE_SCAN_MEASUREMENT_KEY and key == "y_signal":
-            return self._pulse_scan_source_names()
-        if definition_key == OCCUPANCY_STREAM_PROCESSOR_KEY:
-            if key == "camera_frame":
-                return self._camera_frame_signal_names(CAMERA_MEASUREMENT_KEY)
-            if key == "calibration_task":
-                return self._declared_output_names(
-                    SITEMAP_CALIBRATION_TASK_KEY,
-                    "calibration",
-                )
-        if definition_key in {
-            TEMPERATURE_RELEASE_RECAPTURE_KEY,
-            READOUT_DURATION_FIDELITY_KEY,
-            GREY_MOLASSES_DETUNING_KEY,
-        } and key == "calibration":
-            return self._declared_output_names(
-                SITEMAP_CALIBRATION_TASK_KEY,
-                "calibration",
-            )
-        return self._signal_names()
 
     def _signal_formats(self) -> dict:
         """Describe every value present in the current immutable data front.
@@ -1257,21 +1247,9 @@ class TaskConsole(QtWidgets.QWidget):
         cross-console fallback is permitted.
         """
 
-        from .occupancy_binding import ConsoleProducerBinding
+        from zlc_workbench.input_binding import ConsoleProducerBinding
 
         row, spec, output = self._console_producer_match(signal_key)
-        editor = self._logic_editors.get(id(row))
-        if editor is None:
-            values = dict(row.node.values or {})
-        else:
-            try:
-                edited = editor.collect_values()
-            except Exception as error:
-                raise ValueError(
-                    f"{row.node.title!r} has invalid current form values: {error}"
-                ) from error
-            values = {**dict(row.node.values or {}), **edited}
-        request = spec.build_request(values)
         run_node = (
             self._logic_nodes.get(id(row))
             or self._last_node.get(id(row))
@@ -1285,6 +1263,33 @@ class TaskConsole(QtWidgets.QWidget):
                 raise RuntimeError(
                     "retained producer runtime does not belong to the selected row"
                 )
+            try:
+                request = run_node.request
+            except AttributeError as error:
+                raise RuntimeError(
+                    "retained producer runtime exposes no frozen request"
+                ) from error
+            runtime_outputs = tuple(
+                getattr(run_node, "output_declarations", ()) or ()
+            )
+            if output not in runtime_outputs:
+                raise RuntimeError(
+                    "selected output is absent from the producer runtime's frozen "
+                    "declarations"
+                )
+        else:
+            editor = self._logic_editors.get(id(row))
+            if editor is None:
+                values = dict(row.node.values or {})
+            else:
+                try:
+                    edited = editor.collect_values()
+                except Exception as error:
+                    raise ValueError(
+                        f"{row.node.title!r} has invalid current form values: {error}"
+                    ) from error
+                values = {**dict(row.node.values or {}), **edited}
+            request = spec.build_request(values)
         resolved = bool(
             run_node is not None
             and getattr(run_node, "final_result_resolved", False)
@@ -1293,7 +1298,7 @@ class TaskConsole(QtWidgets.QWidget):
             signal_key=signal_key,
             producer_label=str(row.node.title),
             definition_key=spec.key,
-            output_name=str(output.name),
+            output=output.declaration,
             request=request,
             run_node=run_node,
             final_result_resolved=resolved,
@@ -1304,116 +1309,92 @@ class TaskConsole(QtWidgets.QWidget):
             ),
         )
 
-    def _pulse_scan_source_kind(
-        self,
-        signal_key: str,
-        active: set[str],
-    ) -> str | None:
-        """Classify one candidate without building another row's request."""
-
-        from zlc_frontend.figure_outputs import AREA_DATA_OUTPUT
-        from .pulse_scan_binding import classify_pulse_scan_producer
-
-        current = str(signal_key)
-        if not current or current in active:
-            return None
-        try:
-            _row, spec, output = self._console_producer_match(current)
-        except LookupError:
-            pass
-        else:
-            return classify_pulse_scan_producer(
-                spec.key,
-                str(output.name),
-            )
-
-        for card in self.cards:
-            area_key = panel_signal_key(card.panel_id, AREA_DATA_OUTPUT)
-            if current != area_key:
-                continue
-            source_key = str(card.config.signal).strip()
-            _value, selection, _cross, _fit = card.frozen_figure_output_state()
-            if not source_key or selection is None:
-                return None
-            return self._pulse_scan_source_kind(
-                source_key,
-                {*active, current},
-            )
-        return None
-
-    def resolve_pulse_scan_source(self, signal_key: str):
-        """Resolve an exact scan source without reading the display data front."""
+    def _resolve_dataset_input(self, selection, active: set[str]):
+        """Resolve a contract-admitted Dataset or authoritative Area output."""
 
         from zlc_data import DataTransformSpec
-
         from zlc_frontend.figure_outputs import AREA_DATA_OUTPUT
-        from .pulse_scan_binding import (
-            PulseScanSourceBinding,
-            classify_pulse_scan_producer,
+        from zlc_workbench.input_binding import (
+            DatasetInputSelection,
+            ResolvedDatasetInput,
         )
 
-        def resolve(current: str, active: set[str]):
-            if current in active:
-                raise ValueError("Pulse scan source panels form a cycle")
-            try:
-                _row, spec, output = self._console_producer_match(current)
-            except LookupError:
-                pass
-            else:
-                source_kind = classify_pulse_scan_producer(
-                    spec.key,
-                    str(output.name),
-                )
-                if source_kind is None:
-                    raise ValueError(
-                        "Pulse scan exact sources are Camera frame and Occupancy "
-                        "counts/occupied"
-                    )
-                return PulseScanSourceBinding(
-                    source_kind,
-                    self.resolve_console_producer(current),
-                )
-
-            for card in self.cards:
-                area_key = panel_signal_key(card.panel_id, AREA_DATA_OUTPUT)
-                if current != area_key:
-                    continue
-                source_key = str(card.config.signal).strip()
-                if not source_key:
-                    raise ValueError(
-                        "the selected Figure Area has no bound source dataset"
-                    )
-                _value, selection, _cross, _fit = (
-                    card.frozen_figure_output_state()
-                )
-                if selection is None:
-                    raise ValueError(
-                        "the selected Figure Area has no completed selector gesture"
-                    )
-                upstream = resolve(source_key, {*active, current})
-                prior = (
-                    ()
-                    if upstream.transform_spec is None
-                    else upstream.transform_spec.operations
-                )
-                return PulseScanSourceBinding(
-                    upstream.source_kind,
-                    upstream.producer,
-                    DataTransformSpec((*prior, selection)),
-                )
-
-            if current.startswith("@panel/"):
-                raise ValueError(
-                    "Pulse scan y requires event-bearing Figure Area data; "
-                    "Cross/range/Fit outputs are static derived signals"
-                )
+        if not isinstance(selection, DatasetInputSelection):
+            raise TypeError("selection must be DatasetInputSelection")
+        current = selection.signal_key
+        if current in active:
+            raise ValueError("Dataset input Figure Areas form a cycle")
+        topology = self._signal_topology()
+        entry = topology.get(current)
+        if entry is None:
             raise LookupError(
-                f"{current!r} is not an output of a node or Figure in this TaskConsole"
+                f"{current!r} is not an output in this TaskConsole"
             )
+        contract_id = getattr(entry["declaration"], "contract_id", None)
+        if contract_id not in selection.spec.accepted_output_contract_ids:
+            raise ValueError(
+                f"{selection.spec.label} rejects output contract {contract_id!r}"
+            )
+        try:
+            producer = self.resolve_console_producer(current)
+        except LookupError:
+            producer = None
+        if producer is not None:
+            return ResolvedDatasetInput(selection, producer)
 
-        if type(signal_key) is not str or not signal_key:
-            raise TypeError("Pulse scan signal key must be a non-empty str")
-        return resolve(signal_key, set())
+        for card in self.cards:
+            if current != panel_signal_key(card.panel_id, AREA_DATA_OUTPUT):
+                continue
+            source_key = str(card.config.signal or "").strip()
+            if not source_key:
+                raise ValueError("the selected Figure Area has no bound Dataset")
+            _value, area, _cross, _fit = card.frozen_figure_output_state()
+            if area is None:
+                raise ValueError(
+                    "the selected Figure Area has no completed selector gesture"
+                )
+            upstream = self._resolve_dataset_input(
+                DatasetInputSelection(selection.spec, source_key),
+                {*active, current},
+            )
+            prior = (
+                ()
+                if upstream.transform_spec is None
+                else upstream.transform_spec.operations
+            )
+            return ResolvedDatasetInput(
+                selection,
+                upstream.producer,
+                DataTransformSpec((*prior, area)),
+            )
+        raise ValueError(
+            f"{current!r} is not a contract-admitted Dataset producer or Area"
+        )
+
+    def resolve_node_inputs(self, spec, values) -> dict[str, object]:
+        """Resolve every owner-declared input without DefinitionKey dispatch."""
+
+        from zlc_workbench.input_binding import (
+            ArtifactInputSelection,
+            DatasetInputSelection,
+            ResolvedArtifactInput,
+        )
+
+        selections = spec.freeze_input_selections(values)
+        resolved: dict[str, object] = {}
+        for key, selection in selections.items():
+            if isinstance(selection, DatasetInputSelection):
+                resolved[key] = self._resolve_dataset_input(selection, set())
+                continue
+            if not isinstance(selection, ArtifactInputSelection):
+                raise TypeError("owner input freeze returned another selection type")
+            producer = (
+                None
+                if selection.producer_signal_key is None
+                else self.resolve_console_producer(selection.producer_signal_key)
+            )
+            resolved[key] = ResolvedArtifactInput(selection, producer)
+        return resolved
 
     def _node_for_signal(self, name: str):
         """Return the exact running/retained producer; declarations are not Runs."""
@@ -1516,7 +1497,7 @@ class TaskConsole(QtWidgets.QWidget):
         # The Qt owner performs exactly one observation.  Future timer turns
         # continue the same state transition; no GUI callback sleeps or joins a
         # hardware/worker owner.
-        self._data.drain_monitor_processors()
+        self._data.drain_latest_only_processors()
         snapshot = node.poll()
         ready = (
             snapshot is None
@@ -1573,7 +1554,10 @@ class TaskConsole(QtWidgets.QWidget):
         if index >= 0:
             self.tabs.removeTab(index)
         editor.teardown()
-        editor.setParent(None)
+        # ``removeTab`` leaves the page owned by the tab stack until deferred
+        # deletion.  Keep that parent: reparenting a QWidget to ``None`` turns
+        # it into a native top-level between this callback and DeferredDelete.
+        editor.hide()
         editor.deleteLater()
 
     def _on_editor_tab_closed(self, widget) -> None:
@@ -1581,6 +1565,28 @@ class TaskConsole(QtWidgets.QWidget):
         registry.  The permanent Monitor / Logic tabs carry no X, so they never
         arrive here.  A logic node's Edit only closes the TAB -- the node keeps
         running and stays in the Logic list (reopen its Edit from its row)."""
+        logic_entry = next(
+            (
+                (key, editor)
+                for key, editor in self._logic_editors.items()
+                if editor is widget
+            ),
+            None,
+        )
+        if logic_entry is not None:
+            key, editor = logic_entry
+            row = next((item for item in self.logic_nodes if id(item) == key), None)
+            if row is None:
+                raise RuntimeError("Logic editor lost its authored row")
+            try:
+                self._commit_logic_authored_values(row, editor=editor)
+            except Exception as error:
+                message = f"cannot close: invalid form values: {error}"
+                editor.set_status(message, error=True)
+                self.status_strip.show_message(message, severity="error")
+                self.tabs.setCurrentWidget(editor)
+                return
+
         index = self.tabs.indexOf(widget)
         if index >= 0:
             self.tabs.removeTab(index)
@@ -1592,13 +1598,16 @@ class TaskConsole(QtWidgets.QWidget):
                 del self._logic_editors[key]
         if hasattr(widget, "teardown"):
             widget.teardown()
-        widget.setParent(None)
+        # A retired Edit page has no legal top-level state.  Hiding it while the
+        # tab stack remains its owner makes teardown atomic from the operator's
+        # point of view and prevents the historical one-frame popup.
+        widget.hide()
         widget.deleteLater()
 
     def _on_tab_changed(self, _index: int) -> None:
         # ONE rule: when a tab becomes visible, give whatever's inside a chance to refresh its
         # dynamic content -- any widget that implements ``refresh_on_show()`` runs it.  No
-        # special-casing per tab type (PanelEditor / LogicNodeEditor / MeasurementPanel all
+        # special-casing per tab type (PanelEditor / LogicNodeEditor / parameter forms all
         # honour the same hook), so a brand new editor automatically participates by
         # implementing ``refresh_on_show`` without adding a type branch here.
         widget = self.tabs.currentWidget()
@@ -1745,19 +1754,33 @@ class TaskConsole(QtWidgets.QWidget):
     # ------------------------------------------------------------------ actions
     def _add_panel(self) -> None:
         """Header "Add Panel": add either a BLANK plot panel (a plot kind) or a
-        STOPPED logic node (camera / measurement / processor / task)."""
+        STOPPED logic node (measurement / processor / task)."""
         if self._task_locked:
             return
         data = self.kind_combo.currentData()
-        # A node LAYER -> a STOPPED logic node on the Logic tab (camera /
-        # measurement / processor / task).  It publishes nothing until Started.
+        # A node LAYER -> a STOPPED logic node on the Logic tab.  It publishes
+        # nothing until Started.
         if isinstance(data, tuple) and len(data) == 3 and data[0] in LOGIC_KINDS:
             kind, definition_key, title = data
+            if self._catalog is None:
+                raise RuntimeError("TaskConsole has no Logic-node catalog")
+            spec = self._catalog.spec_for_definition(definition_key)
+            if spec is None or spec.kind != kind:
+                raise RuntimeError(
+                    "Add Panel selection differs from the frozen catalog"
+                )
             self._add_logic_node(
                 LogicNodeConfig(
                     kind=kind,
                     definition_key=definition_key,
                     title=str(title),
+                    # A stopped row is already a complete owner-authored draft.
+                    # Dynamic choices (for example an installed Camera role)
+                    # live in this projection and may differ from the domain
+                    # schema's deliberately unavailable base default.  Admit
+                    # them before the row enters signal topology; never let an
+                    # empty GUI placeholder masquerade as a domain request.
+                    values=spec.editor_default_values(),
                 ),
                 focus=True,
             )
@@ -1812,7 +1835,10 @@ class TaskConsole(QtWidgets.QWidget):
             self._signal_topology_changed()
             phases.add("removed")
         if "qt_detached" not in phases:
-            card.setParent(None)
+            # PanelBoard remains the QObject owner through DeferredDelete.
+            # ``setParent(None)`` would briefly promote the removed card to a
+            # top-level QWidget on Windows.
+            card.hide()
             card.deleteLater()
             phases.add("qt_detached")
         if "arranged" not in phases:
@@ -1899,15 +1925,17 @@ class TaskConsole(QtWidgets.QWidget):
         spec = self._spec_for_logic(row.node)
         signal_names_providers = {}
         if spec is not None:
-            signal_names_providers = {
-                parameter.key: (
-                    lambda definition_key=spec.key, parameter_key=parameter.key: (
-                        self._signal_input_names(definition_key, parameter_key)
+            for parameter in spec.input_fields:
+                if str(parameter.kind) != "signal":
+                    continue
+                input_spec = spec.input_spec_for_signal_field(parameter.key)
+                if input_spec is None:
+                    raise RuntimeError(
+                        f"signal field {parameter.key!r} has no typed input spec"
                     )
+                signal_names_providers[parameter.key] = (
+                    lambda declared=input_spec: self._input_signal_names(declared)
                 )
-                for parameter in spec.form.fields
-                if str(parameter.kind) == "signal"
-            }
         editor = LogicNodeEditor(
             title=row.node.title,
             spec=spec,
@@ -1916,7 +1944,6 @@ class TaskConsole(QtWidgets.QWidget):
                 row,
                 signal_names_providers=signal_names_providers,
             ),
-            pulse_template_reader=self._pulse_template_reader,
             parent=self.tabs,
         )
         editor.start_requested.connect(
@@ -1925,6 +1952,9 @@ class TaskConsole(QtWidgets.QWidget):
         editor.stop_requested.connect(
             lambda current=row: self._stop_logic_node(current)
         )
+        # A draft makes the saved layout stale, but stays widget-local until a
+        # semantic commit boundary; typing never rebuilds a node or snapshots data.
+        editor.draft_changed.connect(self._mark_dirty)
         # reflect the live run state on the form (a Started node reopened keeps Stop enabled)
         node = self._logic_nodes.get(id(row))
         editor.set_running(bool(getattr(node, "running", False)))
@@ -1971,7 +2001,7 @@ class TaskConsole(QtWidgets.QWidget):
         self._conflict_start_waits.pop(id(row), None)
         editor = self._logic_editors.get(id(row))
         try:
-            values = editor.collect_values() if editor is not None else dict(row.node.values)
+            values = self._commit_logic_authored_values(row, editor=editor)
         except Exception as error:
             current = self._logic_nodes.get(id(row))
             still_running = bool(
@@ -1997,7 +2027,6 @@ class TaskConsole(QtWidgets.QWidget):
             if editor is not None:
                 editor.set_status(f"build failed: {exc}", error=True)
             return
-        row.node.values = dict(values)            # remember for the next Edit reopen + save
         previous = (
             self._logic_nodes.get(id(row))
             or self._last_node.get(id(row))
@@ -2353,7 +2382,7 @@ class TaskConsole(QtWidgets.QWidget):
             if idx >= 0:
                 self.tabs.removeTab(idx)
             editor.teardown()
-            editor.setParent(None)
+            editor.hide()
             editor.deleteLater()
         self._logic_nodes.pop(id(row), None)
         self._last_node.pop(id(row), None)
@@ -2363,7 +2392,9 @@ class TaskConsole(QtWidgets.QWidget):
             self.logic_nodes.remove(row)
         self._signal_topology_changed()
         self.logic_layout.removeWidget(row)
-        row.setParent(None)
+        # The Logic page owns the retired row until DeferredDelete; there is no
+        # intermediate unparented-widget state.
+        row.hide()
         row.deleteLater()
         if not self.logic_nodes:
             self.logic_hint.show()
@@ -2382,7 +2413,7 @@ class TaskConsole(QtWidgets.QWidget):
         # Admit shared-lane completions before reading node lifecycle.  Source
         # revisions are routed later by ConsoleDataPlane.freeze(); this is only
         # the single owner-side result drain.
-        self._data.drain_monitor_processors()
+        self._data.drain_latest_only_processors()
         for row in self.logic_nodes:
             node = self._logic_nodes.get(id(row))
             if node is None:
@@ -3023,7 +3054,6 @@ def show_task_console(
     catalog_view: object | None = None,
     run_factory=None,
     data_plane=None,
-    pulse_template_reader=None,
     scale: float | None = None,
     window_ratio: float = WINDOW_SCREEN_FRACTION,
     title: str = "TaskConsole@Zou lab",
@@ -3038,7 +3068,7 @@ def show_task_console(
 
     ``catalog_view`` is the catalog seam: a
     :class:`~zlc_workbench.task_console.catalog_bridge.ConsoleCatalogView`
-    projecting the domain DefinitionCatalog into the Add-Panel dropdown -- every
+    projecting the composition root's closed attachment tuple into the Add-Panel dropdown -- every
     entry brings its own parameter form, declared outputs and typed-request
     builder.  Omit it and the dropdown carries only plot kinds.
 
@@ -3056,7 +3086,6 @@ def show_task_console(
     console = TaskConsole(state=state, running_nodes=running_nodes,
                           catalog_view=catalog_view, run_factory=run_factory,
                           data_plane=data_plane,
-                          pulse_template_reader=pulse_template_reader,
                           scale=scale,
                           window_ratio=window_ratio)
     console._on_close = on_close

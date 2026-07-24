@@ -208,6 +208,50 @@ def test_visible_edge_points_map_to_the_last_sample_inside_the_window():
     assert viewport.normalized_bounds_for_selection(selection) == pytest.approx(bounds)
 
 
+def test_full_raster_area_coordinates_are_invariant_under_unbounded_pan():
+    home = _viewport(width=8, height=6)
+    full_bounds = (0.25, 1 / 6, 0.75, 5 / 6)
+    expected = home.coordinate_rectangle_for_full_bounds(full_bounds)
+
+    # Main permits axes background beyond the source during pan.  A standing
+    # Area remains source-relative, while visible-window coordinates follow
+    # the new physical viewport and therefore use a different explicit API.
+    panned = home.panned_by_pixels((10_000.0, -10_000.0), (200, 100))
+    assert any(value < 0.0 or value > 1.0 for value in panned.visible_bounds)
+    assert panned.coordinate_rectangle_for_full_bounds(full_bounds) == pytest.approx(
+        expected
+    )
+    assert panned.coordinate_rectangle_for_visible_bounds(
+        (0.0, 0.0, 1.0, 1.0)
+    ) == pytest.approx(
+        (
+            panned.x_limits[0],
+            panned.y_limits[0],
+            panned.x_limits[1],
+            panned.y_limits[1],
+        )
+    )
+
+    selection = panned.selection_for_normalized_bounds(full_bounds)
+    assert panned.normalized_bounds_for_selection(selection) == pytest.approx(
+        full_bounds
+    )
+
+
+def test_visible_area_drag_intersects_source_in_the_coordinate_owner():
+    viewport = _viewport().panned_by_pixels((100.0, 0.0), (200, 100))
+    assert viewport.visible_bounds == pytest.approx((-0.5, 0.0, 0.5, 1.0))
+
+    # Left-hand background is not a data Area.  A drag crossing the data edge
+    # is retained only for the exact source intersection.
+    assert viewport.clipped_full_bounds_for_visible_bounds(
+        (0.05, 0.2, 0.45, 0.8)
+    ) is None
+    assert viewport.clipped_full_bounds_for_visible_bounds(
+        (0.25, 0.2, 0.75, 0.8)
+    ) == pytest.approx((0.0, 0.2, 0.25, 0.8))
+
+
 def test_centered_zoom_preserves_anchor_clamps_to_home_and_one_cell():
     viewport = _viewport(width=100, height=80, revision=5)
     anchor = (0.25, 0.75)

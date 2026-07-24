@@ -62,7 +62,7 @@ from zlc_frontend.figure import (
     suggest_fit_view,
 )
 from zlc_neutral_atom.artifacts import FitResultRepository
-from zlc_workbench.frozen_raster import FrozenRasterWindow
+from zlc_workbench.data_figure.window import DataFigureWindow
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -408,8 +408,23 @@ def test_public_execution_and_saved_ref_reopen_the_same_selection_transform(
                 application,
                 lambda: draft_window.worker_idle and draft_window.raster_ready,
             )
-            assert isinstance(draft_window, FrozenRasterWindow)
-            assert draft_window._view_family == "encoded"
+            assert isinstance(draft_window, DataFigureWindow)
+            assert draft_window._view_family == "image-overview"
+            assert draft_window._grid_overview is not None
+            assert draft_window._grid_overview.figure.has_fit_overlays
+            region = draft_window._grid_overview.regions[0]
+            draft_window._focus_grid_region(
+                (region.left + region.right) / 2.0,
+                (region.top + region.bottom) / 2.0,
+            )
+            _until(
+                application,
+                lambda: draft_window.worker_idle
+                and draft_window._view_family == "image",
+            )
+            assert draft_window._visible_figure is not None
+            assert draft_window._visible_figure.has_fit_overlays
+            assert draft_window._visible_fit_result_identity is not None
         finally:
             draft_window.close()
             _until(

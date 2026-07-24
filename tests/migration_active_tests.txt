@@ -14,7 +14,7 @@ tests/test_pulse_scan_tick_quantization.py
 tests/test_task_console_start_gate_current.py
 tests/test_task_console_render_hot_path.py
 tests/test_console_run_bridge.py
-tests/test_definition_catalog.py
+tests/test_definition_identity.py
 tests/test_design_charter.py
 tests/test_device_manager_current.py
 tests/test_installation_config_current.py
@@ -69,7 +69,6 @@ tests/test_u03d_unified_figure_fit_workbench.py
 tests/test_u03f_meter_grid_figure.py
 tests/test_u03g_histogram_grid_figure.py
 tests/test_u03h_curve_grid_figure.py
-tests/test_u04_catalog_projection.py
 tests/test_u04_meter_display_owner.py
 tests/test_u04_scan_capacity_refusal.py
 tests/test_u04_settings_popup_anchor.py
@@ -105,6 +104,7 @@ tests/test_z0_import_targets_resolve.py
 tests/test_zlc_calibration_commit.py
 tests/test_zlc_calibration_stream_contracts.py
 tests/test_zlc_camera_adapter_sdk.py
+tests/test_zlc_dcam_camera_adapter.py
 tests/test_zlc_curve_display.py
 tests/test_zlc_data_fit.py
 tests/test_zlc_data_kernel.py

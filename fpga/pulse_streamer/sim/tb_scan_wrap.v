@@ -6,7 +6,7 @@
 // scan_bank_base parity.  Asserts: the engine re-sweeps points 0..N-1 forever with the
 // CORRECT slot each point and NEVER stalls (underflow) at the wrap -- truly seamless.
 module tb_scan_wrap;
-  localparam integer CH=8, EAW=12, TW=32, NS=1, CW=16, DTW=12, BUSC=4, BW=10;
+  localparam integer CH=8, EAW=12, TW=32, NS=1, CW=16, DTW=32, BUSC=4, BW=10;
   localparam integer BANK_SIZE=4, SAW=3;          // SAW = clog2(BANK_SIZE)+1 = 3 (2 banks x 4)
   localparam integer NPTS=10;                      // K = ceil(10/4) = 3 (odd)
   localparam integer KCH=(NPTS+BANK_SIZE-1)/BANK_SIZE;

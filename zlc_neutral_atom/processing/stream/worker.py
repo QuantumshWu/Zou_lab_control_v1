@@ -1,4 +1,4 @@
-"""Synchronous one-to-one operator hosted by one bounded worker thread."""
+"""Synchronous one-to-one operator hosted by one worker thread."""
 
 from __future__ import annotations
 
@@ -174,7 +174,7 @@ class _ProcessorStageOutput:
 
 
 class ExactStreamProcessorWorker:
-    """Consume one exact interval in a bounded live processor chain.
+    """Consume one finite interval in an exact processor chain.
 
     The worker owns no scheduler and no secondary input queue.  One input delivery
     remains unacknowledged until the pass-through-key output has been emitted and
@@ -655,13 +655,7 @@ class ExactStreamProcessorWorker:
             )
         self._ordered_input_refs.update(envelope.ref)
         invocation_payload = envelope.payload
-        started = time.monotonic()
         output_payload = self._bound.operator(invocation_payload, self._bound.config)
-        elapsed = time.monotonic() - started
-        if elapsed > self._bound.operator_deadline_seconds:
-            raise TimeoutError(
-                "trusted synchronous processor exceeded operator_deadline_seconds"
-            )
         self._checkpoint()
         output_trace = TraceContext(
             run_id=envelope.trace.run_id,
@@ -699,15 +693,9 @@ class ExactStreamProcessorWorker:
         )
 
     def _wait_for_eos(self) -> EndOfStream:
-        deadline = min(
-            self._deadline_monotonic,
-            time.monotonic() + self._bound.terminal_wait_seconds,
-        )
         while True:
             self._checkpoint()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("source did not publish a terminal fact within its contract")
+            remaining = self._remaining()
             eos = self._input_stream._await_terminal(min(0.05, remaining))
             if eos is None:
                 continue

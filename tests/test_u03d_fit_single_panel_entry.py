@@ -52,7 +52,7 @@ from zlc_frontend.figure import (
     fit_single_panel_presentation,
     suggest_view,
 )
-from zlc_neutral_atom.readout.sitemap import load_packaged_sitemap_pulse
+from zlc_neutral_atom.logic_nodes.calibration.sitemap import load_packaged_sitemap_pulse
 from zlc_pulse import FrozenScanTable, RepeatRegion, ScanParameter
 
 

@@ -16,7 +16,7 @@ from zlc_neutral_atom.runtime.run import (
     RunSnapshot,
     RunState,
 )
-from zlc_neutral_atom.scan.reference import ScanArtifactRef
+from zlc_neutral_atom.logic_nodes.pulse_scan.reference import ScanArtifactRef
 from zlc_workbench.scan import (
     FinalScanPresentation,
     PreparedScanPanelRun,

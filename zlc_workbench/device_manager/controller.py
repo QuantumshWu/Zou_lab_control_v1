@@ -126,21 +126,16 @@ class DeviceManagerController(QtCore.QObject):
 
     def switch_backend(self, backend: str) -> None:
         self._field_errors.clear()
-        self.editor.switch_backend(str(backend))
+        self.editor.switch_backend(backend)
         self.document_replaced.emit()
 
-    def new_virtual(self) -> None:
-        self._replace_new("virtual")
-        self.status_changed.emit("new virtual installation draft", "info")
+    def replace_new(self, backend: str) -> None:
+        """Start one new draft for a domain-declared backend."""
 
-    def new_remote_pulse(self) -> None:
-        self._replace_new("remote_pulse")
-        self.status_changed.emit("new remote pulse installation draft", "info")
-
-    def _replace_new(self, backend: str) -> None:
         self._field_errors.clear()
         self.editor.replace_new(backend)
         self.document_replaced.emit()
+        self.status_changed.emit("new installation draft", "info")
 
     def load_file(self, path: str | Path) -> None:
         document = load_installation_config(path)

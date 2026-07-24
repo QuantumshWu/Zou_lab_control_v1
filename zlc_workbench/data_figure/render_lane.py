@@ -29,7 +29,7 @@ from zlc_frontend import (
     validate_fit_authoring_options,
 )
 from zlc_frontend.curve_display import CurveDisplayState
-from zlc_frontend.display_range import RelimMode, validated_display_range
+from zlc_frontend.display_range import validated_display_range
 from zlc_frontend.encoded_raster import EncodedRasterDocument, EncodedRasterPage
 from zlc_frontend.fit_curve_projection import CurveFitOverlayPlan, materialize_curve_fit_overlay_plan
 from zlc_frontend.figure import EvaluatedImage, ViewIntent
@@ -62,7 +62,6 @@ from .projection import (
     _payload_intent,
     _grid_state_intent,
     _state_intent,
-    _require_not_cancelled,
     _validate_rendered_authored_payload,
     _typed_join_digest,
 )
@@ -71,6 +70,10 @@ _FIT_WORK_EXECUTOR = ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="zlc-data-figure-fit",
 )
+
+def _require_not_cancelled(cancelled: threading.Event | None) -> None:
+    if cancelled is not None and cancelled.is_set():
+        raise CancelledError()
 
 def _encoded_figure(
     figure: DataFigure,
@@ -286,15 +289,6 @@ def _execute_fit_draft(
         # generation or all later Fit submissions deadlock behind a hidden draft.
         authority.discard(draft)
         raise
-
-def _reload_fit_result(
-    reload_result,
-    handle: object,
-) -> FitResultBatch:
-    result = reload_result(handle)
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("saved Fit reload returned another result type")
-    return result
 
 def _render_typed_front(
     figure: DataFigure,

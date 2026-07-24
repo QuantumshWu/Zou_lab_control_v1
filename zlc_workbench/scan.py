@@ -21,8 +21,8 @@ from zlc_neutral_atom.runtime.run import (
     RunSnapshot,
     RunState,
 )
-from zlc_neutral_atom.scan.reference import ScanArtifactRef
-from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewPort
+from zlc_neutral_atom.logic_nodes.pulse_scan.reference import ScanArtifactRef
+from zlc_neutral_atom.runtime.preview import ExactDatasetPreviewPort
 from zlc_frontend.render import BoardPresenter
 from zlc_frontend.curve_display import CurveDisplayState
 from zlc_frontend.encoded_raster import png_raster_size

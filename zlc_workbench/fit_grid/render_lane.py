@@ -29,7 +29,7 @@ from zlc_frontend.image_display import (
     resolve_image_color_limits,
 )
 from zlc_frontend.plot_layout import panel_display_size
-from zlc_neutral_atom.fit_reference import FitResultArtifactRef
+from zlc_neutral_atom.artifacts.fit_reference import FitResultArtifactRef
 from zlc_workbench.window_runtime import stage_and_replace_export
 
 from .projection import (

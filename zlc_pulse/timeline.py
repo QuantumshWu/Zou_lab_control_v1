@@ -267,7 +267,50 @@ def build_pulse_timeline(
     if artifact.target_ir.scan_points or artifact.target_ir.repeat_forever:
         raise ValueError("timeline preview requires a finite static/reference TargetIR")
 
-    target_ir = _authored_projection_ir(document, artifact)
+    return build_authored_pulse_timeline(
+        document,
+        artifact.target_ir,
+        execution_form=artifact.execution_form,
+        reference_label=reference_label,
+    )
+
+
+def build_authored_pulse_timeline(
+    document: PulseDocument,
+    target_ir: TargetIR,
+    *,
+    execution_form: PulseExecutionForm,
+    reference_label: str,
+) -> PulseTimelineDocument:
+    """Project an already-compiled logical TargetIR for authoring.
+
+    Unlike :func:`build_pulse_timeline`, this boundary requires no wire image or
+    deployed streamer geometry.  It is the Offline editor path: the pulse
+    compiler remains authoritative for physical timing, while frozen hardware
+    admission belongs exclusively to artifact packing and Run preflight.
+    """
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    if not isinstance(target_ir, TargetIR):
+        raise TypeError("target_ir must be TargetIR")
+    if not isinstance(execution_form, PulseExecutionForm):
+        raise TypeError("execution_form must be PulseExecutionForm")
+    if execution_form not in (
+        PulseExecutionForm.STATIC_ONCE,
+        PulseExecutionForm.STATIC_REFERENCE_POINT,
+    ):
+        raise ValueError("authored timeline requires a finite static/reference compile")
+    if target_ir.scan_points or target_ir.repeat_forever:
+        raise ValueError("authored timeline requires a finite static/reference TargetIR")
+    if target_ir.target_abi_fingerprint != document.target.abi_fingerprint:
+        raise ValueError("TargetIR belongs to another PulseTarget")
+
+    target_ir = _authored_projection_ir(
+        document,
+        target_ir,
+        execution_form,
+    )
     logical_duration = _authored_period_starts(document)[-1]
     compiled_terminal = physical_digital_playback_terminal_tick(target_ir)
     if compiled_terminal != logical_duration:
@@ -344,10 +387,11 @@ def build_pulse_timeline(
 
 def _authored_projection_ir(
     document: PulseDocument,
-    artifact: CompiledPulseArtifact,
+    target_ir: TargetIR,
+    execution_form: PulseExecutionForm,
 ) -> TargetIR:
     if document.repeat is None:
-        return artifact.target_ir
+        return target_ir
     # Import at the projection seam so compiler.py remains independent of the
     # renderer-neutral value types exported by this module.
     from .compiler import compile_pulse_document
@@ -355,8 +399,8 @@ def _authored_projection_ir(
     authored = replace(document, repeat=None)
     return compile_pulse_document(
         authored,
-        clock_hz=artifact.target_ir.clock_hz,
-        execution_form=artifact.execution_form,
+        clock_hz=target_ir.clock_hz,
+        execution_form=execution_form,
         live_target=document.target,
     )
 
@@ -630,5 +674,6 @@ __all__ = [
     "PulseTimelineDocument",
     "PulseTimelineRow",
     "PulseTimelineSegment",
+    "build_authored_pulse_timeline",
     "build_pulse_timeline",
 ]

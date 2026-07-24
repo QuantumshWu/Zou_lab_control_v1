@@ -11,10 +11,15 @@ from zlc_frontend.scan_preview import (
     ScanDisplayIntent,
     build_occupancy_scan_curve,
 )
-from zlc_neutral_atom.scan import OccupancyScanRequest, ScanRequest
-from zlc_neutral_atom.scan.application import PreparedExactScan
-from zlc_neutral_atom.scan.contracts import AutonomousScanSlotProgram
-from zlc_neutral_atom.scan.reference import ScanArtifactRef
+from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import (
+    OccupancyScanRequest,
+    ScanRequest,
+)
+from zlc_neutral_atom.logic_nodes.pulse_scan.application import PreparedExactScan
+from zlc_neutral_atom.logic_nodes.pulse_scan.contracts import (
+    AutonomousScanSlotProgram,
+)
+from zlc_neutral_atom.logic_nodes.pulse_scan.reference import ScanArtifactRef
 from zlc_storage import canonical_digest
 from zlc_workbench.progressive_scan import ProgressiveScanSpec
 from zlc_workbench.scan import FinalScanPresentation, PreparedScanPanelRun

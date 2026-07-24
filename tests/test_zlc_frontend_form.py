@@ -160,6 +160,9 @@ def test_closed_registry_has_one_complete_atomic_handler_per_kind() -> None:
         "number",
         "choice",
         "bool",
+        "axis_range",
+        "path",
+        "signal",
     }
     assert FormWidgetHandler.__abstractmethods__ == {
         "normalize",

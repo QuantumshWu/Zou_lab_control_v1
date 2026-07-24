@@ -11,6 +11,8 @@ from typing import Mapping, Sequence, TypeVar
 from uuid import uuid4
 
 from .document import (
+    DEFAULT_PERIOD_DURATION,
+    DEFAULT_TIME_UNIT,
     FIELD_DAC,
     FIELD_DELAY,
     FIELD_DURATION,
@@ -228,7 +230,7 @@ def cycle_field_binding(
             created = set_output_delay(
                 working,
                 field.port,
-                OutputDelay(field.port, 0, "ns"),
+                OutputDelay(field.port, 0, DEFAULT_TIME_UNIT),
             )
             working = created.document
         _value, unit = working.field_value(field)
@@ -284,8 +286,8 @@ def new_pulse_document(
     *,
     time_step_ns: int | float,
     name: str = "Untitled pulse",
-    duration: int | float = 1000,
-    unit: str = "ns",
+    duration: int | float = DEFAULT_PERIOD_DURATION,
+    unit: str = DEFAULT_TIME_UNIT,
 ) -> PulseDocument:
     """Create the one-period, all-safe document used by a new editor session."""
 
@@ -1028,8 +1030,8 @@ def _new_period_id(document: PulseDocument) -> str:
 def new_period(
     document: PulseDocument,
     *,
-    duration: int | float = 1000,
-    unit: str = "ns",
+    duration: int | float = DEFAULT_PERIOD_DURATION,
+    unit: str = DEFAULT_TIME_UNIT,
     name: str = "",
     states: Sequence[int] | None = None,
     analog_steps: Sequence[AnalogStep] = (),

@@ -11,7 +11,7 @@ import pytest
 
 from conftest import pulse_backend_completion_for
 
-from zlc_neutral_atom.bootstrap._sequencer_endpoint import (
+from zlc_neutral_atom.devices.sequencer.remote_pulse import (
     RemotePulseExecutionEndpoint,
 )
 from zlc_neutral_atom.runtime.ports import (
@@ -24,7 +24,7 @@ from zlc_neutral_atom.runtime.resources import (
     PhysicalDeviceIdentity,
     ResourceKey,
 )
-from zlc_neutral_atom.timing.pulse import (
+from zlc_neutral_atom.devices.sequencer.port import (
     CompletePulseCommand,
     ContinuousPulseExecutionRequest,
     FinitePulseExecutionRequest,

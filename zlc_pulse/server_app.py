@@ -15,6 +15,7 @@ from fpga.pulse_streamer.host.image import (
     StreamerParams,
     default_clock_hz,
     default_params,
+    load_streamer_config,
 )
 
 from .artifact import CompiledPulseArtifact
@@ -270,6 +271,35 @@ def build_server_runtime(
     return runtime
 
 
+def load_deployed_streamer_config(
+    path: str | Path | None = None,
+) -> tuple[StreamerParams, float, Path]:
+    """Load the explicit frozen deployment geometry without fallback.
+
+    Offline authoring and resource estimation may use the image owner's
+    documented defaults.  A process about to connect to physical hardware may
+    not: the exact config file and every deployed field must have loaded
+    successfully before the independent register-layout handshake runs.
+    """
+
+    config = load_streamer_config(path)
+    source = config["source"]
+    warnings = tuple(str(item) for item in config["warnings"])
+    if source is None:
+        raise FileNotFoundError(
+            "deployed streamer_config.json was not found; refusing hardware startup"
+        )
+    if warnings:
+        raise ValueError(
+            "deployed streamer config is not exact: " + "; ".join(warnings)
+        )
+    params = config["params"]
+    if not isinstance(params, StreamerParams):
+        raise TypeError("streamer config returned another geometry type")
+    clock_hz = float(config["clock_hz"])
+    return params, clock_hz, Path(source).resolve()
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the current-only pulse execution server")
     parser.add_argument("--target", required=True, help="canonical zlc_pulse.PulseTarget file")
@@ -301,6 +331,8 @@ def main(argv: list[str] | None = None) -> int:
     arguments = build_arg_parser().parse_args(argv)
     target = load_pulse_target(arguments.target)
     manifest = pulse_target_manifest_from_xdc(target, arguments.xdc)
+    params, clock_hz, config_path = load_deployed_streamer_config()
+    logging.info("deployment geometry loaded from %s", config_path)
     build_server_runtime(
         manifest,
         backend=arguments.backend,
@@ -309,6 +341,8 @@ def main(argv: list[str] | None = None) -> int:
         port=arguments.port,
         uart_port=arguments.uart_port,
         uart_baud=arguments.uart_baud,
+        params=params,
+        clock_hz=clock_hz,
         start=True,
     )
     return 0
@@ -325,6 +359,7 @@ __all__ = [
     "build_arg_parser",
     "build_server_runtime",
     "build_service_for_session",
+    "load_deployed_streamer_config",
     "main",
     "open_deployed_session",
     "validate_deployed_target",

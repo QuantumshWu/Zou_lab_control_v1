@@ -12,7 +12,13 @@ from zlc_neutral_atom.installation_config import (
     VirtualInstallationConfig,
     load_installation_config,
     save_installation_config,
+    default_installation_authoring_schema,
 )
+from zlc_workbench.device_manager.editor_session import (
+    DeviceConfigEditorSession,
+    form_spec,
+)
+from zlc_workbench.form_projection import project_authoring_form
 
 
 def test_current_configs_round_trip_through_canonical_json(tmp_path):
@@ -95,6 +101,67 @@ def test_field_contracts_reject_non_current_values():
     }
     with pytest.raises(ValueError, match="exactly"):
         InstallationConfigDocument.from_dict(extra_parameter)
+
+
+def test_backend_owner_declares_device_manager_form_semantics():
+    virtual_schema = default_installation_authoring_schema("virtual")
+    assert form_spec("virtual") == project_authoring_form(virtual_schema)
+    assert virtual_schema.keys == ("seed",)
+    seed = virtual_schema.fields[0]
+    assert (
+        seed.kind,
+        seed.label,
+        seed.default,
+        seed.required,
+        seed.unit,
+        seed.minimum,
+        seed.maximum,
+        seed.allow_blank,
+    ) == ("int", "Random seed", 7, False, "", 0, None, True)
+    assert seed.description
+
+    remote_schema = default_installation_authoring_schema("remote_pulse")
+    assert form_spec("remote_pulse") == project_authoring_form(remote_schema)
+    assert remote_schema.keys == (
+        "host",
+        "port",
+        "transport_timeout_seconds",
+    )
+    host, port, timeout = remote_schema.fields
+    assert (host.kind, host.default, host.required) == ("text", "", True)
+    assert (port.kind, port.default, port.minimum, port.maximum) == (
+        "int",
+        18861,
+        1,
+        65535,
+    )
+    assert (
+        timeout.kind,
+        timeout.default,
+        timeout.required,
+        timeout.unit,
+        timeout.maximum,
+    ) == ("float", 120.0, True, "s", None)
+    assert timeout.minimum == float.fromhex("0x0.0000000000001p-1022")
+    assert all(field.description for field in remote_schema.fields)
+
+    current = InstallationConfigDocument.remote_pulse(
+        host="pulse-host",
+        port=18862,
+        transport_timeout_seconds=45.5,
+    )
+    assert form_spec(current).default_values() == {
+        "host": "pulse-host",
+        "port": 18862,
+        "transport_timeout_seconds": 45.5,
+    }
+    editor = DeviceConfigEditorSession(current)
+    editor.set_field("port", 18863)
+    assert editor.candidate() == InstallationConfigDocument.remote_pulse(
+        host="pulse-host",
+        port=18863,
+        transport_timeout_seconds=45.5,
+    )
 
 
 def test_expected_digest_is_a_real_compare_and_swap(tmp_path):

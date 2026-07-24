@@ -15,7 +15,7 @@ import sys
 from types import SimpleNamespace
 
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
-from zlc_neutral_atom.scan import ScanArtifactRef
+from zlc_neutral_atom.logic_nodes.pulse_scan import ScanArtifactRef
 from zlc_workbench.task_console.run_bridge import ConsoleRunNode
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -65,10 +65,13 @@ def test_successful_run_result_is_the_only_final_artifact_authority() -> None:
         key=SimpleNamespace(stable_definition_id="final-result"),
         name="Pulse scan",
         build_request=lambda values: values,
+        outputs_for=lambda request: (),
     )
     node = ConsoleRunNode(
         spec,
         {},
+        instance_id="final-result-instance",
+        instance_label="Pulse scan",
         prepare=lambda request: request,
         request_owner_wake=lambda: None,
     )

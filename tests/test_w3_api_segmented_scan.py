@@ -16,18 +16,18 @@ import numpy as np
 import pytest
 
 import Zou_lab_control.notebook as zlc
-from fpga.pulse_streamer.host.image import DEFAULT_CLOCK_HZ
+from fpga.pulse_streamer.host.image import DEFAULT_CONFIG_PATH, default_clock_hz
 from zlc_data import ComponentValidity
-from zlc_neutral_atom.bootstrap._sequencer_endpoint import (
+from zlc_neutral_atom.devices.simulation.sequencer_endpoint import (
     VirtualSequencerExecutionEndpoint,
 )
-from zlc_neutral_atom.bootstrap._virtual_hardware import (
+from zlc_neutral_atom.devices.simulation.apparatus import (
     VirtualAtomArray,
     VirtualCamera,
     VirtualMotFrameSource,
     VirtualSequencer,
 )
-from zlc_neutral_atom.readout.sitemap import load_packaged_sitemap_pulse
+from zlc_neutral_atom.logic_nodes.calibration.sitemap import load_packaged_sitemap_pulse
 from zlc_neutral_atom.runtime.ports import (
     DeviceBroker,
     SafetyOperation,
@@ -39,7 +39,7 @@ from zlc_neutral_atom.runtime.resources import (
     ResourceKey,
 )
 from zlc_neutral_atom.runtime.run import RunFailed
-from zlc_neutral_atom.scan import (
+from zlc_neutral_atom.logic_nodes.pulse_scan import (
     ApiSegmentTable,
     ApiSegmentedScanExecution,
     ApiSlotSegmentedProgram,
@@ -47,14 +47,14 @@ from zlc_neutral_atom.scan import (
     pulse_scan_program_from_tree,
     pulse_scan_program_to_tree,
 )
-from zlc_neutral_atom.scan.repository import ScanRepository
-from zlc_neutral_atom.scan.lineage import (
+from zlc_neutral_atom.logic_nodes.pulse_scan.repository import ScanRepository
+from zlc_neutral_atom.logic_nodes.pulse_scan.lineage import (
     api_segmented_cell_schedule,
     execution_compiled_artifacts,
     pulse_scan_execution_from_tree,
     pulse_scan_execution_to_tree,
 )
-from zlc_neutral_atom.timing.pulse import (
+from zlc_neutral_atom.devices.sequencer.port import (
     CompletePulseCommand,
     FinitePulseExecutionRequest,
     FirePulseCommand,
@@ -69,14 +69,16 @@ from zlc_pulse import (
     RepeatRegion,
     ScanParameter,
     compile_pulse_artifact,
+    pulse_target_manifest_from_lanes,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CLOCK_HZ = default_clock_hz(DEFAULT_CONFIG_PATH)
 _SEGMENTATION_RATIONALE = (
     "Each point is a physically independent finite exposure; host gaps are allowed."
 )
-from zlc_neutral_atom.timing.segmented import (
+from zlc_neutral_atom.logic_nodes.pulse_scan.segmented import (
     _host_boundary_delay_seconds,
     _wait_for_host_boundary,
 )
@@ -184,10 +186,13 @@ def _bind_endpoint(program: ApiSlotSegmentedProgram):
     document = program.resolved_point_documents[0]
     sequencer = VirtualSequencer(
         document.target,
-        clock_hz=DEFAULT_CLOCK_HZ,
+        clock_hz=CLOCK_HZ,
         sleep_scale=0,
     )
-    endpoint = VirtualSequencerExecutionEndpoint(sequencer)
+    endpoint = VirtualSequencerExecutionEndpoint(
+        sequencer,
+        pulse_target_manifest_from_lanes(document.target),
+    )
     broker = DeviceBroker()
     identity = PhysicalDeviceIdentity(
         "w3f-endpoint-sequencer",
@@ -217,7 +222,7 @@ def _bind_endpoint(program: ApiSlotSegmentedProgram):
     capability = broker.verify_capability(binding).snapshot
     artifact = compile_pulse_artifact(
         document,
-        clock_hz=DEFAULT_CLOCK_HZ,
+        clock_hz=CLOCK_HZ,
         execution_form=PulseExecutionForm.STATIC_ONCE,
         trigger_channels=("ch11",),
         live_target=document.target,
@@ -233,7 +238,7 @@ def _camera_with_one_trigger_source(source, *, timeout: float = 0.05):
     atoms.iter_frames = source
     sequencer = VirtualSequencer(
         _api_document().target,
-        clock_hz=DEFAULT_CLOCK_HZ,
+        clock_hz=CLOCK_HZ,
         sleep_scale=0,
     )
     camera = VirtualCamera(
@@ -251,7 +256,7 @@ def _camera_with_one_trigger_source(source, *, timeout: float = 0.05):
         False,
         trigger_channels=("ch11",),
     )
-    camera.arm(1, source_group_sizes=(1,), max_inflight_frames=1)
+    camera.arm(1, source_group_sizes=(1,), buffer_frame_count=1)
     camera._on_fire(playback)
     return camera, sequencer
 
@@ -302,7 +307,7 @@ def test_virtual_camera_consumes_frozen_groups_across_multiple_fire_calls():
     atoms.iter_frames = source
     sequencer = VirtualSequencer(
         _api_document().target,
-        clock_hz=DEFAULT_CLOCK_HZ,
+        clock_hz=CLOCK_HZ,
         sleep_scale=0,
     )
     camera = VirtualCamera(
@@ -312,7 +317,7 @@ def test_virtual_camera_consumes_frozen_groups_across_multiple_fire_calls():
         exposure=1e-6,
     )
     try:
-        camera.arm(2, source_group_sizes=(1, 1), max_inflight_frames=2)
+        camera.arm(2, source_group_sizes=(1, 1), buffer_frame_count=2)
         for _index in range(2):
             camera._on_fire(_camera_playback(1))
             assert len(camera.read_frame_records(1, timeout=0.5, exact=True)) == 1
@@ -364,7 +369,7 @@ def test_virtual_camera_rejects_split_or_mismatched_frozen_groups():
     atoms.iter_frames = source
     sequencer = VirtualSequencer(
         _api_document().target,
-        clock_hz=DEFAULT_CLOCK_HZ,
+        clock_hz=CLOCK_HZ,
         sleep_scale=0,
     )
     camera = VirtualCamera(
@@ -374,12 +379,12 @@ def test_virtual_camera_rejects_split_or_mismatched_frozen_groups():
         exposure=1e-6,
     )
     try:
-        camera.arm(2, source_group_sizes=(2,), max_inflight_frames=2)
+        camera.arm(2, source_group_sizes=(2,), buffer_frame_count=2)
         with pytest.raises(RuntimeError, match="splits a frozen camera source group"):
             camera._on_fire(_camera_playback(1))
         camera.finish_record_capture()
 
-        camera.arm(2, source_group_sizes=(2,), max_inflight_frames=2)
+        camera.arm(2, source_group_sizes=(2,), buffer_frame_count=2)
         groups = (
             PlaybackTriggerGroup(0, 0, (("ch11", 1),)),
             PlaybackTriggerGroup(1, 0, (("ch11", 1),)),
@@ -581,7 +586,7 @@ def test_camera_boundary_delay_is_derived_before_fire():
 
 
 def _run_api_segmented_virtual_product(workspace: Path) -> None:
-    from zlc_neutral_atom.bootstrap._installation import _InstallationRuntime
+    from zlc_neutral_atom.installation_runtime import _InstallationRuntime
 
     program = _program()
     run_names: list[str] = []
@@ -633,7 +638,6 @@ def _run_api_segmented_virtual_product(workspace: Path) -> None:
                 program.document,
                 api_table=program.table,
                 segmentation_rationale=program.segmentation_rationale,
-                timeout_seconds=20.0,
             )
             reference = exp.scan(request)
             artifact = exp.readout.load_scan(reference)
@@ -679,13 +683,6 @@ def _run_api_segmented_virtual_product(workspace: Path) -> None:
             assert camera.arm_spec.digest == camera.terminal.capture_spec_fingerprint
             assert camera.capability.fingerprint == camera.terminal.capability_fingerprint
             camera.validate_dataset_provenance(artifact.provenance)
-            with pytest.raises(ValueError, match="pulse terminal acknowledgement"):
-                replace(
-                    artifact.execution.segments[0].evidence.terminal,
-                    session_id="x" * 9_000,
-                )
-            with pytest.raises(ValueError, match="capture terminal acknowledgement"):
-                replace(camera.terminal, session_id="x" * 5_000)
 
             execution_tree = pulse_scan_execution_to_tree(artifact.execution)
             assert pulse_scan_execution_from_tree(
@@ -763,7 +760,6 @@ def _run_api_segmented_virtual_product(workspace: Path) -> None:
                 exp.readout.scan_request(
                     program.document,
                     api_values=autonomous_values,
-                    timeout_seconds=20.0,
                 )
             )
             autonomous = exp.readout.load_scan(autonomous_ref)
@@ -779,15 +775,11 @@ def _run_api_segmented_virtual_product(workspace: Path) -> None:
                 api_table=program.table,
                 segmentation_rationale=program.segmentation_rationale,
                 calibration_ref=calibration_ref,
-                timeout_seconds=20.0,
             )
-            from Zou_lab_control.notebook.facade import (
-                _prepare_occupancy_scan_for_workbench,
-            )
-            from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewSpec
+            from zlc_neutral_atom.runtime.preview import ExactDatasetPreviewSpec
             from zlc_workbench.progressive_scan import ExactDatasetLiveSlot
 
-            rejected = _prepare_occupancy_scan_for_workbench(exp, occupancy_request)
+            rejected = exp.readout.prepare_occupancy_scan(occupancy_request)
             preview = ExactDatasetLiveSlot(
                 ExactDatasetPreviewSpec(
                     rejected.source_schema.fingerprint,

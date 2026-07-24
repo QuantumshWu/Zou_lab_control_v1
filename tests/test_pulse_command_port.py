@@ -11,7 +11,7 @@ from Zou_lab_control.workbench import (
     open_pulse_workbench,
 )
 from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.pulse_application import (
+from zlc_neutral_atom.devices.sequencer.application import (
     PulseRunRequest,
     PulseTargetDescriptor,
 )

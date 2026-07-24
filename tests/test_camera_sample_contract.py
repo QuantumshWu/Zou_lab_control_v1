@@ -24,7 +24,7 @@ from zlc_data import (
     ValuePayloadContract,
     ValueSchema,
 )
-from zlc_neutral_atom.acquisition.camera import (
+from zlc_neutral_atom.devices.camera.contract import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
     CameraAcquisitionMode,
     CameraCaptureSpec,
@@ -36,14 +36,16 @@ from zlc_neutral_atom.acquisition.camera import (
     decode_camera_capture_spec,
     freeze_camera_capture_spec,
 )
-from zlc_neutral_atom.runtime.capture import (
-    CameraCapabilityEvidence,
+from zlc_neutral_atom.logic_nodes.camera_capture.session import (
     CameraCaptureContract,
     CameraCaptureProvenance,
-    CameraPhysicalFacts,
-    CaptureCapabilitySnapshot,
 )
-from zlc_neutral_atom.readout.contracts import (
+from zlc_neutral_atom.devices.camera.capture_port import CaptureCapabilitySnapshot
+from zlc_neutral_atom.devices.camera.contract import (
+    CameraCapabilityEvidence,
+    CameraPhysicalFacts,
+)
+from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureDescriptor,
     ReadoutBindingKey,
 )
@@ -57,11 +59,8 @@ from zlc_neutral_atom.runtime.resources import (
     DeviceIdentityEvidenceKind,
     PhysicalDeviceIdentity,
 )
-from zlc_neutral_atom.runtime.streams import (
-    ProducerFlowControl,
-    StreamId,
-)
-from zlc_neutral_atom.bootstrap._camera_endpoint import (
+from zlc_neutral_atom.runtime.streams import StreamId
+from zlc_neutral_atom.logic_nodes.camera_measurement.binding import (
     CameraCaptureBindingRequest,
     _source_group_sizes,
 )
@@ -127,7 +126,6 @@ def test_camera_source_groups_come_only_from_the_frozen_cell_schedule() -> None:
         scalar_layout,
         DatasetCellSchedule.from_cells(scalar_schema, scalar_cells),
         CameraAcquisitionMode.EXTERNAL_TRIGGERED,
-        0,
     )
     assert _source_group_sizes(scalar_request, scalar_schema) == (1,) * 6
 
@@ -151,7 +149,6 @@ def test_camera_source_groups_come_only_from_the_frozen_cell_schedule() -> None:
         layout,
         DatasetCellSchedule.from_cells(schema, cells),
         CameraAcquisitionMode.EXTERNAL_TRIGGERED,
-        0,
     )
     assert _source_group_sizes(request, schema) == (2,) * 6
 
@@ -327,8 +324,6 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         source_id="camera",
         payload_contract_fingerprint=payload_contract.fingerprint,
         capture_spec_owner_fingerprint=CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
-        flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
-        max_source_burst_events=2,
         max_blocking_call_seconds=1.0,
         physical_facts=physical_facts,
     )
@@ -379,7 +374,6 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
             DatasetCellSchedule.from_cells(dataset_schema, cells),
         ),
         capability=capability,
-        required_consumer_lag_events=0,
         camera_provenance=CameraCaptureProvenance(
             descriptor,
             ReadoutBindingKey("camera"),
@@ -395,4 +389,3 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
     assert projected.values.shape == (3, 4)
     assert np.array_equal(projected.values, sample.image.values)
     assert contract.total_events == 4
-    assert contract.max_inflight_events == 2

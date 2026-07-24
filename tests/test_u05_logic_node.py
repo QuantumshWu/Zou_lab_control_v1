@@ -85,7 +85,7 @@ def test_record_round_trip_preserves_three_distinct_identities() -> None:
 def test_unknown_kind_and_noncanonical_record_are_rejected() -> None:
     with pytest.raises(ValueError):
         _record(kind="bogus")
-    assert LOGIC_KINDS == ("camera", "measurement", "processor", "task")
+    assert LOGIC_KINDS == ("measurement", "processor", "task")
     payload = _record().to_dict()
     payload["title"] = " Analysis #1 "
     with pytest.raises(ValueError, match="canonical"):

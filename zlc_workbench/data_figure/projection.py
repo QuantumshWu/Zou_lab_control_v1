@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from concurrent.futures import CancelledError
 from dataclasses import dataclass
 import math
-import threading
 
-from zlc_data import AxisId, FitResultBatch, FitSpec, Selection, dataset_revision_ref_to_tree
+from zlc_data import AxisId, FitResultBatch, Selection, dataset_revision_ref_to_tree
 from zlc_frontend import (
     BoardFrame,
     CurvePanelPayload,
@@ -52,7 +50,6 @@ from zlc_frontend.image_display import (
     image_display_from_form,
 )
 from zlc_frontend.image_view import image_viewport_for_evaluated_image
-from zlc_frontend.selector import PanelInteractionOrigin
 from zlc_storage import canonical_digest, nonnegative_integer
 
 _DEFAULT_FIT_TIMEOUT_SECONDS = 30.0
@@ -70,10 +67,6 @@ _TYPED_JOIN_SCHEMA_DIGEST = canonical_digest(
     }
 )
 
-
-def _require_not_cancelled(cancelled: threading.Event | None) -> None:
-    if cancelled is not None and cancelled.is_set():
-        raise CancelledError()
 
 def _figure_summary(figure: DataFigure) -> str:
     document = figure.document
@@ -151,8 +144,6 @@ def _classify_typed_grid(
 
     if not isinstance(figure, DataFigure):
         raise TypeError("figure must be DataFigure")
-    if figure.has_fit_overlays:
-        return None, None, "multi-cell typed display does not accept fit overlays"
     if (
         len(figure.document.layers) != 1
         or len(figure.evaluated.layers) != 1
@@ -168,6 +159,21 @@ def _classify_typed_grid(
     }.get(intent)
     if data_type is None:
         return None, None, "figure intent has no current typed grid consumer"
+    if figure.has_fit_overlays:
+        if intent not in (ViewIntent.IMAGE, ViewIntent.CURVE):
+            return None, None, (
+                "typed fit grids require IMAGE or CURVE intent"
+            )
+        fit_results = tuple(figure.fit_results.values())
+        if len(fit_results) != 1:
+            return None, None, "typed fit grid requires one exact layer result"
+        if (
+            intent is ViewIntent.IMAGE
+            and fit_results[0].spec.model_id != "radial_gaussian_center"
+        ):
+            return None, None, (
+                "typed IMAGE fit grid requires radial_gaussian_center"
+            )
     cells = figure.evaluated.layers[0].cells
     if len(cells) <= 1:
         return None, None, "typed grid requires more than one logical panel"
@@ -421,17 +427,6 @@ class _FitSaveReceipt:
             raise TypeError(
                 "Fit save receipt reloaded_result must be FitResultBatch or None"
             )
-
-@dataclass(frozen=True, slots=True)
-class _FitSelectionCandidate:
-    origin: PanelInteractionOrigin
-    selection: Selection
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.origin, PanelInteractionOrigin):
-            raise TypeError("fit selection origin must be PanelInteractionOrigin")
-        if not isinstance(self.selection, Selection):
-            raise TypeError("fit selection candidate must be Selection")
 
 @dataclass(frozen=True, slots=True)
 class _FitOverlayRequest:
@@ -780,18 +775,6 @@ def _build_typed_front_contract(
     # cross-front CAS compares only the stable component.
     identity = (stable_identity, stamp.join_key_digest)
     return identity, exact_data
-
-def _typed_front_contract(
-    front: _TypedFigureFront,
-) -> tuple[tuple[object, ...], tuple[object, ...]]:
-    """Rebuild the compact token from the payload actually being presented."""
-
-    if not isinstance(front, _TypedFigureFront):
-        raise TypeError("front must be _TypedFigureFront")
-    return _build_typed_front_contract(
-        front.intent,
-        front.frame,
-    )
 
 def _same_exact_data_owners(
     left: tuple[object, ...],

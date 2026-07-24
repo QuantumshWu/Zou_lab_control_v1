@@ -1,4 +1,4 @@
-"""The logic-node parameter editor: a MeasurementPanel wrapped with node identity chrome.
+"""The logic-node parameter editor wrapped with node identity chrome.
 
 Pure Qt, per the placement axiom.
 """
@@ -14,7 +14,7 @@ from zlc_frontend.qt_widgets import (
     GREY,
     scaled_px,
 )
-from .measurement_panel import MeasurementPanel
+from .logic_node_parameter_panel import LogicNodeParameterPanel
 from zlc_frontend.qt_widgets import FormRuntimeContext
 
 __all__ = ["LogicNodeEditor"]
@@ -25,7 +25,7 @@ class LogicNodeEditor(QtWidgets.QWidget):
     Stop + a status line.  NO curve fit -- fitting a curve is a plotter concern (add
     a Plot panel on the Monitor board pointed at the signals this node publishes).
 
-    The param form reuses :class:`MeasurementPanel` (single-spec).  Each stable
+    The param form reuses :class:`LogicNodeParameterPanel` (single-spec).  Each stable
     DefinitionKey resolves to one catalog spec and form, so the same form engine
     and Start/Stop signals drive every logic kind.  The
     Camera Measurement uses the same path for camera role, frames-per-cycle and
@@ -34,6 +34,7 @@ class LogicNodeEditor(QtWidgets.QWidget):
 
     start_requested = QtCore.pyqtSignal()
     stop_requested = QtCore.pyqtSignal()
+    draft_changed = QtCore.pyqtSignal()
 
     def __init__(
         self,
@@ -42,7 +43,6 @@ class LogicNodeEditor(QtWidgets.QWidget):
         spec,
         initial_values,
         runtime: FormRuntimeContext,
-        pulse_template_reader=None,
         parent: QtWidgets.QWidget,
     ):
         if parent is None:
@@ -65,7 +65,7 @@ class LogicNodeEditor(QtWidgets.QWidget):
         col.setSpacing(scaled_px(6, minimum=4))
 
         col.addWidget(FluentSectionLabel(str(title)))
-        # The auto-generated parameter form + Start / Stop (reused MeasurementPanel,
+        # The auto-generated parameter form + Start / Stop (reused parameter panel,
         # which already carries start_requested(self) / stop_requested + the typed,
         # no-eval form).  Every node, including Camera, is driven by its real
         # FormSpec; no camera-only controls are injected by this editor.
@@ -73,15 +73,16 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # physical parameters (for example a monitor's history depth), and the
         # editor renders exactly that form.  Deadlines remain internal Port/Run
         # mechanics, never generic Measurement inputs invented by the UI.
-        self.form = MeasurementPanel(
+        self.form = LogicNodeParameterPanel(
             [spec] if spec is not None else [],
+            parent=page,
             single=True,
             runtime=runtime,
-            pulse_template_reader=pulse_template_reader,
         )
         self.form.seed_values(initial_values or {})
         self.form.start_requested.connect(lambda *_: self.start_requested.emit())
         self.form.stop_requested.connect(self.stop_requested.emit)
+        self.form.draft_changed.connect(self.draft_changed.emit)
         col.addWidget(self.form)
         # (The node's published-signals + shapes are shown on its Logic-tab ROW card,
         # the single place for that legend -- not duplicated here.)

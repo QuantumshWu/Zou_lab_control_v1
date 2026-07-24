@@ -1,6 +1,5 @@
 `timescale 1ns/1ps
-// PER-DA-BIT event-scheduler DAC delay on the REAL engine (the unified design: each DA bit is
-// its own 1-bit event FIFO; the bus's BUS_WIDTH bits share one per-bus delay).  Program one
+// PER-BUS segment-scheduler DAC delay on the REAL engine.  Program one
 // HOLD segment (value 1023) on buses 0..2 so each undelayed bus value steps SAFE(512)->1023 at
 // FIRE, with per-bus delays d0=5, d1=0 (passthrough), d2=1 (the register path).  ORACLE: record
 // the engine's UNDELAYED dut.bus_value_active[b] every cycle and assert the delayed pin output

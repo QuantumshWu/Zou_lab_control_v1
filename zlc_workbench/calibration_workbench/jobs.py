@@ -6,13 +6,13 @@ from concurrent.futures import CancelledError
 import threading
 
 from zlc_frontend.encoded_raster import EncodedRasterDocument
-from zlc_neutral_atom.readout.calibration_application import (
+from zlc_neutral_atom.logic_nodes.calibration.application import (
     calibration_request_from_computation,
 )
-from zlc_neutral_atom.readout.calibration_projection import (
+from zlc_neutral_atom.logic_nodes.calibration.projection import (
     project_calibration_report,
 )
-from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
+from zlc_neutral_atom.logic_nodes.calibration.reference import CalibrationArtifactRef
 
 
 def _require_not_cancelled(cancelled: threading.Event) -> None:

@@ -41,7 +41,7 @@ from zlc_frontend.render import (
     SourceIdentity,
     detached_render_fault,
 )
-from zlc_neutral_atom.scan.application import PreparedExactScan
+from zlc_neutral_atom.logic_nodes.pulse_scan.application import PreparedExactScan
 from zlc_storage import canonical_digest
 
 from .exact_live_slot import ExactDatasetLiveSlot

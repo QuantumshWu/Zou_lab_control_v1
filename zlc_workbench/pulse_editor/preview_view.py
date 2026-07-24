@@ -173,8 +173,10 @@ class PulsePreviewView(QtWidgets.QWidget):
         if not isinstance(widget, QtWidgets.QWidget):
             raise TypeError("preview content must be a QWidget")
         if self._content_widget is not None and self._content_widget is not widget:
-            self.preview_body_layout.removeWidget(self._content_widget)
-            self._content_widget.setParent(None)
+            retired = self._content_widget
+            self.preview_body_layout.removeWidget(retired)
+            retired.hide()
+            retired.deleteLater()
         if self._content_widget is not widget:
             self.preview_body_layout.addWidget(
                 widget,

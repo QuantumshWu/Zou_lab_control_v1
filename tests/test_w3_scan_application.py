@@ -63,22 +63,22 @@ from zlc_frontend.scan_preview import (
     ScanDisplayIntent,
     build_occupancy_scan_curve,
 )
-from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewSpec
+from zlc_neutral_atom.runtime.preview import ExactDatasetPreviewSpec
 from zlc_neutral_atom.runtime.run import (
     RunFailed,
 )
-from zlc_neutral_atom.scan import (
+from zlc_neutral_atom.logic_nodes.pulse_scan import (
     AutonomousScanExecution,
     AutonomousScanSlotProgram,
     ScanOutputContract,
     ScanPointTable,
 )
-from zlc_neutral_atom.scan.application import PreparedExactScan
-from zlc_neutral_atom.scan.repository import ScanRepository
-from zlc_neutral_atom.readout.calibration_reference import (
+from zlc_neutral_atom.logic_nodes.pulse_scan.application import PreparedExactScan
+from zlc_neutral_atom.logic_nodes.pulse_scan.repository import ScanRepository
+from zlc_neutral_atom.logic_nodes.calibration.reference import (
     calibration_artifact_input_ref,
 )
-from zlc_neutral_atom.readout.sitemap import load_packaged_sitemap_pulse
+from zlc_neutral_atom.logic_nodes.calibration.sitemap import load_packaged_sitemap_pulse
 from zlc_pulse import (
     FrozenScanTable,
     RepeatRegion,
@@ -814,7 +814,7 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
         # Exercise the durable reload boundary, not just the live PipelineResult:
         # a well-typed forged aggregate digest must still be rejected against
         # the independently persisted DatasetSealProvenance.
-        import zlc_neutral_atom.scan.repository as scan_repository
+        import zlc_neutral_atom.logic_nodes.pulse_scan.repository as scan_repository
 
         decode_index = scan_repository._decode_metadata_index
 
@@ -847,11 +847,11 @@ def test_public_sparse_scan_reopens_with_stable_identity_and_data_figure(
         with monkeypatch.context() as patch:
             patch.setattr(ScanRepository, "materialize", forbidden_heavy_read)
             patch.setattr(
-                "zlc_neutral_atom.scan.repository.decode_compiled_pulse_artifact",
+                "zlc_neutral_atom.logic_nodes.pulse_scan.repository.decode_compiled_pulse_artifact",
                 forbidden_heavy_read,
             )
             patch.setattr(
-                "zlc_neutral_atom.scan.repository._decode_program",
+                "zlc_neutral_atom.logic_nodes.pulse_scan.repository._decode_program",
                 forbidden_heavy_read,
             )
             figure_document = exp.figure_document(scan_ref)
@@ -956,7 +956,7 @@ def _assert_public_occupancy_scan(exp, monkeypatch):
         with pytest.raises(RuntimeError, match="Experiment is closed"):
             guarded.start()
 
-    import zlc_neutral_atom.timing.occupancy as timing_occupancy
+    import zlc_neutral_atom.logic_nodes.occupancy.timing as timing_occupancy
 
     failed_prepared = exp.readout.prepare_occupancy_scan(request)
     failed_progressive = build_occupancy_progressive_spec(
@@ -1053,7 +1053,7 @@ def _assert_occupancy_scan_window(exp, request, monkeypatch):
         QtRasterBoard,
     )
     import zlc_workbench.progressive_scan as progressive_scan
-    import zlc_neutral_atom.timing.occupancy as timing_occupancy
+    import zlc_neutral_atom.logic_nodes.occupancy.timing as timing_occupancy
 
     owner_thread = threading.get_ident()
     renderer_construct_threads = []

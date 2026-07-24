@@ -9,6 +9,7 @@ It never reconstructs a document from widget contents.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace as dataclass_replace
+import sys
 from typing import Mapping, Sequence
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -35,18 +36,23 @@ from zlc_frontend.qt_widgets import (
     signals_blocked,
 )
 from zlc_pulse import (
+    DEFAULT_REPEAT_COUNT,
+    DEFAULT_TIME_UNIT,
     FIELD_DAC,
     FIELD_DELAY,
     FIELD_DURATION,
+    MIN_REPEAT_COUNT,
     PORT_CLOCK,
     PORT_DAC,
     PORT_DIGITAL,
+    TIME_UNIT_CHOICES,
     TIME_UNIT_TO_NS,
     PulseDocument,
     PulseFieldRef,
     PulseTargetManifest,
     count_authored_digital_pulses,
     pulse_target_manifest_from_lanes,
+    time_value_per_tick,
 )
 
 from ._layout import (
@@ -70,8 +76,7 @@ from .repeat_presentation import pulse_repeat_presentation
 from .scan_line_edit import FluentScanLineEdit
 
 
-DURATION_UNITS = ("ns", "us", "ms", "s")
-DELAY_UNITS = ("ns", "us", "ms", "s")
+_SCAN_DURATION_UNIT = f"str ({DEFAULT_TIME_UNIT})"
 
 
 def _bus_mode_title(mode: str) -> str:
@@ -100,11 +105,11 @@ def _format_clock_text(time_step_ns: float) -> str:
 
 
 def _summary_time_text(value_ns: float) -> str:
-    for unit in ("s", "ms", "us", "ns"):
+    for unit in reversed(TIME_UNIT_CHOICES):
         factor = float(TIME_UNIT_TO_NS[unit])
-        if abs(value_ns) >= factor or unit == "ns":
+        if abs(value_ns) >= factor or unit == DEFAULT_TIME_UNIT:
             return f"{format_compact_number(value_ns / factor, digits=6)} {unit}"
-    return f"{format_compact_number(value_ns, digits=6)} ns"
+    return f"{format_compact_number(value_ns, digits=6)} {DEFAULT_TIME_UNIT}"
 
 
 def _number(text: object) -> int | float:
@@ -276,7 +281,7 @@ def _field_bindings(document: PulseDocument) -> dict[PulseFieldRef, _Binding]:
 def _delay_values(
     document: PulseDocument,
 ) -> dict[str, tuple[int | float, str]]:
-    """Display values for optional delays; absence is the canonical 0 ns."""
+    """Display values for optional delays; absence is zero in the owner unit."""
 
     return {item.port: (item.value, item.unit) for item in document.delays}
 
@@ -310,12 +315,12 @@ def _analog_values(
 
 def _set_duration_units(combo: FluentComboBox, binding: _Binding | None, unit: str) -> None:
     scanned = binding is not None and binding.kind == "scan"
-    desired = tuple(DURATION_UNITS) + (("str (ns)",) if scanned else ())
+    desired = TIME_UNIT_CHOICES + ((_SCAN_DURATION_UNIT,) if scanned else ())
     current = tuple(combo.itemText(index) for index in range(combo.count()))
     if current != desired:
         combo.clear()
         combo.addItems(list(desired))
-    selected = "str (ns)" if scanned else unit
+    selected = _SCAN_DURATION_UNIT if scanned else unit
     if combo.currentText() != selected:
         combo.setCurrentText(selected)
     combo.setEnabled(not scanned)
@@ -373,6 +378,7 @@ class PeriodCard(FluentGroupBox):
         index: int,
         period,
         *,
+        time_step_ns: float,
         total_periods: int,
         rows: Sequence[_PortRow],
         visible_ports: frozenset[str],
@@ -383,6 +389,7 @@ class PeriodCard(FluentGroupBox):
     ) -> None:
         super().__init__("", parent)
         self.period_id = period.period_id
+        self._time_step_ns = float(time_step_ns)
         self._rows: tuple[_PortRow, ...] = ()
         self.checks: dict[str, FluentCheckBox] = {}
         self.bus_mode_combos: dict[str, FluentComboBox] = {}
@@ -459,7 +466,7 @@ class PeriodCard(FluentGroupBox):
         column.addWidget(top)
         column.addSpacing(max(0, row_top - card_pad))
 
-        self.duration_edit.set_numeric_validator("float", bottom=0.0)
+        self._configure_duration_edit(period.unit)
         if duration_binding is not None and duration_binding.kind == "scan":
             self.duration_edit.setValidator(None)
         self.name_edit.editingFinished.connect(self._commit_name)
@@ -467,12 +474,13 @@ class PeriodCard(FluentGroupBox):
             lambda _checked=False, ref=duration_ref: self.bindingCycleRequested.emit(ref)
         )
         self.duration_edit.editingFinished.connect(self._commit_duration)
-        self.unit_combo.currentTextChanged.connect(lambda _text: self._commit_duration())
+        self.unit_combo.currentTextChanged.connect(self._duration_unit_changed)
 
         column.addStretch(1)
         self.reconcile(
             index,
             period,
+            time_step_ns=time_step_ns,
             total_periods=total_periods,
             rows=rows,
             visible_ports=visible_ports,
@@ -515,7 +523,7 @@ class PeriodCard(FluentGroupBox):
     def _remove_port_row(self, key: str) -> None:
         widget = self.port_rows.pop(key)
         self._column.removeWidget(widget)
-        widget.setParent(None)
+        widget.hide()
         widget.deleteLater()
         self.checks.pop(key, None)
         self.bus_mode_combos.pop(key, None)
@@ -622,6 +630,17 @@ class PeriodCard(FluentGroupBox):
         )
         return row
 
+    def _configure_duration_edit(self, unit: str) -> None:
+        quantum = float(time_value_per_tick(self._time_step_ns, unit))
+        self.duration_edit.set_numeric_validator("float", bottom=quantum)
+        self.duration_edit.set_resolution(quantum)
+        self.duration_edit.set_allow_any(False)
+
+    def _duration_unit_changed(self, unit: str) -> None:
+        if unit in TIME_UNIT_CHOICES:
+            self._configure_duration_edit(unit)
+        self._commit_duration()
+
     def _commit_duration(self) -> None:
         if not self.unit_combo.isEnabled():
             return
@@ -697,7 +716,7 @@ class PeriodCard(FluentGroupBox):
             else str(value)
         )
         with signals_blocked(self.duration_edit, self.unit_combo):
-            self.duration_edit.set_numeric_validator("float", bottom=0.0)
+            self._configure_duration_edit(str(unit))
             _set_widget_text(self.duration_edit, text)
             tooltip = "How long this period lasts, in the unit below"
             if binding is not None:
@@ -770,6 +789,7 @@ class PeriodCard(FluentGroupBox):
         index: int,
         period,
         *,
+        time_step_ns: float,
         total_periods: int,
         rows: Sequence[_PortRow],
         visible_ports: frozenset[str],
@@ -781,9 +801,11 @@ class PeriodCard(FluentGroupBox):
 
         if period.period_id != self.period_id:
             raise ValueError("cannot reconcile a PeriodCard to another period_id")
+        self._time_step_ns = float(time_step_ns)
         projection_state = (
             int(index),
             int(total_periods),
+            self._time_step_ns,
             period,
             tuple(rows),
             visible_ports,
@@ -947,7 +969,7 @@ class ChannelNamesPanel(FluentGroupBox):
                 continue
             widget = self.row_widgets.pop(key)
             self._column.removeWidget(widget)
-            widget.setParent(None)
+            widget.hide()
             widget.deleteLater()
             self.hardware_labels.pop(key)
             self.port_labels.pop(key)
@@ -1040,6 +1062,7 @@ class ChannelPanel(FluentGroupBox):
         parent=None,
     ) -> None:
         super().__init__("Delay / Scan", parent)
+        self._time_step_ns = float(time_step_ns)
         self.rows: tuple[_PortRow, ...] = ()
         self.delay_edits: dict[str, FluentScanLineEdit] = {}
         self.delay_units: dict[str, FluentComboBox] = {}
@@ -1154,10 +1177,10 @@ class ChannelPanel(FluentGroupBox):
             lambda key=row_info.key: self._commit_delay(key)
         )
         unit = FluentComboBox()
-        unit.addItems(DELAY_UNITS)
+        unit.addItems(TIME_UNIT_CHOICES)
         unit.setFixedSize(self._unit_width, row_height)
         unit.currentTextChanged.connect(
-            lambda _text, key=row_info.key: self._commit_delay(key)
+            lambda text, key=row_info.key: self._delay_unit_changed(key, text)
         )
         clear_btn = FluentButton("X", color=ORANGE)
         clear_btn.setFixedSize(self._hide_width, row_height)
@@ -1190,7 +1213,10 @@ class ChannelPanel(FluentGroupBox):
         projection_state = (
             rows,
             float(time_step_ns),
-            tuple((row.key, delays.get(row.key, (0, "ns"))) for row in rows),
+            tuple(
+                (row.key, delays.get(row.key, (0, DEFAULT_TIME_UNIT)))
+                for row in rows
+            ),
             tuple(
                 (
                     row.key,
@@ -1203,6 +1229,7 @@ class ChannelPanel(FluentGroupBox):
         )
         if projection_state == self._projection_state:
             return
+        self._time_step_ns = float(time_step_ns)
         desired = tuple(row.key for row in rows)
         if len(desired) != len(set(desired)):
             raise ValueError("channel rows must have unique keys")
@@ -1213,7 +1240,7 @@ class ChannelPanel(FluentGroupBox):
                 continue
             widget = self.row_widgets.pop(key)
             self._column.removeWidget(widget)
-            widget.setParent(None)
+            widget.hide()
             widget.deleteLater()
             self.channel_labels.pop(key)
             self.delay_edits.pop(key)
@@ -1241,9 +1268,19 @@ class ChannelPanel(FluentGroupBox):
             _set_widget_text(label, row.label)
             label.setToolTip(key)
             binding = bindings.get(PulseFieldRef(FIELD_DELAY, None, key))
-            value, unit_text = delays.get(key, (0, "ns"))
+            value, unit_text = delays.get(key, (0, DEFAULT_TIME_UNIT))
             self.apply_delay(key, value, unit_text, binding)
         self._projection_state = projection_state
+
+    def _configure_delay_edit(self, edit: FluentScanLineEdit, unit: str) -> None:
+        edit.set_numeric_validator("float")
+        edit.set_resolution(float(time_value_per_tick(self._time_step_ns, unit)))
+        edit.set_allow_any(True)
+
+    def _delay_unit_changed(self, port: str, unit: str) -> None:
+        if unit in TIME_UNIT_CHOICES:
+            self._configure_delay_edit(self.delay_edits[port], unit)
+        self._commit_delay(port)
 
     def _commit_delay(self, port: str) -> None:
         edit = self.delay_edits[port]
@@ -1291,7 +1328,10 @@ class ChannelPanel(FluentGroupBox):
         if edit is None or unit is None or row is None:
             raise KeyError(f"unknown delay row {port!r}")
         with signals_blocked(edit, unit):
-            edit.set_numeric_validator("float")
+            selected_unit = (
+                unit_text if unit_text in TIME_UNIT_CHOICES else DEFAULT_TIME_UNIT
+            )
+            self._configure_delay_edit(edit, selected_unit)
             _set_widget_text(edit, value)
             if binding is not None:
                 edit.setToolTip(f"API parameter: {binding.parameter_id}")
@@ -1306,7 +1346,6 @@ class ChannelPanel(FluentGroupBox):
                     "whole channel waveform shifts by d, out[t] = in[t-d]."
                 )
             _apply_field_state(edit, editable=True, binding=binding)
-            selected_unit = unit_text if unit_text in DELAY_UNITS else "ns"
             if unit.currentText() != selected_unit:
                 unit.setCurrentText(selected_unit)
         self._projection_state = None
@@ -1319,7 +1358,12 @@ class ChannelPanel(FluentGroupBox):
 class RepeatBracket(FluentGroupBox):
     changed = QtCore.pyqtSignal()
 
-    def __init__(self, kind: str, repeat_count: int = 2, parent=None) -> None:
+    def __init__(
+        self,
+        kind: str,
+        repeat_count: int = DEFAULT_REPEAT_COUNT,
+        parent=None,
+    ) -> None:
         super().__init__("", parent)
         self.kind = kind
         self._committed_count = int(repeat_count)
@@ -1340,7 +1384,8 @@ class RepeatBracket(FluentGroupBox):
         self.repeat_spin = None
         if kind == "end":
             self.repeat_spin = FluentDoubleSpinBox(length=5, allow_minus=False)
-            self.repeat_spin.setRange(1, 999)
+            self.repeat_spin.setMinimum(MIN_REPEAT_COUNT)
+            self.repeat_spin.setMaximum(sys.float_info.max)
             self.repeat_spin.setValue(repeat_count)
             self.repeat_spin.setFixedHeight(_row_height())
             self.repeat_spin.editingFinished.connect(self._commit_count)
@@ -2087,6 +2132,7 @@ class PulseScheduleView(QtWidgets.QWidget):
                 card = PeriodCard(
                     index,
                     period,
+                    time_step_ns=document.time_step_ns,
                     total_periods=total,
                     rows=rows,
                     visible_ports=visible_ports,
@@ -2111,6 +2157,7 @@ class PulseScheduleView(QtWidgets.QWidget):
                 card.reconcile(
                     index,
                     period,
+                    time_step_ns=document.time_step_ns,
                     total_periods=total,
                     rows=rows,
                     visible_ports=visible_ports,
@@ -2181,7 +2228,7 @@ class PulseScheduleView(QtWidgets.QWidget):
             if id(item.widget) in desired_widget_ids:
                 continue
             self.drag_container.layout_main.removeWidget(item.widget)
-            item.widget.setParent(None)
+            item.widget.hide()
             item.widget.deleteLater()
         self.drag_container.reconcile_items(desired_items)
 
@@ -2463,7 +2510,7 @@ class PulseScheduleView(QtWidgets.QWidget):
 
     def apply_delay(self, document: PulseDocument, port: str) -> None:
         field = PulseFieldRef(FIELD_DELAY, None, port)
-        value, unit = _delay_values(document).get(port, (0, "ns"))
+        value, unit = _delay_values(document).get(port, (0, DEFAULT_TIME_UNIT))
         self.channel_panel.apply_delay(
             port,
             value,
@@ -2490,7 +2537,7 @@ class PulseScheduleView(QtWidgets.QWidget):
                 )
         for port in self.channel_panel.delay_edits:
             field = PulseFieldRef(FIELD_DELAY, None, port)
-            value, unit = delays.get(port, (0, "ns"))
+            value, unit = delays.get(port, (0, DEFAULT_TIME_UNIT))
             self.channel_panel.apply_delay(
                 port,
                 value,
@@ -2715,7 +2762,11 @@ class PulseScheduleView(QtWidgets.QWidget):
         if len(self._period_ids) < 2:
             self.feedbackRequested.emit("Repeat needs at least two periods.")
             return
-        self.repeatEdited.emit(self._period_ids[0], self._period_ids[-1], 2)
+        self.repeatEdited.emit(
+            self._period_ids[0],
+            self._period_ids[-1],
+            DEFAULT_REPEAT_COUNT,
+        )
 
     def _request_repeat_count(self) -> None:
         if self._repeat is None:

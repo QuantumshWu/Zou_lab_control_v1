@@ -7,7 +7,7 @@ import inspect
 import pytest
 
 import zlc_neutral_atom.runtime.commit as commit_module
-from zlc_neutral_atom.artifacts import CaptureRepository
+from zlc_neutral_atom.logic_nodes.camera_capture.artifact import CaptureRepository
 from zlc_neutral_atom.runtime.commit import CommitIntent, CommitTarget, FinalCommit
 from zlc_neutral_atom.runtime.run import PostSafetyContext
 

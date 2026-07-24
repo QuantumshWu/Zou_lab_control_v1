@@ -26,7 +26,7 @@ from zlc_frontend.render import SiteMapPanelPayload
 from zlc_frontend.selector import (
     ImageColorLimitsCommit, ImageInteractionCommit, ImageViewportCommit,
 )
-from zlc_neutral_atom.readout.occupancy_reference import OccupancyArtifactRef
+from zlc_neutral_atom.logic_nodes.occupancy.reference import OccupancyArtifactRef
 
 from zlc_workbench.window_runtime import (
     RASTER_WORK_EXECUTOR,

@@ -13,10 +13,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5 import QtCore, QtTest, QtWidgets  # noqa: E402
 
 from test_u03b_interactive_curve_figure import _curve_figure, _until  # noqa: E402
-from zlc_frontend import CurveDisplayState, load_figure_archive  # noqa: E402
+from zlc_frontend import CurveDisplayState  # noqa: E402
 from zlc_frontend.display_range import RelimMode  # noqa: E402
 from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app  # noqa: E402
 from zlc_workbench.figure_viewer.app import open_figure_viewer  # noqa: E402
+from zlc_workbench.data_figure.archive_repository import (  # noqa: E402
+    load_figure_archive,
+)
 
 
 @pytest.fixture
@@ -314,12 +317,12 @@ def test_formal_viewer_refits_and_reopens_the_same_archive(
             ),
         )
         pane = viewer.figure_pane
-        analyze = pane.findChild(
+        fit_entry = pane.findChild(
             QtWidgets.QPushButton,
-            "figureViewerAnalyzeFitButton",
+            "figureViewerFitButton",
         )
-        assert analyze is not None and analyze.isEnabled()
-        QtTest.QTest.mouseClick(analyze, QtCore.Qt.LeftButton)
+        assert fit_entry is not None and fit_entry.isEnabled()
+        QtTest.QTest.mouseClick(fit_entry, QtCore.Qt.LeftButton)
         _until(
             application,
             lambda: pane.worker_idle and bool(pane.fit_models),

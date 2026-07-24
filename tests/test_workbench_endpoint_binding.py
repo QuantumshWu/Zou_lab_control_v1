@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from zlc_neutral_atom.bootstrap._endpoint_binding import (
+from zlc_neutral_atom.runtime.ports import (
     require_current_endpoint_binding,
 )
 from zlc_neutral_atom.runtime.ports import BoundDevice, DeviceBroker

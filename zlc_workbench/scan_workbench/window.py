@@ -40,9 +40,14 @@ from zlc_frontend.selector import (
     PanelInteractionOrigin,
 )
 from zlc_frontend.scan_preview import SCAN_CURVE_PANEL_ID, ScanDisplayIntent
-from zlc_neutral_atom.scan.reference import ScanArtifactRef
-from zlc_neutral_atom.scan.contracts import AutonomousScanSlotProgram
-from zlc_neutral_atom.scan import OccupancyScanRequest, ScanRequest
+from zlc_neutral_atom.logic_nodes.pulse_scan.reference import ScanArtifactRef
+from zlc_neutral_atom.logic_nodes.pulse_scan.contracts import (
+    AutonomousScanSlotProgram,
+)
+from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import (
+    OccupancyScanRequest,
+    ScanRequest,
+)
 from zlc_workbench.scan import (
     FinalScanPresentation,
     ScanPanelController,

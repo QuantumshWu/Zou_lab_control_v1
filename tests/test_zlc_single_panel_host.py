@@ -16,7 +16,22 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import test_zlc_qt_image_interaction as image_fixtures
+import test_u02c_qt_curve_interaction as image_fixtures
+
+
+def _image_frame(sequence: int):
+    from zlc_frontend.render import BoardFrame
+
+    return BoardFrame(
+        "image-board",
+        0,
+        sequence,
+        (image_fixtures._image_panel(sequence),),
+    )
+
+
+def _image_target(board):
+    return board._selector_target(board._image_bindings["image"])[0]
 
 
 def _host_with_image_front():
@@ -26,7 +41,7 @@ def _host_with_image_front():
     host = SinglePanelHost("image", group="camera")
     host.resize(640, 420)
     host.show()
-    host.present_frame(image_fixtures._frame(0))
+    host.present_frame(_image_frame(0))
     application.processEvents()
     return application, host
 
@@ -61,7 +76,7 @@ def test_present_frame_binds_the_image_family_and_forwards_typed_intents() -> No
         host.colorLimitsCommitted.connect(limits.append)
 
         host.set_selectors_enabled(True)
-        target = image_fixtures._target(board)
+        target = _image_target(board)
         before = board.visible_image_payload().viewport
 
         start = image_fixtures._point(target, 0.30, 0.30)
@@ -97,8 +112,17 @@ def test_present_frame_refuses_a_frame_for_another_panel() -> None:
     application = ensure_qt_app()
     host = SinglePanelHost("image", group="camera")
     try:
+        from zlc_frontend.render import BoardFrame
+
         with pytest.raises(ValueError):
-            host.present_frame(image_fixtures._frame(0, panel_id="other"))
+            host.present_frame(
+                BoardFrame(
+                    "curve-board",
+                    0,
+                    0,
+                    (image_fixtures._curve_panel(0),),
+                )
+            )
     finally:
         host.close()
         application.processEvents()

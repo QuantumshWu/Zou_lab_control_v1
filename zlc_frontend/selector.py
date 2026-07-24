@@ -38,6 +38,8 @@ class RectangleGesture:
     cleared span: a fresh left click that never forms a non-degenerate box.
     Existing-box move/resize gestures retain their non-degenerate initial
     rectangle, so an unmoved handle click is not misclassified as a clear.
+    Non-``None`` bounds are complete-raster source-relative Area coordinates,
+    never visible-window coordinates or an unbounded viewport.
     """
 
     panel_id: str

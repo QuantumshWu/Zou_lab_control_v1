@@ -34,16 +34,16 @@ from zlc_storage import (
     exact_mapping,
 )
 
-from zlc_neutral_atom.capture_reference import (
+from zlc_neutral_atom.logic_nodes.camera_capture.reference import (
     CaptureArtifactRef,
     capture_artifact_ref_from_tree,
     capture_artifact_ref_to_tree,
 )
-from zlc_neutral_atom.fit_reference import (
+from .fit_reference import (
     FIT_RESULT_ARTIFACT_NAMESPACE,
     FitResultArtifactRef,
 )
-from zlc_neutral_atom.scan.reference import (
+from zlc_neutral_atom.logic_nodes.pulse_scan.reference import (
     ScanArtifactRef,
     scan_artifact_ref_from_tree,
     scan_artifact_ref_to_tree,
@@ -333,7 +333,7 @@ class FitResultRepository:
     ) -> FitExecution:
         """Fit one exact FINAL capture."""
 
-        from .capture import CaptureRepository
+        from zlc_neutral_atom.logic_nodes.camera_capture.artifact import CaptureRepository
 
         if type(capture_repository) is not CaptureRepository:
             raise TypeError("capture_repository must be CaptureRepository")
@@ -368,7 +368,7 @@ class FitResultRepository:
     ) -> FitExecution:
         """Fit one exact FINAL scan output without accepting a naked snapshot."""
 
-        from zlc_neutral_atom.scan.repository import ScanRepository
+        from zlc_neutral_atom.logic_nodes.pulse_scan.repository import ScanRepository
 
         if type(scan_repository) is not ScanRepository:
             raise TypeError("scan_repository must be ScanRepository")
@@ -455,7 +455,7 @@ class FitResultRepository:
             source_ref = _source_ref_from_tree(manifest["source"])
             result_ref = content_ref_from_tree(manifest["result_blob"])
             if isinstance(source_ref, CaptureArtifactRef):
-                from .capture import CaptureRepository
+                from zlc_neutral_atom.logic_nodes.camera_capture.artifact import CaptureRepository
 
                 if type(capture_repository) is not CaptureRepository:
                     raise TypeError(
@@ -468,7 +468,9 @@ class FitResultRepository:
                     source_artifact.provenance.generation
                 )
             else:
-                from zlc_neutral_atom.scan.repository import ScanRepository
+                from zlc_neutral_atom.logic_nodes.pulse_scan.repository import (
+                    ScanRepository,
+                )
 
                 if type(scan_repository) is not ScanRepository:
                     raise TypeError(

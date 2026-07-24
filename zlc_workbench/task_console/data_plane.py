@@ -34,6 +34,7 @@ from zlc_frontend.figure_outputs import (
 )
 from zlc_frontend.site_map_render import SiteMapView
 from zlc_neutral_atom.dataset_output import (
+    DatasetOutputDeclaration,
     FinalDatasetOutput,
     LiveDatasetOutput,
 )
@@ -169,18 +170,38 @@ class ConsoleDataFront:
         return self.signals.get(str(name))
 
 
-def _declared_output_names(declarations) -> set[str]:
-    """Validate only the Workbench vocabulary, never application stage truth."""
+def _declared_outputs(declarations) -> dict[str, DatasetOutputDeclaration]:
+    """Return the frozen owner declarations behind Workbench presentation."""
 
-    names = tuple(item.name for item in tuple(declarations))
-    if any(
-        not isinstance(name, str) or not name or name.strip() != name
-        for name in names
-    ):
-        raise ValueError("console output names must be canonical non-empty text")
-    if len(set(names)) != len(names):
+    values = tuple(
+        getattr(item, "declaration", None) for item in tuple(declarations)
+    )
+    if any(not isinstance(value, DatasetOutputDeclaration) for value in values):
+        raise TypeError(
+            "console outputs must retain DatasetOutputDeclaration values"
+        )
+    result = {value.name: value for value in values}
+    if len(result) != len(values):
         raise ValueError("console output declarations contain duplicate names")
-    return set(names)
+    return result
+
+
+def _require_published_declaration(
+    route_name: str,
+    output: FinalDatasetOutput | LiveDatasetOutput,
+    declared: Mapping[str, DatasetOutputDeclaration],
+) -> None:
+    if output.name != route_name:
+        raise ValueError("published output key differs from its owner declaration")
+    expected = declared.get(route_name)
+    if expected is None:
+        raise ValueError(
+            "published output is absent from the frozen Workbench vocabulary"
+        )
+    if output.declaration != expected:
+        raise ValueError(
+            "published output contract differs from the frozen owner declaration"
+        )
 
 
 def _node_instance_id(node: object) -> str:
@@ -204,10 +225,10 @@ def _node_display_label(node: object) -> str:
 
 
 def _signal_revision_identity(value: ConsoleSignalValue) -> tuple[object, ...]:
-    """Exact source identity used by the monitor-processor lane."""
+    """Exact source identity used by the latest-only Processor lane."""
 
     if not isinstance(value, ConsoleSignalValue):
-        raise TypeError("monitor processor source must be ConsoleSignalValue")
+        raise TypeError("processor source must be ConsoleSignalValue")
     return (
         value.name,
         value.run_id,
@@ -217,11 +238,12 @@ def _signal_revision_identity(value: ConsoleSignalValue) -> tuple[object, ...]:
     )
 
 
-def _evaluate_prepared_monitor_application(
+def _evaluate_prepared_processor_application(
     application: object,
     source: ConsoleSignalValue,
+    coverage: MonitorCoverage,
 ) -> object:
-    """Run one domain-owned monitor operation over an admitted revision.
+    """Run one domain-owned Processor operation over an admitted revision.
 
     The data plane knows only the common application seam: an immutable source,
     typed coverage, and its event digest go into the already-prepared domain
@@ -231,19 +253,17 @@ def _evaluate_prepared_monitor_application(
     evaluate = getattr(application, "evaluate", None)
     if not callable(evaluate):
         raise TypeError(
-            "prepared monitor application must expose evaluate()"
+            "prepared Processor application must expose evaluate()"
         )
-    if source.coverage is None:
-        raise ValueError("monitor application source has no typed coverage")
     return evaluate(
         source.snapshot,
-        source.coverage,
+        coverage,
         source_event_digest=source.join_digest,
     )
 
 
 @dataclass(slots=True)
-class _MonitorProcessorEntry:
+class _LatestOnlyProcessorEntry:
     node: object
     source_name: str
     prepare_future: Future
@@ -255,38 +275,40 @@ class _MonitorProcessorEntry:
     cancel_requested: bool = False
 
 
-class _MonitorProcessorHost:
-    """One shared worker lane for explicit monitor-source revisions.
+class _LatestOnlyProcessorLane:
+    """Internal shared worker lane for explicit source revisions.
 
     This host has no graph, scheduler policy, restart machinery, or domain
-    algorithm.  It serializes the already-prepared monitor Processor operations
-    owned by nodes in one TaskConsole and keeps at most the newest not-yet-run
-    source revision per node.
+    algorithm.  It serializes already-prepared Processor operations owned by
+    nodes in one TaskConsole and keeps at most the newest not-yet-run source
+    revision per node.  Replacing pending work is a host scheduling decision,
+    not acquisition loss: it must never rewrite the producer-owned
+    ``MonitorCoverage`` carried by that revision.
     """
 
     def __init__(self) -> None:
         self._executor = ThreadPoolExecutor(
             max_workers=1,
-            thread_name_prefix="console-monitor-processor",
+            thread_name_prefix="console-latest-processor",
         )
-        self._entries: dict[int, _MonitorProcessorEntry] = {}
+        self._entries: dict[int, _LatestOnlyProcessorEntry] = {}
         self._closed = False
 
     @staticmethod
     def _require_node_contract(node: object) -> None:
         for name in (
-            "_prepare_monitor_application",
-            "_validate_monitor_source",
-            "_monitor_application_ready",
-            "_monitor_work_started",
-            "_accept_monitor_result",
-            "_accept_monitor_failure",
-            "_accept_monitor_cancelled",
-            "_request_monitor_owner_wake",
+            "_prepare_processor_application",
+            "_validate_processor_source",
+            "_processor_application_ready",
+            "_processor_work_started",
+            "_accept_processor_result",
+            "_accept_processor_failure",
+            "_accept_processor_cancelled",
+            "_request_processor_owner_wake",
         ):
             if not callable(getattr(node, name, None)):
                 raise TypeError(
-                    f"monitor processor node must implement {name}()"
+                    f"Processor node must implement {name}()"
                 )
 
     def attach(
@@ -296,22 +318,22 @@ class _MonitorProcessorHost:
         initial_source: ConsoleSignalValue,
     ) -> None:
         if self._closed:
-            raise RuntimeError("monitor processor host is closed")
+            raise RuntimeError("latest-only Processor lane is closed")
         self._require_node_contract(node)
-        name = canonical_text(source_name, "monitor processor source name")
+        name = canonical_text(source_name, "processor source name")
         if not isinstance(initial_source, ConsoleSignalValue):
-            raise TypeError("initial monitor source must be ConsoleSignalValue")
+            raise TypeError("initial Processor source must be ConsoleSignalValue")
         if initial_source.name != name:
-            raise ValueError("initial monitor source has another signal name")
+            raise ValueError("initial Processor source has another signal name")
         key = id(node)
         if key in self._entries:
-            raise RuntimeError("monitor processor node is already attached")
-        node._validate_monitor_source(initial_source)
-        future = self._executor.submit(node._prepare_monitor_application)
+            raise RuntimeError("Processor node is already attached")
+        node._validate_processor_source(initial_source)
+        future = self._executor.submit(node._prepare_processor_application)
         future.add_done_callback(
             lambda _future, current=node: self._wake_owner_if_open(current)
         )
-        self._entries[key] = _MonitorProcessorEntry(
+        self._entries[key] = _LatestOnlyProcessorEntry(
             node=node,
             source_name=name,
             prepare_future=future,
@@ -360,7 +382,7 @@ class _MonitorProcessorHost:
             if identity == entry.last_source_identity:
                 continue
             try:
-                entry.node._validate_monitor_source(source)
+                entry.node._validate_processor_source(source)
             except Exception as error:
                 self._retire_failed(entry, error)
                 continue
@@ -377,7 +399,7 @@ class _MonitorProcessorHost:
             if entry.application is None:
                 try:
                     application = entry.prepare_future.result()
-                    entry.node._monitor_application_ready(application)
+                    entry.node._processor_application_ready(application)
                 except Exception as error:
                     self._retire_failed(entry, error)
                     continue
@@ -393,10 +415,10 @@ class _MonitorProcessorHost:
                 try:
                     if source is None:
                         raise RuntimeError(
-                            "monitor processor lost its source revision"
+                            "Processor lane lost its source revision"
                         )
                     result = work.result()
-                    entry.node._accept_monitor_result(source, result)
+                    entry.node._accept_processor_result(source, result)
                 except Exception as error:
                     self._retire_failed(entry, error)
                     continue
@@ -406,7 +428,7 @@ class _MonitorProcessorHost:
                 continue
             self._start_pending(entry)
 
-    def _start_pending(self, entry: _MonitorProcessorEntry) -> None:
+    def _start_pending(self, entry: _LatestOnlyProcessorEntry) -> None:
         if (
             entry.cancel_requested
             or entry.application is None
@@ -414,13 +436,23 @@ class _MonitorProcessorHost:
             or entry.pending_source is None
         ):
             return
-        source, entry.pending_source = entry.pending_source, None
-        entry.node._monitor_work_started(source)
-        future = self._executor.submit(
-            _evaluate_prepared_monitor_application,
-            entry.application,
-            source,
-        )
+        try:
+            source, entry.pending_source = entry.pending_source, None
+            coverage = source.coverage
+            if not isinstance(coverage, MonitorCoverage):
+                raise TypeError(
+                    "latest-only Processor source must carry MonitorCoverage"
+                )
+            entry.node._processor_work_started(source)
+            future = self._executor.submit(
+                _evaluate_prepared_processor_application,
+                entry.application,
+                source,
+                coverage,
+            )
+        except Exception as error:
+            self._retire_failed(entry, error)
+            return
         future.add_done_callback(
             lambda _future, current=entry.node: self._wake_owner_if_open(current)
         )
@@ -429,21 +461,21 @@ class _MonitorProcessorHost:
 
     def _retire_failed(
         self,
-        entry: _MonitorProcessorEntry,
+        entry: _LatestOnlyProcessorEntry,
         error: Exception,
     ) -> None:
         self._entries.pop(id(entry.node), None)
-        entry.node._accept_monitor_failure(error)
+        entry.node._accept_processor_failure(error)
 
-    def _retire_cancelled(self, entry: _MonitorProcessorEntry) -> None:
+    def _retire_cancelled(self, entry: _LatestOnlyProcessorEntry) -> None:
         self._entries.pop(id(entry.node), None)
-        entry.node._accept_monitor_cancelled()
+        entry.node._accept_processor_cancelled()
 
     def _wake_owner_if_open(self, node: object) -> None:
         """Never enqueue an owner wake after the data plane has retired."""
 
         if not self._closed:
-            node._request_monitor_owner_wake()
+            node._request_processor_owner_wake()
 
     def close(self) -> None:
         if self._closed:
@@ -469,7 +501,7 @@ class ConsoleDataPlane:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._monitor_processors = _MonitorProcessorHost()
+        self._processor_lane = _LatestOnlyProcessorLane()
         self._slots: dict[int, tuple[object, object]] = {}
         self._dirty: set[int] = set()
         self._cache: dict[int, dict[str, ConsoleSignalValue]] = {}
@@ -524,7 +556,7 @@ class ConsoleDataPlane:
             if key in self._slots:
                 self._dirty.add(key)
 
-    def attach_monitor_processor(
+    def attach_latest_only_processor(
         self,
         node: object,
         *,
@@ -536,17 +568,17 @@ class ConsoleDataPlane:
         with self._lock:
             if self._closed:
                 raise RuntimeError("console data plane is closed")
-        self._monitor_processors.attach(node, source_name, initial_source)
+        self._processor_lane.attach(node, source_name, initial_source)
 
-    def cancel_monitor_processor(self, node: object) -> bool:
+    def cancel_latest_only_processor(self, node: object) -> bool:
         """Stop routing new revisions to one processor."""
 
-        return self._monitor_processors.cancel(node)
+        return self._processor_lane.cancel(node)
 
-    def drain_monitor_processors(self) -> None:
+    def drain_latest_only_processors(self) -> None:
         """Admit completed shared-lane work on the TaskConsole owner thread."""
 
-        self._monitor_processors.drain()
+        self._processor_lane.drain()
 
     def publish_final(
         self,
@@ -571,7 +603,7 @@ class ConsoleDataPlane:
         declarations = tuple(
             getattr(node, "output_declarations", ()) or ()
         )
-        declared = _declared_output_names(declarations)
+        declared = _declared_outputs(declarations)
         output_names = tuple(projected)
         if any(
             not isinstance(name, str) or not name or name.strip() != name
@@ -586,7 +618,7 @@ class ConsoleDataPlane:
                 "FINAL output owner published an output absent from the "
                 "Workbench vocabulary: "
                 f"declared={tuple(sorted(declared))}, "
-                f"unknown={tuple(sorted(actual - declared))}"
+                f"unknown={tuple(sorted(actual - set(declared)))}"
             )
         presentation_names = tuple(presentations)
         if any(
@@ -618,10 +650,11 @@ class ConsoleDataPlane:
                     "FINAL values must be FinalDatasetOutput"
                 )
             output = value
-            if output.name != str(output_name):
-                raise ValueError(
-                    "FINAL route key differs from the owner-declared output name"
-                )
+            _require_published_declaration(
+                str(output_name),
+                output,
+                declared,
+            )
             key = node.signal_key(output.name)
             snapshot = output.snapshot
             frozen[key] = ConsoleSignalValue(
@@ -665,7 +698,7 @@ class ConsoleDataPlane:
         if not isinstance(presentations, Mapping):
             raise TypeError("processor presentations must be a mapping")
         declarations = tuple(getattr(node, "output_declarations", ()) or ())
-        declared = _declared_output_names(declarations)
+        declared = _declared_outputs(declarations)
         output_names = tuple(outputs)
         if any(
             not isinstance(name, str) or not name or name.strip() != name
@@ -695,8 +728,7 @@ class ConsoleDataPlane:
                 raise TypeError(
                     "processor outputs must contain LiveDatasetOutput"
                 )
-            if output.name != output_name:
-                raise ValueError("processor output key differs from its bare name")
+            _require_published_declaration(output_name, output, declared)
             presentation = presentations.get(output_name)
             selected = node.signal_key(output_name)
             frozen[selected] = ConsoleSignalValue(
@@ -783,7 +815,7 @@ class ConsoleDataPlane:
 
     def detach(self, node) -> None:
         key = id(node)
-        self._monitor_processors.detach(node)
+        self._processor_lane.detach(node)
         with self._lock:
             entry = self._slots.pop(key, None)
             self._dirty.discard(key)
@@ -829,7 +861,7 @@ class ConsoleDataPlane:
             self._membership_changed = True
         for _node, slot in entries:
             slot.close()
-        self._monitor_processors.close()
+        self._processor_lane.close()
 
     def __len__(self) -> int:
         with self._lock:
@@ -849,7 +881,7 @@ class ConsoleDataPlane:
         manufacture a new aggregate data front merely because time passed.
         """
 
-        self._monitor_processors.drain()
+        self._processor_lane.drain()
         with self._lock:
             if not self._dirty and not self._membership_changed:
                 return self._front
@@ -909,7 +941,7 @@ class ConsoleDataPlane:
             signals.update(values)
         for _panel_id, values in panels.items():
             signals.update(values)
-        self._monitor_processors.route(signals)
+        self._processor_lane.route(signals)
         front = ConsoleDataFront(
             signals=MappingProxyType(signals),
             failures=MappingProxyType(failures),
@@ -942,7 +974,7 @@ class ConsoleDataPlane:
         declarations = tuple(
             getattr(node, "output_declarations", ()) or ()
         )
-        declared = _declared_output_names(declarations)
+        declared = _declared_outputs(declarations)
         bare_names = tuple(outputs)
         if any(
             not isinstance(name, str) or not name or name.strip() != name
@@ -955,15 +987,14 @@ class ConsoleDataPlane:
                 "live output owner published an output absent from the "
                 "Workbench vocabulary: "
                 f"declared={tuple(sorted(declared))}, "
-                f"unknown={tuple(sorted(actual - declared))}"
+                f"unknown={tuple(sorted(actual - set(declared)))}"
             )
         frozen: dict[str, ConsoleSignalValue] = {}
         for output_name in bare_names:
             output = outputs[output_name]
             if not isinstance(output, LiveDatasetOutput):
                 raise TypeError("live output values must be LiveDatasetOutput")
-            if output.name != output_name:
-                raise ValueError("live output key differs from its bare name")
+            _require_published_declaration(output_name, output, declared)
             output_snapshot = output.snapshot
             selected = node.signal_key(output_name)
             frozen[selected] = ConsoleSignalValue(

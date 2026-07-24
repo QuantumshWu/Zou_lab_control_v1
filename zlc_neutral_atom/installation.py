@@ -4,9 +4,94 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+import math
 from types import MappingProxyType
 
 from zlc_storage import canonical_text, nonnegative_integer
+
+
+def _positive_pair(value: object, field: str) -> tuple[int, int]:
+    try:
+        pair = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise TypeError(f"{field} must be a two-integer tuple") from exc
+    if len(pair) != 2:
+        raise ValueError(f"{field} must contain Y and X")
+    normalized: list[int] = []
+    for index, item in enumerate(pair):
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            raise ValueError(f"{field}[{index}] must be a positive integer")
+        normalized.append(item)
+    return normalized[0], normalized[1]
+
+
+@dataclass(frozen=True, slots=True)
+class ReadoutApparatusFacts:
+    """Installed cross-device readout wiring and site geometry.
+
+    This is capability-free physical configuration.  It deliberately does not
+    contain a Calibration request, pulse recipe, Port, callback, or mutable
+    metadata bag.  A Logic-node owner may combine it with the exact bound
+    Camera and Sequencer Ports at the application composition root.
+    """
+
+    camera_role: str
+    sequencer_role: str
+    frame_shape_yx: tuple[int, int]
+    grid_shape_yx: tuple[int, int]
+    site_centers_xy: tuple[tuple[float, float], ...]
+    trigger_channel: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "camera_role",
+            canonical_text(self.camera_role, "camera_role"),
+        )
+        object.__setattr__(
+            self,
+            "sequencer_role",
+            canonical_text(self.sequencer_role, "sequencer_role"),
+        )
+        frame_shape = _positive_pair(self.frame_shape_yx, "frame_shape_yx")
+        grid_shape = _positive_pair(self.grid_shape_yx, "grid_shape_yx")
+        try:
+            raw_centers = tuple(self.site_centers_xy)
+        except TypeError as exc:
+            raise TypeError("site_centers_xy must be an iterable of X,Y pairs") from exc
+        if len(raw_centers) != grid_shape[0] * grid_shape[1]:
+            raise ValueError(
+                "site_centers_xy must contain one center per installed grid site"
+            )
+        height, width = frame_shape
+        centers: list[tuple[float, float]] = []
+        for index, value in enumerate(raw_centers):
+            try:
+                pair = tuple(value)
+            except TypeError as exc:
+                raise TypeError(
+                    f"site_centers_xy[{index}] must be an X,Y pair"
+                ) from exc
+            if len(pair) != 2:
+                raise ValueError(
+                    f"site_centers_xy[{index}] must contain X and Y"
+                )
+            x, y = float(pair[0]), float(pair[1])
+            if not math.isfinite(x) or not math.isfinite(y):
+                raise ValueError("site centers must be finite")
+            if not 0.0 <= x < width or not 0.0 <= y < height:
+                raise ValueError("site centers must lie inside the installed frame")
+            centers.append((x, y))
+        if len(set(centers)) != len(centers):
+            raise ValueError("installed site centers must be unique")
+        object.__setattr__(self, "frame_shape_yx", frame_shape)
+        object.__setattr__(self, "grid_shape_yx", grid_shape)
+        object.__setattr__(self, "site_centers_xy", tuple(centers))
+        object.__setattr__(
+            self,
+            "trigger_channel",
+            canonical_text(self.trigger_channel, "trigger_channel"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,4 +259,5 @@ __all__ = [
     "DeviceCatalogView",
     "DeviceInfo",
     "DeviceRef",
+    "ReadoutApparatusFacts",
 ]

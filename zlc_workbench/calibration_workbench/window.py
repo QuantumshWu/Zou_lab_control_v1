@@ -16,16 +16,19 @@ from zlc_frontend.qt_widgets import (
     GREY,
     ORANGE,
 )
-from zlc_neutral_atom.readout.calibration_application import (
+from zlc_neutral_atom.logic_nodes.calibration.application import (
     CalibrationArtifactRequest,
 )
-from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
+from zlc_neutral_atom.logic_nodes.calibration.calibration import (
+    build_calibration_analysis_request_from_authoring,
+    calibration_analysis_authoring_schema,
+)
+from zlc_neutral_atom.logic_nodes.calibration.reference import CalibrationArtifactRef
 from zlc_neutral_atom.runtime.run import RunCancelled, RunHandle
-from zlc_workbench.calibration import (
-    calibration_analysis_form,
-    calibration_analysis_from_form,
+from zlc_workbench.logic_node_presentations.calibration import (
     calibration_authority_summary,
 )
+from zlc_workbench.form_projection import project_authoring_form
 from zlc_workbench.run_owner import QtRunOwnerMailbox
 
 from zlc_workbench.frozen_raster import FrozenRasterWindow
@@ -186,11 +189,16 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             CalibrationArtifactRef,
         ):
             raise TypeError("previous_reference must be CalibrationArtifactRef or None")
-        prior = self._form_scroll.takeWidget()
+        prior = self._form_scroll.widget()
         if prior is not None:
+            prior.hide()
+            self._form_scroll.takeWidget()
+            prior.setParent(self)
             prior.deleteLater()
         form = FluentParameterForm(
-            calibration_analysis_form(request.analysis),
+            project_authoring_form(
+                calibration_analysis_authoring_schema(request.analysis)
+            ),
             parent=self,
         )
         form.setObjectName("calibrationParameters")
@@ -227,7 +235,7 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
         if request is None or form is None:
             return
         try:
-            analysis = calibration_analysis_from_form(
+            analysis = build_calibration_analysis_request_from_authoring(
                 request.analysis,
                 form.read_all(),
             )

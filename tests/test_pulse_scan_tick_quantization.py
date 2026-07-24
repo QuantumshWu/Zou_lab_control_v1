@@ -7,8 +7,13 @@ from fractions import Fraction
 import pytest
 
 from zlc_pulse.scan_template import scan_table_template
-from zlc_neutral_atom.pulse_programs import DEFAULT_PROBE_PULSE_PATH
-from zlc_neutral_atom.scan import ApiSegmentTable, ApiSlotSegmentedProgram
+from zlc_neutral_atom.logic_nodes.pulse_scan.authoring import (
+    DEFAULT_PROBE_PULSE_PATH,
+)
+from zlc_neutral_atom.logic_nodes.pulse_scan import (
+    ApiSegmentTable,
+    ApiSlotSegmentedProgram,
+)
 from zlc_pulse import (
     ScanColumnSpec,
     api_column_specs,

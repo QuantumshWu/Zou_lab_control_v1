@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable, Iterator, Mapping, TYPE_CHECKING
 from uuid import uuid4
 
@@ -40,47 +41,50 @@ from zlc_data import (
 )
 from zlc_neutral_atom.artifacts import (
     AdmittedFitResult,
-    CaptureArtifact,
-    CaptureArtifactRef,
-    CaptureRepository,
     FitExecution,
     FitResultArtifactRef,
     FitResultRepository,
 )
-from zlc_neutral_atom.capture_application import (
+from zlc_neutral_atom.logic_nodes.camera_capture.artifact import (
+    CaptureArtifact,
+    CaptureRepository,
+)
+from zlc_neutral_atom.logic_nodes.camera_capture.reference import CaptureArtifactRef
+from zlc_neutral_atom.logic_nodes.camera_capture.application import (
     CaptureRequest,
     PlanDescriptor,
     PreparedFiniteCapture,
-    PreparedFiniteCameraMeasurement,
     prepare_finite_capture,
-    prepare_finite_camera_measurement,
 )
-from zlc_neutral_atom.camera_measurement import (
+from zlc_neutral_atom.logic_nodes.camera_measurement import (
     CameraMeasurementRequest,
     DEFAULT_CAMERA_FRAMES_PER_CYCLE,
     DEFAULT_CAMERA_MEASUREMENT_REPEAT,
     DEFAULT_CAMERA_MEASUREMENT_ROLE,
-)
-from zlc_neutral_atom.monitor_application import (
+    DEFAULT_CAMERA_MONITOR_HISTORY_CYCLES,
+    PreparedFiniteCameraMeasurement,
     PreparedLiveCameraMeasurement,
+    prepare_finite_camera_measurement,
     prepare_live_camera_measurement,
 )
-from zlc_neutral_atom.mot_field import (
+from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
+from zlc_neutral_atom.logic_nodes.mot_field import (
     DEFAULT_MOT_FIELD_CAMERA_ROLE,
     DEFAULT_MOT_FIELD_CENTER_CODE,
     DEFAULT_MOT_FIELD_POINTS,
+    DEFAULT_MOT_FIELD_PULSE_PATH,
     DEFAULT_MOT_FIELD_ROI_RADIUS_PX,
     DEFAULT_MOT_FIELD_SPAN_CODE,
     MotFieldRequest,
     MotFieldResult,
     build_mot_scan_program,
 )
-from zlc_neutral_atom.mot_field_task import (
+from zlc_neutral_atom.logic_nodes.mot_field import (
     MotFieldTaskIntent,
     PreparedMotFieldTask,
     prepare_mot_field_task as prepare_mot_field_task_application,
 )
-from zlc_neutral_atom.pulse_application import (
+from zlc_neutral_atom.devices.sequencer.application import (
     AppliedPulseSnapshot,
     PreparedPulseExecution,
     PulseApplicationOwner,
@@ -91,8 +95,7 @@ from zlc_neutral_atom.pulse_application import (
     PulseTargetDescriptor,
     prepare_pulse_execution,
 )
-from zlc_neutral_atom.pulse_programs import DEFAULT_MOT_FIELD_PULSE_PATH
-from zlc_neutral_atom.readout.calibration import (
+from zlc_neutral_atom.logic_nodes.calibration.calibration import (
     BackgroundMode,
     BoxReducer,
     CalibrationAnalysisRequest,
@@ -101,15 +104,15 @@ from zlc_neutral_atom.readout.calibration import (
     ResolvedCalibration,
     ThresholdMethod,
 )
-from zlc_neutral_atom.readout.calibration_application import (
+from zlc_neutral_atom.logic_nodes.calibration.application import (
     CalibrationArtifactRequest,
     build_calibration_artifact_request,
     prepare_calibration_artifact_plan,
 )
-from zlc_neutral_atom.readout.calibration_reference import (
+from zlc_neutral_atom.logic_nodes.calibration.reference import (
     CalibrationArtifactRef,
 )
-from zlc_neutral_atom.readout.calibration_task import (
+from zlc_neutral_atom.logic_nodes.calibration.task import (
     CalibrationTaskIntent,
     PreparedCalibrationTask,
     admit_calibration_capture_export,
@@ -117,76 +120,81 @@ from zlc_neutral_atom.readout.calibration_task import (
     prepare_calibration_task as prepare_calibration_task_application,
     write_calibration_task_outputs as write_calibration_application_outputs,
 )
-from zlc_neutral_atom.readout.coupled_measurements import (
+from zlc_neutral_atom.logic_nodes.grey_molasses_detuning import (
     AutonomousMeasurementUnavailable,
     GREY_MOLASSES_CAPABILITY_GAP,
+    GreyMolassesDetuningApplicationCommand,
     GreyMolassesDetuningIntent,
     GreyMolassesDetuningRequest,
+    prepare_grey_molasses_detuning,
+    prepare_grey_molasses_detuning_application,
+)
+from zlc_neutral_atom.logic_nodes.readout_duration_fidelity import (
+    PreparedReadoutDurationFidelity,
+    ReadoutDurationFidelityApplicationCommand,
     ReadoutDurationFidelityIntent,
     ReadoutDurationFidelityRequest,
+    prepare_readout_duration_fidelity,
+    prepare_readout_duration_fidelity_application,
+)
+from zlc_neutral_atom.logic_nodes.release_recapture_common.application import (
+    PreparedReleaseRecapture,
+)
+from zlc_neutral_atom.logic_nodes.temperature_release_recapture import (
+    TemperatureReleaseRecaptureApplicationCommand,
     TemperatureReleaseRecaptureIntent,
     TemperatureReleaseRecaptureRequest,
-)
-from zlc_neutral_atom.readout.coupled_application import (
-    CoupledMeasurementApplicationCommand,
-    prepare_grey_molasses_detuning_application,
-    prepare_readout_duration_fidelity_application,
+    prepare_temperature_release_recapture,
     prepare_temperature_release_recapture_application,
 )
-from zlc_neutral_atom.readout.occupancy_reference import OccupancyArtifactRef
-from zlc_neutral_atom.readout.occupancy_cell import (
+from zlc_neutral_atom.logic_nodes.occupancy.reference import OccupancyArtifactRef
+from zlc_neutral_atom.logic_nodes.occupancy.cell import (
     ExactOccupancyCellSource,
     OccupancyCellDomain,
     inspect_occupancy_cell_domain,
     load_exact_occupancy_cell_source,
 )
-from zlc_neutral_atom.readout.contracts import (
-    CalibrationCaptureLayout,
-    ReadoutBindingKey,
-)
-from zlc_neutral_atom.readout.sitemap import (
+from zlc_neutral_atom.logic_nodes.readout_common.contracts import CalibrationCaptureLayout
+from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
+from zlc_neutral_atom.logic_nodes.calibration.sitemap import (
     SitemapAcquisitionProfile,
     SitemapCalibrationRequest,
     build_sitemap_analysis_request,
     build_sitemap_calibration_request,
 )
-from zlc_neutral_atom.scan import (
+from zlc_neutral_atom.logic_nodes.calibration.installation import (
+    build_sitemap_acquisition_profile,
+)
+from zlc_neutral_atom.logic_nodes.pulse_scan import (
     ApiSegmentTable,
     ApiSlotSegmentedProgram,
     AutonomousScanSlotProgram,
     MaterializedScanData,
-    OccupancyScanRequest,
     PulseScanProgram,
+    ScanPointTable,
+)
+from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import (
+    OccupancyScanRequest,
     ScanRequest,
     ScanSourceBinding,
-    ScanPointTable,
     build_scan_request,
 )
-from zlc_neutral_atom.scan.reference import ScanArtifactRef
-from zlc_neutral_atom.scan.application import (
+from zlc_neutral_atom.logic_nodes.pulse_scan.reference import ScanArtifactRef
+from zlc_neutral_atom.logic_nodes.pulse_scan.application import (
     PreparedExactScan,
     prepare_exact_scan,
 )
-from zlc_neutral_atom.occupancy_application import (
+from zlc_neutral_atom.logic_nodes.occupancy.application import (
     DetectionRequest,
     build_detection_request,
     prepare_detection_plan,
 )
-from zlc_neutral_atom.readout.reactive_occupancy_application import (
-    PreparedReactiveOccupancyMonitor,
-    ReactiveOccupancyMonitorRequest,
-    prepare_reactive_occupancy_monitor,
+from zlc_neutral_atom.logic_nodes.occupancy.processor_application import (
+    PreparedOccupancyProcessor,
+    OccupancyProcessorRequest,
+    prepare_occupancy_processor,
 )
-from zlc_neutral_atom.release_recapture_application import (
-    PreparedTemperatureReleaseRecapture,
-    prepare_grey_molasses_detuning,
-    prepare_temperature_release_recapture,
-)
-from zlc_neutral_atom.readout_duration_application import (
-    PreparedReadoutDurationFidelity,
-    prepare_readout_duration_fidelity,
-)
-from zlc_neutral_atom.timing.pulse import PulseScanProgress
+from zlc_neutral_atom.devices.sequencer.port import PulseScanProgress
 from zlc_neutral_atom.runtime.run import CancelOutcome, RunHandle
 from zlc_pulse import (
     PulseDocument,
@@ -200,16 +208,19 @@ from zlc_storage import positive_real as _positive_real
 if TYPE_CHECKING:
     from zlc_frontend import DataFigure
     from zlc_frontend.figure import FigureDocument, ViewIntent, ViewPreferences
-    from zlc_neutral_atom.readout.analysis import (
+    from zlc_neutral_atom.logic_nodes.calibration.analysis import (
         CalibrationComputation,
         CalibrationReport,
     )
-    from zlc_neutral_atom.readout.calibration_repository import (
+    from zlc_neutral_atom.logic_nodes.calibration.repository import (
         CalibrationRepository,
     )
-    from zlc_neutral_atom.readout.occupancy import ResolvedOccupancy
-    from zlc_neutral_atom.readout.occupancy_repository import OccupancyRepository
-    from zlc_neutral_atom.scan.repository import ScanArtifact, ScanRepository
+    from zlc_neutral_atom.logic_nodes.occupancy.processor import ResolvedOccupancy
+    from zlc_neutral_atom.logic_nodes.occupancy.repository import OccupancyRepository
+    from zlc_neutral_atom.logic_nodes.pulse_scan.repository import (
+        ScanArtifact,
+        ScanRepository,
+    )
 
 
 _DEFAULT_FIT_GUI_TIMEOUT_SECONDS = 30.0
@@ -294,6 +305,7 @@ class _ExperimentServices:
     occupancy_repository: "OccupancyRepository | None"
     fit_repository: FitResultRepository
     catalog: DeviceCatalogView
+    sitemap_profiles: Mapping[str, SitemapAcquisitionProfile]
     installation_config: InstallationConfigDocument
     pulse_application: PulseApplicationOwner
     operation_lock: threading.RLock
@@ -363,7 +375,7 @@ def _calibration_repository(
 ) -> "CalibrationRepository":
     repository = services.calibration_repository
     if repository is None:
-        from zlc_neutral_atom.readout.calibration_repository import (
+        from zlc_neutral_atom.logic_nodes.calibration.repository import (
             CalibrationRepository,
         )
 
@@ -377,7 +389,7 @@ def _occupancy_repository(
 ) -> "OccupancyRepository":
     repository = services.occupancy_repository
     if repository is None:
-        from zlc_neutral_atom.readout.occupancy_repository import (
+        from zlc_neutral_atom.logic_nodes.occupancy.repository import (
             OccupancyRepository,
         )
 
@@ -605,6 +617,7 @@ class ReadoutFacade:
         *,
         camera_role: str | None = None,
         repeat: int = DEFAULT_CAMERA_MEASUREMENT_REPEAT,
+        history_cycles: int = DEFAULT_CAMERA_MONITOR_HISTORY_CYCLES,
         frames_per_cycle: int = DEFAULT_CAMERA_FRAMES_PER_CYCLE,
     ) -> CameraMeasurementRequest:
         """Freeze Main's one Camera semantic: 0=live, K=finite."""
@@ -615,6 +628,7 @@ class ReadoutFacade:
             return CameraMeasurementRequest(
                 camera_ref=camera_ref,
                 repeat=repeat,
+                history_cycles=history_cycles,
                 frames_per_cycle=frames_per_cycle,
             )
 
@@ -744,7 +758,7 @@ class ReadoutFacade:
         self,
         intent: TemperatureReleaseRecaptureIntent,
         calibration_ref: CalibrationArtifactRef,
-    ) -> CoupledMeasurementApplicationCommand:
+    ) -> TemperatureReleaseRecaptureApplicationCommand:
         """Bind the complete Temperature Measurement behind one command."""
 
         return prepare_temperature_release_recapture_application(
@@ -819,7 +833,7 @@ class ReadoutFacade:
         self,
         intent: ReadoutDurationFidelityIntent,
         calibration_ref: CalibrationArtifactRef,
-    ) -> CoupledMeasurementApplicationCommand:
+    ) -> ReadoutDurationFidelityApplicationCommand:
         """Bind the complete readout-duration Measurement command."""
 
         return prepare_readout_duration_fidelity_application(
@@ -909,7 +923,7 @@ class ReadoutFacade:
         self,
         intent: GreyMolassesDetuningIntent,
         calibration_ref: CalibrationArtifactRef,
-    ) -> CoupledMeasurementApplicationCommand:
+    ) -> GreyMolassesDetuningApplicationCommand:
         """Bind the complete Grey-molasses Measurement command."""
 
         return prepare_grey_molasses_detuning_application(
@@ -1318,17 +1332,21 @@ class ReadoutFacade:
         self,
         camera_role: str | None,
     ) -> tuple[str, SitemapAcquisitionProfile]:
-        """Resolve the one installation-owned sitemap profile for a camera."""
+        """Resolve the explicitly composed sitemap profile for a camera."""
 
         with _service_guard(self._services) as services:
             selected_camera = self._resolve_camera_role(services, camera_role)
-            camera_ref = services.catalog.require(selected_camera).ref
-            profile = services.runtime.sitemap_profile(camera_ref)
+            try:
+                profile = services.sitemap_profiles[selected_camera]
+            except KeyError as exc:
+                raise ValueError(
+                    f"camera role {selected_camera!r} has no sitemap profile"
+                ) from exc
         if not isinstance(profile, SitemapAcquisitionProfile):
-            raise TypeError("installation returned an invalid sitemap profile")
+            raise TypeError("experiment composition contains an invalid sitemap profile")
         if profile.readout_binding != ReadoutBindingKey(selected_camera):
             raise ValueError(
-                "installation sitemap profile differs from the selected camera"
+                "composed sitemap profile differs from the selected camera"
             )
         return selected_camera, profile
 
@@ -1336,7 +1354,7 @@ class ReadoutFacade:
         """Installed camera roles with a complete live calibration profile."""
 
         with _service_guard(self._services) as services:
-            roles = tuple(services.runtime.sitemap_camera_roles())
+            roles = tuple(services.sitemap_profiles)
             cameras = set(services.catalog.roles("camera"))
         if any(role not in cameras for role in roles):
             raise RuntimeError(
@@ -1606,15 +1624,11 @@ class ReadoutFacade:
             self._require_binding(resolved.artifact.frame_contract.binding)
         return resolved
 
-    def prepare_reactive_occupancy_monitor(
+    def prepare_occupancy_processor_request(
         self,
-        camera_request: CameraMeasurementRequest,
-        camera_output_name: str,
-        *,
-        calibration_ref: CalibrationArtifactRef,
-        model_kind: ReadoutModelKind | None = None,
-    ) -> PreparedReactiveOccupancyMonitor:
-        """Bind one Camera output and admitted calibration for live Occupancy.
+        request: OccupancyProcessorRequest,
+    ) -> PreparedOccupancyProcessor:
+        """Admit and prepare one complete typed Occupancy Processor request.
 
         The returned command owns model selection, schema validation, and the
         complete ``counts/occupied/rate`` output transaction.  A Workbench may
@@ -1622,12 +1636,8 @@ class ReadoutFacade:
         loader or a physical projection callback.
         """
 
-        request = ReactiveOccupancyMonitorRequest(
-            camera_request,
-            camera_output_name,
-            calibration_ref,
-            model_kind,
-        )
+        if not isinstance(request, OccupancyProcessorRequest):
+            raise TypeError("request must be OccupancyProcessorRequest")
         with _service_guard(self._services) as services:
             resolved = _calibration_repository(services).admit(
                 request.calibration_ref,
@@ -1636,26 +1646,45 @@ class ReadoutFacade:
             self._require_binding(
                 resolved.artifact.frame_contract.binding
             )
-        return prepare_reactive_occupancy_monitor(request, resolved)
+        return prepare_occupancy_processor(request, resolved)
 
-    def prepare_saved_reactive_occupancy_monitor(
+    def prepare_occupancy_processor(
         self,
         camera_request: CameraMeasurementRequest,
-        camera_output_name: str,
+        camera_output: DatasetOutputDeclaration,
+        *,
+        calibration_ref: CalibrationArtifactRef,
+        model_kind: ReadoutModelKind | None = None,
+    ) -> PreparedOccupancyProcessor:
+        """Notebook convenience for constructing one typed Processor request."""
+
+        return self.prepare_occupancy_processor_request(
+            OccupancyProcessorRequest(
+                camera_request,
+                camera_output,
+                calibration_ref,
+                model_kind,
+            )
+        )
+
+    def prepare_saved_occupancy_processor(
+        self,
+        camera_request: CameraMeasurementRequest,
+        camera_output: DatasetOutputDeclaration,
         *,
         calibration_ref_file: str | Path,
         model_kind: ReadoutModelKind | None = None,
-    ) -> PreparedReactiveOccupancyMonitor:
-        """Bind live Occupancy from one explicit saved calibration pointer."""
+    ) -> PreparedOccupancyProcessor:
+        """Prepare Occupancy Processor from one saved calibration pointer."""
 
         resolved = self.load_saved_calibration(calibration_ref_file)
-        request = ReactiveOccupancyMonitorRequest(
+        request = OccupancyProcessorRequest(
             camera_request,
-            camera_output_name,
+            camera_output,
             resolved.reference,
             model_kind,
         )
-        return prepare_reactive_occupancy_monitor(request, resolved)
+        return self.prepare_occupancy_processor_request(request)
 
     def load_calibration_computation(
         self,
@@ -3092,7 +3121,7 @@ def _prepare_scan_for_services(
 def _prepare_temperature_release_recapture_for_services(
     services: _ExperimentServices,
     request: TemperatureReleaseRecaptureRequest,
-) -> PreparedTemperatureReleaseRecapture:
+) -> PreparedReleaseRecapture:
     if not isinstance(request, TemperatureReleaseRecaptureRequest):
         raise TypeError(
             "request must be TemperatureReleaseRecaptureRequest"
@@ -3132,7 +3161,7 @@ def _prepare_readout_duration_fidelity_for_services(
 def _prepare_grey_molasses_detuning_for_services(
     services: _ExperimentServices,
     request: GreyMolassesDetuningRequest,
-) -> PreparedTemperatureReleaseRecapture:
+) -> PreparedReleaseRecapture:
     if not isinstance(request, GreyMolassesDetuningRequest):
         raise TypeError("request must be GreyMolassesDetuningRequest")
     rf_info = services.catalog.find(request.rf_role)
@@ -3360,17 +3389,32 @@ def connect(
     runtime = None
     try:
         capture_repository = CaptureRepository(repository_root / "captures")
-        from zlc_neutral_atom.scan.repository import ScanRepository
+        from zlc_neutral_atom.logic_nodes.pulse_scan.repository import ScanRepository
 
         scan_repository = ScanRepository(repository_root / "scans")
         fit_repository = FitResultRepository(repository_root / "fits")
         from zlc_neutral_atom.bootstrap._installation import create_installation
 
-        runtime = create_installation(
+        installation = create_installation(
             installation_document,
             required_pulse_document=required_pulse_document,
         )
+        runtime = installation.runtime
         catalog = runtime.device_catalog
+        sitemap_profiles: dict[str, SitemapAcquisitionProfile] = {}
+        for apparatus in installation.readout_apparatus_facts:
+            camera_info = catalog.require(apparatus.camera_role)
+            sequencer_info = catalog.require(apparatus.sequencer_role)
+            profile = build_sitemap_acquisition_profile(
+                apparatus,
+                camera_port=runtime.camera_port(camera_info.ref),
+                pulse_port=runtime.pulse_port(sequencer_info.ref),
+            )
+            if profile.readout_binding.value in sitemap_profiles:
+                raise ValueError(
+                    "installation produced duplicate sitemap profile bindings"
+                )
+            sitemap_profiles[profile.readout_binding.value] = profile
         fit_operations_drained = threading.Event()
         fit_operations_drained.set()
         services = _ExperimentServices(
@@ -3383,6 +3427,7 @@ def connect(
             occupancy_repository=None,
             fit_repository=fit_repository,
             catalog=catalog,
+            sitemap_profiles=MappingProxyType(sitemap_profiles),
             installation_config=installation_document,
             pulse_application=PulseApplicationOwner(),
             operation_lock=threading.RLock(),

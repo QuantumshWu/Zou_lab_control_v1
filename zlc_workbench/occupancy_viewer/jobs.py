@@ -6,7 +6,7 @@ from concurrent.futures import CancelledError
 import threading
 
 from zlc_frontend.site_map_render import OccupancyCellView, compose_site_map_front
-from zlc_neutral_atom.readout.occupancy_cell import OccupancyCellDomain
+from zlc_neutral_atom.logic_nodes.occupancy.cell import OccupancyCellDomain
 
 
 _PANEL_ID = "sites"

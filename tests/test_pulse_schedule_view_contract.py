@@ -11,14 +11,29 @@ from PyQt5 import QtCore, QtTest, QtWidgets
 
 from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_pulse import (
+    DEFAULT_PERIOD_DURATION,
+    DEFAULT_REPEAT_COUNT,
+    DEFAULT_SCAN_SWEEP_COUNT,
+    DEFAULT_TIME_UNIT,
+    MIN_REPEAT_COUNT,
+    MIN_SCAN_SWEEP_COUNT,
+    PORT_DAC,
     PORT_DIGITAL,
+    TIME_UNIT_CHOICES,
     PulseDocument,
     PulsePeriod,
     PulsePortSpec,
     PulseTarget,
+    PulseTargetPortDraft,
     RepeatRegion,
+    build_pulse_target_manifest,
+    new_period,
+    pulse_target_port_width_spec,
 )
+from zlc_workbench.pulse_editor.scan_view import PulseScanView
 from zlc_workbench.pulse_editor.schedule_view import PulseScheduleView
+from zlc_workbench.pulse_editor.target_view import PulseTargetView
+from zlc_workbench.pulse import project_pulse_preview
 
 
 def _target(count: int) -> PulseTarget:
@@ -117,12 +132,12 @@ def test_summary_keeps_expanded_pulse_and_repeat_warnings() -> None:
         _process_events(application)
 
 
-def test_offline_summary_does_not_preflight_frozen_streamer_geometry() -> None:
+def test_offline_authoring_does_not_preflight_frozen_streamer_geometry() -> None:
     """A valid authoring target may exceed the currently deployed FPGA ABI.
 
-    The Edit summary must remain usable; Preview/Run preflight is the boundary
-    that may reject deployment.  This reproduces the former Qt-slot crash after
-    adding an Offline DAC port.
+    Edit and Preview must remain usable; Run/Deploy is the only boundary that
+    may reject the frozen hardware geometry.  This reproduces the former
+    Qt-slot crash after adding an Offline DAC port.
     """
 
     application = ensure_qt_app()
@@ -162,6 +177,9 @@ def test_offline_summary_does_not_preflight_frozen_streamer_geometry() -> None:
     view = PulseScheduleView(document)
     try:
         assert " | 1 pulses | " in view.summary_text()
+        preview = project_pulse_preview(document)
+        assert len(preview.rows) == 70
+        assert preview.rows[0].label == "Offline 0"
     finally:
         view.close()
         _process_events(application)
@@ -285,6 +303,91 @@ def test_one_period_add_bracket_emits_the_frozen_feedback() -> None:
         _process_events(application)
         assert feedback == ["Repeat needs at least two periods."]
         assert repeats == []
+    finally:
+        view.close()
+        _process_events(application)
+
+
+def test_leaf_editors_consume_owner_grid_defaults_and_unbounded_counts() -> None:
+    application = ensure_qt_app()
+    base = _interaction_document(period_count=2)
+    document = replace(
+        base,
+        repeat=RepeatRegion("p1", "p2", DEFAULT_REPEAT_COUNT),
+    )
+    view = PulseScheduleView(document)
+    scan = PulseScanView()
+    try:
+        card = view.period_cards()[0]
+        added = new_period(document)
+        assert (
+            tuple(
+                card.unit_combo.itemText(index)
+                for index in range(card.unit_combo.count())
+            ),
+            card.duration_edit._res_step,
+            (added.duration, added.unit),
+        ) == (
+            TIME_UNIT_CHOICES,
+            document.time_step_ns,
+            (DEFAULT_PERIOD_DURATION, DEFAULT_TIME_UNIT),
+        )
+
+        card.duration_edit.setText("13")
+        card.duration_edit.editingFinished.emit()
+        delay = view.channel_panel.delay_edits["ch0"]
+        delay.setText("-13")
+        delay.editingFinished.emit()
+        assert (card.duration_edit.text(), delay.text()) == ("10", "-10")
+
+        bracket = next(
+            item.widget
+            for item in view.drag_container.items
+            if item.item_type == "bracket_end"
+        )
+        assert (
+            bracket.repeat_spin.minimum(),
+            bracket.repeat_spin.maximum() > 999,
+            scan.scan_repeats_spin.minimum(),
+            scan.scan_repeats_spin.value(),
+            scan.scan_repeats_spin.maximum() > 999,
+        ) == (
+            MIN_REPEAT_COUNT,
+            True,
+            MIN_SCAN_SWEEP_COUNT,
+            DEFAULT_SCAN_SWEEP_COUNT,
+            True,
+        )
+    finally:
+        view.close()
+        scan.close()
+        _process_events(application)
+
+
+def test_target_width_uses_owner_default_without_a_gui_product_cap() -> None:
+    application = ensure_qt_app()
+    manifest = build_pulse_target_manifest(
+        (PulseTargetPortDraft("ttl", PORT_DIGITAL, "TTL", ("TTL0",)),)
+    )
+    view = PulseTargetView(manifest, editable=True, mode="offline")
+    try:
+        view._add_dac()
+        row = next(item for item in view._rows if item.kind == PORT_DAC)
+        owner = pulse_target_port_width_spec(PORT_DAC)
+        assert (
+            owner.minimum,
+            owner.default,
+            owner.maximum,
+            row.width.minimum(),
+            row.width.value(),
+            row.width.maximum() > 32,
+        ) == (2, 10, None, 2, 10, True)
+
+        row.width.setValue(33)
+        assert (
+            len(view._endpoint_values(row.endpoints.text())),
+            view.draft_manifest().target.by_key[row.key].width,
+        ) == (33, 33)
     finally:
         view.close()
         _process_events(application)

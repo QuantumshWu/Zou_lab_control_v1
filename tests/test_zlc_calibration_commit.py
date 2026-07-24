@@ -12,29 +12,29 @@ import textwrap
 
 import pytest
 
-import zlc_neutral_atom.readout.analysis as analysis_module
-from zlc_neutral_atom.readout.analysis import (
+import zlc_neutral_atom.logic_nodes.calibration.analysis as analysis_module
+from zlc_neutral_atom.logic_nodes.calibration.analysis import (
     CalibrationAnalysisResult,
     CalibrationComputation,
     compute_calibration,
 )
-from zlc_neutral_atom.readout.calibration import (
+from zlc_neutral_atom.logic_nodes.calibration.calibration import (
     CalibrationAnalysisRequest,
     ResolvedCalibration,
 )
-from zlc_neutral_atom.readout.calibration_application import (
+from zlc_neutral_atom.logic_nodes.calibration.application import (
     CalibrationArtifactRequest,
     build_calibration_artifact_request,
     calibration_request_from_computation,
 )
-from zlc_neutral_atom.readout.calibration_repository import (
+from zlc_neutral_atom.logic_nodes.calibration.repository import (
     compile_calibration_artifact_plan,
 )
-from zlc_neutral_atom.readout.sitemap import (
+from zlc_neutral_atom.logic_nodes.calibration.sitemap import (
     SitemapCalibrationRequest,
     build_sitemap_calibration_request,
 )
-from zlc_neutral_atom.occupancy_application import (
+from zlc_neutral_atom.logic_nodes.occupancy.application import (
     DetectionRequest,
     build_detection_request,
 )
@@ -66,8 +66,12 @@ def _run_isolated(script: str, workspace: Path) -> dict[str, object]:
 
 
 def test_calibration_analysis_owner_is_split_from_commit_authority():
-    assert CalibrationAnalysisRequest.__module__.endswith("readout.calibration")
-    assert compute_calibration.__module__.endswith("readout.analysis")
+    assert CalibrationAnalysisRequest.__module__.endswith(
+        "logic_nodes.calibration.calibration"
+    )
+    assert compute_calibration.__module__.endswith(
+        "logic_nodes.calibration.analysis"
+    )
     assert not hasattr(analysis_module, "analyze_calibration")
     assert inspect.isclass(CalibrationComputation)
     with pytest.raises(TypeError, match="returned by a committed calibration Run"):
@@ -150,8 +154,8 @@ def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_pa
         import sys
 
         from Zou_lab_control.notebook import connect
-        from zlc_neutral_atom.artifacts import CaptureRepository
-        from zlc_neutral_atom.readout.calibration_repository import (
+        from zlc_neutral_atom.logic_nodes.camera_capture.artifact import CaptureRepository
+        from zlc_neutral_atom.logic_nodes.calibration.repository import (
             CalibrationRepository,
         )
 
@@ -211,7 +215,7 @@ def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_pa
 
 
 def test_removed_calibration_commit_wrappers_are_not_reintroduced():
-    import zlc_neutral_atom.readout.calibration_repository as repository_module
+    import zlc_neutral_atom.logic_nodes.calibration.repository as repository_module
 
     for removed in (
         "CalibrationCommit",

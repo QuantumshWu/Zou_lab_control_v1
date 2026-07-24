@@ -6,7 +6,7 @@ import gc
 import threading
 import numpy as np
 from zlc_data import FitBatchStatus, FitResultBatch
-from zlc_storage import positive_integer
+from zlc_storage import nonnegative_integer, positive_integer
 from .figure import (
     EvaluatedAxis,
     EvaluatedCurve,

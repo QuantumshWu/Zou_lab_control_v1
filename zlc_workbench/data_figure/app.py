@@ -138,7 +138,7 @@ def _figure_window_factory(
     worker_thread_id: int | None = None
     cached_typed: DataFigure | None = None
     cached_base: DataFigure | None = None
-    cached_typed_grid: tuple[ViewIntent, DataFigure] | None = None
+    cached_typed_grid: tuple[ViewIntent, DataFigure, str | None] | None = None
     cached_grid_histogram_home_x_limits: tuple[float, float] | None = None
 
     def require_worker_owner() -> None:
@@ -226,8 +226,18 @@ def _figure_window_factory(
                 raise ValueError(
                     "a multi-panel figure does not accept one single-panel display state"
                 )
-            if initial_fit_result_identity is not None:
-                raise ValueError("Fit result identity was supplied for a typed grid")
+            if figure.has_fit_overlays and initial_fit_result_identity is None:
+                return _encoded_figure(
+                    figure,
+                    cancelled,
+                    unavailable_reason=(
+                        "typed Fit replay requires an exact caller-supplied result identity"
+                    ),
+                )
+            if not figure.has_fit_overlays and initial_fit_result_identity is not None:
+                raise ValueError(
+                    "Fit result identity was supplied for a source-only typed grid"
+                )
             overview = _render_typed_grid_overview(
                 figure,
                 cancelled,
@@ -238,7 +248,11 @@ def _figure_window_factory(
                 presentation_title=presentation_title,
                 presentation_value_label=presentation_value_label,
             )
-            cached_typed_grid = (grid_intent, figure)
+            cached_typed_grid = (
+                grid_intent,
+                figure,
+                initial_fit_result_identity,
+            )
             return overview
         if initial_grid_display is not None:
             raise ValueError(
@@ -269,12 +283,14 @@ def _figure_window_factory(
         if isinstance(state, _GridFocusRequest):
             if cached_typed_grid is None:
                 raise RuntimeError("typed grid focus has no frozen source")
-            grid_intent, grid = cached_typed_grid
+            grid_intent, grid, grid_fit_result_identity = cached_typed_grid
             display = state.display
             if _state_intent(display) is not grid_intent:
                 raise ValueError("typed grid focus intent changed after overview")
             if fit_result is not None or fit_result_identity is not None:
-                raise ValueError("typed grid focus cannot carry a Fit result")
+                raise ValueError(
+                    "typed grid focus does not accept a transient Fit result"
+                )
             cached_typed = None
             cached_base = None
             focused = grid.focused_typed_panel(
@@ -290,6 +306,7 @@ def _figure_window_factory(
                 previous_count_scale=None,
                 sequence=sequence,
                 cancelled=cancelled,
+                fit_result_identity=grid_fit_result_identity,
                 histogram_projection_value_range=state.histogram_home_x_limits,
                 raster_size=raster_size,
                 size_name=size_name,
@@ -298,7 +315,11 @@ def _figure_window_factory(
                 presentation_value_label=presentation_value_label,
             )
             cached_typed = focused
-            cached_base = focused
+            cached_base = (
+                focused.with_fit_results(None)
+                if focused.has_fit_overlays
+                else focused
+            )
             cached_grid_histogram_home_x_limits = state.histogram_home_x_limits
             return front
         figure = cached_typed
@@ -359,10 +380,6 @@ def _figure_window_factory(
         initial_display=initial_display,
         embedded=embedded,
         logical_panel_size=logical_size,
-        size_name=size_name,
-        pixel_ratio=pixel_ratio,
-        presentation_title=presentation_title,
-        presentation_value_label=presentation_value_label,
     )
 
 def create_data_figure_pane(

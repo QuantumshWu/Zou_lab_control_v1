@@ -35,7 +35,7 @@ class FitAuthoringPane(QtWidgets.QWidget):
     clearRequested = QtCore.pyqtSignal()
     editorChanged = QtCore.pyqtSignal(int)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, label_width: int | None = None) -> None:
         super().__init__(parent)
         self._fit_options: dict[str, FitAuthoringOption] = {}
         self._argument_drafts: dict[str, str] = {}
@@ -50,14 +50,26 @@ class FitAuthoringPane(QtWidgets.QWidget):
 
         self.model_combo = FluentComboBox(self)
         self.model_combo.setObjectName("fitAuthoringModel")
-        layout.addWidget(FluentSettingRow("model", self.model_combo))
+        layout.addWidget(
+            FluentSettingRow(
+                "model",
+                self.model_combo,
+                label_width=label_width,
+            )
+        )
 
         self.arguments_edit = FluentLineEdit("", self)
         self.arguments_edit.setObjectName("fitAuthoringArguments")
         self.arguments_edit.setPlaceholderText(
             "auto (for example: center=50, sigma_lower=0)"
         )
-        layout.addWidget(FluentSettingRow("args", self.arguments_edit))
+        layout.addWidget(
+            FluentSettingRow(
+                "args",
+                self.arguments_edit,
+                label_width=label_width,
+            )
+        )
 
         self.fit_button = FluentButton("Fit", self, color=GREEN)
         self.fit_button.setObjectName("fitAuthoringFitButton")

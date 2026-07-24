@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.pulse_application import PulseTargetDescriptor
+from zlc_neutral_atom.devices.sequencer.application import PulseTargetDescriptor
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
 from zlc_pulse import (
     PORT_DIGITAL,

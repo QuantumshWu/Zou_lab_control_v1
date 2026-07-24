@@ -17,7 +17,7 @@ from .capture_plan import (
     capture_cell_join_contract_from_tree,
     capture_cell_join_contract_to_tree,
 )
-from .pulse import (
+from zlc_neutral_atom.devices.sequencer.port import (
     PulseTerminalAck,
     pulse_terminal_ack_from_tree,
     pulse_terminal_ack_to_tree,

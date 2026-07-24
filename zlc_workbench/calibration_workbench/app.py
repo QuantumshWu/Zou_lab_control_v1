@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from zlc_workbench.frozen_raster import FrozenRasterWindow
-    from zlc_neutral_atom.readout.calibration_reference import (
+    from zlc_neutral_atom.logic_nodes.calibration.reference import (
         CalibrationArtifactRef,
     )
-    from zlc_neutral_atom.readout.calibration_application import (
+    from zlc_neutral_atom.logic_nodes.calibration.application import (
         CalibrationArtifactRequest,
     )
 
@@ -25,7 +25,7 @@ def open_calibration_report_workbench(
     from zlc_workbench.frozen_raster import (
         open_frozen_raster_window,
     )
-    from zlc_neutral_atom.readout.calibration_reference import (
+    from zlc_neutral_atom.logic_nodes.calibration.reference import (
         CalibrationArtifactRef,
     )
 

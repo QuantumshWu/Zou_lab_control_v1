@@ -2,13 +2,14 @@
 # zlc_edge_streamer): BRAM edge/scan tables + 1-tick FIFO prefetch + 2-bank
 # streaming scan, JTAG-to-AXI control.  ONE clean build (no variants).
 #
-# 35T solved geometry (host.image.solve_capacity, <=90% target): 4096 edges +
-# bank_size 2048 (4096 resident scan points) + UNBOUNDED streaming @ 78% RAMB36.
+# Frozen 35T geometry: 4096 edges + bank_size 2048 (4096 fully resident scan
+# points).  The RTL contains a refill mailbox, but the current qualified host
+# deliberately admits only the resident window.
 #
-# *** The engine + control FSM are PROVEN by cycle-accurate Python models
+# *** The engine + control FSM have cycle-accurate Python models
 # (engine_model.rtl_mirror_play == reference at read latency 1/2/3 incl. 1-tick;
 # streaming_scan_play gapless/stall) and contract tests, but the multi-BRAM AXI
-# integration is BLIND (no Verilog sim in repo) and needs on-board bring-up.  IP
+# integration also has targeted xsim benches and still needs on-board evidence.  IP
 # property names are version-specific: each is set defensively (zlc_try warns,
 # does not abort); the real CONFIG.* are dumped -- grep "ZLC IPDUMP"/"ZLC
 # TRY-FAIL".  CRITICAL: the 3 edge BRAMs are forced to READ_LATENCY_B = 2 (both
@@ -352,9 +353,29 @@ phys_opt_design
 route_design
 set bit_path [file join $impl_dir ${top}.bit]
 set ltx_path [file join $impl_dir ${top}.ltx]
+report_utilization -file [file join $impl_dir ${top}_utilization_routed.rpt]
+report_timing_summary -file [file join $impl_dir ${top}_timing_summary_routed.rpt]
+
+# Producing a .bit file is not sufficient qualification for a physical timing
+# source.  Reject setup or hold violations before a recovery image can exist.
+proc zlc_require_nonnegative_slack {delay_type label} {
+    set paths [get_timing_paths -quiet -delay_type $delay_type -max_paths 1 -nworst 1]
+    if {[llength $paths] == 0} {
+        error "No constrained $label timing path was found; refusing an unattested bitstream"
+    }
+    set slack [get_property SLACK [lindex $paths 0]]
+    if {![string is double -strict $slack]} {
+        error "Vivado returned a non-numeric $label slack: $slack"
+    }
+    if {$slack < 0.0} {
+        error "$label timing failed: worst slack $slack ns"
+    }
+    puts "ZLC $label timing slack: $slack ns"
+}
+zlc_require_nonnegative_slack max setup
+zlc_require_nonnegative_slack min hold
+
 write_bitstream -force $bit_path
 catch {write_debug_probes -force $ltx_path}
-report_utilization -file [file join $impl_dir ${top}_utilization_routed.rpt]
-catch {report_timing_summary -file [file join $impl_dir ${top}_timing_summary_routed.rpt]}
 if {![file exists $bit_path]} { error "Bitstream was not generated: $bit_path" }
 puts "ZLC bitstream: $bit_path"

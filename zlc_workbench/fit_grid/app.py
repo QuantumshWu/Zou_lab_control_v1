@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from zlc_neutral_atom.fit_reference import FitResultArtifactRef
+from zlc_neutral_atom.artifacts.fit_reference import FitResultArtifactRef
 from zlc_workbench.window_runtime import open_workbench_window
 
 from .window import SavedFitGridWindow

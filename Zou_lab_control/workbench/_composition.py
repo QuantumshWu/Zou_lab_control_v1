@@ -36,33 +36,96 @@ def task_console_ports(experiment):
     from zlc_workbench.task_console.application_ports import (
         TaskConsoleApplicationPorts,
     )
+    from Zou_lab_control.workbench.task_console_attachments.calibration import (
+        calibration_attachment,
+    )
+    from Zou_lab_control.workbench.task_console_attachments.camera_measurement import (
+        camera_measurement_attachment,
+    )
+    from Zou_lab_control.workbench.task_console_attachments.coupled_measurements import (
+        coupled_measurement_attachments,
+    )
+    from Zou_lab_control.workbench.task_console_attachments.mot_field import (
+        mot_field_attachment,
+    )
+    from Zou_lab_control.workbench.task_console_attachments.occupancy import (
+        occupancy_attachment,
+    )
+    from Zou_lab_control.workbench.task_console_attachments.pulse_scan import (
+        pulse_scan_attachment,
+    )
 
-    def load_saved_calibration_reference(path):
-        return readout.load_saved_calibration(path).reference
+    def resolve_artifact_reference(binding):
+        from zlc_neutral_atom.logic_nodes.calibration.reference import (
+            CALIBRATION_ARTIFACT_REF_FORMAT,
+            CalibrationArtifactRef,
+        )
+        from zlc_workbench.input_binding import ResolvedArtifactInput
 
+        if not isinstance(binding, ResolvedArtifactInput):
+            raise TypeError("binding must be ResolvedArtifactInput")
+        if binding.selection.spec.output_contract_id != CALIBRATION_ARTIFACT_REF_FORMAT:
+            raise ValueError(
+                "TaskConsole composition has no resolver for artifact contract "
+                f"{binding.selection.spec.output_contract_id!r}"
+            )
+        producer = binding.producer
+        if producer is None:
+            path = binding.selection.reference_path
+            if path is None:
+                raise RuntimeError("saved artifact input lost its exact path")
+            reference = readout.load_saved_calibration(path).reference
+        else:
+            if producer.running:
+                raise RuntimeError("the selected artifact-producing Task is running")
+            if not producer.final_result_resolved:
+                raise RuntimeError(
+                    "the selected artifact producer has no successful current FINAL result"
+                )
+            reference = producer.final_result
+        if not isinstance(reference, CalibrationArtifactRef):
+            raise TypeError("artifact resolver returned another reference type")
+        return reference
+
+    camera_roles = catalog.roles("camera")
+    rf_roles = catalog.roles("rf")
+    attachments = (
+        camera_measurement_attachment(
+            installed_camera_roles=camera_roles,
+            request_builder=readout.camera_measurement_request,
+            prepare=readout.prepare_camera_measurement,
+        ),
+        *coupled_measurement_attachments(
+            installed_rf_roles=rf_roles,
+            prepare_temperature=(
+                readout.prepare_temperature_release_recapture_application
+            ),
+            prepare_readout_duration=(
+                readout.prepare_readout_duration_fidelity_application
+            ),
+            prepare_grey_molasses=(
+                readout.prepare_grey_molasses_detuning_application
+            ),
+        ),
+        occupancy_attachment(
+            prepare=readout.prepare_occupancy_processor_request,
+        ),
+        calibration_attachment(
+            sitemap_camera_roles=readout.sitemap_camera_roles(),
+            prepare=readout.prepare_calibration_task,
+        ),
+        mot_field_attachment(
+            installed_camera_roles=camera_roles,
+            prepare=readout.prepare_mot_field_task,
+        ),
+        pulse_scan_attachment(
+            prepare=readout.prepare_scan_source,
+            read_pulse_template=describe_pulse_template,
+        ),
+    )
     return TaskConsoleApplicationPorts(
-        installed_camera_roles=catalog.roles("camera"),
-        sitemap_camera_roles=readout.sitemap_camera_roles(),
-        installed_rf_roles=catalog.roles("rf"),
-        build_camera_measurement_request=readout.camera_measurement_request,
-        prepare_camera_measurement=readout.prepare_camera_measurement,
-        load_saved_calibration_reference=load_saved_calibration_reference,
-        prepare_temperature_release_recapture=(
-            readout.prepare_temperature_release_recapture_application
-        ),
-        prepare_readout_duration_fidelity=(
-            readout.prepare_readout_duration_fidelity_application
-        ),
-        prepare_grey_molasses_detuning=(
-            readout.prepare_grey_molasses_detuning_application
-        ),
-        prepare_reactive_occupancy=(
-            readout.prepare_reactive_occupancy_monitor
-        ),
-        prepare_calibration_task=readout.prepare_calibration_task,
-        prepare_mot_field_task=readout.prepare_mot_field_task,
-        prepare_scan_source=readout.prepare_scan_source,
-        read_pulse_template=describe_pulse_template,
+        attachments=attachments,
+        resolve_artifact_reference=resolve_artifact_reference,
     )
 
 

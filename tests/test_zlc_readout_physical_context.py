@@ -19,7 +19,7 @@ from zlc_data import (
     ValidityContract,
     ValueSchema,
 )
-from zlc_neutral_atom.readout.physical_context import (
+from zlc_neutral_atom.logic_nodes.readout_common.physical_context import (
     BusReadoutTrace,
     DigitalReadoutTrace,
     derive_readout_physical_context,

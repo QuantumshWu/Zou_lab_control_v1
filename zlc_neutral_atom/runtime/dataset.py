@@ -1916,11 +1916,11 @@ class MonitorDataset(Generic[PayloadT]):
                     "append_window requires dense MONITOR_HISTORY storage, "
                     "optionally followed by one READOUT_EVENT axis"
                 )
-            self._append_history_capacity = history_axis.size
+            self._append_history_slots = history_axis.size
             self._append_group_size = 1 if event_axis is None else event_axis.size
         else:
             edge.validate_stream(self._source)
-            self._append_history_capacity = 0
+            self._append_history_slots = 0
             self._append_group_size = 0
         self.stream_id = self._source.stream_id
         self.generation = self._source.generation
@@ -2160,7 +2160,7 @@ class MonitorDataset(Generic[PayloadT]):
                         )
                     if update.missed != 0:
                         raise DatasetError(
-                            "append replacement publication overwrote an unconsumed event"
+                            "append replacement requires ordered monitor delivery"
                         )
                     if self._revision != replacement.base_revision:
                         raise DatasetError(
@@ -2173,8 +2173,8 @@ class MonitorDataset(Generic[PayloadT]):
                     self._validity = replacement.validity
                     self._cell_metadata = replacement.cell_metadata
                     self._event_refs = replacement.event_refs
-                    capacity = self._append_history_capacity
-                    self._next_slot = 1 % capacity
+                    history_slots = self._append_history_slots
+                    self._next_slot = 1 % history_slots
                     self._count = 1
                     self._missed_events = 0
                     self._last_sequence = envelope.sequence
@@ -2254,10 +2254,10 @@ class MonitorDataset(Generic[PayloadT]):
                     self._append_group.clear()
                     self._next_slot = (
                         next_slot + 1
-                    ) % self._append_history_capacity
+                    ) % self._append_history_slots
                     self._count = min(
                         self._count + 1,
-                        self._append_history_capacity,
+                        self._append_history_slots,
                     )
                     self._head = envelope.ref
                     self._revision += 1
@@ -2311,9 +2311,9 @@ class MonitorDataset(Generic[PayloadT]):
             cell_metadata[flat_cell] = metadata
             event_refs[flat_cell] = envelope.ref
             if self._cycle_schedule is None:
-                capacity = self._append_history_capacity
-                self._next_slot = (next_slot + 1) % capacity
-                self._count = min(count + 1, capacity)
+                history_slots = self._append_history_slots
+                self._next_slot = (next_slot + 1) % history_slots
+                self._count = min(count + 1, history_slots)
             self._missed_events = missed_events
             self._last_sequence = envelope.sequence
             self._head = envelope.ref
@@ -2386,10 +2386,15 @@ class MonitorDataset(Generic[PayloadT]):
         return False
 
     def _append_order_locked(self) -> tuple[int, ...]:
-        capacity = self._append_history_capacity
-        used = tuple((self._next_slot - 1 - age) % capacity for age in range(self._count))
+        history_slots = self._append_history_slots
+        used = tuple(
+            (self._next_slot - 1 - age) % history_slots
+            for age in range(self._count)
+        )
         used_set = set(used)
-        slots = used + tuple(slot for slot in range(capacity) if slot not in used_set)
+        slots = used + tuple(
+            slot for slot in range(history_slots) if slot not in used_set
+        )
         return tuple(
             slot * self._append_group_size + event_index
             for slot in slots

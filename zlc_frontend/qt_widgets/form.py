@@ -72,20 +72,16 @@ class FormRuntimeContext:
     def names_for(self, key: str) -> tuple[str, ...]:
         if not callable(self.signal_names):
             return ()
-        try:
-            return tuple(str(value) for value in self.signal_names(str(key)))
-        except Exception:
-            return ()
+        return tuple(str(value) for value in self.signal_names(str(key)))
 
     @staticmethod
     def _mapping(provider) -> Mapping[str, object]:
         if not callable(provider):
             return _empty_mapping()
-        try:
-            value = provider()
-        except Exception:
-            return _empty_mapping()
-        return value if isinstance(value, Mapping) else _empty_mapping()
+        value = provider()
+        if not isinstance(value, Mapping):
+            raise TypeError("dynamic form provider must return a mapping")
+        return value
 
     def sources(self) -> Mapping[str, object]:
         return self._mapping(self.signal_sources)
@@ -927,7 +923,11 @@ class FluentParameterForm(QtWidgets.QWidget):
                 if key in desired_keys and key not in replaced_keys:
                     continue
                 self._layout.removeWidget(row)
-                row.setParent(None)
+                # Reconcile may run while an Edit page is visible.  An
+                # unparented QWidget becomes a transient native window; hide
+                # the retired row and retain this form as QObject owner until
+                # DeferredDelete instead.
+                row.hide()
                 row.deleteLater()
                 self._rows.pop(key, None)
                 self._widgets.pop(key, None)

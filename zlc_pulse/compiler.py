@@ -96,8 +96,6 @@ def compile_pulse_document(
             raise TypeError("live_target must be PulseTarget")
         if live_target.abi_fingerprint != document.target.abi_fingerprint:
             raise ValueError("pulse document target ABI differs from live target")
-    _validate_target_geometry(document.target, geometry)
-
     if execution_form in (
         PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
         PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
@@ -166,6 +164,7 @@ def compile_pulse_artifact(
                 f"trigger lane {channel!r} belongs to {owner.kind!r}, not a digital port"
             )
     geometry = params or StreamerParams()
+    _validate_target_geometry(document.target, geometry)
     target_ir = compile_pulse_document(
         document,
         clock_hz=clock_hz,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -24,3 +25,21 @@ class CleanupReport:
         errors: tuple[BaseException, ...] = (),
     ) -> "CleanupReport":
         return cls(tuple(errors))
+
+
+def run_cleanup_steps(
+    *steps: Callable[[], CleanupReport],
+) -> CleanupReport:
+    """Run every physical cleanup step and aggregate all failures."""
+
+    errors: list[BaseException] = []
+    for step in steps:
+        try:
+            report = step()
+            if not isinstance(report, CleanupReport):
+                raise TypeError("hardware cleanup step must return CleanupReport")
+        except BaseException as error:
+            errors.append(error)
+            continue
+        errors.extend(report.errors)
+    return CleanupReport.complete(errors=tuple(errors))

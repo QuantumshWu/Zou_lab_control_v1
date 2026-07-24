@@ -322,7 +322,7 @@ _HISTOGRAM_DISPLAY_FORM = FormSpec(
         FormFieldProps(
             "count_scale",
             "choice",
-            "Count scale",
+            "Log count",
             default=HistogramCountScale.LINEAR,
             choices=tuple(
                 FormChoice(scale.value.title(), scale)
@@ -875,57 +875,48 @@ class HistogramBinProjection:
         object.__setattr__(self, "requested_bin_count", bins)
 
 
-@dataclass(frozen=True, slots=True, eq=False, init=False)
-class _WindowedHistogramProjection:
-    """Renderer-private robust bars for Main-equivalent Grid thumbnails."""
+def _windowed_histogram_projection(
+    series_samples: tuple[np.ndarray, ...],
+    bins: int,
+    *,
+    visible_range: DisplayRange,
+) -> tuple[tuple[np.ndarray, ...], np.ndarray]:
+    """Build renderer-private robust bars for Main-equivalent Grid thumbnails."""
 
-    visible_bin_counts: tuple[np.ndarray, ...]
-    visible_bin_edges: np.ndarray
-
-    def __init__(
-        self,
-        series_samples: tuple[np.ndarray, ...],
-        bins: int,
-        *,
-        visible_range: DisplayRange,
-    ) -> None:
-        values_by_series = _histogram_series(series_samples)
-        bins = _histogram_bin_count(bins)
-        low, high = validated_display_range(
-            visible_range,
-            "windowed histogram visible_range",
+    values_by_series = _histogram_series(series_samples)
+    bins = _histogram_bin_count(bins)
+    low, high = validated_display_range(
+        visible_range,
+        "windowed histogram visible_range",
+    )
+    # The live Grid's visible bars intentionally retain Main's robust
+    # uniformly-spaced thumbnail geometry, including boolean payloads.
+    edges = _immutable_histogram_array(
+        np.linspace(low, high, bins + 1, dtype=np.float64),
+        np.dtype(np.float64),
+    )
+    visible_counts = []
+    for values in values_by_series:
+        histogram_values = (
+            values.astype(np.uint8, copy=False)
+            if values.dtype.kind == "b"
+            else values
         )
-        # The live Grid's visible bars intentionally retain Main's robust
-        # uniformly-spaced thumbnail geometry, including boolean payloads.
-        edges = _immutable_histogram_array(
-            np.linspace(low, high, bins + 1, dtype=np.float64),
-            np.dtype(np.float64),
+        counts = np.histogram(histogram_values, bins=edges)[0]
+        underflow = int(np.count_nonzero(histogram_values < edges[0]))
+        overflow = int(np.count_nonzero(histogram_values > edges[-1]))
+        visible = int(np.sum(counts, dtype=np.int64))
+        if visible + underflow + overflow != int(values.size):
+            raise RuntimeError("windowed histogram did not account for every sample")
+        visible_counts.append(
+            _immutable_histogram_array(
+                np.asarray(counts, dtype=np.int64),
+                np.dtype(np.int64),
+            )
         )
-        visible_counts = []
-        for values in values_by_series:
-            histogram_values = (
-                values.astype(np.uint8, copy=False)
-                if values.dtype.kind == "b"
-                else values
-            )
-            counts = np.histogram(histogram_values, bins=edges)[0]
-            underflow = int(np.count_nonzero(histogram_values < edges[0]))
-            overflow = int(np.count_nonzero(histogram_values > edges[-1]))
-            visible = int(np.sum(counts, dtype=np.int64))
-            if visible + underflow + overflow != int(values.size):
-                raise RuntimeError(
-                    "windowed histogram did not account for every sample"
-                )
-            visible_counts.append(
-                _immutable_histogram_array(
-                    np.asarray(counts, dtype=np.int64),
-                    np.dtype(np.int64),
-                )
-            )
-        # Under/overflow are construction-time conservation facts only.  A
-        # display micro-fit consumes the visible bars it actually annotates.
-        object.__setattr__(self, "visible_bin_counts", tuple(visible_counts))
-        object.__setattr__(self, "visible_bin_edges", edges)
+    # Under/overflow are construction-time conservation facts only.  A
+    # display micro-fit consumes the visible bars it actually annotates.
+    return tuple(visible_counts), edges
 
 
 def histogram_home_x_limits(edges: np.ndarray) -> DisplayRange:

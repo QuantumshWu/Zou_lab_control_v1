@@ -197,11 +197,6 @@ _NUMPY_MAX_NDIM = _probe_numpy_max_ndim()
 _NUMPY_MAX_INDEX = int(np.iinfo(np.intp).max)
 
 
-@dataclass
-class _InspectionState:
-    events: list["CanonicalStructureEvent"]
-
-
 CanonicalStructureEvent: TypeAlias = CanonicalListEvent | CanonicalArrayEvent
 CanonicalStructureAdmission: TypeAlias = Callable[
     [tuple[CanonicalStructureEvent, ...]],
@@ -278,13 +273,12 @@ def decode(
         raise CanonicalEncodingError("payload is valid but not in canonical form")
     if admit_structure is not None and not callable(admit_structure):
         raise TypeError("admit_structure must be callable or None")
-    state = _InspectionState([])
+    events: list[CanonicalStructureEvent] = []
     try:
-        _inspect_value(tagged, path="$", event_path=(), state=state)
+        _inspect_value(tagged, path="$", event_path=(), events=events)
     except RecursionError as exc:
         raise CanonicalEncodingError("canonical structure exceeds recursion limit") from exc
     if admit_structure is not None:
-        events = state.events
         admit_structure(tuple(events))
     try:
         value = _decode_value(tagged, path="$")
@@ -323,7 +317,7 @@ def _inspect_value(
     *,
     path: str,
     event_path: tuple[str | int, ...],
-    state: _InspectionState,
+    events: list[CanonicalStructureEvent],
 ) -> None:
     if not isinstance(tagged, list) or not tagged or not isinstance(tagged[0], str):
         raise CanonicalEncodingError(f"{path}: expected a tagged canonical value")
@@ -372,13 +366,13 @@ def _inspect_value(
         payload = tagged[1]
         if not isinstance(payload, list):
             raise CanonicalEncodingError(f"{path}: list payload must be a JSON list")
-        state.events.append(CanonicalListEvent(event_path, len(payload)))
+        events.append(CanonicalListEvent(event_path, len(payload)))
         for index, item in enumerate(payload):
             _inspect_value(
                 item,
                 path=f"{path}[{index}]",
                 event_path=event_path + (index,),
-                state=state,
+                events=events,
             )
         return
     if tag == "map":
@@ -387,13 +381,13 @@ def _inspect_value(
             tagged[1],
             path=path,
             event_path=event_path,
-            state=state,
+            events=events,
         )
         return
     if tag == "ndarray":
         _require_arity(tagged, 2, path)
         event = _inspect_array(tagged[1], path=path, event_path=event_path)
-        state.events.append(event)
+        events.append(event)
         return
     raise CanonicalEncodingError(f"{path}: unknown canonical tag {tag!r}")
 
@@ -403,7 +397,7 @@ def _inspect_map(
     *,
     path: str,
     event_path: tuple[str | int, ...],
-    state: _InspectionState,
+    events: list[CanonicalStructureEvent],
 ) -> None:
     if not isinstance(payload, list):
         raise CanonicalEncodingError(f"{path}: map payload must be a JSON list")
@@ -418,7 +412,7 @@ def _inspect_map(
             pair[1],
             path=f"{path}.{key}",
             event_path=event_path + (key,),
-            state=state,
+            events=events,
         )
         previous = key
 

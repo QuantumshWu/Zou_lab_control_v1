@@ -2,9 +2,8 @@
 
 The expected arrays are immutable evidence generated from the exact ``main``
 implementation.  This test deliberately exercises only the current
-``readout.calibration`` and ``readout.analysis`` APIs; it neither imports the
-reference tree nor regenerates expected values from the implementation under
-test.
+Calibration capability APIs; it neither imports the reference tree nor
+regenerates expected values from the implementation under test.
 """
 
 from __future__ import annotations
@@ -27,15 +26,15 @@ from zlc_data import (
     Value,
     ValueSchema,
 )
-from zlc_neutral_atom.capture_reference import CaptureArtifactRef
-from zlc_neutral_atom.readout.analysis import (
+from zlc_neutral_atom.logic_nodes.camera_capture.reference import CaptureArtifactRef
+from zlc_neutral_atom.logic_nodes.calibration.analysis import (
     CalibrationAnalysisRequest,
     CalibrationComputation,
     _calibrate_readout_frames,
     _validate_site_center_admission,
     find_site_centers,
 )
-from zlc_neutral_atom.readout.calibration import (
+from zlc_neutral_atom.logic_nodes.calibration.calibration import (
     BackgroundMode,
     BoxFeature,
     BoxReducer,
@@ -47,12 +46,12 @@ from zlc_neutral_atom.readout.calibration import (
     apply_calibration,
     extract_readout_features,
 )
-from zlc_neutral_atom.readout.contracts import (
+from zlc_neutral_atom.logic_nodes.readout_common.contracts import (
     CalibrationCaptureLayout,
     FrameContract,
-    ReadoutBindingKey,
 )
-from zlc_neutral_atom.readout.physical_context import ReadoutPhysicalContext
+from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
+from zlc_neutral_atom.logic_nodes.readout_common.physical_context import ReadoutPhysicalContext
 
 
 _FIXTURES = Path(__file__).with_name("fixtures")

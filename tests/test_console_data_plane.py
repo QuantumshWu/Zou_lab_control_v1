@@ -13,22 +13,92 @@ from __future__ import annotations
 
 import ast
 import pathlib
-import subprocess
-import sys
 from types import SimpleNamespace
 
+import numpy as np
+
+from zlc_data import (
+    REPEAT,
+    SCAN_POINT,
+    AxisId,
+    AxisSpec,
+    BlockId,
+    CellValidity,
+    DataBlock,
+    DatasetRevision,
+    DatasetSchema,
+    OwnedSnapshot,
+    PointLayout,
+    StreamGenerationId,
+    ValueSchema,
+)
+from zlc_neutral_atom.dataset_output import (
+    DatasetOutputDeclaration,
+    LiveDatasetOutput,
+)
+from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_workbench.task_console.data_plane import ConsoleDataPlane
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 
+def _live_output(name: str, revision: int, digest: str) -> LiveDatasetOutput:
+    repeat = AxisSpec(AxisId(f"{name}.repeat"), "repeat", REPEAT, 1, (0,))
+    point = AxisSpec(AxisId(f"{name}.point"), "point", SCAN_POINT, 1, (0,))
+    schema = DatasetSchema(
+        repeat,
+        (point,),
+        PointLayout.rect_c((1,)),
+        ValueSchema.scalar(np.dtype("float64"), "count"),
+    )
+    values = np.asarray([[[float(revision)]]], dtype=np.float64)
+    block = DataBlock(
+        BlockId(f"{name}-block"),
+        DatasetRevision(revision),
+        values,
+        CellValidity(np.ones((1, 1), dtype=np.bool_)),
+        schema,
+    )
+    snapshot = OwnedSnapshot(
+        block.ref(StreamGenerationId(f"{name}-generation")),
+        block,
+    )
+    return LiveDatasetOutput(
+        DatasetOutputDeclaration(name, f"test.{name}"),
+        snapshot,
+        MonitorCoverage(1, 1, 0, False),
+        digest,
+    )
+
+
+def _node(instance_id: str, output: LiveDatasetOutput):
+    return SimpleNamespace(
+        instance_id=instance_id,
+        display_label=instance_id,
+        output_declarations=(
+            SimpleNamespace(declaration=output.declaration),
+        ),
+        signal_key=lambda name: f"{instance_id}/{name}",
+    )
+
+
+def _slot(*, run: str, epoch: str, outputs):
+    return SimpleNamespace(
+        freeze_live_outputs=lambda: (run, epoch, outputs),
+        close=lambda: None,
+        notification_failure=None,
+    )
+
+
 def test_unchanged_sources_reuse_their_immutable_front() -> None:
     plane = ConsoleDataPlane()
-    node = SimpleNamespace(name="camera")
-    slot = object()
+    output = _live_output("frame", 1, "a" * 64)
+    node = _node("camera", output)
+    slot = _slot(run="run", epoch="epoch", outputs={"frame": output})
     calls = []
     plane._freeze_one = lambda *_args: (calls.append(object()) or {}, None)
     plane.attach(node, slot)
+    plane.mark_changed(node)
 
     first = plane.freeze()
     assert plane.freeze() is first
@@ -53,50 +123,21 @@ def test_the_data_plane_holds_no_toolkit_and_no_domain_authority():
     assert not roots & {"PyQt5", "matplotlib", "Zou_lab_control"}, roots
 
 
-def test_unrelated_derived_event_is_never_stamped_as_the_raw_event() -> None:
-    """A mismatched raw/scalar pair keeps raw and rejects the false join."""
+def test_live_slot_cannot_publish_an_undeclared_output_contract() -> None:
+    """The generic plane routes only owner-declared typed outputs."""
 
-    raw_head = SimpleNamespace(payload_digest="a" * 64, sequence=7)
-    scalar_head = SimpleNamespace(payload_digest="b" * 64, sequence=8)
-    raw = SimpleNamespace(
-        head=raw_head,
-        snapshot=SimpleNamespace(block=object()),
-        coverage=None,
-    )
-    scalar = SimpleNamespace(
-        head=scalar_head,
-        snapshot=SimpleNamespace(block=object()),
-        coverage=None,
-    )
-    slot = SimpleNamespace(
-        freeze_camera_current=lambda: (
-            "run",
-            "epoch",
-            SimpleNamespace(
-                raw=raw,
-                scalar=scalar,
-                scalar_metadata=SimpleNamespace(
-                    source_event_ref=SimpleNamespace(payload_digest="c" * 64),
-                ),
-            ),
-        )
-    )
-    node = SimpleNamespace(
-        name="camera",
-        spec=SimpleNamespace(
-            declared_outputs=(SimpleNamespace(name="frame"), SimpleNamespace(name="roi")),
-        ),
-    )
+    declared = _live_output("frame", 1, "a" * 64)
+    undeclared = _live_output("roi", 1, "b" * 64)
+    node = _node("camera", declared)
+    slot = _slot(run="run", epoch="epoch", outputs={"roi": undeclared})
     plane = ConsoleDataPlane()
     plane.attach(node, slot)
+    plane.mark_changed(node)
 
     front = plane.freeze()
 
-    assert front.value("frame") is not None
-    assert front.value("roi") is None
-    assert front.failures == {
-        "camera": "roi does not identify the raw event it reduced"
-    }
+    assert front.names() == ()
+    assert "absent from the Workbench vocabulary" in front.failures["camera"]
 
 
 def test_independent_producers_keep_independent_causation_in_one_present_cycle() -> None:
@@ -105,33 +146,25 @@ def test_independent_producers_keep_independent_causation_in_one_present_cycle()
     plane = ConsoleDataPlane()
 
     def attach(name: str, *, run: str, epoch: str, sequence: int, digest: str) -> None:
-        head = SimpleNamespace(payload_digest=digest, sequence=sequence)
-        raw = SimpleNamespace(
-            head=head,
-            snapshot=SimpleNamespace(block=object()),
-            coverage=None,
-        )
-        slot = SimpleNamespace(
-            freeze_camera_current=lambda: (
-                run,
-                epoch,
-                SimpleNamespace(raw=raw, scalar=None, scalar_metadata=None),
-            )
-        )
-        node = SimpleNamespace(
-            name=name,
-            spec=SimpleNamespace(
-                declared_outputs=(SimpleNamespace(name=f"{name}_frame"),),
+        output_name = f"{name}_frame"
+        output = _live_output(output_name, sequence, digest)
+        node = _node(name, output)
+        plane.attach(
+            node,
+            _slot(
+                run=run,
+                epoch=epoch,
+                outputs={output_name: output},
             ),
         )
-        plane.attach(node, slot)
+        plane.mark_changed(node)
 
     attach("slow", run="run-slow", epoch="epoch-slow", sequence=3, digest="a" * 64)
     attach("fast", run="run-fast", epoch="epoch-fast", sequence=91, digest="b" * 64)
 
     front = plane.freeze()
-    slow = front.value("slow_frame")
-    fast = front.value("fast_frame")
+    slow = front.value("slow/slow_frame")
+    fast = front.value("fast/fast_frame")
 
     assert slow is not None and fast is not None
     assert (slow.run_id, slow.epoch_id, slow.join_digest) == (

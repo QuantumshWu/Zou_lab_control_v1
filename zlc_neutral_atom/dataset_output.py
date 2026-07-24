@@ -28,33 +28,58 @@ def _bare_name(value: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class DatasetOutputDeclaration:
+    """One owner-paired public output name and semantic contract identity."""
+
+    name: str
+    contract_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", _bare_name(self.name))
+        object.__setattr__(
+            self,
+            "contract_id",
+            canonical_text(self.contract_id, "dataset output contract id"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FinalDatasetOutput:
     """One owner-materialized FINAL Dataset under one bare output name."""
 
-    name: str
+    declaration: DatasetOutputDeclaration
     snapshot: OwnedSnapshot
     join_digest: str
 
     def __post_init__(self) -> None:
-        name = _bare_name(self.name)
+        if not isinstance(self.declaration, DatasetOutputDeclaration):
+            raise TypeError("declaration must be DatasetOutputDeclaration")
         if not isinstance(self.snapshot, OwnedSnapshot):
             raise TypeError("snapshot must be OwnedSnapshot")
         digest = sha256_text(self.join_digest, "join_digest")
-        object.__setattr__(self, "name", name)
         object.__setattr__(self, "join_digest", digest)
+
+    @property
+    def name(self) -> str:
+        return self.declaration.name
+
+    @property
+    def contract_id(self) -> str:
+        return self.declaration.contract_id
 
 
 @dataclass(frozen=True, slots=True)
 class LiveDatasetOutput:
     """One owner-projected live Dataset with coverage in its own geometry."""
 
-    name: str
+    declaration: DatasetOutputDeclaration
     snapshot: OwnedSnapshot
     coverage: DatasetCoverage | MonitorCoverage
     join_digest: str
 
     def __post_init__(self) -> None:
-        name = _bare_name(self.name)
+        if not isinstance(self.declaration, DatasetOutputDeclaration):
+            raise TypeError("declaration must be DatasetOutputDeclaration")
         if not isinstance(self.snapshot, OwnedSnapshot):
             raise TypeError("snapshot must be OwnedSnapshot")
         if not isinstance(self.coverage, (DatasetCoverage, MonitorCoverage)):
@@ -66,8 +91,15 @@ class LiveDatasetOutput:
         if self.coverage.total_cells != total:
             raise ValueError("live coverage differs from projected Dataset geometry")
         digest = sha256_text(self.join_digest, "join_digest")
-        object.__setattr__(self, "name", name)
         object.__setattr__(self, "join_digest", digest)
+
+    @property
+    def name(self) -> str:
+        return self.declaration.name
+
+    @property
+    def contract_id(self) -> str:
+        return self.declaration.contract_id
 
 
 class LiveDatasetOutputOwner(Protocol):
@@ -117,12 +149,14 @@ class FinalDatasetOutputOwner(Protocol, Generic[ResultT]):
 
 
 def single_live_dataset_output(
-    output_name: str,
+    declaration: DatasetOutputDeclaration,
     frozen: DatasetPreviewSnapshot | MonitorDatasetSnapshot,
 ) -> LiveDatasetOutput:
     """Publish an identity live view whose geometry was not transformed."""
 
-    name = _bare_name(output_name)
+    if not isinstance(declaration, DatasetOutputDeclaration):
+        raise TypeError("declaration must be DatasetOutputDeclaration")
+    name = declaration.name
     if isinstance(frozen, MonitorDatasetSnapshot):
         if frozen.head is None:
             raise RuntimeError("monitor dataset has no accepted event head")
@@ -144,7 +178,7 @@ def single_live_dataset_output(
             "live output requires MonitorDatasetSnapshot or DatasetPreviewSnapshot"
         )
     return LiveDatasetOutput(
-        name,
+        declaration,
         frozen.snapshot,
         frozen.coverage,
         join_digest,
@@ -154,21 +188,23 @@ def single_live_dataset_output(
 def final_dataset_join_digest(
     *,
     owner: str,
-    output_name: str,
+    declaration: DatasetOutputDeclaration,
     source_identity: object,
     snapshot: OwnedSnapshot,
 ) -> str:
     """Return the canonical join identity shared by every FINAL owner."""
 
     owner_name = canonical_text(owner, "final output owner")
-    name = _bare_name(output_name)
+    if not isinstance(declaration, DatasetOutputDeclaration):
+        raise TypeError("declaration must be DatasetOutputDeclaration")
     if not isinstance(snapshot, OwnedSnapshot):
         raise TypeError("snapshot must be OwnedSnapshot")
     return canonical_digest(
         {
             "owner": "zlc_neutral_atom.final-dataset-output",
             "domain_owner": owner_name,
-            "output_name": name,
+            "output_name": declaration.name,
+            "output_contract_id": declaration.contract_id,
             "source_identity": source_identity,
             "dataset": dataset_revision_ref_to_tree(snapshot.ref),
         }
@@ -176,6 +212,7 @@ def final_dataset_join_digest(
 
 
 __all__ = [
+    "DatasetOutputDeclaration",
     "FinalDatasetOutput",
     "FinalDatasetOutputOwner",
     "LiveDatasetOutput",

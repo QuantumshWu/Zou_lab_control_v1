@@ -1,16 +1,16 @@
 `timescale 1ns / 1ps
 // SINGLE GEOMETRY SOURCE: every parameter default below comes from zlc_geometry.vh, which is
-// AUTO-GENERATED from fpga/board_config/streamer_config.json by image.emit_geometry_vh (regenerated
-// by build_and_program.bat before synth).  Edit the JSON -> the whole bitstream + testbenches follow;
-// no .v carries a hand-typed geometry literal or a hand-computed LAYOUT_FINGERPRINT.
+// AUTO-GENERATED from fpga/board_config/streamer_config.json by image.emit_geometry_vh during a
+// separately approved recovery build.  Normal experiment startup never regenerates or programs
+// hardware; no .v carries a hand-typed geometry literal or LAYOUT_FINGERPRINT.
 `include "zlc_geometry.vh"
 // =============================================================================
 // zlc_pulse_streamer_top -- FINAL board top for the affine edge-table streamer.
 //
 // One clean design (no variants).  JTAG-to-AXI control; edge + scan tables in
 // BLOCK RAM, bus tables in LUTRAM inside the engine.  Reaches 4096 edges + 4096
-// resident scan points + UNBOUNDED streaming scan points at 78% of the 35T
-// RAMB36 (host.image.solve_capacity, <=90% target).
+// resident scan points in the currently qualified runtime.  The frozen mailbox
+// contains refill fields, but host-refilled operation is not a published mode.
 //
 // Control path (all behind ONE proven axi_bram_ctrl, so AXI handshakes are the
 // vendor IP -- only a SIMPLE combinational write decoder is custom):
@@ -25,11 +25,10 @@
 //     R_SCAN  scan BRAM (128b slot vector/point), 2*BANK_SIZE deep (ping-pong)
 //     R_BUS   bus-image BRAM; the mini-loader copies it into the engine bus LUTRAM
 //
-// STREAMING: the engine plays scan point 0..N-1, addressing bank (idx/BANK_SIZE)
-// %2.  It exposes scan_cursor (points consumed) -> R_CTRL[CURSOR]; the host polls
-// it, rewrites the bank it has left in R_SCAN, and sets the matching bit of
-// R_CTRL[BANK_READY].  A not-ready bank STALLS the engine (STATUS underflow,
-// never a wrong point).  This makes the scan-point count UNBOUNDED.
+// SCAN BANKS: the engine plays scan point 0..N-1 through two banks and exposes
+// scan_cursor plus BANK_READY/BANK*_CHUNK.  The current host loads both banks
+// before FIRE and admits N<=2*BANK_SIZE.  Refill fields remain frozen RTL facts,
+// not evidence that host-refilled timing has been qualified.
 //
 // 1-TICK: the build tcl forces the 3 edge BRAMs to READ_LATENCY_B = 2 so the
 // engine's RD_LAT=2 prefetch pipeline is deterministic and back-to-back 20 ns
@@ -40,8 +39,8 @@
 // the BRAM IP geometry from host.image too.
 //
 // *** Structurally complete + contract-tested; the engine + control FSM are
-// proven by the Python cycle models, but the multi-BRAM AXI integration needs
-// on-board bring-up (no Verilog simulator in this repo). ***
+// checked by Python cycle models and targeted xsim benches; physical deployment
+// still requires on-board evidence. ***
 // =============================================================================
 
 module zlc_pulse_streamer_top #(
@@ -51,7 +50,7 @@ module zlc_pulse_streamer_top #(
     parameter integer EDGE_ADDR_WIDTH = `ZLC_EDGE_ADDR_WIDTH,
     parameter integer BANK_SIZE = `ZLC_BANK_SIZE,           // power of two; scan ping-pong bank
     parameter integer SCAN_ADDR_WIDTH = `ZLC_SCAN_ADDR_WIDTH, // = clog2(2*BANK_SIZE), image.scan_addr_width
-    parameter integer SCAN_COUNT_WIDTH = 32,                // total scan points N (unbounded)
+    parameter integer SCAN_COUNT_WIDTH = 32,                // encoded total N; current host admits resident capacity
     parameter integer TICK_WIDTH = `ZLC_TICK_WIDTH,
     parameter integer NUM_SLOTS = `ZLC_NUM_SLOTS,
     parameter integer COEFF_WIDTH = `ZLC_COEFF_WIDTH,

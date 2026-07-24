@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from fpga.pulse_streamer.host.image import StreamerParams, default_slot_mul_width
+from fpga.pulse_streamer.host.image import (
+    StreamerParams,
+    default_slot_mul_width,
+    pack_program,
+)
 from zlc_storage import canonical_digest
 from zlc_pulse import (
     PulseExecutionForm,
@@ -40,8 +45,8 @@ def test_current_validator_pins_the_frozen_rtl_slot_multiplier_width():
     [
         ("camera_imaging_address_switch.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "5d4984bc20a7e635210903878e3b5c0dacd1f22d0ba0029ab7de0218db5fc946"),
         ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "929b45c22a81cb7071fbe480bc270d591bbc5fea96d79703d6370bdf1509cb40"),
-        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "7b6122ea0799bc7ffd52dba2e20505e67f92dc5f63333968170afaefd3af60ea"),
-        ("probe_template.json", PulseExecutionForm.STATIC_ONCE, "7a2a1b1d6a35cb7b94df7bc4e149dda3c2b6f9d1d57ae331dbbca0d74346d46a"),
+        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "763f7df74b083fc1cb971fd4b1354bd5bcdd226293c0813c255887fea437d16d"),
+        ("probe_template.json", PulseExecutionForm.STATIC_ONCE, "52b9dd8fc0f4bcfb60fd7f22189904bdfcad8ccfcba0e192d8e668b80430d6fa"),
         ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "d9a679a6d6118a817cd213fe908d5b27f51590675638941f3aa5656c7b5c253a"),
     ],
 )
@@ -189,6 +194,26 @@ def test_wire_geometry_gate_rejects_bus_row_and_literal_overflow():
     )
     with pytest.raises(ValueError, match="more than 64"):
         pack_target_ir(replace(scan, bus_segments=segments))
+
+    # The low-level image serializer is also a public upload boundary.  It
+    # must reject the same overflow even when a caller bypasses TargetIR's
+    # higher-level geometry validator; otherwise row 64 aliases the next bus.
+    carrier = SimpleNamespace(
+        ticks=scan.ticks,
+        masks=scan.masks,
+        slot_count=scan.slot_count,
+        tick_slot_coeffs=scan.tick_slot_coeffs,
+        scan_points=scan.scan_points,
+        bus_segments=segments,
+        repeat_forever=scan.repeat_forever,
+        repeat_from_index=0,
+        loop_start_index=scan.loop_start_index,
+        loop_count=scan.loop_count,
+        loop_end_tick=scan.loop_end_tick,
+        loop_end_slot_coeffs=scan.loop_end_slot_coeffs,
+    )
+    with pytest.raises(ValueError, match="more than 64"):
+        pack_program(carrier)
 
     segment = scan.bus_segments[0]
     with pytest.raises(ValueError, match="literal value"):

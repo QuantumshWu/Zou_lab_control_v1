@@ -16,11 +16,17 @@ The Xilinx constraints file that maps each logical output to a physical **packag
 on your board, plus the input clock. The shipped default is the 62-output address-switch
 board map. It defines, by port name:
 
-- the **62 TTL outputs** (named: `trap`, `cooling`, `probe`, `repump`, `trig`,
-  `emCCD`, the shutters, etc. — these names are projected into the deployed
-  `PulseTarget` used by the GUI/API),
-- the **DAC clock(s)** (`da_clk[...]`) and any analog-bus pins,
+- the **18 logical TTL outputs** (`trap`, `cooling`, `probe`, `repump`, `trig`,
+  `emCCD`, the shutters, etc. — projected into the deployed `PulseTarget`),
+- four 10-bit **DAC data buses** and their four **DAC latch clocks**; together
+  with the TTL lanes these form the streamer's 62 raw output lanes,
 - the input **`clk`** and the `GND`/unused pins.
+
+The checked-in `board.xdc` is currently a pin/electrical map only: it contains
+no `create_clock` constraint and no external DAC timing constraints.  This
+known gap does **not** authorize rebuilding the frozen bitstream.  If hardware
+evidence later requires a rebuild, add the real board-clock and DAC interface
+constraints first, then require routed timing signoff before qualification.
 
 Contract the build enforces (`fpga/build_and_program.bat`, `create_project.tcl`):
 

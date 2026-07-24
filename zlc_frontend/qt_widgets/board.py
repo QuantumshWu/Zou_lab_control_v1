@@ -80,7 +80,6 @@ from ._raster_image_interaction import (
 )
 from ._raster_numeric_interaction import (
     _NUMERIC_PAYLOAD_TYPES,
-    _NumericCross,
     _NumericIntent,
     _NumericKind,
     _NumericPanelBinding,
@@ -1366,7 +1365,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             viewport = numeric_target.payload.viewport
             if event.button() == QtCore.Qt.RightButton:
                 x, y = viewport.widget_normalized_to_data(*point)
-                binding.cross = _NumericCross(x, y)
+                binding.cross = (x, y)
                 self.crossSelected.emit(
                     CrossGesture(
                         self._numeric_interaction_origin(binding),
@@ -1715,7 +1714,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 image_binding.draft_bounds = image_binding.drag_prior_draft
             else:
                 image_binding.draft_bounds = _image_bounds_for_rectangle_drag(
-                    image_binding,
+                    self._require_selector_viewport(image_binding),
                     visible_bounds,
                 )
             self.update()
@@ -1873,7 +1872,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 )
             else:
                 completed_bounds = _image_bounds_for_rectangle_drag(
-                    image_binding,
+                    self._require_selector_viewport(image_binding),
                     visible_bounds,
                 )
                 image_binding.draft_bounds = completed_bounds
@@ -2197,11 +2196,28 @@ class QtRasterBoard(QtWidgets.QWidget):
             raise RuntimeError("image panel is not bound")
         return binding
 
-    @staticmethod
     def _require_selector_viewport(
+        self,
         binding: _ImagePanelBinding,
     ) -> ImageViewportTransform:
+        """Return the viewport belonging to the exact painted image front.
+
+        A board front may advance while one selector gesture keeps its panel
+        payload held.  ``binding.viewport`` tracks the admitted front and is
+        therefore only authoritative for legacy/raw raster panels, which have
+        no typed viewport in either the held or current painted payload.
+        """
+
+        payload, _origin = self._visible_display(
+            binding.panel_id,
+            (ImagePanelPayload, SiteMapPanelPayload),
+        )
+        if isinstance(payload, SiteMapPanelPayload):
+            return payload.background.viewport
+        if isinstance(payload, ImagePanelPayload):
+            return payload.viewport
         return binding.viewport
+
     def _numeric_binding_for_kind(
         self,
         kind: _NumericKind,

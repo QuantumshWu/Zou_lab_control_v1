@@ -34,8 +34,8 @@ __all__ = ["DEFAULT_UPDATE_MS", "LOGIC_KINDS", "LOGIC_NODE_CONFIG_FIELDS",
            "panel_signal_key"]
 
 
-#: The four node families the Logic tab can add.
-LOGIC_KINDS = ("camera", "measurement", "processor", "task")
+#: The three domain node families the Logic tab can add.
+LOGIC_KINDS = ("measurement", "processor", "task")
 
 LOGIC_NODE_CONFIG_FIELDS = {
     "node_id": str,
@@ -95,8 +95,8 @@ class LogicNodeConfig:
     """One LOGIC NODE: which node it is + the param values to build it with.
 
     A logic node lives on the Logic tab, NOT the Monitor board, and is the thing
-    that PRODUCES data.  ``kind`` is one of :data:`LOGIC_KINDS` (camera /
-    measurement / processor / task). ``node_id`` is the immutable saved row
+    that PRODUCES data.  ``kind`` is one of :data:`LOGIC_KINDS`
+    (measurement / processor / task). ``node_id`` is the immutable saved row
     identity used to namespace its outputs; the presented ``title`` never
     participates in identity. ``definition_key`` is the opaque tree
     emitted by the owning catalog's DefinitionKey codec; presentation titles

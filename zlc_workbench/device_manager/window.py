@@ -47,15 +47,24 @@ from zlc_neutral_atom.installation_plan import (
     InstallationDevicePlan,
     installation_device_plan,
 )
+from zlc_neutral_atom.installation_config import (
+    SUPPORTED_INSTALLATION_BACKENDS,
+)
 
 from .controller import DeviceAdminState, DeviceManagerController
 from .editor_session import form_spec
 
 
-_BACKEND_LABELS = {
-    "virtual": "Virtual",
-    "remote_pulse": "Remote pulse",
-}
+_BACKEND_PRESENTATION = (
+    ("virtual", "Virtual"),
+    ("remote_pulse", "Remote pulse"),
+)
+if frozenset(backend for backend, _label in _BACKEND_PRESENTATION) != (
+    SUPPORTED_INSTALLATION_BACKENDS
+):
+    raise RuntimeError(
+        "DeviceManager backend labels differ from the supported config backends"
+    )
 
 
 class _DeviceSummaryCard(FluentFrame):
@@ -180,7 +189,7 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         installation_layout.setSpacing(window_pad(0.45))
 
         self.backend_combo = FluentComboBox(self.installation_group)
-        for backend, label in _BACKEND_LABELS.items():
+        for backend, label in _BACKEND_PRESENTATION:
             self.backend_combo.addItem(label, backend)
         backend_row = FluentSettingRow(
             "Backend",
@@ -210,9 +219,10 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         available_layout = QtWidgets.QVBoxLayout(self.available_group)
         available_layout.setContentsMargins(group_pad, group_pad, group_pad, group_pad)
         available_layout.setSpacing(window_pad(0.4))
-        self.virtual_template_button = FluentButton("Virtual", color=ACCENT)
-        self.remote_template_button = FluentButton("Remote pulse", color=ACCENT)
-        for button in (self.virtual_template_button, self.remote_template_button):
+        self._template_buttons = {}
+        for backend, label in _BACKEND_PRESENTATION:
+            button = FluentButton(label, color=ACCENT)
+            self._template_buttons[backend] = button
             button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             available_layout.addWidget(button)
         right_layout.addWidget(self.available_group)
@@ -238,8 +248,8 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         actions.setSpacing(scaled_px(7, minimum=5))
         self.new_combo = FluentComboBox(self.config_page)
         self.new_combo.addItem("New…", None)
-        self.new_combo.addItem("Virtual", "virtual")
-        self.new_combo.addItem("Remote pulse", "remote_pulse")
+        for backend, label in _BACKEND_PRESENTATION:
+            self.new_combo.addItem(label, backend)
         self.load_button = FluentButton("Load…", color=ORANGE)
         self.save_button = FluentButton("Save", color=ACCENT)
         self.save_as_button = FluentButton("Save as…", color=ACCENT)
@@ -260,8 +270,7 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self._action_widgets = (
             self.backend_combo,
             self.new_combo,
-            self.virtual_template_button,
-            self.remote_template_button,
+            *self._template_buttons.values(),
             self.load_button,
             self.save_button,
             self.save_as_button,
@@ -284,8 +293,10 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self.form.changed.connect(self._field_changed)
         self.backend_combo.activated.connect(self._backend_selected)
         self.new_combo.activated.connect(self._new_selected)
-        self.virtual_template_button.clicked.connect(self._controller.new_virtual)
-        self.remote_template_button.clicked.connect(self._controller.new_remote_pulse)
+        for backend, button in self._template_buttons.items():
+            button.clicked.connect(
+                lambda _checked=False, name=backend: self._controller.replace_new(name)
+            )
         self.load_button.clicked.connect(self._load)
         self.save_button.clicked.connect(self._save)
         self.save_as_button.clicked.connect(self._save_as)
@@ -320,18 +331,16 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
     @QtCore.pyqtSlot(int)
     def _backend_selected(self, index: int) -> None:
         backend = self.backend_combo.itemData(index)
-        if backend is not None and backend != self._controller.editor.backend:
-            self._controller.switch_backend(str(backend))
+        if isinstance(backend, str) and backend != self._controller.editor.backend:
+            self._controller.switch_backend(backend)
 
     @QtCore.pyqtSlot(int)
     def _new_selected(self, index: int) -> None:
         backend = self.new_combo.itemData(index)
         with signals_blocked(self.new_combo):
             self.new_combo.setCurrentIndex(0)
-        if backend == "virtual":
-            self._controller.new_virtual()
-        elif backend == "remote_pulse":
-            self._controller.new_remote_pulse()
+        if isinstance(backend, str):
+            self._controller.replace_new(backend)
 
     @QtCore.pyqtSlot(str)
     def _draft_changed(self, key: str) -> None:
@@ -379,6 +388,7 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
             if role not in desired:
                 card = self._configured_cards.pop(role)
                 self.configured_layout.removeWidget(card)
+                card.hide()
                 card.deleteLater()
         for index, row in enumerate(rows):
             card = self._configured_cards.get(row.role)
@@ -389,41 +399,39 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
                 role=row.role,
                 domain=row.domain,
                 adapter_kind=row.adapter_kind.rsplit(".", 1)[-1],
-                detail=self._configured_detail(row.role),
+                detail=self._configured_detail(row),
             )
             self.configured_layout.insertWidget(index, card)
 
     def _update_configured_details_in_place(self) -> None:
-        for role, card in self._configured_cards.items():
-            detail = self._configured_detail(role)
+        for row in self._configured_rows_for_current_draft():
+            card = self._configured_cards[row.role]
+            detail = self._configured_detail(row)
             card.detail_label.setText(detail)
             card.detail_label.setToolTip(detail)
 
-    def _configured_detail(self, role: str) -> str:
+    def _configured_detail(self, row: InstallationDevicePlan) -> str:
         editor = self._controller.editor
         values = editor.values
-        if editor.backend == "remote_pulse":
-            host = str(values.get("host", "")).strip() or "<host>"
-            port = values.get("port", 18861)
-            timeout = values.get("transport_timeout_seconds", 120.0)
-            return f"{host}:{port}; timeout={timeout} s"
-        seed = values.get("seed")
-        seed_text = "random" if seed is None else str(seed)
-        details = {
-            "sequencer": f"In-process pulse target execution; seed={seed_text}",
-            "rf": "In-process RF-table source driven by the virtual sequencer",
-            "camera": "Externally triggered readout camera",
-            "mot_camera": (
-                "MOT camera; free-running live and externally triggered "
-                "finite acquisition"
-            ),
-        }
-        try:
-            return details[role]
-        except KeyError as error:
-            raise RuntimeError(
-                f"installation plan contains an unknown virtual role {role!r}"
-            ) from error
+        fields = {field.key: field for field in self.form.spec.fields}
+        details = [row.summary]
+        for key in row.configuration_keys:
+            if key not in values or key not in fields:
+                raise RuntimeError(
+                    f"device plan field {key!r} is absent from {editor.backend!r}"
+                )
+            field = fields[key]
+            value = values[key]
+            shown = (
+                "not set"
+                if value is None
+                else "empty"
+                if value == ""
+                else str(value)
+            )
+            suffix = f" {field.unit}" if field.unit else ""
+            details.append(f"{field.label}={shown}{suffix}")
+        return "; ".join(details)
 
     # ------------------------------------------------------------------
     # runtime observation (event driven; no timer and no control plane)
@@ -440,6 +448,7 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
             if role not in desired_roles:
                 card = self._loaded_cards.pop(role)
                 self.loaded_layout.removeWidget(card)
+                card.hide()
                 card.deleteLater()
         for index, (role, info) in enumerate(rows):
             card = self._loaded_cards.get(role)
@@ -511,7 +520,7 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
             widget.setEnabled(not busy)
         self.form.setEnabled(not busy)
         has_errors = bool(self._controller.field_errors)
-        draft_ready = not has_errors and self._draft_has_required_identity()
+        draft_ready = not has_errors and self._draft_has_required_values()
         self.save_button.setEnabled(not busy and path is not None and draft_ready)
         self.save_as_button.setEnabled(not busy and draft_ready)
         self.cancel_button.setEnabled(not busy and editor.dirty)
@@ -529,11 +538,13 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
             self.lifecycle_button.setText("Init devices")
             self.lifecycle_button.setEnabled(not busy and draft_ready)
 
-    def _draft_has_required_identity(self) -> bool:
-        editor = self._controller.editor
-        if editor.backend != "remote_pulse":
-            return True
-        return bool(str(editor.values.get("host", "")).strip())
+    def _draft_has_required_values(self) -> bool:
+        return all(
+            not field.required
+            or field.required_choice_unavailable
+            or not self.form.is_empty(field.key)
+            for field in self.form.spec.fields
+        )
 
     # ------------------------------------------------------------------
     # explicit file/lifecycle boundaries

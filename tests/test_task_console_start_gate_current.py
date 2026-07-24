@@ -23,6 +23,7 @@ def test_stop_during_prepare_never_calls_the_hardware_starter() -> None:
         kind="measurement",
         declared_outputs=(),
         build_request=lambda values: build_calls.append(dict(values)),
+        outputs_for=lambda request: (),
     )
 
     def prepare(request):
@@ -34,6 +35,8 @@ def test_stop_during_prepare_never_calls_the_hardware_starter() -> None:
     node = ConsoleRunNode(
         spec,
         {},
+        instance_id="prepare-stop-instance",
+        instance_label="Pulse scan",
         prepare=prepare,
         request_owner_wake=lambda: None,
         frozen_request=frozen,

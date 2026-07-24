@@ -13,7 +13,7 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetPreviewSnapshot,
     ExactDatasetPreviewReader,
 )
-from zlc_neutral_atom.runtime.pipeline import ExactDatasetPreviewSpec
+from zlc_neutral_atom.runtime.preview import ExactDatasetPreviewSpec
 from zlc_storage import canonical_text
 
 

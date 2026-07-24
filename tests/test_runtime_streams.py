@@ -29,11 +29,9 @@ from zlc_data import (
 )
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
-    ReservationCapacityExceeded,
     ReservationStateError,
     ReservationState,
     SchemaChanged,
-    StreamBackpressure,
     StreamGap,
     StreamEndedEarly,
     StreamError,
@@ -42,8 +40,6 @@ from zlc_neutral_atom.runtime.streams import (
     EventId,
     EventRef,
     OrderedEventSpanHasher,
-    ProducerFlowControl,
-    RetentionOverrun,
     SourceFailed,
     StreamId,
     TraceContext,
@@ -133,23 +129,17 @@ def trace() -> TraceContext:
 
 def scalar_value(value: float) -> Value:
     return Value(
-        np.asarray(value, dtype=np.float64),
+        np.asarray([value], dtype=np.float64),
         VALID,
         SCALAR_SCHEMA,
     )
 
 
-def stream(
-    *,
-    events: int = 8,
-    flow_control: ProducerFlowControl = ProducerFlowControl.BACKPRESSURE_CAPABLE,
-):
+def stream():
     contract = ValuePayloadContract(SCALAR_SCHEMA)
     return AcquisitionStream.create(
         StreamId("camera.frames"),
         contract,
-        flow_control=flow_control,
-        retention_events=events,
         join_key_contract=TupleJoinContract(),
     )
 
@@ -186,10 +176,9 @@ def abort_consumer(source, reservation, owner) -> None:
 
 
 def test_exact_reservation_retains_every_event_until_ordered_ack():
-    source, producer = stream(events=4)
+    source, producer = stream()
     reservation = source.reserve(
         total_events=4,
-        max_inflight_events=4,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -219,10 +208,9 @@ def test_exact_consumer_reuses_the_publication_event_ref_without_rehash(monkeypa
         return original_digest(contract, payload)
 
     monkeypatch.setattr(ValuePayloadContract, "digest", counted_digest)
-    source, producer = stream(events=1)
+    source, producer = stream()
     reservation = source.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
@@ -241,86 +229,87 @@ def test_exact_consumer_reuses_the_publication_event_ref_without_rehash(monkeypa
 
 
 def test_unreserved_cursor_gets_typed_gap_instead_of_latest_fallback():
-    source, producer = stream(events=2)
+    source, producer = stream()
     cursor = source.subscribe(start_sequence=0)
     for index in range(5):
         emit(producer, float(index))
     with pytest.raises(StreamGap) as caught:
         cursor.next()
     assert caught.value.expected == 0
-    assert caught.value.earliest_retained == 3
+    assert caught.value.earliest_retained == 5
 
 
-def test_exact_backlog_fails_before_overwrite_and_monitor_still_overwrites():
-    source, producer = stream(events=3)
+def test_slow_exact_consumer_retains_all_events_and_display_latest_reports_skips():
+    source, producer = stream()
     reservation = source.reserve(
         total_events=4,
-        max_inflight_events=3,
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     owner = bind_terminal_consumer(source, reservation)
-    monitor = source.monitor(max_events=2)
-    for index in range(3):
-        emit(producer, float(index))
-    with pytest.raises(StreamBackpressure):
-        emit(producer, 3.0)
+    monitor = source.monitor()
+    emitted = []
+    for index in range(4):
+        emitted.append(emit(producer, float(index)))
 
-    first = cursor.next()
-    acknowledge(source, reservation, first, owner)
-    fourth = emit(producer, 3.0)
+    assert source.retained_events == 4
     update = monitor.latest()
-    assert update.envelope is fourth
+    assert update.envelope is emitted[-1]
     assert update.missed == 3
-    abort_consumer(source, reservation, owner)
-    reservation.release()
-    monitor.close()
-
-
-def test_monitor_loss_accounting_never_changes_exact_order_or_retention():
-    total = 100
-    source, producer = stream(events=total)
-    reservation = source.reserve(
-        total_events=total,
-        max_inflight_events=1,
-        trace_binding=TRACE_BINDING,
-    )
-    cursor = reservation.activate()
-    owner = bind_terminal_consumer(source, reservation)
-    monitor = source.monitor(max_events=7)
-    exact_sequences = []
-    updates = []
-
-    for sequence in range(total):
-        emit(producer, float(sequence))
+    for expected in emitted:
         delivery = cursor.next()
-        exact_sequences.append(delivery.envelope.sequence)
+        assert delivery.envelope is expected
         acknowledge(source, reservation, delivery, owner)
-        if sequence % 17 == 16:
-            updates.append(monitor.latest())
-    updates.append(monitor.latest())
-
-    assert exact_sequences == list(range(total))
-    assert [update.envelope.sequence for update in updates] == sorted(
-        update.envelope.sequence for update in updates
-    )
-    assert len(updates) + sum(update.missed for update in updates) == total
+    assert source.retained_events == 0
     eos = producer.finish()
     source._complete_consumer(reservation, eos, owner, lambda: None)
     reservation.release()
     monitor.close()
 
 
+def test_monitor_next_never_drops_and_display_latest_does_not_change_exact_order():
+    total = 100
+    source, producer = stream()
+    reservation = source.reserve(
+        total_events=total,
+        trace_binding=TRACE_BINDING,
+    )
+    cursor = reservation.activate()
+    owner = bind_terminal_consumer(source, reservation)
+    ordered_monitor = source.monitor()
+    latest_monitor = source.monitor()
+    exact_sequences = []
+
+    for sequence in range(total):
+        emit(producer, float(sequence))
+        delivery = cursor.next()
+        exact_sequences.append(delivery.envelope.sequence)
+        acknowledge(source, reservation, delivery, owner)
+
+    assert exact_sequences == list(range(total))
+    ordered_updates = [ordered_monitor.next() for _ in range(total)]
+    assert [update.envelope.sequence for update in ordered_updates] == list(range(total))
+    assert all(update.missed == 0 for update in ordered_updates)
+    latest = latest_monitor.latest()
+    assert latest.envelope.sequence == total - 1
+    assert latest.missed == total - 1
+    eos = producer.finish()
+    source._complete_consumer(reservation, eos, owner, lambda: None)
+    reservation.release()
+    ordered_monitor.close()
+    latest_monitor.close()
+
+
 def test_monitor_topology_cannot_expand_after_publication_begins():
-    source, producer = stream(events=2)
+    source, producer = stream()
     emit(producer, 0.0)
     with pytest.raises(ReservationStateError, match="before the first publication"):
-        source.monitor(max_events=1)
+        source.monitor()
 
 
 def test_monitor_close_is_terminal_for_polling_and_wakes_blocked_reader(monkeypatch):
-    source, _producer = stream(events=2)
-    monitor = source.monitor(max_events=1)
+    source, _producer = stream()
+    monitor = source.monitor()
     failures: list[BaseException] = []
     entered_wait = threading.Event()
     real_wait = monitor._condition.wait
@@ -352,16 +341,14 @@ def test_monitor_close_is_terminal_for_polling_and_wakes_blocked_reader(monkeypa
 
 
 def test_reservation_allows_only_one_formal_exact_consumer():
-    source, _producer = stream(events=4)
+    source, _producer = stream()
     first = source.reserve(
         total_events=4,
-        max_inflight_events=3,
         trace_binding=TRACE_BINDING,
     )
-    with pytest.raises(ReservationCapacityExceeded, match="one formal exact consumer"):
+    with pytest.raises(ReservationStateError, match="one formal exact consumer"):
         source.reserve(
             total_events=2,
-            max_inflight_events=2,
             trace_binding=TRACE_BINDING,
         )
     first.abort()
@@ -369,10 +356,9 @@ def test_reservation_allows_only_one_formal_exact_consumer():
 
 
 def test_unbound_exact_emit_is_side_effect_free_and_zero_event_preflight_is_retryable():
-    source, producer = stream(events=1)
+    source, producer = stream()
     reservation = source.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TRACE_BINDING,
     )
     reservation.activate()
@@ -386,7 +372,6 @@ def test_unbound_exact_emit_is_side_effect_free_and_zero_event_preflight_is_retr
 
     replacement = source.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TRACE_BINDING,
     )
     replacement.abort()
@@ -394,10 +379,9 @@ def test_unbound_exact_emit_is_side_effect_free_and_zero_event_preflight_is_retr
 
 
 def test_failed_preclaim_is_retryable_but_first_data_tombstones_generation():
-    source, producer = stream(events=1)
+    source, producer = stream()
     reservation = source.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TRACE_BINDING,
     )
     reservation.activate()
@@ -416,7 +400,6 @@ def test_failed_preclaim_is_retryable_but_first_data_tombstones_generation():
 
     claimed = source.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TRACE_BINDING,
     )
     claimed.activate()
@@ -425,21 +408,19 @@ def test_failed_preclaim_is_retryable_but_first_data_tombstones_generation():
     abort_consumer(source, claimed, owner)
     claimed.release()
     with pytest.raises(
-        ReservationCapacityExceeded,
+        ReservationStateError,
         match="already had its formal exact consumer",
     ):
         source.reserve(
             total_events=1,
-            max_inflight_events=1,
             trace_binding=TRACE_BINDING,
         )
 
 
 def test_zero_event_rebind_gate_blocks_loose_emit_and_survives_failed_replacement():
-    source, producer = stream(events=1)
+    source, producer = stream()
     abandoned = source.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TRACE_BINDING,
     )
     abandoned.activate()
@@ -455,7 +436,6 @@ def test_zero_event_rebind_gate_blocks_loose_emit_and_survives_failed_replacemen
 
     failed = source.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TRACE_BINDING,
     )
     failed.activate()
@@ -477,7 +457,6 @@ def test_zero_event_rebind_gate_blocks_loose_emit_and_survives_failed_replacemen
 
     replacement = source.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TRACE_BINDING,
     )
     replacement.activate()
@@ -490,10 +469,9 @@ def test_zero_event_rebind_gate_blocks_loose_emit_and_survives_failed_replacemen
 
 
 def test_zero_event_release_and_emit_are_serialized_without_an_authority_gap():
-    source, producer = stream(events=1)
+    source, producer = stream()
     reservation = source.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TRACE_BINDING,
     )
     reservation.activate()
@@ -535,10 +513,9 @@ def test_zero_event_release_and_emit_are_serialized_without_an_authority_gap():
 
 
 def test_formal_interval_rejects_extra_or_post_failure_emit_and_short_finish():
-    source, producer = stream(events=2)
+    source, producer = stream()
     reservation = source.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TRACE_BINDING,
     )
     reservation.activate()
@@ -552,10 +529,9 @@ def test_formal_interval_rejects_extra_or_post_failure_emit_and_short_finish():
         emit(producer, 1.0)
     assert producer.finish().end_sequence == 1
 
-    short_source, short_producer = stream(events=2)
+    short_source, short_producer = stream()
     short = short_source.reserve(
         total_events=2,
-        max_inflight_events=2,
         trace_binding=TRACE_BINDING,
     )
     short.activate()
@@ -575,10 +551,9 @@ def test_formal_interval_rejects_extra_or_post_failure_emit_and_short_finish():
     ),
 )
 def test_formal_emit_rejects_wrong_trace_without_publication(wrong_trace):
-    source, producer = stream(events=1)
+    source, producer = stream()
     reservation = source.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TRACE_BINDING,
     )
     reservation.activate()
@@ -616,8 +591,6 @@ def test_stream_rejects_materialized_dataset_payloads():
     source, producer = AcquisitionStream.create(
         StreamId("illegal.dataset"),
         IllegalContract(),
-        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-        retention_events=1,
     )
     repeat = AxisSpec(AxisId("repeat"), "repeat", REPEAT, 1)
     point = AxisSpec(AxisId("point"), "point", SPATIAL_X, 1)
@@ -626,7 +599,7 @@ def test_stream_rejects_materialized_dataset_payloads():
     block = DataBlock(
         BlockId("block"),
         DatasetRevision(0),
-        np.zeros((1, 1), dtype=np.float64),
+        np.zeros((1, 1, 1), dtype=np.float64),
         VALID,
         schema,
     )
@@ -647,7 +620,7 @@ def test_stream_rejects_materialized_dataset_payloads():
 
 
 def test_value_payload_runs_the_materialization_admission_once(monkeypatch):
-    source, producer = stream(events=1)
+    source, producer = stream()
     original = runtime_streams._contains_materialization
     calls = 0
 
@@ -679,8 +652,6 @@ def test_stream_requires_payload_contract_owned_content_digest():
         AcquisitionStream.create(
             StreamId("missing.payload-digest"),
             MissingDigestContract(),
-            flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-            retention_events=1,
         )
 
 
@@ -707,8 +678,9 @@ def test_generation_supersession_terminates_old_cursor_even_with_retained_data()
 
 def test_monitor_drains_retained_event_then_observes_source_eos():
     source, producer = stream()
-    monitor = source.monitor(max_events=2)
+    monitor = source.monitor()
     expected = emit(producer, 1.0)
+    assert source.retained_events == 0
     eos = producer.finish()
     assert eos.end_sequence == 1
     assert monitor.next().envelope is expected
@@ -748,7 +720,7 @@ def test_cursor_and_terminal_receipt_cannot_be_fabricated():
 
 def test_schema_change_discards_monitor_queue_immediately():
     source, producer = stream()
-    monitor = source.monitor(max_events=2)
+    monitor = source.monitor()
     emit(producer, 1.0)
     producer.supersede(StreamGenerationId("generation-two"))
     with pytest.raises(SchemaChanged):
@@ -756,8 +728,10 @@ def test_schema_change_discards_monitor_queue_immediately():
 
 
 def test_rejected_emit_has_no_retention_side_effects():
-    source, producer = stream(events=1)
-    cursor = source.subscribe(start_sequence=0)
+    source, producer = stream()
+    reservation = source.reserve(total_events=2, trace_binding=TRACE_BINDING)
+    cursor = reservation.activate()
+    owner = bind_terminal_consumer(source, reservation)
     expected = emit(producer, 1.0)
     with pytest.raises(ValueError):
         producer.emit(
@@ -767,51 +741,25 @@ def test_rejected_emit_has_no_retention_side_effects():
             join_key=(0, 2),
         )
     assert source.retained_events == 1
-    assert cursor.next().envelope is expected
-
-
-def test_no_eviction_publish_does_not_scan_the_retained_backlog():
-    source, producer = stream(events=128)
-    for index in range(64):
-        emit(producer, float(index))
-
-    class CountingOrder:
-        def __init__(self, values):
-            self.values = runtime_streams.deque(values)
-            self.iterated = 0
-
-        def __len__(self):
-            return len(self.values)
-
-        def __iter__(self):
-            for value in self.values:
-                self.iterated += 1
-                yield value
-
-        def append(self, value):
-            self.values.append(value)
-
-        def popleft(self):
-            return self.values.popleft()
-
-    order = CountingOrder(source._order)
-    source._order = order
-    emit(producer, 64.0)
-
-    assert order.iterated == 1
+    delivery = cursor.next()
+    assert delivery.envelope is expected
+    acknowledge(source, reservation, delivery, owner)
+    abort_consumer(source, reservation, owner)
+    reservation.release()
 
 
 def test_first_post_marker_failure_terminalizes_without_retryable_hole(monkeypatch):
-    source, producer = stream(events=1)
+    source, producer = stream()
+    monitor = source.monitor()
     emit(producer, 1.0)
-    real_apply_trim = AcquisitionStream._apply_trim_locked
+    real_offer = runtime_streams.MonitorTap._offer
 
-    def fail_target_trim(self, removals):
-        if self is source:
+    def fail_target_offer(self, stored):
+        if self is monitor:
             raise RuntimeError("synthetic first post-marker failure")
-        return real_apply_trim(self, removals)
+        return real_offer(self, stored)
 
-    monkeypatch.setattr(AcquisitionStream, "_apply_trim_locked", fail_target_trim)
+    monkeypatch.setattr(runtime_streams.MonitorTap, "_offer", fail_target_offer)
     with pytest.raises(SourceFailed, match="authoritative sequence 1 committed"):
         emit(producer, 2.0)
 
@@ -823,31 +771,6 @@ def test_first_post_marker_failure_terminalizes_without_retryable_hole(monkeypat
             trace=trace(),
             join_key=(0, 3),
         )
-
-
-def test_non_backpressure_overrun_permanently_poisons_generation():
-    source, producer = stream(
-        events=1,
-        flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
-    )
-    reservation = source.reserve(
-        total_events=2,
-        max_inflight_events=1,
-        trace_binding=TRACE_BINDING,
-    )
-    cursor = reservation.activate()
-    bind_terminal_consumer(source, reservation)
-    emit(producer, 10.0)
-    with pytest.raises(RetentionOverrun):
-        emit(producer, 20.0)
-    with pytest.raises(RetentionOverrun):
-        emit(producer, 30.0)
-    with pytest.raises(RetentionOverrun):
-        producer.finish()
-    with pytest.raises(RetentionOverrun):
-        cursor.next()
-    assert reservation.state is ReservationState.FAILED
-    reservation.release()
 
 
 def test_first_terminal_fact_cannot_be_replaced():
@@ -872,8 +795,8 @@ def test_first_terminal_fact_cannot_be_replaced():
 
 def test_one_broken_terminal_tap_cannot_strand_the_remaining_fanout(monkeypatch):
     source, producer = stream()
-    broken = source.monitor(max_events=1)
-    healthy = source.monitor(max_events=1)
+    broken = source.monitor()
+    healthy = source.monitor()
     real_source_ended = runtime_streams.MonitorTap._source_ended
 
     def fail_one_tap(self, error):

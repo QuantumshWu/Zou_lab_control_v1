@@ -1,10 +1,8 @@
-"""Neutral-atom timing execution contracts.
+"""Shared neutral-atom clock, lineage, and cross-node timing protocols.
 
-``zlc_pulse`` owns pulse authoring, target topology, compilation, and transport
-values.  This package owns only neutral-atom execution ports/evidence that
-consume those compiled values.  Import concrete contracts from their leaf
-modules; the package root remains inert so an ordinary acquisition import does
-not load unrelated hardware or readout composition.
+Physical Camera and Sequencer commands, acknowledgements, capabilities, and
+bound Ports belong to their device owners.  Logic-node-specific timing belongs
+to the logic node.  This package root stays inert.
 """
 
 __all__: tuple[str, ...] = ()

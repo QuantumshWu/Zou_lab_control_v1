@@ -11,10 +11,12 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias
 
+from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
 from zlc_storage import (
     canonical_text,
     flush_directory,
@@ -31,13 +33,18 @@ from zlc_storage.file_lock import (
 
 
 INSTALLATION_CONFIG_FORMAT = "zlc_neutral_atom.InstallationConfig"
+SUPPORTED_INSTALLATION_BACKENDS = frozenset(("virtual", "remote_pulse"))
+_DEFAULT_VIRTUAL_SEED = 7
+_DEFAULT_REMOTE_PORT = 18861
+_DEFAULT_TRANSPORT_TIMEOUT_SECONDS = 120.0
+_MIN_POSITIVE_FLOAT = float.fromhex("0x0.0000000000001p-1022")
 
 
 @dataclass(frozen=True, slots=True)
 class VirtualInstallationConfig:
     """The deterministic in-process installation currently used for simulation."""
 
-    seed: int | None = 7
+    seed: int | None = _DEFAULT_VIRTUAL_SEED
 
     def __post_init__(self) -> None:
         seed = integer(
@@ -48,14 +55,28 @@ class VirtualInstallationConfig:
         )
         object.__setattr__(self, "seed", seed)
 
+    def authoring_schema(self) -> AuthoringSchema:
+        return _virtual_authoring_schema(self.seed)
+
+    def to_parameters(self) -> dict[str, object]:
+        return {"seed": self.seed}
+
+    @classmethod
+    def from_parameters(
+        cls,
+        values: Mapping[str, object],
+    ) -> "VirtualInstallationConfig":
+        checked = _parameters(values, {"seed"}, "virtual parameters")
+        return cls(seed=checked["seed"])
+
 
 @dataclass(frozen=True, slots=True)
 class RemotePulseInstallationConfig:
     """The current sequencer-only installation served by the pulse RPC server."""
 
     host: str
-    port: int = 18861
-    transport_timeout_seconds: float = 120.0
+    port: int = _DEFAULT_REMOTE_PORT
+    transport_timeout_seconds: float = _DEFAULT_TRANSPORT_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "host", canonical_text(self.host, "remote host"))
@@ -71,6 +92,36 @@ class RemotePulseInstallationConfig:
                 self.transport_timeout_seconds,
                 "transport_timeout_seconds",
             ),
+        )
+
+    def authoring_schema(self) -> AuthoringSchema:
+        return _remote_pulse_authoring_schema(
+            host=self.host,
+            port=self.port,
+            transport_timeout_seconds=self.transport_timeout_seconds,
+        )
+
+    def to_parameters(self) -> dict[str, object]:
+        return {
+            "host": self.host,
+            "port": self.port,
+            "transport_timeout_seconds": self.transport_timeout_seconds,
+        }
+
+    @classmethod
+    def from_parameters(
+        cls,
+        values: Mapping[str, object],
+    ) -> "RemotePulseInstallationConfig":
+        checked = _parameters(
+            values,
+            {"host", "port", "transport_timeout_seconds"},
+            "remote_pulse parameters",
+        )
+        return cls(
+            host=checked["host"],
+            port=checked["port"],
+            transport_timeout_seconds=checked["transport_timeout_seconds"],
         )
 
 
@@ -93,7 +144,11 @@ class InstallationConfigDocument:
             raise TypeError("config must be a current installation config")
 
     @classmethod
-    def virtual(cls, *, seed: int | None = 7) -> "InstallationConfigDocument":
+    def virtual(
+        cls,
+        *,
+        seed: int | None = _DEFAULT_VIRTUAL_SEED,
+    ) -> "InstallationConfigDocument":
         return cls(VirtualInstallationConfig(seed))
 
     @classmethod
@@ -101,8 +156,8 @@ class InstallationConfigDocument:
         cls,
         *,
         host: str,
-        port: int = 18861,
-        transport_timeout_seconds: float = 120.0,
+        port: int = _DEFAULT_REMOTE_PORT,
+        transport_timeout_seconds: float = _DEFAULT_TRANSPORT_TIMEOUT_SECONDS,
     ) -> "InstallationConfigDocument":
         return cls(
             RemotePulseInstallationConfig(
@@ -111,6 +166,20 @@ class InstallationConfigDocument:
                 transport_timeout_seconds,
             )
         )
+
+    @classmethod
+    def from_parameters(
+        cls,
+        backend: str,
+        values: Mapping[str, object],
+    ) -> "InstallationConfigDocument":
+        """Build one domain-validated document from an ordinary editor draft."""
+
+        if backend == "virtual":
+            return cls(VirtualInstallationConfig.from_parameters(values))
+        if backend == "remote_pulse":
+            return cls(RemotePulseInstallationConfig.from_parameters(values))
+        raise ValueError(f"unsupported installation backend {backend!r}")
 
     @property
     def backend(self) -> str:
@@ -123,19 +192,10 @@ class InstallationConfigDocument:
         return sha256_digest(self.to_bytes())
 
     def to_dict(self) -> dict[str, object]:
-        config = self.config
-        if isinstance(config, VirtualInstallationConfig):
-            parameters: dict[str, object] = {"seed": config.seed}
-        else:
-            parameters = {
-                "host": config.host,
-                "port": config.port,
-                "transport_timeout_seconds": config.transport_timeout_seconds,
-            }
         return {
             "format": INSTALLATION_CONFIG_FORMAT,
             "backend": self.backend,
-            "parameters": parameters,
+            "parameters": self.config.to_parameters(),
         }
 
     def to_bytes(self) -> bytes:
@@ -171,23 +231,7 @@ class InstallationConfigDocument:
         if not isinstance(parameters, dict):
             raise TypeError("installation config parameters must be a mapping")
         backend = value["backend"]
-        if backend == "virtual":
-            _require_exact_fields(parameters, {"seed"}, "virtual parameters")
-            return cls.virtual(seed=parameters["seed"])
-        if backend == "remote_pulse":
-            _require_exact_fields(
-                parameters,
-                {"host", "port", "transport_timeout_seconds"},
-                "remote_pulse parameters",
-            )
-            return cls.remote_pulse(
-                host=parameters["host"],
-                port=parameters["port"],
-                transport_timeout_seconds=parameters[
-                    "transport_timeout_seconds"
-                ],
-            )
-        raise ValueError(f"unsupported installation backend {backend!r}")
+        return cls.from_parameters(backend, parameters)
 
     @classmethod
     def from_bytes(cls, payload: bytes | bytearray | memoryview) -> "InstallationConfigDocument":
@@ -297,13 +341,98 @@ def save_installation_config(
         lock_stream.close()
 
 
-def _require_exact_fields(
-    value: dict[str, object],
+def default_installation_authoring_schema(backend: str) -> AuthoringSchema:
+    """Return the backend owner's declared defaults and field semantics."""
+
+    if not isinstance(backend, str):
+        raise TypeError("backend must be text")
+    if backend == "virtual":
+        return _virtual_authoring_schema(_DEFAULT_VIRTUAL_SEED)
+    if backend == "remote_pulse":
+        return _remote_pulse_authoring_schema(
+            host="",
+            port=_DEFAULT_REMOTE_PORT,
+            transport_timeout_seconds=_DEFAULT_TRANSPORT_TIMEOUT_SECONDS,
+        )
+    raise ValueError(f"unsupported installation backend {backend!r}")
+
+
+def _virtual_authoring_schema(seed: int | None) -> AuthoringSchema:
+    return AuthoringSchema(
+        (
+            AuthoringField(
+                key="seed",
+                kind="int",
+                label="Random seed",
+                default=seed,
+                required=False,
+                minimum=0,
+                description=(
+                    "Optional non-negative integer seed for deterministic virtual "
+                    "hardware; blank selects non-deterministic initialization."
+                ),
+                allow_blank=True,
+            ),
+        )
+    )
+
+
+def _remote_pulse_authoring_schema(
+    *,
+    host: str,
+    port: int,
+    transport_timeout_seconds: float,
+) -> AuthoringSchema:
+    return AuthoringSchema(
+        (
+            AuthoringField(
+                key="host",
+                kind="text",
+                label="Host",
+                default=host,
+                required=True,
+                description=(
+                    "Pulse execution server host name or address; surrounding "
+                    "whitespace is invalid."
+                ),
+            ),
+            AuthoringField(
+                key="port",
+                kind="int",
+                label="Port",
+                default=port,
+                required=True,
+                minimum=1,
+                maximum=65535,
+                description="TCP port exposed by the pulse execution server.",
+            ),
+            AuthoringField(
+                key="transport_timeout_seconds",
+                kind="float",
+                label="Transport timeout",
+                default=transport_timeout_seconds,
+                required=True,
+                unit="s",
+                minimum=_MIN_POSITIVE_FLOAT,
+                description=(
+                    "Maximum time for one pulse RPC transport call; must be finite "
+                    "and greater than zero."
+                ),
+            ),
+        )
+    )
+
+
+def _parameters(
+    values: Mapping[str, object],
     fields: set[str],
     name: str,
-) -> None:
-    if set(value) != fields:
+) -> Mapping[str, object]:
+    if not isinstance(values, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    if set(values) != fields:
         raise ValueError(f"{name} must contain exactly {sorted(fields)}")
+    return values
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -327,11 +456,13 @@ def _config_path(path: str | os.PathLike[str]) -> Path:
 
 __all__ = [
     "INSTALLATION_CONFIG_FORMAT",
+    "SUPPORTED_INSTALLATION_BACKENDS",
     "InstallationConfig",
     "InstallationConfigConflict",
     "InstallationConfigDocument",
     "RemotePulseInstallationConfig",
     "VirtualInstallationConfig",
+    "default_installation_authoring_schema",
     "load_installation_config",
     "save_installation_config",
 ]

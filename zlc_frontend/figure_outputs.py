@@ -25,6 +25,7 @@ import numpy as np
 from zlc_storage import canonical_digest, sha256_text
 
 from zlc_data import (
+    AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID,
     COMPONENT,
     SCALAR_AXIS,
     AxisId,
@@ -45,6 +46,7 @@ from zlc_data import (
     materialize_dataset_selection,
     materialize_fit_parameter_snapshots,
     materialize_numeric_dataset,
+    projected_dataset_output_contract_id,
 )
 from .site_map_render import SiteMapView
 from .render import (
@@ -58,12 +60,43 @@ AREA_DATA_OUTPUT = "area.data"
 CROSS_X_OUTPUT = "cross.x"
 CROSS_Y_OUTPUT = "cross.y"
 FIT_OUTPUT_PREFIX = "fit."
+FIGURE_AREA_RANGE_OUTPUT_CONTRACT_ID = "zlc_frontend.figure.area-range"
+FIGURE_CROSS_COORDINATE_OUTPUT_CONTRACT_ID = (
+    "zlc_frontend.figure.cross-coordinate"
+)
+FIGURE_FIT_PARAMETER_OUTPUT_CONTRACT_ID = "zlc_frontend.figure.fit-parameter"
+
+
+def figure_output_contract_id(
+    output_name: str,
+    *,
+    source_contract_id: str | None = None,
+) -> str:
+    """Return the frontend owner's exact contract for one Figure output."""
+
+    if output_name == AREA_DATA_OUTPUT:
+        if not isinstance(source_contract_id, str) or not source_contract_id:
+            raise ValueError("Figure Area output requires its source contract id")
+        return projected_dataset_output_contract_id(
+            source_contract_id,
+            AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID,
+        )
+    if output_name.startswith("area.range."):
+        return FIGURE_AREA_RANGE_OUTPUT_CONTRACT_ID
+    if output_name in {CROSS_X_OUTPUT, CROSS_Y_OUTPUT}:
+        return FIGURE_CROSS_COORDINATE_OUTPUT_CONTRACT_ID
+    if output_name.startswith(FIT_OUTPUT_PREFIX) and output_name != FIT_OUTPUT_PREFIX:
+        return FIGURE_FIT_PARAMETER_OUTPUT_CONTRACT_ID
+    raise ValueError(f"unknown Figure output {output_name!r}")
 
 __all__ = [
     "AREA_DATA_OUTPUT",
     "CROSS_X_OUTPUT",
     "CROSS_Y_OUTPUT",
     "FIT_OUTPUT_PREFIX",
+    "FIGURE_AREA_RANGE_OUTPUT_CONTRACT_ID",
+    "FIGURE_CROSS_COORDINATE_OUTPUT_CONTRACT_ID",
+    "FIGURE_FIT_PARAMETER_OUTPUT_CONTRACT_ID",
     "FigureDerivedSignal",
     "FigureAreaCommit",
     "FigureCrossCommit",
@@ -72,6 +105,7 @@ __all__ = [
     "HistogramValueRangeSelection",
     "SelectorAxisMetadata",
     "area_range_output_name",
+    "figure_output_contract_id",
     "materialize_area_outputs",
     "materialize_area_snapshot",
     "materialize_cross_outputs",

@@ -5,7 +5,7 @@
 // UNDELAYED stream (dut.state_mask) every cycle and assert out[t] == in[t-d] for
 // every delayed channel on every cycle (0 before t=d), across frames and seams.
 module tb_delay_sched;
-  localparam integer CH=8, EAW=12, TW=32, NS=1, CW=16, DTW=12, BUSC=4, BW=10;
+  localparam integer CH=8, EAW=12, TW=32, NS=1, CW=16, DTW=32, BUSC=4, BW=10;
   localparam integer NE=8;
   localparam integer NT=12000;          // > 3 frames + the 1000-tick delayed tail
   reg clk=0, reset=0, start=0; always #10 clk=~clk;

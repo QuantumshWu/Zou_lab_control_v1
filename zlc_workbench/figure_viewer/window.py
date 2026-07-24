@@ -117,6 +117,7 @@ class FigureViewer(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Expanding,
         )
+        self._pane_host = holder
         self._pane_holder = QtWidgets.QVBoxLayout(holder)
         self._pane_holder.setContentsMargins(0, 0, window_pad(1), 0)
         self._pane_holder.setSpacing(0)
@@ -351,6 +352,8 @@ class FigureViewer(QtWidgets.QWidget):
         )
         if not isinstance(candidate, QtWidgets.QWidget):
             raise TypeError("create_data_figure_pane must return a QWidget")
+        candidate.setParent(self._pane_host)
+        candidate.hide()
         ready = getattr(candidate, "initialReady", None)
         failed = getattr(candidate, "initialFailed", None)
         if ready is None or failed is None:
@@ -394,13 +397,12 @@ class FigureViewer(QtWidgets.QWidget):
         previous = self.figure_pane
         if self._placeholder is not None:
             self._pane_holder.removeWidget(self._placeholder)
+            self._placeholder.hide()
             self._placeholder.deleteLater()
             self._placeholder = None
         self._pane_holder.addWidget(candidate)
-        # The candidate is constructed parentless while its first raster is
-        # rendered.  Reparenting that already-created widget into a visible
-        # layout does not make it visible on every Qt platform, so the
-        # generation commit must explicitly publish the admitted pane.
+        # The hidden candidate already belongs to this composition root; the
+        # generation commit is the only point that publishes it.
         candidate.show()
         self.figure_pane = candidate
         if previous is not None:

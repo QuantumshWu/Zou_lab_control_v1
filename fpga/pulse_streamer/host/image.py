@@ -573,7 +573,19 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
     # bus segments (bus-major)
     per_bus: list[list[object]] = [[] for _ in range(p.bus_count)]
     for seg in bus_segments:
-        per_bus[int(getattr(seg, "bus_index", 0))].append(seg)
+        bus_index = int(getattr(seg, "bus_index", 0))
+        if not 0 <= bus_index < p.bus_count:
+            raise ValueError(
+                f"bus segment index {bus_index} is outside the "
+                f"{p.bus_count}-bus wire geometry"
+            )
+        segments = per_bus[bus_index]
+        if len(segments) >= p.max_bus_segments:
+            raise ValueError(
+                f"bus {bus_index} has more than {p.max_bus_segments} "
+                "hardware segment rows"
+            )
+        segments.append(seg)
     cnt_w = p.bus_seg_addr_width + 1
     bus_counts = 0
     for b in range(p.bus_count):
@@ -633,8 +645,8 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
         d = channel_delays[ch] if ch < len(channel_delays) else 0
         w[bases["delay"] + ch] = _to_unsigned(d, 32)
 
-    # PER-BUS DAC DELAY -- each DA bit is now its OWN event-scheduler channel (the bus's 10 bits
-    # share one 32-bit delay), so a bus delay is 32-bit like TTL and rides the SAME R_DELAY region,
+    # PER-BUS DAC DELAY -- each bus has one delayed segment-descriptor FIFO and re-player; all
+    # bits share that bus's 32-bit delay.  A bus delay is 32-bit like TTL and rides the SAME R_DELAY region,
     # one 32b word per bus right after the channels (words channel_count .. channel_count+bus_count-1).
     # Pack ALL bus_count words (0 = passthrough for any bus NOT in bus_delays) -- exactly like the
     # channel loop above.  Writing only the listed buses left every OTHER bus's R_DELAY word at its
@@ -789,7 +801,7 @@ def _scan_ramb(bank_size: int, p: StreamerParams) -> int:
 
 
 def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0,
-                       slot_mul_width: int = 25, engine_logic_luts: int = 12843,
+                       slot_mul_width: int = 25, engine_logic_luts: int = 14639,
                        engine_ff: int = 11502, engine_dsp: int | None = None) -> dict:
     """Resource usage of a CONCRETE ``StreamerParams`` vs a part, per axis.
 
@@ -801,12 +813,12 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
     LUT is CALIBRATED to a REAL Vivado 2019.1 SYNTH+PLACE+ROUTE of the current 35T build
     (2026-06-29, zlc_pulse_streamer_top_utilization_routed.rpt): 18607 of 20800 slice LUTs
     (89.5%, FITS) at evt_fifo_depth=128 / bus_evt_fifo_depth=64.  ``engine_logic_luts``
-    (=12843) is the fixed, non-depth-scaled remainder (logic LUTs + the LUTRAM the geometry
+    (=14639) is the fixed, non-depth-scaled remainder (logic LUTs + the LUTRAM the geometry
     terms below do not capture) once the bus-segment LUTRAM and the two event-FIFO terms
-    (ttl_sched + dac_evt, which DO scale with evt_fifo_depth / bus_evt_fifo_depth) are
+    (ttl_sched + per-bus segment scheduler, which DO scale with evt_fifo_depth /
+    bus_evt_fifo_depth) are
     subtracted -- so the model reproduces the real 18607 at (128/64) and predicts other
-    depths honestly.  The 40 DA bits cost ~2.2x per depth-tick vs the 18 TTL channels, so
-    DEEPENING DA is far pricier than deepening TTL.  FF (real 11502), DSP (real 52, exact)
+    depths honestly.  FF (real 11502), DSP (real 52, exact)
     and RAMB36 (real 40) are calibrated to the same routed build; edge fields are parallel
     BRAMs and the event FIFOs are distributed RAM (LUTs in SLICEM, no RAMB36)."""
     prof = part_profile(part)
@@ -836,12 +848,22 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
     # ceil(EVT_DEPTH*49/64) LUTs per slot plus ~20 LUTs of pointer/comparator control is an
     # honest, slightly-conservative estimate.
     ttl_sched_luts = num_delay_ch * (20 + _ceil(evt_depth * 49, 64))
-    # DAC delay is event-scheduled PER DA BIT (bus_count*bus_width 1-bit channels), each its own
-    # BUS_EVT_DEPTH-deep 49b FIFO exactly like a TTL channel (the bus's bits share one delay), so
-    # TTL and DAC delay use the same 32-bit range and the same mechanism -- a negative-delay global
-    # shift G reaches the buses with no range mismatch.
-    dac_evt_luts = (params.bus_count * params.bus_width) * (20 + _ceil(bus_evt_depth * 49, 64))
-    delay_lutram = ttl_sched_luts + dac_evt_luts
+    # DAC delay is instruction-level: one FIFO of resolved segment descriptors per bus, followed
+    # by one delayed ramp re-player.  This mirrors zlc_edge_streamer.g_busseg exactly; storage scales
+    # with segments in flight, not with DA bits or ramp value changes.  SEG_W is the RTL descriptor:
+    # three 48-bit global times, two BUS_WIDTH values, one TICK_WIDTH denominator, two BUS_WIDTH+1
+    # step/remainder fields, and three flags.
+    bus_segment_bits = (
+        3 * 48
+        + 2 * params.bus_width
+        + params.tick_width
+        + 2 * (params.bus_width + 1)
+        + 3
+    )
+    bus_sched_luts = params.bus_count * (
+        20 + _ceil(bus_evt_depth * bus_segment_bits, 64)
+    )
+    delay_lutram = ttl_sched_luts + bus_sched_luts
     # DSP: engine affine-MAC call sites (2 evals/bus + 5 main) x num_slots products,
     # each coeff(<=18b) x slot(slot_mul_width); slot operand <=25b fits ONE DSP48E1.
     if engine_dsp is None:
@@ -868,7 +890,7 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
                    slot_mul_width: int = 25,
                    target_pct: float = 90.0, bank_size: int = 2048,
                    max_edges_cap: int = 16384,
-                   engine_logic_luts: int = 12843, engine_ff: int = 11502, engine_dsp: int | None = None) -> SolvedCapacity:
+                   engine_logic_luts: int = 14639, engine_ff: int = 11502, engine_dsp: int | None = None) -> SolvedCapacity:
     """Maximise max_edges under <=target_pct of the part's RAMB36. Scan capacity
     is the two-bank resident window; edge fields are parallel BRAMs (no width
     padding).
@@ -887,7 +909,7 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
                           bus_seg_addr_width=bus_seg_addr_width, bus_sel_width=bus_sel_width)
     # bus image is a small 32b BRAM (bus_rows*bus_words words); bus tables themselves
     # live in engine LUTRAM (counted under distributed RAM / LUT, not RAMB36).  The OUTPUT delay
-    # event scheduler is per-channel / per-DA-bit distributed-RAM event FIFOs (NO BRAM image --
+    # delay scheduler uses per-TTL event FIFOs plus per-bus segment FIFOs (NO BRAM image --
     # ram_style="distributed"), so it costs LUTs, not RAMB36.
     bus_img_ram = _ceil(base.bus_rows * base.bus_words, 1024)
     scan_ram = _scan_ramb(bank_size, base)
@@ -994,7 +1016,27 @@ def load_streamer_config(path: str | Path | None = None) -> dict:
     if not isinstance(raw, dict):
         warnings.append("config root is not an object; using built-in defaults.")
         raw = {}
-    params_map = raw.get("params") if isinstance(raw.get("params"), dict) else {}
+    raw_params = raw.get("params")
+    params_map = raw_params if isinstance(raw_params, dict) else {}
+    if source is not None:
+        if not isinstance(raw_params, dict):
+            warnings.append("config has no params object; using built-in defaults.")
+        else:
+            required = set(_PARAM_FIELD_NAMES) | {"slot_mul_width"}
+            missing = tuple(sorted(required - set(raw_params)))
+            if missing:
+                warnings.append(
+                    "config params omit deployed fields: " + ", ".join(missing)
+                )
+        missing_top = tuple(
+            name
+            for name in ("fpga_part", "clock_hz", "target_pct")
+            if name not in raw
+        )
+        if missing_top:
+            warnings.append(
+                "config omits deployed fields: " + ", ".join(missing_top)
+            )
     try:
         params = params_from_config(params_map)
     except (TypeError, ValueError) as exc:

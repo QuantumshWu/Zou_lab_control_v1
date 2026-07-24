@@ -1,4 +1,4 @@
-"""Unified DataFigure Analyze -> Fit product and authority contracts."""
+"""Unified Figure Fit product and authority contracts."""
 
 from __future__ import annotations
 
@@ -164,15 +164,15 @@ def _drag_image_roi(window: DataFigureWindow) -> Selection:
     return candidate.selection
 
 
-def _open_image_analysis(application, experiment, reference) -> DataFigureWindow:
+def _open_image_fit(application, experiment, reference) -> DataFigureWindow:
     window = experiment.figure_gui(reference)
     assert isinstance(window, DataFigureWindow)
     _until(application, lambda: window.worker_idle and window.raster_ready)
     assert window._view_family == "image"
     assert window._fit_pane is not None
     assert window._tabs.indexOf(window._fit_pane) < 0
-    assert window._analyze_button.isEnabled()
-    QtTest.QTest.mouseClick(window._analyze_button, QtCore.Qt.LeftButton)
+    assert window._fit_button.isEnabled()
+    QtTest.QTest.mouseClick(window._fit_button, QtCore.Qt.LeftButton)
     _until(application, lambda: window.worker_idle and bool(window.fit_models))
     return window
 
@@ -244,7 +244,7 @@ def test_public_fit_surfaces_remain_headless_until_a_window_is_opened() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_plot_analyze_fit_is_one_step_save_reopen_refit_and_export(
+def test_figure_fit_is_one_step_save_reopen_refit_and_export(
     application,
     capture_product,
     tmp_path,
@@ -260,7 +260,7 @@ def test_plot_analyze_fit_is_one_step_save_reopen_refit_and_export(
         return original_execute(self, *args, **kwargs)
 
     monkeypatch.setattr(FitResultRepository, "execute_capture", observed_execute)
-    window = _open_image_analysis(application, experiment, reference)
+    window = _open_image_fit(application, experiment, reference)
     try:
         pane = window._fit_pane
         assert pane is not None
@@ -385,7 +385,7 @@ def test_curve_range_promotes_only_x_while_display_cell_stays_presentation(
     try:
         _until(application, lambda: window.worker_idle and window.raster_ready)
         assert window._view_family == "curve"
-        QtTest.QTest.mouseClick(window._analyze_button, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseClick(window._fit_button, QtCore.Qt.LeftButton)
         _until(application, lambda: window.worker_idle and bool(window.fit_models))
         pane = window._fit_pane
         assert pane is not None
@@ -442,7 +442,7 @@ def test_fit_solver_does_not_block_image_navigation_and_new_roi_revokes_it(
         return original_execute(self, *args, **kwargs)
 
     monkeypatch.setattr(FitResultRepository, "execute_capture", blocked_execute)
-    window = _open_image_analysis(application, experiment, reference)
+    window = _open_image_fit(application, experiment, reference)
     try:
         pane = window._fit_pane
         assert pane is not None
@@ -474,7 +474,7 @@ def test_fit_overlay_render_blocks_duplicate_fit_and_save_submission(
     experiment, reference, _workspace = capture_product
     entered = threading.Event()
     release = threading.Event()
-    window = _open_image_analysis(application, experiment, reference)
+    window = _open_image_fit(application, experiment, reference)
     original_renderer = window._fit_overlay_renderer
     assert original_renderer is not None
 
@@ -515,7 +515,7 @@ def test_viewport_rerender_rejects_a_self_consistent_foreign_fit_identity(
     capture_product,
 ) -> None:
     experiment, reference, _workspace = capture_product
-    window = _open_image_analysis(application, experiment, reference)
+    window = _open_image_fit(application, experiment, reference)
     try:
         pane = window._fit_pane
         assert pane is not None
@@ -579,7 +579,7 @@ def test_failed_save_cannot_restore_draft_after_selector_revision_changes(
         raise OSError("synthetic durable publication failure")
 
     monkeypatch.setattr(FitExecution, "save", failed_save)
-    window = _open_image_analysis(application, experiment, reference)
+    window = _open_image_fit(application, experiment, reference)
     try:
         pane = window._fit_pane
         assert pane is not None

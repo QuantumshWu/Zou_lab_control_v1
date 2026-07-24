@@ -162,6 +162,7 @@ from .figure import (
     encode_figure_document,
     encode_view_spec,
     selection_fit_view_projection,
+    suggest_default_grid_view,
     suggest_view,
     suggest_fit_view,
     validate_view_spec,
@@ -188,8 +189,6 @@ from .panel_size import PANEL_SIZES, panel_size_cells
 from .plot_kind import PLOT_KIND_SPECS, PLOT_KIND_SPEC_BY_KEY, PlotKindSpec
 from .shape_text import describe_dataset_shape, indexed_unique_name
 from .panel_policy import (
-    DEFAULT_GRID_FACET_AXIS_PARAM,
-    DEFAULT_GRID_INTENT_PARAM,
     HISTOGRAM_CELL_THRESHOLDS_PARAM,
     HISTOGRAM_THRESHOLDS_PARAM,
     RELIM_MODES,
@@ -223,8 +222,6 @@ __all__ = [
     "NumericDisplayAxis",
     "NumericViewportTransform",
     "CurveViewportCommit",
-    "DEFAULT_GRID_FACET_AXIS_PARAM",
-    "DEFAULT_GRID_INTENT_PARAM",
     "DEFAULT_HISTOGRAM_BINS",
     "DatasetDescriptor",
     "DatasetId",
@@ -368,6 +365,7 @@ __all__ = [
     "prepare_fit_authoring_options",
     "reconcile_fit_authoring_draft",
     "validate_fit_authoring_options",
+    "suggest_default_grid_view",
     "suggest_view",
     "suggest_fit_view",
     "validate_view_spec",

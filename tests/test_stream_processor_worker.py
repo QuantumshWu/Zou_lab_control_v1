@@ -26,15 +26,13 @@ from zlc_data import (
     SCAN_POINT,
     StreamGenerationId,
     VALID,
-    ValidityContract,
     Value,
     ValuePayloadContract,
     ValueSchema,
 )
 from zlc_neutral_atom.catalog import (
-    DefinitionCatalog,
     DefinitionKey,
-    StreamProcessorDefinition,
+    ProcessorDefinition,
 )
 from zlc_neutral_atom.processing.stream import (
     BoundStreamProcessor,
@@ -56,10 +54,8 @@ from zlc_neutral_atom.runtime.dataset import (
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
     ArtifactInputRef,
-    ProducerFlowControl,
     ProcessorStageProvenance,
     ReservationState,
-    RetentionOverrun,
     SourceFailed,
     SchemaChanged,
     StreamEndedEarly,
@@ -155,15 +151,13 @@ def convert_to_probability(payload: object, config: object) -> object:
     assert isinstance(payload, Value)
     assert isinstance(config, ConvertConfig)
     return Value(
-        np.array(float(payload.values.item()) / 10.0, dtype=config.output_schema.dtype),
+        np.array(
+            [float(payload.values.item()) / 10.0],
+            dtype=config.output_schema.dtype,
+        ),
         payload.validity,
         config.output_schema,
     )
-
-
-def slow_value(payload: object, config: object) -> object:
-    time.sleep(0.03)
-    return scale_value(payload, config)
 
 
 def operator_with_extra_default(payload: object, config: object, extra: int = 1) -> object:
@@ -213,13 +207,7 @@ def schema(points: int, *, cell_schema: ValueSchema | None = None) -> DatasetSch
         axis("repeat", REPEAT, 1),
         (axis("point", SCAN_POINT, points),),
         PointLayout.rect_c((points,)),
-        cell_schema
-        or ValueSchema(
-            (),
-            ValidityContract.value(),
-            np.dtype("<i8"),
-            value_unit="count",
-        ),
+        cell_schema or ValueSchema.scalar(np.dtype("<i8"), "count"),
     )
 
 
@@ -341,10 +329,9 @@ def _processor_binding(
     output: AcquisitionStream,
     output_source_id: str,
     operator=scale_value,
-    operator_deadline_seconds: float = 1.0,
     artifact_inputs: tuple[ArtifactInputRef, ...] = (),
 ) -> BoundStreamProcessor:
-    definition = StreamProcessorDefinition(
+    definition = ProcessorDefinition(
         DefinitionKey("test", name),
         name,
         f"test.{name}-config",
@@ -358,8 +345,6 @@ def _processor_binding(
         output_stream_id=output.stream_id,
         output_source_id=output_source_id,
         operator=operator,
-        operator_deadline_seconds=operator_deadline_seconds,
-        terminal_wait_seconds=1.0,
         artifact_inputs=artifact_inputs,
     )
 
@@ -368,11 +353,9 @@ def two_stage_chain(
     *,
     points: int = 3,
     second_operator=scale_value,
-    intermediate_retention: int | None = None,
     cancellation=None,
     start_first: bool = True,
     gate_second_cursor: bool = False,
-    second_operator_deadline_seconds: float = 1.0,
     first_artifact_inputs: tuple[ArtifactInputRef, ...] = (),
     second_artifact_inputs: tuple[ArtifactInputRef, ...] = (),
     source_pair: tuple[AcquisitionStream, object] | None = None,
@@ -398,28 +381,21 @@ def two_stage_chain(
         source, producer = AcquisitionStream.create(
             StreamId("synthetic.chain.raw"),
             payload,
-            flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-            retention_events=points,
             join_key_contract=key_contract,
         )
     source_reservation = source.reserve(
         total_events=points,
-        max_inflight_events=points,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-source"),
     )
     source_cursor = source_reservation.activate()
 
-    retained = points if intermediate_retention is None else intermediate_retention
     intermediate, intermediate_producer = AcquisitionStream.create(
         StreamId("synthetic.chain.first"),
         payload,
-        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-        retention_events=retained,
         join_key_contract=key_contract,
     )
     intermediate_reservation = intermediate.reserve(
         total_events=points,
-        max_inflight_events=retained,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-first"),
     )
     intermediate_cursor = intermediate_reservation.activate()
@@ -437,13 +413,10 @@ def two_stage_chain(
     output, output_producer = AcquisitionStream.create(
         StreamId("synthetic.chain.second"),
         payload,
-        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-        retention_events=points,
         join_key_contract=key_contract,
     )
     output_reservation = output.reserve(
         total_events=points,
-        max_inflight_events=points,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-second"),
     )
     output_cursor = output_reservation.activate()
@@ -463,7 +436,6 @@ def two_stage_chain(
             output=output,
             output_source_id="chain-second",
             operator=second_operator,
-            operator_deadline_seconds=second_operator_deadline_seconds,
             artifact_inputs=second_artifact_inputs,
         ),
         intermediate_reservation,
@@ -494,8 +466,8 @@ def two_stage_chain(
         downstream_readiness=downstream_readiness,
         deadline_monotonic=deadline,
     )
-    monitor = output.monitor(max_events=points)
-    intermediate_monitor = intermediate.monitor(max_events=points)
+    monitor = output.monitor()
+    intermediate_monitor = intermediate.monitor()
     if start_first:
         first.start()
     return TwoStageChain(
@@ -518,7 +490,7 @@ def two_stage_chain(
 def emit_two_stage(item: TwoStageChain, ordinal: int) -> object:
     return item.producer.emit(
         Value(
-            np.array(ordinal + 1, dtype=np.int64),
+            np.array([ordinal + 1], dtype=np.int64),
             VALID,
             item.schema.cell_schema,
         ),
@@ -540,10 +512,6 @@ def chain(
     operator=scale_value,
     config: object | None = None,
     output_cell_schema: ValueSchema | None = None,
-    flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-    input_retention: int | None = None,
-    terminal_wait_seconds: float = 1.0,
-    operator_deadline_seconds: float = 1.0,
     share_join_owner: bool = True,
     input_schedule: tuple[DatasetCellAddress, ...] | None = None,
     builder_schedule: tuple[DatasetCellAddress, ...] | None = None,
@@ -569,25 +537,19 @@ def chain(
     payload = ValuePayloadContract(data_schema.cell_schema)
     output_payload = ValuePayloadContract(result_schema.cell_schema)
     key_contract = DatasetCellKeyContract.from_schema(data_schema)
-    retention = points if input_retention is None else input_retention
     source, producer = AcquisitionStream.create(
         StreamId("synthetic.raw"),
         payload,
-        flow_control=flow_control,
-        retention_events=retention,
         join_key_contract=key_contract,
     )
     reservation = source.reserve(
         total_events=points,
-        max_inflight_events=retention,
         trace_binding=TraceBinding("synthetic-run", "synthetic-source"),
     )
     cursor = reservation.activate()
     output, output_producer = AcquisitionStream.create(
         StreamId("synthetic.scaled"),
         output_payload,
-        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-        retention_events=points,
         join_key_contract=(
             key_contract
             if share_join_owner
@@ -596,7 +558,6 @@ def chain(
     )
     output_reservation = output.reserve(
         total_events=points,
-        max_inflight_events=points,
         trace_binding=TraceBinding(output_trace_run_id, output_trace_source_id),
     )
     output_cursor = output_reservation.activate()
@@ -615,12 +576,11 @@ def chain(
         output_reservation,
         output_edge,
     )
-    definition = StreamProcessorDefinition(
+    definition = ProcessorDefinition(
         DefinitionKey("test", "scale"),
         "Scale",
         "test.scale-config",
     )
-    assert DefinitionCatalog((definition,)).resolve(definition.key) is definition
     bound = BoundStreamProcessor(
         definition=definition,
         config=ScaleConfig(10) if config is None else config,
@@ -630,8 +590,6 @@ def chain(
         output_stream_id=output.stream_id,
         output_source_id="synthetic-processor",
         operator=operator,
-        operator_deadline_seconds=operator_deadline_seconds,
-        terminal_wait_seconds=terminal_wait_seconds,
         artifact_inputs=artifact_inputs,
     )
     if tamper_output_cursor_owner:
@@ -647,7 +605,7 @@ def chain(
         deadline_monotonic=time.monotonic() + absolute_deadline_seconds,
         cancellation=cancellation,
     )
-    monitor = output.monitor(max_events=points)
+    monitor = output.monitor()
     return Chain(
         data_schema,
         result_schema,
@@ -664,7 +622,11 @@ def chain(
 
 
 def emit(item: Chain, ordinal: int, *, key: DatasetCellAddress | None = None) -> object:
-    payload = Value(np.array(ordinal + 1, dtype=np.int64), VALID, item.schema.cell_schema)
+    payload = Value(
+        np.array([ordinal + 1], dtype=np.int64),
+        VALID,
+        item.schema.cell_schema,
+    )
     return item.producer.emit(
         payload,
         captured_at=float(ordinal),
@@ -694,7 +656,7 @@ def test_bound_processor_fingerprint_is_computed_once_at_bind(monkeypatch):
 def test_bound_processor_fingerprint_has_a_literal_current_oracle():
     item = chain(points=1)
     assert item.worker._bound.fingerprint == (
-        "60759d2f8ca98f4da36d020fa330178defddce879715cfc47158043d063a3016"
+        "00ad29cf4aaf78637968cc28c7a93965449c8f5a22baf1f2fdbf83631f4736e6"
     )
     item.worker.close(2.0)
 
@@ -707,10 +669,8 @@ def test_post_commit_monitor_offer_failure_terminalizes_the_stream_generation(
     stream, producer = AcquisitionStream.create(
         StreamId("synthetic.post-commit-publication-failure"),
         payload_contract,
-        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-        retention_events=1,
     )
-    tap = stream.monitor(max_events=1)
+    tap = stream.monitor()
     tap_type = type(tap)
     real_offer = tap_type._offer
 
@@ -720,7 +680,7 @@ def test_post_commit_monitor_offer_failure_terminalizes_the_stream_generation(
         return real_offer(self, stored)
 
     monkeypatch.setattr(tap_type, "_offer", fail_target_offer)
-    payload = Value(np.array(1, dtype=np.int64), VALID, data_schema.cell_schema)
+    payload = Value(np.array([1], dtype=np.int64), VALID, data_schema.cell_schema)
     with pytest.raises(SourceFailed, match="authoritative sequence 0 committed"):
         producer.emit(
             payload,
@@ -756,7 +716,11 @@ def test_exact_chain_preserves_keys_provenance_and_all_cells_before_input_ack():
     )
     inputs = [emit(item, ordinal) for ordinal in range(3)]
     artifact = item.worker.finish(item.producer.finish(), 2.0)
-    assert tuple(int(value) for value in artifact.block.values[0, :, ...]) == (10, 20, 30)
+    assert tuple(int(value) for value in artifact.block.values[0, :, 0]) == (
+        10,
+        20,
+        30,
+    )
     outputs = [item.monitor.next().envelope for _ in range(3)]
     assert [output.join_key for output in outputs] == list(item.schedule)
     assert all(output.event_id != source.event_id for output, source in zip(outputs, inputs))
@@ -769,12 +733,7 @@ def test_exact_chain_preserves_keys_provenance_and_all_cells_before_input_ack():
 
 
 def test_processor_changes_value_schema_without_changing_cell_key_domain():
-    output_cell = ValueSchema(
-        (),
-        ValidityContract.value(),
-        np.dtype("<f8"),
-        value_unit="probability",
-    )
+    output_cell = ValueSchema.scalar(np.dtype("<f8"), "probability")
     item = chain(
         points=1,
         operator=convert_to_probability,
@@ -799,7 +758,7 @@ def test_processor_changes_value_schema_without_changing_cell_key_domain():
     emit(item, 0)
     artifact = item.worker.finish(item.producer.finish(), 2.0)
     assert artifact.block.schema is item.output_schema
-    assert float(artifact.block.values[0, 0]) == pytest.approx(0.1)
+    assert float(artifact.block.values[0, 0, 0]) == pytest.approx(0.1)
 
 
 def test_operator_failure_leaves_failing_input_unacknowledged_and_joins():
@@ -904,7 +863,7 @@ def test_early_eos_fails_chain_without_sealing_partial_dataset():
     assert item.reservation.state is ReservationState.RELEASED
 
 
-def test_source_failure_and_retention_overrun_propagate_and_join():
+def test_source_failure_propagates_and_joins():
     item = chain(points=1)
     item.worker.start()
     item.producer.fail(SourceFailed("synthetic source failure"))
@@ -912,20 +871,6 @@ def test_source_failure_and_retention_overrun_propagate_and_join():
     with pytest.raises(StreamProcessorError) as caught:
         item.worker.raise_if_failed()
     assert_failure_evidence(caught.value.__cause__, SourceFailed)
-
-    overrun = chain(
-        points=2,
-        flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
-        input_retention=1,
-    )
-    emit(overrun, 0)
-    with pytest.raises(RetentionOverrun):
-        emit(overrun, 1)
-    overrun.worker.start()
-    overrun.worker.wait(2.0)
-    with pytest.raises(StreamProcessorError) as caught:
-        overrun.worker.raise_if_failed()
-    assert_failure_evidence(caught.value.__cause__, RetentionOverrun)
 
 
 def test_gap_and_join_key_mismatch_are_fail_closed():
@@ -972,8 +917,8 @@ def test_terminal_failure_and_supersede_after_last_event_wake_worker():
     assert not superseded.worker.is_alive
 
 
-def test_missing_terminal_and_late_operator_fail_with_declared_deadlines():
-    missing = chain(points=1, terminal_wait_seconds=0.05)
+def test_missing_terminal_is_bounded_by_worker_absolute_deadline():
+    missing = chain(points=1, absolute_deadline_seconds=0.05)
     missing.worker.start()
     emit(missing, 0)
     missing.worker.wait(2.0)
@@ -981,19 +926,6 @@ def test_missing_terminal_and_late_operator_fail_with_declared_deadlines():
         missing.worker.raise_if_failed()
     assert_failure_evidence(caught.value.__cause__, TimeoutError)
     assert not missing.worker.is_alive
-
-    late = chain(
-        points=1,
-        operator=slow_value,
-        operator_deadline_seconds=0.005,
-    )
-    late.worker.start()
-    emit(late, 0)
-    late.worker.wait(2.0)
-    with pytest.raises(StreamProcessorError) as caught:
-        late.worker.raise_if_failed()
-    assert_failure_evidence(caught.value.__cause__, TimeoutError)
-    assert late.reservation.acknowledged_sequence == 0
 
 
 def test_pass_through_preflight_cross_binds_owners_schedules_and_cursor():
@@ -1126,7 +1058,7 @@ def test_bound_processor_owner_copies_declarative_inputs():
     payload = ValuePayloadContract(data_schema.cell_schema)
     key_contract = DatasetCellKeyContract.from_schema(data_schema)
     definition_key = DefinitionKey("test", "owned-binding")
-    definition = StreamProcessorDefinition(
+    definition = ProcessorDefinition(
         definition_key,
         "Owned binding",
         "test.owned-binding-config",
@@ -1143,8 +1075,6 @@ def test_bound_processor_owner_copies_declarative_inputs():
         output_stream_id=caller_stream_id,
         output_source_id="synthetic-owned-binding",
         operator=scale_value,
-        operator_deadline_seconds=1.0,
-        terminal_wait_seconds=1.0,
         artifact_inputs=(caller_reference,),
     )
     frozen_fingerprint = bound.fingerprint
@@ -1163,7 +1093,6 @@ def test_bound_processor_owner_copies_declarative_inputs():
 
     assert bound.definition.key.stable_definition_id == "owned-binding"
     assert bound.definition.title == "Owned binding"
-    assert bound.operator_deadline_seconds == 1.0
     assert bound.config == ScaleConfig(2)
     assert bound.artifact_inputs[0].content_digest == "a" * 64
     assert bound.output_stream_id.value == "synthetic.owned-binding"
@@ -1191,22 +1120,8 @@ def test_artifact_input_ref_snapshots_only_canonical_owner_bytes():
         ArtifactInputRef("tests.other-ref", payload, "c" * 64)
     with pytest.raises(ValueError, match="canonical owner data"):
         ArtifactInputRef(schema_id, payload + b"\x00", "c" * 64)
-    oversized = encode({"schema": schema_id, "blob": "x" * (64 * 1024)})
-    with pytest.raises(ValueError, match="at most 64 KiB"):
-        ArtifactInputRef(schema_id, oversized, "c" * 64)
     with pytest.raises(ValueError, match="must not repeat"):
         chain(points=1, artifact_inputs=(reference, reference))
-
-    many = tuple(
-        ArtifactInputRef(
-            schema_id,
-            encode({"schema": schema_id, "id": index}),
-            f"{index:064x}",
-        )
-        for index in range(33)
-    )
-    with pytest.raises(ValueError, match="too many direct artifact inputs"):
-        ProcessorStageProvenance("d" * 64, many)
 
 @pytest.mark.parametrize(
     "dtype",
@@ -1521,7 +1436,6 @@ def test_cancel_arriving_inside_operator_prevents_output_emit_and_input_ack():
     item = chain(
         points=1,
         operator=cancellable_blocking_operator,
-        operator_deadline_seconds=1.0,
     )
     item.worker.start()
     emit(item, 0)
@@ -1561,16 +1475,20 @@ def test_finish_rejects_foreign_eos_even_after_autonomous_success():
     with pytest.raises(PermissionError, match="another source authority"):
         item.worker.finish(foreign_eos, 2.0)
     artifact = item.worker.finish(owned_eos, 2.0)
-    assert int(artifact.block.values[0, 0]) == 10
+    assert int(artifact.block.values[0, 0, 0]) == 10
     foreign.worker.close(2.0)
 
 
 def test_two_live_processor_stages_reach_one_terminal_dataset_with_full_lineage():
-    item = two_stage_chain(points=3, intermediate_retention=1)
+    item = two_stage_chain(points=3)
     inputs = tuple(emit_two_stage(item, ordinal) for ordinal in range(3))
     artifact = item.first.finish(item.producer.finish(), 2.0)
 
-    assert tuple(int(value) for value in artifact.block.values[0, :]) == (6, 12, 18)
+    assert tuple(int(value) for value in artifact.block.values[0, :, 0]) == (
+        6,
+        12,
+        18,
+    )
     outputs = tuple(item.monitor.next().envelope for _ in range(3))
     intermediate = tuple(
         item.intermediate_monitor.next().envelope for _ in range(3)
@@ -1615,7 +1533,10 @@ def test_exact_reservation_owns_downstream_stage_only_until_release_without_gc()
         emit_two_stage(item, 1)
         artifact = item.first.finish(item.producer.finish(), 2.0)
 
-        assert tuple(int(value) for value in artifact.block.values[0, :]) == (6, 12)
+        assert tuple(int(value) for value in artifact.block.values[0, :, 0]) == (
+            6,
+            12,
+        )
         assert item.intermediate_reservation.state is ReservationState.RELEASED
         assert second_reference() is None
     finally:
@@ -1662,7 +1583,7 @@ def test_upstream_ack_waits_for_real_downstream_processing_and_ack():
 
     CHAIN_OPERATOR_RELEASE.set()
     artifact = item.first.finish(item.producer.finish(), 2.0)
-    assert int(artifact.block.values[0, 0]) == 6
+    assert int(artifact.block.values[0, 0, 0]) == 6
     assert item.source_reservation.acknowledged_sequence == 1
 
 
@@ -1694,24 +1615,6 @@ def test_downstream_cancel_propagates_and_does_not_ack_pending_input():
 
     with pytest.raises(StreamProcessorError):
         item.first.raise_if_failed()
-    assert item.source_reservation.acknowledged_sequence == 0
-    assert item.intermediate_reservation.acknowledged_sequence == 0
-    assert not item.first.is_alive
-    assert not item.second.is_alive
-
-
-def test_downstream_operator_deadline_propagates_without_upstream_ack():
-    item = two_stage_chain(
-        points=1,
-        second_operator=slow_value,
-        second_operator_deadline_seconds=0.005,
-    )
-    emit_two_stage(item, 0)
-    item.first.wait(2.0)
-
-    with pytest.raises(StreamProcessorError) as caught:
-        item.first.raise_if_failed()
-    assert evidence_contains(caught.value.__cause__, TimeoutError)
     assert item.source_reservation.acknowledged_sequence == 0
     assert item.intermediate_reservation.acknowledged_sequence == 0
     assert not item.first.is_alive
@@ -1785,26 +1688,20 @@ def test_stale_downstream_readiness_cannot_bind_an_upstream_worker():
     intermediate, intermediate_producer = AcquisitionStream.create(
         StreamId("synthetic.stale.intermediate"),
         payload,
-        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-        retention_events=1,
         join_key_contract=key_contract,
     )
     intermediate_reservation = intermediate.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-first"),
     )
     intermediate_cursor = intermediate_reservation.activate()
     output, output_producer = AcquisitionStream.create(
         StreamId("synthetic.stale.output"),
         payload,
-        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-        retention_events=1,
         join_key_contract=key_contract,
     )
     output_reservation = output.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-second"),
     )
     output_cursor = output_reservation.activate()
@@ -1839,13 +1736,10 @@ def test_stale_downstream_readiness_cannot_bind_an_upstream_worker():
     raw, _raw_producer = AcquisitionStream.create(
         StreamId("synthetic.stale.raw"),
         payload,
-        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
-        retention_events=1,
         join_key_contract=key_contract,
     )
     raw_reservation = raw.reserve(
         total_events=1,
-        max_inflight_events=1,
         trace_binding=TraceBinding("synthetic-chain-run", "chain-source"),
     )
     raw_cursor = raw_reservation.activate()
@@ -1904,7 +1798,10 @@ def test_zero_event_multistage_preflight_can_rebuild_root_and_complete():
     emit_two_stage(rebuilt, 0)
     emit_two_stage(rebuilt, 1)
     artifact = rebuilt.first.finish(rebuilt.producer.finish(), 2.0)
-    assert tuple(int(value) for value in artifact.block.values[0, :]) == (6, 12)
+    assert tuple(int(value) for value in artifact.block.values[0, :, 0]) == (
+        6,
+        12,
+    )
     assert rebuilt.source_reservation.state is ReservationState.RELEASED
     assert rebuilt.intermediate_reservation.state is ReservationState.RELEASED
     assert not rebuilt.first.is_alive

@@ -17,31 +17,33 @@ from zlc_data import (
     encode_fit_result_batch,
     fit_spec_for,
 )
-from zlc_neutral_atom.adapter_sdk import (
+from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureTerminalRecord,
     CameraFrameRecord,
     CameraWorkingPoint,
 )
 from zlc_neutral_atom.artifacts import (
     AdmittedFitResult,
-    CaptureFrameSource,
-    CaptureRepository,
     FitExecution,
     FitResultArtifactRef,
     FitResultRepository,
+)
+from zlc_neutral_atom.logic_nodes.camera_capture.artifact import (
+    CaptureRepository,
     compile_capture_artifact_pipeline,
 )
-from zlc_neutral_atom.bootstrap._camera_endpoint import CameraCaptureEndpoint
-from zlc_neutral_atom.bootstrap._sequencer_endpoint import (
+from zlc_neutral_atom.logic_nodes.camera_capture.frames import CaptureFrameSource
+from zlc_neutral_atom.devices.camera.endpoint import CameraCaptureEndpoint
+from zlc_neutral_atom.devices.simulation.sequencer_endpoint import (
     VirtualSequencerExecutionEndpoint,
 )
-from zlc_neutral_atom.bootstrap._triggered_capture import (
+from zlc_neutral_atom.logic_nodes.camera_capture.binding import (
     TriggeredCameraLayout,
     bind_triggered_camera_acquisition,
 )
-from zlc_neutral_atom.bootstrap._virtual_hardware import VirtualSequencer
-from zlc_neutral_atom.runtime.capture import BoundCapturePort
-from zlc_neutral_atom.runtime.pipeline import MinimalPipelineSpec
+from zlc_neutral_atom.devices.simulation.apparatus import VirtualSequencer
+from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
+from zlc_neutral_atom.logic_nodes.camera_capture.pipeline import MinimalPipelineSpec
 from zlc_neutral_atom.runtime.ports import DeviceBroker, SafetyOperation
 from zlc_neutral_atom.runtime.resources import (
     DeviceIdentityEvidenceKind,
@@ -50,8 +52,8 @@ from zlc_neutral_atom.runtime.resources import (
     ResourceKey,
 )
 from zlc_neutral_atom.runtime.run import RunController
-from zlc_neutral_atom.timing.capture import TriggeredCaptureSpec
-from zlc_neutral_atom.timing.pulse import BoundPulsePort
+from zlc_neutral_atom.logic_nodes.camera_capture.triggered import TriggeredCaptureSpec
+from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
 from zlc_pulse import PulseExecutionForm, load_deployed_pulse_target, load_pulse_document
 from zlc_storage import (
     ContentCorruptionError,
@@ -67,7 +69,6 @@ _ROOT = Path(__file__).parents[1]
 
 
 class _Camera:
-    max_pending_records = 2
     timeout = 1.0
 
     def __init__(self) -> None:
@@ -99,12 +100,12 @@ class _Camera:
         frames: int,
         *,
         source_group_sizes: tuple[int, ...] | None,
-        max_inflight_frames: int,
+        buffer_frame_count: int,
         timeout: float,
     ) -> None:
         assert source_group_sizes is not None
         assert sum(source_group_sizes) == frames
-        assert max_inflight_frames == 2 and timeout > 0
+        assert buffer_frame_count == frames and timeout > 0
         self.expected = frames
         self.ordinal = 0
         self.armed = True

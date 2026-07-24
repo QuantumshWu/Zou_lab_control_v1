@@ -10,9 +10,8 @@ import time
 import numpy as np
 import pytest
 from PIL import Image
-from PyQt5 import QtCore, QtTest, QtWidgets
+from PyQt5 import QtCore, QtTest
 
-import Zou_lab_control.notebook as zlc
 from zlc_data import (
     REPEAT,
     SCAN_POINT,
@@ -28,8 +27,6 @@ from zlc_data import (
     DatasetSchema,
     OwnedSnapshot,
     PointLayout,
-    ReductionMethod,
-    Selection,
     StreamGenerationId,
     ValidityContract,
     ValueSchema,
@@ -133,22 +130,6 @@ def _blank_point(regions):
             if not any(region.contains(float(x), float(y)) for region in regions):
                 return float(x), float(y)
     raise AssertionError("rendered overview unexpectedly has no blank margin")
-
-
-def _camera_roi(experiment) -> Selection:
-    schema = experiment.readout.inspect_camera_monitor(
-        experiment.readout.camera_monitor_request(history_capacity=2)
-    ).output_schema
-    y_axis, x_axis = schema.cell_schema.data_axes
-    return Selection.rectangle(
-        x_axis.axis_id,
-        y_axis.axis_id,
-        x_axis.coordinates[0],
-        x_axis.coordinates[min(15, x_axis.size - 1)],
-        y_axis.coordinates[0],
-        y_axis.coordinates[min(11, y_axis.size - 1)],
-        coordinate_frame=x_axis.coordinate_frame,
-    )
 
 
 def test_meter_unit_validity_and_exact_focus_are_preserved():
@@ -365,7 +346,7 @@ def test_meter_grid_overview_focus_back_escape_and_atomic_exports(
         assert window._mode.text() == "EXACT METER · DISPLAY ONLY"
         assert not window._interaction_switch.isVisible()
         assert not window._settings_button.isVisible()
-        assert not window._analyze_button.isVisible()
+        assert not window._fit_button.isVisible()
 
         focused_frame = window._board_widget.front_frame
         focused_path = tmp_path / "focused.png"
@@ -442,48 +423,3 @@ def test_multi_layer_meter_is_not_promoted_to_the_single_layer_explorer():
     _intent, count, reason = figure_projection._classify_typed_grid(figure)
     assert count is None
     assert "one layer" in reason
-
-
-def test_live_camera_meter_publishes_exact_typed_payload(
-    application,
-    tmp_path,
-):
-    experiment = zlc.connect("virtual", repository=tmp_path / "live-meter")
-    window = None
-    try:
-        request = experiment.readout.camera_monitor_request(
-            history_capacity=3,
-            roi=_camera_roi(experiment),
-            roi_reduction=ReductionMethod.MEAN,
-            scalar_history_capacity=12,
-        )
-        window = experiment.readout.camera_monitor_gui(request)
-        start = window.findChild(QtWidgets.QPushButton, "startButton")
-        board = window.findChild(QtRasterBoard, "cameraMonitorImageBoard")
-        _until(application, start.isEnabled)
-        QtTest.QTest.mouseClick(start, QtCore.Qt.LeftButton)
-        _until(
-            application,
-            lambda: (
-                board.front_frame is not None
-                and isinstance(
-                    board.front_frame.panels[3].display_payload,
-                    MeterPanelPayload,
-                )
-            ),
-        )
-        frame = board.front_frame
-        meter = frame.panels[3].display_payload
-        histogram = frame.panels[2].display_payload
-        assert meter.evaluated_input == histogram.evaluated_input
-        assert meter.display_revision == frame.panels[0].coherence_stamp.presentations[3].panel_revision
-        assert frame.panels[3].coherence_stamp is frame.panels[0].coherence_stamp
-        assert board.visible_meter_payload("camera-monitor-roi-meter") is meter
-    finally:
-        if window is not None:
-            window.close()
-            _until(application, lambda: not window.isVisible(), timeout=8.0)
-            window.deleteLater()
-            application.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
-            application.processEvents()
-        experiment.close()

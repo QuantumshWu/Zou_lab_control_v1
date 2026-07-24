@@ -54,8 +54,6 @@ from zlc_frontend.panel_params import (
     resolved_panel_param as _resolved_panel_param,
 )
 from zlc_frontend import (
-    DEFAULT_GRID_FACET_AXIS_PARAM,
-    DEFAULT_GRID_INTENT_PARAM,
     HISTOGRAM_CELL_THRESHOLDS_PARAM as _HISTOGRAM_CELL_THRESHOLDS_PARAM,
     HISTOGRAM_THRESHOLDS_PARAM as _HISTOGRAM_THRESHOLDS_PARAM,
     RELIM_PARAM as _RELIM_PARAM,
@@ -163,18 +161,6 @@ class PanelCard(FluentGroupBox):
 
             fit_spec = fit_spec_from_tree(raw_fit_spec)
         _decode_panel_view(config)
-        raw_grid_intent = config.params.get(DEFAULT_GRID_INTENT_PARAM)
-        raw_grid_facet = config.params.get(DEFAULT_GRID_FACET_AXIS_PARAM)
-        if raw_grid_intent is not None or raw_grid_facet is not None:
-            if config.kind != "grid":
-                raise ValueError("default Grid metadata belongs only to Grid panels")
-            if not isinstance(raw_grid_intent, str):
-                raise TypeError("default grid intent must be str")
-            if not isinstance(raw_grid_facet, str) or not raw_grid_facet:
-                raise ValueError("default grid facet axis must be non-empty str")
-            from zlc_frontend.figure import ViewIntent
-
-            ViewIntent(raw_grid_intent)
         return fit_spec
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
@@ -378,12 +364,17 @@ class PanelCard(FluentGroupBox):
 
         return self.config.kind in {"1d", "monitor", "2d", "grid"}
 
-    def make_fit_authoring_pane(self, parent=None) -> FitAuthoringPane:
+    def make_fit_authoring_pane(
+        self,
+        parent=None,
+        *,
+        label_width: int | None = None,
+    ) -> FitAuthoringPane:
         """Build another editable view of this card's one Fit state."""
 
         if not self._fit_capable_kind():
             raise ValueError("this panel kind does not support Figure Fit")
-        pane = FitAuthoringPane(parent)
+        pane = FitAuthoringPane(parent, label_width=label_width)
         pane.fitRequested.connect(
             lambda _revision, spec, owner=pane: self._accept_fit_request(
                 owner,
@@ -547,7 +538,7 @@ class PanelCard(FluentGroupBox):
             self._fit_draft_context = None
             self._fit_options_identity = None
             self._fit_pending_source_ref = None
-            self.config.params.pop(_FIT_SPEC_PARAM, None)
+            self._commit_persisted_params(remove=(_FIT_SPEC_PARAM,))
             self.fit_cancel_requested.emit()
             self._clear_fit_result(notify=True)
 
@@ -608,7 +599,7 @@ class PanelCard(FluentGroupBox):
                 selected_model = None
                 if self._fit_active_spec is not None:
                     self._fit_active_spec = None
-                    self.config.params.pop(_FIT_SPEC_PARAM, None)
+                    self._commit_persisted_params(remove=(_FIT_SPEC_PARAM,))
                     self._clear_fit_result(notify=True)
             self._fit_options = options
             self._fit_options_identity = identity
@@ -676,9 +667,10 @@ class PanelCard(FluentGroupBox):
         self.fit_cancel_requested.emit()
         self._fit_draft = draft
         self._fit_active_spec = spec
-        self.config.params[_FIT_SPEC_PARAM] = fit_spec_to_tree(spec)
+        self._commit_persisted_params(
+            {_FIT_SPEC_PARAM: fit_spec_to_tree(spec)}
+        )
         self._clear_fit_result(notify=True)
-        self.changed.emit()
         self._queue_active_fit_for_presented()
 
     def _queue_active_fit_for_presented(self) -> None:
@@ -772,12 +764,11 @@ class PanelCard(FluentGroupBox):
         self._fit_pending_source_ref = None
         self.fit_cancel_requested.emit()
         self._fit_active_spec = None
-        self.config.params.pop(_FIT_SPEC_PARAM, None)
+        self._commit_persisted_params(remove=(_FIT_SPEC_PARAM,))
         self._clear_fit_result(notify=True)
         for pane in tuple(self._fit_panes):
             pane.set_busy(None, draft_ready=False)
         if had_state:
-            self.changed.emit()
             self._request_current_render()
     # ------------------------------------------------------------- settings UI
 
@@ -823,7 +814,7 @@ class PanelCard(FluentGroupBox):
             widget.setKeyboardTracking(False)
         return widget
 
-    def _emit_param_rows(self, specs, add, apply, label_w) -> dict:
+    def _emit_param_rows(self, specs, add, apply, label_w, *, parent) -> dict:
         """Render each declarative field in ``specs`` as a ``[label | control]`` row through the
         same frontend form-handler path the measurement form uses, appending it via the
         ``add`` callback.  Returns ``{key: widget}`` so a caller can keep a named back-reference.  BOTH
@@ -834,10 +825,17 @@ class PanelCard(FluentGroupBox):
             widget = self._make_param_widget(spec, apply=apply)
             out[spec.key] = widget
             self._param_fields[spec.key] = spec
-            add(FluentSettingRow(spec.label, widget, label_width=label_w))
+            add(
+                FluentSettingRow(
+                    spec.label,
+                    widget,
+                    label_width=label_w,
+                    parent=parent,
+                )
+            )
         return out
 
-    def _make_fixed_lim_row(self, apply_cb, label_w):
+    def _make_fixed_lim_row(self, apply_cb, label_w, *, parent):
         """The fixed lo/hi inputs as ONE bespoke ``[lo | hi]`` row (the single display knob kept
         special-cased rather than declarative -- it is not a scalar form field),
         shown only when relim == "fixed".  Built by this ONE helper so the Setting popup and the Edit tab
@@ -855,37 +853,33 @@ class PanelCard(FluentGroupBox):
         lay.setSpacing(scaled_px(6, minimum=4))
         lay.addWidget(lo, 1)
         lay.addWidget(hi, 1)
-        row = FluentSettingRow("lo / hi", host, label_width=label_w)
+        row = FluentSettingRow(
+            "lo / hi",
+            host,
+            label_width=label_w,
+            parent=parent,
+        )
         row.setVisible(self._relim() == "fixed")
         return row, lo, hi
 
-    def _make_unit_cycle_row(self, on_click, label_w, *, with_label: bool):
-        """The x-axis unit-cycle row as ONE bespoke ``[Unit button | <stretch> [| current-unit text]]``
-        row.  Built by this ONE helper (like ``_make_fixed_lim_row``) so the Setting popup and the Edit
-        tab get the IDENTICAL row -- same button width, same flush-left idiom, same SINGLE tooltip --
-        instead of two hand-copied blocks whose tooltips had already drifted apart.  ``with_label=True``
-        (Setting) also builds the live current-unit ``self.unit_label`` (refreshed by ``_on_unit_cycle``);
-        Edit passes ``with_label=False``.  Returns ``(row, button, label_or_None)``."""
-        button = FluentButton("Unit", color=GREY)
-        button.setFixedWidth(scaled_px(70, minimum=56))
-        button.setToolTip(
-            "Cycle the x-axis unit (GHz/nm/MHz or ns/us/ms) where the axis label\n"
-            "declares a convertible unit; otherwise a no-op")
-        button.clicked.connect(on_click)
-        host = QtWidgets.QWidget()
-        lay = QtWidgets.QHBoxLayout(host)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(scaled_px(6, minimum=4))
-        lay.addWidget(button, 0)
-        lay.addStretch(1)
-        label = None
-        if with_label:
-            label = FluentLabel(self._current_unit_text())
-            label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-            lay.addWidget(label, 0)
-        row = FluentSettingRow("unit", host, label_width=label_w)
-        return row, button, label
+    def _make_unit_readout_row(self, label_w, *, parent):
+        """Build the shared read-only producer-unit row for Setting and Edit."""
+
+        label = FluentLabel(self._current_unit_text())
+        label.setStyleSheet(
+            f"color: {GREY}; background: transparent; border: none;"
+        )
+        label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        label.setToolTip(
+            "Declared by the producer schema. Display panels do not rewrite units."
+        )
+        row = FluentSettingRow(
+            "unit",
+            label,
+            label_width=label_w,
+            parent=parent,
+        )
+        return row, label
 
     def _relim(self) -> str:
         """The panel's relim mode, defaulting to ``_RELIM_PARAM.default`` -- the ONE place that
@@ -918,6 +912,7 @@ class PanelCard(FluentGroupBox):
                     ),
                 )
         self._refresh_repeat_mode_control()
+        self._refresh_unit_readout()
 
     def _build_plot(self) -> None:
         """Give this card its raster surface.
@@ -1255,21 +1250,10 @@ class PanelCard(FluentGroupBox):
         schema = value.snapshot.block.schema
         site_map_view = None
         if self.config.kind == "sites":
-            from zlc_frontend.site_map_render import (
-                CalibrationSiteMapView,
-                OccupancyCellView,
-                OccupancySummarySiteMapView,
-            )
+            from zlc_frontend.site_map_render import SiteMapView
 
             site_map_view = getattr(value, "presentation", None)
-            if not isinstance(
-                site_map_view,
-                (
-                    OccupancyCellView,
-                    CalibrationSiteMapView,
-                    OccupancySummarySiteMapView,
-                ),
-            ):
+            if not isinstance(site_map_view, SiteMapView.__args__):
                 self.set_status(
                     "Site map needs a committed calibration or an exact "
                     "single-cell occupancy result",
@@ -1283,6 +1267,7 @@ class PanelCard(FluentGroupBox):
                 )
                 return None
         if schema != self._candidate_schema:
+            self._reconcile_persisted_view_for_schema(schema)
             self._candidate_schema = schema
             self._grid_focus = None
             self._pending_faceted_result = None
@@ -1303,7 +1288,7 @@ class PanelCard(FluentGroupBox):
             else self._saved_view_spec(schema)
         )
         if self.config.kind == "grid" and view is None:
-            view = self._catalog_default_grid_view(schema)
+            view = self._default_grid_view(schema)
         if self.config.kind == "grid" and view is None:
             self.set_status(
                 "choose a named facet axis in Setting",
@@ -1945,6 +1930,7 @@ class PanelCard(FluentGroupBox):
             self._presented_title = pending_title
             self._presented_value_label = pending_value_label
             self._presented_value = pending_value
+            self._refresh_unit_readout()
             self._settle_pending_interaction_through(
                 pending_display.revision,
                 failed=False,
@@ -2036,10 +2022,9 @@ class PanelCard(FluentGroupBox):
 
         display_specs = list(_panel_param_decls(self.config.kind)) + [_RELIM_PARAM]
         label_w = self.setting_label_width(self.fontMetrics())
-        # Main's settings card leaves a real control column beside the shared
-        # label column.  Derive the popup minimum from those two columns plus
-        # Fluent chrome instead of freezing one narrow whole-popup width.
-        popup.setMinimumWidth(
+        # The Setting surface owns one stable width.  Descendant combo/path/error
+        # size hints are content, not a request to widen the outer popup/window.
+        popup.setFixedWidth(
             label_w
             + scaled_px(360, minimum=320)
             + 2 * pad
@@ -2105,7 +2090,12 @@ class PanelCard(FluentGroupBox):
             FluentSettingRow("size", self.size_combo, label_width=label_w)
         )
         self.form_widgets = self._emit_param_rows(
-            display_specs, display.addWidget, self._set_param, label_w)
+            display_specs,
+            display.addWidget,
+            self._set_param,
+            label_w,
+            parent=content,
+        )
         self._mount_grid_row_inventory(
             self,
             display.addWidget,
@@ -2113,18 +2103,25 @@ class PanelCard(FluentGroupBox):
             param_apply=self._set_param,
             label_w=label_w,
             form_widgets=self.form_widgets,
+            parent=content,
         )
         self.repeat_mode_row, self.repeat_mode_combo = self._make_repeat_mode_row(
             self._commit_repeat_mode,
             label_w,
+            parent=content,
         )
         display.addWidget(self.repeat_mode_row)
         self.fixed_lim_row, self.fixed_lo_edit, self.fixed_hi_edit = self._make_fixed_lim_row(
-            self._on_fixed_lim_edited, label_w)
+            self._on_fixed_lim_edited,
+            label_w,
+            parent=content,
+        )
         display.addWidget(self.fixed_lim_row)
         self.fixed_lim_row.setVisible(self._relim() == "fixed")
-        unit_row, self.unit_button, self.unit_label = self._make_unit_cycle_row(
-            self._on_unit_cycle, label_w, with_label=True)
+        unit_row, self.unit_label = self._make_unit_readout_row(
+            label_w,
+            parent=content,
+        )
         display.addWidget(unit_row)
         self.update_combo = FluentComboBox()
         for interval in UPDATE_INTERVALS:
@@ -2151,7 +2148,10 @@ class PanelCard(FluentGroupBox):
         self.fit_authoring_pane = None
         if self._fit_capable_kind():
             fit_section = section("Fit")
-            self.fit_authoring_pane = self.make_fit_authoring_pane(popup)
+            self.fit_authoring_pane = self.make_fit_authoring_pane(
+                popup,
+                label_width=label_w,
+            )
             fit_section.addWidget(self.fit_authoring_pane)
 
         # ---- Panel: card identity and the two standard panel actions.
@@ -2410,33 +2410,13 @@ class PanelCard(FluentGroupBox):
         )
         return suggestion.spec
 
-    def _catalog_default_grid_view(self, schema):
-        """Resolve a catalog-declared default through the ordinary Figure contract."""
+    def _default_grid_view(self, schema):
+        """Resolve the stable schema-derived default without authoring state."""
 
-        from zlc_frontend.figure import ViewIntent, dataset_axes, view_spec_to_tree
+        from zlc_frontend.figure import suggest_default_grid_view
 
-        raw_intent = self.config.params.get(DEFAULT_GRID_INTENT_PARAM)
-        raw_facet = self.config.params.get(DEFAULT_GRID_FACET_AXIS_PARAM)
-        if raw_intent is None or raw_facet is None:
-            return None
-        if not isinstance(raw_intent, str):
-            raise TypeError("default grid intent must be str")
-        if not isinstance(raw_facet, str):
-            raise TypeError("default grid facet axis must be str")
-        intent = ViewIntent(raw_intent)
-        axes_by_text = {
-            str(axis.axis_id): axis.axis_id for axis in dataset_axes(schema)
-        }
-        facet_axis_id = axes_by_text.get(raw_facet)
-        if facet_axis_id is None:
-            raise ValueError(
-                "default grid facet axis is absent from the current DatasetSchema"
-            )
-        candidate = self._resolved_grid_view(intent, facet_axis_id)
-        if candidate is None:
-            raise ValueError("default grid view cannot be resolved for this schema")
-        self.config.params[_VIEW_SPEC_PARAM] = view_spec_to_tree(candidate)
-        return candidate
+        suggestion = suggest_default_grid_view(schema)
+        return suggestion.spec
 
     def _grid_facet_choices(self, intent):
         from zlc_frontend.figure import grid_facet_axes
@@ -2451,7 +2431,7 @@ class PanelCard(FluentGroupBox):
             current_view=saved,
         )
 
-    def _make_grid_view_rows(self, label_w, *, apply):
+    def _make_grid_view_rows(self, label_w, *, apply, parent):
         intent_combo = FluentComboBox()
         intent_combo.setToolTip(
             "What each Grid cell draws. The selected family is resolved "
@@ -2465,11 +2445,13 @@ class PanelCard(FluentGroupBox):
             "sub plot",
             intent_combo,
             label_width=label_w,
+            parent=parent,
         )
         facet_row = FluentSettingRow(
             "facet",
             facet_combo,
             label_width=label_w,
+            parent=parent,
         )
         def commit_facet(index: int) -> None:
             intent = intent_combo.currentData()
@@ -2507,7 +2489,7 @@ class PanelCard(FluentGroupBox):
         facet_row.setVisible(visible)
         return intent_row, intent_combo, facet_row, facet_combo
 
-    def _grid_row_inventory(self, *, view_apply, param_apply, label_w):
+    def _grid_row_inventory(self, *, view_apply, param_apply, label_w, parent):
         """Build the one ordered Grid field inventory used by both surfaces."""
 
         (
@@ -2515,12 +2497,21 @@ class PanelCard(FluentGroupBox):
             intent_combo,
             facet_row,
             facet_combo,
-        ) = self._make_grid_view_rows(label_w, apply=view_apply)
-        bins_row, bins_widget = self._make_grid_bins_row(param_apply, label_w)
+        ) = self._make_grid_view_rows(
+            label_w,
+            apply=view_apply,
+            parent=parent,
+        )
+        bins_row, bins_widget = self._make_grid_bins_row(
+            param_apply,
+            label_w,
+            parent=parent,
+        )
         count_scale_row, count_scale_widget = self._make_grid_hist_param_row(
             "count_scale",
             param_apply,
             label_w,
+            parent=parent,
         )
         colormap_row, colormap_widget = self._make_grid_cell_param_row(
             "2d",
@@ -2528,6 +2519,7 @@ class PanelCard(FluentGroupBox):
             self._image_intent(),
             param_apply,
             label_w,
+            parent=parent,
         )
         # Attribute names are explicit here so neither host can reorder or
         # silently omit a field while still claiming to share the same UI.
@@ -2566,6 +2558,7 @@ class PanelCard(FluentGroupBox):
         param_apply,
         label_w,
         form_widgets,
+        parent,
     ) -> None:
         """Mount the shared Grid rows without a second Setting/Edit schema."""
 
@@ -2576,6 +2569,7 @@ class PanelCard(FluentGroupBox):
                 view_apply=view_apply,
                 param_apply=param_apply,
                 label_w=label_w,
+                parent=parent,
             )
         ):
             setattr(owner, row_name, row)
@@ -2584,7 +2578,7 @@ class PanelCard(FluentGroupBox):
                 form_widgets[param_key] = widget
             add(row)
 
-    def _make_grid_hist_param_row(self, key: str, apply, label_w):
+    def _make_grid_hist_param_row(self, key: str, apply, label_w, *, parent):
         """Build one histogram-only Grid knob through the shared param owner."""
 
         return self._make_grid_cell_param_row(
@@ -2593,6 +2587,7 @@ class PanelCard(FluentGroupBox):
             self._histogram_intent(),
             apply,
             label_w,
+            parent=parent,
         )
 
     def _make_grid_cell_param_row(
@@ -2602,6 +2597,8 @@ class PanelCard(FluentGroupBox):
         intent,
         apply,
         label_w,
+        *,
+        parent,
     ):
         """Build one cell-family Grid knob from its ordinary panel declaration."""
 
@@ -2612,12 +2609,22 @@ class PanelCard(FluentGroupBox):
         )
         widget = self._make_param_widget(declaration, apply=apply)
         self._param_fields[declaration.key] = declaration
-        row = FluentSettingRow(declaration.label, widget, label_width=label_w)
+        row = FluentSettingRow(
+            declaration.label,
+            widget,
+            label_width=label_w,
+            parent=parent,
+        )
         row.setVisible(self._grid_cell_intent() is intent)
         return row, widget
 
-    def _make_grid_bins_row(self, apply, label_w):
-        return self._make_grid_hist_param_row("bin_count", apply, label_w)
+    def _make_grid_bins_row(self, apply, label_w, *, parent):
+        return self._make_grid_hist_param_row(
+            "bin_count",
+            apply,
+            label_w,
+            parent=parent,
+        )
 
     @staticmethod
     def _histogram_intent():
@@ -2769,7 +2776,7 @@ class PanelCard(FluentGroupBox):
         return changed
 
     def _saved_view_spec(self, schema):
-        """Decode the one current owner-coded presentation value, if authored."""
+        """Purely read the current owner-coded presentation value, if valid."""
 
         if self.config.kind == "sites":
             return None
@@ -2777,15 +2784,26 @@ class PanelCard(FluentGroupBox):
         if view is None:
             return None
         if view.schema_fingerprint != schema.fingerprint:
-            # A producer schema generation is a real view boundary.  Never
-            # reinterpret prior-generation bindings by axis position; discard this
-            # presentation-only value and let the Figure owner suggest a new
-            # typed default for the new schema.
-            self.config.params.pop(_VIEW_SPEC_PARAM, None)
-            self.config.params.pop(_HISTOGRAM_CELL_THRESHOLDS_PARAM, None)
-            self.config.params.pop(_HISTOGRAM_THRESHOLDS_PARAM, None)
+            # Reconciliation belongs to the explicit schema-change boundary,
+            # never to this read.  A stale value is simply not readable here.
             return None
         return view
+
+    def _reconcile_persisted_view_for_schema(self, schema) -> None:
+        """Retire prior-generation view state at the schema commit boundary."""
+
+        if self.config.kind == "sites":
+            return
+        view = _decode_panel_view(self.config)
+        if view is None or view.schema_fingerprint == schema.fingerprint:
+            return
+        self._commit_persisted_params(
+            remove=(
+                _VIEW_SPEC_PARAM,
+                _HISTOGRAM_CELL_THRESHOLDS_PARAM,
+                _HISTOGRAM_THRESHOLDS_PARAM,
+            )
+        )
 
     def _repeat_modes_for_current_schema(self):
         """Typed repeat policies this one-panel host can actually render.
@@ -2902,7 +2920,7 @@ class PanelCard(FluentGroupBox):
         row.setVisible(bool(modes))
         combo.setEnabled(len(modes) > 1)
 
-    def _make_repeat_mode_row(self, apply, label_w):
+    def _make_repeat_mode_row(self, apply, label_w, *, parent):
         from zlc_frontend.figure import RepeatViewMode
 
         combo = FluentComboBox()
@@ -2920,7 +2938,12 @@ class PanelCard(FluentGroupBox):
                 apply(mode)
 
         combo.currentIndexChanged.connect(commit)
-        row = FluentSettingRow("repeat", combo, label_width=label_w)
+        row = FluentSettingRow(
+            "repeat",
+            combo,
+            label_width=label_w,
+            parent=parent,
+        )
         self._seed_repeat_mode_control(combo, row)
         return row, combo
 
@@ -3004,9 +3027,14 @@ class PanelCard(FluentGroupBox):
         if name == self.config.signal:
             return
         self.config.signal = name
-        self.config.params.pop(_VIEW_SPEC_PARAM, None)
-        self.config.params.pop(_HISTOGRAM_CELL_THRESHOLDS_PARAM, None)
-        self.config.params.pop(_HISTOGRAM_THRESHOLDS_PARAM, None)
+        self._commit_persisted_params(
+            remove=(
+                _VIEW_SPEC_PARAM,
+                _HISTOGRAM_CELL_THRESHOLDS_PARAM,
+                _HISTOGRAM_THRESHOLDS_PARAM,
+            ),
+            emit_changed=False,
+        )
         self._last_value = None
         self._candidate_value = None
         self._last_document = None
@@ -3021,23 +3049,17 @@ class PanelCard(FluentGroupBox):
         self.changed.emit()
 
     def _current_unit_text(self) -> str:
-        """The bound signal's declared unit, or a neutral placeholder."""
+        """The visible signal's producer-declared unit."""
 
-        value = self._last_value
-        unit = "" if value is None else (value.unit or "")
-        return unit or "unit"
+        value = self._presented_value or self._last_value
+        if value is None:
+            return "—"
+        return value.unit or "dimensionless"
 
-    def _on_unit_cycle(self) -> None:
-        """Refresh the unit readout.
-
-        The unit is the PRODUCER's declared fact (``cell_schema.value_unit`` and
-        each axis's own unit), carried on the data and printed by the renderer.
-        A panel cannot cycle it: rewriting the unit here would make the picture
-        disagree with the schema every other reader trusts.  The row stays as
-        the readout of what the bound signal actually declares.
-        """
-
-        self.unit_label.setText(self._current_unit_text()) if hasattr(self, "unit_label") else None
+    def _refresh_unit_readout(self) -> None:
+        label = getattr(self, "unit_label", None)
+        if label is not None:
+            label.setText(self._current_unit_text())
 
     def _on_view_committed(self, commit) -> None:
         self.accept_view_commit_from(self.board, commit)
@@ -3139,7 +3161,6 @@ class PanelCard(FluentGroupBox):
         self._pending_interaction_host = host
         self._pending_interaction_revision = self._display_revision
         self._request_current_render()
-        self.changed.emit()
 
     def _on_histogram_thresholds_committed(self, commit) -> None:
         self.accept_thresholds_from(self.board, commit)
@@ -3198,10 +3219,13 @@ class PanelCard(FluentGroupBox):
             if candidate == display:
                 host.discard_pending_interaction(commit.origin)
                 return
-            self.config.params[_HISTOGRAM_CELL_THRESHOLDS_PARAM] = (
-                histogram_cell_thresholds_to_tree(
-                    candidate.cell_thresholds
-                )
+            self._commit_persisted_params(
+                {
+                    _HISTOGRAM_CELL_THRESHOLDS_PARAM:
+                        histogram_cell_thresholds_to_tree(
+                            candidate.cell_thresholds
+                        )
+                }
             )
             self._display_revision = candidate.revision
         else:
@@ -3212,22 +3236,27 @@ class PanelCard(FluentGroupBox):
             if candidate == display:
                 host.discard_pending_interaction(commit.origin)
                 return
-            self.config.params[_HISTOGRAM_THRESHOLDS_PARAM] = list(
-                candidate.thresholds
+            self._commit_persisted_params(
+                {
+                    _HISTOGRAM_THRESHOLDS_PARAM: list(candidate.thresholds)
+                }
             )
             self._display_revision = candidate.revision
         self._pending_interaction_origin = commit.origin
         self._pending_interaction_host = host
         self._pending_interaction_revision = self._display_revision
         self._request_current_render()
-        self.changed.emit()
 
     def _store_fixed_lims(self, lo: float, hi: float) -> None:
         """The sole low-level writer for persisted fixed colour/count limits."""
 
-        self.config.params["relim"] = "fixed"
-        self.config.params["fixed_lo"] = float(lo)
-        self.config.params["fixed_hi"] = float(hi)
+        self._commit_persisted_params(
+            {
+                "relim": "fixed",
+                "fixed_lo": float(lo),
+                "fixed_hi": float(hi),
+            }
+        )
 
     def apply_fixed_lims(self, lo: float, hi: float) -> None:
         """Persist the fixed lo/hi and re-compose with them NOW.
@@ -3257,9 +3286,8 @@ class PanelCard(FluentGroupBox):
         ms = int(self.update_combo.currentData() or DEFAULT_UPDATE_MS)
         if ms == int(self.config.params.get("update_ms", DEFAULT_UPDATE_MS) or DEFAULT_UPDATE_MS):
             return
-        self.config.params["update_ms"] = ms
+        self._commit_persisted_params({"update_ms": ms})
         self.update_interval_changed.emit()    # console re-bases the shared timer
-        self.changed.emit()                    # mark the layout dirty
 
     def _refresh_title(self) -> None:
         """Compose the grey frame TITLE: the panel KIND + WHERE its signal comes from (the
@@ -3373,6 +3401,58 @@ class PanelCard(FluentGroupBox):
     def _set_param(self, key: str, value) -> bool:
         return self._set_params({str(key): value})
 
+    def _commit_persisted_params(
+        self,
+        updates: Mapping[str, object] | None = None,
+        *,
+        remove=(),
+        request_render: bool = False,
+        emit_changed: bool = True,
+    ) -> frozenset[str]:
+        """The only writer for persisted panel parameters.
+
+        Callers supply one complete semantic transaction.  This method owns
+        choice encoding, removals, equality checks, and the two observable
+        effects of a persisted edit (optional render request and dirty signal).
+        Pure readers must never call it.
+        """
+
+        if not isinstance(request_render, bool) or not isinstance(emit_changed, bool):
+            raise TypeError("persisted parameter effects must be bool")
+        incoming = {} if updates is None else dict(updates)
+        removals = tuple(str(key) for key in remove)
+        overlap = set(incoming).intersection(removals)
+        if overlap:
+            raise ValueError(
+                "persisted parameter transaction both updates and removes "
+                f"{tuple(sorted(overlap))}"
+            )
+        missing = object()
+        encoded = {}
+        for raw_key, value in incoming.items():
+            key = str(raw_key)
+            field = self._param_fields.get(key)
+            encoded[key] = (
+                choice_value_to_tree(field, value)
+                if field is not None and field.kind == "choice"
+                else value
+            )
+        changed = {
+            key for key, value in encoded.items()
+            if self.config.params.get(key, missing) != value
+        }
+        changed.update(key for key in removals if key in self.config.params)
+        if not changed:
+            return frozenset()
+        for key in removals:
+            self.config.params.pop(key, None)
+        self.config.params.update(encoded)
+        if request_render:
+            self._request_display_render()
+        if emit_changed:
+            self.changed.emit()
+        return frozenset(changed)
+
     def _set_params(self, updates: Mapping[str, object]) -> bool:
         """Commit one semantic parameter transaction and request one compose.
 
@@ -3383,39 +3463,37 @@ class PanelCard(FluentGroupBox):
         stored and what is drawn cannot drift.
         """
 
-        missing = object()
-        changed = {}
-        for key, value in dict(updates).items():
-            key = str(key)
-            field = self._param_fields.get(key)
-            stored = (
-                choice_value_to_tree(field, value)
-                if field is not None and field.kind == "choice"
-                else value
-            )
-            if self.config.params.get(key, missing) != stored:
-                changed[key] = stored
-        if not changed:
-            return False
-        self.config.params.update(changed)
-        if "relim" in changed:
-            value = changed["relim"]
+        effective = {str(key): value for key, value in dict(updates).items()}
+        if (
+            str(effective.get("relim", "")) == "fixed"
+            and not {"fixed_lo", "fixed_hi"}.intersection(effective)
+        ):
             # Flipping INTO ``fixed`` FREEZES the window currently on screen.
             # Seeding from the composed front's own limits (never the default
             # 0..1 pair) is what keeps the picture: pinning a counts histogram
             # or a camera frame to 0..1 empties it, which reads as "the panel
             # just died".  The operator then types exact bounds.
-            if str(value) == "fixed" and not {
-                "fixed_lo", "fixed_hi"
-            }.issubset(changed):
-                shown = self._shown_limits()
-                if shown is not None:
-                    lo, hi = shown
-                    self.config.params["fixed_lo"], self.config.params["fixed_hi"] = lo, hi
-                    for edit, val in ((getattr(self, "fixed_lo_edit", None), lo),
-                                      (getattr(self, "fixed_hi_edit", None), hi)):
-                        if edit is not None:
-                            edit.setText(f"{val:g}")   # setText does NOT re-fire editingFinished
+            shown = self._shown_limits()
+            if shown is not None:
+                lo, hi = shown
+                effective["fixed_lo"], effective["fixed_hi"] = lo, hi
+        changed = self._commit_persisted_params(
+            effective,
+            request_render=True,
+        )
+        if not changed:
+            return False
+        if "relim" in changed:
+            value = self.config.params["relim"]
+            if str(value) == "fixed":
+                for edit, key in (
+                    (getattr(self, "fixed_lo_edit", None), "fixed_lo"),
+                    (getattr(self, "fixed_hi_edit", None), "fixed_hi"),
+                ):
+                    if edit is not None and key in self.config.params:
+                        edit.setText(
+                            f"{float(self.config.params[key]):g}"
+                        )  # setText does not re-fire editingFinished
             if getattr(self, "fixed_lim_row", None) is not None:        # the Setting popup's lo/hi row
                 self.fixed_lim_row.setVisible(str(value) == "fixed")    # (the Edit tab toggles its own)
                 # Revealing/hiding the row changes the popup's content height, and the popup is a
@@ -3424,8 +3502,6 @@ class PanelCard(FluentGroupBox):
                 # fixed frame (which reads as a jump).
                 if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
                     self._size_settings_popup()
-        self._request_display_render()
-        self.changed.emit()
         return True
 
     def _shown_limits(self):
@@ -3525,10 +3601,9 @@ class PanelCard(FluentGroupBox):
     def _teardown_plot(self) -> None:
         """Drop this card's surface, leaving nothing painted behind it.
 
-        ``setParent(None)`` before the deferred delete: removing a widget from
-        the layout only detaches it from the LAYOUT -- it stays parented, and
-        painted, until the delete actually runs.  Explicit detachment makes the
-        replacement atomic from the layout's point of view.
+        Hide synchronously, then keep the host parented until deferred deletion.
+        Reparenting a QWidget to ``None`` would temporarily make it a top-level
+        window, which is never a legal Figure lifecycle state.
         """
 
         board = self.board
@@ -3573,7 +3648,7 @@ class PanelCard(FluentGroupBox):
         self._latest_requested_display_revision = None
         if board is not None:
             self.canvas_holder.removeWidget(board)
-            board.setParent(None)
+            board.hide()
             board.deleteLater()
 
     def shutdown(self) -> None:

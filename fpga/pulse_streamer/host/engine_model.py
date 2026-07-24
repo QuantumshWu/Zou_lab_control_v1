@@ -18,9 +18,10 @@ Three models, all walking the SAME engine FSM:
 
 * :func:`streaming_scan_play` -- the SCAN path: the scan-point table is a 2-bank
   ping-pong window of ``bank_size`` points; the host refills the idle bank behind
-  the engine cursor so the total number of scan points is UNBOUNDED.  Proven ==
-  reference over the full N-point sweep when the host keeps up, and STALL (hold,
-  never a wrong point) on a late refill.
+  the engine cursor.  This model verifies the dormant refill handshake against
+  reference and proves STALL (hold, never a wrong point) on a late refill.  The
+  current deployed host does not publish refill: its admitted baseline is the
+  fully resident two-bank window and rejects larger tables before FIRE.
 
 The RTL combines the edge FIFO and the scan ping-pong; each is verified here
 independently and against the same ``reference_play`` ground truth.
@@ -146,8 +147,8 @@ def bus_delay_line_reference(undelayed_bus: Sequence[int], delay: int,
     """Exact per-bus delay line: a 10-bit DAC value stream delayed by ``d`` (one delay
     shared by all 10 bits), holding ``safe_value`` before t == d.  The hardware default is
     the SAFE mid-scale code 512 (= BUS_SAFE_VALUE = true 0 V on the offset-binary driver).
-    The hardware schedules each DA bit's value-changes as events (per-bit, sharing one per-bus d),
-    so out[t] = in[t-d].  d=0 is exact passthrough."""
+    The hardware queues resolved segment descriptors once per bus and replays the same ramp
+    stepper after the shared delay, so out[t] = in[t-d].  d=0 is exact passthrough."""
     d = int(delay)
     out = []
     for t in range(len(undelayed_bus)):
@@ -224,13 +225,18 @@ def rtl_delay_line_mirror(undelayed: Sequence[int], channel_delays,
             level = (prev >> b) & 1 if d == 1 else evt_out[b]
             m |= (level & 1) << b
         out.append(m)
-        # end-of-cycle register updates: pops (head == t), then pushes (toggle at t)
+        # The RTL derives both guards from the pre-clock FIFO count.  A full
+        # queue therefore rejects a push even when its head pops on this same
+        # edge; the host capacity validator rejects that closed-window
+        # boundary before deployment, but this literal mirror must still match
+        # the frozen registers for an out-of-contract input sequence.
         for b, d in cds.items():
             q = queues[b]
+            push_has_space = len(q) < evt_depth
             if q and q[0][0] == t:
                 evt_out[b] = q.pop(0)[1]
             if d >= 2 and (((cur ^ prev) >> b) & 1):
-                if len(q) < evt_depth:          # overflow guard: drop (validator prevents)
+                if push_has_space:              # overflow guard: drop (validator prevents)
                     q.append((t + d - 1, (cur >> b) & 1))
         prev = cur
     return out
@@ -480,7 +486,7 @@ def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: i
 
 
 # ----------------------------------------------------------------------------
-# scan ping-pong streaming (unbounded scan points)
+# scan ping-pong refill model (dormant in the current deployed host)
 # ----------------------------------------------------------------------------
 def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: int = 0,
                         raise_on_underflow: bool = False):
@@ -492,7 +498,7 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
     later (modelling JTAG-AXI write latency).  Returns (out, stalled, points_played).
 
     With ``refill_delay`` small enough the output equals :func:`reference_play` over
-    the full N-point sweep (gapless, unbounded points).  A late refill makes the
+    the full N-point sweep.  A late refill makes the
     engine STALL (hold the current state, never emit a wrong point); set
     ``raise_on_underflow`` to turn that stall into a :class:`ScanUnderflow`."""
     p = program if isinstance(program, EngineProgram) else EngineProgram.from_program(program)
@@ -1001,7 +1007,7 @@ def rtl_bus_segment_delay_mirror(program, bus_index: int, delay: int, n_ticks: i
                                  scan_point_seq: Sequence[int] | None = None,
                                  return_occupancy: bool = False):
     """Cycle-exact mirror of the NEW per-bus SEGMENT-DESCRIPTOR delay (the instruction-level DAC
-    delay that replaces the per-DA-bit value-change ``g_busdly`` FIFO).
+    delay implemented by the per-bus segment-descriptor FIFO and re-player).
 
     Instead of buffering one event per per-tick value-CHANGE (a ramp = ~span events), the delay
     captures each RESOLVED segment the live engine applies -- ``{emit = apply_tick + d, descriptor}``
@@ -1034,9 +1040,13 @@ def rtl_bus_segment_delay_mirror(program, bus_index: int, delay: int, n_ticks: i
     live = 0
     window: deque = deque()             # emit ticks of descriptors still in flight
     for (t_apply, snap) in log:
+        # Like g_busseg, push/pop eligibility is computed from the pre-edge
+        # count.  Preserve that detail even though the validator rejects a
+        # full+simultaneous-pop schedule on the formal path.
+        push_has_space = live < cap
         while window and window[0] <= t_apply:        # retire descriptors already emitted
             window.popleft(); live -= 1
-        if live >= cap:
+        if not push_has_space:
             continue                    # OVERFLOW: drop this segment (diverges from reference)
         window.append(t_apply + d); live += 1
         peak = max(peak, live)

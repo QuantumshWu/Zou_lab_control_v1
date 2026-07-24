@@ -124,7 +124,10 @@ def open_scan_workbench(experiment, request):
 
     from zlc_frontend.figure import ViewIntent
     from zlc_frontend.scan_preview import describe_scan_figure
-    from zlc_neutral_atom.scan import OccupancyScanRequest, ScanRequest
+    from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import (
+        OccupancyScanRequest,
+        ScanRequest,
+    )
     from zlc_workbench.scan import FinalScanPresentation
     from zlc_workbench.scan_workbench.application import ScanWorkbenchActions
     from zlc_workbench.scan_workbench.app import open_scan_workbench as _open

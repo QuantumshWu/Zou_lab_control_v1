@@ -8,7 +8,7 @@
 // All 8 channels carry the SAME undelayed waveform (bit of hist), so each delayed
 // channel can be checked against hist[t-d][0].
 module tb_delay_compact;
-  localparam integer CH=8, EAW=12, TW=32, NS=1, CW=16, DTW=12, BUSC=4, BW=10;
+  localparam integer CH=8, EAW=12, TW=32, NS=1, CW=16, DTW=32, BUSC=4, BW=10;
   localparam integer NE=8;
   localparam integer NT=6000;
   reg clk=0, reset=0, start=0; always #10 clk=~clk;

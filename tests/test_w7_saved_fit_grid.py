@@ -67,8 +67,9 @@ from zlc_frontend.figure import (
 )
 from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import AxisLayoutNavigator, FrozenRasterView, QtRasterBoard
-from zlc_neutral_atom.artifacts import AdmittedCapture, FitResultRepository
-from zlc_neutral_atom.fit_reference import FitResultArtifactRef
+from zlc_neutral_atom.artifacts import FitResultRepository
+from zlc_neutral_atom.artifacts.fit_reference import FitResultArtifactRef
+from zlc_neutral_atom.logic_nodes.camera_capture.artifact import AdmittedCapture
 
 from zlc_workbench.fit_grid.render_lane import (
     _build_image_grid_frame,
@@ -306,7 +307,7 @@ def test_saved_fit_grid_public_imports_stay_headless_and_ref_has_exact_identity(
             (
                 "import sys; import zlc_frontend; import Zou_lab_control.notebook; "
                 "import Zou_lab_control.workbench; "
-                "from zlc_neutral_atom.fit_reference import "
+                "from zlc_neutral_atom.artifacts.fit_reference import "
                 "FitResultArtifactRef; "
                 "r=FitResultArtifactRef('repo','f'*64); "
                 "assert r.target_ref == 'fit-result/' + 'f'*64; "

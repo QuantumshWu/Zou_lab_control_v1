@@ -165,6 +165,7 @@ class FigureInfoPane(QtWidgets.QWidget):
             item = layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                widget.hide()
                 widget.deleteLater()
 
     def _fill_rows(self, layout, rows) -> None:

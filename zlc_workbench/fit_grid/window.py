@@ -54,7 +54,7 @@ from zlc_frontend.selector import (
     PanelInteractionOrigin,
     RectangleGesture,
 )
-from zlc_neutral_atom.fit_reference import FitResultArtifactRef
+from zlc_neutral_atom.artifacts.fit_reference import FitResultArtifactRef
 from zlc_workbench.frozen_raster import FrozenRasterWindow
 from zlc_workbench.window_runtime import cancel_export_commits, error_summary
 
