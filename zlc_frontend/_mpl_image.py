@@ -223,6 +223,7 @@ def _draw_projected_image(
     )
     axis.set_xlim(*x_limits)
     axis.set_ylim(*y_limits)
+    axis.set_anchor("W")
     axis.set_aspect("equal", adjustable="box")
     if center is not None:
         from matplotlib.patches import Circle
@@ -1235,52 +1236,26 @@ class ImagePanelAggRenderer:
                 physical_size=self._size,
             )
             actual_width, actual_height = raster.width, raster.height
-            if self._size_name is None:
-                geometry = ImagePanelRasterGeometry(
-                    _normalized_axis_bbox(
-                        self._axis,
-                        actual_width,
-                        actual_height,
-                    ),
-                    _normalized_axis_bbox(
-                        self._distribution,
-                        actual_width,
-                        actual_height,
-                    ),
-                    _normalized_axis_bbox(
-                        self._colorbar.ax,
-                        actual_width,
-                        actual_height,
-                    ),
-                )
-            else:
-                # Named TaskConsole presets are authored in Main's design
-                # coordinate system.  Their Figure has a deliberately
-                # fractional nominal pixel bbox (480.2 px at DPR 1), so
-                # re-normalising its axes by the rounded Agg buffer would
-                # shift the published selector geometry.  Publish the exact
-                # boxes that authored the axes; arbitrary hosts still report
-                # their measured Agg geometry above.
-                geometry = ImagePanelRasterGeometry(
-                    (
-                        self._layout.image.left,
-                        self._layout.image.top,
-                        self._layout.image.right,
-                        self._layout.image.bottom,
-                    ),
-                    (
-                        self._layout.distribution.left,
-                        self._layout.distribution.top,
-                        self._layout.distribution.right,
-                        self._layout.distribution.bottom,
-                    ),
-                    (
-                        self._layout.colorbar.left,
-                        self._layout.colorbar.top,
-                        self._layout.colorbar.right,
-                        self._layout.colorbar.bottom,
-                    ),
-                )
+            # ``aspect='equal', adjustable='box'`` can shrink the live image
+            # axes after limits change.  The drawn Agg bbox is therefore the
+            # only mapping authority; authored layout boxes are merely inputs.
+            geometry = ImagePanelRasterGeometry(
+                _normalized_axis_bbox(
+                    self._axis,
+                    actual_width,
+                    actual_height,
+                ),
+                _normalized_axis_bbox(
+                    self._distribution,
+                    actual_width,
+                    actual_height,
+                ),
+                _normalized_axis_bbox(
+                    self._colorbar.ax,
+                    actual_width,
+                    actual_height,
+                ),
+            )
             self._bin_count = bin_count
             self._render_count += 1
             return raster, geometry

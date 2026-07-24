@@ -158,6 +158,10 @@ class TaskConsole(QtWidgets.QWidget):
         # row removal.
         self._last_node: dict[int, object] = {}
         self._logic_editors: dict[int, "LogicNodeEditor"] = {}  # id(row) -> Edit tab
+        # Exact in-console resource conflicts are retired and retried by RunId.
+        # This contains only transient GUI orchestration; the runtime arbiter
+        # remains the sole authority for resource admission.
+        self._conflict_start_waits: dict[int, str] = {}
         self._building = False
         self._address: str | None = None
         # The folder the LAST panel "Save Fig" wrote into -- so a panel's Edit-tab save
@@ -424,6 +428,11 @@ class TaskConsole(QtWidgets.QWidget):
             self.logic_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
             logic_body = QtWidgets.QWidget()
             logic_body.setStyleSheet("background: transparent;")
+            logic_body.setMinimumWidth(0)
+            logic_body.setSizePolicy(
+                QtWidgets.QSizePolicy.Ignored,
+                QtWidgets.QSizePolicy.Preferred,
+            )
             self.logic_layout = QtWidgets.QVBoxLayout(logic_body)
             lm = scaled_px(10, minimum=6)
             self.logic_layout.setContentsMargins(lm, lm, lm, lm)
@@ -731,7 +740,7 @@ class TaskConsole(QtWidgets.QWidget):
             spec = self._spec_for_logic(row.node)
             if spec is None:
                 continue
-            outputs = tuple(getattr(spec, "declared_outputs", ()) or ())
+            outputs = self._outputs_for_row(row)
             keys = tuple(self._declared_signal_keys(row))
             live = self._logic_nodes.get(id(row))
             retained = self._last_node.get(id(row))
@@ -784,7 +793,11 @@ class TaskConsole(QtWidgets.QWidget):
                 or getattr(catalog_spec, "key", None) != getattr(spec, "key", None)
             ):
                 continue
-            outputs = tuple(getattr(catalog_spec, "declared_outputs", ()) or ())
+            outputs = tuple(getattr(node, "output_declarations", ()) or ())
+            if not outputs:
+                raise RuntimeError(
+                    "row-less runtime does not expose its frozen output declarations"
+                )
             keys = tuple(node.signal_key(output.name) for output in outputs)
             if tuple(node.published_signals()) != keys:
                 raise RuntimeError(
@@ -909,6 +922,22 @@ class TaskConsole(QtWidgets.QWidget):
                 accepted.append(name)
         return accepted
 
+    def _camera_frame_signal_names(self, definition_key) -> list[str]:
+        """All canonical frame_i outputs of Camera rows in this console."""
+
+        from zlc_neutral_atom.camera_measurement import camera_frame_output_index
+
+        accepted: list[str] = []
+        for name in self._signal_names():
+            try:
+                _row, spec, output = self._console_producer_match(name)
+                camera_frame_output_index(str(output.name))
+            except (LookupError, TypeError, ValueError):
+                continue
+            if spec.key == definition_key:
+                accepted.append(name)
+        return accepted
+
     def _signal_input_names(self, definition_key, parameter_key: str) -> list[str]:
         """Project one request field's declared producer contract into its picker."""
 
@@ -929,8 +958,8 @@ class TaskConsole(QtWidgets.QWidget):
             return self._pulse_scan_source_names()
         if definition_key == OCCUPANCY_STREAM_PROCESSOR_KEY:
             if key == "camera_frame":
-                return self._declared_output_names(CAMERA_MEASUREMENT_KEY, "frame")
-            if key == "calibration":
+                return self._camera_frame_signal_names(CAMERA_MEASUREMENT_KEY)
+            if key == "calibration_task":
                 return self._declared_output_names(
                     SITEMAP_CALIBRATION_TASK_KEY,
                     "calibration",
@@ -1050,12 +1079,12 @@ class TaskConsole(QtWidgets.QWidget):
         Measurement and processor nodes publish to the data plane under their prefix.
         Task outputs are FINAL artifact declarations and are rendered by the spec-only
         branch in :meth:`_update_row_publishes`, never fabricated as live signals."""
-        declarations = tuple(
-            getattr(getattr(node, "spec", None), "declared_outputs", ()) or ()
-        )
+        declarations = tuple(getattr(node, "output_declarations", ()) or ())
+        if not declarations:
+            raise RuntimeError("running node has no frozen output declarations")
         published = tuple(node.published_signals())
         rows: list[tuple[str, str, str]] = []
-        for full, declaration in zip(published, declarations):
+        for full, declaration in zip(published, declarations, strict=True):
             short = str(declaration.short or declaration.name)
             # Logic rows and signal pickers share this one schema-driven owner.
             # The field is a read-only physical tensor contract, not an axis-summary
@@ -1085,8 +1114,7 @@ class TaskConsole(QtWidgets.QWidget):
         view or FINAL value; only an output that has never published is shown as
         ``—``."""
         if row.node.kind == "task":
-            spec = self._spec_for_logic(row.node)
-            outputs = tuple(getattr(spec, "declared_outputs", ()) or ())
+            outputs = self._outputs_for_row(row)
             keys = tuple(self._declared_signal_keys(row))
             row.set_publishes(
                 [
@@ -1110,8 +1138,7 @@ class TaskConsole(QtWidgets.QWidget):
         if node is not None and getattr(node, "running", False):
             row.set_publishes(self._live_node_formats(node))
             return
-        spec = self._spec_for_logic(row.node)
-        outputs = tuple(getattr(spec, "declared_outputs", ()) or ())
+        outputs = self._outputs_for_row(row)
         keys = tuple(self._declared_signal_keys(row))
         row.set_publishes(
             [
@@ -1134,11 +1161,33 @@ class TaskConsole(QtWidgets.QWidget):
     def _declared_signal_keys(self, row: "LogicNodeRow") -> list[str]:
         """Exact keys a row will publish or commit, before it is started."""
 
-        spec = self._spec_for_logic(row.node)
         return [
             console_signal_key(row.node.title, output.name)
-            for output in getattr(spec, "declared_outputs", ()) or ()
+            for output in self._outputs_for_row(row)
         ]
+
+    def _outputs_for_row(self, row: "LogicNodeRow") -> tuple:
+        """Resolve one row's output contract from its exact frozen request.
+
+        A live/retained node owns the declarations frozen with that run.  A row
+        that has never run derives them from its current form values through
+        the catalog's sole ``outputs_for`` owner.  No picker or legend may read
+        the static fallback directly because Camera cardinality is request data.
+        """
+
+        spec = self._spec_for_logic(row.node)
+        if spec is None:
+            return ()
+        runtime = self._logic_nodes.get(id(row)) or self._last_node.get(id(row))
+        if runtime is not None:
+            runtime_spec = getattr(runtime, "spec", None)
+            if getattr(runtime_spec, "key", None) == spec.key:
+                outputs = tuple(
+                    getattr(runtime, "output_declarations", ()) or ()
+                )
+                if outputs:
+                    return outputs
+        return tuple(spec.outputs_for(dict(row.node.values or {})))
 
     def _console_producer_match(self, signal_key: str):
         """Return the unique row/spec/output declaration behind an exact key."""
@@ -1150,7 +1199,7 @@ class TaskConsole(QtWidgets.QWidget):
             spec = self._spec_for_logic(row.node)
             if spec is None:
                 continue
-            outputs = tuple(getattr(spec, "declared_outputs", ()) or ())
+            outputs = self._outputs_for_row(row)
             keys = tuple(self._declared_signal_keys(row))
             for key, output in zip(keys, outputs, strict=True):
                 if key == signal_key:
@@ -1518,6 +1567,7 @@ class TaskConsole(QtWidgets.QWidget):
         self._panel_editors[id(card)] = editor
         title = (card.config.title or PANEL_KINDS[card.config.kind]).strip() or "panel"
         self.tabs.add_closable_tab(editor, title)
+        editor.rebuild()
 
     def _close_panel_editor(self, card: "PanelCard") -> None:
         """Close a card's Edit tab if open (called when the card is removed)."""
@@ -1868,6 +1918,7 @@ class TaskConsole(QtWidgets.QWidget):
         line.  Reuses the SAME node-build paths the real readout / notebook use."""
         if self._task_locked:
             return                                 # a task owns the console -- no other Start
+        self._conflict_start_waits.pop(id(row), None)
         editor = self._logic_editors.get(id(row))
         try:
             values = editor.collect_values() if editor is not None else dict(row.node.values)
@@ -1904,15 +1955,11 @@ class TaskConsole(QtWidgets.QWidget):
             self._logic_nodes.get(id(row))
             or self._last_node.get(id(row))
         )
-        # The build is good -- NOW stand the previous run of THIS node down (never pile up), and
-        # apply the device-OCCUPANCY mutual exclusion over ALL running nodes (#A3): each node
-        # declares the hardware INSTANCES it drives (``occupied_devices``, from its own
-        # ``_occupies`` attribute names), and two nodes conflict iff those sets intersect by
-        # identity.  Only the conflicting nodes stop; everyone on disjoint hardware keeps
-        # running -- the monitor camera's live view stays up while the main camera's
-        # calibration or measurement starts.  Declared on the NODE, so a notebook-injected
-        # ``running_nodes=`` node (which has no row) obeys the SAME rule as a GUI row; a
-        # reactive processor occupies nothing and is never stopped.
+        # A row never stacks two generations of itself.  Conflicts with another
+        # row are not guessed here from device fields: the runtime arbiter is the
+        # sole admission authority.  If start reports the exact owning RunId,
+        # _retire_conflict_and_retry stops only that row and retries this frozen
+        # request after the owner has actually gone terminal.
         if not self._stop_logic_node(row, _silent=True):
             row.set_state("running", status="restart blocked: previous owner still active")
             if editor is not None:
@@ -1975,7 +2022,7 @@ class TaskConsole(QtWidgets.QWidget):
         declaration = next(
             (
                 item
-                for item in tuple(spec.declared_outputs)
+                for item in self._outputs_for_row(row)
                 if item.name == output_name
             ),
             None,
@@ -2206,6 +2253,7 @@ class TaskConsole(QtWidgets.QWidget):
         timeout: float = 2.0,
     ) -> bool:
         """Cancel a logic row's Run and grey its dot."""
+        self._conflict_start_waits.pop(id(row), None)
         deadline = time.monotonic() + max(0.0, float(timeout))
         node = self._logic_nodes.get(id(row))
         if node is not None:
@@ -2288,6 +2336,8 @@ class TaskConsole(QtWidgets.QWidget):
             snapshot = node.poll()
             error = node.last_error
             if error:
+                if self._retire_conflict_and_retry(row, node):
+                    continue
                 row.set_state("error", status=f"error: {error}")
                 if editor is not None:
                     editor.set_running(False)
@@ -2310,10 +2360,10 @@ class TaskConsole(QtWidgets.QWidget):
                 continue
             state = snapshot.state.name
             if state == "CANCELLING":
-                row.set_state("running", status="stop pending: cleanup/safety not complete")
+                row.set_state("running", status="stop pending: run owner not terminal")
                 if editor is not None:
                     editor.set_running(True)
-                    editor.set_status("stop pending: cleanup/safety not complete", error=True)
+                    editor.set_status("stop pending: run owner not terminal", error=False)
                 continue
             if snapshot.state.terminal:
                 if state == "FAILED":
@@ -2366,6 +2416,110 @@ class TaskConsole(QtWidgets.QWidget):
             if editor is not None:
                 editor.set_running(True)
                 editor.set_status("running", error=False)
+
+    def _retire_conflict_and_retry(self, row: "LogicNodeRow", node) -> bool:
+        """Resolve an exact TaskConsole-internal resource conflict.
+
+        The runtime still rejects the first admission and identifies the real
+        owner by RunId.  If that owner is another Logic row in this console, the
+        shell requests its normal Stop, waits for actual terminal cleanup, then
+        retries the already-frozen requested node.  External-window/process
+        owners are never guessed or preempted and remain a visible rejection.
+        """
+
+        from zlc_neutral_atom.runtime.run import RunStartRejected
+
+        rejection = getattr(node, "start_exception", None)
+        if not isinstance(rejection, RunStartRejected):
+            return False
+        row_id = id(row)
+        conflict_run_id = str(rejection.outcome.conflicting_run_id)
+        remembered = self._conflict_start_waits.get(row_id)
+        if remembered is not None and remembered != conflict_run_id:
+            return False
+
+        conflict_row = None
+        conflict_node = None
+        conflict_is_active = False
+        unresolved_local_start = False
+        for candidate in self.logic_nodes:
+            active = self._logic_nodes.get(id(candidate))
+            retained = self._last_node.get(id(candidate))
+            if (
+                candidate is not row
+                and active is not None
+                and bool(getattr(active, "running", False))
+                and getattr(active, "handle", None) is None
+            ):
+                # RunController may already hold the lease while its start()
+                # call has not yet returned the RunHandle to this Qt owner.
+                unresolved_local_start = True
+            seen = set()
+            for other in (active, retained):
+                if other is None or id(other) in seen:
+                    continue
+                seen.add(id(other))
+                handle = getattr(other, "handle", None)
+                run_id = None if handle is None else getattr(handle, "run_id", None)
+                if run_id is not None and str(run_id) == conflict_run_id:
+                    conflict_row = candidate
+                    conflict_node = other
+                    conflict_is_active = active is other
+                    break
+            if conflict_node is not None:
+                break
+
+        if conflict_node is None:
+            if unresolved_local_start:
+                status = "resolving conflicting start"
+                row.set_state("running", status=status)
+                editor = self._logic_editors.get(row_id)
+                if editor is not None:
+                    editor.set_running(True)
+                    editor.set_status(status, error=False)
+                return True
+            if remembered is None:
+                return False
+            # The conflicting row reached terminal earlier in this same owner
+            # cycle and has already been detached.  Its resource lease is gone.
+            self._retry_after_conflict(row, node)
+            return True
+        if conflict_node is node:
+            return False
+
+        if not conflict_is_active:
+            # The exact owner reached terminal and was detached before this
+            # row's next poll.  _last_node keeps the RunId long enough to prove
+            # this is a local handoff; its lease is already released.
+            self._retry_after_conflict(row, node)
+            return True
+
+        self._conflict_start_waits[row_id] = conflict_run_id
+        conflict_node.cancel(
+            f"TaskConsole is handing the resource to {row.node.title}"
+        )
+        if not self._stop_logic_node(conflict_row, _silent=False, timeout=0.0):
+            status = f"stopping conflicting {conflict_row.node.title}"
+            row.set_state("running", status=status)
+            editor = self._logic_editors.get(row_id)
+            if editor is not None:
+                editor.set_running(True)
+                editor.set_status(status, error=False)
+            return True
+
+        self._retry_after_conflict(row, node)
+        return True
+
+    def _retry_after_conflict(self, row: "LogicNodeRow", node) -> None:
+        """Retry one frozen request after its exact local owner retired."""
+
+        self._conflict_start_waits.pop(id(row), None)
+        node.start()
+        row.set_state("running", status="starting")
+        editor = self._logic_editors.get(id(row))
+        if editor is not None:
+            editor.set_running(True)
+            editor.set_status("starting", error=False)
 
     def _mark_dirty(self, *_args) -> None:
         if self._building:

@@ -43,6 +43,7 @@ from zlc_data import (
     ValueSchema,
 )
 from zlc_neutral_atom.capture_reference import CaptureArtifactRef
+from zlc_neutral_atom.camera_measurement import CameraMeasurementRequest
 from zlc_neutral_atom.mot_field import MotFieldResult
 from zlc_neutral_atom.readout.calibration import (
     ReadoutModelKind,
@@ -65,6 +66,8 @@ from zlc_neutral_atom.timing.release_recapture import (
     TriggeredReleaseRecaptureResult,
 )
 from zlc_storage import canonical_digest
+
+from .camera_projection import project_camera_frame_snapshots
 
 if TYPE_CHECKING:
     from zlc_frontend.site_map_render import OccupancyCellView
@@ -136,17 +139,12 @@ def _occupancy_rate_snapshot(occupied: OwnedSnapshot) -> OwnedSnapshot:
         schema.repeat_axis,
         schema.point_axes,
         schema.point_layout,
-        ValueSchema(
-            (),
-            ValidityContract.value(),
-            np.dtype("<f8"),
-            "occupation",
-        ),
+        ValueSchema.scalar(np.dtype("<f8"), "occupation"),
     )
     block = DataBlock(
         BlockId("occupancy-rate"),
         occupied.block.revision,
-        rate_values,
+        rate_values[..., np.newaxis],
         CellValidity(cell_validity),
         rate_schema,
     )
@@ -528,11 +526,21 @@ def _calibration_diagnostic_snapshot(
     else:
         axis_ids = ()
         validity_contract = ValidityContract.value()
+    value_schema = (
+        ValueSchema(
+            axes,
+            validity_contract,
+            np.dtype("<f8"),
+            value_unit,
+        )
+        if axes
+        else ValueSchema.scalar(np.dtype("<f8"), value_unit)
+    )
     schema = DatasetSchema(
         repeat_axis,
         (),
         PointLayout.rect_c(()),
-        ValueSchema(axes, validity_contract, np.dtype("<f8"), value_unit),
+        value_schema,
     )
     if axis_ids:
         axis_by_id = {axis.axis_id: axis for axis in axes}
@@ -761,9 +769,9 @@ def _mot_intensity_snapshot(result: MotFieldResult) -> OwnedSnapshot:
 
     axes = tuple(result.point_axes)
     layout = PointLayout.rect_c(tuple(axis.size for axis in axes))
-    physical = np.empty((1, layout.storage_size), dtype="<f8")
+    physical = np.empty((1, layout.storage_size, 1), dtype="<f8")
     for storage_index in range(layout.storage_size):
-        physical[0, storage_index] = result.intensity[
+        physical[0, storage_index, 0] = result.intensity[
             layout.multi_index(storage_index)
         ]
     identity = canonical_digest(
@@ -783,12 +791,7 @@ def _mot_intensity_snapshot(result: MotFieldResult) -> OwnedSnapshot:
         ),
         axes,
         layout,
-        ValueSchema(
-            (),
-            ValidityContract.value(),
-            np.dtype("<f8"),
-            "counts",
-        ),
+        ValueSchema.scalar(np.dtype("<f8"), "counts"),
     )
     block = DataBlock(
         BlockId(f"mot-field-intensity-{identity[:20]}"),
@@ -806,9 +809,7 @@ def _mot_intensity_snapshot(result: MotFieldResult) -> OwnedSnapshot:
 def _declared(node) -> set[str]:
     return {
         str(output.name)
-        for output in tuple(
-            getattr(getattr(node, "spec", None), "declared_outputs", ()) or ()
-        )
+        for output in tuple(getattr(node, "output_declarations", ()) or ())
     }
 
 
@@ -836,12 +837,25 @@ def project_final_signals(experiment, node, result) -> dict[str, ProjectedFinalS
         )
         return projected
 
-    if isinstance(result, CaptureArtifactRef) and "frame" in names:
-        projected["frame"] = ProjectedFinalSignal(
+    if isinstance(result, CaptureArtifactRef) and isinstance(
+        getattr(node, "request", None),
+        CameraMeasurementRequest,
+    ):
+        frames = project_camera_frame_snapshots(
             experiment.readout.materialize_capture(result),
-            result.manifest_digest,
+            node.request,
         )
-        return projected
+        if set(frames) != names:
+            raise RuntimeError(
+                "Camera FINAL projection differs from its frozen output declarations"
+            )
+        return {
+            output_name: ProjectedFinalSignal(
+                snapshot,
+                result.manifest_digest,
+            )
+            for output_name, snapshot in frames.items()
+        }
 
     if isinstance(result, ScanArtifactRef) and "scan" in names:
         materialized = experiment.readout.materialize_scan(result)

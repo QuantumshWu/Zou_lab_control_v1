@@ -110,7 +110,7 @@ def open_figure_workbench(
     fit_reloader=None,
     fit_selected_model=None,
     fit_initial_selection=None,
-    open_fit_analysis=False,
+    open_fit=False,
     fit_timeout_seconds=None,
     initial_fit_result_identity=None,
 ):
@@ -136,8 +136,8 @@ def open_figure_workbench(
     ):
         if value is not None:
             options[name] = value
-    if open_fit_analysis:
-        options["open_fit_analysis"] = True
+    if open_fit:
+        options["open_fit"] = True
     if fit_timeout_seconds is not None:
         options["fit_timeout_seconds"] = fit_timeout_seconds
     return _open(figure_factory, source, **options)

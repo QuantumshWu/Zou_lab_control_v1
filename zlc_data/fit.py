@@ -1,6 +1,6 @@
 """Public headless fit API assembled from the focused fit submodules."""
 
-from .axis import AxisId
+from .axis import AxisId, SCALAR
 
 from .fit_codec import (
     decode_fit_result_batch,
@@ -129,7 +129,7 @@ def _unbound_fit_spec_for(
     batch_axis_ids = tuple(
         axis.axis_id
         for axis in effective_axes
-        if axis.axis_id not in resolved_fit_axis_ids
+        if axis.axis_id not in resolved_fit_axis_ids and axis.role != SCALAR
     )
     return FitSpec(
         input_schema_fingerprint=schema.fingerprint,

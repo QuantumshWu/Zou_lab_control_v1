@@ -9,6 +9,36 @@ from zlc_neutral_atom.installation import DeviceRef
 from zlc_storage import canonical_text, positive_integer
 
 
+def camera_frame_output_index(output_name: str) -> int:
+    """Parse one canonical ``frame_i`` name without accepting aliases."""
+
+    name = canonical_text(output_name, "camera frame output name")
+    prefix = "frame_"
+    if not name.startswith(prefix):
+        raise ValueError("camera frame output name must start with 'frame_'")
+    token = name[len(prefix) :]
+    if not token.isascii() or not token.isdecimal():
+        raise ValueError("camera frame output index must be a decimal integer")
+    index = int(token)
+    if token != str(index):
+        raise ValueError("camera frame output index must use canonical decimal text")
+    return index
+
+
+def camera_frame_output_names(frames_per_cycle: int) -> tuple[str, ...]:
+    """Return the public signal names for one camera cycle.
+
+    A camera cycle is stored atomically as one Dataset whose named
+    ``READOUT_EVENT`` axis has ``frames_per_cycle`` cells.  Presentation may
+    expose those cells independently, but their names are owned here beside
+    the request that defines the cycle -- never guessed from an ndarray shape
+    and never supplemented with a lossy ``frame`` alias.
+    """
+
+    count = positive_integer(frames_per_cycle, "frames_per_cycle")
+    return tuple(f"frame_{index}" for index in range(count))
+
+
 @dataclass(frozen=True)
 class CameraMeasurementRequest:
     """Read raw camera cycles: ``repeat=0`` live, ``repeat=K`` finite.
@@ -41,6 +71,12 @@ class CameraMeasurementRequest:
             positive_integer(self.frames_per_cycle, "frames_per_cycle"),
         )
 
+    @property
+    def output_names(self) -> tuple[str, ...]:
+        """One signal per declared readout event, in cycle order."""
+
+        return camera_frame_output_names(self.frames_per_cycle)
+
 
 @dataclass(frozen=True)
 class CameraMeasurementDescriptor:
@@ -65,4 +101,9 @@ class CameraMeasurementDescriptor:
         return self.output_schema.fingerprint
 
 
-__all__ = ["CameraMeasurementDescriptor", "CameraMeasurementRequest"]
+__all__ = [
+    "CameraMeasurementDescriptor",
+    "CameraMeasurementRequest",
+    "camera_frame_output_index",
+    "camera_frame_output_names",
+]

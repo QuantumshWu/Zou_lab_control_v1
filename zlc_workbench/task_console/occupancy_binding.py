@@ -62,16 +62,26 @@ def parse_occupancy_readout_method(value: object) -> ReadoutModelKind | None:
 
 @dataclass(frozen=True, slots=True)
 class OccupancyBindingIntent:
-    """Exact producer/output keys selected in the processor form."""
+    """Exact Camera input plus one explicit calibration source."""
 
     camera_frame_signal: str
-    calibration_signal: str
+    calibration_signal: str | None = None
+    calibration_ref_path: str | None = None
     model_kind: ReadoutModelKind | None = None
 
     def __post_init__(self) -> None:
         canonical_text(self.camera_frame_signal, "camera_frame_signal")
-        canonical_text(self.calibration_signal, "calibration_signal")
-        if self.camera_frame_signal == self.calibration_signal:
+        signal = self.calibration_signal
+        path = self.calibration_ref_path
+        if (signal is None) == (path is None):
+            raise ValueError(
+                "occupancy requires exactly one calibration task output or saved file"
+            )
+        if signal is not None:
+            canonical_text(signal, "calibration_signal")
+        if path is not None:
+            canonical_text(path, "calibration_ref_path")
+        if signal is not None and self.camera_frame_signal == signal:
             raise ValueError(
                 "occupancy source and calibration must be distinct console outputs"
             )
@@ -177,6 +187,7 @@ class ReactiveOccupancyNode:
         self._spec = spec
         self.instance_label = str(spec.title)
         self._values = dict(values)
+        self._output_declarations = tuple(spec.outputs_for(self._values))
         self._request = intent
         self._source_node = source_node
         self._source_lifecycle_generation = source_generation
@@ -227,6 +238,10 @@ class ReactiveOccupancyNode:
         return None
 
     @property
+    def output_declarations(self) -> tuple:
+        return self._output_declarations
+
+    @property
     def running(self) -> bool:
         return self._state is RunState.RUNNING
 
@@ -260,7 +275,7 @@ class ReactiveOccupancyNode:
     def published_signals(self) -> tuple[str, ...]:
         return tuple(
             self.signal_key(output.name)
-            for output in self._spec.declared_outputs
+            for output in self._output_declarations
         )
 
     def start(self) -> None:
@@ -331,7 +346,7 @@ class ReactiveOccupancyNode:
                 )
                 declared = {
                     output.name: self.signal_key(output.name)
-                    for output in self._spec.declared_outputs
+                    for output in self._output_declarations
                 }
                 if set(declared) != {"counts", "occupied", "rate"}:
                     raise RuntimeError(

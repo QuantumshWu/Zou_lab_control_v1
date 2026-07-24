@@ -363,9 +363,7 @@ def mot_intensity_schema(
         source_schema.repeat_axis,
         source_schema.point_axes,
         source_schema.point_layout,
-        ValueSchema(
-            (),
-            ValidityContract.value(),
+        ValueSchema.scalar(
             np.dtype("<f8"),
             source_schema.cell_schema.value_unit,
         ),

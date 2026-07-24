@@ -70,6 +70,7 @@ SPECTRAL = AxisRoleId("spectral")
 HISTOGRAM_BIN = AxisRoleId("histogram-bin")
 SITE = AxisRoleId("site")
 COMPONENT = AxisRoleId("component")
+SCALAR = AxisRoleId("scalar")
 
 
 @dataclass(frozen=True)
@@ -139,3 +140,15 @@ class AxisSpec:
         if self.coordinates is None:
             return self.index_origin + index
         return self.coordinates[index]
+
+
+# A scalar still occupies one physical trailing data item.  This stable carrier
+# is representation, not an information axis: view/fit owners consume index 0
+# automatically and must never infer the same fact from ``size == 1``.
+SCALAR_AXIS = AxisSpec(
+    AxisId("zlc_data.scalar"),
+    "value",
+    SCALAR,
+    1,
+    (0,),
+)

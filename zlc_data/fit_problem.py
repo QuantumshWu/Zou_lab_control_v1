@@ -8,7 +8,7 @@ from typing import Callable
 
 import numpy as np
 
-from .axis import AxisId, AxisSpec
+from .axis import AxisId, AxisSpec, SCALAR
 from .fit_contract import (
     BoundFit,
     FitCoordinateSource,
@@ -85,6 +85,7 @@ def build_fit_problem(
         cell_batch_positions,
         data_batch_positions,
         data_fit_positions,
+        scalar_data_positions,
         axis_indices,
         row_groups,
         data_combinations,
@@ -125,7 +126,14 @@ def build_fit_problem(
                 for index, position in enumerate(data_batch_positions)
             }
             data_selectors = tuple(
-                data_batch_values.get(axis_id, slice(None)) for axis_id in data_ids
+                (
+                    data_batch_values[axis_id]
+                    if axis_id in data_batch_values
+                    else 0
+                    if position in scalar_data_positions
+                    else slice(None)
+                )
+                for position, axis_id in enumerate(data_ids)
             )
             selection = (row_selector, *data_selectors)
             observation_view = values[selection]
@@ -212,6 +220,7 @@ def validate_fit_result_source_binding(
         _cell_batch_positions,
         _data_batch_positions,
         _data_fit_positions,
+        _scalar_data_positions,
         _axis_indices,
         _row_groups,
         _data_combinations,
@@ -262,6 +271,11 @@ def _schema_batch_plan(
         position
         for position, axis_id in enumerate(data_ids)
         if axis_id in bound.spec.fit_axis_ids
+    )
+    scalar_data_positions = tuple(
+        position
+        for position, axis in enumerate(schema.data_axes)
+        if axis.role == SCALAR
     )
     axis_indices = tuple(
         schema.cell_layout.axis_indices(position)
@@ -314,6 +328,7 @@ def _schema_batch_plan(
         cell_batch_positions,
         data_batch_positions,
         data_fit_positions,
+        scalar_data_positions,
         axis_indices,
         row_groups,
         data_combinations,

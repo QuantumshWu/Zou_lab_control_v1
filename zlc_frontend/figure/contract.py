@@ -17,6 +17,7 @@ from zlc_data import (
     MONITOR_HISTORY,
     READOUT_EVENT,
     REPEAT,
+    SCALAR,
     SCAN_POINT,
     SITE,
     SPATIAL_X,
@@ -764,6 +765,16 @@ def validate_view_spec(
 
     for binding in spec.axis_bindings:
         axis = axis_by_id[binding.axis_id]
+        if axis.role == SCALAR:
+            if (
+                binding.role is not AxisViewRole.SELECTED
+                or not isinstance(binding.selector, FixedIndex)
+                or binding.selector.index != 0
+            ):
+                raise ValueError(
+                    "the scalar carrier must select its sole physical item"
+                )
+            continue
         policy = contract.policy_for(axis.role)
         if axis.role == REPEAT:
             repeat_mode = _repeat_mode_for_binding(binding)

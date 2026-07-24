@@ -40,7 +40,6 @@ from ._raster_front import (
     _advance_held_front,
     _image_payload,
     _hold_matches_frame,
-    _image_viewport_preview_rects,
     _panel_bounds,
     _panel_image_geometry,
     _panel_presentation,
@@ -1317,30 +1316,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 if image_payload is not None:
                     painter.fillRect(bounds, QtGui.QColor("white"))
             painter.drawImage(QtCore.QRectF(target), image, source)
-            binding = self._image_bindings.get(panel_id)
-            pending_viewport = (
-                None if binding is None else binding.pending_viewport
-            )
-            if image_payload is not None and pending_viewport is not None:
-                preview = _image_viewport_preview_rects(
-                    bounds,
-                    image,
-                    geometry.target,
-                    image_payload.viewport,
-                    pending_viewport,
-                )
-                if image_payload.viewport.visible_bounds != pending_viewport.visible_bounds:
-                    # Only the Divider-authored data box moves immediately.
-                    # Title, labels, ticks, margins, distribution and colorbar
-                    # remain the exact painted Agg chrome until the latest
-                    # high-quality worker answer replaces the complete front.
-                    painter.fillRect(
-                        QtCore.QRectF(geometry.target),
-                        QtGui.QColor("white"),
-                    )
-                    if preview is not None:
-                        preview_source, preview_target = preview
-                        painter.drawImage(preview_target, image, preview_source)
             if (
                 image_payload is not None
                 and geometry.distribution is not None
@@ -2105,9 +2080,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 self._cancel_image_gesture(binding, clear_draft=False)
             viewport = self._viewport_for_target(binding, target)
             area = binding.draft_bounds or binding.applied_bounds
-            candidate = viewport.with_visible_bounds(
-                (0.0, 0.0, 1.0, 1.0) if area is None else area
-            )
+            candidate = viewport.home() if area is None else viewport.with_visible_bounds(area)
             self._commit_viewport(binding, candidate)
             self.update()
             event.accept()

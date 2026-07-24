@@ -24,7 +24,7 @@ from ..render import (
     SiteMapPanelPayload,
     SourceIdentity,
 )
-from ..selector import ImageViewportTransform, PanelInteractionOrigin
+from ..selector import PanelInteractionOrigin
 
 
 def _prepared_qimage(panel_or_raster) -> tuple[bytes, QtGui.QImage]:
@@ -50,21 +50,6 @@ def _prepared_qimage(panel_or_raster) -> tuple[bytes, QtGui.QImage]:
     if image.isNull():
         raise RuntimeError("Qt rejected the prepared immutable raster front")
     return raster.pixels, image
-
-
-def _image_source_rect(
-    image: QtGui.QImage,
-    viewport: ImageViewportTransform | None,
-) -> QtCore.QRectF:
-    if viewport is None:
-        return QtCore.QRectF(0.0, 0.0, float(image.width()), float(image.height()))
-    left, top, right, bottom = viewport.visible_bounds
-    return QtCore.QRectF(
-        left * image.width(),
-        top * image.height(),
-        (right - left) * image.width(),
-        (bottom - top) * image.height(),
-    )
 
 
 def _aspect_target_for_source(
@@ -129,9 +114,11 @@ def _panel_image_geometry(
     *,
     site_map_payload: SiteMapPanelPayload | None = None,
 ) -> _ImagePanelGeometry:
-    source = _image_source_rect(
-        image,
-        None if payload is None else payload.viewport,
+    source = QtCore.QRectF(
+        0.0,
+        0.0,
+        float(image.width()),
+        float(image.height()),
     )
     if payload is None:
         target = _aspect_target_for_source(bounds, source)
@@ -147,13 +134,9 @@ def _panel_image_geometry(
         bounds,
         NormalizedBox(*composed.image_bounds),
     )
-    data_target = _map_panel_box(
-        axes_target,
-        NormalizedBox(*payload.viewport.data_bounds_in_display),
-    )
     return _ImagePanelGeometry(
         axes_target,
-        data_target,
+        axes_target,
         QtCore.QRectF(
             0.0,
             0.0,
@@ -169,78 +152,6 @@ def _panel_image_geometry(
             NormalizedBox(*composed.colorbar_bounds),
         ),
     )
-
-
-def _image_viewport_preview_rects(
-    bounds: QtCore.QRect,
-    image: QtGui.QImage,
-    data_target: QtCore.QRect,
-    painted: ImageViewportTransform,
-    candidate: ImageViewportTransform,
-) -> tuple[QtCore.QRectF, QtCore.QRectF] | None:
-    """Map painted IMAGE pixels into one pending viewport immediately.
-
-    The worker raster already contains the authoritative Matplotlib chrome.
-    During a wheel/pan gesture Qt leaves that chrome and its Divider-authored
-    data box fixed, then maps only the pixels currently available inside the
-    data box into the newest pending viewport.  A later worker answer replaces
-    the complete front atomically; this function never creates another image
-    renderer or another authored view state.
-
-    Zooming out or panning can expose an area absent from the painted viewport.
-    The returned destination therefore covers only the old/new intersection;
-    the caller clears the complete data box before drawing it.
-    """
-
-    if (
-        painted.axes != candidate.axes
-        or painted.visible_bounds == candidate.visible_bounds
-        or bounds.width() <= 0
-        or bounds.height() <= 0
-        or data_target.width() <= 0
-        or data_target.height() <= 0
-    ):
-        return None
-
-    old_left, old_top, old_right, old_bottom = painted.visible_bounds
-    new_left, new_top, new_right, new_bottom = candidate.visible_bounds
-    left = max(old_left, new_left)
-    top = max(old_top, new_top)
-    right = min(old_right, new_right)
-    bottom = min(old_bottom, new_bottom)
-    if right <= left or bottom <= top:
-        return None
-
-    # The complete Agg raster is painted one-to-one into ``bounds``.  Convert
-    # the already validated widget data box back to its exact source-pixel box;
-    # no plot-kind geometry is re-derived here.
-    x_scale = float(image.width()) / float(bounds.width())
-    y_scale = float(image.height()) / float(bounds.height())
-    source_data = QtCore.QRectF(
-        (data_target.x() - bounds.x()) * x_scale,
-        (data_target.y() - bounds.y()) * y_scale,
-        data_target.width() * x_scale,
-        data_target.height() * y_scale,
-    )
-
-    old_width = old_right - old_left
-    old_height = old_bottom - old_top
-    new_width = new_right - new_left
-    new_height = new_bottom - new_top
-    source = QtCore.QRectF(
-        source_data.x() + (left - old_left) / old_width * source_data.width(),
-        source_data.y() + (top - old_top) / old_height * source_data.height(),
-        (right - left) / old_width * source_data.width(),
-        (bottom - top) / old_height * source_data.height(),
-    )
-    target = QtCore.QRectF(
-        data_target.x() + (left - new_left) / new_width * data_target.width(),
-        data_target.y() + (top - new_top) / new_height * data_target.height(),
-        (right - left) / new_width * data_target.width(),
-        (bottom - top) / new_height * data_target.height(),
-    )
-    return source, target
-
 
 def _panel_bounds(
     bounds: QtCore.QRect,

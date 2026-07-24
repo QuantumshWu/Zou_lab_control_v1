@@ -94,9 +94,8 @@ from .fit_editor import (
     fit_authoring_option,
     fit_authority_summary,
     fit_axis_summary,
-    fit_constraint_form,
     fit_projection_metadata,
-    fit_spec_from_form,
+    fit_spec_from_arguments,
     validate_fit_authoring_options,
 )
 from .render import (
@@ -298,9 +297,8 @@ __all__ = [
     "fit_axis_summary",
     "fit_authority_summary",
     "fit_authoring_option",
-    "fit_constraint_form",
     "fit_projection_metadata",
-    "fit_spec_from_form",
+    "fit_spec_from_arguments",
     "validate_fit_authoring_options",
     "suggest_view",
     "suggest_fit_view",

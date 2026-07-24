@@ -8,7 +8,7 @@ therefore share one exact mapping without sharing a Figure, artist, or widget.
 
 from __future__ import annotations
 
-from dataclasses import InitVar, dataclass, field
+from dataclasses import dataclass, field
 import math
 from numbers import Real
 from typing import TypeAlias
@@ -36,15 +36,6 @@ from .plot_layout import square_image_extent
 NormalizedPoint: TypeAlias = tuple[float, float]
 NormalizedRectangle: TypeAlias = tuple[float, float, float, float]
 CoordinateView: TypeAlias = tuple[float, float]
-
-
-# Viewports are display geometry, not measurement coordinates.  A fixed
-# binary grid makes their equality stable across the public
-# normalized -> coordinate-view -> normalized bridge while remaining far
-# below one source cell for the admitted rasters.  Forty fractional
-# bits are deterministic and exactly representable by binary64.
-_VIEWPORT_FRACTION_BITS = 40
-_VIEWPORT_TICKS = 1 << _VIEWPORT_FRACTION_BITS
 
 
 def _finite_number(value: object, name: str) -> float:
@@ -99,6 +90,23 @@ def _coordinate_view(value: object, name: str) -> CoordinateView:
     if not math.isfinite(high - low):
         raise ValueError(f"{name} span must be finite")
     return low, high
+
+
+def _unbounded_normalized_rectangle(
+    value: object,
+    name: str = "normalized bounds",
+) -> NormalizedRectangle:
+    """Return finite ordered bounds without clipping them to the source raster."""
+
+    if not isinstance(value, tuple) or len(value) != 4:
+        raise TypeError(f"{name} must be a four-item tuple")
+    left, top, right, bottom = (
+        _finite_number(item, f"{name} {edge}")
+        for edge, item in zip(("left", "top", "right", "bottom"), value, strict=True)
+    )
+    if not left < right or not top < bottom:
+        raise ValueError(f"{name} must contain a non-degenerate rectangle")
+    return left, top, right, bottom
 
 
 def _axis_step(axis: AxisSpec) -> int | float:
@@ -158,151 +166,6 @@ def _axis_edge_coordinates_from_step(
     return start, stop
 
 
-def _axis_edge_coordinates(axis: AxisSpec) -> tuple[float, float]:
-    """Return index-edge coordinates without inventing singleton spacing."""
-
-    return _axis_edge_coordinates_from_step(axis, float(_axis_step(axis)))
-
-
-def _normalized_interval_for_coordinate_view(
-    axis: AxisSpec,
-    view: object,
-    name: str,
-    *,
-    edge_coordinates: tuple[float, float] | None = None,
-) -> tuple[float, float]:
-    low, high = _coordinate_view(view, name)
-    start, stop = (
-        _axis_edge_coordinates(axis)
-        if edge_coordinates is None
-        else edge_coordinates
-    )
-    domain_low, domain_high = sorted((start, stop))
-    # Absorb only arithmetic round-off at the domain's magnitude.  A relative
-    # tolerance would become a physically meaningful out-of-bounds allowance
-    # for cameras whose absolute ROI coordinates are large.
-    tolerance = 8.0 * math.ulp(
-        max(1.0, abs(domain_low), abs(domain_high), abs(low), abs(high))
-    )
-    if low < domain_low - tolerance or high > domain_high + tolerance:
-        raise ValueError(
-            f"{name} lies outside axis {axis.axis_id} edge extent "
-            f"[{domain_low}, {domain_high}]"
-        )
-    low = min(domain_high, max(domain_low, low))
-    high = min(domain_high, max(domain_low, high))
-    first_fraction = (low - start) / (stop - start)
-    second_fraction = (high - start) / (stop - start)
-    normalized_low, normalized_high = sorted((first_fraction, second_fraction))
-    normalized_low = min(1.0, max(0.0, normalized_low))
-    normalized_high = min(1.0, max(0.0, normalized_high))
-    if (normalized_high - normalized_low) * axis.size < 1.0 - 1e-12:
-        raise ValueError(f"{name} must contain at least one raster cell")
-    return normalized_low, normalized_high
-
-
-def _coordinate_view_for_normalized_interval(
-    axis: AxisSpec,
-    low: float,
-    high: float,
-    *,
-    edge_coordinates: tuple[float, float] | None = None,
-) -> CoordinateView:
-    start, stop = (
-        _axis_edge_coordinates(axis)
-        if edge_coordinates is None
-        else edge_coordinates
-    )
-    first = start + low * (stop - start)
-    second = start + high * (stop - start)
-    coordinate_low, coordinate_high = sorted((first, second))
-    return (
-        0.0 if coordinate_low == 0.0 else coordinate_low,
-        0.0 if coordinate_high == 0.0 else coordinate_high,
-    )
-
-
-def _quantized_normalized_edge(value: float) -> float:
-    ticks = min(_VIEWPORT_TICKS, max(0, round(value * _VIEWPORT_TICKS)))
-    return ticks / _VIEWPORT_TICKS
-
-
-def _quantized_normalized_bounds(
-    bounds: NormalizedRectangle,
-) -> NormalizedRectangle:
-    return validate_normalized_rectangle(
-        tuple(_quantized_normalized_edge(value) for value in bounds)
-    )
-
-
-def _coordinate_round_trip_interval(
-    axis: AxisSpec,
-    interval: tuple[float, float],
-    name: str,
-    edge_coordinates: tuple[float, float] | None,
-) -> tuple[float, float]:
-    if interval == (0.0, 1.0):
-        return interval
-    coordinate_view = _coordinate_view_for_normalized_interval(
-        axis,
-        *interval,
-        edge_coordinates=edge_coordinates,
-    )
-    return _normalized_interval_for_coordinate_view(
-        axis,
-        coordinate_view,
-        name,
-        edge_coordinates=edge_coordinates,
-    )
-
-
-def _canonical_viewport_bounds(
-    x_axis: AxisSpec,
-    y_axis: AxisSpec,
-    bounds: NormalizedRectangle,
-    x_edge_coordinates: tuple[float, float] | None,
-    y_edge_coordinates: tuple[float, float] | None,
-) -> NormalizedRectangle:
-    """Return one fixed-grid rectangle stable through authored coordinates.
-
-    Absolute camera ROI coordinates can be much larger than the visible span,
-    so converting normalized bounds to public coordinate pins may lose a few
-    binary64 low bits.  One representability pass selects the fixed-grid value
-    those pins actually encode; a second pass proves it is a fixed point.  A
-    viewport that cannot be represented stably fails closed instead of giving
-    one revision two subtly different rectangles.
-    """
-
-    candidate = _quantized_normalized_bounds(
-        validate_normalized_rectangle(bounds)
-    )
-
-    def represented(value: NormalizedRectangle) -> NormalizedRectangle:
-        left, top, right, bottom = value
-        x_interval = _coordinate_round_trip_interval(
-            x_axis,
-            (left, right),
-            "x_view",
-            x_edge_coordinates,
-        )
-        y_interval = _coordinate_round_trip_interval(
-            y_axis,
-            (top, bottom),
-            "y_view",
-            y_edge_coordinates,
-        )
-        return _quantized_normalized_bounds(
-            (x_interval[0], y_interval[0], x_interval[1], y_interval[1])
-        )
-
-    canonical = represented(candidate)
-    if represented(canonical) != canonical:
-        raise ValueError(
-            "image viewport bounds have no stable coordinate-view representation"
-        )
-    return canonical
-
-
 def _sample_index(
     full_coordinate: float,
     size: int,
@@ -316,12 +179,7 @@ def _sample_index(
     return min(size - 1, max(0, candidate))
 
 
-def _clamped_interval(start: float, span: float) -> tuple[float, float]:
-    start = max(0.0, min(1.0 - span, start))
-    return start, start + span
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ImageViewportTransform:
     """Exact map between a committed visible window and a numeric 2-D raster.
 
@@ -332,15 +190,19 @@ class ImageViewportTransform:
     roles remain untouched: two scan-point axes stay scan-point axes while the
     Figure binding says which is horizontal and which is vertical.
 
-    ``visible_bounds`` uses complete-raster edge coordinates; the home view is
-    ``(0, 0, 1, 1)``.  Rank, singleton shape, and tuple position never supply
-    an axis role or display direction.
+    Physical ``x_limits``/``y_limits`` are the sole viewport authority.  The
+    normalized ``visible_bounds`` bridge is derived for raster-cell selections;
+    it is allowed to extend beyond the source when Main's square home padding,
+    zoom-out, or pan exposes axes background.  Rank, singleton shape, and tuple
+    position never supply an axis role or display direction.
     """
 
     axes: tuple[AxisSpec, AxisSpec]
     viewport_revision: int = 0
-    visible_bounds: NormalizedRectangle = (0.0, 0.0, 1.0, 1.0)
-    display_axis_ids: InitVar[tuple[AxisId, AxisId] | None] = None
+    x_limits: CoordinateView = field(init=False)
+    y_limits: CoordinateView = field(init=False)
+    _home_x_limits: CoordinateView = field(init=False, repr=False, compare=False)
+    _home_y_limits: CoordinateView = field(init=False, repr=False, compare=False)
     _x_edge_coordinates: tuple[float, float] | None = field(
         init=False,
         repr=False,
@@ -352,11 +214,17 @@ class ImageViewportTransform:
         compare=False,
     )
 
-    def __post_init__(
+    def __init__(
         self,
-        display_axis_ids: tuple[AxisId, AxisId] | None,
+        axes: tuple[AxisSpec, AxisSpec],
+        viewport_revision: int = 0,
+        visible_bounds: NormalizedRectangle | None = None,
+        display_axis_ids: tuple[AxisId, AxisId] | None = None,
+        *,
+        x_limits: CoordinateView | None = None,
+        y_limits: CoordinateView | None = None,
     ) -> None:
-        axes = tuple(self.axes)
+        axes = tuple(axes)
         if len(axes) != 2 or any(not isinstance(axis, AxisSpec) for axis in axes):
             raise ValueError("ImageViewportTransform requires exactly two AxisSpec values")
         if display_axis_ids is None:
@@ -413,26 +281,47 @@ class ImageViewportTransform:
             if y_axis.size == 1
             else _axis_edge_coordinates_from_step(y_axis, y_step)
         )
-        bounds = _canonical_viewport_bounds(
-            x_axis,
-            y_axis,
-            validate_normalized_rectangle(self.visible_bounds),
-            x_edge_coordinates,
-            y_edge_coordinates,
-        )
-        if (bounds[2] - bounds[0]) * x_axis.size < 1.0 - 1e-12:
-            raise ValueError("visible x bounds must contain at least one raster cell")
-        if (bounds[3] - bounds[1]) * y_axis.size < 1.0 - 1e-12:
-            raise ValueError("visible y bounds must contain at least one raster cell")
         object.__setattr__(self, "axes", (x_axis, y_axis))
         object.__setattr__(
             self,
             "viewport_revision",
-            nonnegative_integer(self.viewport_revision, "viewport_revision"),
+            nonnegative_integer(viewport_revision, "viewport_revision"),
         )
-        object.__setattr__(self, "visible_bounds", bounds)
         object.__setattr__(self, "_x_edge_coordinates", x_edge_coordinates)
         object.__setattr__(self, "_y_edge_coordinates", y_edge_coordinates)
+        home = square_image_extent(self.data_extent)
+        home_x = tuple(sorted(home[:2]))
+        home_y = tuple(sorted(home[2:]))
+        object.__setattr__(self, "_home_x_limits", home_x)
+        object.__setattr__(self, "_home_y_limits", home_y)
+        if visible_bounds is not None:
+            if x_limits is not None or y_limits is not None:
+                raise ValueError(
+                    "visible_bounds cannot be combined with physical x/y limits"
+                )
+            left, top, right, bottom = _unbounded_normalized_rectangle(
+                visible_bounds
+            )
+            x_start, x_stop = self._cached_axis_edges(x_axis)
+            y_start, y_stop = self._cached_axis_edges(y_axis)
+            x_limits = tuple(sorted((
+                x_start + left * (x_stop - x_start),
+                x_start + right * (x_stop - x_start),
+            )))
+            y_limits = tuple(sorted((
+                y_start + top * (y_stop - y_start),
+                y_start + bottom * (y_stop - y_start),
+            )))
+        object.__setattr__(
+            self,
+            "x_limits",
+            home_x if x_limits is None else _coordinate_view(x_limits, "x_limits"),
+        )
+        object.__setattr__(
+            self,
+            "y_limits",
+            home_y if y_limits is None else _coordinate_view(y_limits, "y_limits"),
+        )
 
     @property
     def x_axis(self) -> AxisSpec:
@@ -459,7 +348,7 @@ class ImageViewportTransform:
         Camera axes can contain thousands of explicit coordinates.  Rewalking
         that immutable tuple every time a frame asks for its extent (and again
         for every pointer mapping) made the supposedly cheap view transform an
-        O(width + height) live-render operation.  ``__post_init__`` already
+        O(width + height) live-render operation.  Construction already
         proves regularity once, so every subsequent mapping must consume that
         proof rather than repeat it.
         """
@@ -475,17 +364,43 @@ class ImageViewportTransform:
         center = float(axis.coordinate_at(0))
         return center - 0.5, center + 0.5
 
+    @property
+    def home_x_limits(self) -> CoordinateView:
+        return self._home_x_limits
+
+    @property
+    def home_y_limits(self) -> CoordinateView:
+        return self._home_y_limits
+
+    @property
+    def visible_bounds(self) -> NormalizedRectangle:
+        """Physical limits expressed against the complete raster, top-origin."""
+
+        x_start, x_stop = self._cached_axis_edges(self.x_axis)
+        y_start, y_stop = self._cached_axis_edges(self.y_axis)
+        x_first = (self.x_limits[0] - x_start) / (x_stop - x_start)
+        x_second = (self.x_limits[1] - x_start) / (x_stop - x_start)
+        y_first = (self.y_limits[0] - y_start) / (y_stop - y_start)
+        y_second = (self.y_limits[1] - y_start) / (y_stop - y_start)
+        left, right = sorted((x_first, x_second))
+        top, bottom = sorted((y_first, y_second))
+        return _unbounded_normalized_rectangle((left, top, right, bottom))
+
     def _validated_replacement(
         self,
-        bounds: NormalizedRectangle,
+        x_limits: CoordinateView,
+        y_limits: CoordinateView,
         revision: int,
     ) -> ImageViewportTransform:
-        """Clone validated affine geometry without revalidating immutable axes."""
+        """Clone physical limits without revalidating immutable source axes."""
 
         candidate = object.__new__(type(self))
         object.__setattr__(candidate, "axes", self.axes)
         object.__setattr__(candidate, "viewport_revision", revision)
-        object.__setattr__(candidate, "visible_bounds", bounds)
+        object.__setattr__(candidate, "x_limits", _coordinate_view(x_limits, "x_limits"))
+        object.__setattr__(candidate, "y_limits", _coordinate_view(y_limits, "y_limits"))
+        object.__setattr__(candidate, "_home_x_limits", self._home_x_limits)
+        object.__setattr__(candidate, "_home_y_limits", self._home_y_limits)
         object.__setattr__(
             candidate, "_x_edge_coordinates", self._x_edge_coordinates
         )
@@ -499,20 +414,20 @@ class ImageViewportTransform:
         bounds: NormalizedRectangle,
         revision: int,
     ) -> ImageViewportTransform:
-        """Canonicalize new bounds while reusing validated affine axes."""
+        """Convert a normalized selection bridge into physical limits once."""
 
-        checked = _canonical_viewport_bounds(
-            self.x_axis,
-            self.y_axis,
-            validate_normalized_rectangle(bounds),
-            self._x_edge_coordinates,
-            self._y_edge_coordinates,
-        )
-        if (checked[2] - checked[0]) * self.x_axis.size < 1.0 - 1e-12:
-            raise ValueError("visible x bounds must contain at least one raster cell")
-        if (checked[3] - checked[1]) * self.y_axis.size < 1.0 - 1e-12:
-            raise ValueError("visible y bounds must contain at least one raster cell")
-        return self._validated_replacement(checked, revision)
+        left, top, right, bottom = _unbounded_normalized_rectangle(bounds)
+        x_start, x_stop = self._cached_axis_edges(self.x_axis)
+        y_start, y_stop = self._cached_axis_edges(self.y_axis)
+        x_limits = tuple(sorted((
+            x_start + left * (x_stop - x_start),
+            x_start + right * (x_stop - x_start),
+        )))
+        y_limits = tuple(sorted((
+            y_start + top * (y_stop - y_start),
+            y_start + bottom * (y_stop - y_start),
+        )))
+        return self._validated_replacement(x_limits, y_limits, revision)
 
     @property
     def data_extent(self) -> tuple[float, float, float, float]:
@@ -524,55 +439,27 @@ class ImageViewportTransform:
 
     @property
     def visible_data_extent(self) -> tuple[float, float, float, float]:
-        """The raw extent selected by ``visible_bounds`` before display padding."""
+        """Current physical Matplotlib ``left,right,bottom,upper`` limits."""
 
-        left, top, right, bottom = self.visible_bounds
-        x_start, x_stop, y_bottom, y_upper = self.data_extent
-        return (
-            x_start + left * (x_stop - x_start),
-            x_start + right * (x_stop - x_start),
-            y_upper + bottom * (y_bottom - y_upper),
-            y_upper + top * (y_bottom - y_upper),
+        x_start, x_stop = self._cached_axis_edges(self.x_axis)
+        y_start, y_stop = self._cached_axis_edges(self.y_axis)
+        x_left_right = (
+            self.x_limits
+            if x_stop > x_start
+            else (self.x_limits[1], self.x_limits[0])
         )
+        y_bottom_upper = (
+            (self.y_limits[1], self.y_limits[0])
+            if y_stop > y_start
+            else self.y_limits
+        )
+        return (*x_left_right, *y_bottom_upper)
 
     @property
     def display_extent(self) -> tuple[float, float, float, float]:
-        """Main's square axes domain for this exact visible data window."""
+        """Alias for the one physical viewport consumed by the renderer."""
 
-        return square_image_extent(self.visible_data_extent)
-
-    @property
-    def data_bounds_in_display(self) -> NormalizedRectangle:
-        """True data rectangle inside the square axes domain, top-origin."""
-
-        data_left, data_right, data_bottom, data_upper = (
-            self.visible_data_extent
-        )
-        display_left, display_right, display_bottom, display_upper = (
-            self.display_extent
-        )
-        x_first = (
-            (data_left - display_left) / (display_right - display_left)
-        )
-        x_second = (
-            (data_right - display_left) / (display_right - display_left)
-        )
-        y_first = (
-            (data_upper - display_upper) / (display_bottom - display_upper)
-        )
-        y_second = (
-            (data_bottom - display_upper) / (display_bottom - display_upper)
-        )
-        left, right = sorted((x_first, x_second))
-        top, bottom = sorted((y_first, y_second))
-        tolerance = 1e-12
-        values = tuple(
-            min(1.0, max(0.0, value))
-            if -tolerance <= value <= 1.0 + tolerance
-            else value
-            for value in (left, top, right, bottom)
-        )
-        return validate_normalized_rectangle(values)
+        return self.visible_data_extent
 
     def normalized_bounds_for_optional_coordinate_views(
         self,
@@ -587,27 +474,17 @@ class ImageViewportTransform:
         usable even though it cannot define a non-degenerate public range.
         """
 
-        left, right = (
-            (0.0, 1.0)
-            if x_view is None
-            else _normalized_interval_for_coordinate_view(
-                self.x_axis,
-                x_view,
-                "x_view",
-                edge_coordinates=self._x_edge_coordinates,
-            )
+        x_limits = self.home_x_limits if x_view is None else _coordinate_view(x_view, "x_view")
+        y_limits = self.home_y_limits if y_view is None else _coordinate_view(y_view, "y_view")
+        x_start, x_stop = self._cached_axis_edges(self.x_axis)
+        y_start, y_stop = self._cached_axis_edges(self.y_axis)
+        left, right = sorted(
+            ((value - x_start) / (x_stop - x_start) for value in x_limits)
         )
-        top, bottom = (
-            (0.0, 1.0)
-            if y_view is None
-            else _normalized_interval_for_coordinate_view(
-                self.y_axis,
-                y_view,
-                "y_view",
-                edge_coordinates=self._y_edge_coordinates,
-            )
+        top, bottom = sorted(
+            ((value - y_start) / (y_stop - y_start) for value in y_limits)
         )
-        return validate_normalized_rectangle((left, top, right, bottom))
+        return _unbounded_normalized_rectangle((left, top, right, bottom))
 
     def optional_coordinate_views_for_normalized_bounds(
         self,
@@ -619,30 +496,22 @@ class ImageViewportTransform:
         not need an invented public coordinate span.
         """
 
-        checked = self.visible_bounds if bounds is None else validate_normalized_rectangle(
-            bounds
-        )
-        left, top, right, bottom = checked
-        x_view = (
-            None
-            if (left, right) == (0.0, 1.0)
-            else _coordinate_view_for_normalized_interval(
-                self.x_axis,
-                left,
-                right,
-                edge_coordinates=self._x_edge_coordinates,
-            )
-        )
-        y_view = (
-            None
-            if (top, bottom) == (0.0, 1.0)
-            else _coordinate_view_for_normalized_interval(
-                self.y_axis,
-                top,
-                bottom,
-                edge_coordinates=self._y_edge_coordinates,
-            )
-        )
+        if bounds is None:
+            x_limits, y_limits = self.x_limits, self.y_limits
+        else:
+            left, top, right, bottom = _unbounded_normalized_rectangle(bounds)
+            x_start, x_stop = self._cached_axis_edges(self.x_axis)
+            y_start, y_stop = self._cached_axis_edges(self.y_axis)
+            x_limits = tuple(sorted((
+                x_start + left * (x_stop - x_start),
+                x_start + right * (x_stop - x_start),
+            )))
+            y_limits = tuple(sorted((
+                y_start + top * (y_stop - y_start),
+                y_start + bottom * (y_stop - y_start),
+            )))
+        x_view = None if x_limits == self.home_x_limits else x_limits
+        y_view = None if y_limits == self.home_y_limits else y_limits
         return x_view, y_view
 
     def full_point_for_visible_point(
@@ -711,22 +580,10 @@ class ImageViewportTransform:
 
         left, top, right, bottom = validate_normalized_rectangle(bounds)
 
-        def coordinate_interval(
-            axis: AxisSpec,
-            low: float,
-            high: float,
-        ) -> tuple[float, float]:
-            if axis.size == 1:
-                center = float(axis.coordinate_at(0))
-                start, stop = center - 0.5, center + 0.5
-            else:
-                start, stop = self._cached_axis_edges(axis)
-            first = start + low * (stop - start)
-            second = start + high * (stop - start)
-            return tuple(sorted((first, second)))
-
-        x_low, x_high = coordinate_interval(self.x_axis, left, right)
-        y_low, y_high = coordinate_interval(self.y_axis, top, bottom)
+        first_x, first_y = self.coordinate_for_visible_point((left, top))
+        second_x, second_y = self.coordinate_for_visible_point((right, bottom))
+        x_low, x_high = sorted((first_x, second_x))
+        y_low, y_high = sorted((first_y, second_y))
         return x_low, y_low, x_high, y_high
 
     def unbounded_visible_point_for_coordinate(
@@ -1076,19 +933,29 @@ class ImageViewportTransform:
         *,
         viewport_revision: int | None = None,
     ) -> ImageViewportTransform:
-        """Commit another visible window, increasing its revision if it changed."""
+        """Commit normalized raster bounds as physical limits once."""
 
-        checked = _canonical_viewport_bounds(
-            self.x_axis,
-            self.y_axis,
-            validate_normalized_rectangle(bounds),
-            self._x_edge_coordinates,
-            self._y_edge_coordinates,
-        )
+        checked = _unbounded_normalized_rectangle(bounds)
         if checked == self.visible_bounds:
             return self
         revision = self._replacement_revision(viewport_revision)
-        return self._validated_replacement(checked, revision)
+        return self._replacement_with_visible_bounds(checked, revision)
+
+    def home(
+        self,
+        *,
+        viewport_revision: int | None = None,
+    ) -> ImageViewportTransform:
+        """Return Main's once-padded square home limits."""
+
+        if self.x_limits == self.home_x_limits and self.y_limits == self.home_y_limits:
+            return self
+        revision = self._replacement_revision(viewport_revision)
+        return self._validated_replacement(
+            self.home_x_limits,
+            self.home_y_limits,
+            revision,
+        )
 
     def centered_zoom(
         self,
@@ -1099,8 +966,8 @@ class ImageViewportTransform:
     ) -> ImageViewportTransform:
         """Scale both spans around one visible point.
 
-        ``span_scale < 1`` zooms in and ``span_scale > 1`` zooms out.  Each
-        span is clamped to the complete raster and to at least one sample cell.
+        ``span_scale < 1`` zooms in and ``span_scale > 1`` zooms out.  Like
+        Main's physical axes, the result is not cropped to the source raster.
         """
 
         visible_x, visible_y = validate_normalized_point(point, "zoom point")
@@ -1109,23 +976,23 @@ class ImageViewportTransform:
             raise ValueError("span_scale must be positive")
         if scale == 1.0:
             return self
-        left, top, right, bottom = self.visible_bounds
-        old_width, old_height = right - left, bottom - top
-        new_width = min(1.0, max(1.0 / self.x_axis.size, old_width * scale))
-        new_height = min(1.0, max(1.0 / self.y_axis.size, old_height * scale))
-        anchor_x, anchor_y = self.full_point_for_visible_point((visible_x, visible_y))
-        new_left, new_right = _clamped_interval(
-            anchor_x - visible_x * new_width,
-            new_width,
+        anchor_x, anchor_y = self.coordinate_for_visible_point((visible_x, visible_y))
+        x_low, x_high = self.x_limits
+        y_low, y_high = self.y_limits
+        candidate = (
+            (
+                anchor_x - (anchor_x - x_low) * scale,
+                anchor_x + (x_high - anchor_x) * scale,
+            ),
+            (
+                anchor_y - (anchor_y - y_low) * scale,
+                anchor_y + (y_high - anchor_y) * scale,
+            ),
         )
-        new_top, new_bottom = _clamped_interval(
-            anchor_y - visible_y * new_height,
-            new_height,
-        )
-        return self.with_visible_bounds(
-            (new_left, new_top, new_right, new_bottom),
-            viewport_revision=viewport_revision,
-        )
+        checked_x = _coordinate_view(candidate[0], "zoom x_limits")
+        checked_y = _coordinate_view(candidate[1], "zoom y_limits")
+        revision = self._replacement_revision(viewport_revision)
+        return self._validated_replacement(checked_x, checked_y, revision)
 
     def panned_by_pixels(
         self,
@@ -1153,16 +1020,13 @@ class ImageViewportTransform:
             return self
         left, top, right, bottom = self.visible_bounds
         span_x, span_y = right - left, bottom - top
-        new_left, new_right = _clamped_interval(
-            left - delta_x * span_x / width,
-            span_x,
-        )
-        new_top, new_bottom = _clamped_interval(
-            top - delta_y * span_y / height,
-            span_y,
-        )
         return self.with_visible_bounds(
-            (new_left, new_top, new_right, new_bottom),
+            (
+                left - delta_x * span_x / width,
+                top - delta_y * span_y / height,
+                right - delta_x * span_x / width,
+                bottom - delta_y * span_y / height,
+            ),
             viewport_revision=viewport_revision,
         )
 

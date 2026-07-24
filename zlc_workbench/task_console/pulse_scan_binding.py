@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from zlc_data import DataTransformSpec
 from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_KEY
+from zlc_neutral_atom.camera_measurement import camera_frame_output_index
 from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.readout.occupancy import OCCUPANCY_STREAM_PROCESSOR_KEY
 from zlc_neutral_atom.scan import (
@@ -33,8 +34,13 @@ def classify_pulse_scan_producer(
 ) -> str | None:
     """Return the exact Pulse Scan source family, or ``None`` if rejected."""
 
-    if definition_key == CAMERA_MEASUREMENT_KEY and output_name == "frame":
-        return PULSE_SCAN_CAMERA_FRAME_SOURCE
+    if definition_key == CAMERA_MEASUREMENT_KEY:
+        try:
+            camera_frame_output_index(output_name)
+        except (TypeError, ValueError):
+            pass
+        else:
+            return PULSE_SCAN_CAMERA_FRAME_SOURCE
     if (
         definition_key == OCCUPANCY_STREAM_PROCESSOR_KEY
         and output_name in ("counts", "occupied")

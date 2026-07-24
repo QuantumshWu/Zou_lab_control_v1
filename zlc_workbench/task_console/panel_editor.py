@@ -34,7 +34,6 @@ from zlc_frontend.qt_widgets import (
     ORANGE,
     RED,
     MeasurementPanel,
-    fluent_text_width,
     scaled_px,
     signals_blocked as _signals_blocked,
 )
@@ -132,9 +131,15 @@ class PanelEditor(QtWidgets.QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         scroll = FluentScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         outer.addWidget(scroll)
         page = QtWidgets.QWidget()
         page.setStyleSheet("background: transparent;")
+        page.setMinimumWidth(0)
+        page.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         scroll.setWidget(page)
         col = QtWidgets.QVBoxLayout(page)
         margin = scaled_px(10, minimum=6)
@@ -156,7 +161,7 @@ class PanelEditor(QtWidgets.QWidget):
                 row.addWidget(trailing, 0)
             return host
 
-        label_w = scaled_px(96, minimum=72)
+        label_w = card.setting_label_width(self.fontMetrics())
 
         # ---- Panel: rename here as well as in the Setting popup; both go through the
         # card's one title handler, so the two surfaces stay views of one string.
@@ -213,44 +218,13 @@ class PanelEditor(QtWidgets.QWidget):
         display_specs = ([spec for spec in _panel_param_decls(card.config.kind)
                           if spec.display] + [_RELIM_PARAM])
         self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, label_w)
-        (
-            self.grid_intent_row,
-            self.grid_intent_combo,
-            self.grid_facet_row,
-            self.grid_facet_combo,
-        ) = card._make_grid_view_rows(
-            label_w,
-            apply=self._edit_grid_facet,
-        )
-        col.addWidget(self.grid_intent_row)
-        col.addWidget(self.grid_facet_row)
-        self.grid_bins_row, self.grid_bins_widget = card._make_grid_bins_row(
+        card._mount_grid_row_inventory(
+            self,
+            col.addWidget,
             self._edit_param,
             label_w,
+            self.ed_params,
         )
-        if self.grid_bins_widget is not None:
-            self.ed_params["bins"] = self.grid_bins_widget
-        col.addWidget(self.grid_bins_row)
-        self.grid_ylog_row, self.grid_ylog_widget = card._make_grid_hist_param_row(
-            "ylog",
-            self._edit_param,
-            label_w,
-        )
-        if self.grid_ylog_widget is not None:
-            self.ed_params["ylog"] = self.grid_ylog_widget
-        col.addWidget(self.grid_ylog_row)
-        self.grid_colormap_row, self.grid_colormap_widget = (
-            card._make_grid_cell_param_row(
-                "2d",
-                "colormap",
-                card._image_intent(),
-                self._edit_param,
-                label_w,
-            )
-        )
-        if self.grid_colormap_widget is not None:
-            self.ed_params["colormap"] = self.grid_colormap_widget
-        col.addWidget(self.grid_colormap_row)
         self.repeat_mode_row, self.repeat_mode_combo = card._make_repeat_mode_row(
             self._edit_repeat_mode,
             label_w,
@@ -286,7 +260,7 @@ class PanelEditor(QtWidgets.QWidget):
         col.addLayout(self.canvas_holder)
 
         if card._fit_capable_kind():
-            section("Analysis")
+            section("Fit")
             self._fit_pane = card.make_fit_authoring_pane(page)
             col.addWidget(self._fit_pane)
 
@@ -375,7 +349,9 @@ class PanelEditor(QtWidgets.QWidget):
         col.addWidget(self.status)
         col.addStretch(1)
 
-        self.rebuild()
+        # The TaskConsole mounts this editor into the tab stack before calling
+        # ``rebuild``.  Building the raster host here would briefly make that
+        # child a top-level native window while the page has no tab parent yet.
 
     def rebuild(self) -> None:
         """Copy the card's immutable front into one stable shared host.
@@ -447,7 +423,11 @@ class PanelEditor(QtWidgets.QWidget):
         if isinstance(board, wanted):
             return board
         self._retire_snapshot_surface(board)
-        board = wanted(self.card.panel_id, empty_text="no snapshot yet")
+        board = wanted(
+            self.card.panel_id,
+            empty_text="no snapshot yet",
+            parent=self,
+        )
         if isinstance(board, FacetedPanelHost):
             board.focusRequested.connect(self._forward_grid_focus)
             board.overviewRequested.connect(self._forward_grid_overview)

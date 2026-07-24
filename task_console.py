@@ -76,13 +76,13 @@ def _close_window(application, window, *, timeout_seconds: float = 10.0) -> None
 
 
 class _StandaloneTaskConsoleFlow:
-    """Own exactly one DeviceManager-created Experiment and its TaskConsole.
+    """Own one DeviceManager-created Experiment, TaskConsole, and Pulse GUI.
 
     The standalone GUI has no hidden process registry and does not manufacture
     a second Experiment.  DeviceManager owns installation composition; after
     its successful Init transition the exact same Experiment is borrowed by
-    TaskConsole.  Closing TaskConsole retires the DeviceManager authority,
-    which in turn closes that one Experiment.
+    both application windows.  Closing TaskConsole first closes its sibling
+    Pulse GUI, then retires DeviceManager authority and that one Experiment.
     """
 
     def __init__(self, args) -> None:
@@ -90,6 +90,7 @@ class _StandaloneTaskConsoleFlow:
         self.devices = None
         self.closing_devices = None
         self.console = None
+        self.pulse = None
         self.experiment = None
         self.failure: BaseException | None = None
 
@@ -114,6 +115,7 @@ class _StandaloneTaskConsoleFlow:
             return
         if self.devices is None:
             return
+        console = None
         try:
             from zlc_workbench.task_console.app import open_task_console
 
@@ -122,7 +124,10 @@ class _StandaloneTaskConsoleFlow:
                 state=self.args.state,
                 task=self.args.task,
             )
+            pulse = experiment.pulse_gui()
         except BaseException as error:
+            if console is not None:
+                console.window().close()
             self.failure = error
             self.devices.status_strip.show_message(
                 f"{type(error).__name__}: {error}",
@@ -131,10 +136,16 @@ class _StandaloneTaskConsoleFlow:
             return
         self.experiment = experiment
         self.console = console
+        self.pulse = pulse
         console.window().closed.connect(self.close)
         self.devices.window().hide()
 
     def close(self) -> None:
+        pulse, self.pulse = self.pulse, None
+        if pulse is not None:
+            pulse_window = pulse.window()
+            if pulse_window.isVisible():
+                pulse_window.close()
         self.experiment = None
         devices, self.devices = self.devices, None
         if devices is not None:

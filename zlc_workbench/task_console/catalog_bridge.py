@@ -16,12 +16,14 @@ is a read-only view plus request construction, and every runtime behaviour
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Mapping
 
 from zlc_data.param_decl import ParamDecl
 from zlc_frontend.form import FormChoice, FormFieldProps, FormSpec
 from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_KEY
 from zlc_neutral_atom.acquisition import CAMERA_MEASUREMENT_DEFINITIONS
+from zlc_neutral_atom.camera_measurement import camera_frame_output_names
 from zlc_neutral_atom.catalog import (
     DefinitionCatalog,
     DefinitionKey,
@@ -76,6 +78,8 @@ from .coupled_measurement_presenter import (
 
 DEFAULT_CAMERA_ROLE = "camera"
 CAMERA_MEASUREMENT_ROLES = ("camera", "mot_camera")
+OCCUPANCY_CALIBRATION_SOURCES = ("Task output", "Saved calibration")
+DEFAULT_CALIBRATION_REF_PATH = "_output/calibrations/calibration_ref.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,12 +122,45 @@ class ConsoleNodeSpec:
     declared_outputs: tuple[ConsoleSignalDecl, ...]
     build_request: Callable[[Mapping[str, object]], object]
     default_panel: tuple[str, str] | tuple[str, str, Mapping[str, object]] | None = None
+    output_factory: (
+        Callable[[Mapping[str, object]], tuple[ConsoleSignalDecl, ...]] | None
+    ) = None
 
     @property
     def name(self) -> str:
         """The skeleton addresses specs by title (its historical lookup key)."""
 
         return self.title
+
+    def outputs_for(
+        self,
+        values: Mapping[str, object],
+    ) -> tuple[ConsoleSignalDecl, ...]:
+        """Resolve this form state to its exact, ordered public outputs.
+
+        Most definitions have a static tuple.  Camera Measurement is different:
+        ``frames_per_cycle`` is part of its request and therefore determines the
+        number of independently bindable ``frame_i`` views.  Keeping that
+        dependency on the catalog seam lets every picker/runtime consumer use
+        one declaration owner without treating a Dataset shape as UI metadata.
+        """
+
+        if not isinstance(values, Mapping):
+            raise TypeError("console form values must be a mapping")
+        outputs = (
+            self.declared_outputs
+            if self.output_factory is None
+            else self.output_factory(values)
+        )
+        outputs = tuple(outputs)
+        if any(not isinstance(output, ConsoleSignalDecl) for output in outputs):
+            raise TypeError("console outputs must contain ConsoleSignalDecl values")
+        names = tuple(output.name for output in outputs)
+        for name in names:
+            canonical_text(name, "console output name")
+        if len(set(names)) != len(names):
+            raise ValueError("console output names must be unique")
+        return outputs
 
 _GROUP_TO_KIND = {"Task": "task", "Measurement": "measurement", "Processor": "processor"}
 
@@ -282,6 +319,25 @@ def _camera_params(
     )
 
 
+def _camera_output_declarations(
+    values: Mapping[str, object],
+) -> tuple[ConsoleSignalDecl, ...]:
+    names = camera_frame_output_names(values.get("frames_per_cycle", 1))
+    return tuple(
+        ConsoleSignalDecl(
+            name,
+            name,
+            "Counts",
+            "counts",
+            (
+                f"camera readout event {event_index}; repeat, point, and "
+                "trailing data axes are preserved"
+            ),
+        )
+        for event_index, name in enumerate(names)
+    )
+
+
 def _pulse_scan_params() -> tuple[ParamDecl, ...]:
     return (
         ParamDecl(
@@ -326,14 +382,34 @@ def _pulse_scan_params() -> tuple[ParamDecl, ...]:
 def _occupancy_params() -> tuple[ParamDecl, ...]:
     return (
         ParamDecl(
-            "calibration",
-            "Calibration",
-            "signal",
+            "calibration_source",
+            "Calibration source",
+            "choice",
+            default="Task output",
             required=True,
+            choices=OCCUPANCY_CALIBRATION_SOURCES,
+            tooltip="Use an exact TaskConsole output or an explicitly chosen saved pointer.",
+        ),
+        ParamDecl(
+            "calibration_task",
+            "Calibration task",
+            "signal",
             tooltip=(
                 "FINAL calibration output of a successful Calibrate readout "
-                "Task row in this TaskConsole; it is admitted once when the "
-                "Processor starts"
+                "Task row; used only when Calibration source is Task output"
+            ),
+        ),
+        ParamDecl(
+            "calibration_file",
+            "Saved calibration",
+            "path",
+            default=DEFAULT_CALIBRATION_REF_PATH,
+            path_mode="file",
+            base_dir="_output/calibrations",
+            file_filter="Calibration pointer (calibration_ref.json);;JSON files (*.json)",
+            tooltip=(
+                "Exact calibration_ref.json produced by a successful calibration; "
+                "used only when Calibration source is Saved calibration"
             ),
         ),
         ParamDecl(
@@ -419,17 +495,14 @@ class ConsoleCatalogView:
                 title=item.title,
                 description=item.title,
                 params=_camera_params(self.camera_roles()),
-                declared_outputs=(
-                    ConsoleSignalDecl(
-                        "frame",
-                        "frame",
-                        "Counts",
-                        "counts",
-                        "live or finite camera dataset preserving every "
-                        "declared axis",
-                    ),
+                # The static tuple describes the form's default state; every
+                # concrete row resolves the same declaration owner against its
+                # actual ``frames_per_cycle`` value.
+                declared_outputs=_camera_output_declarations(
+                    {"frames_per_cycle": 1}
                 ),
                 build_request=build_camera,
+                output_factory=_camera_output_declarations,
             )
         if item.key == TEMPERATURE_RELEASE_RECAPTURE_KEY:
             return ConsoleNodeSpec(
@@ -715,19 +788,39 @@ class ConsoleCatalogView:
 
             def build_occupancy(values: Mapping[str, object]):
                 camera_frame = values.get("camera_frame")
-                calibration = values.get("calibration")
                 if not isinstance(camera_frame, str) or not camera_frame.strip():
                     raise ValueError(
                         "occupancy requires a running Camera frame output"
                     )
-                if not isinstance(calibration, str) or not calibration.strip():
-                    raise ValueError(
-                        "occupancy requires a successful Calibration FINAL output"
+                source = str(values.get("calibration_source", "Task output"))
+                if source not in OCCUPANCY_CALIBRATION_SOURCES:
+                    raise ValueError("unknown occupancy calibration source")
+                calibration_signal = None
+                calibration_ref_path = None
+                if source == "Task output":
+                    value = values.get("calibration_task")
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError(
+                            "occupancy requires a successful Calibration task output"
+                        )
+                    calibration_signal = value.strip()
+                else:
+                    value = values.get(
+                        "calibration_file",
+                        DEFAULT_CALIBRATION_REF_PATH,
+                    )
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError(
+                            "occupancy requires an explicit saved calibration file"
+                        )
+                    calibration_ref_path = str(
+                        Path(value).expanduser().resolve()
                     )
                 return OccupancyBindingIntent(
-                    camera_frame.strip(),
-                    calibration.strip(),
-                    parse_occupancy_readout_method(
+                    camera_frame_signal=camera_frame.strip(),
+                    calibration_signal=calibration_signal,
+                    calibration_ref_path=calibration_ref_path,
+                    model_kind=parse_occupancy_readout_method(
                         values.get("readout_method", "box")
                     ),
                 )

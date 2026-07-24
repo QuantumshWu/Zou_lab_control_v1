@@ -13,6 +13,7 @@ from PyQt5 import QtCore, QtWidgets
 
 from . import param_widgets as _param_widgets
 from .fluent import (
+    ElidedLabel,
     FluentButton,
     FluentComboBox,
     FluentLabel,
@@ -139,7 +140,12 @@ class MeasurementPanel(QtWidgets.QWidget):
             self.start_button.hide()
             self.stop_button.hide()
 
-        self.status = FluentLabel("")
+        self.status = ElidedLabel("")
+        self.status.setMinimumWidth(0)
+        self.status.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
         root.addWidget(self.status)
 

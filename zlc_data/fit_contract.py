@@ -13,7 +13,7 @@ import numpy as np
 from zlc_storage.canonical import canonical_text, sha256_text
 
 from ._arrays import immutable_array, immutable_bool_array
-from .axis import AxisId, AxisSpec
+from .axis import AxisId, AxisSpec, SCALAR
 from .layout import AxisLayout
 from .schema import DatasetSchema
 from .transform import (
@@ -217,10 +217,14 @@ class BoundFit:
         object.__setattr__(self, "model", model)
         if effective_schema.dtype.kind not in "biuf":
             raise TypeError("fit observations must use a real numeric dtype")
-        effective_ids = tuple(axis.axis_id for axis in effective_schema.axes)
+        effective_ids = tuple(
+            axis.axis_id for axis in effective_schema.axes if axis.role != SCALAR
+        )
         requested_ids = self.spec.fit_axis_ids + self.spec.batch_axis_ids
         if len(requested_ids) != len(effective_ids) or set(requested_ids) != set(effective_ids):
-            raise ValueError("BoundFit axes do not cover the effective schema exactly")
+            raise ValueError(
+                "BoundFit axes do not cover every information axis exactly"
+            )
         if len(self.spec.fit_axis_ids) != model.independent_arity:
             raise ValueError(
                 f"model {model.model_id!r} requires "

@@ -44,8 +44,8 @@ def format_dims(dims) -> str:
     """The ONE spelling of a dims tuple for the GUI: axes joined by the ``×`` glyph
     (``40×20``), and ``"1"`` only when the caller needs the multiplicative size of
     an empty axis domain (for example the mandatory single point of a no-scan
-    dataset).  An empty ``data_shape`` is *not* a length-one data axis;
-    :func:`contract_shape_label` omits that group entirely.  EVERY surface that
+    dataset).  A valid ``ValueSchema`` always has at least one trailing data
+    axis; true scalars use the declared singleton scalar carrier.  EVERY surface that
     turns a signal's shape into a display string routes through this module, so
     ``(40, 20)`` (numpy-tuple spelling) can never appear beside ``40×20`` again."""
     parts = tuple(str(int(n)) for n in (dims or ()))
@@ -65,8 +65,9 @@ def contract_shape_label(repeat, point_count, data_shape) -> str:
     if p <= 0:
         raise ValueError("point_count must be positive")
     ds = tuple(int(n) for n in (data_shape or ()))
-    cell_domain = f"{int(repeat)} × {p}"
-    return cell_domain if not ds else f"{cell_domain} × ({format_dims(ds)})"
+    if not ds:
+        raise ValueError("data_shape must include the declared scalar/data axis")
+    return f"{int(repeat)} × {p} × ({format_dims(ds)})"
 
 
 def describe_shape(value, *, point_count=None, data_shape=None) -> str:
@@ -78,8 +79,8 @@ def describe_shape(value, *, point_count=None, data_shape=None) -> str:
     When the value is a registered signal tensor (its shape matches the declared
     physical ``(repeat, P, *data_shape)``) it is shown in contract form
     ``repeat × P [× (data)]``.  P is always the single physical point-storage
-    axis: a scalar 7×7×7 logical scan is ``1 × 343`` (never a fabricated
-    ``(1)`` and never a fake rank-five tensor), while a per-site 1-D scan is
+    axis: a scalar 7×7×7 logical scan is ``1 × 343 × (1)`` (the declared
+    scalar carrier, never a fake rank-five tensor), while a per-site 1-D scan is
     ``5 × 8 × (3)``.  Logical point-axis names and sizes are displayed as
     metadata rather than being spliced into the ndarray shape.  A no-scan
     single-point camera reads ``5 × 1 × (96×128)`` and per-site occupancy

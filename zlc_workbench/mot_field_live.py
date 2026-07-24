@@ -306,7 +306,7 @@ class MotFieldGridLiveSlot:
                     "MOT delta attempted to rewrite a committed grid cell"
                 )
             for output_cell, intensity, metadata in projected:
-                self._values[output_cell] = intensity
+                self._values[(*output_cell, 0)] = intensity
                 self._valid[output_cell] = True
                 flat = output_cell[0] * self._valid.shape[1] + output_cell[1]
                 self._metadata[flat] = metadata

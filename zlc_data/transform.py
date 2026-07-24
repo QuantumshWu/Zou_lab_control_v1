@@ -12,7 +12,7 @@ import numpy as np
 from zlc_storage.canonical import canonical_digest, canonical_text, sha256_text
 
 from ._arrays import canonical_dtype, immutable_array
-from .axis import AxisId, AxisSpec
+from .axis import AxisId, AxisSpec, SCALAR_AXIS
 from .layout import AxisLayout, AxisLayoutMode
 from .numeric import (
     _integer_sum_requires_object,
@@ -546,6 +546,7 @@ def _validate_materialized_snapshot_transform(
                 if isinstance(step, Selection)
                 else _apply_reduction(state, step)
             )
+    state = _ensure_scalar_carrier(state)
     if state.schema.fingerprint != transform.output_schema_fingerprint:
         raise RuntimeError("transform validation disagrees with committed output schema")
 
@@ -724,7 +725,33 @@ def _run_operations(state: _State, spec: DataTransformSpec) -> _State:
             state = _apply_selection(state, operation)
         else:
             state = _apply_reduction(state, operation)
-    return state
+    return _ensure_scalar_carrier(state)
+
+
+def _ensure_scalar_carrier(state: _State) -> _State:
+    """Keep the public trailing-data contract non-empty after a total transform.
+
+    Selecting or reducing the last information axis produces one scalar per
+    remaining cell.  The canonical singleton carrier records that physical
+    item without pretending that an information axis survived.
+    """
+
+    if state.schema.data_axes:
+        return state
+    schema = TransformedSchema(
+        state.schema.cell_axes,
+        state.schema.cell_layout,
+        (SCALAR_AXIS,),
+        (),
+        state.schema.dtype,
+        state.schema.value_unit,
+    )
+    values = (
+        None
+        if state.values is None
+        else np.expand_dims(state.values, axis=-1)
+    )
+    return _State(schema, values, state.validity)
 
 
 def _apply_selection(state: _State, selection: Selection) -> _State:

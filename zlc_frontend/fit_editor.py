@@ -1,38 +1,27 @@
-"""Headless presentation projection for typed fit constraints.
+"""Headless projection between bound Fit requests and their text editor.
 
 ``zlc_data`` remains the sole owner of model, axis, and constraint semantics.
-This module only projects one already-bound fit into the shared scalar-form
-contract and rebuilds a validated ``FitSpec`` from an exact form state.  It
+This module exposes a small, reversible authoring value for the Figure UI and
+rebuilds a validated ``FitSpec`` from the one visible arguments line.  It
 contains no Qt, repository, execution, display selection, or persistence
 authority.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 from zlc_data import (
     AxisId,
     BoundFit,
-    FitParameterConstraint,
     FitSpec,
     Selection,
 )
 
+from ._fit_arguments import format_fit_arguments, parse_fit_arguments
 from .authority import describe_authoritative_transform
 from .data_figure import DataFigure
 from .figure import AxisViewRole, ViewIntent
-from .form import FormFieldProps, FormSpec
-
-
-_CONSTRAINT_FIELDS = ("initial", "lower", "upper", "fixed")
-_CONSTRAINT_DESCRIPTIONS = {
-    "initial": "Optional solver seed; blank uses the model initializer.",
-    "lower": "Optional inclusive lower bound.",
-    "upper": "Optional inclusive upper bound.",
-    "fixed": "Optional fixed value; if initial is also set it must agree.",
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,8 +30,8 @@ class FitAuthoringOption:
 
     spec: FitSpec
     display_name: str
-    constraint_form: FormSpec
     parameter_names: tuple[str, ...]
+    argument_text: str
     fit_axis_roles: tuple[object, ...]
     batch_axis_sizes: tuple[tuple[object, int], ...]
     axis_summary: str
@@ -53,12 +42,22 @@ class FitAuthoringOption:
             raise TypeError("Fit authoring option requires FitSpec")
         if not self.display_name:
             raise ValueError("Fit authoring display_name must be non-empty")
-        if not isinstance(self.constraint_form, FormSpec):
-            raise TypeError("Fit authoring constraint_form must be FormSpec")
-        if len(self.parameter_names) * len(_CONSTRAINT_FIELDS) != len(
-            self.constraint_form.fields
+        if (
+            not self.parameter_names
+            or len(set(self.parameter_names)) != len(self.parameter_names)
+            or any(
+                not isinstance(name, str) or not name.isidentifier()
+                for name in self.parameter_names
+            )
         ):
-            raise ValueError("Fit authoring form differs from its parameter inventory")
+            raise ValueError(
+                "Fit authoring parameter names must be unique identifiers"
+            )
+        if not isinstance(self.argument_text, str):
+            raise TypeError("Fit authoring argument_text must be text")
+        # The prefilled text is part of the reversible presentation contract.
+        # Validate it here so an invalid option never reaches either Qt host.
+        parse_fit_arguments(self.argument_text, self.parameter_names)
         if len(self.fit_axis_roles) != len(self.spec.fit_axis_ids):
             raise ValueError("Fit authoring roles differ from its fit axes")
         if tuple(axis_id for axis_id, _size in self.batch_axis_sizes) != (
@@ -226,55 +225,23 @@ def fit_authority_summary(bound: BoundFit) -> str:
     )
 
 
-def fit_constraint_form(bound: BoundFit) -> FormSpec:
-    """Project the catalog-owned parameter metadata into the shared form DSL."""
-
-    if not isinstance(bound, BoundFit):
-        raise TypeError("bound must be BoundFit")
-    fields = []
-    constraints = {
-        constraint.parameter_name: constraint
-        for constraint in bound.spec.constraints
-    }
-    for parameter, unit in zip(
-        bound.parameter_definitions,
-        bound.parameter_units,
-        strict=True,
-    ):
-        constraint = constraints.get(parameter.name)
-        for field in _CONSTRAINT_FIELDS:
-            fields.append(
-                FormFieldProps(
-                    f"{parameter.name}.{field}",
-                    "float",
-                    f"{parameter.name} {field}",
-                    default=(
-                        None if constraint is None else getattr(constraint, field)
-                    ),
-                    unit=unit,
-                    description=(
-                        f"{_CONSTRAINT_DESCRIPTIONS[field]} "
-                        f"Domain: {parameter.domain.value}."
-                    ),
-                )
-            )
-    return FormSpec(tuple(fields))
-
-
 def fit_authoring_option(bound: BoundFit) -> FitAuthoringOption:
     if not isinstance(bound, BoundFit):
         raise TypeError("bound must be BoundFit")
-    form = fit_constraint_form(bound)
     axis_summary = fit_axis_summary(bound)
     authority_summary = fit_authority_summary(bound)
     parameter_names = tuple(
         parameter.name for parameter in bound.parameter_definitions
     )
+    argument_text = format_fit_arguments(
+        bound.spec.constraints,
+        parameter_names,
+    )
     return FitAuthoringOption(
         bound.spec,
         bound.model.display_name,
-        form,
         parameter_names,
+        argument_text,
         tuple(
             bound.effective_schema.axis(axis_id).role
             for axis_id in bound.spec.fit_axis_ids
@@ -288,40 +255,20 @@ def fit_authoring_option(bound: BoundFit) -> FitAuthoringOption:
     )
 
 
-def fit_spec_from_form(
+def fit_spec_from_arguments(
     option: FitAuthoringOption,
-    values: Mapping[str, object],
+    arguments: str,
 ) -> FitSpec:
-    """Rebuild and domain-validate one authority-bearing fit request.
+    """Parse and domain-validate one authority-bearing Fit request.
 
-    The mapping must contain the exact projected keys.  In particular, no
-    current viewport, display reduction, or selector value is consulted here.
+    No current viewport, display reduction, or selector value is consulted.
+    Empty text means automatic model initialization and domains.
     """
 
     if not isinstance(option, FitAuthoringOption):
         raise TypeError("option must be FitAuthoringOption")
-    if not isinstance(values, Mapping):
-        raise TypeError("values must be a mapping")
-    form = option.constraint_form
-    supplied = set(values)
-    expected = set(form.keys)
-    if supplied != expected:
-        missing = tuple(sorted(expected - supplied))
-        extra = tuple(sorted(supplied - expected))
-        raise ValueError(
-            f"fit constraint values require exact keys; missing={missing!r}, "
-            f"extra={extra!r}"
-        )
-
-    constraints = []
-    for parameter_name in option.parameter_names:
-        fields = {
-            name: values[f"{parameter_name}.{name}"]
-            for name in _CONSTRAINT_FIELDS
-        }
-        if any(value is not None for value in fields.values()):
-            constraints.append(FitParameterConstraint(parameter_name, **fields))
-    return replace(option.spec, constraints=tuple(constraints))
+    constraints = parse_fit_arguments(arguments, option.parameter_names)
+    return replace(option.spec, constraints=constraints)
 
 
 __all__ = [
@@ -329,8 +276,7 @@ __all__ = [
     "fit_authoring_option",
     "fit_authority_summary",
     "fit_axis_summary",
-    "fit_constraint_form",
     "fit_projection_metadata",
-    "fit_spec_from_form",
+    "fit_spec_from_arguments",
     "validate_fit_authoring_options",
 ]

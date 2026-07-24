@@ -78,7 +78,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
         CalibrationTaskIntent,
     )
     from .catalog_bridge import ConsoleCatalogView
-    from .data_plane import ConsoleDataPlane
+    from .data_plane import ConsoleDataPlane, single_output_projection
     from .mot_field_task import MotFieldTaskHandle, MotFieldTaskIntent
     from zlc_workbench.mot_field_live import MotFieldGridLiveSlot
     from .occupancy_binding import (
@@ -429,11 +429,11 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
             )
             if (
                 source.definition_key != CAMERA_MEASUREMENT_KEY
-                or source.output_name != "frame"
                 or not isinstance(source.request, CameraMeasurementRequest)
+                or source.output_name not in source.request.output_names
             ):
                 raise ValueError(
-                    "occupancy Camera source must select the frame output of "
+                    "occupancy Camera source must select one frame_i output of "
                     "a Camera Measurement row in this TaskConsole"
                 )
             if not source.running:
@@ -449,37 +449,53 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                     "the selected running Camera Measurement has not published "
                     "a frame yet"
                 )
-            calibration = console[0].resolve_console_producer(
-                intent.calibration_signal
-            )
-            if (
-                calibration.definition_key != SITEMAP_CALIBRATION_TASK_KEY
-                or calibration.output_name != "calibration"
-            ):
-                raise ValueError(
-                    "occupancy Calibration must select the calibration output "
-                    "of a Calibrate readout Task row in this TaskConsole"
+            if intent.calibration_signal is not None:
+                calibration = console[0].resolve_console_producer(
+                    intent.calibration_signal
                 )
-            if calibration.running:
-                raise RuntimeError(
-                    "the selected Calibrate readout Task is still running"
-                )
-            if (
-                not calibration.final_result_resolved
-                or not isinstance(
-                    calibration.final_result,
-                    CalibrationArtifactRef,
-                )
-            ):
-                raise RuntimeError(
-                    "the selected Calibrate readout row has no successful "
-                    "current FINAL CalibrationArtifactRef; run it successfully "
-                    "before starting occupancy"
-                )
-            calibration_ref = calibration.final_result
+                if (
+                    calibration.definition_key != SITEMAP_CALIBRATION_TASK_KEY
+                    or calibration.output_name != "calibration"
+                ):
+                    raise ValueError(
+                        "occupancy Calibration must select the calibration output "
+                        "of a Calibrate readout Task row in this TaskConsole"
+                    )
+                if calibration.running:
+                    raise RuntimeError(
+                        "the selected Calibrate readout Task is still running"
+                    )
+                if (
+                    not calibration.final_result_resolved
+                    or not isinstance(
+                        calibration.final_result,
+                        CalibrationArtifactRef,
+                    )
+                ):
+                    raise RuntimeError(
+                        "the selected Calibrate readout row has no successful "
+                        "current FINAL CalibrationArtifactRef; run it successfully "
+                        "before starting occupancy"
+                    )
+                calibration_ref = calibration.final_result
+
+                def load_selected_calibration():
+                    return experiment.readout.load_calibration(calibration_ref)
+
+            else:
+                calibration_path = intent.calibration_ref_path
+                if calibration_path is None:
+                    raise RuntimeError("occupancy lost its saved calibration path")
+
+                def load_selected_calibration():
+                    return experiment.readout.load_saved_calibration(
+                        calibration_path
+                    )
 
             def resolve_calibration():
-                resolved = experiment.readout.load_calibration(calibration_ref)
+                # ReactiveOccupancyNode invokes this closure on its sole worker;
+                # neither repository admission nor saved-file I/O runs on Qt.
+                resolved = load_selected_calibration()
                 expected = ReadoutBindingKey(source.request.camera_ref.role)
                 if resolved.artifact.frame_contract.binding != expected:
                     raise ValueError(
@@ -574,7 +590,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                             ),
                             node,
                             data_plane,
-                            output_name="frame",
+                            project_snapshot=single_output_projection("frame"),
                             source_ordinals=reference_ordinals,
                         )
                     )
@@ -660,7 +676,11 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
                 )
                 attached = False
                 try:
-                    data_plane.attach(node, slot, output_name="grid")
+                    data_plane.attach(
+                        node,
+                        slot,
+                        project_snapshot=single_output_projection("grid"),
+                    )
                     attached = True
                     slot.set_change_listener(
                         lambda: data_plane.mark_changed(node)
@@ -753,30 +773,60 @@ def _bind_camera_execution(node, data_plane) -> None:
     from zlc_neutral_atom.capture_application import PreparedFiniteCameraMeasurement
     from zlc_neutral_atom.monitor_application import PreparedLiveCameraMeasurement
     from zlc_workbench.live_slot import LiveDatasetSlot
+    from .camera_projection import project_camera_frame_snapshots
 
     def start(command):
         if isinstance(command, PreparedLiveCameraMeasurement):
             dataset_id = DatasetId(
                 f"console-{node.spec.key.stable_definition_id}-{id(node):x}"
             )
+            attached = False
 
             def live_factory(view_spec):
+                nonlocal attached
                 slot = LiveDatasetSlot(
                     view_spec,
                     dataset_id=dataset_id,
                     retain_on_terminal=True,
                 )
-                data_plane.attach(node, slot, output_name="frame")
+                try:
+                    data_plane.attach(
+                        node,
+                        slot,
+                        project_snapshot=lambda snapshot: (
+                            project_camera_frame_snapshots(snapshot, node.request)
+                        ),
+                    )
+                except BaseException:
+                    slot.close()
+                    raise
+                attached = True
                 slot.set_change_listener(lambda: data_plane.mark_changed(node))
                 return slot
 
-            return command.start_with_view(factory=live_factory)
+            try:
+                return command.start_with_view(factory=live_factory)
+            except BaseException:
+                # The domain asks for its view before runtime admission.  A
+                # rejected resource claim therefore owns no RunHandle but may
+                # already own this provisional slot.  Roll that one boundary
+                # back so the same frozen request can be retried cleanly.
+                if attached:
+                    data_plane.detach_live(node)
+                raise
         if not isinstance(command, PreparedFiniteCameraMeasurement):
             raise TypeError(
                 "Camera execution requires a prepared live or finite Camera "
                 "measurement"
             )
-        return _start_capture_preview(command, node, data_plane)
+        return _start_capture_preview(
+            command,
+            node,
+            data_plane,
+            project_snapshot=lambda snapshot: (
+                project_camera_frame_snapshots(snapshot, node.request)
+            ),
+        )
 
     node.bind_starter(start)
 
@@ -786,10 +836,10 @@ def _start_capture_preview(
     node,
     data_plane,
     *,
-    output_name: str = "frame",
+    project_snapshot,
     source_ordinals: tuple[int, ...] | None = None,
 ):
-    """Start one finite exact capture with the ordinary TaskConsole frame view."""
+    """Start one finite exact capture with an explicit output projection."""
 
     import uuid
 
@@ -803,23 +853,35 @@ def _start_capture_preview(
         return command.start()
 
     token = uuid.uuid4().hex
+    attached = False
 
     def factory(preview_spec):
+        nonlocal attached
         slot = LiveDatasetSlot(
             preview_spec,
             dataset_id=DatasetId(f"console-capture-{token}"),
             retain_on_terminal=True,
         )
-        data_plane.attach(
-            node,
-            slot,
-            output_name=output_name,
-        )
+        try:
+            data_plane.attach(
+                node,
+                slot,
+                project_snapshot=project_snapshot,
+            )
+        except BaseException:
+            slot.close()
+            raise
+        attached = True
         slot.set_change_listener(lambda: data_plane.mark_changed(node))
         return slot
 
-    return command.start_with_preview(
-        block_id=BlockId(f"console-capture-preview-{token}"),
-        factory=factory,
-        source_ordinals=source_ordinals,
-    )
+    try:
+        return command.start_with_preview(
+            block_id=BlockId(f"console-capture-preview-{token}"),
+            factory=factory,
+            source_ordinals=source_ordinals,
+        )
+    except BaseException:
+        if attached:
+            data_plane.detach_live(node)
+        raise

@@ -99,26 +99,36 @@ hardware_change_review_allowed :=
 - 仍通过 `task_console.bat`、`pulse_gui.bat` 和 notebook 启动系统；
 - PulseGUI 仍保留 Edit、Preview、Scan 三个主要工作区；
 - TaskConsole 仍使用 Add Panel、Setting、Edit、Start、Stop、Save/Load；
-- Measurement、Processor、Task 仍可从 catalog 选择并连接；其中 UI 中的 `Processor` 明确对应在线 `StreamProcessor`，完整数据集上的 Fit/Calibration/Report 显示为 `Analysis`；
+- Measurement、Processor、Task 仍可从 catalog 选择并连接；其中 UI 中的 `Processor` 明确对应在线 `StreamProcessor`。用户可见拟合一律命名为 `Fit`；Calibration/Report 保持各自领域名称，不建立泛化的 `Analysis` 菜单或节点；
 - live image、rolling plot、histogram、site map、fit overlay 的视觉语言保持一致；
 - virtual 与 real 仍只替换最低层设备 adapter；
 - pulse prepare/fire/safe、camera arm/read/terminal-drain/disarm 的用户操作流程保持；内部会把旧的“stop后立即release”纠正为可验证的terminal recipe。
 
 以下是有意的用户可见变化：
 
-- Fit 成为明确可见的 `Add Analysis -> Fit` 和 Plot card `Analyze -> Fit` 操作；
+- Fit 直接存在于 panel 的 Setting/Edit 和 DataFigure 的 `Fit` tab；只有 model、一个可选参数命令行（如 `center=50, sigma_lower=0`）、`Fit/Clear`，不展开模型全部参数表，不打开第二个 DataFigure；
 - 非标量数据会自动得到一个可见、可改的默认视图；当选择或降维要进入 fit、scan y 或派生 artifact 等权威结果时，必须冻结为 CommittedTransform，不再暗中取第 0 项；
 - history gap、schema change、缺帧和硬件 mismatch 会明确失败，不再显示拼接结果；
 - qCMOS只有在当前adapter版本的Q0 qualification对目标工作点有效、preflight trigger余量通过且整run EndAttestation一致时才可产出Formal ScanArtifact；否则只能monitor或整run INVALID；
 - qCMOS autonomous与API segmented正式扫描都一次arm整个run session、用按max-inflight定容的driver ring持续排空全部帧；正常SCAN_SLOT把完整逻辑scan table在fire前冻结，resident能力在fire前上传全部物理rows，条件refilled能力只供应冻结chunk，二者都由FPGA自主执行微观时序；仅API-slot值无法无缝更新时沿用既有segmented路径，按R-major/P-fast执行独立`STATIC_ONCE` pulse session并在segment间保留显式host gap，但相机不重复arm/stop且只做整run aggregate attestation；SCAN_SLOT/MOT不允许退化为逐cell host stepping；
 - Stop 后若设备尚未确认退出，UI 显示 `CANCELLING`，不会提前宣称已停止；
-- 设备冲突会提示并等待原 owner 真正退出，而不是静默抢占；
+- 同一个 TaskConsole 内的新 Logic run 若与另一行发生 typed resource conflict，shell 用 runtime 返回的 exact conflicting RunId 停止那一行，等待其真实 terminal 后自动重试原冻结请求；外部窗口/进程 owner 仍明确拒绝，runtime 错误与 admission 逻辑不被绕过；
 - 保存文件只接受当前 artifact schema；历史数据通过独立离线转换工具处理；
 - monitor 可能跳过中间帧以保持实时，但一次画面中的相关信号不会来自不同 shot；
 - 重型 grid/多 panel board 由 worker raster 后整板 coherent present，视觉与交互保持，但内部不再让 GUI/worker 无确认共享 Figure；
 - Pulse prepare/upload、长 fit 和 calibration 不再阻塞 GUI thread。
 
 因此，用户看到的主要入口、操作结构和视觉风格基本一致；变化集中在功能可发现性、错误提示和安全状态。内部实现则会彻底重构。
+
+当前 GUI/data 接缝还必须满足以下单一合同；它覆盖后文只用于记录迁移过程的旧 checkpoint 措辞：
+
+1. `task_console.bat` 先由 DeviceManager 初始化唯一 `Experiment`，然后同时打开 TaskConsole 与 PulseGUI；两窗借用同一个 composition root，TaskConsole 关闭时先关闭其 PulseGUI sibling，再关闭 installation。
+2. 真标量的物理表示固定为 `(R,P,1)`，尾轴只能是 `zlc_data.SCALAR_AXIS`；Logic/picker 自动显示 `R × P × (1)`。空 `data_axes`、按 singleton/rank 猜 scalar、把多维 point layout 展开进 shape 字符串全部拒绝。
+3. Camera 的 `frames_per_cycle=N` 在 request/catalog seam 唯一声明 `frame_0 … frame_(N-1)`；一次原子 Camera Dataset 只沿声明的 `READOUT_EVENT` 轴投影，各输出保留 repeat、其余 point/data axes、validity、revision 与 generation。所有 picker、Logic legend、live/finite route 使用这份冻结声明，不存在 `frame` 兼容别名。
+4. Occupancy 显式选择 Camera `frame_i`，并在 `Task output` 与 `Saved calibration` 二者中选一个 calibration source。保存路径只接受 current `calibration_ref.json` 指针，校验其中 CalibrationArtifactRef 与 source CaptureArtifactRef 的 exact provenance；不搜索 latest、不猜目录、不复制模型。
+5. IMAGE viewport 的唯一权威是物理 `x_limits/y_limits`；wheel/pan 直接提交新 limits 给 worker，禁止先 crop/stretch 旧 raster 伪装响应。renderer 固定 `aspect="equal", adjustable="box", anchor="W"`，Divider/size 使用 draw 后真实 axes bbox；相同 source generation 的已完成 front 按数据 revision 接受，GUI 请求序号不冒充 presentation truth。已有 matplotlib chrome/blit cache继续复用。
+6. 只有 Monitor board 可因用户摆放卡片而横向超过 viewport，并出现 scroll。Logic 与所有 Edit 页永远不因 status/error/path 文本增宽；文本 elide/wrap，横向 scrollbar 关闭。Edit body 先挂入正式 tab/window 再构建 Figure host，禁止产生瞬时 top-level 小窗。
+7. Grid 只 author 一条具名 facet AxisId；其余显示轴由 frontend 的纯 resolver 按 schema 声明顺序补全。repeat 不能暗中形成第二 facet。Setting/Edit 复用同一行 inventory（facet、sub plot、bins、log count、colormap）、同一 label width、一个 outer scroll，不在 Qt callback 猜 AxisId 或维护第二套布局。
 
 ### 2.1 UX 行为权威、冻结条款与 salvage gate
 
@@ -156,20 +166,20 @@ hardware_change_review_allowed :=
 | id | `main` 旧行为权威 | 当前分支/既有 checkpoint 的偏离 | 形成原因（非正当化） | 状态与必须关闭的证据 |
 |---|---|---|---|---|
 | `UX-002` | live plot 的 Area、锁定 Cross、zoom/pan、relim 与 cmap/limits 覆盖正式 plot contract；plot pointer-motion hover 明确不存在。拖动只冻结当前 panel，其它 panel 不停流，松手补拍。旧 1D/Monitor 的 Area 实际画二维矩形却只消费 x，纯水平拖会被误清 | 六个正式 kind 进入同一 `FigureSpec/Divider -> Agg RGBA -> SinglePanelHost/QtRasterBoard` 链；IMAGE/SITES 与 CURVE/MONITOR/HISTOGRAM 分别由两个具体交互族消费同一个 rectangle/handle 几何 owner，Grid overview 只负责精确 typed cell focus，focus 后复用同一个 host/selector。Area/Cross/Fit 是 Figure-owned、可绑定的派生 signal；它们不重配 Measurement、不启动 ROI processor，也不打开第二个 DataFigure 窗口 | 早期按窗口/plot kind 各写一套 selector 与近似 plot painter，导致复用、画面和连续拖动同时漂移；随后又错误加入 pointer-motion 数据 hover 与 Measurement ROI 控制 | **CLOSED**：Measurement-ROI/独立ROI processor/旧Analysis窗口闭包已物理删除；正式Camera→2D Qt流程证明普通mouseMove发布集合不变，Area完成手势后只发布`area.data`及具名轴范围，Cross只在右击锁定后发布坐标，Fit只发布`fit.<parameter>`并在原panel瞬时叠加。Setting/Edit共享同一Figure状态、无第二窗口；panel-local hold、最新front补拍、display-only不升级authority继续保留 |
-| `UX-003` | figure viewer 载入后是可交互 panel，可 zoom/pan、重新 fit 与导出；GridPlot 可 focus/返回 | U0.3a-h 已把单panel HISTOGRAM/CURVE/IMAGE/METER、fit-bearing CURVE/IMAGE，以及单layer METER/HISTOGRAM/CURVE多cell overview/focus接入同一 typed board；range/cross/zoom/pan/home、relim/cmap/limits、Setting/Edit、原子导出、即时 fit overlay 已恢复。FigureViewer打开current `.npz`后也在嵌入的同一DataFigure host显式Refit，Save写回同一archive并从LoadedFigureArchive重开，不产生neutral artifact。exact saved-fit GridPlot、METER grid、SITE-faceted occupancy counts Histogram与真实ScanArtifact CURVE都不暗选第一格，只在显式命中真实cell后focus，并从缓存返回overview；稀疏hole保持原逻辑位置。CURVE grid focus因其显示曲线已含display-only repeat reduction，不能伪装成轴完整Fit authority，故Analyze保持明确禁用；尚未闭合的是multi-layer DataFigure、faceted IMAGE及非Fit的其它archive plot kind，报告类多页仍是 frozen raster | 继续按真实consumer逐个恢复typed交互面；typed资格不足时保留完整whole-figure renderer，不以丢fit/轴/series换交互，也不先造通用dashboard框架 | **待用户批准 / 默认必须继续修复**：剩余multi-layer、faceted IMAGE与archive plot kind，以及CURVE grid的轴完整Analyze入口；U0.3a-h及W7已恢复的typed交互、explicit-cell focus/Refit与导出不得回退。**报告类多页zoom已闭合**：`FrozenRasterView(zoomable=True)` 提供滚轮放大(上限16x)、拖拽平移、放大后双击复位，可见窗口恒被夹在页内；live 面板默认关闭该开关，因为其 zoom 属于同 revision 的 `ViewportTransform`(§12.5 冻结条款)，证据 `tests/test_u04_frozen_report_zoom.py` |
-| `UX-004` | plot/panel 内直接发起 fit，框选与 fit selection 联动，普通 Fit 一步生效；2D box ROI fit 可见 | 通用Figure/FigureViewer继续拥有exact artifact或archive的显式Fit/Save/Refit；TaskConsole则在现有Setting/Edit内编辑同一FitSpec，对panel当前已呈现的exact snapshot运行唯一`BoundFit`，只把结果作为瞬时overlay并发布`fit.<parameter>`派生signal。TaskConsole不打开DataFigure窗口、不创建本地archive、不伪造neutral artifact；Area只有在用户发起Fit时才作为authority intent冻结，viewport/relim/cmap永不进入FitSpec | 先交付typed solver/editor与exact artifact，再删除独立W5 host；随后纠正了把TaskConsole按钮桥接到第二窗口/本地archive的错误产品解释 | **CLOSED**：通用Figure的持久Fit路径与TaskConsole的panel-local瞬时Fit边界分开；两者复用同一named-axis `bind_fit`/model catalog/result类型，但不共享窗口或持久化生命周期。TaskConsole的普通、无repeat和repeat×site/grid结果均保留batch轴及失败cell validity；不得恢复`Analyze`弹窗或把display selection自动升级为authority |
+| `UX-003` | figure viewer 载入后是可交互 panel，可 zoom/pan、重新 fit 与导出；GridPlot 可 focus/返回 | U0.3a-h 已把单panel HISTOGRAM/CURVE/IMAGE/METER、fit-bearing CURVE/IMAGE，以及单layer METER/HISTOGRAM/CURVE多cell overview/focus接入同一 typed board；range/cross/zoom/pan/home、relim/cmap/limits、Setting/Edit、原子导出、即时 fit overlay 已恢复。FigureViewer打开current `.npz`后也在嵌入的同一DataFigure host显式Refit，Save写回同一archive并从LoadedFigureArchive重开，不产生neutral artifact。exact saved-fit GridPlot、METER grid、SITE-faceted occupancy counts Histogram与真实ScanArtifact CURVE都不暗选第一格，只在显式命中真实cell后focus，并从缓存返回overview；稀疏hole保持原逻辑位置。CURVE grid focus因其显示曲线已含display-only repeat reduction，不能伪装成轴完整Fit authority，故Fit保持明确禁用；尚未闭合的是multi-layer DataFigure、faceted IMAGE及非Fit的其它archive plot kind，报告类多页仍是 frozen raster | 继续按真实consumer逐个恢复typed交互面；typed资格不足时保留完整whole-figure renderer，不以丢fit/轴/series换交互，也不先造通用dashboard框架 | **待用户批准 / 默认必须继续修复**：剩余multi-layer、faceted IMAGE与archive plot kind，以及CURVE grid的轴完整Fit入口；U0.3a-h及W7已恢复的typed交互、explicit-cell focus/Refit与导出不得回退。**报告类多页zoom已闭合**：`FrozenRasterView(zoomable=True)` 提供滚轮放大(上限16x)、拖拽平移、放大后双击复位，可见窗口恒被夹在页内；live 面板默认关闭该开关，因为其 zoom 属于同 revision 的 `ViewportTransform`(§12.5 冻结条款)，证据 `tests/test_u04_frozen_report_zoom.py` |
+| `UX-004` | plot/panel 内直接发起 fit，框选与 fit selection 联动，普通 Fit 一步生效；2D box ROI fit 可见 | 通用Figure/FigureViewer继续拥有exact artifact或archive的显式Fit/Save/Refit；TaskConsole则在现有Setting/Edit内编辑同一FitSpec，对panel当前已呈现的exact snapshot运行唯一`BoundFit`，只把结果作为瞬时overlay并发布`fit.<parameter>`派生signal。TaskConsole不打开DataFigure窗口、不创建本地archive、不伪造neutral artifact；Area只有在用户发起Fit时才作为authority intent冻结，viewport/relim/cmap永不进入FitSpec | 先交付typed solver/editor与exact artifact，再删除独立W5 host；随后纠正了把TaskConsole按钮桥接到第二窗口/本地archive的错误产品解释 | **CLOSED**：通用Figure的持久Fit路径与TaskConsole的panel-local瞬时Fit边界分开；两者复用同一named-axis `bind_fit`/model catalog/result类型，但不共享窗口或持久化生命周期。TaskConsole的普通、无repeat和repeat×site/grid结果均保留batch轴及失败cell validity；不得恢复独立拟合弹窗、参数表单或把display selection自动升级为authority |
 | `UX-005` | TaskConsole 支持全部 addable plot kind、Monitor board、Logic rows、Start/Stop、统一 Setting/Edit、树形 signal picker、布局与 workspace；PulseScan 是一项 Measurement：编辑一份 pulse program，并从 Logic/Figure 选择一条精确外部 `Signal(y)` | current TaskConsole 已恢复六种 plot、Measurement/Processor/Task catalog、Monitor/Logic、Start/Stop、Setting/Edit、树形 signal picker、workspace Save/Load、panel size 与 selectors。PulseScan 已收敛为同一个 Measurement，保留 template/SCAN_SLOT/API table/program editor，并把 `y_signal` 单独绑定到 dedicated exact producer；GUI displayed/latest front 永远不能成为 scan authority | 早期窄 checkpoint 曾被误当作完成产品，且 signal picker 仍读取已删除的旧 `SignalSchema` 字段，使真实已发布值被吞错后显示 `waiting`；更早的 PulseScan UI 又把 Camera/trigger/sequencer 参数塞进 Measurement，掩盖了“pulse program + 外部精确信号”这一真实产品语义 | **PARTIAL**：正式 fast-path 已跑通单一Camera Definition的live/finite发布、Calibration/MOT运行期Task panel、Temperature、Fidelity、Camera→Judge occupancy的`counts/occupied/rate`原子发布，以及PulseScan exact source/table；Logic行显示真实维度。普通Measurement/Processor均不自动开图，用户从Setting手动绑定，只有Task打开声明的run-scoped panel。picker由current immutable data front的`DatasetSchema`判定`waiting/ready`并按字段只列合法producer；无通用input-timeout。exact `y`只接受Camera frame、Occupancy counts/occupied或由它们通过显式Area派生的Figure signal；Cross/range/Fit/static/display-only/latest明确拒绝。尚未闭合的是六种plot对Main的最终逐像素/手感复核及其余未逐项运行的catalog Definition，因此本项仍不能标CLOSED |
 | `UX-006` | calibration/site-map/occupancy 图沿统一交互 viewer/GridPlot 获得 focus、selector、zoom 与 export | U0.3f-g已让单layer SITE-faceted occupancy METER与真实`OccupancyArtifactRef(counts)` HISTOGRAM复用同一Figure外壳；U0.3h又把真实AUTONOMOUS occupancy `ScanArtifactRef`的35-cell CURVE接入同一same-draw overview、exact-cell focus、standalone Curve交互、缓存返回与原子export。三者都不暗选第一site，不丢ComponentValidity、sample/value、dropped count、单位、exact ref或SITE地址；CURVE overview共享X/Y以可比，focus恢复局部relim。calibration report、site-map图与其它occupancy图仍未闭合，未提交工作树不能作为证据 | 保留已完成的METER/HISTOGRAM/CURVE grid；其余路径先闭合immutable report/exact-address与线程所有权，再按真实surface接入既有selector/viewer | **待用户批准 / 默认必须修复**：报告类多页zoom**已闭合**(见 `UX-003`)；calibration/site-map与剩余occupancy路径按旧surface补适用的focus/selector/export，或逐项提交用户裁决 |
 | `UX-007` | 旧实现可能按 first/flatten/trailing mean 直接把非标量送入权威结果 | 新设计只让显示层 role-driven auto；fit/scan-y/derived artifact 必须显式冻结 `CommittedTransform` | 防止静默丢轴和错误物理结论 | **待用户批准；安全边界不可回退**：默认视图低摩擦、当前投影始终可见可改、authority draft 由视图预填但明确提交 |
 | `UX-008` | 旧 UI 可能继续显示拼接/latest，或在缺帧、gap/schema/hardware mismatch 后隐式继续 | 新设计明确报错并使 exact attempt 失败 | 防止数据错位和伪成功 | **待用户批准其提示/恢复 UX；正确性不可回退**：错误可理解、原始失败证据可查、monitor 与 formal 状态不混淆 |
 | `UX-009` | 旧 qCMOS 路径可在缺少当前资格/末端证明时继续；部分软件路径可能逐 cell host stepping | Formal 必须 Q0+preflight+EndAttestation；SCAN_SLOT/MOT 保持冻结 bitstream 的 autonomous hardware timing，不允许 host-stepped fallback | 物理时序与帧关联正确性 | **待用户批准其 gate/重跑 UX；硬件/正确性边界不可回退**：INVALID 原因、手动 reject-and-redo 与资格状态清楚可见 |
-| `UX-010` | Stop/设备切换可能立即 release 或静默抢占 | UI 在真实 terminal/SAFE/reap 前显示 `CANCELLING`，冲突等待原 owner 退出 | 防止双 owner 与未安全停止即重用 | **待用户批准其等待/错误 UX；安全边界不可回退**：真实 launcher cancel/close/conflict E2E |
+| `UX-010` | Stop/设备切换可能立即 release 或静默抢占 | runtime 仍以 typed rejection 维护唯一设备 owner；若 conflicting RunId 精确属于本 TaskConsole 的另一 Logic 行，shell 自动 Stop 该行、等待真实 terminal 后重试新行；外部 owner 仍明确拒绝 | 保持 main 的“启动冲突项即关掉本地冲突节点”操作，同时不伪造 release 或吞掉 runtime 错误 | **CLOSED**：正式 DeviceManager→TaskConsole Qt 流程证明同一 camera resource 从 Camera #1 terminal handoff 到 Camera #2，第二行自动进入 running；不得恢复设备字段猜冲突、同步阻塞 GUI 或外部 owner 抢占 |
 | `UX-011` | 历史软件 artifact 可能由同一 reader 猜格式或宽松升级 | 普通软件只接受 current plain schema；历史转换为独立离线工具 | 删除升级链和双 reader 历史残余 | **待用户批准其错误/转换 UX；current-only边界不可回退**：拒绝信息与离线转换 runbook |
 | `UX-012` | monitor 为实时性可跳中间显示帧，重型操作曾阻塞 GUI 或由 GUI/worker 共享 Figure | 新 monitor 仍允许显示丢帧但同一 board coherent；compose/fit/calibration 在有界 worker，GUI 保持响应 | 保持交互性能同时消除 shot 混合和线程竞态 | **待用户批准 / 默认匹配旧手感**：profile + coherent board + GUI event latency E2E，不能把 monitor skip 泄漏到 formal exact |
 
-| `UX-013` | `main` 的 console `_message()` 在真实 GUI 下把「Saved / Load failed / …」这类一次性告知走 `fluent_message` 弹窗，只有 offscreen 时才写进常驻状态条；状态条本身只承载 error/task/display-behind 三级 | 迁移后的 console 把这类告知作为常驻状态条的**最低一级**（`info`）显示，不弹窗 | 迁移后的 console 每一步（Add/Remove/Save/Load/Analysis）都会产生这类告知，逐条弹窗会把日常操作变成点确认；状态条本身是常驻固定高度，显示它不挤动布局 | **待用户批准**：若用户要求恢复弹窗，改回 `fluent_message` 即可，状态条的 error>task>warning 三级排序与常驻性不受影响 |
+| `UX-013` | `main` 的 console `_message()` 在真实 GUI 下把「Saved / Load failed / …」这类一次性告知走 `fluent_message` 弹窗，只有 offscreen 时才写进常驻状态条；状态条本身只承载 error/task/display-behind 三级 | 迁移后的 console 把这类告知作为常驻状态条的**最低一级**（`info`）显示，不弹窗 | 迁移后的 console 每一步（Add/Remove/Save/Load/Fit）都会产生这类告知，逐条弹窗会把日常操作变成点确认；状态条本身是常驻固定高度，显示它不挤动布局 | **待用户批准**：若用户要求恢复弹窗，改回 `fluent_message` 即可，状态条的 error>task>warning 三级排序与常驻性不受影响 |
 
-| `UX-014` | `main` 的 TaskConsole header、常驻 Monitor/Logic、六种 Add Panel、logic catalog、Setting/Edit 与 workspace 操作均为产品面 | current 正式窗口已恢复同一产品面；额外的 Analyze 入口只委托唯一 DataFigure/Fit host，不替代或隐藏旧控件。窗口内部改用 current catalog/data/render/runtime owner，但用户仍从同一 header、tab、Add Panel、Logic row 与 Setting/Edit 操作 | 早期窄窗口曾被误当作完整产品，随后已按 `main` UI oracle 纵切恢复而没有复活旧 Hub/RenderLoop/LogicNode 架构 | **CLOSED**：正式窗口截图和真实 Qt 点击覆盖 header、Monitor/Logic、六 plot、Measurement/Processor/Task、Start/Stop、Setting/Edit、Save/Load；新增 current 功能不得再以删除旧产品入口为代价 |
+| `UX-014` | `main` 的 TaskConsole header、常驻 Monitor/Logic、六种 Add Panel、logic catalog、Setting/Edit 与 workspace 操作均为产品面 | current 正式窗口已恢复同一产品面；Figure-owned Fit 直接嵌入既有 Setting/Edit，不替代或隐藏旧控件。窗口内部改用 current catalog/data/render/runtime owner，但用户仍从同一 header、tab、Add Panel、Logic row 与 Setting/Edit 操作 | 早期窄窗口曾被误当作完整产品，随后已按 `main` UI oracle 纵切恢复而没有复活旧 Hub/RenderLoop/LogicNode 架构 | **CLOSED**：正式窗口截图和真实 Qt 点击覆盖 header、Monitor/Logic、六 plot、Measurement/Processor/Task、Start/Stop、Setting/Edit、Save/Load；新增 current 功能不得再以删除旧产品入口为代价 |
 | `UX-015` | `main` 的 console 在三处 GUI 路径上调用 `RenderLoop.barrier()` 并**忽略返回值**(Edit 快照 / Save image / 无条件 Refresh):barrier 超时后仍继续读写 Figure | 迁移后这三处改为**fail-closed**——握手未落定即放弃该操作,并在常驻状态条以 `error` 级报出被拒的动作名 | L596 规定未迁出的共享-Figure RenderLoop **只允许**活在 `SerializedLegacyAggBridge` 隔离岛内,而该岛是 fail-closed 的;忽略 barrier 结果意味着 GUI 线程可能在 render worker 仍持有 Figure 时闯入,正是该岛存在的理由。这不是为省事缩窄用户面,而是 L129 所指的**安全/数据正确性驱动**偏离 | **LEDGERED_PENDING_APPROVAL**:正常操作下行为不变,仅在握手超时(故障路径)时可见差异——操作被放弃而不是可能存下一张撕裂的图。按 L3874 该状态允许正交整改继续推进;证据 `tests/test_u05_render_island.py` |
 
 只有用户明确批准的偏离才可把状态改为 `APPROVED`，并必须记录批准范围、日期与替代验收；实现者、测试通过或局部架构审查都无权自行批准。
@@ -301,7 +311,7 @@ FitResultBatch 的 canonical payload codec 属于 `zlc_data`，但 durable ident
 
 “selector”必须拆开看：`Selection` 是可保存、可供 fit/processor 共同消费的数据语义，属于 zlc_data；鼠标手势、RectangleSelector、handle、overlay 和 interaction state 属于 frontend。`DataFigure` 明确属于 frontend，因为它是 render/public presentation facade。fit editor/overlay 属于 frontend，但它们调用 zlc_data 的唯一 fit 实现，不复制模型和结果 schema。editor 只能从 public immutable `fit_model_catalog()`/`fit_model_definition()` 取得模型与参数 metadata，并从 BoundFit 的 `parameter_definitions/parameter_units` 取得绑定后单位；不能导入 fit implementation submodule 或在 frontend 硬编码第二份模型表。`fit_projection_metadata()` 与 `validate_fit_authoring_options()` 是 DataFigure窗口、TaskConsole嵌入panel和Grid共同消费的唯一X/Y/FACET/BATCH投影owner；Workbench窗口之间不得互相导入私有`_...projection` helper，也不得各自按shape/rank解释fit轴。
 
-zlc_data 用 `bind_fit(FitSpec, expected DatasetSchema) -> BoundFit` 冻结并验证 fit/batch axes、CommittedTransform、model 与数值策略，但不捕获尚未产生的数据。`BoundFit.run(OwnedSnapshot) -> FitResultBatch` 是当前 interactive、offline/artifact 与未来确有消费者的 formal 路径共享的唯一执行值；OwnedSnapshot 同时持有 frozen DataBlock 与 exact DatasetRevisionRef，禁止 adapter 只传裸 block 丢掉 lineage。当前 baseline 不建立 `DatasetInputSlot`、generic `AnalysisStep`、`FitAnalysisDescriptor -> DataAnalysisProgram` 或 post-materialization workflow：真实用户需求只是对已提交 FINAL Capture/Scan artifact 明确打开Fit并显式保存结果，现有 `FitResultRepository` 已完整拥有这条边界。只有出现自动/headless preset或正式下游消费者后，才先实现“FINAL dataset artifact -> 独立 flat analysis Run -> 自己的一次 FinalCommit”；只有真实领域要求 scan 与 analysis 成为不可分割的一个提交结果时，才另行设计 composite commit。neutral 不得定义 `FitProcessor`、`FitOperator` 或 neutral-owned `FitAnalysisDefinition`，Workbench 的 `Add Analysis -> Fit` 只是 current zlc_data Fit capability 的本地产品入口。
+zlc_data 用 `bind_fit(FitSpec, expected DatasetSchema) -> BoundFit` 冻结并验证 fit/batch axes、CommittedTransform、model 与数值策略，但不捕获尚未产生的数据。`BoundFit.run(OwnedSnapshot) -> FitResultBatch` 是当前 interactive、offline/artifact 与未来确有消费者的 formal 路径共享的唯一执行值；OwnedSnapshot 同时持有 frozen DataBlock 与 exact DatasetRevisionRef，禁止 adapter 只传裸 block 丢掉 lineage。当前 baseline 不建立 `DatasetInputSlot`、generic `AnalysisStep`、`FitAnalysisDescriptor -> DataAnalysisProgram` 或 post-materialization workflow：真实用户需求只是对已提交 FINAL Capture/Scan artifact 明确打开Fit并显式保存结果，现有 `FitResultRepository` 已完整拥有这条边界。只有出现自动/headless preset或正式下游消费者后，才先实现“FINAL dataset artifact -> 独立 flat analysis Run -> 自己的一次 FinalCommit”；只有真实领域要求 scan 与 analysis 成为不可分割的一个提交结果时，才另行设计 composite commit。neutral 不得定义 `FitProcessor`、`FitOperator` 或 neutral-owned `FitAnalysisDefinition`；Workbench 只把 current zlc_data Fit capability 嵌入现有 Figure 的 `Fit` surface。
 
 `zlc_data.codec` 是该 bounded context 内 typed canonical bytes 的唯一 owner；当前只有确有 durable consumer 的 FitSpec/FitResultBatch 暴露 standalone current canonical bytes，并复用这一处 canonical round-trip 判定。Axis/DatasetSchema、Selection 与 CommittedTransform 只公开供外层 artifact 嵌入的 owner tree projector/parser；它们不各自预建无人消费的 bytes wrapper。大型 Value/DataBlock 更不经过通用 JSON/tree codec，真实持久化边界使用 binary chunk/CAS。已排期的 AnalysisPreset/保存 FitSpec 通过 public `fit_spec_to_tree/from_tree` 或 `encode/decode_fit_spec` 委托同一 schema owner；FitResultBatch 的 tree projector 仍为 codec 私有，公开面只给 current canonical bytes，不能顺势恢复 generic result tree/ref codec。各领域类型仍由自己的 projector/parser 负责，primitive bytes 继续委托 `zlc_storage.canonical`。
 
@@ -687,7 +697,7 @@ neutral domain Result
 Notebook 的 Pulse 窗口是 Experiment-owned singleton：第一次 `exp.pulse_gui()` 在该 Experiment 的私有 service lifecycle 中登记 current body；按 X 只走既有 hide 行为，不弹未保存确认、不 Stop、不关闭 controller，下一次无参数调用恢复同一 body、同一 `PulseEditorSession`、路径、scan code 与未保存编辑。已有窗口时再次传 `document/path` 必须明确拒绝，不能静默覆盖。`Experiment.close()` 先在线性化的 service lock 内使该 handle 失效，再由 runtime 独立完成 active Run 的 interrupt/SAFE；GUI 的线程安全 retirement 只在后续 Qt owner turn 脱离已关闭 facade、排空自身 worker、释放 window retention 并永久销毁，不能让 Qt 卡顿阻塞或否决硬件安全。standalone 窗口不登记在此 cache，X 仍执行 dirty confirmation、cancel/reap、owned Experiment SAFE close 与真正销毁。
 
 
-**当前Fit/figure事实覆盖上一段的历史W4/W5/W7/W8枚举：** ScanArtifact已经是FitResultRepository、headless `.fit()`、DataFigure、`figure_gui/fit_gui`与exact saved-grid的正式source；generic单panelCURVE/IMAGE及fit-bearing replay均为typed interactive，不再是`FROZEN / DISPLAY ONLY`；独立W5 `_fit.py`与Capture-only ref/repository均已物理删除。TaskConsole不再有`Analyze`弹窗、artifact特判或本地DataFigure archive：每张可Fit的panel在既有Setting/Edit内显示同一个Figure-owned authoring state，从当前已呈现的exact `OwnedSnapshot`冻结FitSpec，交给唯一`bind_fit -> BoundFit.run`，结果只作为该panel的transient overlay并原子发布`fit.<parameter>` signals。所有非fit轴仍是batch轴；无repeat时只合成一个明确的size-1 repeat dataset轴，repeat×site/grid保留原具名轴、稀疏PointLayout和失败cell validity。Grid overview与focus共用同一完整batch结果，不能把focus raster伪装成single-panel authority。不能把上一段的历史措辞用于新实现。
+**当前Fit/figure事实覆盖上一段的历史W4/W5/W7/W8枚举：** ScanArtifact已经是FitResultRepository、headless `.fit()`、DataFigure、`figure_gui/fit_gui`与exact saved-grid的正式source；generic单panelCURVE/IMAGE及fit-bearing replay均为typed interactive，不再是`FROZEN / DISPLAY ONLY`；独立W5 `_fit.py`与Capture-only ref/repository均已物理删除。TaskConsole不再有独立拟合弹窗、artifact特判或本地DataFigure archive：每张可Fit的panel在既有Setting/Edit内显示同一个Figure-owned authoring state，从当前已呈现的exact `OwnedSnapshot`冻结FitSpec，交给唯一`bind_fit -> BoundFit.run`，结果只作为该panel的transient overlay并原子发布`fit.<parameter>` signals。所有非fit的**信息轴**仍是batch轴；canonical scalar carrier不是信息轴，由binder按其声明的`SCALAR` role取唯一index 0。无repeat时只合成一个明确的size-1 repeat dataset轴，repeat×site/grid保留原具名轴、稀疏PointLayout和失败cell validity。Grid overview与focus共用同一完整batch结果，不能把focus raster伪装成single-panel authority。不能把上一段的历史措辞用于新实现。
 
 `Experiment.figure_gui()`的无参数形态是session-independent的正式FigureViewer入口；传入`.npz`路径则直接打开该文件，传入`.png/.jpg/.jpeg`只解析同stem的`.npz`，绝不从像素或数组rank反猜数据语义。传入typed source/ref仍走既有DataFigure/fit/grid分派，不能因为增加文件入口而改写其行为。FigureViewer沿用`main`正式窗口的File/Info外壳，但右侧嵌入唯一`DataFigureWindow`交互owner；不得恢复旧`LoadedFigureNode`、伪Hub/RunId、TaskConsole重放或另一套plot/selector实现。路径输入仅在Browse结果或`editingFinished`提交时做一次I/O；普通文字输入、viewport、selector、Setting/Edit不产生全局snapshot或重建窗口。候选文件必须在worker中完整解码和验证，成功后才原子替换当前pane；失败保留上一幅有效Figure及Info并给出完整错误。已载入archive的显式Fit/Refit仍在这个pane中执行；Save用`DataFigure.with_fit_results(...)`重建同一冻结figure、原子写回current archive并从`LoadedFigureArchive`重开，绝不伪造neutral artifact ref。
 
@@ -703,9 +713,9 @@ W4e只补W4d已有exact-address产品的离散cell导航，不把它扩成live g
 
 同一窗口在全局唯一capacity-one lane上至多有一个已提交job和一个可覆盖的latest pending selection；每个结果同时校验UI request revision、artifact/schema/generation identity与canonical Selection，stale success/error/cancellation一律不能改status、summary或front。旧Future/PNG在当前owner callback真正退栈后，下一次queued owner turn才启动pending，避免两次大图生命周期重叠。Close只清pending/front、置cooperative cancellation并立即返回；已进入repository/Agg的工作诚实排空但永不发布。W4e当时只完成离散 exact-address 导航，尚无`ViewportTransform`、鼠标selector/ROI、zoom、export或live source；“永久 `DISPLAY ONLY`”这一产品能力上限现已废止。artifact/source仍不可原地修改，但该查看面必须在U0纠正3或通用viewer切片复用统一interaction owner补齐旧行为。
 
-**术语裁决（覆盖本节以上 W4/W7 现态摘要及后文历史 checkpoint）：** `DISPLAY_ONLY` 以后只允许表示 ViewSpec/viewport/display reducer/export raster 不能静默升级成 FitSpec、ScanOutputContract、CommittedTransform 或修改 source artifact；绝不表示产品 UI 可以永久缺少 zoom/pan/selector/re-fit/export。W4a/W4d/W4e 仍保留已证明的 immutable source、单 render owner、cancel/close 与 revision-check 不变量，但其产品能力上限已撤销。W4b calibration 多页报告是 frozen raster 的合法例外，仍必须补 zoom；其 site/grid focus/export 是否适用按规则 9 salvage。W7 exact-result replay 继续禁止**隐式** solver/rewrite；用户显式 `Analyze -> Fit` 必须从 exact source ref + SelectionCandidate 新建 authority draft/result/ref，绝不原地改旧 artifact。
+**术语裁决（覆盖本节以上 W4/W7 现态摘要及后文历史 checkpoint）：** `DISPLAY_ONLY` 以后只允许表示 ViewSpec/viewport/display reducer/export raster 不能静默升级成 FitSpec、ScanOutputContract、CommittedTransform 或修改 source artifact；绝不表示产品 UI 可以永久缺少 zoom/pan/selector/re-fit/export。W4a/W4d/W4e 仍保留已证明的 immutable source、单 render owner、cancel/close 与 revision-check 不变量，但其产品能力上限已撤销。W4b calibration 多页报告是 frozen raster 的合法例外，仍必须补 zoom；其 site/grid focus/export 是否适用按规则 9 salvage。W7 exact-result replay 继续禁止**隐式** solver/rewrite；用户显式 `Fit` 必须从 exact source ref + SelectionCandidate 新建 authority draft/result/ref，绝不原地改旧 artifact。
 
-U0.3d 已把 W5/W8b 的独立 Fit host 物理删除并并入唯一 `DataFigureWindow`。`.fit_gui(CaptureArtifactRef|ScanArtifactRef, ...)`现在只是“打开同一Figure并选中Analysis tab”的便利入口；普通`.figure_gui(source)`与FigureViewer archive也都复用该host并按各自artifact/archive边界持久化。TaskConsole不是这个窗口的第三入口：它复用共享form DSL、catalog-owned seed/bounds/fixed、`FitSpec/BoundFit/FitResultBatch`与同一renderer overlay算法，但authoring pane嵌在panel的Setting/Edit，结果只活在该panel和派生signal里。同一FitSpec冻结具名fit axes，所有其余repeat/point/data axes原样成为batch。1D range与2D box selector只经用户显式Fit动作提升为authority Selection；viewport、relim、cmap与用于单panel显示的batch-cell selection仍是presentation，不能进入FitSpec。
+U0.3d 已把 W5/W8b 的独立 Fit host 物理删除并并入唯一 `DataFigureWindow`。`.fit_gui(CaptureArtifactRef|ScanArtifactRef, ...)`现在只是“打开同一Figure并选中Fit tab”的便利入口；普通`.figure_gui(source)`与FigureViewer archive也都复用该host并按各自artifact/archive边界持久化。TaskConsole不是这个窗口的第三入口：它复用共享form DSL、catalog-owned seed/bounds/fixed、`FitSpec/BoundFit/FitResultBatch`与同一renderer overlay算法，但authoring pane嵌在panel的Setting/Edit，结果只活在该panel和派生signal里。同一FitSpec冻结具名fit axes，所有其余repeat/point/data axes原样成为batch。1D range与2D box selector只经用户显式Fit动作提升为authority Selection；viewport、relim、cmap与用于单panel显示的batch-cell selection仍是presentation，不能进入FitSpec。
 
 DataFigure窗口中唯一未保存的opaque execution与`FitResultBatch`由headless `FitDraftAuthority`独占；Qt只得到不可保存的`FitDraftResult`与immutable typed front。Capture/Scan路径的opaque value是`FitExecution`，本地archive路径则是同一个`BoundFit.run(snapshot)`返回的result；authority不知道两种持久化格式。draft overlay把结果与窗口冻结的exact source重新绑定，并在物化前验证source revision/schema/fit axes/batch layout。只有显式Save才持久化：Capture/Scan通过composition lifecycle gate发布neutral-owned `FitResultArtifactRef`并从exact ref重开；本地Figure写archive并从exact `LoadedFigureArchive`重开。TaskConsole的`PanelFitLane`没有Save capability：每次只接受仍与可见source ref及request revision相同的结果，source推进就撤旧overlay/output并按active spec追随；Clear只撤该panel的spec、overlay与`fit.*`输出。两条路径都不建立workflow/lease/async engine；cancel在lane等待、solver batch之间和Qt接纳处诚实检查，已进入的bounded work只排空而不伪称已中止。
 
@@ -859,7 +869,7 @@ DatasetSchema:
   cell_schema: ValueSchema
 ```
 
-`ValueSchema` 描述一次 Measurement/StreamProcessor event 携带的值，例如一帧 `(H,W)` image、一个 `(site,)` occupancy vector 或一个真正标量。它没有伪造的 R/P leading axes。`DatasetSchema` 描述 materializer 把事件放入哪些 repeat/point cell 后形成的完整数据集。DataBlock 永远符合 DatasetSchema，AcquisitionStream/MonitorTap 的普通 event 永远不携带累计 DataBlock。
+`ValueSchema` 描述一次 Measurement/StreamProcessor event 携带的值，例如一帧 `(H,W)` image、一个 `(site,)` occupancy vector 或一个使用 canonical trailing carrier `(1,)` 的真正标量。`data_axes` 永不为空；scalar 必须使用 zlc_data 唯一的 `SCALAR_AXIS`，普通 singleton data axis 不能冒充它。ValueSchema 没有 R/P leading axes。`DatasetSchema` 描述 materializer 把事件放入哪些 repeat/point cell 后形成的完整数据集。DataBlock 永远符合 DatasetSchema，AcquisitionStream/MonitorTap 的普通 event 永远不携带累计 DataBlock。
 
 一个 domain event 可以是 frozen typed record，例如 `CameraSample(image: Value, frame_metadata)` 或 `OccupancySample(occupied: Value, counts: Value, source_metadata)`；它仍作为一个 Envelope payload 原子发布。record 中每个数值字段使用 zlc_data 的 Value/ValueSchema，record 类型和领域 metadata 由 producer package 拥有。
 
@@ -870,7 +880,7 @@ DatasetSchema:
 - size、coordinates；隐式坐标另带 `index_origin`，连续裁剪只移动 origin，不物化整根坐标轴；
 - unit: canonical unit id 或 `None`、coordinate_frame: CoordinateFrameId。
 
-AxisId 由 producer Definition 的稳定字段语义派生，在相同 semantic axis 的不同 run/adapter 间保持一致；不能每次构造随机 UUID，也不能用可修改 display name 或 tuple position 充当 identity。baseline 的 Selection 保留被保留轴的 AxisId，Reduction 只移除被约简轴，不创造匿名 replacement axis。没有真实消费者的 Transpose/Stack/Create/Rename 与逐 operation 历史对象不预建；出现第二个必须创建派生轴的生产用例时，再由该 operation owner 定义稳定 AxisId 与 lineage。
+AxisId 由 producer Definition 的稳定字段语义派生，在相同 semantic axis 的不同 run/adapter 间保持一致；不能每次构造随机 UUID，也不能用可修改 display name 或 tuple position 充当 identity。baseline 的 Selection 保留被保留轴的 AxisId，Reduction 只移除被约简轴，不创造匿名 replacement axis。唯一例外不是新的信息轴：当变换消费最后一根信息 data axis 时，zlc_data 统一补回同一个 canonical `SCALAR_AXIS` 物理 carrier，使输出保持 trailing scalar dimension。没有真实消费者的 Transpose/Stack/Create/Rename 与逐 operation 历史对象不预建；出现第二个必须创建派生信息轴的生产用例时，再由该 operation owner 定义稳定 AxisId 与 lineage。
 
 单位采用 canonical string（例如 `Hz`、`MHz`、`s`、`count`），display label 与物理单位分开。baseline 不建立量纲代数、单位表达式 AST、UnitConversionTable 或自动换算；只有完全相同的 canonical string 才兼容。未知单位作为 opaque string round-trip。CoordinateFrameId 同样是 stable opaque id，只做等值检查；不同 frame 在 baseline 直接拒绝，不能因 shape、名字或数值范围相似而默认兼容。
 
@@ -919,7 +929,7 @@ RECT_C/RECT_F 要求 `storage_size == product(logical_shape)`，映射由 order 
 
 ```text
 Value:
-  values: ndarray         # (*data_shape)，标量为 shape ()
+  values: ndarray         # (*data_shape)，标量为 shape (1,)
   validity: Valid | Invalid | ComponentValidity
   schema: ValueSchema
 
@@ -982,15 +992,17 @@ Measurement/StreamProcessor 不创建 DataBlock，也不读“当前累计 block
 标量唯一表示：
 
 ```text
-ValueSchema.data_axes == ()
-data_shape == ()
-Value.values.shape == ()
-values.shape == (R, P)
+ValueSchema.data_axes == (SCALAR_AXIS,)
+SCALAR_AXIS.role == SCALAR
+SCALAR_AXIS.size == 1
+data_shape == (1,)
+Value.values.shape == (1,)
+DataBlock.values.shape == (R, P, 1)
 ```
 
-`data_shape == (1,)` 是长度一数据轴，仍需显式 Select 或 Reduce。
+`SCALAR_AXIS` 只是统一的物理 carrier，不携带额外物理自由度。Fit、Figure 与 transform 只能按声明的 `SCALAR` role消费它，绝不能按 `size == 1`、rank 或 singleton 猜。任意其它 role/AxisId 的长度一 data axis 仍是信息轴，仍需显式 Select、Reduce 或作为 batch 保留。旧的空 `data_axes`/shape `()` 直接拒绝，不保留兼容 reader。
 
-GUI 的 canonical signal dimension 必须忠实显示真实物理 tensor：`R × P × (*data_shape)`，其中 `R` 与 `P=point_layout.storage_size` 各自始终只有一个维度。Logic 行与 signal picker 中该字段都是由当前权威 `DatasetSchema`/value 自动派生的只读结果：不得让用户编辑，不得由 catalog、definition 或 Workbench 手写，不得在维度串内追加 logical point axes/coordinates/PointLayout 等第二种说明；未发布时显示 `—`，已有 value 却缺少 `DatasetSchema` 必须报契约错误，不能退回裸 ndarray shape 猜测。logical point metadata 只供 Grid/facet/axis navigation 的具名控件消费，不能混入 signal dimension。因此 7×7×7 的三维标量扫描在 Logic/picker 中只显示 `1 × 343`；不能显示为 `1 × 7×7×7`，也不能把空 `data_shape == ()` 伪造成 `× (1)`。真实 `data_shape == (1,)` 必须显示长度一数据轴，二维/多维 data shape 也必须逐轴完整显示。声明前与已有值后的 Logic、picker、panel 信息统一调用 `zlc_data.shape_text` 的同一 formatter，任何 Workbench 不得另写 shape/rank 特判。
+GUI 的 canonical signal dimension 必须忠实显示真实物理 tensor：`R × P × (*data_shape)`，其中 `R` 与 `P=point_layout.storage_size` 各自始终只有一个维度。Logic 行与 signal picker 中该字段都是由当前权威 `DatasetSchema`/value 自动派生的只读结果：不得让用户编辑，不得由 catalog、definition 或 Workbench 手写，不得在维度串内追加 logical point axes/coordinates/PointLayout 等第二种说明；未发布时显示 `—`，已有 value 却缺少 `DatasetSchema` 必须报契约错误，不能退回裸 ndarray shape 猜测。logical point metadata 只供 Grid/facet/axis navigation 的具名控件消费，不能混入 signal dimension。因此 7×7×7 的三维标量扫描在 Logic/picker 中显示 `1 × 343 × (1)`；不能显示为 `1 × 7×7×7 × (1)`。二维/多维 data shape 必须逐轴完整显示。声明前与已有值后的 Logic、picker、panel 信息统一调用 `zlc_data.shape_text` 的同一 formatter，任何 Workbench 不得另写 shape/rank 特判。
 
 ### 6.5 Materializer 的原子提交
 
@@ -1546,7 +1558,7 @@ DomainAnalysisRequest[Result]:         # 仅在领域物理语义需要时定义
   compile -> one flat RunPlan[Result]
 ```
 
-Analysis 不访问 Device、Hub/latest、QWidget 或 mutable DatasetBuilder。它消费携 exact DatasetRevisionRef 的 OwnedSnapshot或immutable artifact，产生 FitResultBatch、CalibrationArtifact、report 等 typed result。`FitSpec/BoundFit/FitResultBatch` 与 `BoundFit.run()` 全部由 zlc_data 拥有；Calibration/ReadoutFidelity 等带 neutral 物理语义的算法使用自己的typed request/compiler，不以generic Fit wrapper冒充领域判断。neutral 的 DefinitionCatalog不重新注册或包装通用Fit；当前Workbench只投影一个本地`Add Analysis -> Fit` capability。
+离线/权威数据计算不访问 Device、Hub/latest、QWidget 或 mutable DatasetBuilder。它消费携 exact DatasetRevisionRef 的 OwnedSnapshot或immutable artifact，产生 FitResultBatch、CalibrationArtifact、report 等 typed result。`FitSpec/BoundFit/FitResultBatch` 与 `BoundFit.run()` 全部由 zlc_data 拥有；Calibration/ReadoutFidelity 等带 neutral 物理语义的算法使用自己的typed request/compiler，不以generic Fit wrapper冒充领域判断。neutral 的 DefinitionCatalog不重新注册或包装通用Fit；Workbench只在Figure已有的`Fit` surface投影这项capability。
 
 当前有两个挣得起的hosting路径：interactive/offline adapter把已冻结snapshot交给同一个BoundFit；需要durable领域artifact的typed request从已提交输入编译一个flat RunPlan并拥有自己的一次FinalCommit。二者都不是StreamProcessor，也不通过伪造“累计DataBlock event”接入sample stream。
 
@@ -2176,30 +2188,27 @@ W3d 的单 CURVE progressive scan 是该规则的第一个窄实现；M2c 又让
 
 ### 12.6 UI 可见 Fit
 
-提供两个明确入口：
+TaskConsole panel 的 Setting 与 Edit 嵌入同一个 Figure-owned `FitAuthoringPane`；DataFigure/FigureViewer 使用同一个 pane 并把 tab 命名为 `Fit`。产品中不存在 `Add Analysis`、`Analyze`、独立拟合窗口或点击后再弹出的 DataFigure。TaskConsole 的结果只作为当前 panel 的瞬时 overlay 并发布 `fit.<parameter>`；DataFigure 的显式 `Save Fit` 才进入其 artifact/archive 生命周期。
 
-```text
-Add Analysis -> Fit
-Plot card -> Analyze -> Fit
-```
+pane 只有 model combo、一个 `args` 文本框和 `Fit/Clear`。空文本使用 model owner 的自动初始化与边界；文本只接受逗号分隔的有限数值 keyword，例如 `center=50, sigma_lower=0, sigma_upper=8`。`name=value` 固定参数，`name_initial/name_lower/name_upper`设置solver constraint。parser 只解析受限 AST numeric literal，拒绝 positional argument、表达式、call、`**`、未知/重复参数和 NaN/Inf，绝不 `eval`。model metadata、参数名、默认 seed/bounds、FitSpec 和 solver 仍由唯一 zlc_data catalog/binder拥有，Qt 不复制参数表。
 
-两个入口现在都落在唯一`DataFigureWindow`。TaskConsole card在两种source任一成立时开放同一个按钮：唯一匹配logic row的FINAL `CaptureArtifactRef | ScanArtifactRef`，或当前已经接受并画出的非Grid单layerCURVE/IMAGE frozen DataFigure。点击瞬间重新解析source；前者调用既有`fit_gui(ref)` artifact composition，后者把card的同一immutable snapshot/document交给本地DataFigure composition。Grid/Sites在轴完整的explicit-cell Analysis入口交付前不开放这个按钮，不能把overview/focus raster伪装成single-panel authority。重复点击同一source与同一selection只聚焦既有窗口；新front、selector、Run或Load/reconfigure产生新identity，不能暗用旧窗口。按钮不持FitSpec preset、不加入neutral DefinitionCatalog、不创建FitProcessor/AnalysisStep。只有用户在共享Fit pane中明确点击Fit才求解；明确Save在artifact路径产生FitResultArtifactRef，在本地路径产生显式选择的`.npz` DataFigure archive。
+TaskConsole 点击 Fit 时从当前已经接受并画出的 exact `OwnedSnapshot`、具名显示轴和仍有效的 SelectionCandidate 冻结权威 draft；没有可证明的轴完整source时按钮不可执行。它不反推 artifact、不启动第二个窗口、不保存本地archive。DataFigure/FigureViewer 对 FINAL `CaptureArtifactRef | ScanArtifactRef` 或 current figure archive 走自身既有的持久Fit路径。Grid overview/focus raster不能冒充single-panel authority；只有resolver证明的完整具名batch source才允许Fit。
 
 耐久路径中，card只用自己声明的数据名去匹配logic row的`declared_outputs`；必须恰好匹配一个row，且该row最近一次Run已经`SUCCEEDED`并从`RunHandle.result()`取得真实Capture/Scan ref，才选择artifact authority。除source ref外，当前可见`ConsoleSignalValue.run_id`还必须与该`RunHandle.run_id`全等；这样producer已提交新artifact但worker仍画旧front的短窗口不会把新结果套在旧图上。两个row声明同名输出时视为歧义，不能按row顺序、最近时间或当前显示值猜来源。Run start先撤销旧result，terminal snapshot与owner thread退出之间继续非阻塞轮询，直到result已取得才把row转为done；失败、取消、Load、移除row或重绑card都立即撤销该耐久入口。普通panel路径不反推artifact：`frozen_data_figure()`直接比较当前`board.front_frame` payload的`evaluated_input(dataset_id, ref)`与拟返回DataFigure snapshot；replacement微窗内任一不等都fail closed，不能把旧图/selector与新snapshot拼在一起。旧`AnalysisControls/FitRequest/FitProcessor/region_signal`链整段不存在。
 
-TaskConsole的Qt timer也不是snapshot生产者：`ConsoleDataPlane.freeze()`只有producer revision或membership真实变化时才构造新的immutable per-producer front；无变化必须返回同一对象。一个present cycle可以携带多个producer各自的latest revision，但绝不因此声称它们属于同一物理shot；只有同一producer transaction内经明确EventRef验证的raw/derived值，或数据面按显式join key产生的结果，才可共享coherence group。`INDEPENDENT_LATEST_MONITOR`不得供多输入expression偷偷逐项取latest；没有formal join owner时必须拒绝该表达式。卡片只消费这个front并按自己读取的signal revision决定是否compose，不能因为timer tick、Analysis按钮状态同步或row状态轮询制造全板数据快照。每个card只在Qt owner上冻结一个窄、不可变render request；唯一串行worker持有该panel的`PanelComposer/Agg`，忙时按panel替换为latest pending request，Qt只接受匹配request revision的结果并present。Setting/Edit文本留在稳定widget中，`editingFinished`/Apply才提交；一次提交只进入这一条render request路径，Edit的frozen pane复制已接受front，不再另建composer或第二次evaluate/rasterize。移除card、source identity变化和console shutdown均把composer释放排到同一worker，不能从Qt线程直接close worker-owned Figure。
+TaskConsole的Qt timer也不是snapshot生产者：`ConsoleDataPlane.freeze()`只有producer revision或membership真实变化时才构造新的immutable per-producer front；无变化必须返回同一对象。一个present cycle可以携带多个producer各自的latest revision，但绝不因此声称它们属于同一物理shot；只有同一producer transaction内经明确EventRef验证的raw/derived值，或数据面按显式join key产生的结果，才可共享coherence group。`INDEPENDENT_LATEST_MONITOR`不得供多输入expression偷偷逐项取latest；没有formal join owner时必须拒绝该表达式。卡片只消费这个front并按自己读取的signal revision决定是否compose，不能因为timer tick、Fit控件状态同步或row状态轮询制造全板数据快照。每个card只在Qt owner上冻结一个窄、不可变render request；唯一串行worker持有该panel的`PanelComposer/Agg`，忙时按panel替换为latest pending request，Qt只接受匹配request revision的结果并present。Setting/Edit文本留在稳定widget中，`editingFinished`/Apply才提交；一次提交只进入这一条render request路径，Edit的frozen pane复制已接受front，不再另建composer或第二次evaluate/rasterize。移除card、source identity变化和console shutdown均把composer释放排到同一worker，不能从Qt线程直接close worker-owned Figure。
 
-这不是把formal能力降格为GUI：当前真实consumer包括人对已提交Capture/Scan artifact做可复现分析，也包括人对已画出的单panel immutable dataset显式分析并另存完整DataFigure archive。自动/headless preset或下游consumer出现时按§10.5/§11.8另建以FINAL artifact为输入的flat analysis Run；不能为了保持“Add Analysis”这个按钮文字而预建DatasetInputSlot、generic Analysis registry或修改Scan的单FinalCommit语义。
+这不是把formal能力降格为GUI：当前真实consumer包括人对已提交Capture/Scan artifact做可复现分析，也包括人对已画出的单panel immutable dataset显式分析并另存完整DataFigure archive。自动/headless preset或下游consumer出现时按§10.5/§11.8另建以FINAL artifact为输入的flat analysis Run；不能为了一个泛化菜单名称预建DatasetInputSlot、generic Analysis registry或修改Scan的单FinalCommit语义。
 
 Figure Fit composition固定提供prepare/execute/result/save/reload五个窄能力；artifact binding冻结exact `CaptureArtifactRef | ScanArtifactRef`与source schema inspector，本地binding冻结DataFigure已经拥有的唯一`OwnedSnapshot`。DataFigure不取得repository或neutral `FitExecution`保存能力，TaskConsole也不获得另一套执行接口。两条binding都调用`zlc_data`唯一的`suggest_fit_draft/bind_fit/BoundFit.run`；`FitDraftAuthority`仍是唯一未保存opaque execution owner，Qt只持`FitDraftResult`。执行与overlay raster分别使用既有窄lane，不建立async engine；revision/CAS规则保证旧prepare/solver/overlay/reload completion不能覆盖更新后的selector、约束或viewport。
 
-UI 明确展示 input、fit axes、batch axes、selection authority、model、initial/bounds、status、result、save identity 和 overlay。`suggest_fit_draft(schema, model, fit_axis_ids, selection)`只从schema声明的轴role与当前typed panel的具名显示轴生成候选：repeat及所有非fit point/data轴默认完整保留为batch；显示层为得到单panel可以带标签选择一个真实physical cell，但这个display selection绝不能进入FitSpec。不存在按rank/singleton猜role、`flatten`、取第0个权威batch cell或对trailing axes `nanmean`。
+UI 用紧凑summary/tooltip明确展示 input、fit axes、batch axes、selection authority、model、status、result、save identity 和 overlay；initial/bounds/fixed 只在同一个 `args` 文本中可逆author，不展开成参数表。`suggest_fit_draft(schema, model, fit_axis_ids, selection)`只从schema声明的轴role与当前typed panel的具名显示轴生成候选：repeat及所有非fit point/data轴默认完整保留为batch；显示层为得到单panel可以带标签选择一个真实physical cell，但这个display selection绝不能进入FitSpec。不存在按rank/singleton猜role、`flatten`、取第0个权威batch cell或对trailing axes `nanmean`。
 
 用户看到的普通 `Fit` 动作就是提交当前权威draft，不再弹第二个确认框；但未解析真实fit axis时按钮不可执行。1D range与2D box由Qt selector产生`SelectionCandidate`，经完整exact `PanelInteractionOrigin`转换成只含fit axis的`Selection`并预填同一draft：前者只选择当前CURVE x轴，后者显式绑定`SPATIAL_X/SPATIAL_Y`，其它repeat/point/site/data轴继续为batch。候选只在其完整origin仍与visible front全等时有效，不能跨document/frame revision泄漏。已经保存的DataFigure archive初次打开且没有新authoring时精确恢复原FitSpec，包括任意已提交transform，而不是把它重猜成selection-only spec；若原transform恰好是单个Selection，它作为初始candidate显示，用户点击`Use full range`则明确移除它并重新建议full-range spec，不能静默保留旧range。Clear只撤当前draft/overlay并保留已发布identity及当前selector candidate。zoom/pan/relim/cmap永远是display-only，不能复制进CommittedTransform。
 
 CURVE overlay按batch逐series求值并在每次物化前检查取消；replace/clear必须及时释放旧prediction引用。IMAGE radial overlay只携exact batch storage identity、center/radius及viewport映射，不生成第二张predicted image；失败/NOT_PRESENT只显示诊断，不伪造曲线或圆环。Save成功identity在线性化点先被接受：artifact路径从exact FitResultArtifactRef reload；本地路径用`DataFigure.with_fit_results`合并目标layer、写archive并从exact LoadedFigureArchive reload。后续decode/render失败或Close都不能吞identity，Save中Close明确defer。headless notebook的`fit.save()`仍保持短cell。
 
-saved-fit archive GridPlot不会因一页只有一个panel就暗选第一格：Overview、hole或未聚焦时Refit禁用，只有用户聚焦一个真实`FitGridCell`后才启用`Analyze -> Fit/Refit`。该cell Selection只决定新DataFigure的display panel；重新author的FitSpec从exact saved ref恢复原model、constraints、numeric policy与range-preserving CommittedTransform，并绑定原Capture/Scan source。打开Analysis不求解，只有随后明确点击Fit才创建新draft；原artifact不可变。当前权威transform边界仍是一个range-preserving Selection，unsupported transform显式拒绝，不能用显示fallback解释。
+saved-fit archive GridPlot不会因一页只有一个panel就暗选第一格：Overview、hole或未聚焦时Refit禁用，只有用户聚焦一个真实`FitGridCell`后才启用`Fit/Refit`。该cell Selection只决定新DataFigure的display panel；重新author的FitSpec从exact saved ref恢复原model、constraints、numeric policy与range-preserving CommittedTransform，并绑定原Capture/Scan source。打开Fit tab不求解，只有随后明确点击Fit才创建新draft；原artifact不可变。当前权威transform边界仍是一个range-preserving Selection，unsupported transform显式拒绝，不能用显示fallback解释。
 
 ### 12.7 Shutdown
 
@@ -3289,7 +3298,7 @@ Correctness tests 使用 deterministic TestClock/Scheduler，不依赖真实 sle
 - hardware tutorial compile/lint/dry-run；
 - API、schema、enum、hardware tables 从 owner 生成。
 
-Workbench E2E 必须从真实 launcher/composition root 驱动用户路径：Add Panel -> Setting -> 选 Measurement/Processor -> Start -> selector/repeat -> Add Analysis/Fit -> Save/Load -> Stop/Close；不能用 demo fixture、直接 poke controller 内部或手工调用 `_tick` 代替。PulseGUI 同样从真实入口执行 Edit -> Preview -> Scan/prepare -> cancel/safe。
+Workbench E2E 必须从真实 launcher/composition root 驱动用户路径：DeviceManager Init -> 同时得到 TaskConsole/PulseGUI -> Add Panel -> Setting -> 选 Measurement/Processor -> Start -> selector/repeat -> Fit -> Save/Load -> Stop/Close；不能用 demo fixture、直接 poke controller 内部或手工调用 `_tick` 代替。PulseGUI 同样从真实入口执行 Edit -> Preview -> Scan/prepare -> cancel/safe。
 
 所有GUI的视觉debug/验收采用同一双轨合同。**快轨就是offscreen正式窗口**：共享test helper必须在QApplication出现前只设置`QT_QPA_PLATFORM=offscreen`，再调用唯一`ensure_qt_app()`，随后只走该产品的正式open/composition与`launch_fluent_window()`，通过真实Qt input点击可见控件、等待事件稳定后抓outer FluentWindow。它不得另建`QApplication`、设置任何DPI/scale、改产品窗口尺寸/样式、直接`setCurrent*`或poke controller，也不得在桌面弹窗。Windows offscreen plugin若给出空font database，唯一application owner可注册产品本来就声明的系统font face；共享契约测试必须直接栅格化文字并验证非背景glyph像素，只有方框/空白的截图无效。**慢轨才是真正桌面人类流程**：从该产品正式根`.py/.bat` launcher启动，用桌面鼠标/键盘逐步操作并取屏幕截图，作为最终或任何视觉争议的裁决。两轨共享完全相同的application owner、composition root、sizing/style与产品操作序列，差别只有Qt平台和驱动层；快轨截图用于高频视觉debug，慢轨证明真实桌面呈现。这个合同覆盖PulseGUI、TaskConsole、DeviceManager、FigureViewer及未来所有GUI；每个应用只定义自己的动作序列，offscreen选择、事件等待、整窗抓取和geometry记录由共享owner实现，禁止再复制一套截图脚本。
 
@@ -3299,7 +3308,7 @@ Workbench E2E 必须从真实 launcher/composition root 驱动用户路径：Add
 - 对每种 live plot kind 执行适用的 Area、locked Cross、zoom/pan、clim/threshold；plot pointer-motion 数据 hover 明确不存在。shown plot 必须返回适用的非空 interaction handle，并用同 revision 的 `ViewportTransform` 验证 raster↔data 命中；
 - 拖拽/调整一个 panel 期间，其它 panel 继续 present；被拖 panel 在 release 后补到最新合法 revision，不把拖拽期间的 stale front 当新 front；
 - 通过同一 Setting/Edit 路径切换 `normal/tight/fixed` relim、cmap 与 limits，并验证保存/重开；
-- 从 panel/figure 的 `Add Analysis -> Fit` 或 `Analyze -> Fit` 一键提交 authority draft，框选直接预填同一 draft，覆盖 1D range 与 2D box ROI fit，并证明后台求解时 live/其它 panel 仍响应、stale completion 不覆盖新 selection；
+- 从 panel Setting/Edit 或 DataFigure `Fit` tab 的同一个 model+args pane 一键提交 authority draft，框选直接预填同一 draft，覆盖 1D range 与 2D box ROI fit，并证明后台求解时 live/其它 panel 仍响应、stale completion 不覆盖新 selection；
 - 从通用 figure/archive viewer 载入任意已存 figure/artifact，执行 zoom/pan、re-fit 与 export；报告类 frozen multi-page raster 至少必须支持 zoom，不能以静态 PNG 通过通用 viewer 验收。
 
 每条 E2E 都必须同时验证用户可见结果、时序与不中断项；截图只补视觉证据，不能替代行为 oracle。
@@ -3329,7 +3338,7 @@ producer/adapter
 
 1. **Monitor/ROI 生命周期纠正。** 相机 source Run/raw front 永不因 ROI/threshold retarget、新建或删除而重启或 gap；已有 downstream processor 由 revisioned `ControlTopic` 在事务边界 `APPLIED`，新建/删除只迁移该 downstream stream/generation。以 `main:frontend/task_console.py::_apply_panel_analysis/_publish_region` 的“retarget can never gap a running consumer”为 UX oracle，并用真实 launcher E2E 证明 source run id/generation/tap topology 与 raw sequence 连续。
 2. **补齐 full live interaction。** 为全部可交互的 live plot kind 交付 `ViewportTransform + Qt overlay` 的 Area、locked Cross、zoom/pan与适用的clim/threshold；不实现pointer-motion数据hover。拖拽一个 panel 时其它 panel 不停流，被拖 panel 松手补拍；Setting/Edit 恢复 `normal/tight/fixed` relim、cmap 与 limits。shown plot 返回空 interaction handle 一律验收失败。
-3. **纠正已暴露 figure/viewer/Fit 产品面并建立唯一交互 owner。** 先让现有 W4 generic `figure_gui`、W7 saved-fit grid、calibration/occupancy 已暴露路径恢复适用的zoom/pan、selector、显式re-fit与export；frozen raster只允许报告类多页使用且必须可zoom。本纠正建立后续复用的唯一 viewer interaction/Fit owner，但只验收当前已经公开的source/ref类型，不在此处预建“任意artifact catalog/browser”。panel/figure 的 `Add Analysis -> Fit` / `Analyze -> Fit` 是主入口，普通 Fit 一键提交 authority draft，selector 直接预填同一 draft，并同时交付 1D range 与 2D box ROI fit；独立 `fit_gui` 只保留为直达入口。TaskConsole的`Add Analysis`只桥接当前FINAL artifact，不因按钮命名预建formal workflow。
+3. **纠正已暴露 figure/viewer/Fit 产品面并建立唯一交互 owner。** 先让现有 W4 generic `figure_gui`、W7 saved-fit grid、calibration/occupancy 已暴露路径恢复适用的zoom/pan、selector、显式re-fit与export；frozen raster只允许报告类多页使用且必须可zoom。本纠正建立后续复用的唯一 viewer interaction/Fit owner，但只验收当前已经公开的source/ref类型，不在此处预建“任意artifact catalog/browser”。panel Setting/Edit 与 DataFigure `Fit` tab 复用同一个紧凑Fit pane，普通 Fit 一键提交 authority draft，selector 直接预填同一 draft，并同时交付 1D range 与 2D box ROI fit；独立 `fit_gui` 只保留为直达入口。TaskConsole不建立generic Analysis入口或formal workflow。
 
 #### U0.1 Monitor/ROI salvage gate（开工冻结证据）
 
@@ -3695,15 +3704,20 @@ capability gap 拒绝。catalog 表单不再暴露通用 input-timeout 字段。
 finite Camera 的 capacity-one preview 只是单cell布局可选的显示支路，不是Measurement成功条件；
 实际prepared command不满足preview contract时直接执行同一有限采集，FINAL仍发布完整
 `(R,P,*data_shape)`。同一个Camera Definition的live与finite运行都可在运行期发布typed capacity-one
-current-frame view；Occupancy只接受该带`MonitorCoverage + MONITOR_HISTORY`语义的`frame` signal，绝不从
-完整finite dataset按shape或validity猜“最新cell”，也不重新采集recipe。binding 时必须冻结 producer object、
+current-cycle view。Camera request 的 `frames_per_cycle=N` 唯一决定具名输出 `frame_0…frame_(N-1)`；一次
+原子Dataset沿声明的`READOUT_EVENT`轴逐项投影，repeat、MONITOR_HISTORY/其它point轴、完整data shape、
+ComponentValidity、revision与generation不变。Occupancy只接受其中一条带`MonitorCoverage`语义的
+`frame_i` signal，绝不从完整finite dataset按shape或validity猜“最新cell”，也不重新采集recipe。binding 时必须冻结 producer object、
 lifecycle generation、run/epoch 与初始 immutable front；后续
 只消费同一代新 revision，同名 Camera 停止或重启均使 processor 明确失败并要求重新绑定，绝不能静默
 接到新 generation。普通Start/Restart只接受当前表单成功解析的值，解析失败原位拒绝且保留已运行
 owner，绝不退回旧保存值偷偷启动。
 
-`Judge occupancy` 的 visible authority 表单固定为显式 `Calibration` signal、`Frame source` signal 与 Main
-同序的 `Readout method = box / per-site PSF / uniform PSF`；没有按shape推断或`auto`权威选择。一次原子
+`Judge occupancy` 的 visible authority 表单固定为显式 `Frame source=frame_i`、
+`Calibration source = Task output | Saved calibration` 与 Main同序的
+`Readout method = box / per-site PSF / uniform PSF`；前者要求成功Calibration Task的FINAL signal，后者要求
+用户明确选择current `calibration_ref.json`，并校验pointer中的CalibrationArtifactRef/source CaptureArtifactRef
+与repository artifact完全一致。没有latest目录搜索、按shape推断或`auto`权威选择。一次原子
 processor publication只包含`counts / occupied / rate`及附着在同revision `occupied`值上的typed Sites
 presentation，后者组合这次实际judged frame与校准site geometry。不得恢复松散`centers/thresholds/
 frame_judged`旁路、Measurement ROI、自动Sites窗口或pointer hover。用户把`occupied`手动接Sites，把
@@ -3833,7 +3847,7 @@ W3d/W3e兑现S4中不依赖Q0/real composition的source-neutral软件纵切与cu
 ### S5：Workbench、其余 use cases 与用户兼容
 
 1. 在 S0.5 宿主上迁剩余 WorkspaceModel/RunCoordinator/controllers；Setting/Edit 使用共享 EditorSession/schema widgets/base-revision conflict，catalog 只做各 bounded context capability/definition 的本地投影。
-2. Fit 保持 zlc_data 单一算法 owner；U0.3d已把旧独立`.fit_gui()` host并入唯一DataFigure/Fit editor、draft overlay与explicit Save/reopen/Clear路径，W8b的selection-only CommittedTransform也由同一authority消费；U0.3e已让TaskConsole的`Add Analysis -> Fit`从当前FINAL ScanArtifact进入该host，仍不从display/selector生成权威、不复制模型表/solver、不建立formal workflow。未来自动分析只按§10.5真实consumer门槛另立flat Run；Pulse prepare/fire/safe继续后台托管。
+2. Fit 保持 zlc_data 单一算法 owner；U0.3d已把旧独立`.fit_gui()` host并入唯一DataFigure/Fit editor、draft overlay与explicit Save/reopen/Clear路径，W8b的selection-only CommittedTransform也由同一authority消费；TaskConsole在当前panel的Setting/Edit内复用同一Fit authoring contract并只产生瞬时overlay/derived signals，仍不从display/selector生成权威、不复制模型表/solver、不建立formal workflow。未来自动分析只按§10.5真实consumer门槛另立flat Run；Pulse prepare/fire/safe继续后台托管。
 3. 所有 panel 使用 S1/S2 的 render/evaluation lanes；完成 acknowledgement-driven shutdown 和 ControlTopic terminal/superseded ack。
 4. 逐条迁 temperature、MOT、readout、device manager 和 notebook convenience；W4a-W4e、W5-W8与M1-M2e只记录各自已经证明的data/authority/线程/lifecycle子合同，不再被解释为终态用户面。whole-Run ROI replacement、永久 frozen generic viewer、缺 selector/zoom/re-fit 与独立 `fit_gui` 作为主入口均先按U0三项纠正关闭；随后再完成通用live grid/动态layout、TaskConsole/scan/live Fit、ROI/transform authoring、可zoom/export的live calibration/occupancy grid、跨artifact saved gallery、real Pylon qualification及其它 convenience。每条按最后 consumer 做dependency-closed删除，不能提前删共享producer，也不能以“不重开旧审查”为由拒绝补齐缺失UX。
 5. 真实入口 E2E 覆盖 fit/gridplot、calibration/occupancy、PulseScan、save/load、cancel/cleanup failure、shutdown 和 virtual/real adapter parity。

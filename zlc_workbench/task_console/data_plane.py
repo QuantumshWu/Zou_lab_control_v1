@@ -26,9 +26,34 @@ from __future__ import annotations
 from dataclasses import dataclass
 import threading
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping
 
-__all__ = ["ConsoleDataFront", "ConsoleDataPlane", "ConsoleSignalValue"]
+from zlc_data import OwnedSnapshot
+
+__all__ = [
+    "ConsoleDataFront",
+    "ConsoleDataPlane",
+    "ConsoleSignalValue",
+    "single_output_projection",
+]
+
+
+SnapshotProjector = Callable[[OwnedSnapshot], Mapping[str, OwnedSnapshot]]
+
+
+def single_output_projection(output_name: str) -> SnapshotProjector:
+    """Return the explicit identity projection for a one-output live route."""
+
+    name = str(output_name)
+    if not name or name.strip() != name:
+        raise ValueError("live output name must be canonical non-empty text")
+
+    def project(snapshot: OwnedSnapshot) -> Mapping[str, OwnedSnapshot]:
+        if not isinstance(snapshot, OwnedSnapshot):
+            raise TypeError("live projection source must be OwnedSnapshot")
+        return {name: snapshot}
+
+    return project
 
 
 @dataclass(frozen=True)
@@ -130,7 +155,7 @@ class ConsoleDataPlane:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._slots: dict[int, tuple[object, object, str | None]] = {}
+        self._slots: dict[int, tuple[object, object, SnapshotProjector]] = {}
         self._dirty: set[int] = set()
         self._cache: dict[int, dict[str, ConsoleSignalValue]] = {}
         self._finals: dict[
@@ -154,19 +179,12 @@ class ConsoleDataPlane:
         node,
         slot,
         *,
-        output_name: str | None = None,
+        project_snapshot: SnapshotProjector,
     ) -> None:
         if slot is None:
             raise ValueError("a monitor slot is required")
-        if output_name is not None:
-            output_name = str(output_name).strip()
-            if not output_name:
-                raise ValueError("live output_name must not be empty")
-            published = tuple(node.published_signals())
-            if node.signal_key(output_name) not in published:
-                raise ValueError(
-                    f"live route {output_name!r} is not a declared node output"
-                )
+        if not callable(project_snapshot):
+            raise TypeError("live project_snapshot must be callable")
         key = id(node)
         with self._lock:
             if self._closed:
@@ -175,7 +193,7 @@ class ConsoleDataPlane:
                 raise RuntimeError(
                     "console node already owns a run-scoped live route"
                 )
-            self._slots[key] = (node, slot, output_name)
+            self._slots[key] = (node, slot, project_snapshot)
             # The view factory attaches before the domain binds its materializer.
             # Only the slot's first real revision marks it dirty; trying to freeze
             # here would turn the normal ARMED/no-frame-yet state into a false
@@ -206,11 +224,21 @@ class ConsoleDataPlane:
 
         if not isinstance(projected, Mapping):
             raise TypeError("projected FINAL signals must be a mapping")
-        declared = {
+        declarations = tuple(
+            getattr(node, "output_declarations", ()) or ()
+        )
+        run_scoped = {
             str(output.name)
-            for output in tuple(
-                getattr(getattr(node, "spec", None), "declared_outputs", ()) or ()
-            )
+            for output in declarations
+            if bool(getattr(output, "run_scoped", False))
+        }
+        # A task may declare both a provisional RUN value and several FINAL
+        # artifacts.  Every other live producer publishes its complete frozen
+        # vocabulary.  This is an equality contract: accepting only a subset
+        # would make a Camera configured for three events appear to work while
+        # silently omitting frame_1/frame_2 from the data plane.
+        declared = run_scoped or {
+            str(output.name) for output in declarations
         }
         unknown = set(map(str, projected)).difference(declared)
         if unknown:
@@ -345,7 +373,7 @@ class ConsoleDataPlane:
             self._failures.pop(key, None)
             self._membership_changed = True
         if entry is not None:
-            _node, slot, _output_name = entry
+            _node, slot, _project_snapshot = entry
             slot.close()
 
     def detach_live(self, node) -> None:
@@ -360,7 +388,7 @@ class ConsoleDataPlane:
             if entry is not None:
                 self._membership_changed = True
         if entry is not None:
-            _node, slot, _output_name = entry
+            _node, slot, _project_snapshot = entry
             slot.close()
 
     def close(self) -> None:
@@ -379,7 +407,7 @@ class ConsoleDataPlane:
             self._panels.clear()
             self._failures.clear()
             self._membership_changed = True
-        for _node, slot, _output_name in entries:
+        for _node, slot, _project_snapshot in entries:
             slot.close()
 
     def __len__(self) -> int:
@@ -411,25 +439,25 @@ class ConsoleDataPlane:
             # therefore rebuilt on the next owner tick.
             self._membership_changed = False
         for key in dirty:
-            node, slot, output_name = slots[key]
+            node, slot, project_snapshot = slots[key]
             title = str(getattr(node, "name", "") or type(node).__name__)
             try:
                 result = self._freeze_one(
                     node,
                     slot,
                     title,
-                    output_name=output_name,
+                    project_snapshot=project_snapshot,
                 )
             except Exception as error:
                 failure = f"{type(error).__name__}: {error}"
                 with self._lock:
-                    if self._slots.get(key) == (node, slot, output_name):
+                    if self._slots.get(key) == (node, slot, project_snapshot):
                         self._cache.pop(key, None)
                         self._failures[key] = failure
                 continue
             frozen, alignment_failure = result
             with self._lock:
-                if self._slots.get(key) == (node, slot, output_name):
+                if self._slots.get(key) == (node, slot, project_snapshot):
                     self._cache[key] = frozen
                     if alignment_failure is None:
                         self._failures.pop(key, None)
@@ -453,7 +481,7 @@ class ConsoleDataPlane:
                 for panel_id, value in self._panels.items()
             }
             failed = dict(self._failures)
-        for key, (node, _slot, _output_name) in current.items():
+        for key, (node, _slot, _project_snapshot) in current.items():
             signals.update(cached.get(key, {}))
             failure = failed.get(key)
             if failure is not None:
@@ -479,7 +507,7 @@ class ConsoleDataPlane:
         slot,
         title: str,
         *,
-        output_name: str | None = None,
+        project_snapshot: SnapshotProjector,
     ) -> tuple[dict[str, ConsoleSignalValue], str | None]:
         """One slot's atomic transaction, projected onto its declared outputs.
 
@@ -524,22 +552,46 @@ class ConsoleDataPlane:
             raise TypeError(
                 "console live slot must freeze a typed monitor or exact preview snapshot"
             )
-        declared = tuple(node.published_signals())
-        selected = (
-            declared[0]
-            if output_name is None and len(declared) == 1
-            else node.signal_key(str(output_name))
-        )
-        if selected not in declared:
-            raise ValueError("live dataset route is not a declared output")
-        return {
-            selected: ConsoleSignalValue(
+        source_snapshot = snapshot.snapshot
+        projected = project_snapshot(source_snapshot)
+        if not isinstance(projected, Mapping) or not projected:
+            raise ValueError("live projection must return a non-empty mapping")
+        declared = {
+            str(output.name)
+            for output in tuple(getattr(node, "output_declarations", ()) or ())
+        }
+        bare_names = tuple(projected)
+        if any(
+            not isinstance(name, str) or not name or name.strip() != name
+            for name in bare_names
+        ):
+            raise ValueError("live projection output names must be canonical text")
+        actual = set(bare_names)
+        if actual != declared:
+            raise ValueError(
+                "live projection output set differs from its frozen declaration: "
+                f"expected={tuple(sorted(declared))}, actual={tuple(sorted(actual))}"
+            )
+        frozen: dict[str, ConsoleSignalValue] = {}
+        for output_name in bare_names:
+            output_snapshot = projected[output_name]
+            if not isinstance(output_snapshot, OwnedSnapshot):
+                raise TypeError("live projection values must be OwnedSnapshot")
+            if output_snapshot.ref.revision != source_snapshot.ref.revision:
+                raise ValueError("live projection changed its source revision")
+            if (
+                output_snapshot.ref.stream_generation
+                != source_snapshot.ref.stream_generation
+            ):
+                raise ValueError("live projection changed its source generation")
+            selected = node.signal_key(output_name)
+            frozen[selected] = ConsoleSignalValue(
                 name=selected,
                 source=title,
-                snapshot=snapshot.snapshot,
+                snapshot=output_snapshot,
                 coverage=snapshot.coverage,
                 run_id=run_id,
                 epoch_id=causation,
                 join_digest=join_digest,
             )
-        }, getattr(slot, "notification_failure", None)
+        return frozen, getattr(slot, "notification_failure", None)

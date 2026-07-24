@@ -34,20 +34,16 @@ from zlc_data import (
     ComponentValidity,
     CoordinateRangeSelection,
     DataBlock,
-    DataTransformSpec,
     DatasetRevisionRef,
     DatasetSchema,
     IndexRangeSelection,
     IndexSelection,
     OwnedSnapshot,
     PointLayout,
-    RowComponentValidity,
     Selection,
     StreamGenerationId,
     ValidityContract,
     ValueSchema,
-    apply_transform,
-    commit_transform,
     dataset_revision_ref_to_tree,
     expand_dataset_validity,
     selection_to_tree,
@@ -56,6 +52,7 @@ from zlc_data import (
 from zlc_data.console_records import panel_signal_key
 
 from .data_plane import ConsoleSignalValue
+from .dataset_projection import materialize_dataset_selection
 
 
 AREA_DATA_OUTPUT = "area.data"
@@ -162,64 +159,6 @@ def area_range_output_name(axis_id: AxisId) -> str:
     return f"area.range.{axis_id.value}"
 
 
-def _selected_point_layout(transformed) -> tuple[PointLayout, np.ndarray]:
-    """Factor repeat from a transformed cell layout and return canonical rows."""
-
-    cell_axes = tuple(transformed.schema.cell_axes)
-    repeat_positions = tuple(
-        index for index, axis in enumerate(cell_axes) if axis.role == REPEAT
-    )
-    if repeat_positions != (0,):
-        raise ValueError(
-            "Area selection must preserve the dataset repeat axis; select a "
-            "repeat range instead of dropping it"
-        )
-    repeat_size = cell_axes[0].size
-    point_axes = cell_axes[1:]
-    layout = transformed.schema.cell_layout
-    row_by_multi = {
-        layout.multi_index(row): row for row in range(layout.storage_size)
-    }
-    if len(row_by_multi) != layout.storage_size:
-        raise RuntimeError("transformed cell layout contains duplicate rows")
-
-    point_mapping: tuple[tuple[int, ...], ...] | None = None
-    for repeat_index in range(repeat_size):
-        current = tuple(
-            multi[1:]
-            for multi in (
-                layout.multi_index(row) for row in range(layout.storage_size)
-            )
-            if multi[0] == repeat_index
-        )
-        if point_mapping is None:
-            point_mapping = current
-        elif current != point_mapping:
-            raise ValueError(
-                "Area selection produced repeat-dependent point membership, "
-                "which DatasetSchema cannot represent"
-            )
-    if not point_mapping:
-        raise ValueError("Area selection produced no dataset points")
-
-    point_layout = PointLayout.from_mapping(
-        tuple(axis.size for axis in point_axes),
-        point_mapping,
-    )
-    if not isinstance(point_layout, PointLayout):
-        raise RuntimeError("point layout factory returned the wrong layout type")
-    order = np.fromiter(
-        (
-            row_by_multi[(repeat_index, *point_layout.multi_index(point_index))]
-            for repeat_index in range(repeat_size)
-            for point_index in range(point_layout.storage_size)
-        ),
-        dtype=np.intp,
-        count=repeat_size * point_layout.storage_size,
-    )
-    return point_layout, order
-
-
 def _derived_ref(
     panel_id: str,
     output_name: str,
@@ -255,69 +194,17 @@ def materialize_area_snapshot(
 ) -> OwnedSnapshot:
     """Materialise one accepted Area selection without flattening or reducing."""
 
-    if not isinstance(source, OwnedSnapshot):
-        raise TypeError("Area source must be OwnedSnapshot")
-    if not isinstance(selection, Selection):
-        raise TypeError("Area selection must be Selection")
-    transform = commit_transform(
-        source.block.schema,
-        DataTransformSpec((selection,)),
-    )
-    transformed = apply_transform(source, transform)
-    point_layout, order = _selected_point_layout(transformed)
-    repeat_axis = transformed.schema.cell_axes[0]
-    point_axes = tuple(transformed.schema.cell_axes[1:])
-    validity_ids = tuple(transformed.schema.validity_axis_ids)
-    validity_contract = (
-        ValidityContract.components(*validity_ids)
-        if validity_ids
-        else ValidityContract.value()
-    )
-    output_schema = DatasetSchema(
-        repeat_axis,
-        point_axes,
-        point_layout,
-        ValueSchema(
-            tuple(transformed.schema.data_axes),
-            validity_contract,
-            transformed.schema.dtype,
-            transformed.schema.value_unit,
+    return materialize_dataset_selection(
+        source,
+        selection,
+        reference_for=lambda output_schema: _derived_ref(
+            panel_id,
+            output_name,
+            source.ref,
+            output_schema,
+            {"selection": selection_to_tree(selection)},
         ),
     )
-    ref = _derived_ref(
-        panel_id,
-        output_name,
-        source.ref,
-        output_schema,
-        {"selection": selection_to_tree(selection)},
-    )
-    values = transformed.values[order].reshape(output_schema.physical_shape)
-    transformed_validity = transformed.validity
-    if isinstance(transformed_validity, RowComponentValidity):
-        mask = transformed_validity.mask[order]
-        if transformed_validity.axis_ids:
-            validity = ComponentValidity(
-                transformed_validity.axis_ids,
-                mask.reshape(
-                    repeat_axis.size,
-                    point_layout.storage_size,
-                    *mask.shape[1:],
-                ),
-            )
-        else:
-            validity = CellValidity(
-                mask.reshape(repeat_axis.size, point_layout.storage_size)
-            )
-    else:
-        validity = transformed_validity
-    block = DataBlock(
-        ref.block_id,
-        ref.revision,
-        values,
-        validity,
-        output_schema,
-    )
-    return OwnedSnapshot(ref, block)
 
 
 def _numeric_array(values: object, data_axes: tuple[AxisSpec, ...]) -> np.ndarray:
@@ -354,6 +241,16 @@ def materialize_numeric_snapshot(
         raise TypeError("selector data_axes must contain AxisSpec values")
     array = _numeric_array(values, axes)
     _panel, _signal, identity = _panel_identity(panel_id, output_name)
+    value_schema = (
+        ValueSchema(
+            axes,
+            ValidityContract.value(),
+            np.dtype("<f8"),
+            unit,
+        )
+        if axes
+        else ValueSchema.scalar(np.dtype("<f8"), unit)
+    )
     schema = DatasetSchema(
         AxisSpec(
             AxisId(f"panel-output-{identity[:24]}-repeat"),
@@ -364,12 +261,7 @@ def materialize_numeric_snapshot(
         ),
         (),
         PointLayout.rect_c(()),
-        ValueSchema(
-            axes,
-            ValidityContract.value(),
-            np.dtype("<f8"),
-            unit,
-        ),
+        value_schema,
     )
     ref = _derived_ref(
         panel_id,
@@ -735,7 +627,10 @@ def materialize_area_outputs(
             & (values <= selection.upper)
         )
         data_axes = tuple(schema.cell_schema.data_axes)
-        if data_axes:
+        if schema.cell_schema.is_scalar:
+            validity_contract = ValidityContract.value()
+            validity = CellValidity(selected_validity[..., 0])
+        else:
             validity_contract = ValidityContract.components(
                 *(axis.axis_id for axis in data_axes)
             )
@@ -743,9 +638,6 @@ def materialize_area_outputs(
                 tuple(axis.axis_id for axis in data_axes),
                 selected_validity,
             )
-        else:
-            validity_contract = ValidityContract.value()
-            validity = CellValidity(selected_validity)
         output_schema = DatasetSchema(
             schema.repeat_axis,
             schema.point_axes,
@@ -1051,12 +943,7 @@ def materialize_fit_outputs(
             repeat_axis,
             point_axes,
             point_layout,
-            ValueSchema(
-                (),
-                ValidityContract.value(),
-                np.dtype("<f8"),
-                unit,
-            ),
+            ValueSchema.scalar(np.dtype("<f8"), unit),
         )
         ref = _derived_ref(
             panel_id,

@@ -197,13 +197,13 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._settings_popup,
             self._setting_button,
         )
-        self._analyze_button = FluentButton(
-            "Analyze → Fit/Refit",
+        self._fit_button = FluentButton(
+            "Fit / Refit",
             self,
             color=ORANGE,
         )
-        self._analyze_button.setObjectName("savedFitGridAnalyzeFitButton")
-        self._analyze_button.setEnabled(False)
+        self._fit_button.setObjectName("savedFitGridFitButton")
+        self._fit_button.setEnabled(False)
         self._export_button = FluentButton("Export image…", self, color=ORANGE)
         self._export_button.setObjectName("savedFitGridExport")
         actions = QtWidgets.QHBoxLayout()
@@ -216,7 +216,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             actions.addWidget(button)
         actions.addWidget(self._selector_switch)
         actions.addWidget(self._setting_button)
-        actions.addWidget(self._analyze_button)
+        actions.addWidget(self._fit_button)
         actions.addWidget(self._export_button)
         self._export_button.setEnabled(False)
         actions.addStretch(1)
@@ -241,7 +241,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._export_button.clicked.connect(self._choose_export)
         self._selector_switch.toggled.connect(self._set_selector_enabled)
         self._setting_button.clicked.connect(self._open_display_settings)
-        self._analyze_button.clicked.connect(self._open_refit)
+        self._fit_button.clicked.connect(self._open_refit)
         self._board_widget.imagePanelLeftDoubleClicked.connect(
             self._focus_panel_id
         )
@@ -689,7 +689,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 pass
             else:
                 focused = True
-        self._analyze_button.setEnabled(focused)
+        self._fit_button.setEnabled(focused)
         if self._navigator is not None:
             self._navigator.set_interaction_enabled(enabled)
         self._previous_page_button.setEnabled(
@@ -743,7 +743,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             or self._closing
             or self._showing_page
             or self._model is None
-            or not self._analyze_button.isEnabled()
+            or not self._fit_button.isEnabled()
         ):
             return
         selection = self._current_selection
@@ -1485,7 +1485,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._next_page_button,
             self._selector_switch,
             self._setting_button,
-            self._analyze_button,
+            self._fit_button,
             self._export_button,
         ):
             button.setEnabled(False)

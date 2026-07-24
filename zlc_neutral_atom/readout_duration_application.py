@@ -214,7 +214,7 @@ def _result_snapshot(
         AxisSpec(AxisId("readout_duration.repeat"), "repeat", REPEAT, 1, (0,)),
         (point_axis,),
         PointLayout.rect_c((len(durations),)),
-        ValueSchema((), ValidityContract.value(), np.dtype("<f8"), "fidelity"),
+        ValueSchema.scalar(np.dtype("<f8"), "fidelity"),
     )
     identity = canonical_digest(
         {
@@ -227,7 +227,7 @@ def _result_snapshot(
     block = DataBlock(
         BlockId(f"readout-duration-{identity[:20]}"),
         DatasetRevision(0),
-        np.asarray(fidelities, dtype="<f8").reshape((1, len(durations))),
+        np.asarray(fidelities, dtype="<f8").reshape((1, len(durations), 1)),
         CellValidity(np.asarray(validity, dtype=bool).reshape((1, len(durations)))),
         schema,
     )

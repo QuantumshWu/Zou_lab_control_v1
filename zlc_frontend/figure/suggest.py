@@ -9,6 +9,7 @@ from zlc_data import (
     FitResultBatch,
     MONITOR_HISTORY,
     REPEAT,
+    SCALAR,
     SCAN_POINT,
     SITE,
     SPATIAL_X,
@@ -305,6 +306,25 @@ def _suggest_view(
                 chosen.axis_id,
             )
         )
+
+    # The scalar carrier is a physical singleton required by the data
+    # contract, not information for the operator to facet or reduce.  Consume
+    # it by its declared role; never infer the same rule from axis size.
+    for axis in axes:
+        if axis.axis_id in unbound and axis.role == SCALAR:
+            bindings[axis.axis_id] = AxisViewBinding(
+                axis.axis_id,
+                AxisViewRole.SELECTED,
+                selector=FixedIndex(0),
+            )
+            unbound.remove(axis.axis_id)
+            reasons.append(
+                DecisionReason(
+                    "SCALAR_CARRIER",
+                    "the declared scalar carrier resolves to its sole physical item",
+                    axis.axis_id,
+                )
+            )
 
     repeat_axis = schema.repeat_axis
     if repeat_axis.axis_id in unbound:

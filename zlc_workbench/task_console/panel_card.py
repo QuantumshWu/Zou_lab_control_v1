@@ -219,6 +219,9 @@ class PanelCard(FluentGroupBox):
         self._grid_focus = None
         self._render_request_revision = 0
         self._requested_signature = None
+        self._latest_requested_source_ref = None
+        self._latest_requested_source_key = None
+        self._latest_requested_display_revision = None
         # Qt paints the card in logical pixels, while the worker raster is
         # authored at the physical-pixel ratio of the screen containing the
         # TaskConsole.  The console owns screen observation and updates this
@@ -333,7 +336,6 @@ class PanelCard(FluentGroupBox):
         if not self._fit_capable_kind():
             raise ValueError("this panel kind does not support Figure Fit")
         pane = FitAuthoringPane(parent)
-        pane.save_button.hide()  # TaskConsole publishes signals; it owns no fit archive action.
         pane.clear_button.setText("Clear fit")
         pane.fitRequested.connect(
             lambda _revision, spec, owner=pane: self._accept_fit_request(
@@ -349,7 +351,6 @@ class PanelCard(FluentGroupBox):
         )
         pane.cancelRequested.connect(self._cancel_fit_request)
         pane.clearRequested.connect(self.clear_fit)
-        pane.clearSelectionRequested.connect(self._clear_fit_selection)
         pane.editorChanged.connect(
             lambda _revision, owner=pane: self._fit_editor_changed(owner)
         )
@@ -369,7 +370,6 @@ class PanelCard(FluentGroupBox):
             pane.set_busy(None, draft_ready=self._fit_result is not None)
         else:
             pane.set_busy("prepare", draft_ready=False)
-        pane.set_selection_present(self._current_fit_selection() is not None)
         return pane
 
     def release_fit_authoring_pane(self, pane: FitAuthoringPane) -> None:
@@ -385,10 +385,7 @@ class PanelCard(FluentGroupBox):
             return
         try:
             option = owner.current_option()
-            form = owner.constraint_form
-            if form is None:
-                return
-            values = form.read_all()
+            arguments = owner.arguments_text
         except (TypeError, ValueError, RuntimeError):
             return
         self._fit_syncing_panes = True
@@ -396,14 +393,13 @@ class PanelCard(FluentGroupBox):
             for pane in tuple(self._fit_panes):
                 if pane is owner or not pane.fit_models:
                     continue
-                index = pane.model_combo.findData(option.spec.model_id)
-                if index < 0:
+                if option.spec.model_id not in pane.fit_models:
                     continue
-                if pane.model_combo.currentIndex() != index:
-                    pane.model_combo.setCurrentIndex(index)
-                target = pane.constraint_form
-                if target is not None and set(target.keys) == set(values):
-                    target.write_all(values)
+                pane.set_editor_draft(
+                    option.spec.model_id,
+                    arguments,
+                    notify=False,
+                )
         finally:
             self._fit_syncing_panes = False
 
@@ -427,10 +423,6 @@ class PanelCard(FluentGroupBox):
         self._fit_options_identity = None
         if self._presented_figure is not None and self._presented_value is not None:
             self._sync_fit_authoring_from_presented()
-
-    def _clear_fit_selection(self) -> None:
-        if self._area_selection is not None:
-            self._set_area_output(None, None)
 
     def _clear_fit_result(self, *, notify: bool) -> None:
         changed = self._fit_result is not None
@@ -503,8 +495,8 @@ class PanelCard(FluentGroupBox):
                 for pane in tuple(self._fit_panes):
                     if pane.fit_models:
                         pane.clear_options()
-                    pane.axis_summary.setText(str(error))
                     pane.set_busy("prepare", draft_ready=False)
+                self.set_status(f"Fit unavailable: {error}", error=True)
                 return
 
             selected_model = None if seed is None else seed.model_id
@@ -522,7 +514,6 @@ class PanelCard(FluentGroupBox):
                     options,
                     selected_model=selected_model,
                 )
-                pane.set_selection_present(selection is not None)
                 pane.set_busy(None, draft_ready=self._fit_result is not None)
 
             # An already-active model follows a newly completed Area selection
@@ -1361,6 +1352,9 @@ class PanelCard(FluentGroupBox):
             return None
         self._render_request_revision += 1
         self._requested_signature = signature
+        self._latest_requested_source_ref = value.snapshot.ref
+        self._latest_requested_source_key = source_key
+        self._latest_requested_display_revision = int(display.revision)
         value_label = self._signal_axis_label(str(value.name))
         return _PanelRenderRequest(
             self.panel_id,
@@ -1413,10 +1407,50 @@ class PanelCard(FluentGroupBox):
         figure=None,
         error: str | None = None,
     ) -> bool:
-        """Accept one worker result on the Qt owner and nothing else."""
+        """Accept any useful completed front from the current source generation.
 
-        if request.request_revision != self._render_request_revision:
+        Request revisions only order queued work; they are not presentation
+        authority.  A completed immutable source revision remains a real front
+        while a later same-generation request is waiting in the capacity-one
+        lane, so show it unless an equal/newer front is already pending or
+        painted.  Structural rebinds and generation replacement still reject
+        the old result.
+        """
+
+        source_ref = request.value.snapshot.ref
+        latest_ref = self._latest_requested_source_ref
+        if (
+            latest_ref is None
+            or request.source_key != self._latest_requested_source_key
+            or source_ref.block_id != latest_ref.block_id
+            or source_ref.stream_generation != latest_ref.stream_generation
+            or source_ref.schema_fingerprint != latest_ref.schema_fingerprint
+        ):
             return False
+        if error is not None and (
+            source_ref.revision != latest_ref.revision
+            or int(request.display.revision)
+            != self._latest_requested_display_revision
+        ):
+            return False
+        for value, display in (
+            (self._pending_value, self._pending_display),
+            (self._presented_value, self._presented_display),
+        ):
+            existing_ref = getattr(getattr(value, "snapshot", None), "ref", None)
+            if (
+                existing_ref is None
+                or existing_ref.stream_generation != source_ref.stream_generation
+            ):
+                continue
+            if existing_ref.revision > source_ref.revision:
+                return False
+            if (
+                existing_ref.revision == source_ref.revision
+                and display is not None
+                and int(display.revision) >= int(request.display.revision)
+            ):
+                return False
         self._render_version = request.frame_key
         if error is not None:
             self._settle_pending_interaction_through(
@@ -1490,7 +1524,17 @@ class PanelCard(FluentGroupBox):
                 pending_figure = figure
             pending_display = request.display
         self._last_value = request.value
-        self._candidate_value = request.value
+        candidate_ref = getattr(
+            getattr(self._candidate_value, "snapshot", None),
+            "ref",
+            None,
+        )
+        if (
+            candidate_ref is None
+            or candidate_ref.stream_generation != source_ref.stream_generation
+            or candidate_ref.revision <= source_ref.revision
+        ):
+            self._candidate_value = request.value
         self._last_document = (
             None if pending_figure is None else pending_figure.document
         )
@@ -1783,7 +1827,7 @@ class PanelCard(FluentGroupBox):
         """Return the producer RunId promoted with the visible immutable front.
 
         A FINAL result and its projected dataset become available before the
-        worker necessarily presents that revision.  Analysis must not fit the
+        worker necessarily presents that revision.  Fit must not use the
         new artifact while the operator is still looking at the previous
         front.  The value therefore crosses the same Qt present boundary as
         its figure/display/geometry rather than being read from the latest
@@ -1903,10 +1947,50 @@ class PanelCard(FluentGroupBox):
         ):
             self.figure_outputs_changed.emit()
 
+    def setting_label_width(self, metrics) -> int:
+        """One label column for Setting and Edit, independent of live text."""
+
+        labels = {
+            "signal",
+            "size",
+            "sub plot",
+            "facet",
+            "repeat",
+            "lo / hi",
+            "unit",
+            "update",
+            "title",
+            "x range",
+            "y range",
+            "colour range",
+            "path",
+            "name",
+            "file",
+        }
+        labels.update(
+            spec.label for spec in _panel_param_decls(self.config.kind)
+        )
+        if self.config.kind == "grid":
+            labels.update(
+                spec.label
+                for kind in ("hist", "2d")
+                for spec in _panel_param_decls(kind)
+            )
+        labels.add(_RELIM_PARAM.label)
+        widest = max(
+            (fluent_text_width(metrics, label) for label in labels),
+            default=0,
+        )
+        return max(
+            scaled_px(96, minimum=72),
+            widest + scaled_px(10),
+        )
+
     def _build_settings(self) -> None:
         """Build the main-UI flat Setting surface over current typed state."""
 
         popup = FluentPopup(self)
+        popup.setFixedWidth(scaled_px(380, minimum=340))
         outer = QtWidgets.QVBoxLayout(popup)
         outer.setContentsMargins(0, 0, 0, 0)
         self._settings_scroll = FluentScrollArea()
@@ -1921,6 +2005,11 @@ class PanelCard(FluentGroupBox):
         self._settings_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         content = QtWidgets.QWidget()
         content.setStyleSheet("background: transparent;")
+        content.setMinimumWidth(0)
+        content.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         self._settings_col = QtWidgets.QVBoxLayout(content)
         pad = scaled_px(10)
         self._settings_col.setContentsMargins(
@@ -1938,21 +2027,7 @@ class PanelCard(FluentGroupBox):
         display_specs = [
             spec for spec in _panel_param_decls(self.config.kind) if spec.display
         ] + [_RELIM_PARAM]
-        labels = [
-            "signal",
-            "size",
-            "view",
-            "facet",
-            "repeat",
-            "lo / hi",
-            "unit",
-            "update",
-            "title",
-            *(spec.label for spec in display_specs),
-        ]
-        fm = self.fontMetrics()
-        widest = max((fluent_text_width(fm, label) for label in labels), default=0)
-        label_w = max(scaled_px(80, minimum=56), widest + scaled_px(10))
+        label_w = self.setting_label_width(self.fontMetrics())
 
         def section(title):
             self._settings_col.addWidget(FluentSectionLabel(title))
@@ -2013,41 +2088,13 @@ class PanelCard(FluentGroupBox):
         )
         self.param_widgets = self._emit_param_rows(
             display_specs, display.addWidget, self._set_param, label_w)
-        self.grid_bins_row, self.grid_bins_widget = self._make_grid_bins_row(
+        self._mount_grid_row_inventory(
+            self,
+            display.addWidget,
             self._set_param,
             label_w,
+            self.param_widgets,
         )
-        if self.grid_bins_widget is not None:
-            self.param_widgets["bins"] = self.grid_bins_widget
-        display.addWidget(self.grid_bins_row)
-        self.grid_ylog_row, self.grid_ylog_widget = self._make_grid_hist_param_row(
-            "ylog",
-            self._set_param,
-            label_w,
-        )
-        if self.grid_ylog_widget is not None:
-            self.param_widgets["ylog"] = self.grid_ylog_widget
-        display.addWidget(self.grid_ylog_row)
-        self.grid_colormap_row, self.grid_colormap_widget = (
-            self._make_grid_cell_param_row(
-                "2d",
-                "colormap",
-                self._image_intent(),
-                self._set_param,
-                label_w,
-            )
-        )
-        if self.grid_colormap_widget is not None:
-            self.param_widgets["colormap"] = self.grid_colormap_widget
-        display.addWidget(self.grid_colormap_row)
-        (
-            self.grid_intent_row,
-            self.grid_intent_combo,
-            self.grid_facet_row,
-            self.grid_facet_combo,
-        ) = self._make_grid_view_rows(label_w)
-        display.addWidget(self.grid_intent_row)
-        display.addWidget(self.grid_facet_row)
         self.repeat_mode_row, self.repeat_mode_combo = self._make_repeat_mode_row(
             self._commit_repeat_mode,
             label_w,
@@ -2079,12 +2126,12 @@ class PanelCard(FluentGroupBox):
             FluentSettingRow("update", self.update_combo, label_width=label_w)
         )
 
-        # ---- Analysis: one Figure-owned Fit editor.  The Edit tab builds a
+        # ---- Fit: one Figure-owned editor.  The Edit tab builds a
         # second view through the same factory; both reconcile against the
         # card's one request/result state and neither opens a DataFigure window.
         self.fit_authoring_pane = None
         if self._fit_capable_kind():
-            analysis = section("Analysis")
+            analysis = section("Fit")
             self.fit_authoring_pane = self.make_fit_authoring_pane(popup)
             analysis.addWidget(self.fit_authoring_pane)
 
@@ -2324,142 +2371,22 @@ class PanelCard(FluentGroupBox):
         )
         return None if not terms else Selection(terms)
 
-    @staticmethod
-    def _facet_axis_ids(view):
-        from zlc_frontend.figure import AxisViewRole
-
-        return tuple(
-            binding.axis_id
-            for binding in view.axis_bindings
-            if binding.role is AxisViewRole.FACET
-        )
-
-    def _grid_candidate_view(self, intent, facet_axis_id):
-        """Resolve one explicit facet choice to the complete named facet tuple."""
-
-        from dataclasses import replace
-
-        from zlc_frontend.figure import (
-            AxisViewRole,
-            RepeatViewMode,
-            SuggestionStatus,
-            ViewPreferences,
-            dataset_contract_for,
-            suggest_view,
-        )
+    def _resolved_grid_view(self, intent, facet_axis_id, *, repeat_mode=None):
+        """Supply card state to the frontend's pure one-facet resolver."""
 
         schema = self._current_schema()
         if schema is None:
             return None
+        from zlc_frontend.figure import resolve_grid_view
+
         saved = self._saved_view_spec(schema)
-        selection = (
-            None
-            if saved is None
-            else self._display_selection_from_view(saved)
-        )
-        if saved is not None and saved.intent is intent:
-            repeat_mode = self._repeat_mode_from_view(saved, schema)
-            # Moving the explicit primary choice away from repeat restores the
-            # intent's ordinary repeat default.  Other contract-required FACET
-            # axes remain explicit in the resolved ViewSpec and are shown in
-            # the control's complete tuple.
-            if (
-                repeat_mode is RepeatViewMode.FACET
-                and facet_axis_id != schema.repeat_axis.axis_id
-            ):
-                repeat_mode = dataset_contract_for(intent).default_repeat_mode
-            preferences = self._preferences_from_view(
-                saved,
-                schema,
-                repeat_mode=(
-                    RepeatViewMode.FACET
-                    if facet_axis_id == schema.repeat_axis.axis_id
-                    else repeat_mode
-                ),
-                facet_axis_ids=(
-                    ()
-                    if facet_axis_id == schema.repeat_axis.axis_id
-                    else (facet_axis_id,)
-                ),
-            )
-        else:
-            preferences = ViewPreferences(
-                repeat_mode=(
-                    RepeatViewMode.FACET
-                    if facet_axis_id == schema.repeat_axis.axis_id
-                    else dataset_contract_for(intent).default_repeat_mode
-                ),
-                facet_axis_ids=(
-                    ()
-                    if facet_axis_id == schema.repeat_axis.axis_id
-                    else (facet_axis_id,)
-                ),
-            )
-        suggestion = suggest_view(
+        suggestion = resolve_grid_view(
             schema,
             intent,
-            selection,
-            preferences=preferences,
+            facet_axis_id,
+            current_view=saved,
+            repeat_mode=repeat_mode,
         )
-        # A named facet can still leave a display slot ambiguous.  For example,
-        # the MOT result has three equally typed SCAN_POINT axes: after the
-        # operator picks Bx as the primary facet, CURVE still needs one of
-        # By/Bz as X (and IMAGE needs both X and Y).  Do not restate the
-        # ViewContract's axis-role rules here.  Instead, consume only
-        # ``suggest_view``'s typed alternatives, exclude the already-authored
-        # facet, and choose the stable AxisId for that display-only slot.  A
-        # retry may expose the next IMAGE slot; each role is filled at most
-        # once, so this loop is bounded by the typed display-slot vocabulary.
-        auto_display_roles = set()
-        preference_field = {
-            AxisViewRole.X: "x_axis_id",
-            AxisViewRole.IMAGE_X: "image_x_axis_id",
-            AxisViewRole.IMAGE_Y: "image_y_axis_id",
-        }
-        while suggestion.status is SuggestionStatus.NEEDS_INPUT:
-            if not any(
-                reason.code == "AMBIGUOUS_DISPLAY_AXIS"
-                for reason in suggestion.reasons
-            ):
-                break
-            alternatives = tuple(
-                alternative
-                for alternative in suggestion.alternatives
-                if alternative.axis_id != facet_axis_id
-            )
-            roles = {alternative.binding_role for alternative in alternatives}
-            if len(roles) != 1:
-                break
-            role = next(iter(roles))
-            field = preference_field.get(role)
-            if (
-                field is None
-                or role in auto_display_roles
-                or getattr(preferences, field) is not None
-            ):
-                break
-            chosen = min(
-                alternatives,
-                key=lambda alternative: alternative.axis_id.value,
-            )
-            preferences = replace(
-                preferences,
-                **{field: chosen.axis_id},
-            )
-            auto_display_roles.add(role)
-            suggestion = suggest_view(
-                schema,
-                intent,
-                selection,
-                preferences=preferences,
-            )
-        if (
-            suggestion.status is SuggestionStatus.NEEDS_INPUT
-            or suggestion.spec is None
-            or suggestion.spec.binding(facet_axis_id).role
-            is not AxisViewRole.FACET
-        ):
-            return None
         return suggestion.spec
 
     def _catalog_default_grid_view(self, schema):
@@ -2479,46 +2406,43 @@ class PanelCard(FluentGroupBox):
             return None
         if facet_axis_id not in {axis.axis_id for axis in dataset_axes(schema)}:
             return None
-        candidate = self._grid_candidate_view(intent, facet_axis_id)
+        candidate = self._resolved_grid_view(intent, facet_axis_id)
         if candidate is None:
             return None
         self.config.params[_VIEW_SPEC_PARAM] = view_spec_to_tree(candidate)
         return candidate
 
     def _grid_facet_choices(self, intent):
-        from zlc_frontend.figure import dataset_axes
+        from zlc_frontend.figure import grid_facet_axes
 
         schema = self._current_schema()
         if schema is None:
             return ()
-        out = []
-        for axis in dataset_axes(schema):
-            if axis.size <= 1:
-                continue
-            view = self._grid_candidate_view(intent, axis.axis_id)
-            if view is not None:
-                out.append((axis, view))
-        return tuple(out)
+        saved = self._saved_view_spec(schema)
+        return grid_facet_axes(
+            schema,
+            intent,
+            current_view=saved,
+        )
 
     def _make_grid_view_rows(self, label_w, *, apply=None):
         apply = self._commit_grid_facet if apply is None else apply
         intent_combo = FluentComboBox()
         intent_combo.setToolTip(
-            "What every cell displays. This is a typed ViewIntent, not a "
-            "shape-derived plot guess."
+            "What each Grid cell draws. The selected family is resolved "
+            "against the dataset's declared axes."
         )
         facet_combo = FluentComboBox()
         facet_combo.setToolTip(
-            "Choose the primary declared facet. Each item shows the complete "
-            "named facet_axis_ids tuple persisted in the ViewSpec."
+            "Expand exactly one declared dataset axis into Grid cells."
         )
         intent_row = FluentSettingRow(
-            "cell view",
+            "sub plot",
             intent_combo,
             label_width=label_w,
         )
         facet_row = FluentSettingRow(
-            "facet axes",
+            "facet",
             facet_combo,
             label_width=label_w,
         )
@@ -2540,6 +2464,63 @@ class PanelCard(FluentGroupBox):
         intent_row.setVisible(visible)
         facet_row.setVisible(visible)
         return intent_row, intent_combo, facet_row, facet_combo
+
+    def _grid_row_inventory(self, apply, label_w):
+        """Build the one ordered Grid field inventory used by both surfaces."""
+
+        (
+            intent_row,
+            intent_combo,
+            facet_row,
+            facet_combo,
+        ) = self._make_grid_view_rows(label_w, apply=apply)
+        bins_row, bins_widget = self._make_grid_bins_row(apply, label_w)
+        ylog_row, ylog_widget = self._make_grid_hist_param_row(
+            "ylog",
+            apply,
+            label_w,
+        )
+        colormap_row, colormap_widget = self._make_grid_cell_param_row(
+            "2d",
+            "colormap",
+            self._image_intent(),
+            apply,
+            label_w,
+        )
+        # Attribute names are explicit here so neither host can reorder or
+        # silently omit a field while still claiming to share the same UI.
+        return (
+            ("grid_facet_row", "grid_facet_combo", None, facet_row, facet_combo),
+            ("grid_intent_row", "grid_intent_combo", None, intent_row, intent_combo),
+            ("grid_bins_row", "grid_bins_widget", "bins", bins_row, bins_widget),
+            ("grid_ylog_row", "grid_ylog_widget", "ylog", ylog_row, ylog_widget),
+            (
+                "grid_colormap_row",
+                "grid_colormap_widget",
+                "colormap",
+                colormap_row,
+                colormap_widget,
+            ),
+        )
+
+    def _mount_grid_row_inventory(
+        self,
+        owner,
+        add,
+        apply,
+        label_w,
+        param_widgets,
+    ) -> None:
+        """Mount the shared Grid rows without a second Setting/Edit schema."""
+
+        for row_name, widget_name, param_key, row, widget in (
+            self._grid_row_inventory(apply, label_w)
+        ):
+            setattr(owner, row_name, row)
+            setattr(owner, widget_name, widget)
+            if param_key is not None and widget is not None:
+                param_widgets[param_key] = widget
+            add(row)
 
     def _make_grid_hist_param_row(self, key: str, apply, label_w):
         """Build one histogram-only Grid knob through the shared param owner."""
@@ -2615,80 +2596,26 @@ class PanelCard(FluentGroupBox):
             return
         schema = self._current_schema()
         current = self._saved_view_spec(schema) if schema is not None else None
-        current_ids = (
-            ()
-            if current is None or current.intent is not intent
-            else tuple(
-                binding.axis_id
-                for binding in current.axis_bindings
-                if binding.role.value == "FACET"
-            )
-        )
-        preferred = next(
-            (
-                axis_id
-                for axis_id in current_ids
-                if axis_id != schema.repeat_axis.axis_id
-            ),
-            next(iter(current_ids), None),
-        ) if schema is not None else None
+        preferred = None
+        if current is not None and current.intent is intent:
+            from zlc_frontend.figure import grid_facet_axis
+
+            preferred = grid_facet_axis(current)
         with _signals_blocked(facet_combo):
             facet_combo.clear()
-            from zlc_frontend.figure import AxisViewRole, dataset_axes
-
-            axes_by_id = {
-                axis.axis_id: axis
-                for axis in (() if schema is None else dataset_axes(schema))
+            choices = self._grid_facet_choices(intent)
+            duplicate_names = {
+                axis.name
+                for axis in choices
+                if sum(item.name == axis.name for item in choices) > 1
             }
-
-            def axis_text(axis_id):
-                axis = axes_by_id.get(axis_id)
-                return (
-                    axis_id.value
-                    if axis is None
-                    else f"{axis.name} [{axis_id.value}]"
+            for axis in choices:
+                label = (
+                    f"{axis.name} [{axis.axis_id.value}]"
+                    if axis.name in duplicate_names
+                    else axis.name
                 )
-
-            for axis, view in self._grid_facet_choices(intent):
-                displayed_view = (
-                    current
-                    if (
-                        current is not None
-                        and current.intent is intent
-                        and axis.axis_id == preferred
-                    )
-                    else view
-                )
-                by_role = {
-                    binding.role: binding.axis_id
-                    for binding in displayed_view.axis_bindings
-                }
-                if AxisViewRole.X in by_role:
-                    display_summary = (
-                        f"auto x={axis_text(by_role[AxisViewRole.X])}"
-                    )
-                elif (
-                    AxisViewRole.IMAGE_X in by_role
-                    and AxisViewRole.IMAGE_Y in by_role
-                ):
-                    display_summary = (
-                        "auto "
-                        f"x={axis_text(by_role[AxisViewRole.IMAGE_X])} + "
-                        f"y={axis_text(by_role[AxisViewRole.IMAGE_Y])}"
-                    )
-                else:
-                    display_summary = "value distribution"
-                facet_summary = " × ".join(
-                    axis_text(axis_id)
-                    for axis_id in self._facet_axis_ids(displayed_view)
-                ) or "(none)"
-                facet_combo.addItem(
-                    (
-                        f"{axis.name} · {axis.role.value} → "
-                        f"{display_summary}; facets={facet_summary}"
-                    ),
-                    axis.axis_id,
-                )
+                facet_combo.addItem(label, axis.axis_id)
             index = facet_combo.findData(preferred)
             facet_combo.setCurrentIndex(index)
         facet_combo.setEnabled(facet_combo.count() > 0)
@@ -2736,7 +2663,7 @@ class PanelCard(FluentGroupBox):
     def _commit_grid_facet(self, intent, axis_id) -> bool:
         from zlc_frontend.figure import view_spec_to_tree
 
-        candidate = self._grid_candidate_view(intent, axis_id)
+        candidate = self._resolved_grid_view(intent, axis_id)
         if candidate is None:
             self.set_status(
                 "that named axis cannot form a complete typed grid view",
@@ -2779,6 +2706,21 @@ class PanelCard(FluentGroupBox):
         )
         if view.intent not in allowed_intents:
             raise ValueError("saved panel view belongs to a different panel kind")
+        if self.config.kind == "grid":
+            from zlc_frontend.figure import grid_facet_axis
+
+            try:
+                grid_facet_axis(view)
+            except ValueError:
+                # A Grid now authors one named facet, not an opaque tuple of
+                # axes.  Multi-facet values were produced by the removed Qt
+                # resolver and have no unambiguous control state to restore.
+                self.config.params.pop(_VIEW_SPEC_PARAM, None)
+                self.config.params.pop(
+                    _HISTOGRAM_CELL_THRESHOLDS_PARAM,
+                    None,
+                )
+                return None
         return view
 
     def _repeat_modes_for_current_schema(self):
@@ -2799,10 +2741,29 @@ class PanelCard(FluentGroupBox):
         from zlc_frontend.figure import RepeatViewMode, dataset_contract_for
 
         contract = dataset_contract_for(self._repeat_control_intent())
-        return tuple(
-            mode
-            for mode in contract.repeat_modes
-            if self.config.kind == "grid" or mode is not RepeatViewMode.FACET
+        if self.config.kind != "grid":
+            return tuple(
+                mode
+                for mode in contract.repeat_modes
+                if mode is not RepeatViewMode.FACET
+            )
+        view = self._saved_view_spec(schema)
+        if view is None:
+            return tuple(
+                mode
+                for mode in contract.repeat_modes
+                if mode is not RepeatViewMode.FACET
+            )
+        from zlc_frontend.figure import grid_facet_axis
+
+        return (
+            (RepeatViewMode.FACET,)
+            if grid_facet_axis(view) == schema.repeat_axis.axis_id
+            else tuple(
+                mode
+                for mode in contract.repeat_modes
+                if mode is not RepeatViewMode.FACET
+            )
         )
 
     def _repeat_mode_from_view(self, view, schema):
@@ -2875,7 +2836,7 @@ class PanelCard(FluentGroupBox):
                 index = combo.findData(selected)
                 combo.setCurrentIndex(max(0, index))
         row.setVisible(bool(modes))
-        combo.setEnabled(bool(modes))
+        combo.setEnabled(len(modes) > 1)
 
     def _make_repeat_mode_row(self, apply, label_w):
         from zlc_frontend.figure import RepeatViewMode
@@ -2928,34 +2889,15 @@ class PanelCard(FluentGroupBox):
         if self.config.kind == "grid":
             if saved is None:
                 return False
-            if mode is RepeatViewMode.FACET:
-                preferences = self._preferences_from_view(
-                    saved,
-                    schema,
-                    repeat_mode=mode,
-                    facet_axis_ids=(),
-                )
-            else:
-                from zlc_frontend.figure import AxisViewRole
+            from zlc_frontend.figure import grid_facet_axis, resolve_grid_view
 
-                facets = tuple(
-                    binding.axis_id
-                    for binding in saved.axis_bindings
-                    if binding.role is AxisViewRole.FACET
-                    and binding.axis_id != schema.repeat_axis.axis_id
-                )
-                if not facets:
-                    self.set_status(
-                        "choose a non-repeat facet axis before reducing repeats",
-                        error=True,
-                    )
-                    return False
-                preferences = self._preferences_from_view(
-                    saved,
-                    schema,
-                    repeat_mode=mode,
-                    facet_axis_ids=facets,
-                )
+            suggestion = resolve_grid_view(
+                schema,
+                intent,
+                grid_facet_axis(saved),
+                current_view=saved,
+                repeat_mode=mode,
+            )
         elif saved is not None:
             preferences = self._preferences_from_view(
                 saved,
@@ -2964,17 +2906,18 @@ class PanelCard(FluentGroupBox):
             )
         else:
             preferences = ViewPreferences(repeat_mode=mode)
-        selection = (
-            None
-            if saved is None
-            else self._display_selection_from_view(saved)
-        )
-        suggestion = suggest_view(
-            schema,
-            intent,
-            selection,
-            preferences=preferences,
-        )
+        if self.config.kind != "grid":
+            selection = (
+                None
+                if saved is None
+                else self._display_selection_from_view(saved)
+            )
+            suggestion = suggest_view(
+                schema,
+                intent,
+                selection,
+                preferences=preferences,
+            )
         if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
             self.set_status(
                 "repeat choice needs an explicit axis selection for this data",
@@ -3256,7 +3199,7 @@ class PanelCard(FluentGroupBox):
 
     def _refresh_title(self) -> None:
         """Compose the grey frame TITLE: the panel KIND + WHERE its signal comes from (the
-        legend the console computes), e.g. ``1D vector — value ← Analysis``.  This is
+        legend the console computes), e.g. ``1D vector — value ← Fit``.  This is
         the ordinary QGroupBox title -- the grey chip, alignment and font are the frame's own."""
         head = PANEL_KINDS[self.config.kind]
         info = " · ".join(p for p in self._signal_info.splitlines() if p.strip())
@@ -3505,6 +3448,9 @@ class PanelCard(FluentGroupBox):
         self._pending_value = None
         self._render_request_revision += 1
         self._requested_signature = None
+        self._latest_requested_source_ref = None
+        self._latest_requested_source_key = None
+        self._latest_requested_display_revision = None
 
     def _teardown_plot(self) -> None:
         """Drop this card's surface, leaving nothing painted behind it.
@@ -3552,6 +3498,9 @@ class PanelCard(FluentGroupBox):
         self._presented_value = None
         self._clear_figure_outputs(notify=False)
         self._requested_signature = None
+        self._latest_requested_source_ref = None
+        self._latest_requested_source_key = None
+        self._latest_requested_display_revision = None
         if board is not None:
             self.canvas_holder.removeWidget(board)
             board.setParent(None)

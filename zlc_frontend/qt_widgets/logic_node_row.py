@@ -14,7 +14,14 @@ from PyQt5 import QtCore, QtWidgets
 
 from zlc_data.console_records import LogicNodeConfig
 
-from .fluent import FluentButton, FluentFrame, FluentLabel, FluentStatusDot, scaled_px
+from .fluent import (
+    ElidedLabel,
+    FluentButton,
+    FluentFrame,
+    FluentLabel,
+    FluentStatusDot,
+    scaled_px,
+)
 from .style import ACCENT, GREEN, GREY, ORANGE, RED
 
 __all__ = ["LogicNodeRow"]
@@ -40,6 +47,11 @@ class LogicNodeRow(FluentFrame):
     def __init__(self, node: LogicNodeConfig, parent=None):
         super().__init__(parent)
         self.node = node
+        self.setMinimumWidth(0)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(scaled_px(12), scaled_px(8), scaled_px(12), scaled_px(8))
         outer.setSpacing(scaled_px(4, minimum=3))
@@ -49,10 +61,20 @@ class LogicNodeRow(FluentFrame):
         top.setSpacing(scaled_px(10, minimum=6))
         self.dot = FluentStatusDot(size=14)
         self.dot.set_color(GREY)
-        self.name_label = FluentLabel(node.title)
+        self.name_label = ElidedLabel(node.title)
+        self.name_label.setMinimumWidth(0)
+        self.name_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         self.kind_label = FluentLabel(f"({node.kind})")
         self.kind_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-        self.status_label = FluentLabel("stopped")
+        self.status_label = ElidedLabel("stopped")
+        self.status_label.setMinimumWidth(0)
+        self.status_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         self.status_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
         self.start_button = FluentButton("Start", color=GREEN)
         self.start_button.setFixedWidth(scaled_px(60, minimum=48))
@@ -68,9 +90,9 @@ class LogicNodeRow(FluentFrame):
         remove.setFixedWidth(scaled_px(82, minimum=66))
         remove.clicked.connect(lambda: self.remove_requested.emit(self))
         top.addWidget(self.dot, 0)
-        top.addWidget(self.name_label, 0)
+        top.addWidget(self.name_label, 1)
         top.addWidget(self.kind_label, 0)
-        top.addWidget(self.status_label, 1)
+        top.addWidget(self.status_label, 2)
         for b in (self.start_button, self.stop_button, edit_button, remove):
             top.addWidget(b, 0)
         outer.addLayout(top)
@@ -82,6 +104,11 @@ class LogicNodeRow(FluentFrame):
         # horizontal scroll (#2).  The publishes legend is name + shape only (short, fits) -- the longer
         # per-signal meaning lives in the tooltip, so nothing forces the card wider than the column.
         self.publishes_label.setWordWrap(True)
+        self.publishes_label.setMinimumWidth(0)
+        self.publishes_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         self.publishes_label.setStyleSheet(
             f"color: {GREY}; background: transparent; border: none; "
             "font-family: Consolas, 'DejaVu Sans Mono', monospace;")

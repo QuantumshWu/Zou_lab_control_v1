@@ -358,7 +358,7 @@ class _FitWorkbenchBindings:
     reload: object
     selected_model: str | None = None
     initial_selection: Selection | None = None
-    open_analysis: bool = False
+    open_fit: bool = False
     timeout_seconds: float = _DEFAULT_FIT_TIMEOUT_SECONDS
     save_requires_path: bool = False
     initial_save_path: object | None = None

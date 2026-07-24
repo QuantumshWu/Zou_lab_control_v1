@@ -9,11 +9,18 @@ from zlc_storage import canonical_text
 from ..render import BoardFrame
 from ._raster_front import (
     _aspect_target_for_source,
-    _image_payload,
-    _image_source_rect,
     _prepared_qimage,
 )
 from .style import BG
+
+
+def _full_image_rect(image: QtGui.QImage) -> QtCore.QRectF:
+    return QtCore.QRectF(
+        0.0,
+        0.0,
+        float(image.width()),
+        float(image.height()),
+    )
 
 
 class FrozenRasterView(QtWidgets.QWidget):
@@ -105,15 +112,7 @@ class FrozenRasterView(QtWidgets.QWidget):
                 painter.drawText(self.rect(), QtCore.Qt.AlignCenter, self._empty_text)
             return
         image = front[1]
-        payload = (
-            None
-            if self._front_frame is None
-            else _image_payload(self._front_frame.panels[0])
-        )
-        source = _image_source_rect(
-            image,
-            None if payload is None else payload.viewport,
-        )
+        source = _full_image_rect(image)
         painter.drawImage(
             QtCore.QRectF(_aspect_target_for_source(self.rect(), source)),
             image,
@@ -130,15 +129,7 @@ class FrozenRasterView(QtWidgets.QWidget):
             return
         front = self._front
         if front is not None:
-            payload = (
-                None
-                if self._front_frame is None
-                else _image_payload(self._front_frame.panels[0])
-            )
-            source = _image_source_rect(
-                front[1],
-                None if payload is None else payload.viewport,
-            )
+            source = _full_image_rect(front[1])
             target = _aspect_target_for_source(self.rect(), source)
             position = event.pos()
             if target.contains(position) and target.width() > 0 and target.height() > 0:
@@ -211,15 +202,7 @@ class FrozenRasterView(QtWidgets.QWidget):
         front = self._front
         if front is None:
             return None
-        payload = (
-            None
-            if self._front_frame is None
-            else _image_payload(self._front_frame.panels[0])
-        )
-        source = _image_source_rect(
-            front[1],
-            None if payload is None else payload.viewport,
-        )
+        source = _full_image_rect(front[1])
         target = _aspect_target_for_source(self.rect(), source)
         if target.width() <= 0 or target.height() <= 0:
             return None

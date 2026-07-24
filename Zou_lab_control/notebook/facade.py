@@ -110,6 +110,11 @@ from zlc_neutral_atom.readout.calibration_reference import (
     CalibrationArtifactRef,
     calibration_artifact_ref_to_tree,
 )
+from zlc_neutral_atom.readout.calibration_task_output import (
+    CalibrationTaskOutput,
+    read_calibration_task_output,
+    write_calibration_task_output,
+)
 from zlc_neutral_atom.readout.coupled_measurements import (
     AutonomousMeasurementUnavailable,
     GREY_MOLASSES_CAPABILITY_GAP,
@@ -1590,20 +1595,9 @@ class ReadoutFacade:
             raise TypeError("save_frames must be bool")
         root = Path(folder).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
-        (root / "calibration_ref.json").write_text(
-            json.dumps(
-                {
-                    "schema": "zlc.calibration-task.result.v1",
-                    "calibration_ref": calibration_artifact_ref_to_tree(calibration),
-                    "source_capture_ref": capture_artifact_ref_to_tree(source),
-                    "artifact_owner": "CalibrationRepository",
-                    "report_owner": "CalibrationRepository",
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
+        write_calibration_task_output(
+            root / "calibration_ref.json",
+            CalibrationTaskOutput(calibration, source),
         )
         if not save_frames:
             return
@@ -1748,6 +1742,25 @@ class ReadoutFacade:
             )
             self._require_binding(resolved.artifact.frame_contract.binding)
             return resolved
+
+    def load_saved_calibration(
+        self,
+        calibration_ref_file: str | Path,
+    ) -> ResolvedCalibration:
+        """Admit the exact calibration named by one task-output pointer.
+
+        This is an explicit file selection, never a ``latest`` lookup.  The
+        pointer's capture edge is checked against the admitted artifact so a
+        copied or edited pointer cannot silently join unrelated provenance.
+        """
+
+        output = read_calibration_task_output(calibration_ref_file)
+        resolved = self.load_calibration(output.calibration_ref)
+        if resolved.artifact.source_capture_ref != output.source_capture_ref:
+            raise ValueError(
+                "saved calibration pointer names another source capture"
+            )
+        return resolved
 
     def load_calibration_computation(
         self,
@@ -2685,7 +2698,7 @@ class Experiment:
         selected_model: str | None = None,
         initial_fit_spec: FitSpec | None = None,
         initial_selection: Selection | None = None,
-        open_analysis: bool = False,
+        open_fit: bool = False,
         timeout_seconds: float = _DEFAULT_FIT_GUI_TIMEOUT_SECONDS,
         initial_fit_result_identity: str | None = None,
         direct_fit_single_panel: bool = False,
@@ -2922,7 +2935,7 @@ class Experiment:
             fit_reloader=reload_fit_result,
             fit_selected_model=chosen_model,
             fit_initial_selection=initial_selection,
-            open_fit_analysis=open_analysis,
+            open_fit=open_fit,
             fit_timeout_seconds=timeout,
             initial_fit_result_identity=initial_fit_result_identity,
         )
@@ -2935,7 +2948,7 @@ class Experiment:
         committed_transform: CommittedTransform | None = None,
         timeout_seconds: float = _DEFAULT_FIT_GUI_TIMEOUT_SECONDS,
     ):
-        """Open the same DataFigure host with its Analysis tab selected."""
+        """Open the same DataFigure host with its Fit tab selected."""
 
         if not isinstance(source, (CaptureArtifactRef, ScanArtifactRef)):
             raise TypeError("source must be CaptureArtifactRef or ScanArtifactRef")
@@ -2960,7 +2973,7 @@ class Experiment:
             occupancy_output=None,
             selected_model=model,
             initial_selection=initial_selection,
-            open_analysis=True,
+            open_fit=True,
             timeout_seconds=timeout_seconds,
             direct_fit_single_panel=True,
         )
@@ -3199,7 +3212,7 @@ class Experiment:
                     selected_model=result.spec.model_id,
                     initial_fit_spec=result.spec,
                     initial_selection=authority_selection,
-                    open_analysis=True,
+                    open_fit=True,
                 )
 
             from Zou_lab_control.workbench import open_saved_fit_grid_workbench

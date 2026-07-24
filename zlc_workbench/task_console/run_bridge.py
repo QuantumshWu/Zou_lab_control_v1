@@ -74,6 +74,10 @@ class ConsoleRunNode:
             if frozen_request is _BUILD_REQUEST
             else frozen_request
         )
+        # Freeze the output vocabulary beside the request.  Camera output
+        # cardinality is request state (frames_per_cycle), not a late guess from
+        # whichever Dataset revision happens to reach the GUI first.
+        self._output_declarations = tuple(spec.outputs_for(self._values))
         self._handle = None
         self._start_future: Future | None = None
         self._start_pending = False
@@ -89,6 +93,7 @@ class ConsoleRunNode:
         self._projected_final_signals = None
         self._final_projection_error: str | None = None
         self._error: str | None = None
+        self._start_exception: BaseException | None = None
         self._stop_requested = False
         self._stop_reason = "Console user requested stop"
         self._starter = None
@@ -133,7 +138,15 @@ class ConsoleRunNode:
         from overwriting one another in the board data plane.
         """
 
-        return tuple(self.signal_key(item.name) for item in self._spec.declared_outputs)
+        return tuple(
+            self.signal_key(item.name) for item in self._output_declarations
+        )
+
+    @property
+    def output_declarations(self) -> tuple:
+        """The exact output vocabulary frozen with this node's request."""
+
+        return self._output_declarations
 
     @property
     def request(self):
@@ -148,6 +161,17 @@ class ConsoleRunNode:
     @property
     def last_error(self) -> str | None:
         return self._error
+
+    @property
+    def start_exception(self) -> BaseException | None:
+        """Structured exception from the most recent start submission.
+
+        Normal presentation uses :attr:`last_error`.  The TaskConsole shell also
+        needs an exact ``RunStartRejected`` payload to retire a conflicting Logic
+        row without parsing text or weakening runtime admission.
+        """
+
+        return self._start_exception
 
     @property
     def final_result(self):
@@ -292,6 +316,7 @@ class ConsoleRunNode:
         if self.running or self._start_pending:
             return
         self._error = None
+        self._start_exception = None
         self._stop_requested = False
         self._cancelled_before_start = False
         self._stop_event.clear()
@@ -371,6 +396,7 @@ class ConsoleRunNode:
                     self._owner.mark_owner_reaped()
                     continue
                 self._error = f"{type(error).__name__}: {error}"
+                self._start_exception = error
                 self._handle = None
                 self._snapshot = None
                 self._final_result = _UNRESOLVED_FINAL

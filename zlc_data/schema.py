@@ -8,7 +8,7 @@ import numpy as np
 from zlc_storage.canonical import canonical_text
 
 from ._arrays import canonical_dtype
-from .axis import AxisId, AxisSpec, REPEAT
+from .axis import AxisId, AxisSpec, REPEAT, SCALAR, SCALAR_AXIS
 from .layout import AxisLayout, PointLayout
 from .validity import ValidityContract, ValidityMode
 
@@ -41,10 +41,21 @@ class ValueSchema:
         axes = tuple(self.data_axes)
         if any(not isinstance(axis, AxisSpec) for axis in axes):
             raise TypeError("data_axes must contain AxisSpec values")
+        if not axes:
+            raise ValueError(
+                "data_axes must be non-empty; use ValueSchema.scalar() for a scalar value"
+            )
+        scalar_axes = tuple(axis for axis in axes if axis.role == SCALAR)
+        if scalar_axes and axes != (SCALAR_AXIS,):
+            raise ValueError(
+                "the canonical scalar carrier must be the sole data axis"
+            )
         _unique_axis_ids(axes, context="data")
         object.__setattr__(self, "data_axes", axes)
         if not isinstance(self.validity_contract, ValidityContract):
             raise TypeError("validity_contract must be ValidityContract")
+        if scalar_axes and self.validity_contract.mode is not ValidityMode.VALUE:
+            raise ValueError("the scalar carrier uses value-level validity")
         object.__setattr__(self, "dtype", canonical_dtype(self.dtype))
         if self.value_unit is not None:
             canonical_text(self.value_unit, "value_unit")
@@ -61,6 +72,23 @@ class ValueSchema:
     @property
     def data_shape(self) -> tuple[int, ...]:
         return tuple(axis.size for axis in self.data_axes)
+
+    @property
+    def is_scalar(self) -> bool:
+        return self.data_axes == (SCALAR_AXIS,)
+
+    @classmethod
+    def scalar(
+        cls,
+        dtype: np.dtype,
+        value_unit: str | None = None,
+    ) -> "ValueSchema":
+        return cls(
+            (SCALAR_AXIS,),
+            ValidityContract.value(),
+            dtype,
+            value_unit,
+        )
 
     @property
     def fingerprint(self) -> str:
@@ -98,6 +126,8 @@ class DatasetSchema:
             for axis in points + self.cell_schema.data_axes
         ):
             raise ValueError("REPEAT role belongs only to DatasetSchema.repeat_axis")
+        if any(axis.role == SCALAR for axis in points):
+            raise ValueError("SCALAR role belongs only to ValueSchema.data_axes")
         logical_shape = tuple(axis.size for axis in points)
         if self.point_layout.logical_shape != logical_shape:
             raise ValueError(

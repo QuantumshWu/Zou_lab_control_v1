@@ -396,12 +396,7 @@ def _output_contract(
             "survival",
         )
         if spec.per_site
-        else ValueSchema(
-            (),
-            ValidityContract.value(),
-            np.dtype("<f8"),
-            "survival",
-        )
+        else ValueSchema.scalar(np.dtype("<f8"), "survival")
     )
     # Removing the one READOUT_EVENT axis leaves exactly the scan layout whose
     # rows were frozen by the Measurement binder.
@@ -602,12 +597,12 @@ class ExactReleaseRecaptureTransaction:
             denominator = int(np.count_nonzero(initially_occupied))
             if denominator:
                 values = np.asarray(
-                    np.count_nonzero(survived) / denominator,
+                    [np.count_nonzero(survived) / denominator],
                     dtype="<f8",
                 )
                 validity = VALID
             else:
-                values = np.asarray(0.0, dtype="<f8")
+                values = np.asarray([0.0], dtype="<f8")
                 validity = INVALID
         return ReleaseRecaptureSample(
             Value(values, validity, schema),

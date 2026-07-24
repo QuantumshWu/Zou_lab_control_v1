@@ -375,7 +375,7 @@ def create_data_figure_pane(
     local_fit_initial_selection: Selection | None = None,
     local_fit_archive_path: str | Path | None = None,
     local_fit_archive_metadata: Mapping[str, object] | None = None,
-    open_fit_analysis: bool = False,
+    open_fit: bool = False,
     embedded: bool = True,
     size_name: str | None = None,
     pixel_ratio: float = 1.0,
@@ -404,8 +404,8 @@ def create_data_figure_pane(
         )
     ):
         raise ValueError("local Fit options require local_fit=True")
-    if not local_fit and open_fit_analysis:
-        raise ValueError("open_fit_analysis requires local_fit=True")
+    if not local_fit and open_fit:
+        raise ValueError("open_fit requires local_fit=True")
     fit_bindings = None
     if local_fit:
         from .local_fit import local_fit_bindings
@@ -413,7 +413,7 @@ def create_data_figure_pane(
         fit_bindings = local_fit_bindings(
             figure,
             initial_selection=local_fit_initial_selection,
-            open_analysis=open_fit_analysis,
+            open_fit=open_fit,
             archive_path=local_fit_archive_path,
             archive_metadata=local_fit_archive_metadata,
         )
@@ -448,14 +448,14 @@ def open_data_figure_workbench(
     )
 
 
-def open_local_data_figure_analysis(
+def open_local_data_figure_fit(
     figure: DataFigure,
     *,
     initial_selection: Selection | None = None,
     archive_path: str | Path | None = None,
     archive_metadata: Mapping[str, object] | None = None,
     initial_display: _TypedDisplayState | None = None,
-    open_analysis: bool = True,
+    open_fit: bool = True,
 ) -> DataFigureWindow:
     """Open one frozen panel in the sole DataFigure/Fit host.
 
@@ -471,7 +471,7 @@ def open_local_data_figure_analysis(
     bindings = local_fit_bindings(
         figure,
         initial_selection=initial_selection,
-        open_analysis=open_analysis,
+        open_fit=open_fit,
         archive_path=archive_path,
         archive_metadata=archive_metadata,
     )
@@ -498,7 +498,7 @@ def open_figure_workbench(
     fit_reloader=None,
     fit_selected_model: str | None = None,
     fit_initial_selection: Selection | None = None,
-    open_fit_analysis: bool = False,
+    open_fit: bool = False,
     fit_timeout_seconds: float = _DEFAULT_FIT_TIMEOUT_SECONDS,
     initial_fit_result_identity: str | None = None,
 ) -> DataFigureWindow:
@@ -542,7 +542,7 @@ def open_figure_workbench(
             fit_reloader,
             selected_model=fit_selected_model,
             initial_selection=fit_initial_selection,
-            open_analysis=bool(open_fit_analysis),
+            open_fit=bool(open_fit),
             timeout_seconds=fit_timeout_seconds,
         )
     options = {
@@ -565,5 +565,5 @@ __all__ = [
     "create_data_figure_pane",
     "open_data_figure_workbench",
     "open_figure_workbench",
-    "open_local_data_figure_analysis",
+    "open_local_data_figure_fit",
 ]

@@ -5,7 +5,7 @@ Pure Qt, per the placement axiom.
 
 from __future__ import annotations
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 from zlc_data.param_decl import ParamDecl
 
@@ -52,9 +52,15 @@ class LogicNodeEditor(QtWidgets.QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         scroll = FluentScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         outer.addWidget(scroll)
         page = QtWidgets.QWidget()
         page.setStyleSheet("background: transparent;")
+        page.setMinimumWidth(0)
+        page.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         scroll.setWidget(page)
         col = QtWidgets.QVBoxLayout(page)
         m = scaled_px(10, minimum=6)
