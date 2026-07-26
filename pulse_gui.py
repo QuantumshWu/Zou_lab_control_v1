@@ -52,7 +52,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     application = ensure_qt_app()
     remote_endpoint = None
     if args.remote_host:
-        host = str(args.remote_host)
+        host = str(args.remote_host).strip()
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
         remote_endpoint = (
             f"[{host}]:{args.remote_port}" if ":" in host else f"{host}:{args.remote_port}"
         )

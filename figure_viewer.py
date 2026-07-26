@@ -32,13 +32,15 @@ def main(argv: list[str] | None = None) -> int:
     from zlc_workbench.figure_viewer.app import open_figure_viewer
 
     app = ensure_qt_app()
-    open_figure_viewer(path=args.path, scale=args.scale)
+    viewer = open_figure_viewer(path=args.path, scale=args.scale)
 
     auto_close_ms = os.environ.get("ZLC_FIGURE_VIEWER_AUTO_CLOSE_MS")
     if auto_close_ms:
-        QtCore.QTimer.singleShot(int(auto_close_ms), app.quit)
-    app.exec_()
-    return 0
+        QtCore.QTimer.singleShot(
+            max(0, int(auto_close_ms)),
+            viewer.window().close,
+        )
+    return int(app.exec_())
 
 
 if __name__ == "__main__":

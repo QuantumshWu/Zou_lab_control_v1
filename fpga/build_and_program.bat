@@ -53,7 +53,7 @@ if not "%~1"=="" if "%MODE%"=="all" if not defined ZLC_FORCE_BUILD (
   goto zlc_help
 )
 
-call :zlc_find_vivado
+call "%FPGA_DIR%_resolve_tools.bat" vivado
 if errorlevel 1 exit /b 1
 call :zlc_default_paths
 call :zlc_verify_sources
@@ -77,6 +77,8 @@ if /I "%MODE%"=="program" goto zlc_program
 
 rem Only a real build/check may derive source files from streamer_config.json.
 rem Diagnose/program/flash consume the already-built frozen artifact and must be read-only.
+call "%FPGA_DIR%_resolve_tools.bat" python "%REPO_ROOT%"
+if errorlevel 1 exit /b 1
 call :zlc_resolve_part
 call :zlc_emit_geom
 if errorlevel 1 exit /b 1
@@ -210,13 +212,11 @@ exit /b 0
 :zlc_resolve_part
 rem Single source: take the synthesis part from fpga\board_config\streamer_config.json
 rem (unless ZLC_PS_FPGA_PART is already set) and export it so create_project.tcl targets
-rem the configured board.  Pure read; never fails the build if python/config is missing.
+rem the configured board.  Python was resolved once at the build boundary above.
 if not "%ZLC_PS_FPGA_PART%"=="" goto :zlc_resolve_part_done
-where python >nul 2>nul
-if errorlevel 1 goto :zlc_resolve_part_done
 set "ZLC_CFG_JSON=%REPO_ROOT%\fpga\board_config\streamer_config.json"
 if not exist "%ZLC_CFG_JSON%" goto :zlc_resolve_part_done
-for /f "delims=" %%I in ('python -c "import json;print(json.load(open(r'%ZLC_CFG_JSON%'))['fpga_part'])" 2^>nul') do set "ZLC_PS_FPGA_PART=%%I"
+for /f "delims=" %%I in ('%ZLC_PY_CMD% -c "import json;print(json.load(open(r'%ZLC_CFG_JSON%'))['fpga_part'])" 2^>nul') do set "ZLC_PS_FPGA_PART=%%I"
 :zlc_resolve_part_done
 if not "%ZLC_PS_FPGA_PART%"=="" echo ZLC synthesis part: %ZLC_PS_FPGA_PART% (from streamer_config.json / env)
 exit /b 0
@@ -228,18 +228,13 @@ rem parameter defaults + LAYOUT_FINGERPRINT the .v `include) IN PLACE, so editin
 rem the SYNTHESIZED bitstream (IP depths + every RTL geometry param + the connect fingerprint) with
 rem no hand edits.  This routine is called only for a real build/check and fails closed: synthesis
 rem must never proceed with a stale header or a partially generated geometry file.
-where python >nul 2>nul
-if errorlevel 1 (
-  echo ERROR: Python is required to derive the FPGA geometry for a build.
-  exit /b 1
-)
 pushd "%REPO_ROOT%"
 set "PYTHONPATH=%CD%;%PYTHONPATH%"
-python -m fpga.pulse_streamer.host.image --emit-geometry-vh "%STREAMER_DIR%\zlc_geometry.vh" >nul 2>nul
+%ZLC_PY_CMD% -m fpga.pulse_streamer.host.image --emit-geometry-vh "%STREAMER_DIR%\zlc_geometry.vh" >nul 2>nul
 if errorlevel 1 goto zlc_emit_geom_fail
 if "%ZLC_PS_GEOM_TCL%"=="" (
   set "ZLC_GEOM_OUT=%ZLC_PS_BUILD_ROOT%\geom.tcl"
-  python -m fpga.pulse_streamer.host.image --emit-geom-tcl "!ZLC_GEOM_OUT!" >nul 2>nul
+  %ZLC_PY_CMD% -m fpga.pulse_streamer.host.image --emit-geom-tcl "!ZLC_GEOM_OUT!" >nul 2>nul
   if errorlevel 1 goto zlc_emit_geom_fail
   set "ZLC_PS_GEOM_TCL=!ZLC_GEOM_OUT!"
 )
@@ -255,17 +250,15 @@ exit /b 1
 
 :zlc_compute_src_hash
 rem Hash the files that go into the bitstream (engine + top + build tcl + program tcl + XDC +
-rem board config + the generated geom tcl).  ZLC_SRC_HASH stays empty if python is missing ->
-rem then the skip is simply disabled (always rebuild), never a wrong skip.
+rem board config + the generated geom tcl).  Failure leaves ZLC_SRC_HASH empty, so the
+rem skip is disabled (always rebuild), never a wrong skip.
 set "ZLC_SRC_HASH="
-where python >nul 2>nul
-if errorlevel 1 exit /b 0
 set "ZLC_HASH_GEOM="
 if defined ZLC_PS_GEOM_TCL if exist "%ZLC_PS_GEOM_TCL%" set "ZLC_HASH_GEOM=%ZLC_PS_GEOM_TCL%"
 rem Hash EVERY synthesized HDL create_project.tcl reads -- INCLUDING zlc_uart_bridge.v.  Omitting it
 rem meant a UART-bridge edit did not invalidate the build cache, so the bat "skipped build" and
 rem re-programmed a stale bitstream (the byte-mux fix silently never made it onto the board).
-for /f "delims=" %%H in ('python "%STREAMER_DIR%\host\src_hash.py" "%STREAMER_DIR%\zlc_edge_streamer.v" "%STREAMER_DIR%\zlc_uart_bridge.v" "%STREAMER_DIR%\zlc_pulse_streamer_top.v" "%STREAMER_DIR%\zlc_geometry.vh" "%STREAMER_DIR%\!ZLC_CREATE_TCL!" "%STREAMER_DIR%\!ZLC_PROGRAM_TCL!" "!ZLC_SELECTED_XDC!" "%REPO_ROOT%\fpga\board_config\streamer_config.json" "!ZLC_HASH_GEOM!" 2^>nul') do set "ZLC_SRC_HASH=%%H"
+for /f "delims=" %%H in ('%ZLC_PY_CMD% "%STREAMER_DIR%\host\src_hash.py" "%STREAMER_DIR%\zlc_edge_streamer.v" "%STREAMER_DIR%\zlc_uart_bridge.v" "%STREAMER_DIR%\zlc_pulse_streamer_top.v" "%STREAMER_DIR%\zlc_geometry.vh" "%STREAMER_DIR%\!ZLC_CREATE_TCL!" "%STREAMER_DIR%\!ZLC_PROGRAM_TCL!" "!ZLC_SELECTED_XDC!" "%REPO_ROOT%\fpga\board_config\streamer_config.json" "!ZLC_HASH_GEOM!" 2^>nul') do set "ZLC_SRC_HASH=%%H"
 exit /b 0
 
 :zlc_check_prebuilt
@@ -293,16 +286,11 @@ if not exist "%ZLC_PS_PROJECT_DIR%\" exit /b 0
 exit /b 0
 
 :zlc_print_capacity_estimate
-where python >nul 2>nul
-if errorlevel 1 (
-  echo ZLC capacity estimate skipped: python was not found on PATH.
-  exit /b 0
-)
 set "ZLC_EST_PART=%ZLC_PS_FPGA_PART%"
 if "%ZLC_EST_PART%"=="" set "ZLC_EST_PART=xc7a35tfgg484-2"
 pushd "%REPO_ROOT%"
 set "PYTHONPATH=%CD%;%PYTHONPATH%"
-python -m fpga.pulse_streamer.host.image --part "%ZLC_EST_PART%"
+%ZLC_PY_CMD% -m fpga.pulse_streamer.host.image --part "%ZLC_EST_PART%"
 popd
 exit /b 0
 
@@ -322,37 +310,6 @@ rem run/.Xil temp path under the Windows MAX_PATH limit without leaving fpga/.
 if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\!ZLC_PROJ_SUB!"
 if not defined ZLC_PS_LOG_DIR set "ZLC_PS_LOG_DIR=%ZLC_PS_BUILD_ROOT%\logs"
 echo ZLC build root: %ZLC_PS_BUILD_ROOT%
-exit /b 0
-
-:zlc_find_vivado
-if not "%ZLC_PS_VIVADO_BIN%"=="" goto zlc_vivado_found
-if not "%ZLC_VIVADO_BIN%"=="" set "ZLC_PS_VIVADO_BIN=%ZLC_VIVADO_BIN%"
-if not "%ZLC_PS_VIVADO_BIN%"=="" goto zlc_vivado_found
-
-for %%V in (2019.1 2019.2 2020.1 2020.2 2021.1 2021.2 2022.1 2022.2 2023.1 2023.2 2024.1 2024.2 2025.1 2025.2) do (
-  if exist "C:\Xilinx\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\%%V\bin\vivado.bat"
-  if exist "D:\Xilinx\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=D:\Xilinx\Vivado\%%V\bin\vivado.bat"
-)
-rem Future-proof: also glob any Vivado version directory in the default install roots
-rem (so a newer release than the list above is still auto-found); last match wins (newest).
-for /d %%V in ("C:\Xilinx\Vivado\*" "D:\Xilinx\Vivado\*") do (
-  if exist "%%~V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=%%~V\bin\vivado.bat"
-)
-if not "%ZLC_PS_VIVADO_BIN%"=="" goto zlc_vivado_found
-
-for /f "delims=" %%I in ('where vivado.bat 2^>nul') do if "%ZLC_PS_VIVADO_BIN%"=="" set "ZLC_PS_VIVADO_BIN=%%I"
-if not "%ZLC_PS_VIVADO_BIN%"=="" goto zlc_vivado_found
-
-where vivado >nul 2>nul
-if not errorlevel 1 set "ZLC_PS_VIVADO_BIN=vivado"
-if not "%ZLC_PS_VIVADO_BIN%"=="" goto zlc_vivado_found
-
-echo Could not find Vivado.
-echo Set ZLC_PS_VIVADO_BIN to the full path of vivado.bat.
-exit /b 1
-
-:zlc_vivado_found
-echo ZLC Vivado: %ZLC_PS_VIVADO_BIN%
 exit /b 0
 
 :zlc_run_tcl

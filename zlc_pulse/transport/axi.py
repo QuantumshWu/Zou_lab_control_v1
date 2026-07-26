@@ -21,9 +21,7 @@ _AXI_BURST_BOUNDARY_BYTES = 4096
 
 
 def _default_vivado() -> str:
-    return os.environ.get("ZLC_PS_VIVADO_BIN") or os.environ.get(
-        "ZLC_VIVADO_BIN", "vivado"
-    )
+    return os.environ.get("ZLC_PS_VIVADO_BIN", "vivado")
 
 
 def _default_probes() -> str | None:

@@ -97,10 +97,10 @@ if errorlevel 1 (
 )
 
 echo.
-echo Remembering this Python for pulse_gui.bat...
+echo Remembering this Python for the repository launchers...
 %PYTHON_CMD% -c "import sys, pathlib; pathlib.Path(r'%~dp0.zlc_python_path').write_text(sys.executable, encoding='utf-8')"
 if errorlevel 1 (
-    echo Warning: could not write .zlc_python_path. pulse_gui.bat can still use PATH or ZLC_PULSE_GUI_PYTHON.
+    echo Warning: could not write .zlc_python_path. Launchers can still use PATH or their explicit Python override.
 )
 
 echo.
@@ -131,7 +131,7 @@ echo   install_requirements.bat
 echo   install_requirements.bat C:\path\to\python.exe
 echo.
 echo The script installs this repo with its declared pyproject extras,
-echo registers the Jupyter kernel, and writes .zlc_python_path for pulse_gui.bat.
+echo registers the Jupyter kernel, and writes .zlc_python_path for the repository launchers.
 exit /b 0
 
 :from_vscode_settings

@@ -29,7 +29,7 @@ shift /1
 set "REPO_ROOT=%~dp0"
 if "%REPO_ROOT:~-1%"=="\" set "REPO_ROOT=%REPO_ROOT:~0,-1%"
 
-call :zlc_find_python
+call "%REPO_ROOT%\fpga\_resolve_tools.bat" python "%REPO_ROOT%"
 if errorlevel 1 exit /b 2
 
 pushd "%REPO_ROOT%"
@@ -42,33 +42,3 @@ echo.
 set "ZLC_RC=%ERRORLEVEL%"
 popd
 exit /b %ZLC_RC%
-
-:zlc_find_python
-if defined ZLC_PY_CMD goto zlc_python_found
-if defined ZLC_FPGA_SERVER_PYTHON (
-  if exist "%ZLC_FPGA_SERVER_PYTHON%" (
-    set "ZLC_PY_CMD=call "%ZLC_FPGA_SERVER_PYTHON%""
-  ) else (
-    set "ZLC_PY_CMD=%ZLC_FPGA_SERVER_PYTHON%"
-  )
-  goto zlc_python_found
-)
-if exist "%REPO_ROOT%\.zlc_python_path" (
-  set /p "ZLC_STORED_PY="<"%REPO_ROOT%\.zlc_python_path"
-  if exist "!ZLC_STORED_PY!" (
-    set "ZLC_PY_CMD=call "!ZLC_STORED_PY!""
-    goto zlc_python_found
-  )
-  echo Ignoring stale .zlc_python_path: !ZLC_STORED_PY!
-)
-where python >nul 2>nul
-if not errorlevel 1 set "ZLC_PY_CMD=python"
-if defined ZLC_PY_CMD goto zlc_python_found
-where py >nul 2>nul
-if not errorlevel 1 set "ZLC_PY_CMD=py -3"
-if defined ZLC_PY_CMD goto zlc_python_found
-echo Could not find python or py. Run fpga\install_requirements.bat first.
-exit /b 1
-:zlc_python_found
-echo ZLC Python: %ZLC_PY_CMD%
-exit /b 0
