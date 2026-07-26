@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-import zlc_storage.framed_journal as journal_module
 
 from zlc_storage import FramedJournal, JournalCorruptionError
 from zlc_storage.file_lock import FileLockBusy
@@ -58,39 +57,24 @@ def test_framed_journal_has_one_lifetime_owner_and_reopens_after_close(tmp_path)
         assert reopened.records() == (("record", {"value": 1}),)
 
 
-def test_framed_journal_decodes_each_existing_record_once_per_scan(
-    tmp_path,
-    monkeypatch,
-):
+def test_framed_journal_records_are_fresh_projections_of_durable_bytes(tmp_path):
     path = tmp_path / "journal.zlcj"
-    expected = tuple(
-        (f"record-{index}", {"index": index})
-        for index in range(4)
-    )
+    expected = (("record", {"nested": [{"value": 1}]}),)
     with FramedJournal.open_exclusive(path) as journal:
         for record_id, value in expected:
             journal.append(record_id, value)
 
-    decode_calls = 0
-    real_decode = journal_module.decode
+        first = journal.records()
+        first[0][1]["nested"][0]["value"] = 99
 
-    def counting_decode(payload):
-        nonlocal decode_calls
-        decode_calls += 1
-        return real_decode(payload)
+        # Callers receive ordinary mutable trees, but those projections never
+        # become the journal's authority.  Every read is decoded afresh from
+        # the cached canonical bytes, so one caller cannot rewrite what a later
+        # caller observes without an append.
+        second = journal.records()
+        assert second == expected
+        assert second[0][1] is not first[0][1]
 
-    monkeypatch.setattr(journal_module, "decode", counting_decode)
-
-    with FramedJournal.open_exclusive(path) as journal:
-        # The lifetime session scans each existing frame exactly once.
-        assert decode_calls == len(expected)
-        assert journal.records() == expected
-        assert decode_calls == len(expected)
-
-        assert journal.append("record-next", {"index": len(expected)})
-        assert decode_calls == len(expected) + 1
-        assert not journal.append("record-next", {"index": len(expected)})
-        assert decode_calls == len(expected) + 1
-        assert journal.records() == expected + (
-            ("record-next", {"index": len(expected)}),
-        )
+        assert not journal.append("record", {"nested": [{"value": 1}]})
+        with pytest.raises(ValueError, match="conflicting content"):
+            journal.append("record", {"nested": [{"value": 99}]})
