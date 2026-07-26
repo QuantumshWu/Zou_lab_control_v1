@@ -37,7 +37,7 @@ __all__ = [
     "materialize_dataset_acceptance_mask",
     "materialize_dataset_selection",
     "materialize_fit_parameter_snapshots",
-    "materialize_numeric_dataset",
+    "materialize_scalar_dataset",
 ]
 
 
@@ -81,53 +81,41 @@ def _single_cell_schema(cell_schema: ValueSchema) -> DatasetSchema:
     )
 
 
-def materialize_numeric_dataset(
+def materialize_scalar_dataset(
     source_ref: DatasetRevisionRef,
-    values: object,
+    value: object,
     *,
-    data_axes: tuple[AxisSpec, ...],
+    valid: bool,
     unit: str | None,
     reference_for: Callable[[DatasetSchema], DatasetRevisionRef],
 ) -> OwnedSnapshot:
-    """Materialize a finite real or boolean scalar/vector as one typed Dataset cell.
+    """Materialize one typed scalar with its value-level validity.
 
-    ``data_axes`` is always explicit.  Scalar values use the canonical
-    ``(SCALAR_AXIS,)`` declaration and therefore the physical ``(1, 1, 1)``
-    carrier; an empty declaration is rejected instead of being guessed.
-    Integer and boolean precision is preserved; only floating inputs require a
-    finite-value check.
+    A scalar's canonical physical carrier remains ``(R=1, P=1, data=1)``;
+    unlike a multi-component value it cannot use component validity.  Invalid
+    floating payloads may retain a non-finite diagnostic value, while a value
+    declared valid must be finite.
     """
 
-    axes = tuple(data_axes)
-    if not axes or any(not isinstance(axis, AxisSpec) for axis in axes):
-        raise TypeError(
-            "numeric dataset data_axes must contain at least one AxisSpec"
-        )
-    raw = np.asarray(values)
+    if type(valid) is not bool:
+        raise TypeError("scalar dataset valid must be bool")
+    raw = np.asarray(value)
+    if raw.shape not in {(), (1,)}:
+        raise ValueError("scalar dataset value must contain exactly one item")
     dtype = canonical_dtype(raw.dtype)
     if dtype.kind not in "biuf":
-        raise TypeError("numeric dataset values must be real numeric or boolean values")
-    array = np.asarray(raw, dtype=dtype)
-    expected = tuple(axis.size for axis in axes)
-    if array.shape != expected:
-        raise ValueError(
-            f"numeric dataset shape {array.shape} does not match axes {expected}"
-        )
-    if dtype.kind == "f" and not np.all(np.isfinite(array)):
-        raise ValueError("numeric dataset values must be finite")
-    cell_schema = ValueSchema(
-        axes,
-        ValidityContract.value(),
-        dtype,
-        unit,
-    )
+        raise TypeError("scalar dataset value must be real numeric or boolean")
+    array = np.asarray(raw, dtype=dtype).reshape(1)
+    if valid and dtype.kind == "f" and not bool(np.isfinite(array[0])):
+        raise ValueError("valid scalar dataset value must be finite")
+    cell_schema = ValueSchema.scalar(dtype, unit)
     schema = _single_cell_schema(cell_schema)
     ref = _derived_reference(source_ref, schema, reference_for)
     block = DataBlock(
         ref.block_id,
         ref.revision,
         array.reshape(schema.physical_shape),
-        VALID,
+        CellValidity(np.asarray([[valid]], dtype=np.bool_)),
         schema,
     )
     return OwnedSnapshot(ref, block)
@@ -283,24 +271,20 @@ def _selected_dataset_schema(
     repeat_axis = cell_axes[0]
     point_axes = cell_axes[1:]
     layout = transformed.schema.cell_layout
-    row_by_multi = {
-        layout.multi_index(row): row for row in range(layout.storage_size)
-    }
-    if len(row_by_multi) != layout.storage_size:
-        raise RuntimeError("transformed cell layout contains duplicate rows")
+    row_by_multi: dict[tuple[int, ...], int] = {}
+    point_rows_by_repeat: list[list[tuple[int, ...]]] = [
+        [] for _ in range(repeat_axis.size)
+    ]
+    for row in range(layout.storage_size):
+        multi = layout.multi_index(row)
+        if multi in row_by_multi:
+            raise RuntimeError("transformed cell layout contains duplicate rows")
+        row_by_multi[multi] = row
+        point_rows_by_repeat[multi[0]].append(multi[1:])
 
-    point_mapping: tuple[tuple[int, ...], ...] | None = None
-    for repeat_index in range(repeat_axis.size):
-        current = tuple(
-            multi[1:]
-            for multi in (
-                layout.multi_index(row) for row in range(layout.storage_size)
-            )
-            if multi[0] == repeat_index
-        )
-        if point_mapping is None:
-            point_mapping = current
-        elif current != point_mapping:
+    point_mapping = tuple(point_rows_by_repeat[0])
+    for current_rows in point_rows_by_repeat[1:]:
+        if tuple(current_rows) != point_mapping:
             raise ValueError(
                 "dataset projection produced repeat-dependent point membership"
             )
@@ -429,7 +413,7 @@ def materialize_dataset_selection(
 
 def _fit_parameter_dataset_layout(
     result: FitResultBatch,
-) -> tuple[AxisSpec, tuple[AxisSpec, ...], PointLayout, np.ndarray]:
+) -> tuple[AxisSpec, tuple[AxisSpec, ...], PointLayout, np.ndarray | None]:
     """Factor named Fit batch axes into Dataset repeat/point storage."""
 
     axes = tuple(result.batch_axis_specs)
@@ -483,6 +467,8 @@ def _fit_parameter_dataset_layout(
             dtype=np.intp,
             count=repeat_axis.size * point_layout.storage_size,
         )
+        if all(int(row) == index for index, row in enumerate(order)):
+            order = None
         return repeat_axis, point_axes, point_layout, order
 
     # Dataset's physical carrier always has one repeat axis.  When repeat was
@@ -510,8 +496,7 @@ def _fit_parameter_dataset_layout(
         tuple(axis.size for axis in point_axes),
         point_mapping,
     )
-    order = np.arange(layout.storage_size, dtype=np.intp)
-    return repeat_axis, point_axes, point_layout, order
+    return repeat_axis, point_axes, point_layout, None
 
 
 def materialize_fit_parameter_snapshots(
@@ -538,7 +523,9 @@ def materialize_fit_parameter_snapshots(
         (status is FitBatchStatus.CONVERGED for status in result.statuses),
         dtype=np.bool_,
         count=len(result.statuses),
-    )[order]
+    )
+    if order is not None:
+        validity_rows = validity_rows[order]
     physical_shape = (repeat_axis.size, point_layout.storage_size)
     validity = CellValidity(validity_rows.reshape(physical_shape))
 
@@ -567,10 +554,15 @@ def materialize_fit_parameter_snapshots(
         if identity in identities:
             raise ValueError("Fit parameters must have distinct dataset identities")
         identities.add(identity)
-        values = np.asarray(
+        parameter_values = np.asarray(
             result.parameter_values[:, parameter_index],
             dtype="<f8",
-        )[order].reshape(schema.physical_shape)
+        )
+        values = (
+            parameter_values
+            if order is None
+            else parameter_values[order]
+        ).reshape(schema.physical_shape)
         block = DataBlock(
             ref.block_id,
             ref.revision,

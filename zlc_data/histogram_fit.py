@@ -16,6 +16,8 @@ import numpy as np
 from scipy.optimize import curve_fit
 from scipy.special import erf
 
+from ._arrays import immutable_array
+
 
 _SIGMA_FLOOR = 1e-12
 
@@ -156,7 +158,7 @@ class HistogramFitResult:
         count = int(self.component_count)
         if count not in expected:
             raise ValueError("component_count must be 0, 1, or 2")
-        source = np.asarray(self.parameters, dtype=np.float64).reshape(-1)
+        source = np.asarray(self.parameters, dtype=np.dtype("<f8")).reshape(-1)
         if source.size != expected[count]:
             raise ValueError("histogram fit parameter count does not match its model")
         if not isinstance(self.valid, (bool, np.bool_)) or not isinstance(
@@ -206,8 +208,11 @@ class HistogramFitResult:
         status = self.status.strip()
         if not status:
             raise ValueError("histogram fit status must not be empty")
-        owned = np.frombuffer(source.tobytes(), dtype=np.dtype("<f8"))
-        owned.setflags(write=False)
+        owned = immutable_array(
+            source,
+            dtype=np.dtype("<f8"),
+            shape=(expected[count],),
+        )
         object.__setattr__(self, "requested_mode", mode)
         object.__setattr__(self, "component_count", count)
         object.__setattr__(self, "parameters", owned)

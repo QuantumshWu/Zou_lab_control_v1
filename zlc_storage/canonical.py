@@ -687,7 +687,7 @@ def _decode_array(payload: Any, *, path: str) -> np.ndarray:
             f"{path}: ndarray byte length {len(raw)} does not match expected {expected}"
         )
     try:
-        array = np.frombuffer(raw, dtype=dtype).reshape(shape, order="C").copy()
+        array = np.frombuffer(raw, dtype=dtype).reshape(shape, order="C")
     except (TypeError, ValueError, OverflowError) as exc:
         raise CanonicalEncodingError(
             f"{path}: ndarray shape cannot be materialized by NumPy"

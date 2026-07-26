@@ -117,7 +117,7 @@ from .snapshot_projection import (
     materialize_dataset_acceptance_mask,
     materialize_dataset_selection,
     materialize_fit_parameter_snapshots,
-    materialize_numeric_dataset,
+    materialize_scalar_dataset,
 )
 from .fit import (
     BoundFit,
@@ -267,7 +267,7 @@ __all__ = [
     "materialize_dataset_acceptance_mask",
     "materialize_dataset_selection",
     "materialize_fit_parameter_snapshots",
-    "materialize_numeric_dataset",
+    "materialize_scalar_dataset",
     "resolve_outer_cell_selection",
     "resolve_selection_indices",
     "selection_for_outer_cell",

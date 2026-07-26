@@ -57,11 +57,11 @@ class FramedJournal:
 
     @staticmethod
     def _record_values(
-        records: dict[str, tuple[bytes, Any]],
+        records: dict[str, bytes],
     ) -> tuple[tuple[str, Any], ...]:
         return tuple(
-            (record_id, value)
-            for record_id, (_payload, value) in records.items()
+            (record_id, decode(payload)["value"])
+            for record_id, payload in records.items()
         )
 
     def _scan(
@@ -69,9 +69,9 @@ class FramedJournal:
         stream,
         *,
         repair_torn_tail: bool,
-    ) -> dict[str, tuple[bytes, Any]]:
+    ) -> dict[str, bytes]:
         stream.seek(0)
-        records: dict[str, tuple[bytes, Any]] = {}
+        records: dict[str, bytes] = {}
         valid_end = 0
         while True:
             frame_start = stream.tell()
@@ -105,11 +105,11 @@ class FramedJournal:
                     f"invalid canonical journal record at byte {frame_start}"
                 ) from exc
             previous = records.get(record_id)
-            if previous is not None and previous[0] != payload:
+            if previous is not None and previous != payload:
                 raise JournalCorruptionError(
                     f"journal record id {record_id!r} has conflicting content"
                 )
-            records[record_id] = (payload, decoded["value"])
+            records[record_id] = payload
             valid_end = stream.tell()
         stream.seek(0, os.SEEK_END)
         end = stream.tell()
@@ -164,7 +164,7 @@ class FramedJournalSession:
         payload = encode({"record_id": record_id, "value": value})
         previous = self._records.get(record_id)
         if previous is not None:
-            if previous[0] != payload:
+            if previous != payload:
                 raise ValueError(
                     f"journal record id {record_id!r} has conflicting content"
                 )
@@ -173,7 +173,6 @@ class FramedJournalSession:
             _HEADER.pack(_MAGIC, len(payload), hashlib.sha256(payload).digest())
             + payload
         )
-        candidate_value = decode(payload)["value"]
         assert self._stream is not None
         try:
             self._stream.seek(0, os.SEEK_END)
@@ -188,14 +187,8 @@ class FramedJournalSession:
                 repair_torn_tail=True,
             )
             raise
-        self._records[record_id] = (payload, candidate_value)
+        self._records[record_id] = payload
         return True
-
-    @property
-    def owns_file_lock(self) -> bool:
-        """Whether this process still owns the journal authority lock."""
-
-        return os.getpid() == self._creator_pid and self._owns_lock
 
     def close(self) -> None:
         if self._closed:
