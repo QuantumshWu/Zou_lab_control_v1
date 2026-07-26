@@ -83,6 +83,20 @@ def sync_revisioned_form_editors(
         raise TypeError("replace_owner must be bool")
     if replace_owner and accepted_editor is not None:
         raise ValueError("owner replacement cannot accept an old draft commit")
+    # Validate the complete multi-surface transition before touching the first
+    # widget.  Each individual form already writes atomically; this preflight
+    # closes the remaining cross-surface hole where a later editor could reject
+    # a revision after an earlier editor had accepted it.
+    for editor in editors:
+        editor._preflight_owner_projection(
+            revision=revision,
+            semantic_identity=semantic_identity,
+            values=values,
+            runtime_placeholders=runtime_placeholders,
+            replace_owner=replace_owner,
+            accept_commit=editor is accepted_editor,
+            accepted_base_revision=accepted_base_revision,
+        )
     for editor in editors:
         if replace_owner:
             editor.replace_owner_state(
@@ -252,6 +266,58 @@ class FluentRevisionedFormEditor(QtWidgets.QWidget):
                 self._show_stale()
 
         self._install_runtime_placeholders(placeholders)
+
+    def _preflight_owner_projection(
+        self,
+        *,
+        revision: int,
+        semantic_identity: object,
+        values: Mapping[str, object],
+        runtime_placeholders: Mapping[str, str] | None,
+        replace_owner: bool,
+        accept_commit: bool,
+        accepted_base_revision: int | None,
+    ) -> None:
+        """Validate one group synchronization without changing editor state."""
+
+        revision = _revision(revision, "revision")
+        exact = self._exact_values(values)
+        self._prepare_runtime_placeholders(runtime_placeholders)
+        if replace_owner:
+            self._form.validate_population(exact)
+            return
+        if accept_commit:
+            if accepted_base_revision is None:
+                raise RuntimeError("accepted editor has no base revision")
+            base_revision = _revision(
+                accepted_base_revision,
+                "accepted_base_revision",
+            )
+            if self._base_revision != base_revision:
+                raise ValueError("accepted commit has another base revision")
+            if revision not in (base_revision, base_revision + 1):
+                raise ValueError("accepted commit must be a no-op or advance once")
+            if revision == base_revision and (
+                self._base_semantic_identity is _UNSET
+                or not _semantic_equal(
+                    semantic_identity,
+                    self._base_semantic_identity,
+                )
+            ):
+                raise ValueError(
+                    "accepted no-op conflicts with the loaded semantic state"
+                )
+            self._validate_observation(revision, semantic_identity)
+            self._form.validate_population(exact)
+            return
+        self._validate_observation(revision, semantic_identity)
+        replace_draft = (
+            self._base_revision is None
+            or self._reload_after_cancel
+            or (not self._dirty and revision > self._base_revision)
+        )
+        if replace_draft:
+            self._form.validate_population(exact)
 
     def replace_owner_state(
         self,

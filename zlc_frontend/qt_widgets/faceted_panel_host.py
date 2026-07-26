@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from PyQt5 import QtCore, QtWidgets
 
-from ..data_figure import FigurePanelRegion
+from ..data_figure import FacetedOverviewArtifact
 from ..render import BoardFrame
 from .frozen_raster import FrozenRasterView
 from .panel_host import SinglePanelHost
@@ -43,8 +43,7 @@ class FacetedPanelHost(QtWidgets.QWidget):
     ) -> None:
         super().__init__(parent)
         self._panel_id = str(panel_id)
-        self._regions: tuple[FigurePanelRegion, ...] = ()
-        self._overview_png: bytes | None = None
+        self._overview_artifact: FacetedOverviewArtifact | None = None
         self._selectors_on = False
 
         self._stack = QtWidgets.QStackedLayout(self)
@@ -86,23 +85,17 @@ class FacetedPanelHost(QtWidgets.QWidget):
 
     @property
     def front_frame(self) -> BoardFrame | None:
-        """The exact focused frame; overview is encoded and returns ``None``."""
+        """The exact focused frame; overview is a raw raster and returns ``None``."""
 
         if self._stack.currentWidget() is not self._focus:
             return None
         return self._focus.front_frame
 
     @property
-    def overview_png(self) -> bytes | None:
-        """The exact currently cached overview bytes."""
+    def overview_artifact(self) -> FacetedOverviewArtifact | None:
+        """The indivisible overview currently accepted by this host."""
 
-        return self._overview_png
-
-    @property
-    def overview_regions(self) -> tuple[FigurePanelRegion, ...]:
-        """Immutable hit map belonging to the currently presented overview."""
-
-        return self._regions
+        return self._overview_artifact
 
     @property
     def showing_overview(self) -> bool:
@@ -110,37 +103,21 @@ class FacetedPanelHost(QtWidgets.QWidget):
 
     def present_overview(
         self,
-        png_bytes: bytes,
-        regions: tuple[FigurePanelRegion, ...],
-        *,
-        logical_size: tuple[int, int] | None = None,
+        artifact: FacetedOverviewArtifact,
     ) -> None:
         """Atomically replace the complete overview and its exact hit map."""
 
-        if not isinstance(png_bytes, bytes):
-            raise TypeError("faceted overview must be owned PNG bytes")
-        resolved = tuple(regions)
-        if len(resolved) <= 1 or any(
-            not isinstance(region, FigurePanelRegion) for region in resolved
-        ):
-            raise ValueError(
-                "faceted overview requires multiple FigurePanelRegion values"
-            )
-        if len({region.key for region in resolved}) != len(resolved):
-            raise ValueError("faceted overview region keys must be unique")
-        if any(region.focus_selection is None for region in resolved):
-            raise ValueError("faceted overview regions require exact selections")
-        geometry_changes = logical_size is not None and (
+        if not isinstance(artifact, FacetedOverviewArtifact):
+            raise TypeError("faceted host requires FacetedOverviewArtifact")
+        geometry_changes = (
             self.width(), self.height()
-        ) != logical_size
+        ) != artifact.logical_size
         if geometry_changes:
             self.setUpdatesEnabled(False)
         try:
-            self._overview.present_encoded(png_bytes, image_format="PNG")
-            self._overview_png = png_bytes
-            self._regions = resolved
-            if logical_size is not None:
-                self.set_logical_size(logical_size)
+            self._overview.present_raster(artifact.raster)
+            self._overview_artifact = artifact
+            self.set_logical_size(artifact.logical_size)
             self._stack.setCurrentWidget(self._overview)
         finally:
             if geometry_changes:
@@ -214,8 +191,7 @@ class FacetedPanelHost(QtWidgets.QWidget):
         return self._focus.discard_pending_interaction(origin)
 
     def clear(self) -> None:
-        self._regions = ()
-        self._overview_png = None
+        self._overview_artifact = None
         self._overview.clear()
         self._focus.clear()
         self._stack.setCurrentWidget(self._overview)
@@ -241,7 +217,11 @@ class FacetedPanelHost(QtWidgets.QWidget):
             return
         hits = tuple(
             (index, region)
-            for index, region in enumerate(self._regions)
+            for index, region in enumerate(
+                ()
+                if self._overview_artifact is None
+                else self._overview_artifact.regions
+            )
             if region.contains(x, y)
         )
         if len(hits) != 1:

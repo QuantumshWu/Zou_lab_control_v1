@@ -235,12 +235,18 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     from ._composition import _require_experiment, task_console_ports
 
     experiment = _require_experiment(experiment)
+    if "hide_on_close" in kwargs:
+        raise TypeError(
+            "a bound TaskConsole always preserves its window on X; "
+            "hide_on_close is not caller-configurable"
+        )
 
     def compose():
         return _open(
             task_console_ports(experiment),
             state=state,
             task=task,
+            hide_on_close=True,
             **kwargs,
         )
 

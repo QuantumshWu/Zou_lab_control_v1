@@ -9,6 +9,7 @@ import threading
 
 import numpy as np
 
+from zlc_frontend import render_plot_report
 from zlc_data import (
     SITE,
     SPATIAL_X,
@@ -27,12 +28,15 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     CalibrationAnalysisRequest,
     GridOrder,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.ui.report_render import (
-    render_calibration_report,
+from zlc_neutral_atom.logic_nodes.readout.calibration.ui.report_projection import (
+    project_calibration_plot_report,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.projection import (
     CalibrationModelReportProjection,
     CalibrationReportProjection,
+)
+from zlc_neutral_atom.logic_nodes.readout.calibration import (
+    projection as calibration_projection,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
@@ -40,6 +44,9 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
 from zlc_neutral_atom.logic_nodes.readout.calibration.result_bundle import (
     CALIBRATION_RESULT_BUNDLE_FORMAT,
     write_calibration_result_bundle,
+)
+from zlc_neutral_atom.logic_nodes.readout.calibration import (
+    result_bundle as calibration_result_bundle,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
     CalibrationRepository,
@@ -49,7 +56,6 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.sitemap import (
     SitemapAcquisitionProfile,
     load_sitemap_pulse,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration import task as calibration_task
 from zlc_neutral_atom.logic_nodes.readout.calibration.task import (
     CalibrationTaskIntent,
     prepare_calibration_task,
@@ -80,6 +86,10 @@ from zlc_neutral_atom.runtime.run import CancelOutcome, RunController, RunPlan
 from zlc_pulse import PulseTarget
 from zlc_storage import RepositoryRootLease
 from zlc_storage.paths import PROJECT_ROOT
+
+
+def _render_current_report(view):
+    return render_plot_report(project_calibration_plot_report(view))
 
 
 def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
@@ -200,7 +210,7 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         capture_ref,
         calibration_repository_root=tmp_path / "workspace" / "calibrations",
         capture_repository_root=tmp_path / "workspace" / "captures",
-        render_report=render_calibration_report,
+        render_report=_render_current_report,
     )
 
     assert {path.name for path in destination.iterdir()} == {
@@ -477,7 +487,7 @@ def test_preserve_policy_keeps_admitted_saved_frame_export(
         ),
     )
     monkeypatch.setattr(
-        calibration_task,
+        calibration_projection,
         "project_calibration_report",
         lambda loaded, reference: (loaded, reference),
     )
@@ -488,7 +498,7 @@ def test_preserve_policy_keeps_admitted_saved_frame_export(
         (root / "marker.txt").write_text("report", encoding="utf-8")
 
     monkeypatch.setattr(
-        calibration_task,
+        calibration_result_bundle,
         "write_calibration_result_bundle",
         write_report,
     )

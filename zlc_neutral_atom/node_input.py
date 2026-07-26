@@ -29,6 +29,7 @@ class BoundDatasetInput:
     producer_request: object
     output: DatasetOutputDeclaration
     transform_spec: DataTransformSpec | None = None
+    output_binding: object | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.spec, DatasetInputSpec):

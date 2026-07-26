@@ -555,7 +555,7 @@ class SinglePanelAggRenderer:
             assert parameters is not None
             _amplitude, mean, sigma = parameters
             label = (
-                r"$\sigma$=0"
+                r"$\sigma/\sqrt{\mu}$=N/A"
                 if mean <= 0.0
                 else rf"$\sigma$={sigma / np.sqrt(mean):.2f}$\sqrt{{\mu}}$"
             )
@@ -772,7 +772,15 @@ class SinglePanelAggRenderer:
         topology = (
             layer.layer_id,
             layer.dataset_id,
-            layer.resolutions,
+            # Resolution *values* are data, not artist topology.  A
+            # LatestNonempty index normally advances every live revision and a
+            # Fixed selector may resolve to another value without changing the
+            # number or kind of artists.  Only the structural selector roles
+            # belong in the persistent Agg topology key.
+            tuple(
+                (resolution.axis_id, resolution.selector)
+                for resolution in layer.resolutions
+            ),
             cell.facet_address,
             kind,
             series_topology,

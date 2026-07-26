@@ -102,7 +102,7 @@ def prepare_release_recapture(
             "owner": owner,
             "program": program_fingerprint,
             "camera_schema": (
-                camera_binding.measurement.capture_contract
+                camera_binding.capture.capture_contract
                 .dataset_schema.fingerprint
             ),
             "calibration": calibration_artifact_ref_to_tree(
@@ -114,7 +114,7 @@ def prepare_release_recapture(
     )
     pipeline = ReleaseRecapturePipelineSpec(
         name,
-        camera_binding.measurement,
+        camera_binding.capture,
         calibration,
         selected.kind,
         per_site,

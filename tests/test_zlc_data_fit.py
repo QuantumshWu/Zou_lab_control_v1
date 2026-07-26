@@ -26,7 +26,7 @@ from zlc_data import (
     BlockId,
     BoundFit,
     CellValidity,
-    ComponentValidity,
+    DatasetComponentValidity,
     CoordinateFrameId,
     DataBlock,
     DataTransformSpec,
@@ -103,21 +103,29 @@ def snapshot_for(
     block_id: str = "fit-source",
 ) -> OwnedSnapshot:
     repeat_axis = axis("repeat", REPEAT, repeat)
-    schema = DatasetSchema(
-        repeat_axis,
-        point_axes,
-        point_layout,
+    array = np.asarray(values, dtype=dtype)
+    cell_schema = (
         ValueSchema(
             data_axes,
             validity_contract or ValidityContract.value(),
             np.dtype(dtype),
             value_unit,
-        ),
+        )
+        if data_axes
+        else ValueSchema.scalar(np.dtype(dtype), value_unit)
+    )
+    if not data_axes:
+        array = array[..., np.newaxis]
+    schema = DatasetSchema(
+        repeat_axis,
+        point_axes,
+        point_layout,
+        cell_schema,
     )
     block = DataBlock(
         BlockId(block_id),
         DatasetRevision(3),
-        np.asarray(values, dtype=dtype),
+        array,
         validity,
         schema,
     )
@@ -406,7 +414,7 @@ def test_every_curve_model_recovers_clean_synthetic_data(model_id, x, parameters
 
 def test_binding_is_axis_total_role_checked_and_declared_coordinates_are_not_ignored():
     snapshot, scan = gaussian_snapshot()
-    with pytest.raises(ValueError, match="do not cover the effective schema"):
+    with pytest.raises(ValueError, match="do not cover every information axis exactly"):
         bind_fit(
             replace(gaussian_spec(snapshot, scan), batch_axis_ids=()),
             snapshot.block.schema,
@@ -724,7 +732,7 @@ def test_grid_site_batch_uses_component_validity_without_collapsing_sites():
         point_layout=PointLayout.rect_c((scan.size,)),
         data_axes=(site,),
         values=values,
-        validity=ComponentValidity((site.axis_id,), mask),
+        validity=DatasetComponentValidity((site.axis_id,), mask),
         validity_contract=ValidityContract.components(site.axis_id),
     )
     spec = FitSpec(
@@ -2056,7 +2064,7 @@ def test_fit_result_wire_format_has_one_frozen_current_golden():
     payload = encode_fit_result_batch(result)
     assert len(payload) == 2608
     assert hashlib.sha256(payload).hexdigest() == (
-        "4d027f2b8ae14dd098cf0eed405fb58910cca94fd0d802977ca6941367dc6339"
+        "f10a7ebbceb3c78410121030f5d3831a0c08d327f46ac8b4fc7d6a6eca27416c"
     )
 
 def test_result_constructor_rejects_impossible_success_and_noncanonical_payloads():

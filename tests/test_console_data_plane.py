@@ -238,6 +238,48 @@ def _wait_for_signal_revision(
     raise AssertionError(f"{name} revision {revision} did not reach the data front")
 
 
+def test_reactive_processor_wakes_only_for_its_declared_source() -> None:
+    plane, _source_state, source_node, first = _live_source_plane()
+    wakes: list[object] = []
+    plane.bind_owner_wake(lambda: wakes.append(object()))
+
+    gates = {1: threading.Event()}
+    gates[1].set()
+    processor = _GatedProcessorNode(
+        plane,
+        instance_id="occupancy",
+        source_name="camera/frame",
+        declared_outputs=("occupied",),
+        gates=gates,
+    )
+    plane.attach_latest_only_processor(
+        processor,
+        source_name="camera/frame",
+        initial_source=first.value("camera/frame"),
+    )
+
+    thermometer_output = _live_output("temperature", 1, "b" * 64)
+    thermometer = _node("thermometer", thermometer_output)
+    plane.attach(
+        thermometer,
+        _slot(
+            run="thermometer-run",
+            epoch="thermometer-epoch",
+            outputs={"temperature": thermometer_output},
+        ),
+    )
+
+    plane.mark_changed(thermometer)
+    assert wakes == []
+    plane.mark_changed(source_node)
+    assert len(wakes) == 1
+
+    plane.cancel_latest_only_processor(processor)
+    plane.mark_changed(source_node)
+    assert len(wakes) == 1
+    plane.close()
+
+
 def test_unchanged_sources_reuse_their_immutable_front() -> None:
     plane = ConsoleDataPlane()
     output = _live_output("frame", 1, "a" * 64)

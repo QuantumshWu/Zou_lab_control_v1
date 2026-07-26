@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from concurrent.futures import CancelledError, Future
 from dataclasses import replace
-import threading
 
 from PyQt5 import QtCore, QtWidgets
 
@@ -15,14 +14,16 @@ from zlc_frontend.image_display import (
     image_display_form_values, image_display_from_form,
     image_viewport_for_display_state,
 )
+from zlc_frontend.plot_layout import panel_surface_geometry
 from zlc_frontend.qt_widgets import (
     AxisLayoutNavigator, FluentButton, FluentLabel, FluentPopup, FluentSwitch,
-    FluentRevisionedFormEditor, FluentTabWidget, GREY, QtOwnerWake,
-    QtRasterBoard, RectangleGesture,
+    FluentRevisionedFormEditor, FluentTabWidget, GREY,
+    RasterPixelRatioObserver, RectangleGesture, SinglePanelHost,
     FluentSettingsPopupAnchor, runtime_range_placeholders, signals_blocked,
     sync_revisioned_form_editors,
 )
 from zlc_frontend.render import SiteMapPanelPayload
+from zlc_frontend.site_map_render import SiteMapComposer
 from zlc_frontend.selector import (
     ImageColorLimitsCommit, ImageInteractionCommit, ImageViewportCommit,
 )
@@ -30,11 +31,11 @@ from zlc_neutral_atom.logic_nodes.readout.occupancy.reference import OccupancyAr
 
 from zlc_workbench.window_runtime import (
     RASTER_WORK_EXECUTOR,
+    SerialWorkerWindow,
     error_summary,
-    release_window,
 )
 
-from .workbench_jobs import _PANEL_ID, _cell_job, _load_navigation
+from .workbench_jobs import _BOARD_ID, _PANEL_ID, _cell_job, _load_navigation
 
 
 def _label(parent, name, text, *, wrap=False):
@@ -54,13 +55,13 @@ def _cell_label(navigation, repeat_index, logical_point) -> str:
     return " | ".join(labels)
 
 
-class OccupancyCellWindow(QtWidgets.QWidget):
+class OccupancyCellWindow(SerialWorkerWindow):
     """Navigate exact cells and interact with one worker-rasterized SiteMap."""
 
     def __init__(
         self, navigation_loader, cell_loader, reference, *, selection,
     ) -> None:
-        super().__init__()
+        super().__init__(executor=RASTER_WORK_EXECUTOR)
         if not callable(navigation_loader) or not callable(cell_loader):
             raise TypeError("occupancy loaders must be callable")
         if not isinstance(reference, OccupancyArtifactRef):
@@ -73,15 +74,33 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         self._display = ImageDisplayState()
         self._loaded_view = self._loaded_selection = None
         self._requested_selection = self._presented_selection = None
-        self._presented_key = self._presented_relim = None
+        self._presented_key = None
         self._rectangle_candidate = None
-        self._request_revision = self._sequence = 0
-        self._future: Future | None = None
+        self._request_revision = 0
+        self._surface_revision = 0
         self._active_kind, self._active_key = None, None
         self._pending_cell, self._render_requested = None, False
-        self._cancelled = threading.Event()
-        self._closing = self._closed = self._allow_close = False
-        self._board_bound = False
+        self._surface_pixel_ratio_observer = RasterPixelRatioObserver(
+            self,
+            self._apply_surface_pixel_ratio,
+        )
+        pixel_ratio = self._surface_pixel_ratio_observer.current_ratio
+        # This object contains only authored geometry until its first worker
+        # call.  Every Agg mutation, including final close, stays on the sole
+        # raster-work thread.
+        self._surface_geometry = panel_surface_geometry(
+            "2x2",
+            pixel_ratio=pixel_ratio,
+        )
+        self._logical_size = self._surface_geometry.logical_size
+        self._composer = SiteMapComposer(
+            _PANEL_ID,
+            board_id=_BOARD_ID,
+            surface_geometry=self._surface_geometry,
+            title="Site map",
+            value_label="Counts",
+        )
+        self._set_worker_release(self._composer.close)
 
         self.setWindowTitle("Occupancy Cell")
         self._mode = _label(
@@ -98,12 +117,15 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         page = QtWidgets.QWidget(self._tabs)
         page_layout = QtWidgets.QVBoxLayout(page)
         page_layout.setContentsMargins(0, 0, 0, 0)
-        self._board = QtRasterBoard(
-            (_PANEL_ID,), page, columns=1, empty_text="No exact occupancy cell",
+        self._panel_host = SinglePanelHost(
+            _PANEL_ID,
+            group=_PANEL_ID,
+            empty_text="No exact occupancy cell",
+            parent=page,
         )
-        self._board.setObjectName("occupancyCellBoard")
-        self._board.setMinimumSize(320, 240)
-        page_layout.addWidget(self._board, 1)
+        self._panel_host.setObjectName("occupancyCellBoard")
+        self._panel_host.setMinimumSize(320, 240)
+        page_layout.addWidget(self._panel_host, 1)
         spec = image_display_form_spec()
         self._edit_display = FluentRevisionedFormEditor(
             spec, "occupancy display",
@@ -148,11 +170,12 @@ class OccupancyCellWindow(QtWidgets.QWidget):
             self._setting_button,
         )
 
-        self._wake = QtOwnerWake(self)
-        self._wake.bind(self._owner_cycle)
         self._close_button.clicked.connect(self.shutdown)
         self._setting_button.clicked.connect(self._open_display_settings)
         self._selector_switch.toggled.connect(self._set_selector_enabled)
+        self._panel_host.rectangleSelected.connect(self._accept_rectangle)
+        self._panel_host.viewCommitted.connect(self._accept_interaction)
+        self._panel_host.colorLimitsCommitted.connect(self._accept_interaction)
         for editor in (self._edit_display, self._setting_display):
             editor.applyRequested.connect(
                 lambda revision, values, owner=editor:
@@ -180,20 +203,48 @@ class OccupancyCellWindow(QtWidgets.QWidget):
     def raster_ready(self):
         return self._front_is_current()
 
-    @property
-    def closed(self):
-        return self._closed
+    def _apply_surface_pixel_ratio(self, ratio: float) -> None:
+        """Author a new raster surface only after Qt binds the real screen."""
+
+        if self._closing:
+            return
+        geometry = panel_surface_geometry(
+            "2x2",
+            pixel_ratio=ratio,
+        )
+        if geometry == self._surface_geometry:
+            return
+        self._surface_geometry = geometry
+        self._logical_size = geometry.logical_size
+        self._surface_revision += 1
+        if self._panel_host.has_front:
+            self._discard_front()
+        if (
+            self._loaded_view is not None
+            and self._loaded_selection == self._requested_selection
+        ):
+            self._render_requested = True
+            self._status.setText(
+                f"RENDERING DISPLAY SURFACE r{self._surface_revision}"
+            )
+        self._start_next()
 
     def _submit(self, kind, key, function, *args):
-        if self._future is not None:
-            raise RuntimeError("occupancy Workbench already has active worker work")
-        try:
-            self._future = RASTER_WORK_EXECUTOR.submit(function, *args)
-        except BaseException as error:
-            self._fail(error)
-            return
+        if not self._submit_future(function, *args):
+            return False
         self._active_kind, self._active_key = kind, key
-        self._future.add_done_callback(lambda _done: self._wake.request_owner_wake())
+        return True
+
+    def _worker_submit_failed(self, error: BaseException) -> None:
+        if self._closing:
+            self._status.setText("CLOSE FAILED")
+            self._diagnostic.setText(error_summary(error))
+        else:
+            self._fail(error)
+
+    def _worker_release_failed(self, error: BaseException) -> None:
+        self._status.setText("CLOSE FAILED")
+        self._diagnostic.setText(error_summary(error))
 
     def _build_navigator(self):
         navigation = self._navigation
@@ -272,23 +323,23 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         if load:
             revision, selection = self._pending_cell
             self._pending_cell = None
-            view, color_limits, previous_relim = None, None, None
+            view = None
         elif self._render_requested:
             revision, selection = self._request_revision, self._loaded_selection
             view = self._loaded_view
             if view is None or selection != self._requested_selection:
                 return
             self._render_requested = False
-            color_limits, previous_relim = self._painted_limits(), self._presented_relim
         else:
             return
-        self._sequence += 1
         display = self._display
+        surface_revision = self._surface_revision
         self._submit(
-            "cell", (revision, selection), _cell_job,
+            "cell", (revision, selection, surface_revision), _cell_job,
             self._cell_loader if load else None, self._reference, selection,
-            self._navigation, view, display, color_limits, previous_relim,
-            revision, self._sequence, self._cancelled,
+            self._navigation, view, display, self._composer,
+            revision, self._surface_geometry, surface_revision,
+            self._cancelled,
         )
 
     def _accept_navigation(self, navigation):
@@ -308,7 +359,10 @@ class OccupancyCellWindow(QtWidgets.QWidget):
             self._diagnostic.setText(error_summary(error))
 
     def _accept_cell(self, result):
-        nav_id, selection, revision, display_revision, view, frame, relim = result
+        (
+            nav_id, selection, revision, display_revision, surface_revision,
+            view, frame,
+        ) = result
         if (
             self._navigation.identity != nav_id or revision != self._request_revision
             or selection != self._requested_selection
@@ -316,24 +370,29 @@ class OccupancyCellWindow(QtWidgets.QWidget):
             return
         self._loaded_view = view
         self._loaded_selection = selection
-        if display_revision == self._display.revision:
-            self._present(revision, selection, display_revision, frame, relim)
+        if (
+            display_revision == self._display.revision
+            and surface_revision == self._surface_revision
+        ):
+            self._present(
+                revision,
+                selection,
+                display_revision,
+                surface_revision,
+                frame,
+            )
         else:
             self._render_requested = True
 
-    def _present(self, revision, selection, display_revision, frame, relim):
-        self._board.present(frame)
+    def _present(
+        self, revision, selection, display_revision, surface_revision, frame,
+    ):
+        self._panel_host.present_frame(frame, logical_size=self._logical_size)
         payload = frame.panels[0].display_payload
         if not isinstance(payload, SiteMapPanelPayload):
             raise TypeError("occupancy worker returned a non-SiteMap payload")
-        if not self._board_bound:
-            self._board.bind_rectangle_selector(
-                _PANEL_ID, payload.background.viewport, self._accept_rectangle,
-                enabled=False, interaction_callback=self._accept_interaction,
-            )
-            self._board_bound = True
         self._presented_selection = selection
-        self._presented_key, self._presented_relim = (revision, display_revision), relim
+        self._presented_key = (revision, display_revision, surface_revision)
         self._status.setText("READY")
         self._diagnostic.setText("")
         self._refresh_summary()
@@ -342,20 +401,30 @@ class OccupancyCellWindow(QtWidgets.QWidget):
 
     def _front_is_current(self):
         if (
-            not self._board.has_front
-            or self._presented_key != (self._request_revision, self._display.revision)
+            not self._panel_host.has_front
+            or self._presented_key != (
+                self._request_revision,
+                self._display.revision,
+                self._surface_revision,
+            )
             or self._presented_selection != self._requested_selection
         ):
             return False
-        origin = self._board.visible_image_origin()
+        origin = self._panel_host.visible_interaction_origin()
         return origin is not None and (
             origin.presentation.selection_revision == self._request_revision
             and origin.presentation.panel_revision == self._display.revision
+            and origin.presentation.document_revision == self._surface_revision
         )
 
     def _painted_limits(self):
-        payload = self._board.visible_image_payload() if self._board_bound else None
-        return None if payload is None else payload.color_limits
+        frame = self._panel_host.front_frame
+        if frame is None:
+            return None
+        payload = frame.panels[0].display_payload
+        if not isinstance(payload, SiteMapPanelPayload):
+            raise TypeError("occupancy front is not a SiteMap payload")
+        return payload.background.color_limits
 
     def _current_limits(self):
         return self._painted_limits() if self._front_is_current() else None
@@ -376,7 +445,7 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         self._summary.setText(text)
 
     def _accept_rectangle(self, gesture):
-        frame = self._board.front_frame
+        frame = self._panel_host.front_frame
         if not isinstance(gesture, RectangleGesture) or not self._front_is_current():
             raise RuntimeError("site-map rectangle origin is stale")
         if frame is None or (
@@ -388,13 +457,16 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         ):
             raise RuntimeError("site-map rectangle origin is stale")
         self._rectangle_candidate = gesture.normalized_bounds
-        self._board.set_image_rectangle_candidate(gesture.normalized_bounds)
+        self._panel_host.set_rectangle_candidate(gesture.normalized_bounds)
         self._refresh_summary()
 
     def _accept_interaction(self, command: ImageInteractionCommit):
         if not isinstance(command, (ImageViewportCommit, ImageColorLimitsCommit)):
             raise TypeError("unknown image interaction")
-        if not self._front_is_current() or command.origin != self._board.visible_image_origin():
+        if (
+            not self._front_is_current()
+            or command.origin != self._panel_host.visible_interaction_origin()
+        ):
             raise RuntimeError("site-map interaction origin is stale")
         if isinstance(command, ImageViewportCommit):
             candidate = image_display_for_viewport(self._display, command.viewport)
@@ -470,7 +542,7 @@ class OccupancyCellWindow(QtWidgets.QWidget):
             self._render_requested = True
             self._status.setText(f"RENDERING DISPLAY r{state.revision}")
             self._diagnostic.setText("")
-            self._board.set_interaction_readiness(image=False, curve=False)
+            self._panel_host.set_interaction_ready(False)
         self._sync_editors(accepted_editor=accepted_editor, accepted_base=accepted_base)
         self._update_controls()
         self._start_next()
@@ -482,43 +554,41 @@ class OccupancyCellWindow(QtWidgets.QWidget):
         )
 
     def _update_controls(self):
-        fault = self._board.selector_fault if self._board_bound else None
+        fault = self._panel_host.selector_fault
         ready = not self._closing and fault is None and self._front_is_current()
         for widget in (self._setting_button, self._edit_display, self._setting_display):
             widget.setEnabled(ready)
         self._selector_switch.setEnabled(ready)
-        self._board.set_interaction_readiness(image=ready, curve=False)
+        self._panel_host.set_interaction_ready(ready)
         if fault is not None:
             blocker = QtCore.QSignalBlocker(self._selector_switch)
             self._selector_switch.setChecked(False)
             del blocker
-            if self._board.selectors_enabled:
-                self._board.set_selectors_enabled(False)
+            if self._panel_host.selectors_enabled:
+                self._panel_host.set_selectors_enabled(False)
             self._diagnostic.setText(f"Selector failed closed: {error_summary(fault)}")
 
     def _set_selector_enabled(self, enabled):
         try:
             if enabled and (
-                not self._front_is_current() or self._board.selector_fault is not None
+                not self._front_is_current()
+                or self._panel_host.selector_fault is not None
             ):
                 raise RuntimeError("selector has no healthy current exact front")
-            self._board.set_selectors_enabled(bool(enabled))
+            self._panel_host.set_selectors_enabled(bool(enabled))
         except BaseException as error:
             blocker = QtCore.QSignalBlocker(self._selector_switch)
             self._selector_switch.setChecked(False)
             del blocker
-            self._board.set_selectors_enabled(False)
+            self._panel_host.set_selectors_enabled(False)
             self._diagnostic.setText(f"Selector rejected: {error_summary(error)}")
 
     def _discard_front(self):
         blocker = QtCore.QSignalBlocker(self._selector_switch)
         self._selector_switch.setChecked(False)
         del blocker
-        if self._board_bound:
-            self._board.unbind_rectangle_selector()
-            self._board_bound = False
-        self._board.clear()
-        self._presented_selection = self._presented_key = self._presented_relim = None
+        self._panel_host.clear()
+        self._presented_selection = self._presented_key = None
         self._rectangle_candidate = None
         self._update_controls()
 
@@ -531,61 +601,46 @@ class OccupancyCellWindow(QtWidgets.QWidget):
     def _job_current(self, kind, key):
         return self._navigation is None if kind == "navigation" else (
             isinstance(key, tuple) and key == (
-                self._request_revision, self._requested_selection,
+                self._request_revision,
+                self._requested_selection,
+                self._surface_revision,
             )
         )
 
-    @QtCore.pyqtSlot()
-    def _owner_cycle(self):
-        future = self._future
-        if future is not None and future.done():
-            kind, key = self._active_kind, self._active_key
-            self._future = self._active_kind = self._active_key = None
-            try:
-                result = future.result()
-                if not self._closing:
-                    self._accept_navigation(result) if kind == "navigation" else self._accept_cell(result)
-            except CancelledError:
-                if not self._closing and self._job_current(kind, key):
-                    self._status.setText("OCCUPANCY CELL CANCELLED")
-            except BaseException as error:
-                if not self._closing and self._job_current(kind, key):
-                    self._fail(error)
+    def _accept_finished_future(self, future: Future) -> None:
+        kind, key = self._active_kind, self._active_key
+        self._active_kind = self._active_key = None
+        try:
+            result = future.result()
             if not self._closing:
-                self._start_next()
-        if not self._closing:
-            self._update_controls()
-        self._finish_close()
+                if kind == "navigation":
+                    self._accept_navigation(result)
+                else:
+                    self._accept_cell(result)
+        except CancelledError:
+            if not self._closing and self._job_current(kind, key):
+                self._status.setText("OCCUPANCY CELL CANCELLED")
+        except BaseException as error:
+            if self._closing:
+                self._status.setText("CLOSE FAILED")
+                self._diagnostic.setText(error_summary(error))
+            elif self._job_current(kind, key):
+                self._fail(error)
 
-    def shutdown(self):
-        if self._closing or self._closed:
-            return
-        self._closing = True
+    def _after_worker_completion(self) -> None:
+        if not self._closing:
+            self._start_next()
+            self._update_controls()
+
+    def _before_worker_shutdown(self) -> None:
+        self._surface_pixel_ratio_observer.detach()
         self._pending_cell, self._render_requested = None, False
-        self._cancelled.set()
         self._settings_popup.hide()
         self._close_button.setEnabled(False)
         if self._navigator is not None:
             self._navigator.set_interaction_enabled(False)
         self._discard_front()
         self._status.setText("CLOSING")
-        if self._future is not None:
-            self._future.cancel()
-        self._finish_close()
-
-    def _finish_close(self):
-        if not self._closing or self._future is not None or self._closed:
-            return
         self._cell_loader = self._navigation = None
         self._navigator = self._loaded_view = None
-        self._wake.detach()
-        self._closed = self._allow_close = True
-        QtCore.QTimer.singleShot(0, self.close)
-
-    def closeEvent(self, event):
-        if self._allow_close:
-            release_window(self)
-            event.accept()
-        else:
-            event.ignore()
-            self.shutdown()
+        self._composer = None

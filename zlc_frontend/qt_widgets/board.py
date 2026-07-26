@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Callable
+from typing import Callable, Literal
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -45,7 +45,6 @@ from ._raster_front import (
     _panel_presentation,
     _panel_semantics_changed,
     _prepared_qimage,
-    _presented_revision_state,
     _validated_panel_layout,
     _visible_display as _resolved_visible_display,
 )
@@ -71,7 +70,6 @@ from ._raster_image_interaction import (
     _painted_image_panel_id_at,
     _rail_value,
     _selector_target,
-    _set_cross_sample,
     _sample_for_target,
     _clim_rail_target,
     _viewport_for_target,
@@ -97,6 +95,7 @@ from ._raster_numeric_interaction import (
     _numeric_target_at,
     _numeric_normalized_point,
     _numeric_interaction_armed,
+    _numeric_interaction_is_pending,
     _numeric_viewport_for_presented_panel,
     _span_data_candidate,
     _span_rect_widget_extents,
@@ -217,6 +216,87 @@ class QtRasterBoard(QtWidgets.QWidget):
         return True
 
     def present(self, frame: BoardFrame) -> None:
+        """Validate, prepare, then atomically install one ordinary front."""
+
+        self._present(frame, interaction_transition=None)
+
+    def present_with_single_panel_interaction(
+        self,
+        frame: BoardFrame,
+        *,
+        panel_id: str,
+        kind: Literal["image", "curve", "histogram", "pulse"] | None,
+        interaction_callback: Callable[[object], object],
+        rectangle_callback: Callable[[RectangleGesture], object],
+        selectors_enabled: bool,
+    ) -> None:
+        """Atomically replace one front and its interaction family.
+
+        The candidate binding is completely typed and validated before the old
+        binding or old front is touched.  This is the only safe family-change
+        path for :class:`SinglePanelHost`: an invalid new raster/payload cannot
+        retire a still-working selector binding.
+        """
+
+        self._require_owner()
+        self._ensure_open()
+        if not isinstance(frame, BoardFrame):
+            raise TypeError("frame must be BoardFrame")
+        panel_id = canonical_text(panel_id, "panel_id")
+        if len(frame.panels) != 1 or frame.panels[0].panel_id != panel_id:
+            raise ValueError(
+                "single-panel interaction transition requires its one panel"
+            )
+        if kind not in (None, "image", "curve", "histogram", "pulse"):
+            raise ValueError("unsupported single-panel interaction kind")
+        if not callable(interaction_callback) or not callable(rectangle_callback):
+            raise TypeError("single-panel interaction callbacks must be callable")
+        if not isinstance(selectors_enabled, bool):
+            raise TypeError("selectors_enabled must be bool")
+        payload = frame.panels[0].display_payload
+        candidate_image = None
+        candidate_numeric = None
+        if kind == "image":
+            image_payload = (
+                payload.background
+                if isinstance(payload, SiteMapPanelPayload)
+                else payload
+            )
+            if not isinstance(image_payload, ImagePanelPayload):
+                raise TypeError("image interaction requires ImagePanelPayload")
+            candidate_image = _ImagePanelBinding(
+                panel_id,
+                image_payload.viewport,
+                rectangle_callback,
+                interaction_callback=interaction_callback,
+                revision_floor=image_payload.viewport.viewport_revision,
+                interaction_ready=True,
+            )
+        elif kind is not None:
+            payload_type = _NUMERIC_PAYLOAD_TYPES[kind]
+            if not isinstance(payload, payload_type):
+                raise TypeError(
+                    f"{kind} interaction requires {payload_type.__name__}"
+                )
+            candidate_numeric = _NumericPanelBinding(
+                kind,
+                panel_id,
+                interaction_callback,
+                viewport=payload.viewport,
+                revision_floor=payload.viewport.display_revision,
+                interaction_ready=True,
+            )
+        self._present(
+            frame,
+            interaction_transition=(
+                panel_id,
+                candidate_image,
+                candidate_numeric,
+                selectors_enabled,
+            ),
+        )
+
+    def _present(self, frame: BoardFrame, *, interaction_transition) -> None:
         self._require_owner()
         self._ensure_open()
         interaction_was_active = self._selector_hold is not None
@@ -227,6 +307,35 @@ class QtRasterBoard(QtWidgets.QWidget):
         target_identity = self._active_layout_identity
         target_image_viewports: dict[str, ImageViewportTransform] = {}
         target_numeric_viewports: dict[str, _NumericViewport] = {}
+        queued_image_viewports: list[
+            tuple[_ImagePanelBinding, NormalizedRectangle]
+        ] = []
+        queued_image_colors: list[
+            tuple[_ImagePanelBinding, tuple[float, float]]
+        ] = []
+        queued_numeric_viewports: list[
+            tuple[_NumericPanelBinding, tuple[float, float]]
+        ] = []
+        queued_histogram_thresholds: list[
+            tuple[_NumericPanelBinding, tuple[float, ...]]
+        ] = []
+        validation_image_bindings = self._image_bindings
+        validation_numeric_bindings = self._numeric_bindings
+        if interaction_transition is not None:
+            (
+                transition_panel_id,
+                candidate_image,
+                candidate_numeric,
+                _transition_selectors_enabled,
+            ) = interaction_transition
+            validation_image_bindings = dict(self._image_bindings)
+            validation_numeric_bindings = dict(self._numeric_bindings)
+            validation_image_bindings.pop(transition_panel_id, None)
+            validation_numeric_bindings.pop(transition_panel_id, None)
+            if candidate_image is not None:
+                validation_image_bindings[transition_panel_id] = candidate_image
+            if candidate_numeric is not None:
+                validation_numeric_bindings[transition_panel_id] = candidate_numeric
         try:
             if not isinstance(frame, BoardFrame):
                 raise TypeError("frame must be BoardFrame")
@@ -256,7 +365,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 )
             else:
                 target_identity = frame_identity
-            for panel_id, binding in self._image_bindings.items():
+            for panel_id, binding in validation_image_bindings.items():
                 if panel_id not in target_panel_ids:
                     continue
                 target_viewport = _viewport_for_presented_panel(
@@ -273,8 +382,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                     panel_ids=target_panel_ids,
                 )
                 target_image_viewports[panel_id] = target_viewport
-                pending_origin = binding.pending_origin
-                pending_limits = binding.pending_color_limits
+                pending_color = binding.pending_color_answer
                 target_panel = frame.panels[
                     target_panel_ids.index(panel_id)
                 ]
@@ -286,17 +394,16 @@ class QtRasterBoard(QtWidgets.QWidget):
                         "image interaction callback requires exact ImagePanelPayload"
                     )
                 if (
-                    pending_origin is not None
-                    and pending_limits is not None
+                    pending_color is not None
                     and _image_payload(target_panel) is not None
-                    and target_viewport.viewport_revision
-                    == pending_origin.presentation.panel_revision + 1
-                    and _image_payload(target_panel).color_limits != pending_limits
+                    and _panel_presentation(target_panel).panel_revision
+                    == pending_color.display_revision
+                    and not pending_color.matches(target_panel)
                 ):
                     raise ValueError(
                         "pending image color-limit revision returned conflicting limits"
                     )
-            for panel_id, binding in self._numeric_bindings.items():
+            for panel_id, binding in validation_numeric_bindings.items():
                 if panel_id in target_panel_ids:
                     target_numeric_viewports[panel_id] = (
                         _numeric_viewport_for_presented_panel(
@@ -331,6 +438,24 @@ class QtRasterBoard(QtWidgets.QWidget):
                 )
                 self.update()
             raise
+        # The candidate frame, QImages, and candidate binding all passed.  The
+        # family swap begins only here; no validation below can reject it.
+        if interaction_transition is not None:
+            (
+                transition_panel_id,
+                candidate_image,
+                candidate_numeric,
+                transition_selectors_enabled,
+            ) = interaction_transition
+            if transition_panel_id in self._image_bindings:
+                self._reset_image_binding(transition_panel_id)
+            if transition_panel_id in self._numeric_bindings:
+                self._reset_numeric_binding(transition_panel_id)
+            if candidate_image is not None:
+                self._image_bindings[transition_panel_id] = candidate_image
+            if candidate_numeric is not None:
+                self._numeric_bindings[transition_panel_id] = candidate_numeric
+            self._selector_enabled = transition_selectors_enabled
         previous = self._front
         for panel_id, binding in tuple(self._image_bindings.items()):
             if panel_id not in target_panel_ids:
@@ -401,76 +526,81 @@ class QtRasterBoard(QtWidgets.QWidget):
                 binding.revision_floor = max(
                     binding.revision_floor, viewport.display_revision)
         for panel_id, binding in self._image_bindings.items():
-            target_viewport = target_image_viewports.get(panel_id)
-            pending = binding.pending_viewport
             hold = self._selector_hold
-            answered, intermediate_answer = _presented_revision_state(
-                None if pending is None else pending.viewport_revision,
-                None if target_viewport is None else target_viewport.viewport_revision,
-                (
-                    hold.presentation.panel_revision
-                    if hold is not None and hold.panel_id == panel_id
-                    else None
-                ),
+            panel = frame.panels[target_panel_ids.index(panel_id)]
+            viewport_answered = (
+                binding.pending_viewport_answer is not None
+                and binding.pending_viewport_answer.matches(panel)
             )
-            if answered:
-                binding.pending_viewport = None
-            pending_origin = binding.pending_origin
+            color_answered = (
+                binding.pending_color_answer is not None
+                and binding.pending_color_answer.matches(panel)
+            )
+            if viewport_answered:
+                binding.pending_viewport_answer = None
+                queued = binding.queued_viewport_bounds
+                binding.queued_viewport_bounds = None
+                if queued is not None:
+                    queued_image_viewports.append((binding, queued))
+            if color_answered:
+                binding.pending_color_answer = None
+                queued = binding.queued_color_limits
+                binding.queued_color_limits = None
+                if queued is not None:
+                    queued_image_colors.append((binding, queued))
             if (
-                binding.pending_color_limits is not None
-                and target_viewport is not None
-                and pending_origin is not None
-                and target_viewport.viewport_revision
-                > pending_origin.presentation.panel_revision
-            ):
-                binding.pending_color_limits = None
-                answered = True
-            if not _image_interaction_is_pending(binding):
-                binding.pending_origin = None
-            if (
-                (answered or intermediate_answer)
+                (viewport_answered or color_answered)
                 and hold is not None
                 and hold.panel_id == panel_id
             ):
                 index = target_panel_ids.index(panel_id)
-                panel = frame.panels[index]
                 self._selector_hold = _advance_held_front(
                     hold, frame, panel, prepared[index]
                 )
         for panel_id, binding in self._numeric_bindings.items():
-            pending = binding.pending_viewport
-            candidate = target_numeric_viewports.get(panel_id)
             hold = self._selector_hold
-            answered, intermediate_answer = _presented_revision_state(
-                None if pending is None else pending.display_revision,
-                None if candidate is None else candidate.display_revision,
-                (
-                    hold.presentation.panel_revision
-                    if hold is not None and hold.panel_id == panel_id
-                    else None
-                ),
+            index = target_panel_ids.index(panel_id)
+            panel = frame.panels[index]
+            viewport_answered = (
+                binding.pending_viewport_answer is not None
+                and binding.pending_viewport_answer.matches(panel)
             )
-            if answered:
-                binding.pending_viewport = None
-            if (
-                binding.threshold_pending_revision is not None
-                and candidate is not None
-                and candidate.display_revision
-                >= binding.threshold_pending_revision
-            ):
-                binding.threshold_pending_revision = None
-                binding.threshold_pending_origin = None
-                answered = True
-            if answered or intermediate_answer:
+            threshold_answered = (
+                binding.threshold_pending_answer is not None
+                and binding.threshold_pending_answer.matches(panel)
+            )
+            if viewport_answered:
+                binding.pending_viewport_answer = None
+                queued = binding.queued_viewport_limits
+                binding.queued_viewport_limits = None
+                if queued is not None:
+                    queued_numeric_viewports.append((binding, queued))
+            if threshold_answered:
+                binding.threshold_pending_answer = None
+                queued = binding.queued_thresholds
+                binding.queued_thresholds = None
+                if queued is not None:
+                    queued_histogram_thresholds.append((binding, queued))
+            if viewport_answered or threshold_answered:
                 if hold is not None and hold.panel_id == panel_id:
-                    index = target_panel_ids.index(panel_id)
-                    panel = frame.panels[index]
                     self._selector_hold = _advance_held_front(
                         hold, frame, panel, prepared[index]
                     )
-            if binding.pending_viewport is None:
-                binding.pending_origin = None
         self._front = (frame, prepared)
+        # Pointer input is allowed to outrun Agg, but semantic answers are not
+        # guessed or accepted by revision alone.  Each binding keeps one exact
+        # in-flight answer plus one latest desired state.  Once that answer is
+        # installed as the real front, author the coalesced state from this
+        # new exact origin.  This yields live render-rate feedback without an
+        # unbounded request queue or fake Qt-side raster scaling.
+        for binding, bounds in queued_image_viewports:
+            self._author_queued_image_viewport(binding, bounds)
+        for binding, limits in queued_image_colors:
+            self._author_queued_image_color(binding, limits)
+        for binding, limits in queued_numeric_viewports:
+            self._author_queued_numeric_viewport(binding, limits)
+        for binding, thresholds in queued_histogram_thresholds:
+            self._author_queued_histogram_thresholds(binding, thresholds)
         self.update()
 
     def clear(self) -> None:
@@ -598,20 +728,6 @@ class QtRasterBoard(QtWidgets.QWidget):
         )
         return origin
 
-    def visible_site_map_payload(
-        self,
-        panel_id: str | None = None,
-    ) -> SiteMapPanelPayload | None:
-        """Return the exact composite payload painted by the image-family panel."""
-
-        self._require_owner()
-        binding = self._image_binding(panel_id)
-        payload, _origin = self._visible_display(
-            None if binding is None else binding.panel_id,
-            SiteMapPanelPayload,
-        )
-        return payload if isinstance(payload, SiteMapPanelPayload) else None
-
     def discard_pending_image_interaction(
         self,
         origin: PanelInteractionOrigin,
@@ -631,12 +747,37 @@ class QtRasterBoard(QtWidgets.QWidget):
         if (
             binding is None
             or not _image_interaction_is_pending(binding)
-            or origin != binding.pending_origin
+            or not any(
+                answer is not None and answer.origin == origin
+                for answer in (
+                    binding.pending_viewport_answer,
+                    binding.pending_color_answer,
+                )
+            )
         ):
             return False
-        binding.pending_viewport = None
-        binding.pending_color_limits = None
-        binding.pending_origin = None
+        if (
+            binding.pending_viewport_answer is not None
+            and binding.pending_viewport_answer.origin == origin
+        ):
+            queued_viewport = binding.queued_viewport_bounds
+            binding.pending_viewport_answer = None
+            binding.queued_viewport_bounds = None
+        else:
+            queued_viewport = None
+        if (
+            binding.pending_color_answer is not None
+            and binding.pending_color_answer.origin == origin
+        ):
+            queued_color = binding.queued_color_limits
+            binding.pending_color_answer = None
+            binding.queued_color_limits = None
+        else:
+            queued_color = None
+        if queued_viewport is not None:
+            self._author_queued_image_viewport(binding, queued_viewport)
+        if queued_color is not None:
+            self._author_queued_image_color(binding, queued_color)
         self.update()
         return True
 
@@ -753,12 +894,15 @@ class QtRasterBoard(QtWidgets.QWidget):
         if (
             binding is None
             or binding.kind != "curve"
-            or binding.pending_viewport is None
-            or origin != binding.pending_origin
+            or binding.pending_viewport_answer is None
+            or origin != binding.pending_viewport_answer.origin
         ):
             return False
-        binding.pending_viewport = None
-        binding.pending_origin = None
+        queued = binding.queued_viewport_limits
+        binding.pending_viewport_answer = None
+        binding.queued_viewport_limits = None
+        if queued is not None:
+            self._author_queued_numeric_viewport(binding, queued)
         self.update()
         return True
 
@@ -775,19 +919,35 @@ class QtRasterBoard(QtWidgets.QWidget):
         if binding is None or binding.kind != "histogram":
             return False
         discarded = False
-        if binding.pending_viewport is not None and origin == binding.pending_origin:
-            binding.pending_viewport = None
-            binding.pending_origin = None
-            discarded = True
         if (
-            binding.threshold_pending_revision is not None
-            and origin == binding.threshold_pending_origin
+            binding.pending_viewport_answer is not None
+            and origin == binding.pending_viewport_answer.origin
         ):
-            binding.threshold_pending_revision = None
-            binding.threshold_pending_origin = None
+            queued_viewport = binding.queued_viewport_limits
+            binding.pending_viewport_answer = None
+            binding.queued_viewport_limits = None
             discarded = True
+        else:
+            queued_viewport = None
+        if (
+            binding.threshold_pending_answer is not None
+            and origin == binding.threshold_pending_answer.origin
+        ):
+            queued_thresholds = binding.queued_thresholds
+            binding.threshold_pending_answer = None
+            binding.queued_thresholds = None
+            discarded = True
+        else:
+            queued_thresholds = None
         if not discarded:
             return False
+        if queued_viewport is not None:
+            self._author_queued_numeric_viewport(binding, queued_viewport)
+        if queued_thresholds is not None:
+            self._author_queued_histogram_thresholds(
+                binding,
+                queued_thresholds,
+            )
         self.update()
         return True
 
@@ -804,12 +964,15 @@ class QtRasterBoard(QtWidgets.QWidget):
         if (
             binding is None
             or binding.kind != "pulse"
-            or binding.pending_viewport is None
-            or origin != binding.pending_origin
+            or binding.pending_viewport_answer is None
+            or origin != binding.pending_viewport_answer.origin
         ):
             return False
-        binding.pending_viewport = None
-        binding.pending_origin = None
+        queued = binding.queued_viewport_limits
+        binding.pending_viewport_answer = None
+        binding.queued_viewport_limits = None
+        if queued is not None:
+            self._author_queued_numeric_viewport(binding, queued)
         self.update()
         return True
 
@@ -1099,25 +1262,6 @@ class QtRasterBoard(QtWidgets.QWidget):
         )
         self.update()
 
-    def set_selector_draft_selection(
-        self,
-        selection: Selection | None,
-        *,
-        panel_id: str | None = None,
-    ) -> None:
-        self._require_owner()
-        binding = self._require_image_binding(panel_id)
-        viewport = self._require_selector_viewport(binding)
-        if selection is not None and not isinstance(selection, Selection):
-            raise TypeError("draft selection must be zlc_data.Selection or None")
-        binding.draft_bounds = (
-            None
-            if selection is None
-            else viewport.normalized_bounds_for_selection(selection)
-        )
-        self._cancel_image_gesture(binding, clear_draft=False)
-        self.update()
-
     def set_image_rectangle_candidate(
         self,
         bounds: NormalizedRectangle | None,
@@ -1272,7 +1416,12 @@ class QtRasterBoard(QtWidgets.QWidget):
             image_payload = None
             if isinstance(
                 payload,
-                (CurvePanelPayload, HistogramPanelPayload, MeterPanelPayload),
+                (
+                    CurvePanelPayload,
+                    HistogramPanelPayload,
+                    MeterPanelPayload,
+                    PulsePanelPayload,
+                ),
             ):
                 target = bounds
                 source = QtCore.QRectF(
@@ -1281,7 +1430,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                     float(image.width()),
                     float(image.height()),
                 )
-                rail = None
             else:
                 image_payload = (
                     payload.background
@@ -1300,7 +1448,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                         else None
                     ),
                 )
-                overlay_target = geometry.target
                 if image_payload is not None:
                     target = bounds
                     source = QtCore.QRectF(
@@ -1357,6 +1504,9 @@ class QtRasterBoard(QtWidgets.QWidget):
         ):
             binding = numeric_target.binding
             if self._selector_hold is not None:
+                event.accept()
+                return
+            if _numeric_interaction_is_pending(binding):
                 event.accept()
                 return
             point = _numeric_normalized_point(
@@ -1494,7 +1644,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             if sample is None:
                 super().mousePressEvent(event)
                 return
-            _set_cross_sample(binding, sample)
+            binding.cross = sample
             self.crossSelected.emit(
                 CrossGesture(
                     self._require_interaction_origin(
@@ -1550,7 +1700,6 @@ class QtRasterBoard(QtWidgets.QWidget):
             )
         )
         binding.drag_prior_draft = binding.draft_bounds
-        binding.drag_start_bounds = bounds
         binding.rectangle_drag = (
             RectangleDrag.fresh(point)
             if handle is None or visible_bounds is None
@@ -1574,32 +1723,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             numeric_binding is not None
             and numeric_binding.threshold_drag is not None
         ):
-            target = self._numeric_target(numeric_binding)
-            if target is not None:
-                viewport = target.payload.viewport
-                point = _numeric_normalized_point(
-                    target,
-                    event.localPos(),
-                    clamp_to_plot=True,
-                )
-                moved = viewport.widget_normalized_to_data(*point)
-                base = list(
-                    numeric_binding.threshold_candidate
-                    or target.payload.thresholds
-                )
-                index = numeric_binding.threshold_drag
-                if 0 <= index < len(base) and math.isfinite(moved[0]):
-                    base[index] = float(moved[0])
-                    candidate = tuple(base)
-                    # The reference's DragVLine calls back on EVERY motion.
-                    if candidate != numeric_binding.threshold_candidate:
-                        numeric_binding.threshold_candidate = candidate
-                        self._commit_histogram_thresholds(
-                            numeric_binding,
-                            candidate,
-                            hold=self._selector_hold,
-                        )
-                self.update()
+            self._move_histogram_threshold(
+                numeric_binding,
+                event.localPos(),
+            )
+            self.update()
             event.accept()
             return
         if (
@@ -1638,60 +1766,16 @@ class QtRasterBoard(QtWidgets.QWidget):
             and numeric_binding.pan_anchor is not None
             and numeric_binding.pan_origin is not None
         ):
-            target = self._numeric_target(numeric_binding)
-            if target is not None:
-                point = _numeric_normalized_point(target, event.localPos())
-                try:
-                    numeric_binding.pan_candidate = (
-                        numeric_binding.pan_origin.panned_x_limits(
-                        numeric_binding.pan_anchor,
-                        point[0],
-                        start_x_limits=numeric_binding.pan_origin.x_limits,
-                        )
-                    )
-                except ValueError:
-                    numeric_binding.pan_candidate = None
-                # The reference pans LIVE: every motion lands the new limits
-                # immediately (mpl's on_motion -> set_xlim -> draw), so the
-                # view follows the pointer instead of jumping at release.
-                if numeric_binding.pan_candidate is not None:
-                    self._commit_numeric_viewport(
-                        numeric_binding,
-                        numeric_binding.pan_candidate,
-                        hold=self._selector_hold,
-                    )
-                self.update()
+            self._move_numeric_pan(numeric_binding, event.localPos())
+            self.update()
             event.accept()
             return
         image_binding = _active_image_binding(
             self._image_bindings, self._selector_hold
         )
         if image_binding is not None and image_binding.clim_drag is not None:
-            rail_target = self._clim_rail_target(image_binding)
-            if (
-                rail_target is not None
-                and image_binding.clim_origin_limits is not None
-                and image_binding.clim_domain is not None
-            ):
-                value = _rail_value(
-                    float(event.localPos().y()),
-                    image_binding.clim_domain,
-                    rail_target[0],
-                )
-                low, high = image_binding.clim_origin_limits
-                if image_binding.clim_drag == "low":
-                    low = min(value, math.nextafter(high, -math.inf))
-                else:
-                    high = max(value, math.nextafter(low, math.inf))
-                image_binding.clim_candidate = (low, high)
-                # The reference's DragHLine recolors on EVERY motion.
-                if self._selector_hold is not None:
-                    self._commit_color_limits(
-                        image_binding,
-                        image_binding.clim_candidate,
-                        hold=self._selector_hold,
-                    )
-                self.update()
+            self._move_image_color_limit(image_binding, event.localPos())
+            self.update()
             event.accept()
             return
         rectangle_drag = (
@@ -1725,22 +1809,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         pan_origin = None if image_binding is None else image_binding.pan_origin
         pan_size = None if image_binding is None else image_binding.pan_target_size
         if pan_anchor is not None and pan_origin is not None and pan_size is not None:
-            delta = (
-                float(event.localPos().x() - pan_anchor.x()),
-                float(event.localPos().y() - pan_anchor.y()),
-            )
-            image_binding.pan_candidate = pan_origin.panned_by_pixels(delta, pan_size)
-            # The reference pans LIVE: every motion lands the new window (the
-            # commit rebases the candidate's revision monotonically).
-            if (
-                image_binding.pan_candidate is not None
-                and self._selector_hold is not None
-            ):
-                self._commit_viewport(
-                    image_binding,
-                    image_binding.pan_candidate,
-                    hold=self._selector_hold,
-                )
+            self._move_image_pan(image_binding, event.localPos())
             self.update()
             event.accept()
             return
@@ -1756,8 +1825,13 @@ class QtRasterBoard(QtWidgets.QWidget):
             and numeric_binding.threshold_drag is not None
             and event.button() == QtCore.Qt.LeftButton
         ):
-            # Every motion already committed its step; release only ends the
-            # drag (the reference's DragVLine on_release re-arms and stops).
+            # Qt may deliver a release position not preceded by a motion.
+            # Reuse the exact motion path so that final coordinate is never
+            # lost; an unchanged candidate remains a no-op.
+            self._move_histogram_threshold(
+                numeric_binding,
+                event.localPos(),
+            )
             self._cancel_active_gesture(
                 clear_image_draft=False,
                 clear_numeric_spans=False,
@@ -1770,8 +1844,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             and numeric_binding.pan_anchor is not None
             and event.button() == QtCore.Qt.MiddleButton
         ):
-            # Every motion already committed its candidate (the reference's
-            # live pan); release only ends the gesture.
+            self._move_numeric_pan(numeric_binding, event.localPos())
             self._cancel_active_gesture(
                 clear_image_draft=False,
                 clear_numeric_spans=False,
@@ -1824,8 +1897,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             and image_binding.clim_drag is not None
             and event.button() == QtCore.Qt.LeftButton
         ):
-            # Every motion already committed its candidate (the reference's
-            # DragHLine recolors live); release only ends the gesture.
+            self._move_image_color_limit(image_binding, event.localPos())
             self._cancel_image_gesture(image_binding, clear_draft=False)
             self.update()
             event.accept()
@@ -1835,7 +1907,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             and image_binding.pan_anchor is not None
             and event.button() == QtCore.Qt.MiddleButton
         ):
-            # Live pan committed per motion; release only ends the gesture.
+            self._move_image_pan(image_binding, event.localPos())
             self._cancel_image_gesture(image_binding, clear_draft=False)
             self.update()
             event.accept()
@@ -1929,6 +2001,9 @@ class QtRasterBoard(QtWidgets.QWidget):
             if self._selector_hold is not None:
                 event.accept()
                 return
+            if binding.threshold_pending_answer is not None:
+                event.accept()
+                return
             delta = event.angleDelta().y()
             if delta == 0:
                 super().wheelEvent(event)
@@ -1938,7 +2013,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             # wheel steps accumulate on the newest authored viewport.  Making
             # the wheel wait for each Agg answer is what made zoom feel
             # proportional to render latency.
-            viewport = binding.pending_viewport or numeric_target.payload.viewport
+            viewport = binding.authored_viewport or numeric_target.payload.viewport
             anchor_x = viewport.widget_normalized_to_data(*point)[0]
             factor = 1.0 / 1.1 if delta < 0 else 1.1
             try:
@@ -2039,7 +2114,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 event.accept()
                 return
             if (
-                binding.pending_viewport is not None
+                _numeric_interaction_is_pending(binding)
                 or self._selector_hold is not None
             ):
                 event.accept()
@@ -2094,7 +2169,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             super().mouseDoubleClickEvent(event)
             return
         if event.button() == QtCore.Qt.RightButton:
-            _set_cross_sample(binding, None)
+            binding.cross = None
             self.crossSelected.emit(
                 CrossGesture(
                     self._require_interaction_origin(
@@ -2204,7 +2279,7 @@ class QtRasterBoard(QtWidgets.QWidget):
 
         A board front may advance while one selector gesture keeps its panel
         payload held.  ``binding.viewport`` tracks the admitted front and is
-        therefore only authoritative for legacy/raw raster panels, which have
+        therefore only authoritative for untyped raster panels, which have
         no typed viewport in either the held or current painted payload.
         """
 
@@ -2379,6 +2454,177 @@ class QtRasterBoard(QtWidgets.QWidget):
             hold=self._selector_hold,
         )
 
+    def _move_histogram_threshold(
+        self,
+        binding: _NumericPanelBinding,
+        position: QtCore.QPointF,
+    ) -> None:
+        """Advance one live threshold drag through the shared exact front."""
+
+        target = self._numeric_target(binding)
+        if target is None or binding.threshold_drag is None:
+            return
+        viewport = target.payload.viewport
+        point = _numeric_normalized_point(
+            target,
+            position,
+            clamp_to_plot=True,
+        )
+        moved = viewport.widget_normalized_to_data(*point)
+        base = list(binding.threshold_candidate or target.payload.thresholds)
+        index = binding.threshold_drag
+        if not (0 <= index < len(base) and math.isfinite(moved[0])):
+            return
+        base[index] = float(moved[0])
+        candidate = tuple(base)
+        if candidate == binding.threshold_candidate:
+            return
+        binding.threshold_candidate = candidate
+        self._commit_histogram_thresholds(
+            binding,
+            candidate,
+            hold=self._selector_hold,
+        )
+
+    def _move_numeric_pan(
+        self,
+        binding: _NumericPanelBinding,
+        position: QtCore.QPointF,
+    ) -> None:
+        """Advance one live numeric pan from its immutable press transform."""
+
+        target = self._numeric_target(binding)
+        if (
+            target is None
+            or binding.pan_anchor is None
+            or binding.pan_origin is None
+        ):
+            return
+        point = _numeric_normalized_point(target, position)
+        try:
+            candidate = binding.pan_origin.panned_x_limits(
+                binding.pan_anchor,
+                point[0],
+                start_x_limits=binding.pan_origin.x_limits,
+            )
+        except ValueError:
+            binding.pan_candidate = None
+            return
+        binding.pan_candidate = candidate
+        self._commit_numeric_viewport(
+            binding,
+            candidate,
+            hold=self._selector_hold,
+        )
+
+    def _move_image_color_limit(
+        self,
+        binding: _ImagePanelBinding,
+        position: QtCore.QPointF,
+    ) -> None:
+        """Advance one live colour-rail drag through the same panel owner."""
+
+        rail_target = self._clim_rail_target(binding)
+        if (
+            rail_target is None
+            or binding.clim_drag is None
+            or binding.clim_origin_limits is None
+            or binding.clim_domain is None
+        ):
+            return
+        value = _rail_value(
+            float(position.y()),
+            binding.clim_domain,
+            rail_target[0],
+        )
+        low, high = binding.clim_origin_limits
+        if binding.clim_drag == "low":
+            low = min(value, math.nextafter(high, -math.inf))
+        else:
+            high = max(value, math.nextafter(low, math.inf))
+        binding.clim_candidate = (low, high)
+        self._commit_color_limits(
+            binding,
+            binding.clim_candidate,
+            hold=self._selector_hold,
+        )
+
+    def _move_image_pan(
+        self,
+        binding: _ImagePanelBinding,
+        position: QtCore.QPointF,
+    ) -> None:
+        """Advance one live image pan from its immutable press transform."""
+
+        anchor = binding.pan_anchor
+        origin = binding.pan_origin
+        target_size = binding.pan_target_size
+        if anchor is None or origin is None or target_size is None:
+            return
+        delta = (
+            float(position.x() - anchor.x()),
+            float(position.y() - anchor.y()),
+        )
+        candidate = origin.panned_by_pixels(delta, target_size)
+        binding.pan_candidate = candidate
+        self._commit_viewport(
+            binding,
+            candidate,
+            hold=self._selector_hold,
+        )
+
+    def _held_origin_for_panel(self, panel_id: str) -> _HeldPanelFront | None:
+        hold = self._selector_hold
+        return (
+            hold
+            if hold is not None and hold.panel_id == panel_id
+            else None
+        )
+
+    def _author_queued_image_viewport(
+        self,
+        binding: _ImagePanelBinding,
+        bounds: NormalizedRectangle,
+    ) -> bool:
+        return self._commit_viewport(
+            binding,
+            binding.viewport.with_visible_bounds(bounds),
+            hold=self._held_origin_for_panel(binding.panel_id),
+        )
+
+    def _author_queued_image_color(
+        self,
+        binding: _ImagePanelBinding,
+        limits: tuple[float, float],
+    ) -> bool:
+        return self._commit_color_limits(
+            binding,
+            limits,
+            hold=self._held_origin_for_panel(binding.panel_id),
+        )
+
+    def _author_queued_numeric_viewport(
+        self,
+        binding: _NumericPanelBinding,
+        limits: tuple[float, float],
+    ) -> bool:
+        return self._commit_numeric_viewport(
+            binding,
+            limits,
+            hold=self._held_origin_for_panel(binding.panel_id),
+        )
+
+    def _author_queued_histogram_thresholds(
+        self,
+        binding: _NumericPanelBinding,
+        thresholds: tuple[float, ...],
+    ) -> bool:
+        return self._commit_histogram_thresholds(
+            binding,
+            thresholds,
+            hold=self._held_origin_for_panel(binding.panel_id),
+        )
+
     def _commit_viewport(
         self,
         binding: _ImagePanelBinding,
@@ -2434,7 +2680,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         binding: _ImagePanelBinding,
         limits: tuple[float, float],
         *,
-        hold: _HeldPanelFront,
+        hold: _HeldPanelFront | None,
     ) -> bool:
         return _commit_image_color_limits(
             binding,

@@ -32,7 +32,7 @@ from zlc_neutral_atom.logic_nodes.camera_measurement import (
     CameraMonitorViewSpec,
     camera_frame_output_declarations,
 )
-from zlc_neutral_atom.logic_nodes.pulse_scan import (
+from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSegmentTable,
     ApiSlotSegmentedProgram,
     AutonomousScanSlotProgram,
@@ -298,6 +298,7 @@ def test_occupancy_scan_artifact_round_trips_expandable_same_shot_lineage(
     with zlc.connect("virtual", repository=repository) as experiment:
         camera_source, camera_handle = _start_virtual_readout_camera(experiment)
         frame_schema = camera_source.value_schema("frame_0")
+        camera_binding = camera_source.dataset_output_binding("frame_0")
         occupancy = AssociatedRunningOccupancySignalSource(
             camera_source,
             source_output_name="frame_0",
@@ -306,6 +307,8 @@ def test_occupancy_scan_artifact_round_trips_expandable_same_shot_lineage(
             classify=classify,
             artifact_input=calibration_input,
             processor_stage=occupancy_stage,
+            expected_source_stream_id=camera_binding.stream_id,
+            expected_source_stream_generation=camera_binding.stream_generation,
         )
         try:
             source = occupancy
@@ -315,7 +318,12 @@ def test_occupancy_scan_artifact_round_trips_expandable_same_shot_lineage(
             artifact = experiment.readout.load_scan(reference)
             assert not camera_handle.snapshot().state.terminal
         finally:
-            occupancy.close()
+            occupancy.request_close()
+            deadline = time.monotonic() + 2.0
+            while not occupancy.worker_idle and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert occupancy.worker_idle
+            occupancy.join_closed()
             _stop_virtual_readout_camera(camera_handle)
 
     assert materialized.values.shape == (1, 2, 1)

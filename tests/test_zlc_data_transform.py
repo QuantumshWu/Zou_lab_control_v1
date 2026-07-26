@@ -21,6 +21,7 @@ from zlc_data import (
     ComponentValidity,
     CoordinateFrameId,
     DataBlock,
+    DatasetComponentValidity,
     DataTransformSpec,
     DatasetRevision,
     DatasetSchema,
@@ -331,7 +332,7 @@ def test_sparse_missing_policy_never_turns_holes_into_invalid_rows():
 def test_component_validity_is_reduced_per_named_component():
     point = axis("point", SCAN_POINT, 1)
     site = axis("site", SITE, 2)
-    validity = ComponentValidity(
+    validity = DatasetComponentValidity(
         (site.axis_id,),
         np.array([[[True, False]], [[True, True]]]),
     )
@@ -363,7 +364,7 @@ def test_component_validity_is_reduced_per_named_component():
 def test_mixed_cell_and_data_mean_uses_one_valid_contributor_count():
     point = axis("point", SCAN_POINT, 1)
     site = axis("site", SITE, 2)
-    validity = ComponentValidity(
+    validity = DatasetComponentValidity(
         (site.axis_id,), np.array([[[True, True]], [[True, False]]])
     )
     block = block_for(
@@ -524,7 +525,7 @@ def test_reduction_axes_are_a_canonical_set_and_min_max_respect_validity():
         layout=PointLayout.rect_c((1,)),
         data_axes=(site,),
         values=np.array([[[2.0, 99.0, 7.0]], [[4.0, 8.0, 6.0]]]),
-        validity=ComponentValidity(
+        validity=DatasetComponentValidity(
             (site.axis_id,), np.array([[[True, False, True]], [[True, True, True]]])
         ),
         component_axes=(site.axis_id,),

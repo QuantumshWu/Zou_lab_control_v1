@@ -16,13 +16,13 @@ from zlc_data import DataTransformSpec
 from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
 from zlc_neutral_atom.node_input import BoundDatasetInput, BoundNodeInputs
-
-from .authoring import PULSE_SCAN_SOURCE_INPUT_SPEC
-from .contracts import (
+from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSlotSegmentedProgram,
     AutonomousScanSlotProgram,
-    PulseScanProgram,
+    PulseParameterScanProgram,
 )
+
+from .authoring import PULSE_SCAN_SOURCE_INPUT_SPEC
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +54,7 @@ class ScanSignalBinding:
 class PulseScanBoundRequest:
     """One pulse program plus one external, source-neutral signal binding."""
 
-    program: PulseScanProgram
+    program: PulseParameterScanProgram
     signal: ScanSignalBinding
 
     def __post_init__(self) -> None:
@@ -82,7 +82,7 @@ def bind_scan_signal(binding: BoundDatasetInput) -> ScanSignalBinding:
 
 
 def bind_pulse_scan_request(
-    program: PulseScanProgram,
+    program: PulseParameterScanProgram,
     inputs: BoundNodeInputs,
 ) -> PulseScanBoundRequest:
     """Bind the declaration-owned signal without inspecting its producer."""

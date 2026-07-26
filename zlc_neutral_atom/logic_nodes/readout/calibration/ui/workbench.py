@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from zlc_workbench.frozen_raster import FrozenRasterWindow
     from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
         CalibrationArtifactRef,
     )
@@ -14,38 +13,31 @@ if TYPE_CHECKING:
     )
 
     from .workbench_window import CalibrationWorkbenchWindow
+    from .report_window import CalibrationReportWindow
 
 
 def open_calibration_report_workbench(
     computation_loader,
     reference: CalibrationArtifactRef,
-) -> FrozenRasterWindow:
+) -> CalibrationReportWindow:
     """Load and display one FINAL calibration report on the shared raster lane."""
 
-    from zlc_workbench.frozen_raster import (
-        open_frozen_raster_window,
-    )
+    from zlc_workbench.window_runtime import open_workbench_window
     from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
         CalibrationArtifactRef,
     )
 
-    from .workbench_jobs import _render_calibration
+    from .report_window import CalibrationReportWindow
 
     if not callable(computation_loader):
         raise TypeError("computation_loader must be callable")
     if not isinstance(reference, CalibrationArtifactRef):
         raise TypeError("reference must be CalibrationArtifactRef")
-    return open_frozen_raster_window(
-        lambda cancelled: _render_calibration(
+    return open_workbench_window(
+        lambda: CalibrationReportWindow(
             computation_loader,
             reference,
-            cancelled,
         ),
-        window_title="Calibration Report",
-        mode_text="FROZEN CALIBRATION REPORT · DISPLAY ONLY",
-        loading_summary=f"Resolving {reference.target_ref}…",
-        object_prefix="calibrationReport",
-        subject="report",
     )
 
 

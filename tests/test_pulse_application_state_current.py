@@ -156,7 +156,7 @@ def test_two_facades_share_run_observation_applied_identity_and_safe_cancel(
         scan_table=None,
         api_parameters=(),
     )
-    peer = PulseFacade(experiment.pulse._token)
+    peer = PulseFacade(experiment._services)
     assert peer.snapshot() == experiment.pulse.snapshot()
 
     request = experiment.pulse.request(
@@ -265,7 +265,7 @@ def test_continuous_backend_failure_terminates_run_without_user_cancel(
         api_values={"api_duration": 200},
     )
     owner = PulseApplicationOwner()
-    with _service_guard(experiment._authority_token) as services:
+    with _service_guard(experiment._services) as services:
         port = replace(
             services.runtime.pulse_port(request.sequencer_ref),
             _continuous_failure_waiter=(

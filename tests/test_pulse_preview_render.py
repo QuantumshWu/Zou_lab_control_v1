@@ -9,6 +9,7 @@ controller actions as a substitute for GUI interaction.
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -20,9 +21,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 import pytest
 
+from gui_user_flow import close_pulse_editor
 from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_pulse import load_pulse_document
-from zlc_workbench.pulse import project_pulse_preview
+from zlc_workbench.pulse_editor.session import project_pulse_preview
 
 
 ROOT = Path(__file__).parents[1]
@@ -113,13 +115,8 @@ def preview_body():
     )
     _until(application, lambda: body.worker_idle)
     yield body
-    deadline = time.monotonic() + 10.0
-    complete = False
-    while not complete and time.monotonic() < deadline:
-        complete = body.request_close(discard_unsaved=True)
-        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-        time.sleep(0.005)
-    assert complete and body.worker_idle
+    close_pulse_editor(application, body)
+    assert body.worker_idle
 
 
 def test_preview_opens_as_the_full_formal_plot_with_display_labels(preview_body) -> None:
@@ -146,6 +143,33 @@ def test_preview_opens_as_the_full_formal_plot_with_display_labels(preview_body)
     assert tuple(zip(payload.row_keys, payload.row_labels, strict=True)) == expected
     assert any(key != label for key, label in expected), (
         "the Preview axis regressed to raw lane keys instead of board labels"
+    )
+
+
+def test_preview_dpr_change_immediately_retires_the_old_front(preview_body) -> None:
+    body = preview_body
+    application = ensure_qt_app()
+    previous = body.preview_host.front_frame
+    assert previous is not None
+    ratio = body._preview_surface_pixel_ratio + 0.5
+
+    body._apply_preview_pixel_ratio(ratio)
+    assert body.preview_host.front_frame is None
+    assert not body.preview_host.isVisible()
+    _until(
+        application,
+        lambda: body.worker_idle
+        and body.preview_host.front_frame is not None
+        and body.preview_host.isVisible(),
+    )
+
+    current = body.preview_host.front_frame
+    assert current is not previous
+    raster = current.panels[0].raster
+    qround = lambda value: int(math.floor(value + 0.5))
+    assert (raster.width, raster.height) == (
+        qround(body.preview_host.width() * ratio),
+        qround(body.preview_host.height() * ratio),
     )
 
 
@@ -196,13 +220,8 @@ def test_preview_keeps_the_placeholder_until_the_first_complete_front(
         assert not body.preview_view.preview_placeholder.isVisible()
     finally:
         release.set()
-        deadline = time.monotonic() + 10.0
-        complete = False
-        while not complete and time.monotonic() < deadline:
-            complete = body.request_close(discard_unsaved=True)
-            application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-            time.sleep(0.005)
-        assert complete and body.worker_idle
+        close_pulse_editor(application, body)
+        assert body.worker_idle
 
 
 def test_show_off_rows_is_a_visible_switch_that_rebuilds_the_same_plot(preview_body) -> None:
@@ -489,11 +508,11 @@ def test_failed_latest_drag_frame_releases_its_exact_pending_intent(
     )
 
 
-def test_failed_intermediate_present_keeps_the_newer_human_drag_intent(
+def test_failed_inflight_present_reissues_the_newer_human_drag_intent(
     preview_body,
     monkeypatch,
 ) -> None:
-    """A stale Qt-present fault cannot discard a later held-drag revision."""
+    """A Qt-present fault cannot discard the mailbox's later drag intent."""
 
     import threading
 
@@ -564,7 +583,9 @@ def test_failed_intermediate_present_keeps_the_newer_human_drag_intent(
             centre + QtCore.QPoint(115, 0),
             QtCore.Qt.MiddleButton,
         )
-        assert body._pending_preview_revision == latest_revision
+        binding = next(iter(board._numeric_bindings.values()))
+        assert body._pending_preview_revision == first_revision
+        assert binding.queued_viewport_limits is not None
 
         release_first.set()
         _until(application, latest_started.is_set)
@@ -681,13 +702,14 @@ assert (raster.width, raster.height) == (
     (physical_front.width(), physical_front.height()),
     ratio,
 )
+body.request_close(discard_unsaved=True)
 deadline = time.monotonic() + 10.0
-complete = False
-while not complete and time.monotonic() < deadline:
-    complete = body.request_close(discard_unsaved=True)
+while not body.permanently_closed and time.monotonic() < deadline:
     app.processEvents(QtCore.QEventLoop.AllEvents, 20)
     time.sleep(0.005)
-assert complete and body.worker_idle
+assert body.permanently_closed and body.worker_idle
+QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+app.processEvents(QtCore.QEventLoop.AllEvents, 20)
 '''
     environment = os.environ.copy()
     environment["QT_QPA_PLATFORM"] = "offscreen"

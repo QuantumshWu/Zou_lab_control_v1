@@ -23,6 +23,7 @@ from zlc_data import (
     CommittedTransform,
     ComponentValidity,
     DataBlock,
+    DatasetComponentValidity,
     DataTransformSpec,
     DatasetRevision,
     DatasetRevisionRef,
@@ -995,7 +996,7 @@ def _apply_signal_value_transform(
 ) -> Value:
     source_validity = event.value.validity
     dataset_validity = (
-        ComponentValidity(
+        DatasetComponentValidity(
             source_validity.axis_ids,
             source_validity.mask.reshape(1, 1, *source_validity.mask.shape),
         )

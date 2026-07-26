@@ -370,8 +370,9 @@ def test_evaluated_image_viewport_preserves_explicit_numeric_axis_truth() -> Non
     assert scan_viewport.unbounded_visible_point_for_coordinate(
         (0, 6),
         coordinate_frame=None,
-    ) == (0.5, 0.75)
+    ) == (0.5, 2.0 / 3.0)
     assert scan_viewport.data_extent == (-18.0, 18.0, 12.0, -12.0)
+    assert scan_viewport.display_extent == (-18.0, 18.0, 18.0, -18.0)
 
     mismatched_frame = EvaluatedImage(
         image.x_axis,

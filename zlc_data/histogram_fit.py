@@ -9,7 +9,8 @@ experiment result. Frontends only draw this result.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import sqrt
+from math import hypot, isfinite, sqrt
+from numbers import Integral
 
 import numpy as np
 from scipy.optimize import curve_fit
@@ -76,6 +77,18 @@ def confidence_weighted_fidelity(
 ):
     """Return the established display-only confidence-weighted fidelity."""
 
+    values = tuple(
+        float(value)
+        for value in (threshold, mu0, sigma0, weight0, mu1, sigma1, weight1)
+    )
+    if not all(isfinite(value) for value in values):
+        raise ValueError("fidelity inputs must be finite")
+    threshold, mu0, sigma0, weight0, mu1, sigma1, weight1 = values
+    if sigma0 < 0.0 or sigma1 < 0.0:
+        raise ValueError("fidelity sigmas must be non-negative")
+    if weight0 < 0.0 or weight1 < 0.0:
+        raise ValueError("fidelity weights must be non-negative")
+
     def normal_cdf(value, mean, sigma):
         scale = max(abs(float(sigma)), _SIGMA_FLOOR)
         result = 0.5 * (
@@ -87,7 +100,7 @@ def confidence_weighted_fidelity(
         )
         return float(result) if result.ndim == 0 else result
 
-    total_weight = float(weight0) + float(weight1)
+    total_weight = weight0 + weight1
     if total_weight <= 0:
         return float("nan"), float("nan"), float("nan")
     dark_ok = normal_cdf(threshold, mu0, sigma0)
@@ -96,9 +109,9 @@ def confidence_weighted_fidelity(
         float(weight0) * float(dark_ok)
         + float(weight1) * float(bright_ok)
     ) / total_weight
-    separation = abs(float(mu1) - float(mu0)) / sqrt(
-        float(sigma0) ** 2 + float(sigma1) ** 2
-    )
+    scale0 = max(abs(float(sigma0)), _SIGMA_FLOOR)
+    scale1 = max(abs(float(sigma1)), _SIGMA_FLOOR)
+    separation = abs(float(mu1) - float(mu0)) / hypot(scale0, scale1)
     balance = 2.0 * min(float(weight0), float(weight1)) / total_weight
     effective_separation = max(0.0, separation - 2.0)
     confidence = float(
@@ -129,26 +142,79 @@ class HistogramFitResult:
     status: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.requested_mode, str):
+            raise TypeError("histogram fit requested_mode must be text")
         mode = str(self.requested_mode).strip().lower()
         if mode not in {"none", "single", "double"}:
             raise ValueError(f"unknown histogram fit mode {self.requested_mode!r}")
         expected = {0: 0, 1: 3, 2: 6}
+        if isinstance(self.component_count, (bool, np.bool_)) or not isinstance(
+            self.component_count,
+            Integral,
+        ):
+            raise TypeError("component_count must be an integer")
         count = int(self.component_count)
         if count not in expected:
             raise ValueError("component_count must be 0, 1, or 2")
         source = np.asarray(self.parameters, dtype=np.float64).reshape(-1)
         if source.size != expected[count]:
             raise ValueError("histogram fit parameter count does not match its model")
+        if not isinstance(self.valid, (bool, np.bool_)) or not isinstance(
+            self.separated,
+            (bool, np.bool_),
+        ):
+            raise TypeError("histogram fit validity flags must be bool")
+        valid = bool(self.valid)
+        separated = bool(self.separated)
+        if valid != (count > 0):
+            raise ValueError(
+                "a valid histogram fit must carry one fitted model and an "
+                "invalid fit must carry none"
+            )
+        if mode == "none" and valid:
+            raise ValueError("disabled histogram fitting cannot carry a valid result")
+        if mode == "single" and count not in (0, 1):
+            raise ValueError("single histogram mode cannot carry a bimodal result")
+        if source.size and not np.all(np.isfinite(source)):
+            raise ValueError("valid histogram fit parameters must be finite")
+        if count:
+            amplitudes = source[0::3]
+            sigmas = source[2::3]
+            if np.any(amplitudes < 0.0):
+                raise ValueError("histogram fit amplitudes must be non-negative")
+            if np.any(sigmas <= 0.0):
+                raise ValueError("histogram fit sigmas must be positive")
+        if count == 2 and source[1] > source[4]:
+            raise ValueError("bimodal histogram means must be ordered")
+        if separated and (not valid or count != 2):
+            raise ValueError("only a valid bimodal fit can be separated")
+        threshold = self.threshold
+        if (threshold is not None) != separated:
+            raise ValueError(
+                "a separated bimodal fit must carry exactly one threshold"
+            )
+        if threshold is not None:
+            threshold = float(threshold)
+            if not isfinite(threshold):
+                raise ValueError("histogram fit threshold must be finite")
+            if not source[1] < threshold < source[4]:
+                raise ValueError(
+                    "histogram fit threshold must lie between ordered means"
+                )
+        if not isinstance(self.status, str):
+            raise TypeError("histogram fit status must be text")
+        status = self.status.strip()
+        if not status:
+            raise ValueError("histogram fit status must not be empty")
         owned = np.frombuffer(source.tobytes(), dtype=np.dtype("<f8"))
         owned.setflags(write=False)
         object.__setattr__(self, "requested_mode", mode)
         object.__setattr__(self, "component_count", count)
         object.__setattr__(self, "parameters", owned)
-        object.__setattr__(self, "valid", bool(self.valid))
-        object.__setattr__(self, "separated", bool(self.separated))
-        if self.threshold is not None:
-            object.__setattr__(self, "threshold", float(self.threshold))
-        object.__setattr__(self, "status", str(self.status))
+        object.__setattr__(self, "valid", valid)
+        object.__setattr__(self, "separated", separated)
+        object.__setattr__(self, "threshold", threshold)
+        object.__setattr__(self, "status", status)
 
     @classmethod
     def invalid(cls, mode: str, status: str) -> "HistogramFitResult":
@@ -192,7 +258,7 @@ def _solve(function, jacobian, x, y, seed, bounds):
             jac=jacobian,
             maxfev=20_000,
         )
-    except Exception as error:
+    except (FloatingPointError, RuntimeError, ValueError) as error:
         return None, f"{type(error).__name__}: {error}"
     prediction = np.asarray(function(x, *parameters), dtype=np.float64)
     if not np.all(np.isfinite(parameters)) or not np.all(np.isfinite(prediction)):
@@ -207,6 +273,8 @@ def fit_histogram(
 ) -> HistogramFitResult:
     """Fit one or two zero-offset Gaussians using main's exact policy."""
 
+    if not isinstance(mode, str):
+        raise TypeError("histogram fit mode must be text")
     requested = str(mode).strip().lower()
     if requested not in {"none", "single", "double"}:
         raise ValueError("histogram fit mode must be 'none', 'single', or 'double'")
@@ -369,7 +437,7 @@ def fit_histogram(
     threshold = None
     if separated and parameters[4] > parameters[1]:
         between = np.linspace(float(parameters[1]), float(parameters[4]), 400)
-        threshold = float(
+        candidate = float(
             between[
                 int(
                     np.argmin(
@@ -381,6 +449,13 @@ def fit_histogram(
                 )
             ]
         )
+        if float(parameters[1]) < candidate < float(parameters[4]):
+            threshold = candidate
+        else:
+            # A visually separated pair with no interior component crossing
+            # has no defensible cut.  Keep the two fitted curves but do not
+            # claim threshold/fidelity semantics.
+            separated = False
     return HistogramFitResult(
         requested,
         2,

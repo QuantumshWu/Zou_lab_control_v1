@@ -25,10 +25,7 @@ from typing import Callable, Mapping
 
 from .console_records import console_signal_key
 from zlc_workbench.run_owner import QtRunOwnerMailbox
-from zlc_neutral_atom.runtime.signal_source import (
-    SignalAssociationScheduleRequirement,
-    SignalEventAssociationSource,
-)
+from zlc_neutral_atom.runtime.signal_source import SignalEventSource
 
 __all__ = ["ConsoleRunNode"]
 
@@ -91,13 +88,13 @@ class ConsoleRunNode:
         # cardinality is application-owned request state, never re-derived from
         # form values or a later Dataset revision.
         self._output_declarations = tuple(spec.outputs_for(self._request))
+        self._artifact_declarations = tuple(spec.artifact_outputs)
         if materialize_final_presentations is not None and not callable(
             materialize_final_presentations
         ):
             raise TypeError("materialize_final_presentations must be callable")
         self._materialize_final_presentations = materialize_final_presentations
         self._prepared_command = None
-        self._clear_signal_association_capability()
         self._handle = None
         self._start_future: Future | None = None
         self._start_pending = False
@@ -164,11 +161,24 @@ class ConsoleRunNode:
             self.signal_key(item.name) for item in self._output_declarations
         )
 
+    def published_artifacts(self) -> tuple[str, ...]:
+        """Return exact keys for FINAL artifact outputs, never Dataset signals."""
+
+        return tuple(
+            self.signal_key(item.name) for item in self._artifact_declarations
+        )
+
     @property
     def output_declarations(self) -> tuple:
         """The exact output vocabulary frozen with this node's request."""
 
         return self._output_declarations
+
+    @property
+    def artifact_declarations(self) -> tuple:
+        """The exact non-Dataset output vocabulary frozen with this run."""
+
+        return self._artifact_declarations
 
     @property
     def request(self):
@@ -197,6 +207,25 @@ class ConsoleRunNode:
         if not callable(open_cursor):
             raise TypeError("this producer does not expose live signal events")
         return open_cursor(output_name)
+
+    def dataset_output_binding(self, output_name: str):
+        """Return an optional domain-owned binding for one running Dataset output."""
+
+        command = self._prepared_command
+        if command is None:
+            raise RuntimeError("producer has not finished prepare/start submission")
+        resolve = getattr(command, "dataset_output_binding", None)
+        return None if not callable(resolve) else resolve(output_name)
+
+    def signal_event_source(self) -> SignalEventSource:
+        """Return the prepared command's real source without proxy capabilities."""
+
+        if not self.running:
+            raise RuntimeError("producer signal source is not running")
+        command = self._prepared_command
+        if not isinstance(command, SignalEventSource):
+            raise TypeError("this producer does not expose live signal events")
+        return command
 
     @property
     def handle(self):
@@ -396,7 +425,6 @@ class ConsoleRunNode:
         generation = self._owner.begin_generation()
         self._handle = None
         self._prepared_command = None
-        self._clear_signal_association_capability()
         self._snapshot = None
         self._final_result = _UNRESOLVED_FINAL
         self._final_outputs_submitted = False
@@ -508,7 +536,6 @@ class ConsoleRunNode:
                 self._start_pending = False
                 prepared, self._handle = completion.future.result()
                 self._prepared_command = prepared
-                self._refresh_signal_association_capability(prepared)
                 self._owner.set_handle(self._handle)
                 if self._stop_requested:
                     self._handle.cancel(self._stop_reason)
@@ -516,7 +543,6 @@ class ConsoleRunNode:
         if handle is not None:
             self._snapshot = handle.snapshot()
             if self._snapshot.state.terminal:
-                self._clear_signal_association_capability()
                 if (
                     self._snapshot.state.name == "SUCCEEDED"
                     and self._final_result is _UNRESOLVED_FINAL
@@ -586,58 +612,6 @@ class ConsoleRunNode:
                     self._final_result = _UNRESOLVED_FINAL
                     self._owner.mark_owner_reaped()
         return self._snapshot
-
-    def _refresh_signal_association_capability(self, command: object) -> None:
-        self._clear_signal_association_capability()
-        if isinstance(command, SignalEventAssociationSource):
-            self.__dict__.update(
-                open_associated_signal_cursor=self._open_associated_signal_cursor,
-                signal_association_schedule_requirement=(
-                    self._signal_association_schedule_requirement
-                ),
-            )
-
-    def _clear_signal_association_capability(self) -> None:
-        self.__dict__.pop("open_associated_signal_cursor", None)
-        self.__dict__.pop("signal_association_schedule_requirement", None)
-
-    def _open_associated_signal_cursor(self, output_name: str):
-        if not self.running:
-            raise RuntimeError("producer association source is not running")
-        command = self._prepared_command
-        if not isinstance(command, SignalEventAssociationSource):
-            raise RuntimeError("producer lost signal association capability")
-        return command.open_associated_signal_cursor(output_name)
-
-    def _signal_association_schedule_requirement(
-        self,
-        output_name: str,
-    ) -> SignalAssociationScheduleRequirement:
-        if not self.running:
-            raise RuntimeError("producer association source is not running")
-        command = self._prepared_command
-        if not isinstance(command, SignalEventAssociationSource):
-            raise RuntimeError("producer lost signal association capability")
-        return command.signal_association_schedule_requirement(output_name)
-
-    def wait_until_terminal(self, *, reason: str) -> None:
-        """Join this node's already-submitted Run without draining Qt completions.
-
-        ``Future`` and ``RunHandle`` are the two thread-safe ownership edges.
-        GUI-owned snapshots and FINAL output admission remain exclusively in
-        :meth:`poll`.  The bound Port/Run owns its finite I/O deadlines; this
-        join does not invent a second user-tunable timeout.
-        """
-
-        future = self._start_future
-        if future is None:
-            return
-        try:
-            _prepared, handle = future.result()
-        except _StartSuppressed:
-            return
-        handle.cancel(str(reason))
-        handle.wait()
 
     def shutdown(self) -> None:
         self.cancel("Console is closing")

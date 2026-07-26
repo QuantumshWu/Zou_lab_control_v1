@@ -382,11 +382,6 @@ class BoundGreyMolassesDetuning:
         if not isinstance(self.rf_table, RfDetuningTable):
             raise TypeError("rf_table has another type")
         if (
-            self.camera_binding.measurement.definition
-            != GREY_MOLASSES_DETUNING_DEFINITION
-        ):
-            raise ValueError("bound Measurement uses another definition")
-        if (
             self.rf_table.pulse_artifact_digest
             != self.camera_binding.compiled_artifact.fingerprint
         ):
@@ -419,7 +414,6 @@ def bind_grey_molasses_detuning(
         readout_event_axis_id=AxisId("grey_molasses.readout_event"),
         scan_axes=(program.detuning_axis,),
         point_layout=program.point_layout,
-        definition=GREY_MOLASSES_DETUNING_DEFINITION,
         calibration=calibration,
     )
     program = _GreyMolassesDetuningProgram(

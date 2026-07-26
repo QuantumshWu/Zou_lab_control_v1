@@ -85,13 +85,13 @@ def project_calibration_final_views(
 
     context = command.site_map_context(result)
     declaration = CALIBRATION_FINAL_OUTPUT_DECLARATIONS[0]
-    calibration_name = declaration.name
-    output = outputs.get(calibration_name)
+    site_map_name = declaration.name
+    output = outputs.get(site_map_name)
     if (
         not isinstance(output, FinalDatasetOutput)
         or output.declaration != declaration
     ):
-        raise ValueError("calibration SiteMap requires the calibration output")
+        raise ValueError("calibration SiteMap requires its declared Dataset output")
     snapshot = output.snapshot
     valid_count = int(context.site_validity.sum())
     view = build_site_map_snapshot_view(
@@ -110,7 +110,7 @@ def project_calibration_final_views(
         ),
         presentation_kind="calibration-sites",
     )
-    return {calibration_name: view}
+    return {site_map_name: view}
 
 
 __all__ = [

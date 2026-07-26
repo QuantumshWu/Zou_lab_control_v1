@@ -21,7 +21,7 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     BlockId,
-    ComponentValidity,
+    DatasetComponentValidity,
     DataBlock,
     DatasetRevision,
     DatasetSchema,
@@ -50,7 +50,7 @@ from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
 from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import QtRasterBoard
 import zlc_workbench.data_figure.app as figure_workbench
-import zlc_workbench.data_figure.projection as figure_projection
+import zlc_frontend.data_figure_presentation as figure_presentation
 
 
 @pytest.fixture(scope="module")
@@ -89,7 +89,7 @@ def _meter_figure(*, layers: int = 1, revision: int = 7) -> DataFigure:
         BlockId("meter-block"),
         DatasetRevision(revision),
         values,
-        ComponentValidity((site.axis_id,), valid),
+        DatasetComponentValidity((site.axis_id,), valid),
         schema,
     )
     dataset_id = DatasetId("meter-dataset")
@@ -144,7 +144,7 @@ def test_meter_unit_validity_and_exact_focus_are_preserved():
     selected_series = cells[1].series[0]
     focused = figure.focused_typed_panel(
         1,
-        expected_selection=regions[1].selection,
+        expected_selection=regions[1].focus_selection,
         expected_intent=ViewIntent.METER,
     )
     assert focused.document.document_id != figure.document.document_id
@@ -163,17 +163,18 @@ def test_meter_unit_validity_and_exact_focus_are_preserved():
     with pytest.raises(ValueError, match="selection differs"):
         figure.focused_typed_panel(
             1,
-            expected_selection=regions[0].selection,
+            expected_selection=regions[0].focus_selection,
             expected_intent=ViewIntent.METER,
         )
     updated = _meter_figure(revision=8)
     _updated_png, updated_regions = updated.to_png_bytes_with_panel_regions()
     updated_focus = updated.focused_typed_panel(
         1,
-        expected_selection=updated_regions[1].selection,
+        expected_selection=updated_regions[1].focus_selection,
         expected_intent=ViewIntent.METER,
     )
-    assert updated_focus.document.document_id != focused.document.document_id
+    assert updated_focus.document.document_id == focused.document.document_id
+    assert updated_focus.evaluated.inputs[0].ref != focused.evaluated.inputs[0].ref
     assert len(figure.evaluated.layers[0].cells) == 3
 
 
@@ -182,7 +183,7 @@ def test_typed_meter_payload_is_exact_and_rejects_semantic_drift():
     _png, regions = figure.to_png_bytes_with_panel_regions()
     focused = figure.focused_typed_panel(
         2,
-        expected_selection=regions[2].selection,
+        expected_selection=regions[2].focus_selection,
         expected_intent=ViewIntent.METER,
     )
     renderer = SinglePanelAggRenderer(focused.document, width=800, height=520)
@@ -222,7 +223,7 @@ def test_sparse_meter_layout_keeps_the_hole_in_its_logical_cell():
     block = DataBlock(
         BlockId("sparse-meter-block"),
         DatasetRevision(1),
-        np.asarray(((10.0, 20.0, 30.0),)),
+        np.asarray((10.0, 20.0, 30.0)).reshape(1, 3, 1),
         VALID,
         schema,
     )
@@ -263,14 +264,13 @@ def test_sparse_meter_layout_keeps_the_hole_in_its_logical_cell():
     _png, regions = figure.to_png_bytes_with_panel_regions()
     hole = figure.focused_typed_panel(
         3,
-        expected_selection=regions[3].selection,
+        expected_selection=regions[3].focus_selection,
         expected_intent=ViewIntent.METER,
     )
     assert hole.evaluated.layers[0].cells[0].series[0].data.valid is False
     assert tuple(
-        (term.axis_id, term.index) for term in regions[3].selection.terms
+        (term.axis_id, term.index) for term in regions[3].focus_selection.terms
     ) == (
-        (repeat.axis_id, 0),
         (scan.axis_id, 1),
         (spectral.axis_id, 1),
     )
@@ -281,7 +281,7 @@ def test_valid_nonfinite_meter_fails_before_mutating_agg_surface():
     _png, regions = figure.to_png_bytes_with_panel_regions()
     focused = figure.focused_typed_panel(
         0,
-        expected_selection=regions[0].selection,
+        expected_selection=regions[0].focus_selection,
         expected_intent=ViewIntent.METER,
     )
     renderer = SinglePanelAggRenderer(focused.document, width=800, height=520)
@@ -419,7 +419,7 @@ def test_close_during_meter_focus_cannot_present_a_late_front(
 
 def test_multi_layer_meter_is_not_promoted_to_the_single_layer_explorer():
     figure = _meter_figure(layers=2)
-    assert figure_projection._classify_single_typed(figure)[0] is None
-    _intent, count, reason = figure_projection._classify_typed_grid(figure)
+    assert figure_presentation.classify_single_data_figure(figure)[0] is None
+    _intent, count, reason = figure_presentation.classify_faceted_data_figure(figure)
     assert count is None
     assert "one layer" in reason

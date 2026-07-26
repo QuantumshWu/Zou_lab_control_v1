@@ -160,7 +160,7 @@ def test_saved_fit_requires_explicit_cell_then_replays_exact_ref_for_refit(
                 (projected, rendered)
                 for projected, rendered in zip(
                     grid._page_panels,
-                    grid._page_frame.panels,
+                    grid._page_front.frame.panels,
                     strict=True,
                 )
                 if projected.fit_storage_index is not None

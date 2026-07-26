@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 import math
 
-from zlc_data import AxisId, FitResultBatch, Selection, dataset_revision_ref_to_tree
-from zlc_frontend import (
+from zlc_data import (
+    AxisId,
+    FitBatchStatus,
+    FitResultBatch,
+    Selection,
+    dataset_revision_ref_to_tree,
+)
+from .data_figure import DataFigure, FigurePanelRegion
+from .meter_display import MeterDisplayState
+from .render import (
     BoardFrame,
     CurvePanelPayload,
-    DataFigure,
-    FigurePanelRegion,
     HistogramPanelPayload,
     ImagePanelPayload,
-    MeterDisplayState,
     MeterPanelPayload,
 )
-from zlc_frontend.curve_display import (
+from .curve_display import (
     CurveDisplayState,
     curve_display_form_spec,
     curve_display_form_values,
@@ -25,9 +32,9 @@ from zlc_frontend.curve_display import (
     curve_display_with_x_view,
     numeric_curve_coordinates,
 )
-from zlc_frontend.display_range import RelimMode, validated_display_range
-from zlc_frontend.encoded_raster import EncodedRasterDocument
-from zlc_frontend.figure import (
+from .display_range import RelimMode, validated_display_range
+from .encoded_raster import EncodedRasterDocument
+from .figure import (
     AxisViewRole,
     EvaluatedCurve,
     EvaluatedHistogram,
@@ -35,32 +42,32 @@ from zlc_frontend.figure import (
     EvaluatedMeter,
     ViewIntent,
 )
-from zlc_frontend.histogram_display import (
+from .histogram_display import (
     FacetedHistogramDisplayState,
+    HistogramCountScale,
     HistogramDisplayState,
     histogram_display_form_spec,
     histogram_display_form_values,
     histogram_display_from_form,
     histogram_display_with_x_view,
 )
-from zlc_frontend.image_display import (
+from .image_display import (
     ImageDisplayState,
     image_display_form_spec,
     image_display_form_values,
     image_display_from_form,
 )
-from zlc_frontend.image_view import image_viewport_for_evaluated_image
-from zlc_storage import canonical_digest, nonnegative_integer
+from .image_view import image_viewport_for_evaluated_image
+from zlc_storage import canonical_digest
 
-_DEFAULT_FIT_TIMEOUT_SECONDS = 30.0
+DATA_FIGURE_BOARD_ID = "generic-typed-figure"
 
-_TYPED_BOARD_ID = "generic-typed-figure"
+DATA_FIGURE_PANEL_ID = "generic-typed"
 
-_TYPED_PANEL_ID = "generic-typed"
+DEFAULT_DATA_FIGURE_RASTER_SIZE = (800, 520)
+DEFAULT_DATA_FIGURE_SIZE_NAME = "4x4"
 
-_NUMERIC_RASTER_SIZE = (800, 520)
-
-_TYPED_JOIN_SCHEMA_DIGEST = canonical_digest(
+DATA_FIGURE_JOIN_SCHEMA_DIGEST = canonical_digest(
     {
         "schema": "zlc_frontend.FrozenTypedFigureJoin",
         "fields": ("document", "input", "intent", "fit_result_identity"),
@@ -68,7 +75,7 @@ _TYPED_JOIN_SCHEMA_DIGEST = canonical_digest(
 )
 
 
-def _figure_summary(figure: DataFigure) -> str:
+def data_figure_summary(figure: DataFigure) -> str:
     document = figure.document
     intents = tuple(dict.fromkeys(layer.view.intent.value for layer in document.layers))
     panel_count = sum(len(layer.cells) for layer in figure.evaluated.layers)
@@ -77,7 +84,51 @@ def _figure_summary(figure: DataFigure) -> str:
         f"document revision {document.revision}"
     )
 
-def _classify_single_typed(
+
+def fit_result_draft_summary(
+    result: FitResultBatch,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> str:
+    """Format one unsaved Fit result through the sole Figure text policy."""
+
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("draft Fit summary requires FitResultBatch")
+    if check_cancelled is not None and not callable(check_cancelled):
+        raise TypeError("check_cancelled must be callable or None")
+    counts = Counter(status.value for status in result.statuses)
+    status_text = ", ".join(
+        f"{name.lower()}={count}" for name, count in sorted(counts.items())
+    )
+    quality_min = math.inf
+    quality_max = -math.inf
+    for index, (status, rss, used) in enumerate(
+        zip(
+            result.statuses,
+            result.residual_sum_squares,
+            result.used_observation_counts,
+            strict=True,
+        )
+    ):
+        if check_cancelled is not None and index % 1024 == 0:
+            check_cancelled()
+        if status is not FitBatchStatus.CONVERGED or int(used) <= 0:
+            continue
+        value = math.sqrt(float(rss) / int(used))
+        if math.isfinite(value):
+            quality_min = min(quality_min, value)
+            quality_max = max(quality_max, value)
+    quality_text = (
+        "no converged RMSE"
+        if not math.isfinite(quality_min)
+        else f"RMSE {quality_min:.4g}–{quality_max:.4g}"
+    )
+    return (
+        f"{result.spec.model_id} · {len(result.statuses)} named batch cell(s) · "
+        f"{status_text} · {quality_text} · draft is not saved"
+    )
+
+def classify_single_data_figure(
     figure: DataFigure,
 ) -> tuple[ViewIntent | None, str | None]:
     """Return the typed intent or one explicit encoded-fallback reason."""
@@ -137,7 +188,7 @@ def _classify_single_typed(
             return None, "curve series do not share one exact x axis and value unit"
     return intent, None
 
-def _classify_typed_grid(
+def classify_faceted_data_figure(
     figure: DataFigure,
 ) -> tuple[ViewIntent | None, int | None, str | None]:
     """Return one supported single-layer typed grid without selecting a cell."""
@@ -230,13 +281,13 @@ def _classify_typed_grid(
     return intent, len(cells), None
 
 @dataclass(frozen=True, slots=True)
-class _TypedGridOverview:
+class DataFigureGridOverview:
     intent: ViewIntent
     figure: DataFigure
     bundle: EncodedRasterDocument
     regions: tuple[FigurePanelRegion, ...]
     histogram_home_x_limits: tuple[float, float] | None
-    display_state: _GridDisplayState | None
+    display_state: DataFigureGridDisplayState | None
 
     def __post_init__(self) -> None:
         if self.intent not in (
@@ -250,7 +301,7 @@ class _TypedGridOverview:
             )
         if not isinstance(self.figure, DataFigure):
             raise TypeError("typed grid overview requires one exact DataFigure")
-        figure_intent, panel_count, reason = _classify_typed_grid(self.figure)
+        figure_intent, panel_count, reason = classify_faceted_data_figure(self.figure)
         if figure_intent is not self.intent or panel_count is None:
             raise ValueError(
                 "typed grid overview figure does not match its intent"
@@ -277,7 +328,7 @@ class _TypedGridOverview:
         if len(set(selections)) != len(selections):
             raise ValueError("typed grid selections must identify unique panels")
         display = self.display_state
-        if display is not None and _grid_state_intent(display) is not self.intent:
+        if display is not None and grid_display_state_intent(display) is not self.intent:
             raise ValueError("typed grid display state does not match its intent")
         object.__setattr__(self, "regions", regions)
         home = self.histogram_home_x_limits
@@ -292,16 +343,16 @@ class _TypedGridOverview:
         elif home is not None:
             raise ValueError("non-HISTOGRAM grid cannot carry a histogram home x range")
 
-_TypedDisplayState = (
+DataFigureDisplayState = (
     ImageDisplayState
     | CurveDisplayState
     | HistogramDisplayState
     | MeterDisplayState
 )
 
-_GridDisplayState = _TypedDisplayState | FacetedHistogramDisplayState
+DataFigureGridDisplayState = DataFigureDisplayState | FacetedHistogramDisplayState
 
-_TypedPanelPayload = (
+DataFigurePanelPayload = (
     ImagePanelPayload
     | CurvePanelPayload
     | HistogramPanelPayload
@@ -309,10 +360,10 @@ _TypedPanelPayload = (
 )
 
 @dataclass(frozen=True, slots=True)
-class _GridFocusRequest:
+class DataFigureGridFocusRequest:
     panel_index: int
     expected_selection: Selection
-    display: _TypedDisplayState
+    display: DataFigureDisplayState
     histogram_home_x_limits: tuple[float, float] | None
 
     def __post_init__(self) -> None:
@@ -322,7 +373,7 @@ class _GridFocusRequest:
             raise ValueError("grid focus panel_index must be a non-negative integer")
         if not isinstance(self.expected_selection, Selection):
             raise TypeError("grid focus requires one exact Selection")
-        if _state_intent(self.display) not in (
+        if display_state_intent(self.display) not in (
             ViewIntent.IMAGE,
             ViewIntent.CURVE,
             ViewIntent.METER,
@@ -343,126 +394,7 @@ class _GridFocusRequest:
         elif home is not None:
             raise ValueError("METER focus cannot carry a histogram home x range")
 
-@dataclass(frozen=True, slots=True)
-class _FitWorkbenchBindings:
-    """Composition-owned capabilities for the optional Figure Fit surface.
-
-    The viewer receives only the fixed prepare/execute/result/save/reload
-    capabilities.  It never receives a repository, application root, source resolver,
-    or generic analysis registry.  ``prepare`` turns exact named display axes
-    plus an optional authority candidate into already-bound data-owned Fit
-    requests; ``execute`` is the only materializing operation; ``result``
-    projects the opaque execution for display; ``save`` persists that execution
-    behind :class:`FitDraftAuthority`; and ``reload`` proves the saved outcome
-    before the UI labels an overlay as persisted.
-    """
-
-    prepare: object
-    execute: object
-    result: object
-    save: object
-    reload: object
-    selected_model: str | None = None
-    initial_selection: Selection | None = None
-    open_fit: bool = False
-    timeout_seconds: float = _DEFAULT_FIT_TIMEOUT_SECONDS
-    save_requires_path: bool = False
-    initial_save_path: object | None = None
-    allow_prepared_transform: bool = False
-
-    def __post_init__(self) -> None:
-        for name in ("prepare", "execute", "result", "save", "reload"):
-            if not callable(getattr(self, name)):
-                raise TypeError(f"fit {name} capability must be callable")
-        selected = self.selected_model
-        if selected is not None and (
-            not isinstance(selected, str) or not selected.strip()
-        ):
-            raise ValueError("selected_model must be non-empty text or None")
-        if self.initial_selection is not None and not isinstance(
-            self.initial_selection,
-            Selection,
-        ):
-            raise TypeError("initial_selection must be Selection or None")
-        timeout = float(self.timeout_seconds)
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("fit timeout_seconds must be finite and positive")
-        object.__setattr__(self, "timeout_seconds", timeout)
-        if not isinstance(self.save_requires_path, bool):
-            raise TypeError("save_requires_path must be bool")
-        if not isinstance(self.allow_prepared_transform, bool):
-            raise TypeError("allow_prepared_transform must be bool")
-        path = self.initial_save_path
-        if path is not None:
-            from pathlib import Path
-
-            object.__setattr__(self, "initial_save_path", Path(path))
-        if not self.save_requires_path and path is not None:
-            raise ValueError(
-                "an initial Fit save path requires save_requires_path=True"
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class _FitSaveReceipt:
-    """One admitted persistence result shared by artifact and archive saves."""
-
-    handle: object
-    identity: str
-    summary: str
-    reloaded_result: FitResultBatch | None = None
-    artifact_reference: object | None = None
-
-    def __post_init__(self) -> None:
-        if self.handle is None:
-            raise TypeError("Fit save receipt requires one persistence handle")
-        for name in ("identity", "summary"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"Fit save receipt {name} must be non-empty text")
-        if self.reloaded_result is not None and not isinstance(
-            self.reloaded_result,
-            FitResultBatch,
-        ):
-            raise TypeError(
-                "Fit save receipt reloaded_result must be FitResultBatch or None"
-            )
-
-@dataclass(frozen=True, slots=True)
-class _FitOverlayRequest:
-    analysis_revision: int
-    result: FitResultBatch | None
-    result_identity: str | None
-
-    def __post_init__(self) -> None:
-        revision = nonnegative_integer(
-            self.analysis_revision,
-            "fit overlay analysis revision",
-        )
-        object.__setattr__(self, "analysis_revision", revision)
-        if self.result is not None and not isinstance(self.result, FitResultBatch):
-            raise TypeError("fit overlay result must be FitResultBatch or None")
-        if self.result is not None and self.result_identity is None:
-            raise ValueError("transient fit overlay result requires an identity")
-        if self.result_identity is not None and (
-            not isinstance(self.result_identity, str)
-            or not self.result_identity.strip()
-        ):
-            raise ValueError("fit overlay identity must be non-empty text or None")
-
-def _same_fit_overlay_request(
-    left: _FitOverlayRequest | None,
-    right: _FitOverlayRequest | None,
-) -> bool:
-    if left is None or right is None:
-        return left is right
-    return bool(
-        left.analysis_revision == right.analysis_revision
-        and left.result_identity == right.result_identity
-        and left.result is right.result
-    )
-
-def _state_intent(state: _TypedDisplayState) -> ViewIntent:
+def display_state_intent(state: DataFigureDisplayState) -> ViewIntent:
     if isinstance(state, ImageDisplayState):
         return ViewIntent.IMAGE
     if isinstance(state, CurveDisplayState):
@@ -473,12 +405,12 @@ def _state_intent(state: _TypedDisplayState) -> ViewIntent:
         return ViewIntent.METER
     raise TypeError("typed display state must be IMAGE, CURVE, HISTOGRAM, or METER")
 
-def _grid_state_intent(state: _GridDisplayState) -> ViewIntent:
+def grid_display_state_intent(state: DataFigureGridDisplayState) -> ViewIntent:
     if isinstance(state, FacetedHistogramDisplayState):
         return ViewIntent.HISTOGRAM
-    return _state_intent(state)
+    return display_state_intent(state)
 
-def _default_typed_state(intent: ViewIntent) -> _TypedDisplayState:
+def default_data_figure_display_state(intent: ViewIntent) -> DataFigureDisplayState:
     if intent is ViewIntent.IMAGE:
         return ImageDisplayState()
     if intent is ViewIntent.CURVE:
@@ -489,7 +421,7 @@ def _default_typed_state(intent: ViewIntent) -> _TypedDisplayState:
         return MeterDisplayState(0, None)
     raise ValueError("typed intent must be IMAGE, CURVE, HISTOGRAM, or METER")
 
-def _typed_form_spec(state: _TypedDisplayState):
+def data_figure_display_form_spec(state: DataFigureDisplayState):
     if isinstance(state, ImageDisplayState):
         return image_display_form_spec()
     if isinstance(state, CurveDisplayState):
@@ -500,7 +432,9 @@ def _typed_form_spec(state: _TypedDisplayState):
         raise ValueError("METER has no authored display form")
     raise TypeError("unknown typed display state")
 
-def _typed_form_values(state: _TypedDisplayState) -> dict[str, object]:
+def data_figure_display_form_values(
+    state: DataFigureDisplayState,
+) -> dict[str, object]:
     if isinstance(state, ImageDisplayState):
         return image_display_form_values(state)
     if isinstance(state, CurveDisplayState):
@@ -511,12 +445,12 @@ def _typed_form_values(state: _TypedDisplayState) -> dict[str, object]:
         raise ValueError("METER has no authored display form")
     raise TypeError("unknown typed display state")
 
-def _typed_state_from_form(
-    state: _TypedDisplayState,
+def data_figure_display_state_from_form(
+    state: DataFigureDisplayState,
     values: dict[str, object],
     *,
     current_value_limits: tuple[float, float] | None,
-) -> _TypedDisplayState:
+) -> DataFigureDisplayState:
     if isinstance(state, ImageDisplayState):
         return image_display_from_form(
             state,
@@ -539,17 +473,17 @@ def _typed_state_from_form(
         raise ValueError("METER has no authored display form")
     raise TypeError("unknown typed display state")
 
-def _typed_state_with_x_view(
-    state: _TypedDisplayState,
+def data_figure_display_state_with_x_view(
+    state: DataFigureDisplayState,
     x_view: tuple[float, float] | None,
-) -> _TypedDisplayState:
+) -> DataFigureDisplayState:
     if isinstance(state, CurveDisplayState):
         return curve_display_with_x_view(state, x_view)
     if isinstance(state, HistogramDisplayState):
         return histogram_display_with_x_view(state, x_view)
     raise TypeError("x-view commits require CURVE or HISTOGRAM state")
 
-def _payload_intent(payload: _TypedPanelPayload) -> ViewIntent:
+def data_figure_payload_intent(payload: DataFigurePanelPayload) -> ViewIntent:
     if isinstance(payload, ImagePanelPayload):
         return ViewIntent.IMAGE
     if isinstance(payload, CurvePanelPayload):
@@ -561,10 +495,10 @@ def _payload_intent(payload: _TypedPanelPayload) -> ViewIntent:
     raise TypeError("unknown typed payload")
 
 @dataclass(frozen=True, slots=True)
-class _TypedFigureFront:
+class DataFigureFront:
     intent: ViewIntent
     figure: DataFigure
-    state: _TypedDisplayState
+    state: DataFigureDisplayState
     summary: str
     frame: BoardFrame
     data_contract: tuple[tuple[object, ...], tuple[object, ...]]
@@ -585,7 +519,7 @@ class _TypedFigureFront:
             raise ValueError("typed figure front has another intent")
         if not isinstance(self.figure, DataFigure):
             raise TypeError("typed figure front requires one exact DataFigure")
-        figure_intent, unavailable_reason = _classify_single_typed(self.figure)
+        figure_intent, unavailable_reason = classify_single_data_figure(self.figure)
         if figure_intent is not self.intent:
             raise ValueError(
                 "typed figure front DataFigure does not match its intent"
@@ -599,7 +533,7 @@ class _TypedFigureFront:
             raise ValueError(
                 "typed figure front Fit overlay and result identity disagree"
             )
-        if _state_intent(self.state) is not self.intent:
+        if display_state_intent(self.state) is not self.intent:
             raise ValueError("typed figure front state belongs to another intent")
         if not isinstance(self.summary, str) or not self.summary:
             raise ValueError("typed figure summary must be non-empty")
@@ -656,7 +590,7 @@ class _TypedFigureFront:
         panel = self.frame.panels[0]
         payload = panel.display_payload
         if (
-            panel.panel_id != _TYPED_PANEL_ID
+            panel.panel_id != DATA_FIGURE_PANEL_ID
             or not isinstance(
                 payload,
                 (
@@ -666,7 +600,7 @@ class _TypedFigureFront:
                     MeterPanelPayload,
                 ),
             )
-            or _payload_intent(payload) is not self.intent
+            or data_figure_payload_intent(payload) is not self.intent
         ):
             raise ValueError("typed figure front has another payload")
         if payload.evaluated_input is not self.figure.evaluated.inputs[0]:
@@ -677,7 +611,7 @@ class _TypedFigureFront:
         if (raster.width, raster.height) != raster_size:
             raise ValueError("typed front has another panel-raster geometry")
 
-def _typed_join_digest(
+def data_figure_join_digest(
     figure: DataFigure,
     intent: ViewIntent,
     fit_result_identity: str | None,
@@ -700,7 +634,7 @@ def _typed_join_digest(
         }
     )
 
-def _build_typed_front_contract(
+def data_figure_front_contract(
     intent: ViewIntent,
     frame: BoardFrame,
 ) -> tuple[tuple[object, ...], tuple[object, ...]]:
@@ -776,7 +710,7 @@ def _build_typed_front_contract(
     identity = (stable_identity, stamp.join_key_digest)
     return identity, exact_data
 
-def _same_exact_data_owners(
+def same_exact_data_owners(
     left: tuple[object, ...],
     right: tuple[object, ...],
 ) -> bool:
@@ -785,9 +719,9 @@ def _same_exact_data_owners(
         for actual, expected in zip(left, right, strict=True)
     )
 
-def _validate_rendered_authored_payload(
-    payload: _TypedPanelPayload,
-    expected_state: _TypedDisplayState,
+def validate_rendered_data_figure_payload(
+    payload: DataFigurePanelPayload,
+    expected_state: DataFigureDisplayState,
     fit_result_identity: str | None,
 ) -> None:
     """Perform data-sized authored-state proof on the render worker."""
@@ -861,3 +795,70 @@ def _validate_rendered_authored_payload(
         )
     ):
         raise ValueError("histogram worker returned conflicting authored state")
+
+
+def data_figure_initial_payload_context(
+    figure: DataFigure,
+    display: DataFigureDisplayState,
+    payload: DataFigurePanelPayload | None,
+    fit_result_identity: str | None,
+) -> tuple[
+    tuple[float, float] | None,
+    RelimMode | None,
+    HistogramCountScale | None,
+]:
+    """Validate and recover the visual state carried by one admitted payload."""
+
+    if payload is None:
+        return None, None, None
+    intent = display_state_intent(display)
+    if data_figure_payload_intent(payload) is not intent:
+        raise ValueError("initial payload does not match the figure display intent")
+    if payload.evaluated_input != figure.evaluated.inputs[0]:
+        raise ValueError("initial payload belongs to another evaluated input")
+    validate_rendered_data_figure_payload(payload, display, fit_result_identity)
+    if isinstance(payload, ImagePanelPayload):
+        return payload.color_limits, display.relim_mode, None
+    if isinstance(payload, CurvePanelPayload):
+        return payload.viewport.y_limits, display.relim_mode, None
+    if isinstance(payload, HistogramPanelPayload):
+        return (
+            payload.viewport.count_limits,
+            display.relim_mode,
+            display.count_scale,
+        )
+    if not isinstance(payload, MeterPanelPayload):
+        raise TypeError("initial payload has another typed panel kind")
+    return None, None, None
+
+
+__all__ = [
+    "DATA_FIGURE_BOARD_ID",
+    "DATA_FIGURE_JOIN_SCHEMA_DIGEST",
+    "DATA_FIGURE_PANEL_ID",
+    "DEFAULT_DATA_FIGURE_RASTER_SIZE",
+    "DEFAULT_DATA_FIGURE_SIZE_NAME",
+    "DataFigureDisplayState",
+    "DataFigureFront",
+    "DataFigureGridDisplayState",
+    "DataFigureGridFocusRequest",
+    "DataFigureGridOverview",
+    "DataFigurePanelPayload",
+    "classify_faceted_data_figure",
+    "classify_single_data_figure",
+    "data_figure_display_form_spec",
+    "data_figure_display_form_values",
+    "data_figure_display_state_from_form",
+    "data_figure_display_state_with_x_view",
+    "data_figure_front_contract",
+    "data_figure_initial_payload_context",
+    "data_figure_join_digest",
+    "data_figure_payload_intent",
+    "data_figure_summary",
+    "default_data_figure_display_state",
+    "display_state_intent",
+    "fit_result_draft_summary",
+    "grid_display_state_intent",
+    "same_exact_data_owners",
+    "validate_rendered_data_figure_payload",
+]

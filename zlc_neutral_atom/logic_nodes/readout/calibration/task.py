@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from typing import Mapping, Protocol
+from typing import TYPE_CHECKING, Mapping, Protocol
 
 import numpy as np
 
@@ -51,14 +51,8 @@ from .calibration import (
     ResolvedCalibration,
     ThresholdMethod,
 )
-from .analysis import CalibrationComputation
-from .projection import (
-    CalibrationSiteMapContext,
-    project_calibration_report,
-)
 from .reference import CalibrationArtifactRef
 from .repository import CalibrationRepository
-from .result_bundle import write_calibration_result_bundle
 from .task_output import (
     CalibrationTaskOutput,
     read_calibration_task_output,
@@ -94,6 +88,10 @@ from zlc_storage import (
 )
 from zlc_storage.paths import resolve_under_project
 from zlc_pulse import PulseExecutionForm
+
+if TYPE_CHECKING:
+    from .analysis import CalibrationComputation
+    from .projection import CalibrationSiteMapContext
 
 CALIBRATION_SOURCE_MODES = ("live", "saved frames")
 CALIBRATION_THRESHOLD_METHODS = tuple(item.value for item in ThresholdMethod)
@@ -237,6 +235,9 @@ def write_calibration_task_outputs(
     :func:`admit_calibration_capture_export`.  Frontend rendering is an explicit
     composition callback; this module never imports a renderer.
     """
+
+    from .projection import project_calibration_report
+    from .result_bundle import write_calibration_result_bundle
 
     if not isinstance(source, CaptureArtifactRef):
         raise TypeError("source must be CaptureArtifactRef")

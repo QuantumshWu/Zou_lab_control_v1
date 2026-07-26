@@ -31,8 +31,6 @@ ROOT = Path(__file__).parents[1]
 
 
 def _document_path(name: str) -> Path:
-    if name == "imaging_template.json":
-        return ROOT / "zlc_neutral_atom" / "assets" / name
     return ROOT / "pulses" / name
 
 

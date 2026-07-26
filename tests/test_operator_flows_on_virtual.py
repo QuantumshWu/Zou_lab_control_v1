@@ -16,9 +16,13 @@ import tempfile
 
 import Zou_lab_control.notebook as zlc
 from zlc_data.fit_model import fit_model_catalog
+from zlc_neutral_atom.capture.reference import CaptureArtifactRef
+from zlc_neutral_atom.logic_nodes.mot_field import MotFieldTaskIntent
+import zlc_neutral_atom.logic_nodes.mot_field.mot_field_task as mot_task_impl
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGING_PULSE = ROOT / "pulses" / "imaging_template.json"
+MOT_FIELD_PULSE = ROOT / "pulses" / "mot_field_template.json"
 
 
 def test_fit_and_figure_run_on_the_virtual_installation() -> None:
@@ -46,3 +50,67 @@ def test_fit_and_figure_run_on_the_virtual_installation() -> None:
             # is a view OF this artifact, not a document reopened from disk.
             figure = exp.figure(capture)
             assert figure.document.datasets, "a figure names the data it draws"
+
+
+def test_mot_task_analyzes_once_and_reuses_that_result_for_every_output(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    analyzed = []
+    reported = []
+    projected = []
+    original_analyze = mot_task_impl.analyze_mot_scan
+    original_report = mot_task_impl.write_mot_field_report
+    original_outputs = mot_task_impl.mot_field_final_outputs
+
+    def count_analysis(request, source):
+        result = original_analyze(request, source)
+        analyzed.append(result)
+        return result
+
+    def observe_report(result, folder):
+        reported.append(result)
+        return original_report(result, folder)
+
+    def observe_outputs(result, source):
+        projected.append((result, source))
+        return original_outputs(result, source)
+
+    monkeypatch.setattr(mot_task_impl, "analyze_mot_scan", count_analysis)
+    monkeypatch.setattr(mot_task_impl, "write_mot_field_report", observe_report)
+    monkeypatch.setattr(mot_task_impl, "mot_field_final_outputs", observe_outputs)
+
+    workspace = tmp_path / "mot-workspace"
+    report_folder = tmp_path / "mot-report"
+    with zlc.connect("virtual", repository=workspace) as exp:
+        command = exp.readout.prepare_mot_field_task(
+            MotFieldTaskIntent(
+                pulse=str(MOT_FIELD_PULSE),
+                center_x=0.0,
+                center_y=0.0,
+                center_z=0.0,
+                span=2.0,
+                points=2,
+                roi_cx=None,
+                roi_cy=None,
+                roi_radius=8.0,
+                folder=str(report_folder),
+                camera_role="mot_camera",
+            )
+        )
+        reference = command.start().result()
+        assert isinstance(reference, CaptureArtifactRef)
+
+        first = command.final_dataset_outputs(reference)
+        second = command.final_dataset_outputs(reference)
+
+    assert len(analyzed) == 1
+    assert reported == [analyzed[0]]
+    assert len(projected) == 2
+    assert all(result is analyzed[0] for result, _source in projected)
+    assert projected[0][1] is projected[1][1]
+    assert first.keys() == second.keys() == {"mot_field", "scan"}
+    assert first["mot_field"].join_digest == second["mot_field"].join_digest
+    assert first["scan"].snapshot is projected[0][1].snapshot
+    assert second["scan"].snapshot is projected[0][1].snapshot
+    assert (report_folder / "mot_field_scan.npz").is_file()

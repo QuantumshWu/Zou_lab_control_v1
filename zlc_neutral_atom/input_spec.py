@@ -98,6 +98,14 @@ class ArtifactInputSpec:
     def accepted_output_contract_ids(self) -> tuple[str, ...]:
         return (self.output_contract_id,)
 
+    def accepts(self, contract_id: str) -> bool:
+        """Return whether one owner-declared Artifact contract is admissible."""
+
+        return (
+            canonical_text(contract_id, "artifact output contract id")
+            == self.output_contract_id
+        )
+
     @property
     def reference_schema_id(self) -> str:
         """The artifact ref schema is the single accepted output contract."""
@@ -110,7 +118,7 @@ class ArtifactInputSpec:
 
     @property
     def producer_key(self) -> str:
-        return self.key if not self.allow_saved_reference else f"{self.key}_signal"
+        return self.key if not self.allow_saved_reference else f"{self.key}_output"
 
     @property
     def reference_path_key(self) -> str | None:

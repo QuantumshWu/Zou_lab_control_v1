@@ -1,4 +1,4 @@
-"""Raw live-dataset attachment owned by one Workbench consumer.
+"""Raw live-dataset attachment owned by one TaskConsole consumer.
 
 The slot carries acquisition revisions across the worker/UI ownership boundary.
 It deliberately has no selector, ROI, reduction, Fit, or render policy: those

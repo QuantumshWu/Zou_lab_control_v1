@@ -893,19 +893,31 @@ class FluentParameterForm(QtWidgets.QWidget):
         changed, so an invalid full state cannot leave a partially updated form.
         """
 
-        exact = self._require_exact_values(values)
-        prepared = {
-            field.key: self._handlers[field.key].normalize(
-                field, exact[field.key]
-            )
-            for field in self._spec.fields
-        }
+        prepared = self._prepare_population(values)
         widgets = tuple(self._widgets[key] for key in self._spec.keys)
         with signals_blocked(*widgets):
             for field in self._spec.fields:
                 self._handlers[field.key].write(
                     field, self._widgets[field.key], prepared[field.key]
                 )
+
+    def validate_population(self, values: Mapping[str, object]) -> None:
+        """Validate one exact owner projection without mutating any widget."""
+
+        self._prepare_population(values)
+
+    def _prepare_population(
+        self,
+        values: Mapping[str, object],
+    ) -> dict[str, object]:
+        exact = self._require_exact_values(values)
+        return {
+            field.key: self._handlers[field.key].normalize(
+                field, exact[field.key]
+            )
+            for field in self._spec.fields
+        }
+
     def write_all(self, values: Mapping[str, object]) -> None:
         self.populate(values)
 

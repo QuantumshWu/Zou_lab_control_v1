@@ -14,7 +14,7 @@ from zlc_pulse import (
     load_deployed_pulse_target,
     pulse_target_manifest_from_lanes,
 )
-from zlc_workbench.pulse import PulseEditorSession
+from zlc_workbench.pulse_editor.session import PulseEditorSession
 from zlc_workbench.pulse_editor.controller import (
     PulseEditorController,
     PulseOwnerUpdate,

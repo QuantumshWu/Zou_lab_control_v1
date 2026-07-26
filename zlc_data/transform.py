@@ -34,7 +34,7 @@ from .validity import (
     INVALID,
     VALID,
     CellValidity,
-    ComponentValidity,
+    DatasetComponentValidity,
     Invalid,
     RowComponentValidity,
     Valid,
@@ -226,6 +226,14 @@ class TransformedData:
             raise TypeError("transform must be CommittedTransform")
         if not isinstance(self.schema, TransformedSchema):
             raise TypeError("schema must be TransformedSchema")
+        if self.source_ref.schema_fingerprint != self.transform.input_schema_fingerprint:
+            raise ValueError(
+                "source_ref schema fingerprint differs from the committed transform input"
+            )
+        if self.schema.fingerprint != self.transform.output_schema_fingerprint:
+            raise ValueError(
+                "transformed schema fingerprint differs from the committed transform output"
+            )
         object.__setattr__(
             self,
             "values",
@@ -254,7 +262,7 @@ def _source_validity(
         return validity
     if isinstance(validity, CellValidity):
         return RowComponentValidity((), validity.mask.reshape(-1))
-    if isinstance(validity, ComponentValidity):
+    if isinstance(validity, DatasetComponentValidity):
         return RowComponentValidity(
             validity.axis_ids,
             validity.mask.reshape((-1, *validity.mask.shape[2:])),
@@ -435,123 +443,6 @@ def apply_transform(
         state.validity,
         state.schema,
     )
-
-
-def _require_materialized_snapshot_step(schema: TransformedSchema, step) -> None:
-    """Keep the DatasetSchema bridge within its declared cell semantics."""
-
-    cell_axes = {axis.axis_id: axis for axis in schema.cell_axes}
-    if isinstance(step, ReductionSpec):
-        if any(axis_id in cell_axes for axis_id in step.axis_ids):
-            raise ValueError(
-                "bounded dataset snapshots do not reduce repeat/point axes"
-            )
-        return
-    term = step.terms[0]
-    axis = cell_axes.get(term.axis_id)
-    if axis is None:
-        return
-    singleton_drop = (
-        isinstance(term, IndexSelection) and axis.size == 1 and term.index == 0
-    )
-    full_noop = (
-        isinstance(term, IndexRangeSelection)
-        and term.start == 0
-        and term.stop == axis.size
-    )
-    if not (singleton_drop or full_noop):
-        raise ValueError(
-            "materialized dataset snapshots only select a singleton cell axis or "
-            "retain its full index range"
-        )
-
-
-def _validate_materialized_snapshot_transform(
-    source_schema: DatasetSchema,
-    transform: CommittedTransform,
-) -> None:
-    """Validate the cell-preserving transform used by snapshot materialization."""
-
-    if not isinstance(source_schema, DatasetSchema):
-        raise TypeError("source_schema must be DatasetSchema")
-    if not isinstance(transform, CommittedTransform):
-        raise TypeError("transform must be CommittedTransform")
-    if transform.input_schema_fingerprint != source_schema.fingerprint:
-        raise ValueError("CommittedTransform input schema fingerprint is stale")
-    state = _State(_source_transformed_schema(source_schema), None, None)
-    for operation in transform.spec.operations:
-        steps = (
-            tuple(Selection((term,)) for term in operation.terms)
-            if isinstance(operation, Selection)
-            else (operation,)
-        )
-        for step in steps:
-            _require_materialized_snapshot_step(state.schema, step)
-            state = (
-                _apply_selection(state, step)
-                if isinstance(step, Selection)
-                else _apply_reduction(state, step)
-            )
-    state = _ensure_scalar_carrier(state)
-    if state.schema.fingerprint != transform.output_schema_fingerprint:
-        raise RuntimeError("transform validation disagrees with committed output schema")
-
-
-def materialize_transformed_snapshot(
-    snapshot: OwnedSnapshot,
-    transform: CommittedTransform,
-    *,
-    output_ref: DatasetRevisionRef,
-    output_schema: DatasetSchema,
-) -> OwnedSnapshot:
-    """Execute one cell-preserving transform into its final DataBlock."""
-
-    if not isinstance(snapshot, OwnedSnapshot):
-        raise TypeError("snapshot must be OwnedSnapshot")
-    if not isinstance(output_ref, DatasetRevisionRef):
-        raise TypeError("output_ref must be DatasetRevisionRef")
-    if not isinstance(output_schema, DatasetSchema):
-        raise TypeError("output_schema must be DatasetSchema")
-    if output_ref.block_id == snapshot.ref.block_id:
-        raise ValueError("a transformed snapshot cannot reuse its source BlockId")
-    if output_ref.revision != snapshot.ref.revision:
-        raise ValueError("a transformed snapshot must retain its source revision")
-    if output_ref.schema_fingerprint != output_schema.fingerprint:
-        raise ValueError("output_ref schema fingerprint differs from output_schema")
-    if _source_transformed_schema(output_schema).fingerprint != transform.output_schema_fingerprint:
-        raise ValueError("output_schema differs from the committed transform")
-    _validate_materialized_snapshot_transform(snapshot.block.schema, transform)
-    state = _execute_transform(snapshot.block, transform.spec)
-    if state.schema.fingerprint != transform.output_schema_fingerprint:
-        raise RuntimeError("transform execution disagrees with its committed output schema")
-    assert state.values is not None and state.validity is not None
-    validity: Valid | Invalid | CellValidity | ComponentValidity
-    if isinstance(state.validity, (Valid, Invalid)):
-        validity = state.validity
-    elif state.validity.axis_ids:
-        validity = ComponentValidity(
-            state.validity.axis_ids,
-            state.validity.mask.reshape(
-                output_schema.repeat_axis.size,
-                output_schema.point_layout.storage_size,
-                *state.validity.mask.shape[1:],
-            ),
-        )
-    else:
-        validity = CellValidity(
-            state.validity.mask.reshape(
-                output_schema.repeat_axis.size,
-                output_schema.point_layout.storage_size,
-            )
-        )
-    block = DataBlock(
-        output_ref.block_id,
-        output_ref.revision,
-        state.values.reshape(output_schema.physical_shape),
-        validity,
-        output_schema,
-    )
-    return OwnedSnapshot(output_ref, block)
 
 
 def _execute_transform(block: DataBlock, spec: DataTransformSpec) -> _State:
@@ -1217,6 +1108,5 @@ __all__ = [
     "ValidityPolicy",
     "apply_transform",
     "commit_transform",
-    "materialize_transformed_snapshot",
     "resolve_transformed_schema",
 ]

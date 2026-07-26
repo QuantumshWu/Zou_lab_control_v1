@@ -344,14 +344,15 @@ class FitResultRepository:
             deadline_monotonic,
         )
         abort_check()
-        snapshot = capture_repository.materialize_final(
+        source_projection = capture_repository.project_dataset_source(
             source,
+            materialize=True,
             abort_check=abort_check,
         )
         abort_check()
         return self._execute_snapshot(
             source,
-            snapshot,
+            source_projection.require_owned_snapshot(),
             spec,
             cancel_check=cancel_check,
             deadline_monotonic=deadline_monotonic,
@@ -379,16 +380,15 @@ class FitResultRepository:
             deadline_monotonic,
         )
         abort_check()
-        materialized = scan_repository.materialize(
+        source_projection = scan_repository.project_dataset_source(
             source,
+            materialize=True,
             abort_check=abort_check,
         )
         abort_check()
-        snapshot = materialized.snapshot
-        del materialized
         return self._execute_snapshot(
             source,
-            snapshot,
+            source_projection.require_owned_snapshot(),
             spec,
             cancel_check=cancel_check,
             deadline_monotonic=deadline_monotonic,
@@ -461,11 +461,9 @@ class FitResultRepository:
                     raise TypeError(
                         "capture_repository is required for a capture fit result"
                     )
-                source_admission = capture_repository.admit(source_ref)
-                source_artifact = source_admission.artifact
-                source_schema = source_artifact.frame_source.schema
-                source_dataset_ref = source_artifact.frame_source.ref(
-                    source_artifact.provenance.generation
+                source_projection = capture_repository.project_dataset_source(
+                    source_ref,
+                    materialize=False,
                 )
             else:
                 from zlc_neutral_atom.logic_nodes.pulse_scan.repository import (
@@ -476,16 +474,18 @@ class FitResultRepository:
                     raise TypeError(
                         "scan_repository is required for a scan fit result"
                     )
-                materialized = scan_repository.materialize(source_ref)
-                source_dataset_ref = materialized.snapshot.ref
-                source_schema = materialized.snapshot.block.schema
+                source_projection = scan_repository.project_dataset_source(
+                    source_ref,
+                    # Preserve full source-content admission for saved Scan fits.
+                    materialize=True,
+                )
             result = decode_fit_result_batch(
                 self._store_authority.read_blob(result_ref)
             )
             validate_fit_result_source_binding(
                 result,
-                source_dataset_ref,
-                source_schema,
+                source_projection.ref,
+                source_projection.schema,
             )
             return AdmittedFitResult(
                 _ADMITTED_FIT_TOKEN,

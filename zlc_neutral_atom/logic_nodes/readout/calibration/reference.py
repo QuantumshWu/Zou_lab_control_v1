@@ -7,7 +7,6 @@ from typing import Any
 
 from zlc_storage import (
     canonical_text as _canonical_text,
-    decode,
     encode,
     sha256_text as _sha256,
 )
@@ -79,18 +78,6 @@ def calibration_artifact_input_ref(value: CalibrationArtifactRef):
     )
 
 
-def decode_calibration_artifact_ref(
-    payload: bytes | bytearray | memoryview,
-) -> CalibrationArtifactRef:
-    if not isinstance(payload, (bytes, bytearray, memoryview)):
-        raise TypeError("CalibrationArtifactRef payload must be bytes-like")
-    raw = bytes(payload)
-    value = calibration_artifact_ref_from_tree(decode(raw))
-    if encode_calibration_artifact_ref(value) != raw:
-        raise ValueError("CalibrationArtifactRef payload is typed but non-canonical")
-    return value
-
-
 __all__ = [
     "CALIBRATION_ARTIFACT_NAMESPACE",
     "CALIBRATION_ARTIFACT_REF_FORMAT",
@@ -98,6 +85,5 @@ __all__ = [
     "calibration_artifact_ref_from_tree",
     "calibration_artifact_input_ref",
     "calibration_artifact_ref_to_tree",
-    "decode_calibration_artifact_ref",
     "encode_calibration_artifact_ref",
 ]

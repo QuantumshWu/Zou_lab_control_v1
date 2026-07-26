@@ -26,7 +26,7 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     BlockId,
-    ComponentValidity,
+    DatasetComponentValidity,
     DataBlock,
     DatasetRevision,
     DatasetSchema,
@@ -58,7 +58,7 @@ from zlc_frontend.histogram_display import (
 )
 from zlc_frontend.selector import HistogramRangeGesture
 import zlc_workbench.data_figure.app as figure_workbench
-import zlc_workbench.data_figure.projection as figure_projection
+import zlc_frontend.data_figure_presentation as figure_presentation
 
 
 @pytest.fixture(scope="module")
@@ -99,7 +99,7 @@ def _histogram_grid(*, layers: int = 1, revision: int = 5) -> DataFigure:
         BlockId("u03g-counts"),
         DatasetRevision(revision),
         values,
-        ComponentValidity((site.axis_id,), valid),
+        DatasetComponentValidity((site.axis_id,), valid),
         schema,
     )
     dataset_id = DatasetId("u03g-counts")
@@ -219,7 +219,7 @@ def test_histogram_focus_reuses_exact_series_and_revision_identity() -> None:
     expected = figure.evaluated.layers[0].cells[1].series[0]
     focused = figure.focused_typed_panel(
         1,
-        expected_selection=regions[1].selection,
+        expected_selection=regions[1].focus_selection,
         expected_intent=ViewIntent.HISTOGRAM,
     )
     assert focused.evaluated.layers[0].cells[0].series[0] is expected
@@ -235,17 +235,18 @@ def test_histogram_focus_reuses_exact_series_and_revision_identity() -> None:
     with pytest.raises(ValueError, match="selection differs"):
         figure.focused_typed_panel(
             1,
-            expected_selection=regions[0].selection,
+            expected_selection=regions[0].focus_selection,
             expected_intent=ViewIntent.HISTOGRAM,
         )
     newer = _histogram_grid(revision=6)
     _new_png, newer_regions = newer.to_png_bytes_with_panel_regions()
     newer_focus = newer.focused_typed_panel(
         1,
-        expected_selection=newer_regions[1].selection,
+        expected_selection=newer_regions[1].focus_selection,
         expected_intent=ViewIntent.HISTOGRAM,
     )
-    assert newer_focus.document.document_id != focused.document.document_id
+    assert newer_focus.document.document_id == focused.document.document_id
+    assert newer_focus.evaluated.inputs[0].ref != focused.evaluated.inputs[0].ref
 
 
 def test_sparse_histogram_layout_keeps_its_empty_logical_cell() -> None:
@@ -261,7 +262,7 @@ def test_sparse_histogram_layout_keeps_its_empty_logical_cell() -> None:
     block = DataBlock(
         BlockId("u03g-sparse-histogram"),
         DatasetRevision(1),
-        np.asarray(((1.0, 2.0, 3.0), (4.0, 5.0, 6.0))),
+        np.asarray(((1.0, 2.0, 3.0), (4.0, 5.0, 6.0)))[..., None],
         VALID,
         schema,
     )
@@ -273,6 +274,11 @@ def test_sparse_histogram_layout_keeps_its_empty_logical_cell() -> None:
             AxisViewBinding(repeat.axis_id, AxisViewRole.SAMPLE),
             AxisViewBinding(row.axis_id, AxisViewRole.FACET),
             AxisViewBinding(column.axis_id, AxisViewRole.FACET),
+            AxisViewBinding(
+                schema.cell_schema.data_axes[0].axis_id,
+                AxisViewRole.SELECTED,
+                selector=FixedIndex(0),
+            ),
         ),
     )
     figure = DataFigure(
@@ -300,13 +306,14 @@ def test_sparse_histogram_layout_keeps_its_empty_logical_cell() -> None:
     _png, regions = figure.to_png_bytes_with_panel_regions()
     hole = figure.focused_typed_panel(
         3,
-        expected_selection=regions[3].selection,
+        expected_selection=regions[3].focus_selection,
         expected_intent=ViewIntent.HISTOGRAM,
     )
     assert hole.evaluated.layers[0].cells[0].series[0] is cells[3].series[0]
     assert hole.evaluated.layers[0].cells[0].series[0].data.samples.size == 0
     assert tuple(
-        (term.axis_id, term.index) for term in regions[3].selection.terms
+        (term.axis_id, term.index)
+        for term in regions[3].focus_selection.terms
     ) == ((column.axis_id, 1), (row.axis_id, 1))
 
 
@@ -352,7 +359,7 @@ def test_histogram_grid_overview_focus_interaction_back_and_exports(
         assert tuple(
             window._tabs.tabText(index) for index in range(window._tabs.count())
         ) == ("Histogram", "Edit")
-        assert window._overview_button.isVisible()
+        assert not window._overview_button.isHidden()
         assert window._overview_button.isEnabled()
         assert _wheel_histogram(window._board_widget, -120).isAccepted()
         _until(application, lambda: window.worker_idle and window.raster_ready)
@@ -394,7 +401,9 @@ def test_histogram_grid_overview_focus_interaction_back_and_exports(
         window._overview_button.click()
         application.processEvents()
         assert window._view_family == "histogram-overview"
-        assert window._tabs.currentWidget() is window._boards[0]
+        assert window._tabs.currentWidget() is window._tab_host_for_board(
+            window._boards[0]
+        )
         assert not window._tabs.tabBar().isVisible()
         assert window._board_widget.front_frame is None
         assert window._bundle.pages[0].png_bytes is original_png
@@ -495,7 +504,7 @@ def test_close_during_histogram_focus_cannot_present_a_late_front(
 
 def test_multi_layer_histogram_remains_whole_figure_fallback(application) -> None:
     figure = _histogram_grid(layers=2)
-    intent, count, reason = figure_projection._classify_typed_grid(figure)
+    intent, count, reason = figure_presentation.classify_faceted_data_figure(figure)
     assert intent is count is None
     assert "one layer" in reason
     window = figure_workbench.create_data_figure_pane(figure)

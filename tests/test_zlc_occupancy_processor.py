@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import textwrap
+import time
 
 import numpy as np
 import pytest
@@ -228,8 +229,8 @@ def test_normal_committed_path_has_one_repository_compiler_owner():
     )
     import zlc_neutral_atom.logic_nodes.readout.occupancy.repository as repository_module
 
-    assert compile_occupancy_artifact_plan.__module__.endswith(
-        "logic_nodes.occupancy.repository"
+    assert compile_occupancy_artifact_plan.__module__ == (
+        "zlc_neutral_atom.logic_nodes.readout.occupancy.repository"
     )
     assert not hasattr(repository_module, "OccupancyCheckpoint")
     assert not hasattr(repository_module, "LegacyOccupancyProcessor")
@@ -336,6 +337,8 @@ def test_live_signal_source_preserves_every_future_camera_event_and_same_shot():
             canonical_digest({"fixture": "occupancy-processor-binding"}),
             (calibration_input,),
         ),
+        expected_source_stream_id=camera_stream.stream_id,
+        expected_source_stream_generation=camera_stream.generation,
     )
     assert not isinstance(occupancy, SignalEventAssociationSource)
 
@@ -374,7 +377,11 @@ def test_live_signal_source_preserves_every_future_camera_event_and_same_shot():
         assert counts.captured_at == camera_event.captured_at
         assert counts.value.values.tolist() == [float(shot), shot + 0.25]
 
-    occupancy.close()
+    occupancy.request_close()
+    deadline = time.monotonic() + 1.0
+    while not occupancy.worker_idle and time.monotonic() < deadline:
+        time.sleep(0.001)
+    occupancy.join_closed()
     assert occupancy.worker_idle
     assert occupancy.error is None
     camera_producer.emit(

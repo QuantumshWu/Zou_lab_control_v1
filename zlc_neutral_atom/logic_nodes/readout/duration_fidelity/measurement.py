@@ -17,7 +17,10 @@ from zlc_neutral_atom.logic_node_declaration import (
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import ReadoutModelKind, ResolvedCalibration
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
-from zlc_neutral_atom.logic_nodes.pulse_scan import ApiSegmentTable, ApiSlotSegmentedProgram
+from zlc_neutral_atom.timing.pulse_parameter_scan import (
+    ApiSegmentTable,
+    ApiSlotSegmentedProgram,
+)
 from zlc_neutral_atom.logic_nodes.readout.calibration_input import (
     calibration_input_specs,
     calibration_reference,

@@ -22,6 +22,7 @@ from PyQt5 import QtCore, QtWidgets
 import pytest
 
 from zlc_frontend.qt_widgets import ensure_qt_app
+from gui_user_flow import close_pulse_editor
 
 #: The deliberate few-px gap between the box and the card below it (the same gap the
 #: Setting popup uses).  Placement is "below", not "flush", so a small positive offset
@@ -44,11 +45,7 @@ def editor(application):
     for _ in range(5):
         application.processEvents()
     yield editor
-    try:
-        window.close()
-    except Exception:                                    # pragma: no cover - teardown only
-        pass
-    application.processEvents()
+    close_pulse_editor(application, editor)
 
 
 def _anchor_report(combo: QtWidgets.QComboBox, application) -> tuple[int, int, int, int]:

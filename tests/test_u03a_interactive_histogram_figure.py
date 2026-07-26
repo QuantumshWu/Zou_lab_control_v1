@@ -26,7 +26,7 @@ from zlc_data import (  # noqa: E402
     AxisId,
     AxisSpec,
     BlockId,
-    ComponentValidity,
+    DatasetComponentValidity,
     DataBlock,
     DatasetRevision,
     DatasetSchema,
@@ -133,7 +133,7 @@ def _histogram_figure(
         BlockId("u03a-histogram-block"),
         DatasetRevision(7),
         values,
-        ComponentValidity((site.axis_id, channel.axis_id), valid),
+        DatasetComponentValidity((site.axis_id, channel.axis_id), valid),
         schema,
     )
     dataset_id = DatasetId("u03a-histogram-dataset")
@@ -250,8 +250,8 @@ def test_generic_histogram_uses_typed_front_edits_and_exact_export(
         ].selection_revision == 0
         assert first_payload.value_unit == "photoelectron"
         assert first_payload.series_labels == (
-            "u03a.site=left",
-            "u03a.site=right",
+            "Site=left",
+            "Site=right",
         )
         assert tuple(item.data.dropped_count for item in first_payload.series) == (0, 1)
         assert tuple(
@@ -588,11 +588,9 @@ def test_histogram_front_request_and_authored_state_are_compare_and_swap(
             front = original_renderer(*args, **kwargs)
             panel = front.frame.panels[0]
             raster = panel.raster
-            stride = raster.stride_bytes + 4
             wrong_raster = replace(
                 raster,
                 width=raster.width + 1,
-                stride_bytes=stride,
                 pixels=raster.pixels + b"\0" * (4 * raster.height),
             )
             return replace(
@@ -609,7 +607,7 @@ def test_histogram_front_request_and_authored_state_are_compare_and_swap(
         assert board.front_frame is old_frame
         assert window._display.revision == 0
         assert window.raster_ready
-        assert "another raster geometry" in window.findChild(
+        assert "another panel-raster geometry" in window.findChild(
             QtWidgets.QLabel,
             "figureViewerDiagnostic",
         ).text()
@@ -683,8 +681,6 @@ def test_close_during_histogram_export_preserves_existing_target_atomically(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    from PIL import Image
-
     window = open_data_figure_workbench(_histogram_figure())
     _until(application, lambda: window.worker_idle and window.raster_ready)
     destination = tmp_path / "typed-histogram.png"
@@ -692,16 +688,17 @@ def test_close_during_histogram_export_preserves_existing_target_atomically(
     destination.write_bytes(original_bytes)
     entered = threading.Event()
     release = threading.Event()
-    original_save = Image.Image.save
+    original_write_bytes = Path.write_bytes
 
-    def blocked_save(self, *args, **kwargs):
-        result = original_save(self, *args, **kwargs)
-        entered.set()
-        if not release.wait(10.0):
-            raise TimeoutError("test did not release staged histogram export")
+    def blocked_write_bytes(path: Path, payload: bytes):
+        result = original_write_bytes(path, payload)
+        if path.parent == tmp_path and path.name.startswith(f".{destination.name}."):
+            entered.set()
+            if not release.wait(10.0):
+                raise TimeoutError("test did not release staged histogram export")
         return result
 
-    monkeypatch.setattr(Image.Image, "save", blocked_save)
+    monkeypatch.setattr(Path, "write_bytes", blocked_write_bytes)
     try:
         window._start_export(destination)
         _until(application, entered.is_set)

@@ -1,6 +1,6 @@
 """Exact two-frame release-recapture reduction in one flat capture pipeline.
 
-The source Measurement publishes every physical camera frame.  This module owns
+The source camera capture publishes every physical frame.  This module owns
 the one earned K:1 operation in the current product: adjacent, explicitly keyed
 READOUT_EVENT 0/1 frames become one survival sample.  It is deliberately not a
 generic workflow or configurable grouping framework.
@@ -33,7 +33,7 @@ from zlc_neutral_atom.devices.camera.contract import (
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     ReadoutModelKind,
     ResolvedCalibration,
-    _apply_readout_model,
+    apply_readout_model,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
@@ -59,7 +59,7 @@ from zlc_neutral_atom.runtime.dataset import (
     FrozenDatasetEdge,
 )
 from zlc_neutral_atom.capture.pipeline import (
-    BoundMeasurement,
+    BoundCameraCapture,
     PipelineResult,
     finalize_pipeline_result,
 )
@@ -247,7 +247,7 @@ class ReleaseRecaptureDatasetEventAdapter:
 @dataclass(frozen=True, slots=True)
 class ReleaseRecapturePipelineSpec:
     name: str
-    measurement: BoundMeasurement
+    camera_capture: BoundCameraCapture
     calibration: ResolvedCalibration
     model_kind: ReadoutModelKind
     per_site: bool
@@ -257,8 +257,8 @@ class ReleaseRecapturePipelineSpec:
 
     def __post_init__(self) -> None:
         canonical_text(self.name, "name")
-        if not isinstance(self.measurement, BoundMeasurement):
-            raise TypeError("measurement must be BoundMeasurement")
+        if not isinstance(self.camera_capture, BoundCameraCapture):
+            raise TypeError("camera_capture must be BoundCameraCapture")
         if type(self.calibration) is not ResolvedCalibration:
             raise TypeError("calibration must be an admitted ResolvedCalibration")
         self.calibration._require_authority()
@@ -381,7 +381,7 @@ def _output_contract(
     tuple[_PairPlan, ...],
     DatasetCellSchedule,
 ]:
-    source = spec.measurement.capture_contract
+    source = spec.camera_capture.capture_contract
     source_schema = source.dataset_schema
     event_axes = tuple(
         (position, axis)
@@ -486,7 +486,9 @@ class ExactReleaseRecaptureTransaction:
         self.session.start(context)
 
     def capture_all(self, context: RunContext) -> None:
-        for _ordinal in range(self.spec.measurement.capture_contract.total_events):
+        for _ordinal in range(
+            self.spec.camera_capture.capture_contract.total_events
+        ):
             context.checkpoint()
             self.session.capture_next(context)
             self._consume_one(context)
@@ -495,7 +497,7 @@ class ExactReleaseRecaptureTransaction:
         if self._done or self._cancelled:
             raise RuntimeError("release-recapture reducer is no longer live")
         call_bound = (
-            self.spec.measurement.capture_port.capability
+            self.spec.camera_capture.capture_port.capability
             .max_blocking_call_seconds
         )
         delivery = self.source_cursor.next(timeout=call_bound)
@@ -580,8 +582,17 @@ class ExactReleaseRecaptureTransaction:
         model = self.spec.calibration.artifact.select_model(
             self.spec.model_kind
         )
-        initial = _apply_readout_model(model, first.payload.image)
-        recaptured = _apply_readout_model(model, second.payload.image)
+        frame_schema = self.spec.calibration.artifact.frame_contract.frame_schema
+        initial = apply_readout_model(
+            model,
+            first.payload.image,
+            expected_frame_schema=frame_schema,
+        )
+        recaptured = apply_readout_model(
+            model,
+            second.payload.image,
+            expected_frame_schema=frame_schema,
+        )
         left = initial.occupied.validity
         right = recaptured.occupied.validity
         if not isinstance(left, ComponentValidity) or not isinstance(
@@ -625,7 +636,7 @@ class ExactReleaseRecaptureTransaction:
     def complete(self, context: RunContext) -> ReleaseRecapturePipelineResult:
         completion: CaptureCompletion = self.session.complete(context)
         if self._first is not None or self._next_source_index != (
-            self.spec.measurement.capture_contract.total_events
+            self.spec.camera_capture.capture_contract.total_events
         ):
             raise RuntimeError("release-recapture reducer ended with an incomplete pair")
         self.source_reservation.validate_completion(
@@ -756,21 +767,21 @@ def open_exact_release_recapture(
 
     if not isinstance(spec, ReleaseRecapturePipelineSpec):
         raise TypeError("spec must be ReleaseRecapturePipelineSpec")
-    measurement = spec.measurement
-    contract = measurement.capture_contract
+    camera_capture = spec.camera_capture
+    contract = camera_capture.capture_contract
     session = open_capture_session(
-        measurement.capture_port,
+        camera_capture.capture_port,
         contract,
         TraceBinding(context.run_id.value, contract.source_id),
-        measurement.capture_spec,
+        camera_capture.capture_spec,
     )
     source_reservation = output_reservation = None
     output_builder = None
     reducer = None
     try:
-        capture_input = session.processor_input_binding
         source_reservation = session.reserve_exact()
         source_cursor = source_reservation.activate()
+        input_edge = contract.dataset_edge
         output_schema, payload_contract, plans, output_schedule = (
             _output_contract(spec)
         )
@@ -827,8 +838,8 @@ def open_exact_release_recapture(
             {
                 "contract": "zlc_neutral_atom.ExactReleaseRecaptureChain",
                 "reducer": stage_fingerprint,
-                "source_contract": capture_input.input_edge.consumer_contract_digest,
-                "source_schedule": capture_input.input_edge.schedule_digest,
+                "source_contract": input_edge.consumer_contract_digest,
+                "source_schedule": input_edge.schedule_digest,
                 "downstream": downstream.chain_contract_digest,
                 "input_events": contract.total_events,
                 "output_events": len(plans),
@@ -855,11 +866,11 @@ def open_exact_release_recapture(
         readiness = source_reservation.bind_consumer(
             reducer,
             source_contract_digest=(
-                capture_input.input_edge.consumer_contract_digest
+                input_edge.consumer_contract_digest
             ),
-            source_schedule_digest=capture_input.input_edge.schedule_digest,
+            source_schedule_digest=input_edge.schedule_digest,
             source_key_sequence_digest=(
-                capture_input.input_edge.exact_key_sequence_digest
+                input_edge.exact_key_sequence_digest
             ),
             chain_contract_digest=chain_digest,
             downstream=downstream,

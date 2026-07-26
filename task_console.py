@@ -53,13 +53,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _close_window(application, window, *, timeout_seconds: float = 10.0) -> None:
-    """Close the console's TOP-LEVEL window and wait for it to actually go.
-
-    ``open_task_console`` returns the console BODY, not the frame around it (the body's
-    ``isWindow()`` is False; its ``window()`` is the Fluent frame).  Closing the body leaves
-    the frame open, the app keeps running, and the launcher hangs forever in ``exec_()`` --
-    which is exactly what happened the first time this entry was switched.
-    """
+    """Close the console's top-level Fluent window and await its shutdown."""
 
     if window is None:
         return
@@ -134,10 +128,19 @@ class _StandaloneTaskConsoleFlow:
         self.experiment = experiment
         self.console = console
         self.pulse = pulse
-        console.window().closed.connect(self.close)
+        # A session-bound TaskConsole intentionally maps X to hide, so its
+        # ``closed`` notification never fires.  In this standalone launcher the
+        # same X action owns the whole application lifetime; observe the explicit
+        # close request (which is distinct from minimize/hide) and retire the
+        # sibling Pulse GUI plus DeviceManager-owned Experiment.
+        console.window().close_requested.connect(self.close)
         self.devices.window().hide()
 
     def close(self) -> None:
+        # The close request already passed TaskConsole's owner guard.  Drop the
+        # launcher borrow before retiring the shared Experiment so no Python
+        # reference outlives the deleted Qt wrapper.
+        self.console = None
         pulse, self.pulse = self.pulse, None
         if pulse is not None:
             pulse_window = pulse.window()

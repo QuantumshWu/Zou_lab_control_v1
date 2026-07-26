@@ -7,7 +7,7 @@ the plain-data arguments consumed by the single pulse drawing implementation.
 
 from __future__ import annotations
 
-from zlc_frontend.render_style import optimal_pulse_size
+from zlc_frontend.plot_layout import optimal_pulse_size
 from zlc_pulse import PORT_DAC, PORT_DIGITAL, PulseTimelineDocument
 
 from .repeat_presentation import pulse_repeat_presentation

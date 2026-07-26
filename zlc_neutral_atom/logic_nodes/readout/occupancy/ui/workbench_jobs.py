@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import CancelledError
 import threading
 
-from zlc_frontend.site_map_render import compose_site_map_front
+from zlc_frontend.site_map_render import SiteMapComposer
 from zlc_frontend.site_map_view import SiteMapView
 from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import OccupancyCellDomain
 
@@ -30,32 +30,6 @@ def _load_navigation(loader, reference, cancelled):
     return result
 
 
-def _build_front(
-    view,
-    display,
-    color_limits,
-    previous_relim,
-    cell_revision,
-    sequence,
-    cancelled,
-):
-    if not isinstance(view, SiteMapView):
-        raise TypeError("cell loader must return SiteMapView")
-    _cancel_point(cancelled)
-    frame, _effective_limits = compose_site_map_front(
-        view,
-        display,
-        panel_id=_PANEL_ID,
-        board_id=_BOARD_ID,
-        sequence=sequence,
-        selection_revision=cell_revision,
-        current_color_limits=color_limits,
-        previous_relim_mode=previous_relim,
-    )
-    _cancel_point(cancelled)
-    return frame
-
-
 def _cell_job(
     loader,
     reference,
@@ -63,10 +37,10 @@ def _cell_job(
     navigation,
     loaded_view,
     display,
-    color_limits,
-    previous_relim,
+    composer,
     cell_revision,
-    sequence,
+    surface_geometry,
+    surface_revision,
     cancelled,
 ):
     _cancel_point(cancelled)
@@ -83,21 +57,23 @@ def _cell_job(
         or loaded_view.cell_selection != expected_selection
     ):
         raise ValueError("cell loader returned a different exact selection")
-    frame = _build_front(
+    if not isinstance(composer, SiteMapComposer):
+        raise TypeError("occupancy cell renderer requires SiteMapComposer")
+    _cancel_point(cancelled)
+    frame = composer.compose(
         loaded_view,
-        display,
-        color_limits,
-        previous_relim,
-        cell_revision,
-        sequence,
-        cancelled,
+        display=display,
+        selection_revision=cell_revision,
+        surface_geometry=surface_geometry,
+        surface_revision=surface_revision,
     )
+    _cancel_point(cancelled)
     return (
         navigation.identity,
         selection,
         cell_revision,
         display.revision,
+        surface_revision,
         loaded_view,
         frame,
-        display.relim_mode,
     )

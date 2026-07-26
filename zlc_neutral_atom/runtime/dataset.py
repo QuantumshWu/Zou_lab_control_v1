@@ -28,6 +28,7 @@ from zlc_data import (
     CellValidity,
     ComponentValidity,
     DataBlock,
+    DatasetComponentValidity,
     DatasetRevision,
     DatasetRevisionRef,
     DatasetSchema,
@@ -1345,7 +1346,7 @@ def _materialized_validity(schema: DatasetSchema, validity: np.ndarray):
     contract = schema.cell_schema.validity_contract
     if contract.mode is ValidityMode.VALUE:
         return CellValidity(validity)
-    return ComponentValidity(contract.component_axis_ids, validity)
+    return DatasetComponentValidity(contract.component_axis_ids, validity)
 
 
 def _project_payload(

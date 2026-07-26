@@ -1,4 +1,5 @@
 tests/test_architecture_import_dag.py
+tests/test_figure_output_presentation.py
 tests/test_application_presentation_boundary.py
 tests/test_camera_capture_endpoint.py
 tests/test_camera_measurement_exposure.py
@@ -19,18 +20,17 @@ tests/test_task_console_start_gate_current.py
 tests/test_task_console_render_hot_path.py
 tests/test_console_run_bridge.py
 tests/test_definition_identity.py
-tests/test_design_charter.py
 tests/test_device_manager_current.py
 tests/test_installation_config_current.py
 tests/test_dropdown_anchor.py
 tests/test_figure_archive_current.py
+tests/test_frontend_exact_front_contracts.py
 tests/test_migration_manifest_gate.py
 tests/test_notebook_experiment_facade.py
 tests/test_operator_flows_on_virtual.py
 tests/test_public_hardware_boundary.py
 tests/test_pulse_application_state_current.py
 tests/test_pulse_command_port.py
-tests/test_pulse_dac_bus_editing.py
 tests/test_pulse_editor_controller_current.py
 tests/test_pulse_edit_alignment.py
 tests/test_pulse_preview_render.py
@@ -56,7 +56,6 @@ tests/test_storage_durability.py
 tests/test_storage_file_lock.py
 tests/test_storage_framed_journal.py
 tests/test_storage_repository_lease.py
-tests/test_stream_processor_worker.py
 tests/test_triggered_capture_pipeline.py
 tests/test_tutorial_notebook_spine.py
 tests/test_u02c_qt_curve_interaction.py
@@ -95,6 +94,7 @@ tests/test_pulse_gui_notebook_lifecycle.py
 tests/test_pulse_gui_scan_runtime_qt.py
 tests/test_pulse_schedule_view_contract.py
 tests/test_w3_data_figure.py
+tests/test_calibration_plot_report_surface.py
 tests/test_w6_calibration_workbench.py
 tests/test_w7_fit_grid_overlay_geometry.py
 tests/test_w7_radial_fit_projection.py
@@ -114,6 +114,7 @@ tests/test_zlc_data_transform.py
 tests/test_zlc_display_editor.py
 tests/test_zlc_fit_convenience.py
 tests/test_zlc_frontend_figure.py
+tests/test_panel_render_faceted_lifecycle.py
 tests/test_zlc_frontend_form.py
 tests/test_zlc_frontend_qt_widgets.py
 tests/test_zlc_histogram_display.py

@@ -9,7 +9,7 @@ from zlc_frontend.figure import DatasetId
 from zlc_neutral_atom.dataset_output import LiveDatasetOutputOwner
 from zlc_neutral_atom.runtime.preview import LiveDatasetViewSpec
 from zlc_storage import canonical_text
-from zlc_workbench.live_slot import LiveDatasetSlot
+from .live_slot import LiveDatasetSlot
 
 
 class ConsoleLiveDatasetHost:

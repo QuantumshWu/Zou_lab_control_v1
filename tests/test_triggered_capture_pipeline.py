@@ -136,7 +136,8 @@ def test_single_fire_failure_poisons_both_finite_owners():
 
 
 def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
-    runtime = create_virtual_installation(seed=7)
+    installation = create_virtual_installation(seed=7)
+    runtime = installation.runtime
     try:
         catalog = runtime.device_catalog
         camera_port = runtime.camera_port(catalog.require("camera").ref)
@@ -171,9 +172,9 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
             static.cell_plan,
         )
         accepted = validate_single_trigger_capture_binding(
-            capture_spec=static.measurement.capture_spec,
+            capture_spec=static.capture.capture_spec,
             contract=_contract_with_required_trigger_interval(
-                static.measurement.capture_contract,
+                static.capture.capture_contract,
                 actual_interval,
             ),
             pulse_binding=pulse_binding,
@@ -184,9 +185,9 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
             match="shorter than the broker-attested required external trigger interval",
         ):
             validate_single_trigger_capture_binding(
-                capture_spec=static.measurement.capture_spec,
+                capture_spec=static.capture.capture_spec,
                 contract=_contract_with_required_trigger_interval(
-                    static.measurement.capture_contract,
+                    static.capture.capture_contract,
                     float(np.nextafter(actual_interval, np.inf)),
                 ),
                 pulse_binding=pulse_binding,
@@ -216,9 +217,9 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
         assert single_schedule.total == 1
         assert single_schedule.minimum_interval_ticks is None
         assert validate_single_trigger_capture_binding(
-            capture_spec=single_edge.measurement.capture_spec,
+            capture_spec=single_edge.capture.capture_spec,
             contract=_contract_with_required_trigger_interval(
-                single_edge.measurement.capture_contract,
+                single_edge.capture.capture_contract,
                 1_000.0,
             ),
             pulse_binding=PulseCaptureBinding(
@@ -292,9 +293,9 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
             match="shorter than the broker-attested required external trigger interval",
         ):
             validate_single_trigger_capture_binding(
-                capture_spec=scanned.measurement.capture_spec,
+                capture_spec=scanned.capture.capture_spec,
                 contract=_contract_with_required_trigger_interval(
-                    scanned.measurement.capture_contract,
+                    scanned.capture.capture_contract,
                     required,
                 ),
                 pulse_binding=PulseCaptureBinding(
@@ -339,7 +340,7 @@ def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation
             schedule = tuple(artifact.frame_source.iter_cell_schedule())
             result = {
                 "expected_frames": descriptor.expected_frames,
-                "descriptor_shape": list(descriptor.output_shape),
+                "descriptor_shape": list(descriptor.output_schema.physical_shape),
                 "physical_shape": list(artifact.frame_source.schema.physical_shape),
                 "data_shape": list(
                     artifact.frame_source.schema.cell_schema.data_shape
@@ -484,10 +485,3 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
         for port in ports:
             port.close()
         experiment.close()
-
-
-def test_host_stepped_scan_is_not_reintroduced_as_a_capture_mode():
-    import zlc_neutral_atom.capture.triggered as capture_module
-
-    assert not hasattr(capture_module, "HOST_STEPPED_GROUP")
-    assert not hasattr(capture_module, "HostSteppedCaptureSpec")

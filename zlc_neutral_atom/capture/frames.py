@@ -17,6 +17,7 @@ from zlc_data import (
     CellValidity,
     ComponentValidity,
     DataBlock,
+    DatasetComponentValidity,
     DatasetRevision,
     DatasetRevisionRef,
     DatasetSchema,
@@ -242,7 +243,7 @@ def _validity_descriptor(validity: object) -> tuple[str, tuple[object, ...]]:
         return "invalid", ()
     if isinstance(validity, CellValidity):
         return "cell", ()
-    if isinstance(validity, ComponentValidity):
+    if isinstance(validity, DatasetComponentValidity):
         return "component", validity.axis_ids
     raise TypeError("capture DataBlock has an unsupported validity type")
 
@@ -271,7 +272,7 @@ def _frame_validity(
     if isinstance(validity, CellValidity):
         admitted = bool(validity.mask[location])
         return (VALID if admitted else INVALID), bytes((int(admitted),))
-    assert isinstance(validity, ComponentValidity)
+    assert isinstance(validity, DatasetComponentValidity)
     mask = np.asarray(validity.mask[location], dtype=bool)
     frame_validity = ComponentValidity(validity.axis_ids, mask)
     return frame_validity, np.ascontiguousarray(mask).tobytes(order="C")
@@ -715,7 +716,7 @@ class CaptureFrameSource:
                 validity = CellValidity(validity_values)
             else:
                 assert validity_values is not None
-                validity = ComponentValidity(
+                validity = DatasetComponentValidity(
                     self._validity_axis_ids,
                     validity_values,
                 )

@@ -1,90 +1,210 @@
-"""Capacity-one DataFigure fit, render, and export worker jobs."""
+"""Canonical DataFigure raster composition and immutable front construction."""
 
 from __future__ import annotations
 
-from collections import Counter
-from concurrent.futures import CancelledError, ThreadPoolExecutor
-import math
-from pathlib import Path
-import threading
-import time
+from collections.abc import Callable
+from io import BytesIO
 
-from zlc_data import FitBatchStatus, FitDeadlineExceeded, FitResultBatch, FitSpec
-from zlc_frontend import (
+from zlc_data import FitResultBatch
+
+from .data_figure import DataFigure
+from .render import (
     BoardFrame,
     CoherenceStamp,
     CurveFitOverlay,
     CurvePanelPayload,
-    DataFigure,
-    FitAuthoringOption,
-    fit_projection_metadata,
     HistogramPanelPayload,
     ImagePanelPayload,
-    MeterDisplayState,
     MeterPanelPayload,
     PanelFrame,
     PanelPresentationIdentity,
     RadialGaussianImageFitOverlay,
     SourceIdentity,
-    validate_fit_authoring_options,
 )
-from zlc_frontend.curve_display import CurveDisplayState
-from zlc_frontend.display_range import validated_display_range
-from zlc_frontend.encoded_raster import EncodedRasterDocument, EncodedRasterPage
-from zlc_frontend.fit_curve_projection import CurveFitOverlayPlan, materialize_curve_fit_overlay_plan
-from zlc_frontend.figure import EvaluatedImage, ViewIntent
-from zlc_frontend.histogram_display import (
+from .curve_display import CurveDisplayState
+from .display_range import validated_display_range
+from .data_figure_presentation import (
+    DATA_FIGURE_BOARD_ID,
+    DATA_FIGURE_JOIN_SCHEMA_DIGEST,
+    DATA_FIGURE_PANEL_ID,
+    DEFAULT_DATA_FIGURE_RASTER_SIZE,
+    DataFigureDisplayState,
+    DataFigureFront,
+    DataFigureGridDisplayState,
+    DataFigureGridOverview,
+    DataFigurePanelPayload,
+    classify_faceted_data_figure,
+    classify_single_data_figure,
+    data_figure_front_contract,
+    data_figure_join_digest,
+    data_figure_payload_intent,
+    data_figure_summary,
+    default_data_figure_display_state,
+    display_state_intent,
+    grid_display_state_intent,
+    validate_rendered_data_figure_payload,
+)
+from .encoded_raster import EncodedRasterDocument, EncodedRasterPage
+from .fit_curve_projection import (
+    CurveFitOverlayPlan,
+    materialize_curve_fit_overlay_plan,
+)
+from .fit_editor import fit_projection_metadata
+from .figure import (
+    EvaluatedImage,
+    EvaluatedProjectionIdentity,
+    ViewIntent,
+)
+from .histogram_display import (
     HistogramCountScale,
     HistogramDisplayState,
     histogram_projection_home_x_limits,
 )
-from zlc_frontend.image_display import ImageDisplayState, image_viewport_for_display_state
-from zlc_frontend.image_display import resolve_image_color_limits
-from zlc_frontend.image_view import image_viewport_for_evaluated_image
-from zlc_frontend.plot_layout import LIVE_PANEL_DPI
-from zlc_workbench.fit import FitDraftAuthority, FitDraftResult
-from zlc_workbench.window_runtime import stage_and_replace_export
-
-from .projection import (
-    _NUMERIC_RASTER_SIZE,
-    _TYPED_BOARD_ID,
-    _TYPED_JOIN_SCHEMA_DIGEST,
-    _TYPED_PANEL_ID,
-    _GridDisplayState,
-    _TypedDisplayState,
-    _TypedFigureFront,
-    _TypedGridOverview,
-    _build_typed_front_contract,
-    _classify_single_typed,
-    _classify_typed_grid,
-    _default_typed_state,
-    _figure_summary,
-    _payload_intent,
-    _grid_state_intent,
-    _state_intent,
-    _validate_rendered_authored_payload,
-    _typed_join_digest,
+from .image_display import (
+    ImageDisplayState,
+    evaluated_image_data_range,
+    image_viewport_for_display_state,
+    resolve_image_color_limits_from_range,
 )
+from .image_view import image_viewport_for_evaluated_image
+from .meter_display import MeterDisplayState
+from .plot_layout import LIVE_PANEL_DPI
 
-_FIT_WORK_EXECUTOR = ThreadPoolExecutor(
-    max_workers=1,
-    thread_name_prefix="zlc-data-figure-fit",
-)
 
-def _require_not_cancelled(cancelled: threading.Event | None) -> None:
-    if cancelled is not None and cancelled.is_set():
-        raise CancelledError()
+class DataFigureRenderSession:
+    """Persistent Agg owner for one interactive DataFigure surface.
 
-def _encoded_figure(
+    Display revisions update the existing artist tree.  Only renderer geometry,
+    authored labels, or the Figure document identity replace that tree.  The
+    stateless public render function remains a one-shot export convenience.
+    """
+
+    def __init__(self) -> None:
+        self._image_key: tuple[object, ...] | None = None
+        self._image_renderer = None
+        self._single_key: tuple[object, ...] | None = None
+        self._single_renderer = None
+        self._image_range_source = None
+        self._image_range: tuple[float, float] | None = None
+
+    def _image(self, *, width, height, dpi, size_name):
+        key = (int(width), int(height), float(dpi), size_name)
+        if self._image_renderer is None or self._image_key != key:
+            self._close_image()
+            from .matplotlib_render import ImagePanelAggRenderer
+
+            self._image_renderer = ImagePanelAggRenderer(
+                width=width,
+                height=height,
+                dpi=dpi,
+                size_name=size_name,
+            )
+            self._image_key = key
+        return self._image_renderer
+
+    def _single(
+        self,
+        figure: DataFigure,
+        *,
+        width,
+        height,
+        dpi,
+        size_name,
+        title,
+        value_label,
+    ):
+        document = figure.document
+        key = (
+            document.document_id,
+            document.revision,
+            int(width),
+            int(height),
+            float(dpi),
+            size_name,
+            title,
+            value_label,
+        )
+        if self._single_renderer is None or self._single_key != key:
+            self._close_single()
+            from .matplotlib_render import SinglePanelAggRenderer
+
+            self._single_renderer = SinglePanelAggRenderer(
+                document,
+                width=width,
+                height=height,
+                dpi=dpi,
+                size_name=size_name,
+                title=title,
+                value_label=value_label,
+            )
+            self._single_key = key
+        return self._single_renderer
+
+    def render_front(self, figure: DataFigure, state, **options) -> DataFigureFront:
+        try:
+            return render_data_figure_front(
+                figure,
+                state,
+                _session=self,
+                **options,
+            )
+        except BaseException:
+            # A partially-mutated Matplotlib artist graph is not reusable.
+            self.close()
+            raise
+
+    def _image_limits(
+        self,
+        image: EvaluatedImage,
+        state: ImageDisplayState,
+        *,
+        current_color_limits,
+        previous_relim_mode,
+    ):
+        if self._image_range_source is not image:
+            self._image_range_source = image
+            self._image_range = evaluated_image_data_range((image,))
+        return resolve_image_color_limits_from_range(
+            self._image_range,
+            state,
+            current_color_limits=current_color_limits,
+            previous_relim_mode=previous_relim_mode,
+        )
+
+    def _close_image(self) -> None:
+        renderer, self._image_renderer = self._image_renderer, None
+        self._image_key = None
+        if renderer is not None:
+            renderer.close()
+
+    def _close_single(self) -> None:
+        renderer, self._single_renderer = self._single_renderer, None
+        self._single_key = None
+        if renderer is not None:
+            renderer.close()
+
+    def close(self) -> None:
+        self._close_image()
+        self._close_single()
+        self._image_range_source = None
+        self._image_range = None
+
+
+def _check(check_cancelled: Callable[[], None] | None) -> None:
+    if check_cancelled is not None:
+        check_cancelled()
+
+
+def render_encoded_data_figure(
     figure: DataFigure,
-    cancelled: threading.Event | None,
     *,
     unavailable_reason: str | None = None,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> EncodedRasterDocument:
-    _require_not_cancelled(cancelled)
+    _check(check_cancelled)
     payload = figure.to_png_bytes()
-    _require_not_cancelled(cancelled)
-    summary = _figure_summary(figure)
+    _check(check_cancelled)
+    summary = data_figure_summary(figure)
     if unavailable_reason is not None:
         if not isinstance(unavailable_reason, str) or not unavailable_reason.strip():
             raise ValueError("unavailable_reason must be non-empty text or None")
@@ -105,24 +225,24 @@ def _presentation_label(
         raise TypeError(f"{name} must be text or None")
     return value
 
-def _render_typed_grid_overview(
+def render_data_figure_grid_overview(
     figure: DataFigure,
-    cancelled: threading.Event,
     *,
-    raster_size: tuple[int, int] = _NUMERIC_RASTER_SIZE,
+    raster_size: tuple[int, int] = DEFAULT_DATA_FIGURE_RASTER_SIZE,
     size_name: str | None = None,
     pixel_ratio: float = 1.0,
-    display_state: _GridDisplayState | None = None,
+    display_state: DataFigureGridDisplayState | None = None,
     presentation_title: str | None = None,
     presentation_value_label: str | None = None,
-) -> _TypedGridOverview:
-    intent, panel_count, reason = _classify_typed_grid(figure)
+    check_cancelled: Callable[[], None] | None = None,
+) -> DataFigureGridOverview:
+    intent, panel_count, reason = classify_faceted_data_figure(figure)
     if intent is None or panel_count is None:
         raise ValueError(
             "typed grid overview requires a supported multi-cell figure"
             + ("" if reason is None else f": {reason}")
         )
-    _require_not_cancelled(cancelled)
+    _check(check_cancelled)
     histogram_home = None
     if intent is ViewIntent.HISTOGRAM:
         histogram_home = histogram_projection_home_x_limits(
@@ -132,10 +252,10 @@ def _render_typed_grid_overview(
                 for series in cell.series
             )
         )
-    _require_not_cancelled(cancelled)
+    _check(check_cancelled)
     if display_state is None:
-        display_state = _default_typed_state(intent)
-    elif _grid_state_intent(display_state) is not intent:
+        display_state = default_data_figure_display_state(intent)
+    elif grid_display_state_intent(display_state) is not intent:
         raise ValueError("typed grid display state does not match the figure intent")
     if size_name is None:
         if (
@@ -145,7 +265,7 @@ def _render_typed_grid_overview(
             raise ValueError(
                 "authored grid labels require named panel geometry"
             )
-        if display_state != _default_typed_state(intent):
+        if display_state != default_data_figure_display_state(intent):
             raise ValueError(
                 "an authored grid display requires named panel geometry"
             )
@@ -172,11 +292,11 @@ def _render_typed_grid_overview(
             value_label=value_label,
         )
         visible_display_state = display_state
-    _require_not_cancelled(cancelled)
+    _check(check_cancelled)
     if len(regions) != panel_count:
         raise RuntimeError("typed grid regions do not cover every canonical panel")
     bundle = EncodedRasterDocument(
-        _figure_summary(figure),
+        data_figure_summary(figure),
         (
             EncodedRasterPage(
                 f"{intent.value.lower()}-overview",
@@ -185,7 +305,7 @@ def _render_typed_grid_overview(
             ),
         ),
     )
-    return _TypedGridOverview(
+    return DataFigureGridOverview(
         intent=intent,
         figure=figure,
         bundle=bundle,
@@ -194,128 +314,33 @@ def _render_typed_grid_overview(
         display_state=visible_display_state,
     )
 
-def _fit_summary(
-    draft: FitDraftResult,
-    *,
-    cancelled=None,
-) -> str:
-    result = draft.result
-    counts = Counter(status.value for status in result.statuses)
-    status_text = ", ".join(
-        f"{name.lower()}={count}" for name, count in sorted(counts.items())
-    )
-    quality_min = math.inf
-    quality_max = -math.inf
-    for index, (status, rss, used) in enumerate(
-        zip(
-            result.statuses,
-            result.residual_sum_squares,
-            result.used_observation_counts,
-            strict=True,
-        )
-    ):
-        if cancelled is not None and index % 1024 == 0 and cancelled():
-            raise CancelledError()
-        if status is not FitBatchStatus.CONVERGED or int(used) <= 0:
-            continue
-        value = math.sqrt(float(rss) / int(used))
-        if math.isfinite(value):
-            quality_min = min(quality_min, value)
-            quality_max = max(quality_max, value)
-    quality_text = (
-        "no converged RMSE"
-        if not math.isfinite(quality_min)
-        else f"RMSE {quality_min:.4g}–{quality_max:.4g}"
-    )
-    return (
-        f"{result.spec.model_id} · {len(result.statuses)} named batch cell(s) · "
-        f"{status_text} · {quality_text} · draft is not saved"
-    )
-
-def _prepare_fit_options(
-    prepare,
-    fit_axis_ids: tuple[AxisId, ...],
-    axis_roles: tuple[tuple[AxisId, AxisViewRole], ...],
-    selection: Selection | None,
-    allow_prepared_transform: bool = False,
-) -> tuple[FitAuthoringOption, ...]:
-    options = tuple(
-        prepare(
-            fit_axis_ids,
-            selection,
-        )
-    )
-    if not options or any(
-        not isinstance(option, FitAuthoringOption) for option in options
-    ):
-        raise ValueError("Fit preparation produced no FitAuthoringOption")
-    schemas = {option.spec.input_schema_fingerprint for option in options}
-    models = tuple(option.spec.model_id for option in options)
-    if len(schemas) != 1 or len(models) != len(set(models)):
-        raise ValueError("Fit options require one source schema and unique models")
-    if any(option.spec.fit_axis_ids != fit_axis_ids for option in options):
-        raise ValueError("Fit option axes differ from the exact displayed axes")
-    return validate_fit_authoring_options(
-        options,
-        fit_axis_ids=fit_axis_ids,
-        axis_roles=axis_roles,
-        selection=selection,
-        allow_prepared_transform=allow_prepared_transform,
-    )
-
-def _execute_fit_draft(
-    authority: FitDraftAuthority,
-    spec: FitSpec,
-    deadline_monotonic: float,
-    window_cancelled: threading.Event,
-    analysis_cancelled: threading.Event,
-) -> tuple[FitDraftResult, str]:
-    def cancelled() -> bool:
-        return window_cancelled.is_set() or analysis_cancelled.is_set()
-
-    if cancelled():
-        raise CancelledError()
-    if time.monotonic() >= deadline_monotonic:
-        raise FitDeadlineExceeded("fit expired while waiting for its worker lane")
-    draft = authority.execute(spec, cancelled, deadline_monotonic)
-    try:
-        return (
-            draft,
-            _fit_summary(draft, cancelled=cancelled),
-        )
-    except BaseException:
-        # ``authority.execute`` has already installed the one live draft.  Any
-        # failure in worker-only presentation/accounting must release that exact
-        # generation or all later Fit submissions deadlock behind a hidden draft.
-        authority.discard(draft)
-        raise
-
-def _render_typed_front(
+def render_data_figure_front(
     figure: DataFigure,
-    state: _TypedDisplayState,
+    state: DataFigureDisplayState,
     *,
     current_value_limits: tuple[float, float] | None,
     previous_relim_mode,
     previous_count_scale: HistogramCountScale | None,
     sequence: int,
-    cancelled: threading.Event,
     fit_result: FitResultBatch | None = None,
     fit_result_identity: str | None = None,
     histogram_projection_value_range: tuple[float, float] | None = None,
     release_initial_canonical_on_commit: bool = False,
-    raster_size: tuple[int, int] = _NUMERIC_RASTER_SIZE,
+    raster_size: tuple[int, int] = DEFAULT_DATA_FIGURE_RASTER_SIZE,
     size_name: str | None = None,
     pixel_ratio: float = 1.0,
     presentation_title: str | None = None,
     presentation_value_label: str | None = None,
-) -> _TypedFigureFront:
-    intent, unavailable_reason = _classify_single_typed(figure)
-    if intent is None or intent is not _state_intent(state):
+    check_cancelled: Callable[[], None] | None = None,
+    _session: DataFigureRenderSession | None = None,
+) -> DataFigureFront:
+    intent, unavailable_reason = classify_single_data_figure(figure)
+    if intent is None or intent is not display_state_intent(state):
         raise ValueError(
             "typed render requires one matching logical panel"
             + ("" if unavailable_reason is None else f": {unavailable_reason}")
         )
-    _require_not_cancelled(cancelled)
+    _check(check_cancelled)
     if histogram_projection_value_range is not None:
         if intent is not ViewIntent.HISTOGRAM:
             raise ValueError("only HISTOGRAM render can fix its projection value range")
@@ -339,7 +364,7 @@ def _render_typed_front(
         or fit_result_identity is not None
     ):
         raise ValueError("METER display cannot carry a Fit overlay")
-    _require_not_cancelled(cancelled)
+    _check(check_cancelled)
     title = _presentation_label(
         presentation_title,
         figure.document.layers[0].layer_id,
@@ -373,17 +398,17 @@ def _render_typed_front(
             image_fit_overlay = figure.transient_single_panel_radial_fit_overlay(
                 fit_result,
                 result_identity=fit_result_identity,
-                check_cancelled=lambda: _require_not_cancelled(cancelled),
+                check_cancelled=check_cancelled,
             )
     curve_fit_overlays: tuple[CurveFitOverlay, ...] = (
         ()
         if curve_fit_overlay_plan is None
         else materialize_curve_fit_overlay_plan(
             curve_fit_overlay_plan,
-            check_cancelled=lambda: _require_not_cancelled(cancelled),
+            check_cancelled=check_cancelled,
         )
     )
-    _require_not_cancelled(cancelled)
+    _check(check_cancelled)
 
     if isinstance(state, ImageDisplayState):
         evaluated_input = figure.evaluated.inputs[0]
@@ -391,16 +416,15 @@ def _render_typed_front(
         assert isinstance(image, EvaluatedImage)
         home_viewport = image_viewport_for_evaluated_image(image)
         viewport = image_viewport_for_display_state(state, home_viewport)
-        data_range, color_limits = resolve_image_color_limits(
+        session = DataFigureRenderSession() if _session is None else _session
+        data_range, color_limits = session._image_limits(
             image,
             state,
             current_color_limits=current_value_limits,
             previous_relim_mode=previous_relim_mode,
         )
-        from zlc_frontend.matplotlib_render import ImagePanelAggRenderer
-
         width, height = raster_size
-        renderer = ImagePanelAggRenderer(
+        renderer = session._image(
             width=width,
             height=height,
             dpi=LIVE_PANEL_DPI * pixel_ratio,
@@ -415,12 +439,22 @@ def _render_typed_front(
                 data_range=data_range,
                 title=title,
                 value_label=value_label,
-                distribution_identity=evaluated_input.ref,
+                projection_identity=EvaluatedProjectionIdentity(
+                    figure.evaluated.document_id,
+                    figure.evaluated.document_revision,
+                    evaluated_input,
+                    figure.evaluated.layers[0].layer_id,
+                    figure.evaluated.layers[0].resolutions,
+                    figure.evaluated.layers[0].cells[0].facet_address,
+                    figure.evaluated.layers[0].cells[0].series[0].batch_address,
+                    image,
+                ),
                 fit_overlay=image_fit_overlay,
             )
         finally:
-            renderer.close()
-        payload: _TypedPanelPayload = ImagePanelPayload(
+            if _session is None:
+                session.close()
+        payload: DataFigurePanelPayload = ImagePanelPayload(
             image,
             evaluated_input,
             viewport,
@@ -431,11 +465,10 @@ def _render_typed_front(
             image_fit_overlay,
         )
     else:
-        from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
-
         width, height = raster_size
-        renderer = SinglePanelAggRenderer(
-            figure.document,
+        session = DataFigureRenderSession() if _session is None else _session
+        renderer = session._single(
+            figure,
             width=width,
             height=height,
             dpi=LIVE_PANEL_DPI * pixel_ratio,
@@ -473,12 +506,13 @@ def _render_typed_front(
                     display_revision=state.revision,
                 )
         finally:
-            renderer.close()
-    _require_not_cancelled(cancelled)
+            if _session is None:
+                session.close()
+    _check(check_cancelled)
 
     evaluated_input = payload.evaluated_input
     presentation = PanelPresentationIdentity(
-        _TYPED_PANEL_ID,
+        DATA_FIGURE_PANEL_ID,
         figure.document.document_id,
         figure.document.revision,
         0,
@@ -489,8 +523,8 @@ def _render_typed_front(
         f"figure:{ref.block_id.value}",
         ref.stream_generation.value,
         "FrozenTypedFigureJoin",
-        _TYPED_JOIN_SCHEMA_DIGEST,
-        _typed_join_digest(figure, intent, fit_result_identity),
+        DATA_FIGURE_JOIN_SCHEMA_DIGEST,
+        data_figure_join_digest(figure, intent, fit_result_identity),
         (evaluated_input,),
         (presentation,),
     )
@@ -501,12 +535,12 @@ def _render_typed_front(
         ref.schema_fingerprint,
     )
     frame = BoardFrame(
-        _TYPED_BOARD_ID,
+        DATA_FIGURE_BOARD_ID,
         0,
         sequence,
         (
             PanelFrame(
-                _TYPED_PANEL_ID,
+                DATA_FIGURE_PANEL_ID,
                 f"frozen-{intent.value.lower()}",
                 source,
                 stamp,
@@ -515,9 +549,9 @@ def _render_typed_front(
             ),
         ),
     )
-    _validate_rendered_authored_payload(payload, state, fit_result_identity)
+    validate_rendered_data_figure_payload(payload, state, fit_result_identity)
     fit_axis_ids, axis_roles = fit_projection_metadata(figure, intent)
-    data_contract = _build_typed_front_contract(
+    data_contract = data_figure_front_contract(
         intent,
         frame,
     )
@@ -528,11 +562,11 @@ def _render_typed_front(
             {figure.document.layers[0].layer_id: fit_result}
         )
     )
-    return _TypedFigureFront(
+    return DataFigureFront(
         intent=intent,
         figure=visible_figure,
         state=state,
-        summary=_figure_summary(figure),
+        summary=data_figure_summary(figure),
         frame=frame,
         data_contract=data_contract,
         fit_axis_ids=fit_axis_ids,
@@ -545,86 +579,58 @@ def _render_typed_front(
         raster_size=raster_size,
     )
 
-def _export_typed_png(
+def encode_data_figure_front_png(
     frame: BoardFrame,
-    state: _TypedDisplayState,
-    destination: Path,
-    revision: int,
-    cancelled: threading.Event,
-    commit_lock: threading.Lock,
-) -> tuple[int, Path]:
+    state: DataFigureDisplayState,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> bytes:
+    """Encode one already-admitted Figure front using the canonical renderer."""
+
+    _check(check_cancelled)
     if not isinstance(frame, BoardFrame) or len(frame.panels) != 1:
         raise TypeError("typed export requires one exact BoardFrame")
     panel = frame.panels[0]
     payload = panel.display_payload
-    if panel.panel_id != _TYPED_PANEL_ID or _payload_intent(payload) is not _state_intent(state):
+    if (
+        panel.panel_id != DATA_FIGURE_PANEL_ID
+        or data_figure_payload_intent(payload) is not display_state_intent(state)
+    ):
         raise ValueError("typed export frame has another presentation")
     if isinstance(payload, ImagePanelPayload):
-        def write_staged(path: Path) -> None:
-            _require_not_cancelled(cancelled)
-            from zlc_frontend.matplotlib_render import encode_image_panel_png
+        from .matplotlib_render import encode_image_panel_png
 
-            encoded = encode_image_panel_png(
-                payload,
-                state,
-            )
-            _require_not_cancelled(cancelled)
-            path.write_bytes(encoded)
-            _require_not_cancelled(cancelled)
-
-        result = stage_and_replace_export(
-            Path(destination),
-            write_staged=write_staged,
-            cancelled=cancelled,
-            commit_lock=commit_lock,
-        )
-        return revision, result
+        encoded = encode_image_panel_png(payload, state)
+        _check(check_cancelled)
+        return encoded
     if not isinstance(
         payload,
         (CurvePanelPayload, HistogramPanelPayload, MeterPanelPayload),
     ):
         raise ValueError("typed export payload is unsupported")
     raster = panel.raster
-    def write_staged(path: Path) -> None:
-        from PIL import Image
+    from PIL import Image
 
-        image = Image.frombytes(
-            "RGBA",
-            (raster.width, raster.height),
-            raster.pixels,
-        )
-        try:
-            image.save(path, format="PNG")
-        finally:
-            image.close()
-
-    result = stage_and_replace_export(
-        Path(destination),
-        write_staged=write_staged,
-        cancelled=cancelled,
-        commit_lock=commit_lock,
+    image = Image.frombytes(
+        "RGBA",
+        (raster.width, raster.height),
+        raster.pixels,
     )
-    return revision, result
+    stream = BytesIO()
+    try:
+        image.save(stream, format="PNG")
+        encoded = stream.getvalue()
+    finally:
+        image.close()
+        stream.close()
+    _check(check_cancelled)
+    return encoded
 
-def _export_encoded_png(
-    payload: bytes,
-    destination: Path,
-    revision: int,
-    cancelled: threading.Event,
-    commit_lock: threading.Lock,
-) -> tuple[int, Path]:
-    if not isinstance(payload, bytes):
-        raise TypeError("encoded export requires owned immutable bytes")
 
-    def write_staged(path: Path) -> None:
-        _require_not_cancelled(cancelled)
-        path.write_bytes(payload)
-        _require_not_cancelled(cancelled)
-
-    result = stage_and_replace_export(
-        Path(destination),
-        write_staged=write_staged,
-        cancelled=cancelled,
-        commit_lock=commit_lock,
-    )
-    return revision, result
+__all__ = [
+    "DataFigureRenderSession",
+    "encode_data_figure_front_png",
+    "render_data_figure_front",
+    "render_data_figure_grid_overview",
+    "render_encoded_data_figure",
+]

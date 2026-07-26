@@ -25,6 +25,7 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     BlockId,
+    CoordinateFrameId,
     DataBlock,
     DatasetRevision,
     DatasetSchema,
@@ -34,6 +35,7 @@ from zlc_data import (
     StreamGenerationId,
     VALID,
     ValidityContract,
+    Value,
     ValueSchema,
     suggest_fit_draft,
 )
@@ -52,8 +54,32 @@ from zlc_frontend.figure import (
     fit_single_panel_presentation,
     suggest_view,
 )
+from zlc_neutral_atom.catalog import DefinitionKey
+from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
+from zlc_neutral_atom.devices.sequencer.port import (
+    PulseTerminalAck,
+    pulse_terminal_ack_to_tree,
+)
+from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import (
+    PulseScanBoundRequest,
+    ScanSignalBinding,
+)
 from zlc_neutral_atom.logic_nodes.readout.calibration.sitemap import load_sitemap_pulse
+from zlc_neutral_atom.runtime.signal_source import (
+    SignalAssociationEvidence,
+    SignalAssociationRequest,
+    SignalAssociationScheduleRequirement,
+    SignalEvent,
+)
+from zlc_neutral_atom.runtime.streams import (
+    EventRef,
+    StreamId,
+    TraceContext,
+    event_id_for_sequence,
+)
+from zlc_neutral_atom.timing.pulse_parameter_scan import AutonomousScanSlotProgram
 from zlc_pulse import FrozenScanTable, RepeatRegion, ScanParameter
+from zlc_storage import canonical_digest, encode
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -205,27 +231,12 @@ def _until(application, predicate, *, timeout: float = 45.0) -> None:
     assert predicate()
 
 
-def _two_point_image_scan_document():
+def _two_point_scan_document():
     document = load_sitemap_pulse()
-    camera_port = next(
-        port for port in document.target.ports if port.label == "emCCD"
-    )
-    trigger_index = document.target.raw_lanes.index(camera_port.lanes[0])
-    segment = -1
-    previous = 0
-    periods = []
-    for period in document.periods:
-        states = list(period.states)
-        current = int(states[trigger_index])
-        if current and not previous:
-            segment += 1
-        states[trigger_index] = int(bool(current and segment == 1))
-        periods.append(replace(period, states=tuple(states)))
-        previous = current
     scanned_api = document.api_parameters[0]
     scanned_period = next(
         period
-        for period in periods
+        for period in document.periods
         if period.period_id == scanned_api.field.period_id
     )
     scan_parameter = ScanParameter(
@@ -239,7 +250,6 @@ def _two_point_image_scan_document():
     return replace(
         document,
         name="fit-single-panel-scan",
-        periods=tuple(periods),
         api_parameters=tuple(
             parameter
             for parameter in document.api_parameters
@@ -251,18 +261,193 @@ def _two_point_image_scan_document():
             ((start,), (start + step,)),
         ),
         repeat=RepeatRegion(
-            periods[0].period_id,
-            periods[-1].period_id,
+            document.periods[0].period_id,
+            document.periods[-1].period_id,
             2,
         ),
     )
 
 
-def _fixed_api_values(document):
-    return {
-        parameter.parameter_id: document.field_value(parameter.field)[0]
-        for parameter in document.api_parameters
-    }
+_SYNTHETIC_IMAGE_OUTPUT = DatasetOutputDeclaration(
+    "image",
+    "tests.synthetic-associated-image",
+)
+_SYNTHETIC_IMAGE_DEFINITION = DefinitionKey(
+    "tests",
+    "synthetic-associated-image",
+)
+_SYNTHETIC_IMAGE_FRAME = CoordinateFrameId("synthetic-image-pixels")
+_SYNTHETIC_IMAGE_SCHEMA = ValueSchema(
+    (
+        AxisSpec(
+            AxisId("synthetic-y"),
+            "synthetic y",
+            SPATIAL_Y,
+            3,
+            (0.0, 1.0, 2.0),
+            "pixel",
+            _SYNTHETIC_IMAGE_FRAME,
+        ),
+        AxisSpec(
+            AxisId("synthetic-x"),
+            "synthetic x",
+            SPATIAL_X,
+            5,
+            (0.0, 1.0, 2.0, 3.0, 4.0),
+            "pixel",
+            _SYNTHETIC_IMAGE_FRAME,
+        ),
+    ),
+    ValidityContract.value(),
+    np.dtype("<f8"),
+    "count",
+)
+_SYNTHETIC_ASSOCIATION_SCHEMA = "tests.synthetic-signal-association"
+
+
+class _SyntheticAssociatedImageCursor:
+    """Test producer proving one exact group without naming a device domain."""
+
+    def __init__(self, values: tuple[Value, ...]) -> None:
+        self._values = values
+        self._stream_id = StreamId("synthetic-image-stream")
+        self._generation = StreamGenerationId("synthetic-image-generation")
+        self._request: SignalAssociationRequest | None = None
+        self._terminal_digest: str | None = None
+        self._delivered = 0
+        self._closed = False
+
+    @property
+    def value_schema(self) -> ValueSchema:
+        return _SYNTHETIC_IMAGE_SCHEMA
+
+    @property
+    def stream_id(self) -> StreamId:
+        return self._stream_id
+
+    @property
+    def stream_generation(self) -> StreamGenerationId:
+        return self._generation
+
+    @property
+    def start_sequence(self) -> int:
+        return 0
+
+    def arm_signal_association(self, request: SignalAssociationRequest) -> object:
+        assert not self._closed
+        assert self._request is None
+        assert request.expected_event_count == len(self._values)
+        self._request = request
+        return request
+
+    def bind_signal_association(
+        self,
+        token: object,
+        terminal_evidence: object,
+    ) -> None:
+        assert token is self._request
+        assert isinstance(terminal_evidence, PulseTerminalAck)
+        assert terminal_evidence.session_id == self._request.cause_id
+        assert terminal_evidence.artifact_digest == self._request.cause_digest
+        self._terminal_digest = canonical_digest(
+            pulse_terminal_ack_to_tree(terminal_evidence)
+        )
+
+    def next_associated_signal(
+        self,
+        token: object,
+        timeout: float | None = None,
+    ) -> SignalEvent:
+        del timeout
+        assert token is self._request
+        assert self._terminal_digest is not None
+        sequence = self._delivered
+        value = self._values[sequence]
+        self._delivered += 1
+        reference = EventRef(
+            self._stream_id,
+            self._generation,
+            sequence,
+            event_id_for_sequence(self._stream_id, self._generation, sequence),
+            canonical_digest({"synthetic_image_sequence": sequence}),
+        )
+        return SignalEvent(
+            value,
+            reference,
+            TraceContext(
+                "synthetic-image-producer-run",
+                "synthetic-image-source",
+                f"synthetic-image:{sequence}",
+            ),
+            float(sequence),
+        )
+
+    def finish_signal_association(self, token: object) -> SignalAssociationEvidence:
+        assert token is self._request
+        assert self._request is not None
+        assert self._terminal_digest is not None
+        assert self._delivered == len(self._values)
+        request = self._request
+        return SignalAssociationEvidence(
+            request,
+            self._terminal_digest,
+            _SYNTHETIC_ASSOCIATION_SCHEMA,
+            encode(
+                {
+                    "schema": _SYNTHETIC_ASSOCIATION_SCHEMA,
+                    "association_id": request.association_id,
+                    "cause_id": request.cause_id,
+                    "cause_digest": request.cause_digest,
+                    "expected_event_count": request.expected_event_count,
+                    "terminal_evidence_digest": self._terminal_digest,
+                    "producer": "synthetic-associated-image",
+                }
+            ),
+        )
+
+    def close(self) -> None:
+        self._closed = True
+
+
+class _SyntheticAssociatedImageSource:
+    def __init__(self, values: tuple[Value, ...]) -> None:
+        self._values = values
+
+    def value_schema(self, output_name: str) -> ValueSchema:
+        assert output_name == _SYNTHETIC_IMAGE_OUTPUT.name
+        return _SYNTHETIC_IMAGE_SCHEMA
+
+    def open_signal_cursor(self, output_name: str):
+        return self.open_associated_signal_cursor(output_name)
+
+    def open_associated_signal_cursor(self, output_name: str):
+        assert output_name == _SYNTHETIC_IMAGE_OUTPUT.name
+        return _SyntheticAssociatedImageCursor(self._values)
+
+    def signal_association_schedule_requirement(
+        self,
+        output_name: str,
+    ) -> SignalAssociationScheduleRequirement:
+        assert output_name == _SYNTHETIC_IMAGE_OUTPUT.name
+        return SignalAssociationScheduleRequirement()
+
+
+def _synthetic_image_source(count: int) -> _SyntheticAssociatedImageSource:
+    y, x = np.mgrid[-1.0:1.0:3j, -1.0:1.0:5j]
+    values = tuple(
+        Value(
+            np.asarray(
+                5.0
+                + (20.0 + index)
+                * np.exp(-((x - 0.1) ** 2 + (y + 0.1) ** 2) / 0.6),
+                dtype=np.dtype("<f8"),
+            ),
+            VALID,
+            _SYNTHETIC_IMAGE_SCHEMA,
+        )
+        for index in range(count)
+    )
+    return _SyntheticAssociatedImageSource(values)
 
 
 def test_direct_capture_fit_entry_is_typed_and_keeps_every_batch_axis(
@@ -320,12 +505,31 @@ def test_direct_scan_fit_entry_is_typed_and_repeat_remains_authoritative_batch(
     application,
     experiment,
 ) -> None:
-    document = _two_point_image_scan_document()
-    reference = experiment.readout.scan(
+    document = _two_point_scan_document()
+    program = AutonomousScanSlotProgram(
         document,
-        api_values=_fixed_api_values(document),
-        timeout_seconds=20.0,
+        tuple(
+            (
+                parameter.parameter_id,
+                document.field_value(parameter.field)[0],
+            )
+            for parameter in document.api_parameters
+        ),
     )
+    request = PulseScanBoundRequest(
+        program,
+        ScanSignalBinding(
+            _SYNTHETIC_IMAGE_DEFINITION,
+            _SYNTHETIC_IMAGE_OUTPUT,
+        ),
+    )
+    source = _synthetic_image_source(
+        program.repeat_count * program.point_table.point_layout.storage_size
+    )
+    reference = experiment.readout.prepare_scan_source(
+        request,
+        source,
+    ).start().result(20.0)
     window = experiment.fit_gui(
         reference,
         model="radial_gaussian_center",

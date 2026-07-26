@@ -1337,9 +1337,26 @@ def classify_occupancy(model: ReadoutModel, signals: Value) -> Value:
     )
 
 
-def _apply_readout_model(model: ReadoutModel, frame: Value) -> ReadoutResult:
-    """Apply an already-bound model; physical compatibility is caller-owned."""
+def apply_readout_model(
+    model: ReadoutModel,
+    frame: Value,
+    *,
+    expected_frame_schema: ValueSchema,
+) -> ReadoutResult:
+    """Apply an already-bound calibration model to one compatible frame.
 
+    This is the public, side-effect-free evaluator shared by every readout
+    consumer.  Calibration owns the fitted model value; Occupancy and other
+    processors reuse this evaluator instead of importing a private fitting
+    implementation or reproducing feature extraction.
+    """
+
+    if not isinstance(expected_frame_schema, ValueSchema):
+        raise TypeError("expected_frame_schema must be ValueSchema")
+    if not isinstance(frame, Value):
+        raise TypeError("frame must be Value")
+    if frame.schema != expected_frame_schema:
+        raise ValueError("frame schema differs from the bound readout schema")
     extracted = extract_readout_features(model.feature, frame)
     occupied = classify_occupancy(model, extracted)
     assert isinstance(occupied.validity, ComponentValidity)
@@ -1347,30 +1364,6 @@ def _apply_readout_model(model: ReadoutModel, frame: Value) -> ReadoutResult:
     values[~occupied.validity.mask] = 0.0
     signals = Value(values, occupied.validity, extracted.schema)
     return ReadoutResult(signals, occupied)
-
-
-def apply_calibration(
-    artifact: CalibrationArtifact,
-    frame: Value,
-    *,
-    model_kind: ReadoutModelKind | None = None,
-) -> ReadoutResult:
-    """Apply the numeric model to a caller-provided frame value.
-
-    This raw-``Value`` API is deliberately non-authoritative: a ``ValueSchema``
-    cannot prove exposure, ROI origin, optical path, camera identity, or pulse
-    conditions.  Capture-backed pipelines establish those facts from the
-    admitted current capture and compiled pulse lineage before using the
-    internal hot path.  This function only prevents structural schema drift.
-    """
-
-    if not isinstance(artifact, CalibrationArtifact):
-        raise TypeError("artifact must be CalibrationArtifact")
-    if not isinstance(frame, Value):
-        raise TypeError("frame must be Value")
-    if frame.schema != artifact.frame_contract.frame_schema:
-        raise ValueError("frame schema differs from the calibration FrameContract")
-    return _apply_readout_model(artifact.select_model(model_kind), frame)
 
 
 __all__ = [
@@ -1403,7 +1396,7 @@ __all__ = [
     "SiteMap",
     "ThresholdMethod",
     "UniformPsfFeature",
-    "apply_calibration",
+    "apply_readout_model",
     "build_calibration_analysis_request_from_authoring",
     "calibration_analysis_authoring_schema",
     "classify_occupancy",

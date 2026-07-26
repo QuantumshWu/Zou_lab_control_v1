@@ -26,7 +26,7 @@ from zlc_data import (  # noqa: E402
     AxisId,
     AxisSpec,
     BlockId,
-    ComponentValidity,
+    DatasetComponentValidity,
     CoordinateFrameId,
     DataBlock,
     DatasetRevision,
@@ -160,7 +160,7 @@ def _image_figure(
         BlockId("u03c-image-block"),
         DatasetRevision(4),
         values,
-        ComponentValidity((y_axis.axis_id, x_axis.axis_id), valid),
+        DatasetComponentValidity((y_axis.axis_id, x_axis.axis_id), valid),
         schema,
     )
     snapshot = OwnedSnapshot(
@@ -449,19 +449,19 @@ def test_image_rerender_cas_rejects_a_new_exact_data_object(
 
 
 def test_initial_image_front_cannot_self_attest_a_conflicting_viewport() -> None:
-    import zlc_workbench.data_figure.render_lane as figure_module
+    import zlc_frontend.data_figure_render as figure_module
     from zlc_workbench.data_figure.window import DataFigureWindow
     from zlc_frontend.image_view import ImageViewportTransform
 
     figure = _image_figure()
-    front = figure_module._render_typed_front(
+    front = figure_module.render_data_figure_front(
         figure,
         ImageDisplayState(),
         current_value_limits=None,
         previous_relim_mode=None,
         previous_count_scale=None,
         sequence=0,
-        cancelled=threading.Event(),
+        check_cancelled=lambda: None,
     )
     panel = front.frame.panels[0]
     payload = panel.display_payload

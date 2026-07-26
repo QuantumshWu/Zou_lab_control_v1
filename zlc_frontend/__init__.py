@@ -3,6 +3,7 @@
 from .authority import describe_authoritative_transform
 from .data_figure import (
     DataFigure,
+    FacetedOverviewArtifact,
     FigurePanelRegion,
 )
 from .frozen_figure import (
@@ -14,8 +15,9 @@ from .figure_archive import (
     FIGURE_ARCHIVE_SCHEMA,
     FigureArchive,
     FigureDisplayState,
-    decode_figure_archive,
-    encode_figure_archive,
+    FigurePresentationContract,
+    decode_figure_archive_payload,
+    encode_figure_archive_payload,
 )
 from .curve_display import (
     CurveDisplayState,
@@ -57,6 +59,12 @@ from .fit_grid import (
 )
 from .fit_image_projection import (
     RadialGaussianImageFitPanel,
+)
+from .flow_graph import (
+    FlowGraph,
+    FlowGraphEdge,
+    FlowGraphNode,
+    flow_graph_from_tree,
 )
 from .image_display import (
     ImageColormap,
@@ -108,7 +116,6 @@ from .fit_editor import (
 )
 from .render import (
     BoardFrame,
-    BoardPresenter,
     CoherenceStamp,
     CurveFitOverlay,
     CurvePanelPayload,
@@ -123,7 +130,6 @@ from .render import (
     PulsePanelPayload,
     RadialGaussianImageFitOverlay,
     RasterBuffer,
-    RenderSurface,
     SourceIdentity,
 )
 from .figure import (
@@ -141,6 +147,7 @@ from .figure import (
     EvaluatedImage,
     EvaluatedInput,
     EvaluatedMeter,
+    EvaluatedProjectionIdentity,
     FigureDocument,
     FigureEvaluationCancelled,
     FigureEvaluationDeadlineExceeded,
@@ -180,8 +187,10 @@ from .figure_outputs import (
     FigureAreaCommit,
     FigureCrossCommit,
     FigureDerivedSignal,
-    FigureOutputSource,
-    FitParameterMetadata,
+    FigureOutputPresentation,
+    FigureOutputFront,
+    FigureOutputRequest,
+    FigureOutputSession,
     HistogramValueRangeSelection,
     SelectorAxisMetadata,
     area_range_output_name,
@@ -190,8 +199,24 @@ from .figure_outputs import (
     materialize_fit_outputs,
     source_identity_matches_snapshot,
 )
+from .figure_source import FigureSource
+from .panel_render import PanelProvenance
 from .panel_size import PANEL_SIZES, panel_size_cells
 from .plot_kind import PLOT_KIND_SPECS, PLOT_KIND_SPEC_BY_KEY, PlotKindSpec
+from .plot_panel import (
+    PlotDisplayState,
+    PlotPanelComposeRequest,
+    PlotPanelComposeResult,
+    PlotPanelContract,
+    PlotPanelSession,
+    plot_panel_display_state,
+)
+from .plot_report import (
+    PlotReportDocument,
+    PlotReportPage,
+    plot_report_page,
+    render_plot_report,
+)
 from .shape_text import describe_dataset_shape, indexed_unique_name
 from .panel_policy import (
     FIXED_HI_PARAM,
@@ -202,6 +227,7 @@ from .panel_policy import (
     RELIM_PARAM,
     VIEW_SPEC_PARAM,
     automatic_panel_kind,
+    automatic_figure_view,
     grid_view_intents,
     panel_view_intents,
     repeat_mode_label,
@@ -214,7 +240,6 @@ __all__ = [
     "AxisViewBinding",
     "AxisViewRole",
     "BoardFrame",
-    "BoardPresenter",
     "coordinate_label",
     "CoherenceStamp",
     "CrossGesture",
@@ -245,11 +270,17 @@ __all__ = [
     "EvaluatedImage",
     "EvaluatedInput",
     "EvaluatedMeter",
+    "EvaluatedProjectionIdentity",
+    "FacetedOverviewArtifact",
     "FigureDocument",
     "FigureAreaCommit",
     "FigureCrossCommit",
     "FigureDerivedSignal",
-    "FigureOutputSource",
+    "FigureOutputPresentation",
+    "FigureOutputFront",
+    "FigureOutputRequest",
+    "FigureOutputSession",
+    "FigureSource",
     "FIXED_HI_PARAM",
     "FIXED_LO_PARAM",
     "FigureEvaluationCancelled",
@@ -259,8 +290,8 @@ __all__ = [
     "FigureLayer",
     "FigurePanelRegion",
     "FigureDisplayState",
+    "FigurePresentationContract",
     "FitAuthoringOption",
-    "FitParameterMetadata",
     "FIT_OUTPUT_PREFIX",
     "FigureSelection",
     "FixedIndex",
@@ -268,6 +299,9 @@ __all__ = [
     "FormFieldKind",
     "FormFieldProps",
     "FormSpec",
+    "FlowGraph",
+    "FlowGraphEdge",
+    "FlowGraphNode",
     "FrozenFigureSource",
     "FitGridCellSummary",
     "FitGridModel",
@@ -310,10 +344,17 @@ __all__ = [
     "PLOT_KIND_SPEC_BY_KEY",
     "PanelInteractionOrigin",
     "PanelPresentationIdentity",
+    "PanelProvenance",
     "PlotKindSpec",
+    "PlotDisplayState",
+    "PlotPanelComposeRequest",
+    "PlotPanelComposeResult",
+    "PlotPanelContract",
+    "PlotPanelSession",
+    "PlotReportDocument",
+    "PlotReportPage",
     "PulsePanelPayload",
     "RasterBuffer",
-    "RenderSurface",
     "RectangleGesture",
     "RELIM_MODES",
     "RELIM_PARAM",
@@ -331,6 +372,7 @@ __all__ = [
     "ViewSuggestion",
     "VIEW_SPEC_PARAM",
     "automatic_panel_kind",
+    "automatic_figure_view",
     "build_frozen_data_figure",
     "build_frozen_figure_document",
     "contract_for",
@@ -339,6 +381,7 @@ __all__ = [
     "describe_dataset_shape",
     "display_axis_indices",
     "fit_single_panel_presentation",
+    "flow_graph_from_tree",
     "decode_figure_document",
     "decode_view_spec",
     "encode_figure_document",
@@ -363,7 +406,7 @@ __all__ = [
     "image_display_from_form",
     "image_viewport_for_display_state",
     "indexed_unique_name",
-    "decode_figure_archive",
+    "decode_figure_archive_payload",
     "materialize_area_outputs",
     "materialize_cross_outputs",
     "materialize_fit_outputs",
@@ -384,8 +427,11 @@ __all__ = [
     "parse_number_text",
     "panel_size_cells",
     "panel_view_intents",
+    "plot_panel_display_state",
+    "plot_report_page",
+    "render_plot_report",
     "repeat_mode_label",
     "selection_fit_view_projection",
-    "encode_figure_archive",
+    "encode_figure_archive_payload",
     "source_identity_matches_snapshot",
 ]

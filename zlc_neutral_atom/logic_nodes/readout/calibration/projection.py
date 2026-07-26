@@ -8,13 +8,13 @@ reconstruct calibration arrays, infer axes, or repeat report mathematics.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from zlc_data import (
     COMPONENT,
     REPEAT,
-    SCAN_POINT,
     SITE,
     SPATIAL_X,
     SPATIAL_Y,
@@ -22,9 +22,9 @@ from zlc_data import (
     AxisSpec,
     BlockId,
     CellValidity,
-    ComponentValidity,
     CoordinateFrameId,
     DataBlock,
+    DatasetComponentValidity,
     DatasetRevision,
     DatasetSchema,
     OwnedSnapshot,
@@ -40,12 +40,9 @@ from zlc_neutral_atom.dataset_output import (
     FinalDatasetOutput,
     final_dataset_join_digest,
 )
+from zlc_neutral_atom.artifact_output import ArtifactOutputDeclaration
 from zlc_storage import canonical_digest, canonical_text
 
-from .analysis import (
-    CalibrationComputation,
-    calibration_runtime_threshold_sources,
-)
 from .calibration import (
     PerSitePsfFeature,
     UniformPsfFeature,
@@ -57,8 +54,12 @@ from .reference import (
     calibration_artifact_ref_to_tree,
 )
 
+if TYPE_CHECKING:
+    from .analysis import CalibrationComputation
+
 __all__ = [
     "CALIBRATION_FINAL_OUTPUT_DECLARATIONS",
+    "CALIBRATION_ARTIFACT_OUTPUT_DECLARATION",
     "CALIBRATION_DIAGNOSTIC_OUTPUT_DECLARATIONS",
     "CalibrationModelReportProjection",
     "CalibrationReportProjection",
@@ -89,8 +90,15 @@ CALIBRATION_DIAGNOSTIC_OUTPUT_DECLARATIONS = (
         "global_fidelity", "zlc_neutral_atom.calibration.global-fidelity"
     ),
 )
+CALIBRATION_ARTIFACT_OUTPUT_DECLARATION = ArtifactOutputDeclaration(
+    "calibration",
+    CALIBRATION_ARTIFACT_REF_FORMAT,
+)
 CALIBRATION_FINAL_OUTPUT_DECLARATIONS = (
-    DatasetOutputDeclaration("calibration", CALIBRATION_ARTIFACT_REF_FORMAT),
+    DatasetOutputDeclaration(
+        "site_map",
+        "zlc_neutral_atom.calibration.site-map",
+    ),
     *CALIBRATION_DIAGNOSTIC_OUTPUT_DECLARATIONS,
 )
 
@@ -217,6 +225,8 @@ def project_calibration_report(
     reference: CalibrationArtifactRef,
 ) -> CalibrationReportProjection:
     """Project an admitted artifact/report pair without presentation inference."""
+
+    from .analysis import calibration_runtime_threshold_sources
 
     _require_inputs(computation, reference)
     artifact = computation.artifact
@@ -437,6 +447,8 @@ def _require_inputs(
     computation: CalibrationComputation,
     reference: CalibrationArtifactRef,
 ) -> None:
+    from .analysis import CalibrationComputation
+
     if not isinstance(computation, CalibrationComputation):
         raise TypeError("computation must be CalibrationComputation")
     if not isinstance(reference, CalibrationArtifactRef):
@@ -479,37 +491,6 @@ def _report_repeat_axis(key: str, size: int) -> AxisSpec:
         size,
         tuple(range(size)),
     )
-
-
-def _report_grid_axes(
-    view: CalibrationReportProjection,
-    key: str,
-) -> tuple[AxisSpec, AxisSpec, PointLayout]:
-    rows, columns = view.grid_shape_yx
-    row_axis = AxisSpec(
-        AxisId(f"calibration-report.{key}.site-row"),
-        "site row",
-        # A report grid is a declared two-dimensional point layout.  SITE
-        # remains one-dimensional in calibration authority and is never
-        # reshaped into a trailing data axis.
-        SCAN_POINT,
-        rows,
-        tuple(range(rows)),
-    )
-    column_axis = AxisSpec(
-        AxisId(f"calibration-report.{key}.site-column"),
-        "site column",
-        SCAN_POINT,
-        columns,
-        tuple(range(columns)),
-    )
-    layout = PointLayout.explicit(
-        (rows, columns),
-        tuple(view.site_grid_positions_yx),
-    )
-    if layout.storage_size != len(view.site_labels):
-        raise ValueError("calibration site grid does not cover every SITE value")
-    return row_axis, column_axis, layout
 
 
 def _report_population_axis(key: str) -> AxisSpec:
@@ -581,7 +562,7 @@ def materialize_calibration_report_datasets(
         "reference",
         reference_schema,
         np.asarray(view.reference_average, dtype="<f8"),
-        ComponentValidity(
+        DatasetComponentValidity(
             tuple(axis.axis_id for axis in frame_axes),
             np.asarray(view.reference_average_validity, dtype=np.bool_).reshape(
                 reference_schema.physical_shape
@@ -596,6 +577,10 @@ def materialize_calibration_report_datasets(
         len(view.models),
         tuple(model.label for model in view.models),
     )
+    # The calibration SITE coordinate may be a human label.  The interactive
+    # curve contract needs a numeric, monotonic x coordinate, so this report
+    # projection declares the positional index explicitly instead of changing
+    # or guessing the authoritative SiteMap coordinate vocabulary.
     site_index_axis = AxisSpec(
         AxisId("calibration-report.fidelity.site-index"),
         "canonical site index",
@@ -631,7 +616,7 @@ def materialize_calibration_report_datasets(
         "fidelity",
         fidelity_schema,
         fidelity_values.reshape(fidelity_schema.physical_shape),
-        ComponentValidity(
+        DatasetComponentValidity(
             (model_axis.axis_id,),
             fidelity_validity.reshape(fidelity_schema.physical_shape),
         ),
@@ -639,7 +624,6 @@ def materialize_calibration_report_datasets(
 
     for model in view.models:
         histogram_key = f"hist-{model.label}"
-        row_axis, column_axis, layout = _report_grid_axes(view, histogram_key)
         population_axis = _report_population_axis(histogram_key)
         histogram_values, histogram_validity = _report_population_values(
             view,
@@ -648,8 +632,8 @@ def materialize_calibration_report_datasets(
         )
         histogram_schema = DatasetSchema(
             _report_repeat_axis(histogram_key, view.group_count),
-            (row_axis, column_axis),
-            layout,
+            (view.site_axis,),
+            PointLayout.rect_c((view.site_axis.size,)),
             ValueSchema(
                 (population_axis,),
                 ValidityContract.components(population_axis.axis_id),
@@ -662,7 +646,7 @@ def materialize_calibration_report_datasets(
             histogram_key,
             histogram_schema,
             histogram_values,
-            ComponentValidity(
+            DatasetComponentValidity(
                 (population_axis.axis_id,),
                 histogram_validity.reshape(histogram_schema.physical_shape),
             ),
@@ -692,7 +676,7 @@ def materialize_calibration_report_datasets(
             pooled_key,
             pooled_schema,
             pooled_values.reshape(sample_count, 1, 2),
-            ComponentValidity(
+            DatasetComponentValidity(
                 (pooled_population_axis.axis_id,),
                 pooled_validity.reshape(sample_count, 1, 2),
             ),
@@ -703,7 +687,6 @@ def materialize_calibration_report_datasets(
         if kernels.ndim != 3 or kernels.shape[0] != len(view.site_labels):
             raise ValueError("PSF report kernels must have shape (site, y, x)")
         key = "psf-kernels"
-        row_axis, column_axis, layout = _report_grid_axes(view, key)
         psf_frame = CoordinateFrameId(
             f"calibration-psf-{canonical_digest({'calibration': view.calibration_identity})}"
         )
@@ -727,8 +710,8 @@ def materialize_calibration_report_datasets(
         )
         psf_schema = DatasetSchema(
             _report_repeat_axis(key, 1),
-            (row_axis, column_axis),
-            layout,
+            (view.site_axis,),
+            PointLayout.rect_c((view.site_axis.size,)),
             ValueSchema(
                 (y_axis, x_axis),
                 ValidityContract.components(y_axis.axis_id, x_axis.axis_id),
@@ -745,7 +728,7 @@ def materialize_calibration_report_datasets(
             key,
             psf_schema,
             kernels.reshape(psf_schema.physical_shape),
-            ComponentValidity(
+            DatasetComponentValidity(
                 (y_axis.axis_id, x_axis.axis_id),
                 pixel_validity.reshape(psf_schema.physical_shape),
             ),
@@ -792,7 +775,7 @@ def materialize_calibration_reference_snapshot(
         np.asarray(report.reference_average, dtype="<f8").reshape(
             schema.physical_shape
         ),
-        ComponentValidity(
+        DatasetComponentValidity(
             tuple(axis.axis_id for axis in axes),
             np.asarray(
                 report.reference_average_validity,
@@ -860,7 +843,7 @@ def _diagnostic_snapshot(
                 f"{output_name} validity has shape {mask.shape}, "
                 f"expected {mask_shape}"
             )
-        validity = ComponentValidity(
+        validity = DatasetComponentValidity(
             axis_ids,
             mask.reshape((1, 1, *mask_shape)),
         )
@@ -997,8 +980,10 @@ def calibration_final_outputs(
 ) -> dict[str, FinalDatasetOutput]:
     """Publish the exact declared outputs of one admitted calibration.
 
-    Numeric diagnostics are ordinary FINAL Datasets.  The ``calibration``
-    SiteMap geometry is available separately through
+    Numeric diagnostics and the reference-average SiteMap carrier are ordinary
+    FINAL Datasets.  The ``calibration`` Artifact output is declared separately
+    and resolves to the Run's exact ``CalibrationArtifactRef``; it is never
+    disguised as image data.  SiteMap geometry is available through
     :func:`calibration_site_map_context`; numeric outputs never carry an open
     metadata bag.
     """

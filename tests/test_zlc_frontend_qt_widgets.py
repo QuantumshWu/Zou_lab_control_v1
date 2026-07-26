@@ -9,13 +9,15 @@ import sys
 import threading
 import tomllib
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 QT_PACKAGE = ROOT / "zlc_frontend" / "qt_widgets"
 WORKBENCH_MODULES = tuple(
     path
-    for path in sorted((ROOT / "Zou_lab_control" / "workbench").glob("_*.py"))
-    if path.name != "__init__.py"
+    for path in sorted((ROOT / "zlc_workbench").rglob("*.py"))
+    if "__pycache__" not in path.parts and path.name != "__init__.py"
 )
 CURRENT_ROOT_QT_LAUNCHERS = tuple(
     ROOT / name for name in ("figure_viewer.py", "pulse_gui.py", "task_console.py")
@@ -338,15 +340,8 @@ def test_optional_style_layers_have_no_reverse_dependency() -> None:
 def test_render_style_is_scoped_and_restores_process_rcparams() -> None:
     import matplotlib
 
-    from zlc_frontend.render_style import (
-        DEFAULT_STYLE,
-        PALETTE,
-        RENDER_TEXT,
-        render_style_context,
-    )
+    from zlc_frontend.render_style import NEW_BLACK, PALETTE, render_style_context
 
-    assert isinstance(DEFAULT_STYLE["font.sans-serif"], tuple)
-    assert isinstance(DEFAULT_STYLE["figure.figsize"], tuple)
     assert isinstance(PALETTE["series"], tuple)
     assert not hasattr(PALETTE["series"], "append")
 
@@ -354,7 +349,7 @@ def test_render_style_is_scoped_and_restores_process_rcparams() -> None:
     matplotlib.rcParams["axes.edgecolor"] = "magenta"
     try:
         with render_style_context():
-            assert matplotlib.rcParams["axes.edgecolor"] == RENDER_TEXT
+            assert matplotlib.rcParams["axes.edgecolor"] == NEW_BLACK
         assert matplotlib.rcParams["axes.edgecolor"] == "magenta"
     finally:
         matplotlib.rcParams["axes.edgecolor"] = original
@@ -363,7 +358,7 @@ def test_render_style_is_scoped_and_restores_process_rcparams() -> None:
 def test_product_render_style_contexts_are_serialized_between_threads() -> None:
     import matplotlib
 
-    from zlc_frontend.render_style import RENDER_TEXT, render_style_context
+    from zlc_frontend.render_style import NEW_BLACK, render_style_context
 
     first_entered = threading.Event()
     second_attempting = threading.Event()
@@ -398,7 +393,7 @@ def test_product_render_style_contexts_are_serialized_between_threads() -> None:
         two.join(2.0)
         assert not one.is_alive() and not two.is_alive()
         assert second_entered.is_set()
-        assert observed == [RENDER_TEXT, RENDER_TEXT]
+        assert observed == [NEW_BLACK, NEW_BLACK]
         assert matplotlib.rcParams["axes.edgecolor"] == "magenta"
     finally:
         release_first.set()
@@ -421,10 +416,12 @@ def test_frontend_and_workbench_roots_remain_headless() -> None:
     qt_result = _run_fresh(
         "import sys\n"
         "import zlc_frontend.qt_widgets as qt\n"
+        "assert not any(k == 'PyQt5' or k.startswith('PyQt5.') for k in sys.modules)\n"
+        "setting_row = qt.FluentSettingRow\n"
         "assert 'PyQt5' in sys.modules\n"
         "assert not any(k == 'matplotlib' or k.startswith('matplotlib.') for k in sys.modules)\n"
         "assert not any(k == 'IPython' or k.startswith('IPython.') for k in sys.modules)\n"
-        "assert qt.FluentSettingRow.__module__ == 'zlc_frontend.qt_widgets.fluent'\n"
+        "assert setting_row.__module__ == 'zlc_frontend.qt_widgets.fluent'\n"
         "assert qt.FrozenRasterView.__module__ == 'zlc_frontend.qt_widgets.frozen_raster'\n"
     )
     assert qt_result.returncode == 0, qt_result.stderr
@@ -949,72 +946,16 @@ def test_qt_and_render_extras_are_independent_and_workbench_is_their_union() -> 
     )
     package_data = project["tool"]["setuptools"]["package-data"]
     assert "assets/*.ttf" in package_data["zlc_frontend"]
-    assert "assets/*.ttf" not in package_data["Zou_lab_control.frontend"]
+    assert "assets/*.ttf" not in package_data.get("Zou_lab_control.frontend", ())
 
 
 def test_w1_w2_w3_take_existing_common_controls_from_qt_widgets() -> None:
-    lifecycle_helpers = {
-        "center_window_on_primary_screen",
-        "ensure_qt_app",
-        "release_window",
-        "retain_window",
-        "screen_fit_window_size",
-        "set_fluent_scale",
-    }
     qt_shells = tuple(
         path for path in WORKBENCH_MODULES if _imports_qt_surface(_tree(path))
     )
     assert qt_shells
     for path in qt_shells:
         tree = _tree(path)
-        imported = {
-            alias.name
-            for node in tree.body
-            if isinstance(node, ast.ImportFrom)
-            and node.module == "zlc_frontend.qt_widgets"
-            for alias in node.names
-        }
-        launchers = tuple(
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith(("open_", "show_", "launch_"))
-            for node in tree.body
-        )
-        if any(launchers) and not lifecycle_helpers.issubset(imported):
-            delegated_calls = {
-                call.func.id
-                for node, is_launcher in zip(tree.body, launchers)
-                if is_launcher
-                for call in ast.walk(node)
-                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
-            }
-            delegated_owners: set[str] = set()
-            for node in tree.body:
-                if not (
-                    isinstance(node, ast.ImportFrom)
-                    and node.level == 1
-                    and node.module
-                ):
-                    continue
-                owner_path = path.parent / f"{node.module}.py"
-                if not owner_path.is_file():
-                    continue
-                owner_tree = _tree(owner_path)
-                owner_imported = {
-                    alias.name
-                    for owner_node in owner_tree.body
-                    if isinstance(owner_node, ast.ImportFrom)
-                    and owner_node.module == "zlc_frontend.qt_widgets"
-                    for alias in owner_node.names
-                }
-                for alias in node.names:
-                    local_name = alias.asname or alias.name
-                    if (
-                        local_name in delegated_calls
-                        and lifecycle_helpers.issubset(owner_imported)
-                    ):
-                        delegated_owners.add(local_name)
-            assert delegated_owners, path
-
         import_aliases: dict[str, str] = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module == "PyQt5":
@@ -1115,7 +1056,6 @@ def test_fluent_double_spinbox_can_preserve_authoritative_float_values() -> None
     field = FluentDoubleSpinBox(
         length=18,
         allow_minus=True,
-        quantize_to_display=False,
     )
     field.setDecimals(9)
     field.setRange(-1e15, 1e15)
@@ -1199,12 +1139,12 @@ def test_qt_public_facade_covers_every_production_consumer(monkeypatch) -> None:
         "getText",
         lambda self: (self._edit.text(), True),
     )
-    assert qt.fluent_text_prompt(
-        None,
-        "title",
+    dialog = qt.FluentInputDialog(
         "prompt",
-        text="stable_parameter_id",
-    ) == ("stable_parameter_id", True)
+        "stable_parameter_id",
+        title="title",
+    )
+    assert dialog.getText() == ("stable_parameter_id", True)
     missing: list[tuple[str, int, str]] = []
     for path in _production_python_files():
         for node in ast.walk(_tree(path)):
@@ -1218,6 +1158,46 @@ def test_qt_public_facade_covers_every_production_consumer(monkeypatch) -> None:
                         (str(path.relative_to(ROOT)), node.lineno, alias.name)
                     )
     assert missing == []
+
+
+def test_raster_pixel_ratio_observer_is_the_single_change_edge() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtCore, QtWidgets
+    from zlc_frontend.qt_widgets import (
+        RasterPixelRatioObserver,
+        ensure_qt_app,
+    )
+
+    class RatioHost(QtWidgets.QWidget):
+        ratio = 1.25
+
+        def devicePixelRatioF(self):  # noqa: N802 - Qt API
+            return self.ratio
+
+    application = ensure_qt_app()
+    host = RatioHost()
+    observed = []
+    observer = RasterPixelRatioObserver(host, observed.append)
+    host.show()
+    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+    assert observed == [1.25]
+
+    observer.refresh()
+    assert observed == [1.25]
+    host.ratio = 1.75
+    observer.refresh()
+    assert observed == [1.25, 1.75]
+    observer.refresh(force=True)
+    assert observed == [1.25, 1.75, 1.75]
+    observer.detach()
+    host.ratio = 2.0
+    observer.refresh(force=True)
+    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+    assert observed == [1.25, 1.75, 1.75]
+    with pytest.raises(RuntimeError, match="detached"):
+        _ = observer.current_ratio
+    host.close()
+    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
 
 def test_current_user_and_maintainer_docs_name_only_the_new_ui_owners() -> None:

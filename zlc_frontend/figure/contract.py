@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from numbers import Integral, Real
+from types import MappingProxyType
+from typing import Mapping
 from typing import Sequence
 
 from zlc_data import (
@@ -270,13 +272,16 @@ PULSE_CONTRACT = DocumentViewContract(
 )
 
 
-VIEW_CONTRACTS = {
+VIEW_CONTRACTS: Mapping[
+    ViewIntent,
+    ViewContract | DocumentViewContract,
+] = MappingProxyType({
     ViewIntent.IMAGE: IMAGE_CONTRACT,
     ViewIntent.CURVE: CURVE_CONTRACT,
     ViewIntent.HISTOGRAM: HISTOGRAM_CONTRACT,
     ViewIntent.METER: METER_CONTRACT,
     ViewIntent.PULSE: PULSE_CONTRACT,
-}
+})
 
 
 def contract_for(intent: ViewIntent) -> ViewContract | DocumentViewContract:

@@ -1,21 +1,10 @@
-"""Pixel placement for a panel board: north-west gravity, and where a drop lands.
+"""Pure north-west-gravity placement for a panel board.
 
-This is the console's board packer, moved out of the legacy shell.  It is pure
-combinatorial geometry over rectangles - no Qt, no Matplotlib, no imports at all
-beyond typing - which is exactly why it can live here while the card CHROME and the
-figure SIZE it measures cannot.
-
-Those two arrive through :class:`BoardMetrics` rather than being read from a style
-module or a renderer.  ``card_size`` is a CALLABLE, deliberately, not a snapshotted
-mapping: a card's pixel size depends on the live Qt scale, so a mapping captured at
-construction would silently go stale the moment the scale changed - the same defect
-the forwarding shims had when they copied bindings instead of forwarding.  The
-inversion also keeps this module free of the Qt-chrome tokens, which the placement
-axiom will not let a Matplotlib-free module reach for.
-
-The identity of a card is duck-typed: anything with ``size``, ``col`` and ``row``
-works, so the shell's own config objects and this module's internal probe are both
-valid without either side importing the other.
+The packer depends only on rectangle geometry.  Qt chrome and renderer size
+policy enter through :class:`BoardMetrics`; this module imports neither UI nor
+rendering backends.  ``card_size`` remains callable because the answer depends
+on the current display scale and must not be captured as stale construction
+state.
 """
 
 from __future__ import annotations

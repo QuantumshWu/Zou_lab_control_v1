@@ -9,7 +9,7 @@ MOT/PulseScan dispatch.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import MappingProxyType
 
 from zlc_neutral_atom.catalog import (
@@ -20,90 +20,18 @@ from zlc_neutral_atom.catalog import (
     definition_key_from_tree,
     definition_key_to_tree,
 )
-from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
 from zlc_neutral_atom.input_spec import require_input_specs
-from zlc_storage import canonical_text
-from zlc_workbench.input_binding import freeze_input_selections
+from zlc_neutral_atom.logic_node_declaration import LogicNodeDeclaration
+from .input_binding import freeze_input_selections
 
 
 __all__ = [
     "ConsoleCatalogView",
-    "ConsoleDefaultPanel",
     "ConsoleNodeSpec",
-    "ConsoleSignalDecl",
 ]
 
 
-@dataclass(frozen=True)
-class ConsoleSignalDecl:
-    """Presentation metadata paired with one owner-declared output."""
-
-    declaration: DatasetOutputDeclaration
-    short: str
-    axis_label: str
-    description: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.declaration, DatasetOutputDeclaration):
-            raise TypeError("declaration must be DatasetOutputDeclaration")
-        for name in ("short", "axis_label"):
-            canonical_text(getattr(self, name), f"console signal {name}")
-        if not isinstance(self.description, str):
-            raise TypeError("console signal description must be str")
-
-    @property
-    def name(self) -> str:
-        return self.declaration.name
-
-    @property
-    def contract_id(self) -> str:
-        return self.declaration.contract_id
-
-
-def _owner_request_builder(
-    callback: Callable[[Mapping[str, object]], object],
-    owner_keys: tuple[str, ...],
-    editor_keys: tuple[str, ...],
-) -> Callable[[Mapping[str, object]], object]:
-    """Restrict an ephemeral editor mapping to its owner's authored fields."""
-
-    editor_key_set = frozenset(editor_keys)
-
-    def build(values: Mapping[str, object]) -> object:
-        if not isinstance(values, Mapping):
-            raise TypeError("console request values must be a mapping")
-        unknown = set(values) - editor_key_set
-        if unknown:
-            raise ValueError(
-                "console request values contain unknown fields: "
-                f"{tuple(sorted(map(str, unknown)))}"
-            )
-        return callback(
-            {key: values[key] for key in owner_keys if key in values}
-        )
-
-    return build
-
-
-@dataclass(frozen=True)
-class ConsoleDefaultPanel:
-    """One initial view over an output admitted by the owning capability."""
-
-    output_name: str
-    kind: str
-    params: Mapping[str, object] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        output_name = canonical_text(self.output_name, "default panel output name")
-        kind = canonical_text(self.kind, "default panel kind")
-        if not isinstance(self.params, Mapping):
-            raise TypeError("default panel params must be a mapping")
-        object.__setattr__(self, "output_name", output_name)
-        object.__setattr__(self, "kind", kind)
-        object.__setattr__(self, "params", MappingProxyType(dict(self.params)))
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ConsoleNodeSpec:
     """Ephemeral UI projection of one owner-declared Logic-node capability.
 
@@ -113,32 +41,14 @@ class ConsoleNodeSpec:
     (PulseScan) supplies ``editor_factory`` from its presentation attachment.
     """
 
-    definition: TaskDefinition | MeasurementDefinition | ProcessorDefinition
-    title: str
-    description: str
+    declaration: LogicNodeDeclaration
     form: object
-    declared_outputs: tuple[ConsoleSignalDecl, ...]
-    build_request: Callable[[Mapping[str, object]], object]
-    input_specs: tuple[object, ...] = ()
     input_fields: tuple[object, ...] = ()
-    default_panels: tuple[ConsoleDefaultPanel, ...] = ()
-    request_output_declarations: (
-        Callable[[object], tuple[DatasetOutputDeclaration, ...]] | None
-    ) = None
-    request_output_axis_label: str | None = None
-    request_output_description: str = ""
     editor_factory: Callable[..., object] | None = None
 
     def __post_init__(self) -> None:
-        if type(self.definition) not in (
-            TaskDefinition,
-            MeasurementDefinition,
-            ProcessorDefinition,
-        ):
-            raise TypeError("definition must be a Task/Measurement/Processor Definition")
-        canonical_text(self.title, "console node title")
-        if not isinstance(self.description, str):
-            raise TypeError("console node description must be str")
+        if not isinstance(self.declaration, LogicNodeDeclaration):
+            raise TypeError("declaration must be LogicNodeDeclaration")
 
         form_keys = tuple(getattr(self.form, "keys", ()))
         form_fields = tuple(getattr(self.form, "fields", ()))
@@ -150,8 +60,11 @@ class ConsoleNodeSpec:
         field_keys = tuple(field.key for field in form_fields)
         if len(set(form_keys)) != len(form_keys) or not set(field_keys) <= set(form_keys):
             raise ValueError("form fields are not a unique subset of its keys")
+        owner_keys = tuple(self.declaration.authoring_schema.keys)
+        if not set(owner_keys) <= set(form_keys):
+            raise ValueError("Workbench form omits an owner authoring field")
 
-        inputs = require_input_specs(self.input_specs)
+        inputs = require_input_specs(self.declaration.input_specs)
         fields = tuple(self.input_fields)
         expected_input_keys = tuple(key for spec in inputs for key in spec.field_keys)
         actual_input_keys = tuple(field.key for field in fields)
@@ -161,50 +74,37 @@ class ConsoleNodeSpec:
             )
         if set(form_keys) & set(actual_input_keys):
             raise ValueError("owner form and input field keys overlap")
-        if not callable(self.build_request):
-            raise TypeError("build_request must be callable")
-        object.__setattr__(self, "input_specs", inputs)
         object.__setattr__(self, "input_fields", fields)
-        object.__setattr__(
-            self,
-            "build_request",
-            _owner_request_builder(
-                self.build_request,
-                form_keys,
-                form_keys + actual_input_keys,
-            ),
-        )
-
-        outputs = tuple(self.declared_outputs)
-        if any(not isinstance(output, ConsoleSignalDecl) for output in outputs):
-            raise TypeError("declared_outputs must contain ConsoleSignalDecl")
-        dynamic = self.request_output_declarations
-        if dynamic is not None and not callable(dynamic):
-            raise TypeError("request_output_declarations must be callable or None")
-        if dynamic is not None and outputs:
-            raise ValueError("static and request-owned outputs are mutually exclusive")
-        if dynamic is None and self.request_output_axis_label is not None:
-            raise ValueError("static outputs cannot declare a dynamic axis label")
-        if dynamic is not None:
-            canonical_text(
-                self.request_output_axis_label,
-                "request output axis label",
-            )
-        if not isinstance(self.request_output_description, str):
-            raise TypeError("request_output_description must be str")
         if self.editor_factory is not None and not callable(self.editor_factory):
             raise TypeError("editor_factory must be callable or None")
         if self.editor_factory is None and field_keys != form_keys:
             raise ValueError("structured form keys require an editor_factory")
-        panels = tuple(self.default_panels)
-        if any(not isinstance(panel, ConsoleDefaultPanel) for panel in panels):
-            raise TypeError("default_panels must contain ConsoleDefaultPanel")
-        if dynamic is None:
-            names = {output.name for output in outputs}
-            if any(panel.output_name not in names for panel in panels):
-                raise ValueError("default panel names an undeclared output")
-        object.__setattr__(self, "declared_outputs", outputs)
-        object.__setattr__(self, "default_panels", panels)
+        if self.editor_factory is None and form_keys != owner_keys:
+            raise ValueError("ordinary form keys must exactly match owner authoring fields")
+
+    @property
+    def definition(self):
+        return self.declaration.definition
+
+    @property
+    def title(self) -> str:
+        return self.definition.title
+
+    @property
+    def description(self) -> str:
+        return self.declaration.description
+
+    @property
+    def input_specs(self) -> tuple:
+        return self.declaration.input_specs
+
+    @property
+    def artifact_outputs(self) -> tuple:
+        return self.declaration.artifact_outputs
+
+    @property
+    def default_views(self) -> tuple:
+        return self.declaration.default_views
 
     @property
     def editor_fields(self) -> tuple:
@@ -219,6 +119,23 @@ class ConsoleNodeSpec:
             **self.form.default_values(),
             **{field.key: field.default for field in self.input_fields},
         }
+
+    def build_request(self, values: Mapping[str, object]) -> object:
+        """Freeze only the exact Workbench form leaves through their owner."""
+
+        if not isinstance(values, Mapping):
+            raise TypeError("console request values must be a mapping")
+        editor_keys = self.editor_keys
+        unknown = set(values) - set(editor_keys)
+        if unknown:
+            raise ValueError(
+                "console request values contain unknown fields: "
+                f"{tuple(sorted(map(str, unknown)))}"
+            )
+        form_keys = tuple(self.form.keys)
+        return self.declaration.build_request(
+            {key: values[key] for key in form_keys if key in values}
+        )
 
     def freeze_input_selections(self, values: Mapping[str, object]):
         return freeze_input_selections(
@@ -261,34 +178,10 @@ class ConsoleNodeSpec:
     def definition_tree(self) -> dict[str, object]:
         return definition_key_to_tree(self.key)
 
-    def outputs_for(self, request: object) -> tuple[ConsoleSignalDecl, ...]:
-        """Return the exact vocabulary frozen by the owner request."""
+    def outputs_for(self, request: object) -> tuple:
+        """Delegate the exact owner presentation vocabulary unchanged."""
 
-        projector = self.request_output_declarations
-        if projector is None:
-            outputs = self.declared_outputs
-        else:
-            declarations = tuple(projector(request))
-            if any(
-                not isinstance(value, DatasetOutputDeclaration)
-                for value in declarations
-            ):
-                raise TypeError(
-                    "request output owner returned another declaration type"
-                )
-            outputs = tuple(
-                ConsoleSignalDecl(
-                    declaration,
-                    declaration.name,
-                    self.request_output_axis_label,
-                    self.request_output_description,
-                )
-                for declaration in declarations
-            )
-        names = tuple(output.name for output in outputs)
-        if len(set(names)) != len(names):
-            raise ValueError("console output names must be unique")
-        return tuple(outputs)
+        return self.declaration.outputs_for(request)
 
 
 class ConsoleCatalogView:

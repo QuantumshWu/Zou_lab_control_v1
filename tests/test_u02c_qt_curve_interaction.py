@@ -284,16 +284,26 @@ def _double_click(board, position, button) -> None:
 
 def _accepted_curve_frame(sequence: int, command):
     accepted = _frame(sequence, curve_revision=command.viewport.display_revision)
-    payload = accepted.panels[1].display_payload
+    panel = accepted.panels[1]
+    payload = panel.display_payload
     payload = replace(
         payload,
+        evaluated_input=command.origin.input_identity,
         viewport=replace(payload.viewport, x_limits=command.viewport.x_limits),
     )
     return replace(
         accepted,
         panels=(
             accepted.panels[0],
-            replace(accepted.panels[1], display_payload=payload),
+            replace(
+                panel,
+                source_identity=command.origin.source_identity,
+                coherence_stamp=replace(
+                    panel.coherence_stamp,
+                    inputs=(command.origin.input_identity,),
+                ),
+                display_payload=payload,
+            ),
         ),
     )
 
@@ -350,7 +360,7 @@ def test_curve_continuous_cross_pins_and_clears() -> None:
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=arbitrary)
         cross = binding.cross
         assert cross is not None
-        assert cross.x != round(cross.x)
+        assert cross[0] != round(cross[0])
         board.mouseDoubleClickEvent(
             QtGui.QMouseEvent(
                 QtCore.QEvent.MouseButtonDblClick,

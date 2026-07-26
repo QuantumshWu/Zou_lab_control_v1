@@ -31,8 +31,12 @@ from zlc_pulse import (
     save_pulse_document,
 )
 from zlc_pulse.server import serve_pulse_execution_service
-from zlc_workbench.pulse_editor.app import open_pulse_editor
-from gui_user_flow import click_tab as _click_tab, until as _until
+from Zou_lab_control.workbench import open_pulse_editor
+from gui_user_flow import (
+    click_tab as _click_tab,
+    close_pulse_editor as _close_pulse_editor,
+    until as _until,
+)
 from pulse_gui_user_flow import (
     choose_mode as _choose_mode,
     exercise_offline_dac_round_trip as _exercise_offline_dac_round_trip,
@@ -126,14 +130,11 @@ def _server_manifest():
 
 def _run_offline_dac_target_gui(workspace: Path, application) -> None:
     body = open_pulse_editor(repository=workspace / "offline-target")
-    wrapper = body.window()
     try:
         _exercise_offline_signal_rename(body, application)
         _exercise_offline_dac_round_trip(body, application)
     finally:
-        body.request_close(discard_unsaved=True)
-        _until(application, lambda: body._controller.runtime_update().close_complete)
-        _until(application, lambda: not wrapper.isVisible())
+        _close_pulse_editor(application, body)
 
 
 def _exercise_offline_signal_rename(body, application) -> None:
@@ -199,7 +200,6 @@ def _run_remote_gui(workspace: Path) -> None:
     application = ensure_qt_app()
     _run_offline_dac_target_gui(workspace, application)
     body = open_pulse_editor(repository=workspace, document=_scan_document())
-    wrapper = body.window()
     try:
         _choose_remote(body)
         _enter_address(body, f"127.0.0.1:{unavailable_port}")
@@ -275,9 +275,7 @@ def _run_remote_gui(workspace: Path) -> None:
             and not body._controller.runtime_update().run_busy,
         )
     finally:
-        body.request_close(discard_unsaved=True)
-        _until(application, lambda: body._controller.runtime_update().close_complete)
-        _until(application, lambda: not wrapper.isVisible())
+        _close_pulse_editor(application, body)
         server.close()
         if server_thread is not None:
             server_thread.join(timeout=3.0)
@@ -319,7 +317,6 @@ def _run_load_before_remote(workspace: Path) -> None:
         path=document_path,
         remote_endpoint=f"127.0.0.1:{server.port}",
     )
-    wrapper = body.window()
     try:
         _until(
             application,
@@ -330,9 +327,7 @@ def _run_load_before_remote(workspace: Path) -> None:
         )
         assert body.schedule_view.conn_connect_button.isEnabled()
     finally:
-        body.request_close(discard_unsaved=True)
-        _until(application, lambda: body._controller.runtime_update().close_complete)
-        _until(application, lambda: not wrapper.isVisible())
+        _close_pulse_editor(application, body)
         server.close()
         server_thread.join(timeout=3.0)
 
@@ -345,7 +340,6 @@ def _run_c47_input_projection_gui(workspace: Path) -> None:
 
     application = ensure_qt_app()
     body = open_pulse_editor(repository=workspace / "c47-input")
-    wrapper = body.window()
     controller = body._controller
     try:
         _until(application, lambda: body.worker_idle)
@@ -422,11 +416,7 @@ def _run_c47_input_projection_gui(workspace: Path) -> None:
             )
         )
     finally:
-        body.request_close(discard_unsaved=True)
-        _until(application, lambda: body._controller.runtime_update().close_complete)
-        if wrapper.isVisible():
-            wrapper.close()
-        _until(application, lambda: not wrapper.isVisible())
+        _close_pulse_editor(application, body)
 
 
 def test_operator_connects_remote_runs_finite_and_continuous_then_stops_safe(
@@ -480,13 +470,13 @@ def test_c47_idle_and_scan_typing_do_not_reproject_the_global_editor(tmp_path) -
 def _run_virtual_manifest_gui(workspace: Path) -> None:
     application = ensure_qt_app()
     body = open_pulse_editor(repository=workspace)
-    wrapper = body.window()
     offline_visible = body.current_document.visible_ports
     offline_available = body._controller.current_target_manifest.available_port_keys
     expected = (
         "ch00",
         "ch01",
         "ch03",
+        "ch06",
         "ch09",
         "ch11",
         "da_bias_y",
@@ -863,9 +853,7 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
         _click_tab(body, body.target_view)
         assert body.target_view.add_dac_button.isEnabled()
     finally:
-        body.request_close(discard_unsaved=True)
-        _until(application, lambda: body._controller.runtime_update().close_complete)
-        _until(application, lambda: not wrapper.isVisible())
+        _close_pulse_editor(application, body)
 
 
 def test_virtual_gui_exposes_only_simulator_wired_digital_and_dac_ports(

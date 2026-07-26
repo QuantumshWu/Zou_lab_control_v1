@@ -27,7 +27,7 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     BlockId,
-    ComponentValidity,
+    DatasetComponentValidity,
     DataBlock,
     DatasetRevision,
     DatasetSchema,
@@ -39,6 +39,16 @@ from zlc_data import (
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.sitemap import load_sitemap_pulse
 from zlc_neutral_atom.logic_nodes.pulse_scan import AutonomousScanExecution
+from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import (
+    PulseScanBoundRequest,
+    ScanSignalBinding,
+)
+from zlc_neutral_atom.logic_nodes.camera_measurement import CameraMonitorViewSpec
+from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
+    OCCUPANCY_LIVE_OUTPUT_DECLARATIONS,
+    OCCUPANCY_PROCESSOR_KEY,
+)
+from zlc_neutral_atom.timing.pulse_parameter_scan import AutonomousScanSlotProgram
 from zlc_pulse import FrozenScanTable, RepeatRegion, ScanParameter
 from zlc_frontend import CurvePanelPayload, DataFigure
 from zlc_frontend.curve_display import (
@@ -127,6 +137,63 @@ def _fixed_api_values(document):
     }
 
 
+class _LiveCameraView:
+    """Minimal view port; Camera Measurement remains the stream owner."""
+
+    def __init__(self, spec: CameraMonitorViewSpec) -> None:
+        self.spec = spec
+        self.dataset = None
+        self.failure: str | None = None
+
+    def bind(self, dataset, *, run_id: str, causation_domain_id: str) -> None:
+        assert run_id and causation_domain_id
+        self.dataset = dataset
+
+    def updated(self) -> None:
+        return None
+
+    def notification_failed(self, message: str) -> None:
+        self.failure = message
+
+    def fail(self, message: str) -> None:
+        self.failure = message
+
+    def source_terminal(self) -> None:
+        return None
+
+
+def _start_virtual_camera_source(experiment):
+    request = experiment.readout.camera_measurement_request(
+        camera_role="camera",
+        repeat=0,
+        frames_per_cycle=1,
+    )
+    source = experiment.readout.prepare_camera_measurement(request)
+    views: list[_LiveCameraView] = []
+
+    def factory(spec: CameraMonitorViewSpec) -> _LiveCameraView:
+        view = _LiveCameraView(spec)
+        views.append(view)
+        return view
+
+    handle = source.start_with_view(factory=factory)
+    deadline = time.monotonic() + 5.0
+    while handle.snapshot().phase != "monitoring-camera":
+        snapshot = handle.snapshot()
+        if snapshot.state.terminal or time.monotonic() >= deadline:
+            raise AssertionError(snapshot)
+        time.sleep(0.005)
+    assert views and views[0].failure is None
+    return source, handle
+
+
+def _stop_virtual_camera_source(handle) -> None:
+    if not handle.snapshot().state.terminal:
+        handle.cancel("curve-grid integration complete")
+    terminal = handle.wait(5.0)
+    assert terminal.state.terminal, terminal
+
+
 def _curve_grid(
     *,
     layers: int = 1,
@@ -185,7 +252,7 @@ def _curve_grid(
         BlockId("u03h-curve-block"),
         DatasetRevision(revision),
         values,
-        ComponentValidity((site.axis_id, component.axis_id), valid),
+        DatasetComponentValidity((site.axis_id, component.axis_id), valid),
         schema,
     )
     dataset_id = DatasetId("u03h-curve-dataset")
@@ -303,7 +370,7 @@ def test_curve_grid_shares_overview_y_but_focus_keeps_local_relim() -> None:
     expected_series = figure.evaluated.layers[0].cells[1].series
     focused = figure.focused_typed_panel(
         1,
-        expected_selection=regions[1].selection,
+        expected_selection=regions[1].focus_selection,
         expected_intent=ViewIntent.CURVE,
     )
     assert focused.evaluated.inputs == figure.evaluated.inputs
@@ -332,7 +399,7 @@ def test_curve_grid_shares_overview_y_but_focus_keeps_local_relim() -> None:
             valid = np.asarray(series.data.validity, dtype=bool)
             local_values.extend(float(value) for value in values[valid])
         expected_local = target_display_range(
-            RelimMode.TIGHT,
+            CurveDisplayState().relim_mode,
             min(local_values),
             max(local_values),
         )
@@ -379,7 +446,7 @@ def test_curve_grid_focus_interaction_back_and_atomic_exports(
         assert payload.viewport.x_axis.unit == "MHz"
         assert payload.value_unit == "photoelectron"
         assert not bool(payload.series[0].data.validity[2])
-        assert window._overview_button.isVisible()
+        assert not window._overview_button.isHidden()
         assert window._overview_button.isEnabled()
         assert tuple(
             window._tabs.tabText(index) for index in range(window._tabs.count())
@@ -419,6 +486,9 @@ def test_curve_grid_focus_interaction_back_and_atomic_exports(
         window._overview_button.click()
         application.processEvents()
         assert window._view_family == "curve-overview"
+        assert window._tabs.currentWidget() is window._tab_host_for_board(
+            window._boards[0]
+        )
         assert window._bundle.pages[0].png_bytes is original_png
         overview_path = tmp_path / "curve-overview.png"
         window._start_export(overview_path)
@@ -608,20 +678,54 @@ def test_public_autonomous_occupancy_scan_opens_exact_curve_grid(
     with zlc.connect("virtual", repository=tmp_path / "u03h-public") as experiment:
         calibration = experiment.readout.sitemap(frames=6)
         document = _occupancy_scan_document()
-        reference = experiment.readout.occupancy_scan(
+        program = AutonomousScanSlotProgram.from_api_values(
             document,
-            calibration_ref=calibration,
-            api_values=_fixed_api_values(document),
-            timeout_seconds=20.0,
+            _fixed_api_values(document),
         )
+        request = PulseScanBoundRequest(
+            program,
+            ScanSignalBinding(
+                OCCUPANCY_PROCESSOR_KEY,
+                OCCUPANCY_LIVE_OUTPUT_DECLARATIONS[1],
+            ),
+        )
+        camera_source, camera_handle = _start_virtual_camera_source(experiment)
+        occupancy_source = None
+        try:
+            occupancy = experiment.readout.prepare_occupancy_processor(
+                camera_source.dataset_output_binding("frame_0"),
+                calibration_ref=calibration,
+            )
+            occupancy_source = occupancy.start_signal_events(camera_source)
+            reference = experiment.readout.prepare_scan_source(
+                request,
+                occupancy_source,
+            ).start().result(20.0)
+        finally:
+            if occupancy_source is not None:
+                occupancy_source.request_close()
+                deadline = time.monotonic() + 5.0
+                while (
+                    not occupancy_source.worker_idle
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.005)
+                assert occupancy_source.worker_idle
+                assert occupancy_source.error is None
+                occupancy_source.join_closed()
+            _stop_virtual_camera_source(camera_handle)
         assert isinstance(reference, zlc.ScanArtifactRef)
         artifact = experiment.readout.load_scan(reference)
         assert isinstance(artifact.execution, AutonomousScanExecution)
         materialized = experiment.readout.materialize_scan(reference)
         assert materialized.values.shape == (2, 2, 35)
-        expected_figure = experiment.figure(reference)
-        layer = expected_figure.document.layers[0]
         site_axis = materialized.schema.cell_schema.data_axes[0]
+        preferences = ViewPreferences(facet_axis_ids=(site_axis.axis_id,))
+        expected_figure = experiment.figure(
+            reference,
+            preferences=preferences,
+        )
+        layer = expected_figure.document.layers[0]
         assert layer.view.intent is ViewIntent.CURVE
         assert layer.view.binding(site_axis.axis_id).role is AxisViewRole.FACET
         expected_cells = expected_figure.evaluated.layers[0].cells
@@ -634,7 +738,10 @@ def test_public_autonomous_occupancy_scan_opens_exact_curve_grid(
             return original(self, source, *args, **options)
 
         monkeypatch.setattr(type(experiment), "figure", traced)
-        window = experiment.figure_gui(reference)
+        window = experiment.figure_gui(
+            reference,
+            preferences=preferences,
+        )
         try:
             _until(
                 application,
@@ -650,6 +757,7 @@ def test_public_autonomous_occupancy_scan_opens_exact_curve_grid(
             assert source == reference and args == ()
             assert options["intent"] is None
             assert options["selection"] is None
+            assert options["preferences"] == preferences
 
             window._focus_grid_region(*_center(overview.regions[1]))
             _until(

@@ -11,6 +11,7 @@ from PyQt5 import QtCore, QtGui
 from ..render import (
     BoardFrame,
     ImagePanelPayload,
+    PanelFrame,
     SiteMapPanelPayload,
     detached_render_fault,
 )
@@ -26,11 +27,13 @@ from ..selector import (
 )
 from ._raster_front import (
     _HeldPanelFront,
+    _ImagePanelGeometry,
     _image_payload,
     _hold_matches_frame,
     _panel_bounds,
     _panel_image_geometry,
     _panel_presentation,
+    _presentation_answers,
     _panel_semantics_changed,
     _raster_geometry,
     _site_map_payload,
@@ -42,6 +45,7 @@ from ._rectangle_selector import (
     paint_rectangle_selector,
     paint_selector_text,
     selector_pen_color,
+    selector_precision,
 )
 from .style import ORANGE
 
@@ -56,6 +60,48 @@ class _ImageSample:
     y_coordinate: object
     value: object
     valid: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpectedImageViewportAnswer:
+    """The exact semantic frame answer reserved by one viewport command."""
+
+    origin: PanelInteractionOrigin
+    viewport: ImageViewportTransform
+
+    def matches(self, panel) -> bool:
+        payload = _image_payload(panel)
+        return (
+            payload is not None
+            and _presentation_answers(
+                self.origin,
+                panel,
+                self.viewport.viewport_revision,
+            )
+            and payload.viewport == self.viewport
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpectedImageColorAnswer:
+    """The exact semantic frame answer reserved by one colour command."""
+
+    origin: PanelInteractionOrigin
+    display_revision: int
+    color_limits: tuple[float, float]
+
+    def matches(self, panel) -> bool:
+        payload = _image_payload(panel)
+        return (
+            payload is not None
+            and _presentation_answers(
+                self.origin,
+                panel,
+                self.display_revision,
+            )
+            and payload.viewport.viewport_revision == self.display_revision
+            and payload.color_limits == self.color_limits
+        )
 
 
 @dataclass(slots=True)
@@ -73,20 +119,51 @@ class _ImagePanelBinding:
     draft_bounds: NormalizedRectangle | None = None
     rectangle_drag: RectangleDrag | None = None
     drag_prior_draft: NormalizedRectangle | None = None
-    drag_start_bounds: NormalizedRectangle | None = None
     pan_anchor: QtCore.QPointF | None = None
     pan_origin: ImageViewportTransform | None = None
     pan_target_size: tuple[int, int] | None = None
     pan_candidate: ImageViewportTransform | None = None
-    pending_viewport: ImageViewportTransform | None = None
-    pending_color_limits: tuple[float, float] | None = None
-    pending_origin: PanelInteractionOrigin | None = None
+    pending_viewport_answer: _ExpectedImageViewportAnswer | None = None
+    queued_viewport_bounds: NormalizedRectangle | None = None
+    pending_color_answer: _ExpectedImageColorAnswer | None = None
+    queued_color_limits: tuple[float, float] | None = None
     clim_drag: str | None = None
     clim_origin_limits: tuple[float, float] | None = None
     clim_candidate: tuple[float, float] | None = None
     clim_domain: tuple[float, float] | None = None
     cross: _ImageSample | None = None
     fault: RuntimeError | None = None
+
+    @property
+    def pending_viewport(self) -> ImageViewportTransform | None:
+        answer = self.pending_viewport_answer
+        return None if answer is None else answer.viewport
+
+    @property
+    def pending_color_limits(self) -> tuple[float, float] | None:
+        answer = self.pending_color_answer
+        return None if answer is None else answer.color_limits
+
+    @property
+    def authored_viewport(self) -> ImageViewportTransform:
+        """Newest requested viewport, including the render-paced mailbox."""
+
+        viewport = self.pending_viewport or self.viewport
+        bounds = self.queued_viewport_bounds
+        if bounds is None:
+            return viewport
+        return viewport.with_visible_bounds(bounds)
+
+
+@dataclass(frozen=True, slots=True)
+class _ImagePanelTarget:
+    """One resolved panel geometry shared by image hit targets."""
+
+    geometry: _ImagePanelGeometry
+    frame: BoardFrame
+    panel: PanelFrame
+    prepared: tuple[bytes, QtGui.QImage]
+    payload: ImagePanelPayload | None
 
 
 def _image_interaction_is_pending(binding: _ImagePanelBinding) -> bool:
@@ -177,7 +254,7 @@ def _viewport_for_presented_panel(
     return candidate
 
 
-def _selector_target(
+def _image_panel_target(
     binding: _ImagePanelBinding | None,
     *,
     widget_rect: QtCore.QRect,
@@ -185,7 +262,7 @@ def _selector_target(
     columns: int,
     front: tuple[BoardFrame, tuple[tuple[bytes, QtGui.QImage], ...]] | None,
     hold: _HeldPanelFront | None,
-):
+) -> _ImagePanelTarget | None:
     if front is None or binding is None:
         return None
     panel_id = binding.panel_id
@@ -220,7 +297,35 @@ def _selector_target(
         payload,
         site_map_payload=composite,
     )
-    return geometry.target, front[0], front[0].panels[index], prepared
+    return _ImagePanelTarget(
+        geometry,
+        front[0],
+        front[0].panels[index],
+        prepared,
+        payload,
+    )
+
+
+def _selector_target(
+    binding: _ImagePanelBinding | None,
+    *,
+    widget_rect: QtCore.QRect,
+    panel_ids: tuple[str, ...],
+    columns: int,
+    front: tuple[BoardFrame, tuple[tuple[bytes, QtGui.QImage], ...]] | None,
+    hold: _HeldPanelFront | None,
+):
+    target = _image_panel_target(
+        binding,
+        widget_rect=widget_rect,
+        panel_ids=panel_ids,
+        columns=columns,
+        front=front,
+        hold=hold,
+    )
+    if target is None:
+        return None
+    return target.geometry.target, target.frame, target.panel, target.prepared
 
 
 def _image_target_at(
@@ -235,7 +340,7 @@ def _image_target_at(
     bindings: dict[str, _ImagePanelBinding],
 ):
     for binding in bindings.values():
-        target = _selector_target(
+        resolved = _image_panel_target(
             binding,
             widget_rect=widget_rect,
             panel_ids=panel_ids,
@@ -243,15 +348,25 @@ def _image_target_at(
             front=front,
             hold=hold,
         )
-        if target is None:
+        if resolved is None:
             continue
-        rail_target = _clim_rail_target(
-            binding,
-            widget_rect=widget_rect,
-            panel_ids=panel_ids,
-            columns=columns,
-            front=front,
-            hold=hold,
+        target = (
+            resolved.geometry.target,
+            resolved.frame,
+            resolved.panel,
+            resolved.prepared,
+        )
+        rail_target = (
+            None
+            if resolved.payload is None
+            or resolved.geometry.distribution is None
+            else (
+                resolved.geometry.distribution,
+                resolved.frame,
+                resolved.panel,
+                resolved.prepared,
+                resolved.payload,
+            )
         )
         integer_point = point.toPoint()
         if target[0].contains(integer_point) or (
@@ -310,43 +425,27 @@ def _clim_rail_target(
     front: tuple[BoardFrame, tuple[tuple[bytes, QtGui.QImage], ...]] | None,
     hold: _HeldPanelFront | None,
 ):
-    panel_id = binding.panel_id
-    if front is None or panel_id not in panel_ids:
-        return None
-    index = panel_ids.index(panel_id)
-    prepared = (
-        hold.prepared
-        if hold is not None and hold.panel_id == panel_id
-        else front[1][index]
-    )
-    panel = front[0].panels[index]
-    payload = (
-        _image_payload(hold)
-        if hold is not None and hold.panel_id == panel_id
-        else _image_payload(panel)
-    )
-    composite = (
-        _site_map_payload(hold)
-        if hold is not None and hold.panel_id == panel_id
-        else _site_map_payload(panel)
-    )
-    if payload is None:
-        return None
-    bounds = _panel_bounds(
-        widget_rect,
-        index=index,
-        count=len(front[1]),
+    target = _image_panel_target(
+        binding,
+        widget_rect=widget_rect,
+        panel_ids=panel_ids,
         columns=columns,
+        front=front,
+        hold=hold,
     )
-    geometry = _panel_image_geometry(
-        bounds,
-        prepared[1],
-        payload,
-        site_map_payload=composite,
-    )
-    if geometry.distribution is None:
+    if (
+        target is None
+        or target.payload is None
+        or target.geometry.distribution is None
+    ):
         return None
-    return geometry.distribution, front[0], panel, prepared, payload
+    return (
+        target.geometry.distribution,
+        target.frame,
+        target.panel,
+        target.prepared,
+        target.payload,
+    )
 
 
 def _viewport_for_target(
@@ -359,8 +458,11 @@ def _viewport_for_target(
     # already-authored viewport rather than replaying the still-painted one.
     # The exact painted front remains the CAS origin; only the display intent
     # accumulates here.
-    if binding.pending_viewport is not None:
-        return binding.pending_viewport
+    if (
+        binding.pending_viewport is not None
+        or binding.queued_viewport_bounds is not None
+    ):
+        return binding.authored_viewport
     if hold is not None and hold.panel_id == target[2].panel_id:
         payload = _image_payload(hold)
         if payload is not None:
@@ -439,8 +541,11 @@ def _commit_viewport(
     hold: _HeldPanelFront | None,
     painted_hold: _HeldPanelFront | None,
 ) -> bool:
+    if binding.pending_color_answer is not None:
+        return False
     current = binding.viewport
-    authored = binding.pending_viewport or current
+    pending = binding.pending_viewport
+    authored = binding.authored_viewport
     if candidate.axes != current.axes:
         raise ValueError("viewport commit cannot change image axes")
     # A gesture candidate carries desired BOUNDS; this owner assigns its
@@ -451,6 +556,13 @@ def _commit_viewport(
     # dataclass (whose stale revision is not a second piece of intent).
     if candidate.visible_bounds == authored.visible_bounds:
         return False
+    if pending is not None:
+        binding.queued_viewport_bounds = (
+            None
+            if candidate.visible_bounds == pending.visible_bounds
+            else candidate.visible_bounds
+        )
+        return True
     # Compare with the latest authored view, not merely the still-painted
     # worker answer.  Otherwise wheel-in followed immediately by wheel-out
     # would be mistaken for a no-op when it reaches the painted home bounds,
@@ -494,13 +606,16 @@ def _commit_viewport(
         binding.revision_floor,
         candidate.viewport_revision,
     )
-    binding.pending_viewport = candidate
-    binding.pending_origin = origin
+    binding.pending_viewport_answer = _ExpectedImageViewportAnswer(
+        origin,
+        candidate,
+    )
+    binding.queued_viewport_bounds = None
     try:
         callback(command)
     except BaseException as error:
-        binding.pending_viewport = None
-        binding.pending_origin = None
+        binding.pending_viewport_answer = None
+        binding.queued_viewport_bounds = None
         if binding.fault is None:
             binding.fault = detached_render_fault(error)
         binding.binding_enabled = False
@@ -514,52 +629,79 @@ def _commit_color_limits(
     *,
     front: tuple[BoardFrame, tuple[tuple[bytes, QtGui.QImage], ...]] | None,
     panel_ids: tuple[str, ...],
-    hold: _HeldPanelFront,
+    hold: _HeldPanelFront | None,
     painted_hold: _HeldPanelFront | None,
 ) -> bool:
-    payload = _image_payload(hold)
-    if payload is None or limits == payload.color_limits:
+    if binding.pending_viewport_answer is not None:
         return False
-    if front is None or not _hold_matches_frame(
-        hold,
-        front[0],
-        panel_ids=panel_ids,
-    ):
-        return False
-    callback = binding.interaction_callback
-    if callback is None:
-        return False
-    _visible_payload, origin = _visible_display(
+    visible_payload, origin = _visible_display(
         binding.panel_id,
         (ImagePanelPayload, SiteMapPanelPayload),
         front=front,
         panel_ids=panel_ids,
         hold=painted_hold,
     )
+    payload = (
+        _image_payload(hold)
+        if hold is not None
+        else (
+            visible_payload.background
+            if isinstance(visible_payload, SiteMapPanelPayload)
+            else visible_payload
+        )
+    )
+    if payload is None:
+        return False
+    pending_limits = binding.pending_color_limits
+    authored_limits = (
+        binding.queued_color_limits
+        if binding.queued_color_limits is not None
+        else pending_limits or payload.color_limits
+    )
+    if limits == authored_limits:
+        return False
+    if pending_limits is not None:
+        binding.queued_color_limits = (
+            None if limits == pending_limits else limits
+        )
+        return True
+    if front is None or (
+        hold is not None
+        and not _hold_matches_frame(
+            hold,
+            front[0],
+            panel_ids=panel_ids,
+        )
+    ):
+        return False
+    callback = binding.interaction_callback
+    if callback is None:
+        return False
     if origin is None:
         raise RuntimeError("image interaction origin has no exact payload")
     command = ImageColorLimitsCommit(origin, limits)
-    binding.pending_color_limits = command.color_limits
-    binding.pending_origin = origin
+    expected_revision = max(
+        payload.viewport.viewport_revision,
+        binding.viewport.viewport_revision,
+        binding.revision_floor,
+    ) + 1
+    binding.revision_floor = expected_revision
+    binding.pending_color_answer = _ExpectedImageColorAnswer(
+        origin,
+        expected_revision,
+        command.color_limits,
+    )
+    binding.queued_color_limits = None
     try:
         callback(command)
     except BaseException as error:
-        binding.pending_color_limits = None
-        binding.pending_origin = None
+        binding.pending_color_answer = None
+        binding.queued_color_limits = None
         if binding.fault is None:
             binding.fault = detached_render_fault(error)
         binding.binding_enabled = False
         return False
     return True
-
-
-def _set_cross_sample(
-    binding: _ImagePanelBinding,
-    sample: _ImageSample | None,
-) -> None:
-    if sample is binding.cross:
-        return
-    binding.cross = sample
 
 
 def _active_image_binding(
@@ -686,9 +828,7 @@ def _clim_candidate_label(
     if limits is None:
         raise RuntimeError("H candidate label requires an active limit draft")
     low, high = _color_rail_domain(payload)
-    span = high - low
-    gap = span / 1000.0 if span else 0.01
-    precision = max(0, -int(math.ceil(math.log10(gap))))
+    precision = selector_precision(high - low)
 
     def formatted(value: float) -> str:
         return (
@@ -722,12 +862,8 @@ def _selection_endpoint_label(
     visible_x_low, visible_x_high = viewport.x_limits
     visible_y_low, visible_y_high = viewport.y_limits
 
-    def precision(span: float) -> int:
-        gap = abs(float(span)) / 1000.0 if span else 0.01
-        return max(0, -int(math.ceil(math.log10(gap))))
-
-    x_precision = precision(visible_x_high - visible_x_low)
-    y_precision = precision(visible_y_high - visible_y_low)
+    x_precision = selector_precision(visible_x_high - visible_x_low)
+    y_precision = selector_precision(visible_y_high - visible_y_low)
     return (
         f"({selected_x_low:.{x_precision}f}, "
         f"{selected_y_low:.{y_precision}f})\n"
@@ -947,7 +1083,6 @@ def _cancel_image_gesture(
 ) -> None:
     binding.rectangle_drag = None
     binding.drag_prior_draft = None
-    binding.drag_start_bounds = None
     binding.pan_anchor = None
     binding.pan_origin = None
     binding.pan_target_size = None
@@ -970,7 +1105,8 @@ def _clear_image_transient(
     if clear_applied_bounds:
         binding.applied_bounds = None
     if clear_pending:
-        binding.pending_viewport = None
-        binding.pending_color_limits = None
-        binding.pending_origin = None
+        binding.pending_viewport_answer = None
+        binding.queued_viewport_bounds = None
+        binding.pending_color_answer = None
+        binding.queued_color_limits = None
     binding.cross = None

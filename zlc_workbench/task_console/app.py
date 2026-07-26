@@ -27,14 +27,17 @@ def open_task_console(
     catalog_view = ConsoleCatalogView(
         tuple(attachment.spec for attachment in ports.attachments)
     )
-    data_plane = ConsoleDataPlane()
     console: list[object] = []
 
     def request_owner_wake() -> None:
-        # The shell polls one owner mailbox per GUI tick.  Keeping this callback
-        # explicit means another host may schedule an immediate owner wake
-        # without letting workers call QWidget methods.
-        return None
+        # Worker callbacks cross exactly one queued Qt-owner seam.  A node cannot
+        # start before ``show_task_console`` has returned its composed body, so a
+        # wake before that point is a broken composition order, not work to drop.
+        if not console:
+            raise RuntimeError("TaskConsole owner is not composed")
+        console[0].request_owner_wake()
+
+    data_plane = ConsoleDataPlane()
 
     def resolve_inputs(spec, values):
         if not console:

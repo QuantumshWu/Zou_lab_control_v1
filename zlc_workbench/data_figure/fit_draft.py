@@ -1,4 +1,4 @@
-"""Headless process-local authority for one interactive fit draft.
+"""DataFigure-owned process-local authority for one interactive fit draft.
 
 The Qt host may display :class:`FitDraftResult`, but it never receives the
 opaque execution value that the composition root needs in order to save that

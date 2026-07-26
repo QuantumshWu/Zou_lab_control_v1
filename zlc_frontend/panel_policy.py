@@ -8,7 +8,10 @@ instead of restating them locally.
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 from .form import FormChoice, FormFieldProps
+from .figure import ViewIntent
 
 
 VIEW_SPEC_PARAM = "view_spec"
@@ -44,17 +47,20 @@ FIXED_HI_PARAM = FormFieldProps(
 )
 
 
-def panel_view_intents():
-    """Return the ordinary panel-key to typed Figure-intent mapping."""
-
-    from zlc_frontend.figure import ViewIntent
-
-    return {
+_PANEL_VIEW_INTENTS = MappingProxyType(
+    {
         "2d": ViewIntent.IMAGE,
         "1d": ViewIntent.CURVE,
         "monitor": ViewIntent.CURVE,
         "hist": ViewIntent.HISTOGRAM,
     }
+)
+
+
+def panel_view_intents():
+    """Return the ordinary panel-key to typed Figure-intent mapping."""
+
+    return _PANEL_VIEW_INTENTS
 
 
 def grid_view_intents():
@@ -107,8 +113,19 @@ def automatic_panel_kind(schema) -> str | None:
 def automatic_figure_intent(schema):
     """Choose the ordinary notebook Figure intent from declared axis roles."""
 
+    return automatic_figure_view(schema)[0]
+
+
+def automatic_figure_view(schema, *, prefer_meter: bool = False):
+    """Return the frontend's default intent and optional view preferences.
+
+    ``prefer_meter`` is a semantic hint for an already scalar-valued product;
+    it never inspects rank or singleton lengths and it never reduces a data
+    axis.  Scan/history axes still win because they carry the visible x domain.
+    """
+
     from zlc_data import MONITOR_HISTORY, SCAN_POINT, SPATIAL_X, SPATIAL_Y, SPECTRAL
-    from zlc_frontend.figure import ViewIntent
+    from zlc_frontend.figure import RepeatViewMode, ViewPreferences
 
     axes = (
         schema.repeat_axis,
@@ -117,10 +134,15 @@ def automatic_figure_intent(schema):
     )
     roles = {axis.role for axis in axes}
     if SPATIAL_X in roles and SPATIAL_Y in roles:
-        return ViewIntent.IMAGE
+        return ViewIntent.IMAGE, None
     if roles.intersection((SCAN_POINT, SPECTRAL, MONITOR_HISTORY)):
-        return ViewIntent.CURVE
-    return ViewIntent.HISTOGRAM
+        return ViewIntent.CURVE, None
+    if bool(prefer_meter):
+        return (
+            ViewIntent.METER,
+            ViewPreferences(repeat_mode=RepeatViewMode.MEAN),
+        )
+    return ViewIntent.HISTOGRAM, None
 
 
 def repeat_mode_label(mode) -> str:
@@ -147,6 +169,7 @@ __all__ = [
     "RELIM_PARAM",
     "VIEW_SPEC_PARAM",
     "automatic_figure_intent",
+    "automatic_figure_view",
     "automatic_panel_kind",
     "grid_view_intents",
     "panel_view_intents",

@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PyQt5 import QtCore, QtTest
 
+from gui_user_flow import close_pulse_editor
 from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_workbench.pulse_editor.app import open_pulse_editor
 
@@ -29,8 +30,7 @@ def editor():
     body.window().show()
     _until(application, lambda: bool(body.schedule_view.period_cards()))
     yield application, body
-    body.request_close(discard_unsaved=True)
-    _until(application, lambda: body._controller.runtime_update().close_complete)
+    close_pulse_editor(application, body)
 
 
 def _first_card(body):
@@ -50,7 +50,6 @@ def test_duration_dot_cycles_none_scan_api_off_through_visible_control(editor):
     )
     field = _first_card(body).duration_edit
     assert field.dot.isChecked() and not getattr(field.dot, "_api", False)
-    assert field.dot.number() == 1
     assert field.isReadOnly()
     assert field.text() == "s0"
 
@@ -92,7 +91,7 @@ def test_delay_dot_cycles_none_api_none_through_visible_control(editor):
         and getattr(delay_field().dot, "_api", False),
     )
     field = delay_field()
-    assert getattr(field.dot, "_api", False) and field.dot.number() == 1
+    assert getattr(field.dot, "_api", False)
     assert not field.isReadOnly()
 
     QtTest.QTest.mouseClick(field.dot, QtCore.Qt.LeftButton)

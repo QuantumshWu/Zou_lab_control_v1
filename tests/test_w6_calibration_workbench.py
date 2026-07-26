@@ -157,12 +157,12 @@ def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
         assert window.saved_reference is None
         assert window._form is not None
         form = window._form
-        form.widget_for("train_fraction").setText("1")
+        form.widget_for("train_fraction").setValue(1.0)
         window._calibrate_button.click()
         assert window.worker_idle
         assert window._status.text() == "CALIBRATION REQUEST INVALID"
         assert _manifest_count(workspace) == before
-        form.widget_for("train_fraction").setText("0.8")
+        form.widget_for("train_fraction").setValue(0.8)
 
         original_starter = window._run_starter
 
@@ -202,7 +202,7 @@ def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
 
         # A disabled form can still be changed programmatically.  The formal
         # Run keeps its captured revision while the UI marks the receipt stale.
-        form.widget_for("split_seed").setText(str(original.split_seed + 2))
+        form.widget_for("split_seed").setValue(original.split_seed + 2)
         window.close()
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
         assert window.isVisible()
@@ -262,10 +262,10 @@ def test_exact_saved_calibration_reopens_for_new_revision_without_mutation(
         assert all(not board.has_front for board in previous_boards)
         assert all(window._tabs.indexOf(board) < 0 for board in previous_boards)
         assert window._form is not None
-        window._form.widget_for("split_seed").setText("7")
+        window._form.widget_for("split_seed").setValue(7)
         assert window._status.text() == "FINAL CALIBRATION · EDITOR CHANGED"
         window._reset_button.click()
-        assert window._form.widget_for("split_seed").text() == "0"
+        assert window._form.widget_for("split_seed").value() == 0
         assert _manifest_count(workspace) == before
     finally:
         _close(application, window)

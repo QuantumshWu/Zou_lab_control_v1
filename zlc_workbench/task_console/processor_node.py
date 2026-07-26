@@ -13,12 +13,8 @@ from zlc_data import ValueSchema
 from zlc_neutral_atom.dataset_output import LiveDatasetOutput
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
-from zlc_neutral_atom.runtime.signal_source import (
-    SignalAssociationScheduleRequirement,
-    SignalEventAssociationSource,
-    SignalEventSource,
-)
-from zlc_workbench.input_binding import ResolvedDatasetInput
+from zlc_neutral_atom.runtime.signal_source import SignalEventSource
+from .input_binding import ResolvedDatasetInput
 
 from .console_records import console_signal_key
 from .data_plane import ConsoleDataPlane, ConsoleSignalValue
@@ -151,6 +147,7 @@ class ConsoleProcessorNode:
         self._source_node = source_node
         self._source_event_source = source_event_source
         self._signal_event_source: SignalEventSource | None = None
+        self._signal_events_close_requested = False
         self._signal_events_closed = False
         self._source_lifecycle_generation = source_generation
         self._initial_source: ConsoleSignalValue | None = initial_source
@@ -165,6 +162,9 @@ class ConsoleProcessorNode:
         self._phase = "not started"
         self._error: str | None = None
         self._cancel_requested = False
+        self._processor_lane_retired = False
+        self._pending_terminal_state: RunState | None = None
+        self._pending_terminal_error: str | None = None
 
     @property
     def spec(self):
@@ -221,30 +221,6 @@ class ConsoleProcessorNode:
     @property
     def last_error(self) -> str | None:
         return self._error
-
-    @property
-    def final_result(self):
-        return None
-
-    @property
-    def final_result_resolved(self) -> bool:
-        return False
-
-    @property
-    def final_outputs_resolved(self) -> bool:
-        return False
-
-    @property
-    def materialized_final_outputs(self):
-        return None
-
-    @property
-    def materialized_final_presentations(self):
-        return None
-
-    @property
-    def final_output_error(self) -> None:
-        return None
 
     def signal_key(self, output_name: str) -> str:
         return console_signal_key(self.instance_id, output_name)
@@ -303,14 +279,22 @@ class ConsoleProcessorNode:
             return
         self._cancel_requested = True
         self._phase = "stopping after current Processor evaluation"
-        self._close_signal_events()
-        if self._data_plane.cancel_latest_only_processor(self):
-            self._accept_processor_cancelled()
+        if self._pending_terminal_state is None:
+            self._pending_terminal_state = RunState.CANCELLED
+        self._request_signal_events_close()
+        idle = self._data_plane.cancel_latest_only_processor(self)
+        if idle and not self._processor_lane_retired:
+            self._processor_lane_retired = True
+            self._data_plane.withdraw_processor(self)
+        self._finish_pending_terminal()
 
     def poll(self) -> RunSnapshot | None:
         if self._state is None:
             return None
         if self._state.terminal:
+            return self._snapshot()
+        if self._pending_terminal_state is not None:
+            self._finish_pending_terminal()
             return self._snapshot()
         signal_source = self._signal_event_source
         signal_error = (
@@ -344,10 +328,8 @@ class ConsoleProcessorNode:
         return self._snapshot()
 
     def shutdown(self) -> None:
-        try:
-            self.cancel("TaskConsole is closing")
-        finally:
-            self._close_signal_events()
+        self.cancel("TaskConsole is closing")
+        self._finish_pending_terminal()
 
     def _prepare_processor_application(self) -> object:
         return self._prepare_application()
@@ -393,13 +375,13 @@ class ConsoleProcessorNode:
             try:
                 self._validate_signal_event_source(derived)
             except BaseException:
-                close = getattr(derived, "close", None)
-                if callable(close):
-                    close()
+                request_close = getattr(derived, "request_close", None)
+                if callable(request_close):
+                    request_close()
                 raise
             self._signal_event_source = derived
+            self._signal_events_close_requested = False
             self._signal_events_closed = False
-            self._refresh_signal_association_capability(derived)
         self._phase = "waiting for a new source revision"
 
     def _processor_work_started(self, source: ConsoleSignalValue) -> None:
@@ -432,25 +414,36 @@ class ConsoleProcessorNode:
     def _accept_processor_failure(self, error: Exception) -> None:
         if self._state is None or self._state.terminal:
             return
-        self._close_signal_events()
+        self._pending_terminal_state = RunState.FAILED
+        self._pending_terminal_error = f"{type(error).__name__}: {error}"
+        self._processor_lane_retired = True
+        self._request_signal_events_close()
         self._data_plane.withdraw_processor(self)
-        self._error = f"{type(error).__name__}: {error}"
-        self._state = RunState.FAILED
-        self._phase = "failed"
+        self._finish_pending_terminal()
 
     def _accept_processor_cancelled(self) -> None:
         if self._state is RunState.RUNNING:
-            self._close_signal_events()
+            if self._pending_terminal_state is None:
+                self._pending_terminal_state = RunState.CANCELLED
+            self._processor_lane_retired = True
+            self._request_signal_events_close()
             self._data_plane.withdraw_processor(self)
-            self._state = RunState.CANCELLED
-            self._phase = "cancelled"
+            self._finish_pending_terminal()
 
     def _request_processor_owner_wake(self) -> None:
         self._request_owner_wake()
 
     def _fail(self, error: Exception) -> None:
-        self._accept_processor_failure(error)
-        self._data_plane.cancel_latest_only_processor(self)
+        if self._state is None or self._state.terminal:
+            return
+        self._pending_terminal_state = RunState.FAILED
+        self._pending_terminal_error = f"{type(error).__name__}: {error}"
+        self._request_signal_events_close()
+        idle = self._data_plane.cancel_latest_only_processor(self)
+        if idle:
+            self._processor_lane_retired = True
+        self._data_plane.withdraw_processor(self)
+        self._finish_pending_terminal()
 
     def _require_output_name(self, output_name: str) -> str:
         if (
@@ -476,9 +469,12 @@ class ConsoleProcessorNode:
             raise TypeError(
                 "Processor start_signal_events returned no SignalEventSource"
             )
-        close = getattr(source, "close", None)
-        if not callable(close):
-            raise TypeError("Processor signal source must expose close()")
+        request_close = getattr(source, "request_close", None)
+        join_closed = getattr(source, "join_closed", None)
+        if not callable(request_close) or not callable(join_closed):
+            raise TypeError(
+                "Processor signal source must expose request_close()/join_closed()"
+            )
         if type(getattr(source, "worker_idle", None)) is not bool:
             raise TypeError(
                 "Processor signal source must expose boolean worker_idle"
@@ -494,47 +490,51 @@ class ConsoleProcessorNode:
                     "Processor signal source value_schema() must return ValueSchema"
                 )
 
-    def _close_signal_events(self) -> None:
-        self._clear_signal_association_capability()
+    def _request_signal_events_close(self) -> None:
+        source = self._signal_event_source
+        if (
+            source is None
+            or self._signal_events_close_requested
+            or self._signal_events_closed
+        ):
+            return
+        request_close = getattr(source, "request_close", None)
+        if not callable(request_close):
+            raise TypeError("Processor signal source lost its request_close() seam")
+        request_close()
+        self._signal_events_close_requested = True
+
+    def _join_signal_events_if_idle(self) -> bool:
         source = self._signal_event_source
         if source is None or self._signal_events_closed:
-            return
-        close = getattr(source, "close", None)
-        if not callable(close):
-            raise TypeError("Processor signal source lost its close() seam")
-        close()
+            return True
+        if not bool(getattr(source, "worker_idle", False)):
+            return False
+        join_closed = getattr(source, "join_closed", None)
+        if not callable(join_closed):
+            raise TypeError("Processor signal source lost its join_closed() seam")
+        join_closed()
         self._signal_events_closed = True
+        return True
 
-    def _refresh_signal_association_capability(self, source: object) -> None:
-        self._clear_signal_association_capability()
-        if isinstance(source, SignalEventAssociationSource):
-            self.__dict__.update(
-                open_associated_signal_cursor=self._open_associated_signal_cursor,
-                signal_association_schedule_requirement=(
-                    self._signal_association_schedule_requirement
-                ),
-            )
+    def _finish_pending_terminal(self) -> bool:
+        state = self._pending_terminal_state
+        if state is None or not self._processor_lane_retired:
+            return False
+        if not self._join_signal_events_if_idle():
+            self._phase = "waiting for Processor event worker to stop"
+            return False
+        self._state = state
+        self._error = self._pending_terminal_error
+        self._phase = "failed" if state is RunState.FAILED else "cancelled"
+        self._pending_terminal_state = None
+        self._pending_terminal_error = None
+        return True
 
-    def _clear_signal_association_capability(self) -> None:
-        self.__dict__.pop("open_associated_signal_cursor", None)
-        self.__dict__.pop("signal_association_schedule_requirement", None)
+    def signal_event_source(self) -> SignalEventSource:
+        """Return the application-owned source without changing this node's type."""
 
-    def _open_associated_signal_cursor(self, output_name: str):
-        name = self._require_output_name(output_name)
-        source = self._running_signal_source()
-        if not isinstance(source, SignalEventAssociationSource):
-            raise RuntimeError("Processor lost signal association capability")
-        return source.open_associated_signal_cursor(name)
-
-    def _signal_association_schedule_requirement(
-        self,
-        output_name: str,
-    ) -> SignalAssociationScheduleRequirement:
-        name = self._require_output_name(output_name)
-        source = self._running_signal_source()
-        if not isinstance(source, SignalEventAssociationSource):
-            raise RuntimeError("Processor lost signal association capability")
-        return source.signal_association_schedule_requirement(name)
+        return self._running_signal_source()
 
     def _snapshot(self) -> RunSnapshot:
         state = self._state

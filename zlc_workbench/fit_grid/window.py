@@ -12,7 +12,6 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from zlc_data import Selection
 from zlc_frontend import (
     BoardFrame,
-    DataFigure,
     FigurePanelRegion,
     FitGridCellSummary,
     FitGridModel,
@@ -22,6 +21,13 @@ from zlc_frontend import (
     RadialGaussianImageFitPanel,
 )
 from zlc_frontend.display_range import RelimMode
+from zlc_frontend.fit_grid_render import (
+    FitGridBoardFront,
+    FitGridRenderSession,
+    fit_grid_join_identity,
+    fit_grid_panel_id,
+    reframe_fit_image_grid_front,
+)
 from zlc_frontend.encoded_raster import EncodedRasterDocument
 from zlc_frontend.image_display import (
     image_display_for_viewport,
@@ -30,6 +36,7 @@ from zlc_frontend.image_display import (
     image_display_from_form,
     image_viewport_for_display_state,
 )
+from zlc_frontend.plot_layout import panel_surface_geometry
 from zlc_frontend.qt_widgets import (
     AxisLayoutNavigator,
     FluentButton,
@@ -42,6 +49,7 @@ from zlc_frontend.qt_widgets import (
     ORANGE,
     FrozenRasterView,
     QtRasterBoard,
+    RasterPixelRatioObserver,
     runtime_range_placeholders,
     FluentSettingsPopupAnchor,
     signals_blocked,
@@ -59,12 +67,10 @@ from zlc_storage.paths import user_output_path
 from zlc_workbench.frozen_raster import FrozenRasterWindow
 from zlc_workbench.window_runtime import cancel_export_commits, error_summary
 
-from .projection import _fit_grid_join_identity, _fit_panel_id, _grid_columns
-from .render_lane import (
+from .worker_jobs import (
     _export_grid_view,
     _export_typed_grid_view,
     _load_grid_view,
-    _reframe_existing_image_panels,
     _rerasterize_grid_view,
 )
 
@@ -90,12 +96,11 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._navigator: AxisLayoutNavigator | None = None
         self._page: FitGridPage | None = None
         self._page_panels: tuple[RadialGaussianImageFitPanel, ...] = ()
-        self._page_frame: BoardFrame | None = None
-        self._page_color_limits: tuple[float, float] | None = None
+        self._page_front: FitGridBoardFront | None = None
         self._page_encoded_bundle: EncodedRasterDocument | None = None
         self._page_regions: tuple[FigurePanelRegion, ...] = ()
         self._current_panels: tuple[RadialGaussianImageFitPanel, ...] = ()
-        self._current_frame: BoardFrame | None = None
+        self._current_front: FitGridBoardFront | None = None
         self._current_encoded_bundle: EncodedRasterDocument | None = None
         self._regions: tuple[FigurePanelRegion, ...] = ()
         self._view_family: str | None = None
@@ -105,6 +110,10 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._request_revision = 0
         self._active_revision = 0
         self._active_kind: str | None = "page"
+        self._active_view_request = None
+        self._surface_view_retry = None
+        self._surface_render_pending = False
+        self._surface_revision = 0
         self._layout_generation = -1
         self._display = ImageDisplayState()
         self._current_color_limits: tuple[float, float] | None = None
@@ -121,7 +130,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
         ] = {}
         self._bound_panel_ids: set[str] = set()
         self._export_commit_lock = threading.Lock()
-
         super().__init__(
             None,
             window_title="Saved Fit Grid",
@@ -130,6 +138,19 @@ class SavedFitGridWindow(FrozenRasterWindow):
             object_prefix="savedFitGrid",
             subject="SAVED FIT GRID",
         )
+        self._surface_pixel_ratio_observer = RasterPixelRatioObserver(
+            self,
+            self._apply_surface_pixel_ratio,
+        )
+        self._surface_geometry = panel_surface_geometry(
+            "2x2",
+            pixel_ratio=self._surface_pixel_ratio_observer.current_ratio,
+        )
+        self._render_session = FitGridRenderSession(
+            size_name=self._surface_geometry.size_name,
+            pixel_ratio=self._surface_geometry.pixel_ratio,
+        )
+        self._set_worker_release(self._render_session.close)
 
         self._retire_tab_pages()
         self._live_page = QtWidgets.QWidget(self._tabs)
@@ -143,7 +164,18 @@ class SavedFitGridWindow(FrozenRasterWindow):
         )
         self._board_widget.setObjectName("savedFitGridBoard")
         self._board_widget.setMinimumSize(480, 320)
-        live_layout.addWidget(self._board_widget, 1)
+        self._typed_scroll = FluentScrollArea(self._live_page)
+        self._typed_scroll.setObjectName("savedFitGridTypedScroll")
+        self._typed_scroll.setWidgetResizable(False)
+        self._typed_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAsNeeded
+        )
+        self._typed_scroll.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAsNeeded
+        )
+        self._typed_scroll.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        self._typed_scroll.setWidget(self._board_widget)
+        live_layout.addWidget(self._typed_scroll, 1)
         self._encoded_board = FrozenRasterView(
             "saved-fit-generic",
             self._live_page,
@@ -295,9 +327,13 @@ class SavedFitGridWindow(FrozenRasterWindow):
             )
         return (
             self._view_family == "typed-image"
-            and self._current_frame is not None
+            and self._current_front is not None
             and self._board_widget.has_front
-            and self._board_widget.front_frame is self._current_frame
+            and self._board_widget.front_frame is self._current_front.frame
+            and (
+                self._board_widget.width(),
+                self._board_widget.height(),
+            ) == self._current_front.logical_size
         )
 
     def _open_display_settings(self) -> None:
@@ -327,19 +363,24 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._navigation_host.layout().insertWidget(1, navigator)
         self._candidate_changed()
 
-    def _frame_matches_display_revision(
+    def _front_matches_display_revision(
         self,
-        frame: BoardFrame | None = None,
+        front: FitGridBoardFront | None = None,
     ) -> bool:
-        candidate = self._current_frame if frame is None else frame
+        candidate = self._current_front if front is None else front
         if candidate is None:
             return False
-        if candidate is self._current_frame and (
+        frame = candidate.frame
+        if candidate is self._current_front and (
             not self._board_widget.has_front
-            or self._board_widget.front_frame is not candidate
+            or self._board_widget.front_frame is not frame
+            or (
+                self._board_widget.width(),
+                self._board_widget.height(),
+            ) != candidate.logical_size
         ):
             return False
-        for panel in candidate.panels:
+        for panel in frame.panels:
             presentations = {
                 item.panel_id: item
                 for item in panel.coherence_stamp.presentations
@@ -356,18 +397,11 @@ class SavedFitGridWindow(FrozenRasterWindow):
         return True
 
     def _visible_image_color_limits(self) -> tuple[float, float] | None:
-        if not self._frame_matches_display_revision():
+        if not self._front_matches_display_revision():
             return None
-        frame = self._current_frame
-        assert frame is not None
-        limits = {
-            panel.display_payload.color_limits
-            for panel in frame.panels
-            if isinstance(panel.display_payload, ImagePanelPayload)
-        }
-        if len(limits) != 1:
-            raise RuntimeError("saved-fit grid front escaped its shared color scale")
-        return next(iter(limits))
+        front = self._current_front
+        assert front is not None
+        return front.color_limits
 
     def _reload_image_display_editor(
         self,
@@ -423,7 +457,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 raise ValueError("image display editor does not belong to this window")
             if self._closing or self._future is not None:
                 raise RuntimeError("saved-fit display already has active work")
-            if not self._frame_matches_display_revision():
+            if not self._front_matches_display_revision():
                 raise RuntimeError("saved-fit display has no current exact front")
             if base_revision != self._display.revision:
                 raise RuntimeError(
@@ -453,7 +487,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
     ) -> bool:
         return (
             isinstance(origin, PanelInteractionOrigin)
-            and self._frame_matches_display_revision()
+            and self._front_matches_display_revision()
             and origin.panel_id in self._bound_panel_ids
             and self._board_widget.visible_image_origin(origin.panel_id) == origin
             and origin.presentation.panel_revision == self._display.revision
@@ -623,38 +657,53 @@ class SavedFitGridWindow(FrozenRasterWindow):
                     panel_id=panel.panel_id,
                 )
 
-    def _present_typed_frame(
+    def _present_typed_front(
         self,
-        frame: BoardFrame,
+        front: FitGridBoardFront,
         panels: tuple[RadialGaussianImageFitPanel, ...],
-        *,
-        color_limits: tuple[float, float],
     ) -> None:
         if self._view_family not in (None, "typed-image"):
             raise RuntimeError("saved-fit view family changed within one exact session")
+        if not isinstance(front, FitGridBoardFront):
+            raise TypeError("saved-fit presentation requires FitGridBoardFront")
+        if front.surface_geometry != self._surface_geometry:
+            raise ValueError("saved-fit front belongs to another display surface")
+        frame = front.frame
         panel_ids = tuple(panel.panel_id for panel in frame.panels)
-        if panel_ids != tuple(_fit_panel_id(panel) for panel in panels):
+        if panel_ids != tuple(fit_grid_panel_id(panel) for panel in panels):
             raise ValueError("saved-fit frame order differs from projected panels")
-        front = self._board_widget.front_frame
-        needs_stage = tuple(self._board_widget.panel_ids) != panel_ids or (
-            front is not None
-            and (front.board_id, front.layout_generation)
-            != (frame.board_id, frame.layout_generation)
-        )
-        if needs_stage:
-            self._board_widget.stage_layout(
-                panel_ids,
-                board_id=frame.board_id,
-                layout_generation=frame.layout_generation,
-                columns=_grid_columns(len(panel_ids)),
+        painted = self._board_widget.front_frame
+        needs_stage = (
+            not self._board_widget.has_front
+            or tuple(self._board_widget.panel_ids) != panel_ids
+            or (
+                painted is not None
+                and (painted.board_id, painted.layout_generation)
+                != (frame.board_id, frame.layout_generation)
             )
-        self._board_widget.present(frame)
+        )
+        self._board_widget.setUpdatesEnabled(False)
+        try:
+            if needs_stage:
+                self._board_widget.stage_layout(
+                    panel_ids,
+                    board_id=frame.board_id,
+                    layout_generation=frame.layout_generation,
+                    columns=front.columns,
+                )
+            self._board_widget.present(frame)
+            self._board_widget.setFixedSize(*front.logical_size)
+        finally:
+            self._board_widget.setUpdatesEnabled(True)
+        self._board_widget.updateGeometry()
+        self._board_widget.update()
         self._view_family = "typed-image"
         self._encoded_scroll.hide()
+        self._typed_scroll.show()
         self._board_widget.show()
         self._current_panels = tuple(panels)
-        self._current_frame = frame
-        self._current_color_limits = color_limits
+        self._current_front = front
+        self._current_color_limits = front.color_limits
         self._layout_generation = frame.layout_generation
         self._sync_panel_bindings(frame)
         self._pending_image_interaction_origin = None
@@ -674,13 +723,13 @@ class SavedFitGridWindow(FrozenRasterWindow):
         )
         self._encoded_board.adjustSize()
         self._view_family = "encoded"
-        self._board_widget.hide()
+        self._typed_scroll.hide()
         self._encoded_scroll.show()
         self._current_encoded_bundle = bundle
 
     def _set_selector_enabled(self, enabled: bool) -> None:
         try:
-            if enabled and not self._frame_matches_display_revision():
+            if enabled and not self._front_matches_display_revision():
                 raise RuntimeError("selector has no current exact IMAGE front")
             self._board_widget.set_selectors_enabled(bool(enabled))
         except BaseException as error:
@@ -730,9 +779,9 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._overview_button.setEnabled(
             enabled
             and not self._showing_page
-            and self._page_frame is not None
+            and self._page_front is not None
         )
-        front_ready = enabled and self._frame_matches_display_revision()
+        front_ready = enabled and self._front_matches_display_revision()
         healthy = False
         for panel_id in self._bound_panel_ids:
             ready = (
@@ -800,9 +849,16 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._request_revision += 1
         self._active_revision = self._request_revision
         self._active_kind = kind
+        self._active_view_request = (
+            kind,
+            page_address,
+            cell_selection,
+            layout_generation,
+        )
         self._requested_selection = cell_selection
         if not self._submit_future(
             _load_grid_view,
+            self._render_session,
             self._view_loader,
             self._reference,
             page_address,
@@ -814,6 +870,8 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._previous_relim_mode,
             layout_generation,
             self._cancelled,
+            self._surface_geometry,
+            self._surface_revision,
         ):
             self._active_kind = None
             self._set_controls_enabled(True)
@@ -832,6 +890,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._active_kind = kind
         submitted = self._submit_future(
             _rerasterize_grid_view,
+            self._render_session,
             tuple(panels),
             self._display,
             baseline_color_limits,
@@ -839,10 +898,68 @@ class SavedFitGridWindow(FrozenRasterWindow):
             layout_generation,
             self._active_revision,
             self._cancelled,
+            self._surface_geometry,
+            self._surface_revision,
         )
         if not submitted:
             self._active_kind = None
         return submitted
+
+    def _apply_surface_pixel_ratio(self, ratio: float) -> None:
+        """Invalidate the old surface and author one exact replacement."""
+
+        if self._closing:
+            return
+        geometry = panel_surface_geometry("2x2", pixel_ratio=ratio)
+        if geometry == self._surface_geometry:
+            return
+        self._surface_geometry = geometry
+        self._surface_revision += 1
+        if self._future is not None and self._active_kind in ("page", "focus"):
+            self._surface_view_retry = self._active_view_request
+        else:
+            self._surface_render_pending = True
+        if self._view_family == "typed-image":
+            self._board_widget.clear()
+            self._page_front = None
+            self._current_front = None
+            self._set_controls_enabled(False)
+        self._start_surface_update()
+
+    def _start_surface_update(self) -> None:
+        if self._future is not None or self._closing:
+            return
+        retry = self._surface_view_retry
+        if retry is not None:
+            self._surface_view_retry = None
+            kind, page_address, cell_selection, layout_generation = retry
+            self._submit_view(
+                kind,
+                page_address=page_address,
+                cell_selection=cell_selection,
+                layout_generation=layout_generation,
+            )
+            return
+        if not self._surface_render_pending:
+            return
+        self._surface_render_pending = False
+        if self._view_family != "typed-image" or not self._current_panels:
+            return
+        self._status.setText("RENDERING DISPLAY SURFACE")
+        self._diagnostic.setText("")
+        self._set_controls_enabled(False)
+        kind = "display-page" if self._showing_page else "display-focus"
+        if not self._submit_grid_reraster(
+            kind,
+            self._current_panels,
+            layout_generation=self._layout_generation,
+            previous_relim_mode=self._previous_relim_mode,
+            baseline_color_limits=self._current_color_limits,
+        ):
+            self._set_controls_enabled(True)
+
+    def _after_worker_completion(self) -> None:
+        self._start_surface_update()
 
     def _start_page(self, address: tuple[int, ...]) -> None:
         if self._future is not None or self._closing:
@@ -879,7 +996,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             (
                 candidate
                 for candidate in self._page_panels
-                if _fit_panel_id(candidate) == panel_id
+                if fit_grid_panel_id(candidate) == panel_id
             ),
             None,
         )
@@ -936,7 +1053,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             return
         model = self._model
         if model is None or (
-            self._view_family == "typed-image" and self._page_frame is None
+            self._view_family == "typed-image" and self._page_front is None
         ) or (
             self._view_family == "encoded"
             and self._page_encoded_bundle is None
@@ -978,35 +1095,32 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self,
         panel: RadialGaussianImageFitPanel,
     ) -> None:
-        page_frame = self._page_frame
+        page_front = self._page_front
         model = self._model
-        if page_frame is None or model is None:
+        if page_front is None or model is None:
             return
-        panel_id = _fit_panel_id(panel)
-        if self._frame_matches_display_revision(page_frame):
+        panel_id = fit_grid_panel_id(panel)
+        if self._front_matches_display_revision(page_front):
             self._request_revision += 1
-            frame = _reframe_existing_image_panels(
-                page_frame,
+            front = reframe_fit_image_grid_front(
+                page_front,
                 (panel,),
                 layout_generation=self._layout_generation + 1,
                 sequence=self._request_revision,
             )
-            page_color_limits = self._page_color_limits
-            payload = frame.panels[0].display_payload
+            payload = front.frame.panels[0].display_payload
             if (
-                page_color_limits is None
-                or not isinstance(payload, ImagePanelPayload)
-                or payload.color_limits != page_color_limits
+                not isinstance(payload, ImagePanelPayload)
+                or payload.color_limits != page_front.color_limits
             ):
                 self._diagnostic.setText(
                     "Cached fit cell differs from its exact page colour scale"
                 )
                 return
             try:
-                self._present_typed_frame(
-                    frame,
+                self._present_typed_front(
+                    front,
                     (panel,),
-                    color_limits=page_color_limits,
                 )
             except BaseException as error:
                 self._status.setText("FIT CELL INVALID")
@@ -1034,7 +1148,9 @@ class SavedFitGridWindow(FrozenRasterWindow):
             (panel,),
             layout_generation=self._layout_generation + 1,
             previous_relim_mode=self._previous_relim_mode,
-            baseline_color_limits=self._page_color_limits,
+            baseline_color_limits=(
+                None if self._page_front is None else self._page_front.color_limits
+            ),
         ):
             self._set_controls_enabled(True)
 
@@ -1070,35 +1186,34 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._diagnostic.setText("")
             self._set_controls_enabled(True)
             return
-        frame = self._page_frame
+        front = self._page_front
         if (
             self._future is not None
             or model is None
             or page is None
-            or frame is None
+            or front is None
             or self._showing_page
         ):
             return
-        if self._frame_matches_display_revision(frame):
+        if self._front_matches_display_revision(front):
             self._request_revision += 1
-            restored = _reframe_existing_image_panels(
-                frame,
+            restored = reframe_fit_image_grid_front(
+                front,
                 self._page_panels,
                 layout_generation=self._layout_generation + 1,
                 sequence=self._request_revision,
             )
             try:
-                self._present_typed_frame(
+                self._present_typed_front(
                     restored,
                     self._page_panels,
-                    color_limits=self._page_color_limits or (0.0, 1.0),
                 )
             except BaseException as error:
                 self._status.setText("DISPLAY FAILED")
                 self._diagnostic.setText(error_summary(error))
                 self._set_controls_enabled(True)
                 return
-            self._page_frame = restored
+            self._page_front = restored
             self._showing_page = True
             self._current_selection = None
             self._requested_selection = None
@@ -1119,7 +1234,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._page_panels,
             layout_generation=self._layout_generation + 1,
             previous_relim_mode=self._previous_relim_mode,
-            baseline_color_limits=self._page_color_limits,
+            baseline_color_limits=front.color_limits,
         ):
             self._set_controls_enabled(True)
 
@@ -1128,7 +1243,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._future is not None
             or self._closing
             or (
-                self._current_frame is None
+                self._current_front is None
                 and self._current_encoded_bundle is None
             )
         ):
@@ -1154,20 +1269,20 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 raise RuntimeError("saved-fit export has no compact model")
             typed_export = self._view_family == "typed-image"
             if typed_export:
-                frame = self._current_frame
+                front = self._current_front
                 panels = self._current_panels
-                color_limits = self._current_color_limits
                 if (
-                    frame is None
+                    front is None
                     or not panels
-                    or color_limits is None
-                    or not self._frame_matches_display_revision(frame)
+                    or not self._front_matches_display_revision(front)
                 ):
                     raise RuntimeError("saved-fit typed export has no exact current front")
-                panel_ids = tuple(_fit_panel_id(panel) for panel in panels)
+                frame = front.frame
+                color_limits = front.color_limits
+                panel_ids = tuple(fit_grid_panel_id(panel) for panel in panels)
                 if panel_ids != tuple(panel.panel_id for panel in frame.panels):
                     raise ValueError("saved-fit export panel order differs from its front")
-                _artifact, _inputs, expected_join = _fit_grid_join_identity(
+                _artifact, _inputs, expected_join = fit_grid_join_identity(
                     panels,
                     panel_ids,
                 )
@@ -1202,7 +1317,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 panels,
                 self._display,
                 color_limits,
-                _grid_columns(len(panels)),
+                front.columns,
                 expected_join,
                 Path(destination),
                 self._active_revision,
@@ -1233,6 +1348,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
     def _accept_view_result(self, result, kind: str, revision: int) -> None:
         (
             result_revision,
+            surface_revision,
             model,
             model_identity,
             page,
@@ -1241,8 +1357,11 @@ class SavedFitGridWindow(FrozenRasterWindow):
             summary,
             projection,
         ) = result
-        if result_revision != revision or revision != self._request_revision:
-            self._set_controls_enabled(True)
+        if (
+            result_revision != revision
+            or revision != self._request_revision
+            or surface_revision != self._surface_revision
+        ):
             return
         if self._model is None:
             if not isinstance(model, FitGridModel):
@@ -1269,19 +1388,17 @@ class SavedFitGridWindow(FrozenRasterWindow):
             if not isinstance(page, FitGridPage) or cell_summary is not None:
                 raise TypeError("saved-fit page result is invalid")
             if family == "typed-image":
-                if len(projection) != 4:
+                if len(projection) != 3:
                     raise TypeError("typed saved-fit projection has invalid fields")
-                _tag, panels, frame, color_limits = projection
+                _tag, panels, front = projection
                 next_panels = tuple(panels)
-                self._present_typed_frame(
-                    frame,
+                self._present_typed_front(
+                    front,
                     next_panels,
-                    color_limits=color_limits,
                 )
                 self._page_panels = next_panels
-                self._page_frame = frame
-                self._page_color_limits = color_limits
-                self._current_frame = self._page_frame
+                self._page_front = front
+                self._current_front = self._page_front
             else:
                 if len(projection) != 3:
                     raise TypeError("encoded saved-fit projection has invalid fields")
@@ -1302,13 +1419,12 @@ class SavedFitGridWindow(FrozenRasterWindow):
             if page is not None or not isinstance(cell_summary, FitGridCellSummary):
                 raise TypeError("saved-fit focus result is invalid")
             if family == "typed-image":
-                if len(projection) != 4:
+                if len(projection) != 3:
                     raise TypeError("typed saved-fit projection has invalid fields")
-                _tag, panels, frame, color_limits = projection
-                self._present_typed_frame(
-                    frame,
+                _tag, panels, front = projection
+                self._present_typed_front(
+                    front,
                     tuple(panels),
-                    color_limits=color_limits,
                 )
             else:
                 if len(projection) != 3:
@@ -1344,13 +1460,16 @@ class SavedFitGridWindow(FrozenRasterWindow):
     ) -> None:
         (
             result_revision,
+            surface_revision,
             panels,
             display,
-            frame,
-            color_limits,
+            front,
         ) = result
-        if result_revision != revision or revision != self._request_revision:
-            self._set_controls_enabled(True)
+        if (
+            result_revision != revision
+            or revision != self._request_revision
+            or surface_revision != self._surface_revision
+        ):
             return
         if display != self._display:
             raise ValueError("saved-fit reraster returned another display revision")
@@ -1362,15 +1481,13 @@ class SavedFitGridWindow(FrozenRasterWindow):
             if page is None:
                 raise RuntimeError("saved-fit page reraster has no page metadata")
             candidate_panels = tuple(panels)
-            self._present_typed_frame(
-                frame,
+            self._present_typed_front(
+                front,
                 candidate_panels,
-                color_limits=color_limits,
             )
             self._page_panels = candidate_panels
-            self._page_frame = frame
-            self._page_color_limits = color_limits
-            self._current_frame = self._page_frame
+            self._page_front = front
+            self._current_front = self._page_front
             self._showing_page = True
             self._current_selection = None
             self._requested_selection = None
@@ -1390,10 +1507,9 @@ class SavedFitGridWindow(FrozenRasterWindow):
                 selection = self._requested_selection
             if panel.selection != selection:
                 raise ValueError("saved-fit focus reraster changed exact selection")
-            self._present_typed_frame(
-                frame,
+            self._present_typed_front(
+                front,
                 focused,
-                color_limits=color_limits,
             )
             self._showing_page = False
             self._current_selection = selection
@@ -1505,6 +1621,9 @@ class SavedFitGridWindow(FrozenRasterWindow):
         ):
             button.setEnabled(False)
         self._settings_popup.hide()
+        self._surface_view_retry = None
+        self._surface_render_pending = False
+        self._surface_pixel_ratio_observer.detach()
         super().shutdown()
 
     def _forget_presented_pages(self) -> None:
@@ -1512,12 +1631,11 @@ class SavedFitGridWindow(FrozenRasterWindow):
 
         self._page = None
         self._page_panels = ()
-        self._page_frame = None
-        self._page_color_limits = None
+        self._page_front = None
         self._page_encoded_bundle = None
         self._page_regions = ()
         self._current_panels = ()
-        self._current_frame = None
+        self._current_front = None
         self._current_encoded_bundle = None
         self._regions = ()
 

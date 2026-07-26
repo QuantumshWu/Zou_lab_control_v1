@@ -27,13 +27,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import threading
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping
 
-from zlc_data import OwnedSnapshot
-from zlc_frontend.figure_outputs import (
-    FitParameterMetadata,
-    SelectorAxisMetadata,
-)
+from zlc_data import DataTransformSpec, OwnedSnapshot
+from zlc_frontend.figure_outputs import FigureOutputPresentation
 from zlc_frontend.site_map import SiteMapPresentation
 from zlc_neutral_atom.dataset_output import (
     DatasetOutputDeclaration,
@@ -68,9 +65,8 @@ class ConsoleSignalValue:
     epoch_id: str                   # causation domain the run belongs to
     join_digest: str                # exact immutable source/coherence digest
     transient: bool = False         # withdrawn with its live producer
-    presentation: (
-        SiteMapPresentation | SelectorAxisMetadata | FitParameterMetadata | None
-    ) = None
+    presentation: SiteMapPresentation | FigureOutputPresentation | None = None
+    source_transform: DataTransformSpec | None = None
 
     def __post_init__(self) -> None:
         name = canonical_text(self.name, "signal name")
@@ -89,9 +85,14 @@ class ConsoleSignalValue:
             raise TypeError("signal transient flag must be bool")
         if self.presentation is not None and not isinstance(
             self.presentation,
-            (SiteMapPresentation, SelectorAxisMetadata, FitParameterMetadata),
+            (SiteMapPresentation, FigureOutputPresentation),
         ):
             raise TypeError("Console signal presentation has an unknown type")
+        if self.source_transform is not None:
+            if not isinstance(self.source_transform, DataTransformSpec):
+                raise TypeError("Console signal source_transform has an unknown type")
+            if not self.source_transform.operations:
+                raise ValueError("Console signal source_transform must not be empty")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "source", source)
         object.__setattr__(self, "run_id", run_id)
@@ -717,6 +718,7 @@ class ConsoleDataPlane:
         self._lock = threading.Lock()
         self._processor_lane = _LatestOnlyProcessorLane()
         self._slots: dict[int, tuple[object, object]] = {}
+        self._slot_signal_names: dict[int, frozenset[str]] = {}
         self._dirty: set[int] = set()
         self._cache: dict[int, dict[str, ConsoleSignalValue]] = {}
         self._finals: dict[
@@ -728,12 +730,33 @@ class ConsoleDataPlane:
         self._failures: dict[int, str] = {}
         self._membership_changed = False
         self._closed = False
+        self._reactive_processor_sources: dict[int, str] = {}
+        self._reactive_source_counts: dict[str, int] = {}
+        self._request_owner_wake: Callable[[], None] | None = None
         empty = MappingProxyType({})
         self._front = ConsoleDataFront(signals=empty, failures=empty)
         self._front_source_components: Mapping[
             str,
             _ProcessorSourceComponent,
         ] = empty
+
+    def bind_owner_wake(self, request_owner_wake: Callable[[], None]) -> None:
+        """Bind the sole GUI-owner wake before live producers are attached.
+
+        A manually driven/headless data plane may remain unbound and call
+        :meth:`freeze` explicitly.  A TaskConsole binds this once, so producer
+        revisions and Processor completions cannot depend on an unrelated
+        display timer beat.
+        """
+
+        if not callable(request_owner_wake):
+            raise TypeError("request_owner_wake must be callable")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("console data plane is closed")
+            if self._request_owner_wake is not None:
+                raise RuntimeError("console data plane owner wake is already bound")
+            self._request_owner_wake = request_owner_wake
 
     # ------------------------------------------------------------ membership
     def attach(self, node, slot) -> None:
@@ -745,6 +768,7 @@ class ConsoleDataPlane:
             )
         _node_instance_id(node)
         key = id(node)
+        signal_names = frozenset(_node_declared_signal_names(node))
         with self._lock:
             if self._closed:
                 raise RuntimeError("console data plane is closed")
@@ -753,6 +777,7 @@ class ConsoleDataPlane:
                     "console node already owns a run-scoped live route"
                 )
             self._slots[key] = (node, slot)
+            self._slot_signal_names[key] = signal_names
             # The view factory attaches before the domain binds its materializer.
             # Only the slot's first real revision marks it dirty; trying to freeze
             # here would turn the normal ARMED/no-frame-yet state into a false
@@ -770,6 +795,18 @@ class ConsoleDataPlane:
         with self._lock:
             if key in self._slots:
                 self._dirty.add(key)
+                # A display-only producer is sampled at its panel cadence.  A
+                # reactive Processor has no display clock, so its input event
+                # must wake the owner immediately to route that exact revision.
+                signal_names = self._slot_signal_names[key]
+                wake = self._request_owner_wake if any(
+                    name in self._reactive_source_counts
+                    for name in signal_names
+                ) else None
+            else:
+                wake = None
+        if wake is not None:
+            wake()
 
     def attach_latest_only_processor(
         self,
@@ -780,6 +817,7 @@ class ConsoleDataPlane:
     ) -> None:
         """Attach one processor to an explicit already-accepted source revision."""
 
+        source_name = canonical_text(source_name, "processor source name")
         with self._lock:
             if self._closed:
                 raise RuntimeError("console data plane is closed")
@@ -793,6 +831,12 @@ class ConsoleDataPlane:
             initial_source,
             initial_component,
         )
+        with self._lock:
+            key = id(node)
+            self._reactive_processor_sources[key] = source_name
+            self._reactive_source_counts[source_name] = (
+                self._reactive_source_counts.get(source_name, 0) + 1
+            )
 
     def _source_component_locked(
         self,
@@ -833,6 +877,8 @@ class ConsoleDataPlane:
         """Stop routing new revisions to one processor."""
 
         idle = self._processor_lane.cancel(node)
+        with self._lock:
+            self._remove_reactive_processor_locked(id(node))
         self.withdraw_processor(node)
         return idle
 
@@ -848,6 +894,16 @@ class ConsoleDataPlane:
         with self._lock:
             if self._processors.pop(key, None) is not None:
                 self._membership_changed = True
+
+    def _remove_reactive_processor_locked(self, key: int) -> None:
+        source_name = self._reactive_processor_sources.pop(key, None)
+        if source_name is None:
+            return
+        remaining = self._reactive_source_counts[source_name] - 1
+        if remaining:
+            self._reactive_source_counts[source_name] = remaining
+        else:
+            del self._reactive_source_counts[source_name]
 
     def publish_final(
         self,
@@ -1060,9 +1116,13 @@ class ConsoleDataPlane:
             raise ValueError("use withdraw_panel() to remove panel outputs")
         frozen: dict[str, ConsoleSignalValue] = {}
         for raw_name, value in values.items():
-            output_name = str(raw_name)
             if not isinstance(value, FigureDerivedSignal):
                 raise TypeError("panel values must contain FigureDerivedSignal")
+            output_name = value.presentation.name
+            if raw_name != output_name:
+                raise ValueError(
+                    "Figure output mapping key differs from its frontend presentation"
+                )
             if value.source_ref != getattr(source.snapshot, "ref", None):
                 raise ValueError("Figure output belongs to another source revision")
             name = panel_signal_key(identity, output_name)
@@ -1080,7 +1140,8 @@ class ConsoleDataPlane:
                     value.derivation_digest,
                 ),
                 transient=False,
-                presentation=value.metadata,
+                presentation=value.presentation,
+                source_transform=value.source_transform,
             )
         with self._lock:
             if self._closed:
@@ -1102,7 +1163,9 @@ class ConsoleDataPlane:
         key = id(node)
         self._processor_lane.detach(node)
         with self._lock:
+            self._remove_reactive_processor_locked(key)
             entry = self._slots.pop(key, None)
+            self._slot_signal_names.pop(key, None)
             self._dirty.discard(key)
             self._cache.pop(key, None)
             self._finals.pop(key, None)
@@ -1119,6 +1182,7 @@ class ConsoleDataPlane:
         key = id(node)
         with self._lock:
             entry = self._slots.pop(key, None)
+            self._slot_signal_names.pop(key, None)
             self._dirty.discard(key)
             self._cache.pop(key, None)
             self._failures.pop(key, None)
@@ -1137,13 +1201,17 @@ class ConsoleDataPlane:
             self._closed = True
             entries = tuple(self._slots.values())
             self._slots.clear()
+            self._slot_signal_names.clear()
             self._dirty.clear()
             self._cache.clear()
             self._finals.clear()
             self._processors.clear()
             self._panels.clear()
             self._failures.clear()
+            self._reactive_processor_sources.clear()
+            self._reactive_source_counts.clear()
             self._membership_changed = True
+            self._request_owner_wake = None
         for _node, slot in entries:
             slot.close()
         self._processor_lane.close()

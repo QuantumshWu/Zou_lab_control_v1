@@ -22,6 +22,7 @@ from zlc_data import (
     CellValidity,
     ComponentValidity,
     DataBlock,
+    DatasetComponentValidity,
     DatasetRevision,
     DatasetSchema,
     INVALID,
@@ -37,6 +38,8 @@ from zlc_data import (
     dataset_schema_to_tree,
     expand_value_validity,
     expand_component_validity,
+    immutable_array,
+    is_intrinsically_immutable_array,
 )
 
 
@@ -70,6 +73,45 @@ def test_scalar_has_the_canonical_length_one_carrier_axis():
     assert value.values.shape == (1,)
     with pytest.raises(ValueError, match="shape"):
         Value(np.array(2.5), VALID, scalar_schema)
+
+
+def test_intrinsically_immutable_strided_views_cross_value_and_dataset_without_copy():
+    mutable = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    frozen = immutable_array(
+        mutable,
+        dtype=np.dtype("<u2"),
+        shape=mutable.shape,
+    )
+    transposed = frozen.T
+    y = axis("camera.transposed.y", SPATIAL_Y, 4)
+    x = axis("camera.transposed.x", SPATIAL_X, 3)
+    value_schema = ValueSchema(
+        (y, x),
+        ValidityContract.value(),
+        np.dtype("<u2"),
+        "count",
+    )
+    value = Value(transposed, VALID, value_schema)
+    assert np.shares_memory(value.values, transposed)
+    assert value.values.strides == transposed.strides
+    assert is_intrinsically_immutable_array(value.values)
+
+    repeat = axis("camera.transposed.repeat", REPEAT, 1)
+    schema = DatasetSchema(repeat, (), PointLayout.rect_c(()), value_schema)
+    block = DataBlock(
+        BlockId("immutable-transpose"),
+        DatasetRevision(0),
+        value.values.reshape(schema.physical_shape),
+        VALID,
+        schema,
+    )
+    assert np.shares_memory(block.values, value.values)
+    assert is_intrinsically_immutable_array(block.values)
+
+    mutable[:] = 0
+    assert np.any(block.values != 0)
+    with pytest.raises(ValueError):
+        block.values.setflags(write=True)
 
 
 @pytest.mark.parametrize("layout", [PointLayout.rect_c((2, 3)), PointLayout.rect_f((2, 3))])
@@ -144,7 +186,7 @@ def test_equal_sized_component_axes_broadcast_by_identity_not_shape():
 def test_dataset_component_validity_includes_repeat_and_physical_point_axes():
     schema = dataset_schema(component_validity=True)
     site_like_x = schema.cell_schema.data_axes[1]
-    validity = ComponentValidity(
+    validity = DatasetComponentValidity(
         (site_like_x.axis_id,),
         np.ones((2, 3, 4), dtype=bool),
     )

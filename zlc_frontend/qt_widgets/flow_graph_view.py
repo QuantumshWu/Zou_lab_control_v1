@@ -28,9 +28,11 @@ and a large graph simply scrolls.
 
 from __future__ import annotations
 
-from typing import Mapping, Protocol, runtime_checkable
+from typing import Mapping
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+from ..flow_graph import FlowGraph, FlowGraphEdge, FlowGraphNode
 
 from .fluent import fluent_font_size, scaled_px
 from .style import ACCENT, DIVIDER, FONT, GREEN, GREY, ORANGE, TEXT, YELLOW
@@ -58,37 +60,16 @@ def _role_style(role: str) -> tuple[str, str]:
     return _ROLE_STYLE.get(str(role), _DEFAULT_STYLE)
 
 
-class _FlowGraphNodeModel(Protocol):
-    node_id: str
-    name: str
-    role: str
-    has_devices: bool
-
-
-class _FlowGraphEdgeModel(Protocol):
-    source_id: str
-    target_id: str
-    signal: str
-    shape: tuple[int, ...] | None
-    role: str
-
-
-@runtime_checkable
-class _FlowGraphModel(Protocol):
-    nodes: tuple[_FlowGraphNodeModel, ...]
-    edges: tuple[_FlowGraphEdgeModel, ...]
-
-
 class FlowGraphView(QtWidgets.QWidget):
     """Paint a current :class:`FlowGraph` as a layered node-link diagram."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._graph: _FlowGraphModel | None = None
+        self._graph: FlowGraph | None = None
         # Laid-out geometry, rebuilt on every set_graph: node id -> QRectF (box), plus the edge list.
         self._boxes: dict[str, QtCore.QRectF] = {}
-        self._layout_nodes: dict[str, _FlowGraphNodeModel] = {}
-        self._layout_edges: tuple[_FlowGraphEdgeModel, ...] = ()
+        self._layout_nodes: dict[str, FlowGraphNode] = {}
+        self._layout_edges: tuple[FlowGraphEdge, ...] = ()
         self._content = QtCore.QSize(scaled_px(320, minimum=200), scaled_px(120, minimum=90))
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.setMinimumSize(self._content)
@@ -109,10 +90,10 @@ class FlowGraphView(QtWidgets.QWidget):
         return scaled_px(34, minimum=26)
 
     @staticmethod
-    def _is_device(node: _FlowGraphNodeModel) -> bool:
+    def _is_device(node: FlowGraphNode) -> bool:
         return node.role == "device"
 
-    def _box_size(self, node: _FlowGraphNodeModel) -> tuple[int, int]:
+    def _box_size(self, node: FlowGraphNode) -> tuple[int, int]:
         """The (w, h) for a node's box -- the compact device size for a ``device`` leaf, the standard node
         size otherwise -- so a single layout routine sizes every box from its role (no per-kind branch at
         the call site)."""
@@ -135,11 +116,11 @@ class FlowGraphView(QtWidgets.QWidget):
         return f
 
     # ------------------------------------------------------------------ public
-    def set_graph(self, graph: _FlowGraphModel | None) -> None:
+    def set_graph(self, graph: FlowGraph | None) -> None:
         """Replace the graph; malformed archive mappings are rejected upstream."""
 
-        if graph is not None and not isinstance(graph, _FlowGraphModel):
-            raise TypeError("graph must implement the typed flow-graph model")
+        if graph is not None and not isinstance(graph, FlowGraph):
+            raise TypeError("graph must be FlowGraph or None")
         self._graph = graph
         self._relayout()
         self.update()
@@ -282,28 +263,28 @@ class FlowGraphView(QtWidgets.QWidget):
 
     def _edge_endpoints(
         self,
-    ) -> list[tuple[_FlowGraphEdgeModel, QtCore.QPointF, QtCore.QPointF]]:
+    ) -> list[tuple[FlowGraphEdge, QtCore.QPointF, QtCore.QPointF]]:
         """Every drawable edge as ``(edge, p1, p2)`` -- the fanned start point on the upstream box's bottom
         edge and the fanned end point on the downstream box's top edge.  Edges sharing ONE downstream target
         fan into DISTINCT points on its top edge (two parents do not both plug into the exact centre); edges
         sharing ONE source fan OUT of distinct points on its bottom edge -- so several signals from the SAME
         producer into the SAME plot read as a spread fan, not one overlapping line.  Shared by the paint and
         the label-placement passes (one source of edge geometry)."""
-        by_target: dict[str, list[_FlowGraphEdgeModel]] = {}
-        by_source: dict[str, list[_FlowGraphEdgeModel]] = {}
+        by_target: dict[str, list[FlowGraphEdge]] = {}
+        by_source: dict[str, list[FlowGraphEdge]] = {}
         for e in self._layout_edges:
             by_target.setdefault(e.target_id, []).append(e)
             by_source.setdefault(e.source_id, []).append(e)
 
         def _fan_x(
             box: QtCore.QRectF,
-            group: list[_FlowGraphEdgeModel],
-            e: _FlowGraphEdgeModel,
+            group: list[FlowGraphEdge],
+            e: FlowGraphEdge,
         ) -> float:
             k, n = group.index(e), max(1, len(group))
             return box.left() + box.width() * (0.2 + 0.6 * (k + 1) / (n + 1))
 
-        out: list[tuple[_FlowGraphEdgeModel, QtCore.QPointF, QtCore.QPointF]] = []
+        out: list[tuple[FlowGraphEdge, QtCore.QPointF, QtCore.QPointF]] = []
         for e in self._layout_edges:
             src = self._boxes[e.source_id]
             dst = self._boxes[e.target_id]
@@ -482,7 +463,7 @@ class FlowGraphView(QtWidgets.QWidget):
             painter.drawText(plate, int(QtCore.Qt.AlignCenter), label)
 
     @staticmethod
-    def _edge_label(edge: _FlowGraphEdgeModel) -> str:
+    def _edge_label(edge: FlowGraphEdge) -> str:
         if not edge.signal:
             return ""
         if edge.shape is None:

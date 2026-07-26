@@ -26,7 +26,7 @@ from zlc_data import (  # noqa: E402
     AxisId,
     AxisSpec,
     BlockId,
-    ComponentValidity,
+    DatasetComponentValidity,
     DataBlock,
     DatasetRevision,
     DatasetSchema,
@@ -155,7 +155,7 @@ def _curve_figure(
         BlockId("u03b-curve-block"),
         DatasetRevision(5),
         values,
-        ComponentValidity((site.axis_id, component.axis_id), valid),
+        DatasetComponentValidity((site.axis_id, component.axis_id), valid),
         schema,
     )
     snapshot = OwnedSnapshot(
@@ -239,6 +239,83 @@ def _wheel(board: QtRasterBoard, delta: int):
     )
     board.wheelEvent(event)
     return event
+
+
+def test_curve_surface_dpr_is_runtime_state_and_never_stretches_old_front(
+    application,
+) -> None:
+    window = open_data_figure_workbench(_curve_figure())
+    try:
+        _until(application, lambda: window.worker_idle and window.raster_ready)
+        board, first_frame, _payload = _typed_front(window)
+        first_geometry = window._surface_geometry
+        first_display = window._display
+
+        window._surface_pixel_ratio_changed(first_geometry.pixel_ratio * 1.5)
+        assert board.front_frame is None
+        assert window._surface_geometry.logical_size == first_geometry.logical_size
+        _until(application, lambda: window.worker_idle and window.raster_ready)
+
+        _board, second_frame, _payload = _typed_front(window)
+        assert second_frame is not first_frame
+        assert window._display == first_display
+        assert (
+            second_frame.panels[0].raster.width,
+            second_frame.panels[0].raster.height,
+        ) == window._surface_geometry.raster_size
+        assert window._surface_geometry.raster_size != first_geometry.raster_size
+        assert (board.width(), board.height()) == first_geometry.logical_size
+    finally:
+        _close(application, window)
+
+
+def test_curve_surface_change_retries_the_same_inflight_display_intent(
+    application,
+    monkeypatch,
+) -> None:
+    from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
+
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    original = SinglePanelAggRenderer.render_interactive_curve
+
+    def block_first_update(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            entered.set()
+            assert release.wait(10.0)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        SinglePanelAggRenderer,
+        "render_interactive_curve",
+        block_first_update,
+    )
+    window = open_data_figure_workbench(_curve_figure())
+    try:
+        _until(application, lambda: window.worker_idle and window.raster_ready)
+        candidate = replace(window._display, revision=window._display.revision + 1)
+        candidate = replace(candidate, x_view=(-1.0, 1.0))
+        window._start_typed_render(candidate)
+        _until(application, entered.is_set)
+
+        previous = window._surface_geometry
+        window._surface_pixel_ratio_changed(previous.pixel_ratio * 1.5)
+        assert window._board_widget.front_frame is None
+        release.set()
+        _until(application, lambda: window.worker_idle and window.raster_ready)
+
+        assert window._display == candidate
+        assert window._surface_geometry.raster_size != previous.raster_size
+        assert window._board_widget.front_frame.panels[0].raster.width == (
+            window._surface_geometry.raster_size[0]
+        )
+        assert calls >= 3
+    finally:
+        release.set()
+        _close(application, window)
 
 
 def test_curve_front_preserves_all_series_axes_validity_and_interacts(
@@ -441,20 +518,20 @@ def test_initial_curve_state_is_checked_against_gui_owned_default(
     application,
     monkeypatch,
 ) -> None:
-    import zlc_workbench.data_figure.render_lane as figure_module
+    import zlc_frontend.data_figure_render as render_module
 
-    original_render = figure_module._render_typed_front
+    original_render = render_module.DataFigureRenderSession.render_front
 
-    def forged_initial_state(*args, **kwargs):
-        front = original_render(*args, **kwargs)
+    def forged_initial_state(self, *args, **kwargs):
+        front = original_render(self, *args, **kwargs)
         return replace(
             front,
             state=CurveDisplayState(revision=1, x_view=(-1.0, 1.0)),
         )
 
     monkeypatch.setattr(
-        figure_module,
-        "_render_typed_front",
+        render_module.DataFigureRenderSession,
+        "render_front",
         forged_initial_state,
     )
     window = open_data_figure_workbench(_curve_figure())

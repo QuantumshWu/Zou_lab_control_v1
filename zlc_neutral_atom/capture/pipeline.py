@@ -19,7 +19,6 @@ from zlc_storage import (
     nonnegative_integer as _nonnegative_integer,
 )
 
-from zlc_neutral_atom.catalog import MeasurementDefinition as _MeasurementDefinition
 from zlc_neutral_atom.devices.camera.contract import (
     CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
 )
@@ -67,21 +66,25 @@ from zlc_neutral_atom.runtime.streams import (
 
 
 @dataclass(frozen=True)
-class BoundMeasurement:
-    definition: _MeasurementDefinition
+class BoundCameraCapture:
+    """Physical camera Port bound to one frozen Dataset/capture contract.
+
+    Logic-node identity deliberately does not live here.  Camera Measurement,
+    MOT field, release/recapture, calibration, and other domain owners may all
+    consume the same physical binding without relabelling it as one another.
+    """
+
     capture_port: BoundCapturePort
     capture_contract: CameraCaptureContract
     capture_spec: FrozenCaptureSpec
 
     def __post_init__(self) -> None:
-        if not isinstance(self.definition, _MeasurementDefinition):
-            raise TypeError("definition must be MeasurementDefinition")
         if not isinstance(self.capture_port, BoundCapturePort):
             raise TypeError("capture_port must be BoundCapturePort")
         if not isinstance(self.capture_contract, CameraCaptureContract):
             raise TypeError("capture_contract must be CameraCaptureContract")
         if self.capture_contract.capability is not self.capture_port.capability:
-            raise ValueError("measurement contract and port must share capability owner")
+            raise ValueError("capture contract and port must share capability owner")
         if not isinstance(self.capture_spec, FrozenCaptureSpec):
             raise TypeError("capture_spec must be FrozenCaptureSpec")
         if (
@@ -100,13 +103,13 @@ class BoundMeasurement:
 @dataclass(frozen=True)
 class MinimalPipelineSpec:
     name: str
-    measurement: BoundMeasurement
+    capture: BoundCameraCapture
     block_id: BlockId
 
     def __post_init__(self) -> None:
         _canonical_text(self.name, "name")
-        if not isinstance(self.measurement, BoundMeasurement):
-            raise TypeError("measurement must be BoundMeasurement")
+        if not isinstance(self.capture, BoundCameraCapture):
+            raise TypeError("capture must be BoundCameraCapture")
         if not isinstance(self.block_id, BlockId):
             raise TypeError("block_id must be BlockId")
 @dataclass(frozen=True)
@@ -160,7 +163,7 @@ class CapturePreviewSpec:
 
         if not isinstance(capture, MinimalPipelineSpec):
             raise TypeError("capture must be MinimalPipelineSpec")
-        contract = capture.measurement.capture_contract
+        contract = capture.capture.capture_contract
         schema = DatasetSchema(
             AxisSpec(
                 AxisId("live-preview.repeat"),
@@ -522,6 +525,35 @@ class ExactCaptureTransaction:
             errors=(*report.errors, *software_errors),
         )
 
+    def release_completed_software(self, result: PipelineResult) -> None:
+        """Release a sealed point transaction before another arm is opened.
+
+        A multi-point application may execute several independently terminal
+        camera arms inside one flat Run.  Hardware completion is already proved
+        by ``PipelineResult``; this operation releases only the completed exact
+        reservation and builder.  It never obtains cleanup hardware authority
+        and is therefore safe to call between point arms during execute.
+        """
+
+        if not isinstance(result, PipelineResult):
+            raise TypeError("completed software release requires PipelineResult")
+        if result.dataset.ref != self.builder.current_ref():
+            raise ValueError("PipelineResult belongs to another capture transaction")
+        if self.preview_dataset is not None or self.preview_port is not None:
+            raise RuntimeError(
+                "a display preview must settle through the Run cleanup boundary"
+            )
+        if self.exact_preview_port is not None:
+            raise RuntimeError(
+                "an exact preview must settle through the Run finalize boundary"
+            )
+        if self.reservation.state not in (
+            ReservationState.COMPLETED,
+            ReservationState.RELEASED,
+        ):
+            raise RuntimeError("capture transaction is not exactly completed")
+        self.builder.close()
+
     def _detach_preview(self, error: BaseException) -> None:
         dataset, self.preview_dataset = self.preview_dataset, None
         port, self.preview_port = self.preview_port, None
@@ -581,7 +613,7 @@ def _capture_preview_spec(
         raise TypeError("preview.spec must be CapturePreviewSpec")
     if not isinstance(getattr(preview, "terminal", None), bool):
         raise TypeError("preview.terminal must be bool")
-    exact_edge = capture.measurement.capture_contract.dataset_edge
+    exact_edge = capture.capture.capture_contract.dataset_edge
     if (
         spec.dataset_edge.schema.cell_schema is not exact_edge.schema.cell_schema
         or spec.dataset_edge.payload_contract is not exact_edge.payload_contract
@@ -592,7 +624,7 @@ def _capture_preview_spec(
             "capture preview must share the exact capture cell schema and event adapter"
         )
     source_ordinals = spec.source_ordinals
-    schedule_size = len(capture.measurement.capture_contract.cell_schedule)
+    schedule_size = len(capture.capture.capture_contract.cell_schedule)
     if source_ordinals is not None and source_ordinals[-1] >= schedule_size:
         raise ValueError(
             "capture preview source_ordinals exceed the frozen cell schedule"
@@ -630,16 +662,23 @@ def _admit_capture_preview(
         raise
 
 
-def _open_exact_capture_transaction(
+def open_exact_capture_transaction(
     spec: MinimalPipelineSpec,
     context: RunContext,
     *,
-    preview: CapturePreviewPort | None,
-    preview_spec: CapturePreviewSpec | None,
+    preview: CapturePreviewPort | None = None,
+    preview_spec: CapturePreviewSpec | None = None,
     exact_preview: ExactDatasetPreviewPort | None = None,
     exact_preview_spec: ExactDatasetPreviewSpec | None = None,
 ) -> ExactCaptureTransaction:
-    """Allocate the single reservation/materializer transaction without touching hardware."""
+    """Open the one exact capture/materializer transaction without touching hardware.
+
+    This is the reusable application boundary for a finite capture that already
+    owns a fully bound ``MinimalPipelineSpec``.  It deliberately returns the
+    concrete transaction rather than a child ``RunPlan`` so a domain Run may
+    coordinate several sequential, independently completed camera arms while
+    retaining ``CaptureSession`` as the sole completion authority.
+    """
 
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
@@ -668,14 +707,14 @@ def _allocate_exact_capture(
 ) -> ExactCaptureTransaction:
     if (exact_preview is None) != (exact_preview_spec is None):
         raise ValueError("exact_preview and exact_preview_spec must be present together")
-    measurement = spec.measurement
-    port = measurement.capture_port
-    contract = measurement.capture_contract
+    camera_capture = spec.capture
+    port = camera_capture.capture_port
+    contract = camera_capture.capture_contract
     session = open_capture_session(
         port,
         contract,
         TraceBinding(context.run_id.value, contract.source_id),
-        measurement.capture_spec,
+        camera_capture.capture_spec,
     )
     reservation = None
     builder = None
@@ -747,7 +786,7 @@ def _allocate_exact_capture(
         raise
 
 
-def _require_passive_external_capture(measurement: BoundMeasurement) -> None:
+def _require_passive_external_capture(capture: BoundCameraCapture) -> None:
     """Admit an exact camera reader whose trigger owner is outside this Run.
 
     A Camera Measurement is a pure grabber: it arms the selected camera and
@@ -756,10 +795,10 @@ def _require_passive_external_capture(measurement: BoundMeasurement) -> None:
     never prepares or fires one.
     """
 
-    camera_spec = decode_camera_capture_spec(measurement.capture_spec)
+    camera_spec = decode_camera_capture_spec(capture.capture_spec)
     if camera_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
         raise ValueError(
-            "passive finite Camera measurement requires an external-trigger source"
+            "passive finite camera capture requires an external-trigger source"
         )
 
 
@@ -778,14 +817,14 @@ def compile_pipeline(
         raise TypeError("spec must be MinimalPipelineSpec")
     preview_spec = _admit_capture_preview(spec, preview)
     try:
-        _require_passive_external_capture(spec.measurement)
+        _require_passive_external_capture(spec.capture)
     except BaseException as error:
         notify_preview_failure(preview, error)
         raise
-    port = spec.measurement.capture_port
+    port = spec.capture.capture_port
 
     def preflight(context: RunContext) -> ExactCaptureTransaction:
-        return _open_exact_capture_transaction(
+        return open_exact_capture_transaction(
             spec,
             context,
             preview=preview,
@@ -851,7 +890,7 @@ def _admit_exact_dataset_preview(
             raise TypeError("exact preview.terminal must be bool")
         if terminal:
             raise RuntimeError("exact dataset preview is already terminal")
-        source_schema = spec.measurement.capture_contract.dataset_schema
+        source_schema = spec.capture.capture_contract.dataset_schema
         if preview_spec.source_schema_fingerprint != source_schema.fingerprint:
             raise ValueError("exact preview schema differs from capture dataset")
         return preview_spec
@@ -881,12 +920,13 @@ def finalize_pipeline_result(
 
 
 __all__ = [
-    "BoundMeasurement",
+    "BoundCameraCapture",
     "CapturePreviewPort",
     "CapturePreviewSpec",
     "compile_pipeline",
     "ExactCaptureTransaction",
     "finalize_pipeline_result",
     "MinimalPipelineSpec",
+    "open_exact_capture_transaction",
     "PipelineResult",
 ]

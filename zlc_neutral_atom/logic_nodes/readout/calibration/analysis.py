@@ -14,10 +14,6 @@ import math
 from typing import Sequence
 
 import numpy as np
-import scipy
-from scipy import ndimage
-from scipy.optimize import curve_fit, minimize_scalar
-from scipy.special import erf
 
 from zlc_data import (
     SITE,
@@ -54,7 +50,6 @@ from .calibration import (
     _extract_readout_arrays,
     _immutable_array,
     _ResolvedCalibrationSource,
-    _resolve_calibration_source,
 )
 from zlc_neutral_atom.logic_nodes.readout.contracts import (
     FrameContract,
@@ -63,6 +58,7 @@ from zlc_neutral_atom.logic_nodes.readout.contracts import (
 from zlc_neutral_atom.logic_nodes.readout.physical_context import (
     ReadoutPhysicalContext,
 )
+import zlc_neutral_atom.logic_nodes.readout.bimodal as _bimodal
 
 
 class CalibrationAnalysisError(ValueError):
@@ -111,27 +107,12 @@ def _validate_site_center_admission(
             )
 
 
-@dataclass(frozen=True)
-class BimodalFit:
-    threshold: float
-    fidelity: float
-    dark_mean: float
-    dark_sigma: float
-    bright_mean: float
-    bright_sigma: float
-    bright_fraction: float
-    dark_fidelity: float
-    bright_fidelity: float
-    bright_above: bool
-    ok: bool
-
-
 @dataclass(frozen=True, eq=False)
 class ReferenceLabels:
     occupied: np.ndarray
     dark: np.ndarray
     valid: np.ndarray
-    fits: tuple[BimodalFit, ...]
+    fits: tuple[_bimodal.BimodalFit, ...]
     n_reference_shots: int
 
     def __post_init__(self) -> None:
@@ -156,7 +137,7 @@ class ReferenceLabels:
         )
         fits = tuple(self.fits)
         if len(fits) != occupied.shape[1] or any(
-            not isinstance(fit, BimodalFit) for fit in fits
+            not isinstance(fit, _bimodal.BimodalFit) for fit in fits
         ):
             raise ValueError("fits must contain one BimodalFit per site")
         shots = _positive_integer(self.n_reference_shots, "n_reference_shots")
@@ -775,6 +756,8 @@ def _fit_gaussian_spot_2d(
     amplitude: float,
     sigma0: float = 0.9,
 ) -> tuple[float, float, float, float, bool]:
+    from scipy.optimize import curve_fit
+
     amplitude = float(amplitude)
     try:
         initial = [
@@ -948,6 +931,8 @@ def find_site_centers(
 ) -> np.ndarray:
     """Gaussian/local-maximum detector with lattice repair."""
 
+    from scipy import ndimage
+
     image = np.asarray(image, dtype=float)
     if image.ndim != 2 or 0 in image.shape or not np.isfinite(image).any():
         raise ValueError("image must be a non-empty finite 2D array")
@@ -1052,6 +1037,8 @@ def _fit_psf_features(
     site_axis: AxisSpec,
     request: CalibrationAnalysisRequest,
 ) -> tuple[PerSitePsfFeature, UniformPsfFeature, tuple[PsfFitDiagnostic, ...]]:
+    from scipy import ndimage
+
     box_extent = 2 * request.psf_half_width + 1
     boxes = []
     kernels = []
@@ -1181,209 +1168,6 @@ def otsu_threshold(values: object, *, bins: int = 96) -> float:
     return float(np.mean(centers[plateau]))
 
 
-def _normal_cdf(x, mean: float, sigma: float):
-    sigma = max(abs(float(sigma)), 1e-12)
-    result = 0.5 * (
-        1.0
-        + erf((np.asarray(x, dtype=float) - mean) / (sigma * math.sqrt(2.0)))
-    )
-    return float(result) if result.ndim == 0 else result
-
-
-def _exact_otsu_threshold(values: np.ndarray, min_fraction: float = 0.02) -> float:
-    samples = np.sort(np.asarray(values, dtype=float)[np.isfinite(values)])
-    count = int(samples.size)
-    if count < 4:
-        return float("nan")
-    minimum = max(2, int(math.ceil(min_fraction * count)))
-    if count < 2 * minimum + 1:
-        minimum = max(1, count // 4)
-    positions = np.arange(1, count, dtype=float)
-    cumulative = np.cumsum(samples)
-    total = float(cumulative[-1])
-    left_count = positions
-    right_count = float(count) - positions
-    valid = (
-        (left_count >= minimum)
-        & (right_count >= minimum)
-        & (samples[:-1] < samples[1:])
-    )
-    if not np.any(valid):
-        return float(np.median(samples))
-    left_mean = cumulative[:-1] / left_count
-    right_mean = (total - cumulative[:-1]) / right_count
-    score = left_count * right_count * (right_mean - left_mean) ** 2
-    score[~valid] = -np.inf
-    index = int(np.argmax(score))
-    if not np.isfinite(score[index]):
-        return float(np.median(samples))
-    return float(0.5 * (samples[index] + samples[index + 1]))
-
-
-def _one_sided_core_stats(
-    samples: np.ndarray,
-    side: str,
-    sigma_floor: float,
-) -> tuple[float, float, bool]:
-    samples = np.asarray(samples, dtype=float).reshape(-1)
-    samples = samples[np.isfinite(samples)]
-    if samples.size < 4:
-        return float("nan"), float("nan"), False
-    q16, q50, q84 = np.percentile(
-        samples,
-        [15.865525393145708, 50.0, 84.1344746068543],
-    )
-    sigma = float(q50 - q16) if side == "low" else float(q84 - q50)
-    alternative = float(0.5 * (q84 - q16))
-    if not math.isfinite(sigma) or sigma <= 0:
-        sigma = alternative
-    if not math.isfinite(sigma) or sigma <= 0:
-        median = float(np.median(samples))
-        sigma = 1.482602218505602 * float(np.median(np.abs(samples - median)))
-    return float(q50), max(float(sigma), sigma_floor, 1e-12), True
-
-
-def _optimal_gaussian_threshold(
-    dark_mean: float,
-    dark_sigma: float,
-    bright_mean: float,
-    bright_sigma: float,
-) -> tuple[float, bool]:
-    bright_above = bool(bright_mean >= dark_mean)
-    lower, upper = min(dark_mean, bright_mean), max(dark_mean, bright_mean)
-    if (
-        not np.isfinite([lower, upper, dark_sigma, bright_sigma]).all()
-        or upper <= lower
-    ):
-        return float(0.5 * (dark_mean + bright_mean)), bright_above
-
-    def error(threshold: float) -> float:
-        if bright_above:
-            dark_error = 1.0 - float(_normal_cdf(threshold, dark_mean, dark_sigma))
-            bright_error = float(_normal_cdf(threshold, bright_mean, bright_sigma))
-        else:
-            dark_error = float(_normal_cdf(threshold, dark_mean, dark_sigma))
-            bright_error = 1.0 - float(
-                _normal_cdf(threshold, bright_mean, bright_sigma)
-            )
-        return 0.5 * (dark_error + bright_error)
-
-    result = minimize_scalar(error, bounds=(lower, upper), method="bounded")
-    threshold = result.x if result.success else 0.5 * (lower + upper)
-    return float(threshold), bright_above
-
-
-def _gaussian_fidelity(
-    dark_mean: float,
-    dark_sigma: float,
-    bright_mean: float,
-    bright_sigma: float,
-    threshold: float,
-    bright_above: bool,
-) -> tuple[float, float, float]:
-    if not np.isfinite(
-        [dark_mean, dark_sigma, bright_mean, bright_sigma, threshold]
-    ).all():
-        return float("nan"), float("nan"), float("nan")
-    if bright_above:
-        dark = float(_normal_cdf(threshold, dark_mean, dark_sigma))
-        bright = 1.0 - float(_normal_cdf(threshold, bright_mean, bright_sigma))
-    else:
-        dark = 1.0 - float(_normal_cdf(threshold, dark_mean, dark_sigma))
-        bright = float(_normal_cdf(threshold, bright_mean, bright_sigma))
-    return dark, bright, 0.5 * (dark + bright)
-
-
-def fit_bimodal(values: object, *, min_component_fraction: float = 0.01) -> BimodalFit:
-    samples = np.asarray(values, dtype=float).reshape(-1)
-    samples = samples[np.isfinite(samples)]
-    split = _exact_otsu_threshold(samples)
-    if samples.size < 8 or not math.isfinite(split):
-        return BimodalFit(
-            split,
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            True,
-            False,
-        )
-    low = samples[samples <= split]
-    high = samples[samples > split]
-    minimum = max(4, int(math.ceil(min_component_fraction * samples.size)))
-    if low.size < minimum or high.size < minimum:
-        return BimodalFit(
-            split,
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float(high.size / samples.size),
-            float("nan"),
-            float("nan"),
-            True,
-            False,
-        )
-    full_sigma = float(np.std(samples)) if samples.size > 1 else 1.0
-    floor = max(1e-6 * full_sigma, 1e-12)
-    dark_mean, dark_sigma, dark_ok = _one_sided_core_stats(low, "low", floor)
-    bright_mean, bright_sigma, bright_ok = _one_sided_core_stats(high, "high", floor)
-    bright_fraction = float(high.size / samples.size)
-    if (
-        not (dark_ok and bright_ok)
-        or not np.isfinite(
-            [dark_mean, dark_sigma, bright_mean, bright_sigma]
-        ).all()
-        or bright_mean <= dark_mean
-    ):
-        return BimodalFit(
-            split,
-            float("nan"),
-            dark_mean,
-            dark_sigma,
-            bright_mean,
-            bright_sigma,
-            bright_fraction,
-            float("nan"),
-            float("nan"),
-            True,
-            False,
-        )
-    threshold, bright_above = _optimal_gaussian_threshold(
-        dark_mean,
-        dark_sigma,
-        bright_mean,
-        bright_sigma,
-    )
-    dark_fidelity, bright_fidelity, fidelity = _gaussian_fidelity(
-        dark_mean,
-        dark_sigma,
-        bright_mean,
-        bright_sigma,
-        threshold,
-        bright_above,
-    )
-    separation = (bright_mean - dark_mean) / max(dark_sigma + bright_sigma, 1e-12)
-    return BimodalFit(
-        threshold,
-        fidelity,
-        dark_mean,
-        dark_sigma,
-        bright_mean,
-        bright_sigma,
-        bright_fraction,
-        dark_fidelity,
-        bright_fidelity,
-        bright_above,
-        bool(separation > 0.5),
-    )
-
-
 def reference_labels(
     reference_signals: np.ndarray,
     reference_validity: np.ndarray | None = None,
@@ -1408,7 +1192,9 @@ def reference_labels(
     fit_ok = np.zeros(sites, dtype=bool)
     fits = []
     for site in range(sites):
-        fit = fit_bimodal(signals[:, :, site][valid_input[:, :, site]])
+        fit = _bimodal.fit_bimodal(
+            signals[:, :, site][valid_input[:, :, site]]
+        )
         fits.append(fit)
         # Fluorescence physics is fixed: an occupied atom is brighter.  A
         # reversed fit is diagnostic evidence of a bad site, never a runtime mode.
@@ -1540,7 +1326,7 @@ def _fit_site_threshold(
     dark_mean, bright_mean = float(np.mean(dark)), float(np.mean(bright))
     dark_sigma = max(float(np.std(dark, ddof=1)), 1e-12)
     bright_sigma = max(float(np.std(bright, ddof=1)), 1e-12)
-    gaussian_threshold, bright_above = _optimal_gaussian_threshold(
+    gaussian_threshold, bright_above = _bimodal.optimal_gaussian_threshold(
         dark_mean,
         dark_sigma,
         bright_mean,
@@ -1555,7 +1341,7 @@ def _fit_site_threshold(
     )
     if not math.isfinite(threshold):
         threshold = gaussian_threshold
-    _dark_fidelity, _bright_fidelity, model_fidelity = _gaussian_fidelity(
+    _dark_fidelity, _bright_fidelity, model_fidelity = _bimodal.gaussian_fidelity(
         dark_mean,
         dark_sigma,
         bright_mean,
@@ -1629,7 +1415,7 @@ def characterize_readout(
         samples = short[:, site][short_validity[:, site]]
         fallback = otsu_threshold(samples)
         if threshold_method is ThresholdMethod.BIMODAL:
-            fitted = fit_bimodal(samples)
+            fitted = _bimodal.fit_bimodal(samples)
             if fitted.ok and fitted.bright_above and math.isfinite(fitted.threshold):
                 fallback = fitted.threshold
         quick_values.append(float(fallback))
@@ -2048,6 +1834,8 @@ def _calibrate_readout_source(
         tuple(models),
         request.default_model_kind,
     )
+    import scipy
+
     report = CalibrationReport(
         request,
         (("numpy", np.__version__), ("scipy", scipy.__version__)),
@@ -2061,85 +1849,6 @@ def _calibrate_readout_source(
         tuple(reports),
     )
     return CalibrationComputation(artifact, report)
-
-
-def _calibrate_readout_frames(
-    reference_frames: np.ndarray,
-    short_frames: np.ndarray,
-    *,
-    source_binding: CalibrationSourceBinding,
-    frame_contract: FrameContract,
-    readout_physical_context: ReadoutPhysicalContext,
-    request: CalibrationAnalysisRequest,
-    reference_validity: np.ndarray | None = None,
-    short_validity: np.ndarray | None = None,
-) -> CalibrationComputation:
-    """Compute a non-submittable array oracle from ``(G,K,H,W)`` and ``(G,H,W)``.
-
-    This path is for deterministic physics tests and offline diagnostics.  A
-    durable calibration must be recomputed from an ``AdmittedCapture`` through
-    the flat calibration RunPlan; caller-supplied lineage never becomes commit
-    authority.
-    """
-
-    if not isinstance(source_binding, CalibrationSourceBinding):
-        raise TypeError("source_binding must be CalibrationSourceBinding")
-    if not isinstance(frame_contract, FrameContract):
-        raise TypeError("frame_contract must be FrameContract")
-    if not isinstance(readout_physical_context, ReadoutPhysicalContext):
-        raise TypeError(
-            "readout_physical_context must be ReadoutPhysicalContext"
-        )
-    if not isinstance(request, CalibrationAnalysisRequest):
-        raise TypeError("request must be CalibrationAnalysisRequest")
-    if source_binding.layout != request.layout:
-        raise ValueError("source binding and request use different capture layouts")
-    references = np.asarray(reference_frames)
-    short = np.asarray(short_frames)
-    if references.ndim != 4 or short.ndim != 3:
-        raise ValueError(
-            "reference_frames must be (groups, shots, y, x) and short_frames (groups, y, x)"
-        )
-    if references.shape[0] != short.shape[0] or references.shape[-2:] != short.shape[-2:]:
-        raise ValueError("reference and short frames must share groups and image shape")
-    if references.shape[-2:] != frame_contract.frame_schema.data_shape:
-        raise ValueError("calibration images differ from the FrameContract")
-    reference_valid = (
-        np.broadcast_to(True, references.shape)
-        if reference_validity is None
-        else np.asarray(reference_validity, dtype=bool)
-    )
-    short_valid = (
-        np.broadcast_to(True, short.shape)
-        if short_validity is None
-        else np.asarray(short_validity, dtype=bool)
-    )
-    if reference_valid.shape != references.shape or short_valid.shape != short.shape:
-        raise ValueError("calibration validity masks have the wrong shape")
-    group_axis = AxisId("calibration-group")
-    contexts = tuple(
-        ((group_axis, group),)
-        for group in range(references.shape[0])
-    )
-    def reference_sequence() -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        for group, shot in np.ndindex(references.shape[:2]):
-            yield references[group, shot], reference_valid[group, shot]
-
-    def short_sequence() -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        for group in range(short.shape[0]):
-            yield short[group], short_valid[group]
-
-    return _calibrate_readout_source(
-        group_count=references.shape[0],
-        reference_shot_count=references.shape[1],
-        reference_frames=reference_sequence,
-        short_frames=short_sequence,
-        group_contexts=contexts,
-        source_binding=source_binding,
-        frame_contract=frame_contract,
-        readout_physical_context=readout_physical_context,
-        request=request,
-    )
 
 
 def _capture_frame_source(
@@ -2200,52 +1909,6 @@ def _capture_frame_source(
     return join.group_count, reference_sequence, short_sequence, contexts
 
 
-def _compute_calibration_resolved(
-    capture: object,
-    request: CalibrationAnalysisRequest,
-    resolved: _ResolvedCalibrationSource,
-) -> CalibrationComputation:
-    """Run the science core from facts bound by one source resolution."""
-
-    try:
-        source = capture.frame_source  # type: ignore[attr-defined]
-    except AttributeError as exc:
-        raise TypeError("capture must be a resolved raw CaptureArtifact") from exc
-    if not isinstance(source, CaptureFrameSource):
-        raise TypeError("capture.frame_source must be CaptureFrameSource")
-    group_count, reference_frames, short_frames, contexts = _capture_frame_source(
-        source,
-        resolved.join,
-    )
-    return _calibrate_readout_source(
-        group_count=group_count,
-        reference_shot_count=len(request.layout.reference_event_indices),
-        reference_frames=reference_frames,
-        short_frames=short_frames,
-        group_contexts=contexts,
-        source_binding=resolved.source_binding,
-        frame_contract=resolved.frame_contract,
-        readout_physical_context=resolved.readout_physical_context,
-        request=request,
-    )
-
-
-def compute_calibration(
-    capture: object,
-    request: CalibrationAnalysisRequest,
-) -> CalibrationComputation:
-    """Compute a non-submittable result from one resolved raw CaptureArtifact."""
-
-    if not isinstance(request, CalibrationAnalysisRequest):
-        raise TypeError("request must be CalibrationAnalysisRequest")
-    from zlc_neutral_atom.capture.artifact import CaptureArtifact
-
-    if not isinstance(capture, CaptureArtifact):
-        raise TypeError("capture must be a resolved raw CaptureArtifact")
-    resolved = _resolve_calibration_source(capture, request.layout)
-    return _compute_calibration_resolved(capture, request, resolved)
-
-
 def _analyze_calibration_resolved(
     source: object,
     request: CalibrationAnalysisRequest,
@@ -2264,7 +1927,24 @@ def _analyze_calibration_resolved(
         )
     if not isinstance(resolved, _ResolvedCalibrationSource):
         raise TypeError("resolved must be _ResolvedCalibrationSource")
-    computation = _compute_calibration_resolved(source.artifact, request, resolved)
+    frame_source = source.artifact.frame_source
+    if not isinstance(frame_source, CaptureFrameSource):
+        raise TypeError("capture.frame_source must be CaptureFrameSource")
+    group_count, reference_frames, short_frames, contexts = _capture_frame_source(
+        frame_source,
+        resolved.join,
+    )
+    computation = _calibrate_readout_source(
+        group_count=group_count,
+        reference_shot_count=len(request.layout.reference_event_indices),
+        reference_frames=reference_frames,
+        short_frames=short_frames,
+        group_contexts=contexts,
+        source_binding=resolved.source_binding,
+        frame_contract=resolved.frame_contract,
+        readout_physical_context=resolved.readout_physical_context,
+        request=request,
+    )
     return CalibrationAnalysisResult._from_admitted_analysis(
         _ADMITTED_ANALYSIS_TOKEN,
         computation,
@@ -2275,7 +1955,6 @@ def _analyze_calibration_resolved(
 
 __all__ = [
     "AblationPoint",
-    "BimodalFit",
     "CalibrationAnalysisError",
     "CalibrationAnalysisResult",
     "CalibrationComputation",
@@ -2287,9 +1966,7 @@ __all__ = [
     "TrainTestSplit",
     "characterize_readout",
     "calibration_runtime_threshold_sources",
-    "compute_calibration",
     "find_site_centers",
-    "fit_bimodal",
     "otsu_threshold",
     "reference_labels",
     "train_test_split",

@@ -1,25 +1,12 @@
-"""The grouped-signal picker's data layer: names -> tree groups -> a filled combo.
+"""Grouped-signal picker projection over plain names and format metadata.
 
-`FluentTreeComboBox` migrated into this package but its data helpers did not -
-they stayed in the old monolith's parameter registry, so a new consumer
-could get the widget and then had to reach back into the old tree to fill it.
-That is the reverse of this migration's package direction, and it is why no
-window under `Zou_lab_control/workbench/` used the picker at all.
-
-Pure Qt-combo utilities: only this package's own widgets plus plain data.  No
-domain types and no hub - which is exactly why the cluster could
-move as a unit without dragging the old tree with it.
+The helpers depend only on frontend widgets and plain data.  They do not know
+about domain nodes, runtime hubs, or application composition.
 """
 
 from __future__ import annotations
 
 from .fluent import FluentTreeComboBox, signals_blocked as _signals_blocked
-
-
-# The grouped-signal-picker helper cluster LIVES HERE (the leaf every form module depends on;
-# task_console / figure_viewer forward-import it).  It used to live in task_console with lazy
-# back-imports from this module -- a cycle that contradicted this file's leaf contract.  Pure
-# Qt-combo utilities: only qt_widgets (FluentTreeComboBox, signals_blocked) + plain data.
 
 
 def signal_state(name, formats, sources=None) -> str:

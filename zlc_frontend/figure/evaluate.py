@@ -16,13 +16,14 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     CellValidity,
-    ComponentValidity,
     DataBlock,
+    DatasetComponentValidity,
     DatasetSchema,
     Invalid,
     OwnedSnapshot,
     REPEAT,
     Valid,
+    immutable_bool_broadcast,
 )
 from zlc_data.numeric import (
     canonical_mean_dtype,
@@ -170,13 +171,12 @@ def _sequence_indexer(indices: Sequence[int] | np.ndarray) -> slice | np.ndarray
         raise ValueError("axis indices must be one-dimensional")
     if explicit.size == 0:
         return slice(0, 0)
-    if isinstance(indices, np.ndarray):
-        start = int(explicit[0])
-        if np.array_equal(
-            explicit,
-            np.arange(start, start + explicit.size, dtype=np.intp),
-        ):
-            return slice(start, start + explicit.size)
+    start = int(explicit[0])
+    if np.array_equal(
+        explicit,
+        np.arange(start, start + explicit.size, dtype=np.intp),
+    ):
+        return slice(start, start + explicit.size)
     return explicit
 
 
@@ -237,16 +237,16 @@ def _component_validity(
 ) -> np.ndarray:
     validity = block.validity
     if isinstance(validity, Valid):
-        return np.broadcast_to(True, values_shape)
+        return immutable_bool_broadcast(True, values_shape)
     if isinstance(validity, Invalid):
-        return np.broadcast_to(False, values_shape)
+        return immutable_bool_broadcast(False, values_shape)
     if isinstance(validity, CellValidity):
         row_mask = _select_axis(validity.mask.reshape(-1), row_ids, axis=0)
         return np.broadcast_to(
             row_mask.reshape((len(row_ids),) + (1,) * len(remaining_data_axes)),
             values_shape,
         )
-    if not isinstance(validity, ComponentValidity):
+    if not isinstance(validity, DatasetComponentValidity):
         raise TypeError(f"unsupported dataset validity {type(validity).__name__}")
     original_data = block.schema.cell_schema.data_axes
     component_axes = tuple(
@@ -456,6 +456,21 @@ def _single_contributor_reduction_dtype(
     return _reduction_output_dtype(input_dtype, binding.reduction.method)
 
 
+def _single_contributor_validity_extent(validity: np.ndarray) -> tuple[int, int]:
+    """Resolve 0/1 contributor bounds without scanning a uniform broadcast plane."""
+
+    validity = np.asarray(validity, dtype=bool)
+    if not validity.size:
+        return 0, 0
+    if all(stride == 0 for stride in validity.strides):
+        contributor = int(bool(validity.flat[0]))
+        return contributor, contributor
+    return (
+        1 if bool(np.all(validity)) else 0,
+        1 if bool(np.any(validity)) else 0,
+    )
+
+
 def _reduce(
     working: _WorkingData,
     reduction_bindings,
@@ -525,19 +540,19 @@ def _reduce(
     )
     if singleton_dtype is not None:
         guard.check()
-        values_array = np.zeros(working.values.shape, dtype=singleton_dtype)
-        np.copyto(
-            values_array,
-            working.values,
-            where=working.validity,
-            casting="unsafe",
-        )
-        validity_array = np.asarray(working.validity, dtype=bool)
-        if validity_array.size:
-            low = 1 if bool(np.all(validity_array)) else 0
-            high = 1 if bool(np.any(validity_array)) else 0
+        # A one-contributor repeat reduction is mathematically an identity.
+        # Keep the immutable source view when its declared output dtype is also
+        # unchanged; validity remains an independent mask, so an invalid sample
+        # never requires rewriting its stored pixel to a sentinel value.  This
+        # is the common live-camera path and avoids copying an entire frame at
+        # the presentation boundary merely to remove a singleton repeat axis.
+        if np.dtype(singleton_dtype) == working.values.dtype:
+            values_array = working.values
+            validity_array = working.validity
         else:
-            low = high = 0
+            values_array = np.asarray(working.values, dtype=singleton_dtype)
+            validity_array = working.validity
+        low, high = _single_contributor_validity_extent(validity_array)
         resolution = ReductionResolution(
             tuple(binding.axis_id for binding in reduction_bindings),
             method,

@@ -18,6 +18,7 @@ from zlc_data import (
     READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
+    SCALAR_AXIS,
     SITE,
     SPATIAL_X,
     SPATIAL_Y,
@@ -29,6 +30,7 @@ from zlc_data import (
     ComponentValidity,
     CoordinateFrameId,
     DataBlock,
+    DatasetComponentValidity,
     DatasetRevision,
     DatasetSchema,
     OwnedSnapshot,
@@ -108,21 +110,24 @@ def make_block(
         if component_axes
         else ValidityContract.value()
     )
+    array = np.asarray(values)
+    cell_schema = (
+        ValueSchema(tuple(data_axes), contract, array.dtype, value_unit)
+        if data_axes
+        else ValueSchema.scalar(array.dtype, value_unit)
+    )
+    if not data_axes:
+        array = array[..., np.newaxis]
     schema = DatasetSchema(
         repeat_axis,
         tuple(point_axes),
         point_layout,
-        ValueSchema(
-            tuple(data_axes),
-            contract,
-            np.asarray(values).dtype,
-            value_unit,
-        ),
+        cell_schema,
     )
     return DataBlock(
         BlockId("block-a"),
         DatasetRevision(revision),
-        np.asarray(values),
+        array,
         validity,
         schema,
     )
@@ -298,7 +303,7 @@ def test_scalar_selection_resolves_display_axis_ambiguity():
     validate_view_spec(schema, suggestion.spec)
 
 
-def test_automatic_layout_matches_independent_capacity_oracle_and_axis_permutations():
+def test_automatic_layout_preserves_every_axis_without_work_caps_and_is_order_stable():
     repeat = axis("planner-repeat", REPEAT, 1)
     point = axis("planner-point", SCAN_POINT, 2)
     layout = PointLayout.rect_c((2,))
@@ -310,19 +315,6 @@ def test_automatic_layout_matches_independent_capacity_oracle_and_axis_permutati
     )
 
     for sizes in product(cardinalities, repeat=3):
-        feasible = False
-        for assignment in product(("batch", "facet"), repeat=3):
-            batch_product = 1
-            facet_product = 1
-            for size, bucket in zip(sizes, assignment):
-                if bucket == "batch":
-                    batch_product *= size
-                else:
-                    facet_product *= size
-            if batch_product <= 32 and facet_product <= 36:
-                feasible = True
-                break
-
         expected_mapping = None
         defined_axes = tuple(
             axis(name, role, size)
@@ -340,9 +332,8 @@ def test_automatic_layout_matches_independent_capacity_oracle_and_axis_permutati
                 ),
             )
             suggestion = suggest_view(schema, ViewIntent.CURVE)
-            assert (suggestion.spec is not None) is feasible
-            if not feasible:
-                continue
+            assert suggestion.status is SuggestionStatus.RESOLVED
+            assert suggestion.spec is not None
             mapping = tuple(
                 sorted(
                     (
@@ -396,7 +387,7 @@ def test_automatic_layout_matches_independent_capacity_oracle_and_axis_permutati
     )
     assert batch_suggestion.status is SuggestionStatus.RESOLVED
     assert batch_suggestion.spec.binding(repeat_batch.axis_id).role is AxisViewRole.BATCH
-    assert batch_suggestion.spec.binding(site.axis_id).role is AxisViewRole.FACET
+    assert batch_suggestion.spec.binding(site.axis_id).role is AxisViewRole.BATCH
 
 
 def test_slider_bindings_preserve_contract_order_and_repeat_latest():
@@ -426,12 +417,12 @@ def test_slider_bindings_preserve_contract_order_and_repeat_latest():
     for axis_id, expected_index in (
         (point.axis_id, 0),
         (spectral.axis_id, 0),
-        (site.axis_id, 5),
-        (component.axis_id, 0),
     ):
         binding = image_suggestion.spec.binding(axis_id)
         assert binding.role is AxisViewRole.SLIDER
         assert binding.selector == FixedIndex(expected_index)
+    assert image_suggestion.spec.binding(site.axis_id).role is AxisViewRole.FACET
+    assert image_suggestion.spec.binding(component.axis_id).role is AxisViewRole.FACET
 
     rolling_point = axis("rolling-meter-point", SCAN_POINT, 40)
     meter_schema = DatasetSchema(
@@ -813,7 +804,6 @@ def test_explicit_image_bindings_render_numeric_scan_axes_without_relabeling() -
     composer = PanelComposer(
         "scan-image",
         intent=ViewIntent.IMAGE,
-        size=(320, 240),
         size_name="1x2",
         view=suggestion.spec,
     )
@@ -823,15 +813,15 @@ def test_explicit_image_bindings_render_numeric_scan_axes_without_relabeling() -
             display=ImageDisplayState(),
             provenance=provenance,
         )
-        assert overview.overview_png is not None
-        assert len(overview.regions) == bz.size
+        assert overview.overview is not None
+        assert len(overview.overview.regions) == bz.size
         focused = composer.compose_faceted(
             snapshot,
             display=ImageDisplayState(),
             provenance=provenance,
             focus=FacetedPanelFocus(
                 0,
-                overview.regions[0].focus_selection,
+                overview.overview.regions[0].focus_selection,
             ),
         )
     finally:
@@ -877,7 +867,7 @@ def test_roi_selection_does_not_invent_a_reducer_but_explicit_reduction_evaluate
         point_axes=(point,),
         point_layout=PointLayout.rect_c((3,)),
         data_axes=(x, y),
-        validity=ComponentValidity((x.axis_id, y.axis_id), valid),
+        validity=DatasetComponentValidity((x.axis_id, y.axis_id), valid),
         component_axes=(x.axis_id, y.axis_id),
     )
     roi = Selection.rectangle(
@@ -963,7 +953,7 @@ def test_histogram_sample_axes_preserve_identity_and_invalid_drop_count():
     point = axis("point", SCAN_POINT, 1)
     site = axis("site", SITE, 2, coordinates=("A", "B"))
     values = np.array([[[1.0, 2.0]], [[3.0, 4.0]]])
-    valid = ComponentValidity(
+    valid = DatasetComponentValidity(
         (site.axis_id,),
         np.array([[[True, False]], [[True, True]]]),
     )
@@ -1252,7 +1242,7 @@ def test_public_evaluator_preserves_one_full_qcmos_frame():
     assert series.reductions[0].axis_ids == (repeat.axis_id,)
     assert series.reductions[0].minimum_contributors == 1
     assert series.reductions[0].maximum_contributors == 1
-    assert not np.shares_memory(image.values, block.values)
+    assert np.shares_memory(image.values, block.values)
     with pytest.raises(ValueError):
         image.values.setflags(write=True)
     with pytest.raises(ValueError):
@@ -1341,7 +1331,7 @@ def test_single_repeat_image_keeps_component_axes_and_invalid_components():
         point_axes=(point,),
         point_layout=PointLayout.rect_c((1,)),
         data_axes=(component, y, x),
-        validity=ComponentValidity(
+        validity=DatasetComponentValidity(
             (component.axis_id, y.axis_id, x.axis_id),
             valid,
         ),
@@ -1355,12 +1345,12 @@ def test_single_repeat_image_keeps_component_axes_and_invalid_components():
         assert cell.facet_address[0].axis_id == component.axis_id
         assert cell.facet_address[0].index == component_index
         image = cell.series[0].data
-        expected = values[0, 0, component_index].copy()
+        expected = values[0, 0, component_index]
         expected_valid = valid[0, 0, component_index]
-        expected = np.where(expected_valid, expected, np.uint16(0))
         np.testing.assert_array_equal(image.values, expected)
         np.testing.assert_array_equal(image.validity, expected_valid)
         assert image.values.dtype == np.dtype("<u2")
+        assert np.shares_memory(image.values, block.values)
     second_reduction = evaluated.layers[0].cells[1].series[0].reductions[0]
     assert second_reduction.minimum_contributors == 0
     assert second_reduction.maximum_contributors == 1
@@ -1504,6 +1494,11 @@ def test_ragged_explicit_reduction_never_pads_to_groups_times_max(monkeypatch):
                 reduced.axis_id,
                 AxisViewRole.REDUCED,
                 reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+            ),
+            AxisViewBinding(
+                SCALAR_AXIS.axis_id,
+                AxisViewRole.SELECTED,
+                selector=FixedIndex(0),
             ),
         ),
         (selection,),

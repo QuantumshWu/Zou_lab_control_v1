@@ -794,6 +794,64 @@ class EvaluatedFigureData:
         object.__setattr__(self, "layers", layers)
 
 
+@dataclass(frozen=True, slots=True)
+class EvaluatedProjectionIdentity:
+    """Exact identity of one evaluated series projection.
+
+    A dataset revision identifies the frozen input, not one of the potentially
+    many facet cells and series evaluated from it.  Values, validity, and
+    derived display histograms may therefore cache only against this complete
+    typed identity.  The evaluated data DTOs are immutable and identity-equal,
+    so a new evaluation is deliberately a cache miss even when its numbers
+    happen to compare equal.
+    """
+
+    document_id: str
+    document_revision: int
+    evaluated_input: EvaluatedInput
+    layer_id: str
+    resolutions: tuple[AxisResolution, ...]
+    facet_address: tuple[AxisAddress, ...]
+    batch_address: tuple[AxisAddress, ...]
+    data: EvaluatedLayerData
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "document_id",
+            _text(self.document_id, "projection document_id"),
+        )
+        object.__setattr__(
+            self,
+            "document_revision",
+            _nonnegative(self.document_revision, "projection document revision"),
+        )
+        if not isinstance(self.evaluated_input, EvaluatedInput):
+            raise TypeError("projection evaluated_input must be EvaluatedInput")
+        object.__setattr__(
+            self,
+            "layer_id",
+            _text(self.layer_id, "projection layer_id"),
+        )
+        resolutions = tuple(self.resolutions)
+        facet_address = tuple(self.facet_address)
+        batch_address = tuple(self.batch_address)
+        if any(not isinstance(item, AxisResolution) for item in resolutions):
+            raise TypeError("projection resolutions must contain AxisResolution values")
+        if any(not isinstance(item, AxisAddress) for item in facet_address):
+            raise TypeError("projection facet_address must contain AxisAddress values")
+        if any(not isinstance(item, AxisAddress) for item in batch_address):
+            raise TypeError("projection batch_address must contain AxisAddress values")
+        if not isinstance(
+            self.data,
+            (EvaluatedImage, EvaluatedCurve, EvaluatedHistogram, EvaluatedMeter),
+        ):
+            raise TypeError("projection data must be an evaluated layer DTO")
+        object.__setattr__(self, "resolutions", resolutions)
+        object.__setattr__(self, "facet_address", facet_address)
+        object.__setattr__(self, "batch_address", batch_address)
+
+
 __all__ = [
     "DATASET_VIEW_INTENTS",
     "AxisAddress",
@@ -818,6 +876,7 @@ __all__ = [
     "EvaluatedLayer",
     "EvaluatedLayerData",
     "EvaluatedMeter",
+    "EvaluatedProjectionIdentity",
     "EvaluatedSeries",
     "FigureDocument",
     "FigureLayer",

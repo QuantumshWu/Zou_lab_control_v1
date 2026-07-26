@@ -9,6 +9,7 @@ import numpy as np
 from zlc_storage.canonical import (
     canonical_digest,
     canonical_text as _text,
+    encode as _encode,
     exact_mapping as _exact_map,
 )
 
@@ -21,6 +22,7 @@ from .validity import (
     VALID,
     CellValidity,
     ComponentValidity,
+    DatasetComponentValidity,
     Invalid,
     Valid,
     ValidityContract,
@@ -72,7 +74,7 @@ def dataset_revision_ref_from_tree(tree: Any) -> DatasetRevisionRef:
         schema_fingerprint=data["schema_fingerprint"],
         revision=DatasetRevision(data["revision"]),
     )
-    if dataset_revision_ref_to_tree(value) != tree:
+    if _encode(dataset_revision_ref_to_tree(value)) != _encode(tree):
         raise ValueError("DatasetRevisionRef tree is typed but non-canonical")
     return value
 
@@ -113,7 +115,7 @@ def axis_from_tree(tree: Any) -> AxisSpec:
     if coordinates is not None and not isinstance(coordinates, list):
         raise ValueError("AxisSpec coordinates must be a list or null")
     frame = data["coordinate_frame"]
-    return AxisSpec(
+    axis = AxisSpec(
         axis_id=AxisId(data["axis_id"]),
         name=data["name"],
         role=AxisRoleId(data["role"]),
@@ -123,6 +125,9 @@ def axis_from_tree(tree: Any) -> AxisSpec:
         coordinate_frame=None if frame is None else CoordinateFrameId(frame),
         index_origin=data["index_origin"],
     )
+    if _encode(axis_to_tree(axis)) != _encode(tree):
+        raise ValueError("AxisSpec tree is typed but non-canonical")
+    return axis
 
 
 def value_schema_to_tree(schema: ValueSchema) -> dict[str, Any]:
@@ -158,12 +163,15 @@ def value_schema_from_tree(tree: Any) -> ValueSchema:
         raise ValueError("component_axis_ids must be a list")
     contract = ValidityContract(mode, tuple(AxisId(item) for item in component_ids))
     unit = data["value_unit"]
-    return ValueSchema(
+    schema = ValueSchema(
         data_axes=tuple(axis_from_tree(axis) for axis in axes),
         validity_contract=contract,
         dtype=np.dtype(_text(data["dtype"], "dtype")),
         value_unit=unit,
     )
+    if _encode(value_schema_to_tree(schema)) != _encode(tree):
+        raise ValueError("ValueSchema tree is typed but non-canonical")
+    return schema
 
 
 def dataset_schema_to_tree(schema: DatasetSchema) -> dict[str, Any]:
@@ -186,12 +194,15 @@ def dataset_schema_from_tree(tree: Any) -> DatasetSchema:
     if not isinstance(point_axes, list):
         raise ValueError("DatasetSchema point_axes must be a list")
     layout = point_layout_from_tree(data["point_layout"])
-    return DatasetSchema(
+    schema = DatasetSchema(
         repeat_axis=axis_from_tree(data["repeat_axis"]),
         point_axes=tuple(axis_from_tree(axis) for axis in point_axes),
         point_layout=layout,
         cell_schema=value_schema_from_tree(data["cell_schema"]),
     )
+    if _encode(dataset_schema_to_tree(schema)) != _encode(tree):
+        raise ValueError("DatasetSchema tree is typed but non-canonical")
+    return schema
 
 
 def axis_layout_to_tree(layout: AxisLayout) -> dict[str, Any]:
@@ -239,11 +250,14 @@ def axis_layout_from_tree(tree: Any) -> AxisLayout:
         )
         if declared != layout:
             raise ValueError("PRODUCT AxisLayout fields are non-canonical")
-        if axis_layout_to_tree(layout) != tree:
+        if _encode(axis_layout_to_tree(layout)) != _encode(tree):
             raise ValueError("PRODUCT AxisLayout tree is non-canonical")
         return layout
     shape, mode, storage_size, mapping = _axis_layout_fields(tree)
-    return AxisLayout(shape, mode, storage_size, mapping)
+    layout = AxisLayout(shape, mode, storage_size, mapping)
+    if _encode(axis_layout_to_tree(layout)) != _encode(tree):
+        raise ValueError("AxisLayout tree is non-canonical")
+    return layout
 
 
 def point_layout_to_tree(layout: PointLayout) -> dict[str, Any]:
@@ -260,7 +274,10 @@ def point_layout_from_tree(tree: Any) -> PointLayout:
     shape, mode, storage_size, mapping = _axis_layout_fields(tree)
     if mode is AxisLayoutMode.PRODUCT:
         raise ValueError("PointLayout cannot be PRODUCT")
-    return PointLayout(shape, mode, storage_size, mapping)
+    layout = PointLayout(shape, mode, storage_size, mapping)
+    if _encode(point_layout_to_tree(layout)) != _encode(tree):
+        raise ValueError("PointLayout tree is non-canonical")
+    return layout
 
 
 def _axis_layout_fields(
@@ -300,7 +317,7 @@ def dataset_schema_fingerprint(schema: DatasetSchema) -> str:
 
 
 def validity_to_tree(
-    validity: Valid | Invalid | CellValidity | ComponentValidity,
+    validity: Valid | Invalid | CellValidity | ComponentValidity | DatasetComponentValidity,
 ) -> dict[str, Any]:
     if isinstance(validity, Valid):
         return {"kind": "valid"}
@@ -314,10 +331,18 @@ def validity_to_tree(
             "axis_ids": [axis_id.value for axis_id in validity.axis_ids],
             "mask": validity.mask,
         }
+    if isinstance(validity, DatasetComponentValidity):
+        return {
+            "kind": "dataset_component",
+            "axis_ids": [axis_id.value for axis_id in validity.axis_ids],
+            "mask": validity.mask,
+        }
     raise TypeError(f"unsupported validity type {type(validity).__name__}")
 
 
-def validity_from_tree(tree: Any) -> Valid | Invalid | CellValidity | ComponentValidity:
+def validity_from_tree(
+    tree: Any,
+) -> Valid | Invalid | CellValidity | ComponentValidity | DatasetComponentValidity:
     if not isinstance(tree, dict) or not isinstance(tree.get("kind"), str):
         raise ValueError("validity must be a tagged map")
     kind = tree["kind"]
@@ -336,6 +361,16 @@ def validity_from_tree(tree: Any) -> Valid | Invalid | CellValidity | ComponentV
         if not isinstance(tree["mask"], np.ndarray):
             raise ValueError("component validity mask must be an ndarray")
         return ComponentValidity(
+            tuple(AxisId(axis_id) for axis_id in axis_ids),
+            tree["mask"],
+        )
+    if kind == "dataset_component" and set(tree) == {"kind", "axis_ids", "mask"}:
+        axis_ids = tree["axis_ids"]
+        if not isinstance(axis_ids, list):
+            raise ValueError("dataset component validity axis_ids must be a list")
+        if not isinstance(tree["mask"], np.ndarray):
+            raise ValueError("dataset component validity mask must be an ndarray")
+        return DatasetComponentValidity(
             tuple(AxisId(axis_id) for axis_id in axis_ids),
             tree["mask"],
         )

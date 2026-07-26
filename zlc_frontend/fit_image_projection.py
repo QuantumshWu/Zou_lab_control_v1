@@ -12,9 +12,8 @@ from zlc_data import (
     FitBatchStatus,
     FitResultBatch,
     IndexSelection,
-    REPEAT,
+    SCALAR_AXIS,
     Selection,
-    SITE,
     resolve_selection_indices,
     validate_fit_result_source_binding,
 )
@@ -148,12 +147,6 @@ def address_label(
     for item in items:
         coordinate = coordinate_label(item.coordinate)
         if isinstance(item, AxisAddress):
-            if item.axis_role == SITE:
-                labels.append(f"site {item.index}")
-                continue
-            if item.axis_role == REPEAT:
-                labels.append(f"repeat {item.index}")
-                continue
             labels.append(f"{item.axis_name}={coordinate}")
             continue
         labels.append(f"{item.axis_id.value}={coordinate}")
@@ -212,7 +205,11 @@ def _fit_batch_multi_index(
         if incumbent != resolution.index:
             raise RuntimeError("figure address and resolution disagree")
     expected = {axis.axis_id for axis in result.batch_axis_specs}
-    extras = set(by_axis) - expected
+    # The canonical scalar carrier is a real physical `(1)` data axis and its
+    # explicit display selection therefore appears in evaluator resolutions.
+    # It is intentionally absent from FitSpec batch axes because it carries no
+    # independent batch identity.
+    extras = set(by_axis) - expected - {SCALAR_AXIS.axis_id}
     if extras:
         raise RuntimeError(
             f"figure resolved non-batch fit axes: {sorted(map(str, extras))}"

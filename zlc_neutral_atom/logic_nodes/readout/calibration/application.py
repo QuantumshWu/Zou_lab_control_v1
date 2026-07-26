@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from zlc_neutral_atom.capture.artifact import (
     AdmittedCapture,
@@ -12,8 +13,10 @@ from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.runtime.run import RunPlan
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 
-from .analysis import CalibrationComputation
 from .calibration import CalibrationAnalysisRequest
+
+if TYPE_CHECKING:
+    from .analysis import CalibrationComputation
 
 
 _CALIBRATION_RUN_DEADLINE_SECONDS = 300.0
@@ -45,6 +48,8 @@ def calibration_request_from_computation(
     returned request, but it never reconstructs source binding or analysis
     authority from the artifact/report pair itself.
     """
+
+    from .analysis import CalibrationComputation
 
     if not isinstance(computation, CalibrationComputation):
         raise TypeError("computation must be CalibrationComputation")

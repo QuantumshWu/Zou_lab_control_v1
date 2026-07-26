@@ -17,10 +17,11 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5 import QtCore
+from PyQt5 import QtCore, QtTest
 import pytest
 
 from zlc_frontend.qt_widgets import ensure_qt_app
+from gui_user_flow import close_pulse_editor
 
 #: Sub-pixel rounding across DPR tiers leaves a couple of px; the regression this
 #: guards was a whole header row (~50-93 px), so a tight bound still discriminates.
@@ -42,11 +43,7 @@ def editor(application):
     for _ in range(6):
         application.processEvents()
     yield editor
-    try:
-        window.close()
-    except Exception:                                    # pragma: no cover - teardown only
-        pass
-    application.processEvents()
+    close_pulse_editor(application, editor)
 
 
 def _top_y(widget) -> int:
@@ -54,8 +51,8 @@ def _top_y(widget) -> int:
 
 
 def test_period_checkboxes_line_up_with_the_channel_delay_rows(editor):
-    card = editor.drag_container.pulse_cards()[0]
-    panel = editor.channel_panel
+    card = editor.schedule_view.period_cards()[0]
+    panel = editor.schedule_view.channel_panel
     channels = [key for key in panel.delay_edits if key in card.checks]
     assert channels, "no channels are shown in both the Period card and the Delay column"
 
@@ -83,25 +80,18 @@ def test_every_row_stays_aligned_in_the_show_all_compact_view(editor, applicatio
     to the shared row height, so the skew must stay within rounding for every row.
     """
 
-    from zlc_pulse import PORT_CLOCK
-
-    state = editor.read_state()
-    state.visible_ports = [
-        port.key for port in state.port_catalog.ports if port.kind != PORT_CLOCK]
-    editor.load_state(state)
+    schedule = editor.schedule_view
+    QtTest.QTest.mouseClick(schedule.show_all_button, QtCore.Qt.LeftButton)
     for _ in range(10):
         application.processEvents()
 
-    names = editor.names_panel.raw_label_widgets
-    card = editor.drag_container.pulse_cards()[0]
+    names = schedule.names_panel.row_widgets
+    card = schedule.period_cards()[0]
     rows_checked = 0
     skewed = []
     for key, name_widget in names.items():
-        if key in card.checks:
-            other = card.checks[key]
-        elif key.startswith("bus:") and key[4:] in card.bus_mode_combos:
-            other = card.bus_mode_combos[key[4:]].parentWidget()
-        else:
+        other = card.port_rows.get(key)
+        if other is None:
             continue
         rows_checked += 1
         dy = _row_centre_y(other) - _row_centre_y(name_widget)

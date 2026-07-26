@@ -19,10 +19,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from numbers import Real
+from types import MappingProxyType
 from typing import Mapping
 
 import numpy as np
-from zlc_storage import canonical_digest, sha256_text
+from zlc_storage import canonical_digest, canonical_text, sha256_text
 
 from zlc_data import (
     AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID,
@@ -32,6 +33,7 @@ from zlc_data import (
     AxisSpec,
     BlockId,
     CoordinateRangeSelection,
+    DataTransformSpec,
     DatasetRevisionRef,
     IndexRangeSelection,
     IndexSelection,
@@ -49,6 +51,7 @@ from zlc_data import (
     projected_dataset_output_contract_id,
 )
 from .site_map import SiteMapPresentation
+from .figure_source import FigureSource
 from .render import (
     CurvePanelPayload,
     HistogramPanelPayload,
@@ -100,11 +103,14 @@ __all__ = [
     "FigureDerivedSignal",
     "FigureAreaCommit",
     "FigureCrossCommit",
-    "FigureOutputSource",
-    "FitParameterMetadata",
+    "FigureOutputFront",
+    "FigureOutputPresentation",
+    "FigureOutputRequest",
+    "FigureOutputSession",
     "HistogramValueRangeSelection",
     "SelectorAxisMetadata",
     "area_range_output_name",
+    "area_data_output_presentation",
     "figure_derived_signal",
     "figure_derivation_digest",
     "figure_output_contract_id",
@@ -142,19 +148,34 @@ class SelectorAxisMetadata:
             object.__setattr__(self, "unit", unit)
 
 
-@dataclass(frozen=True)
-class FitParameterMetadata:
-    """Presentation label for one typed Figure-fit parameter signal."""
+@dataclass(frozen=True, slots=True)
+class FigureOutputPresentation:
+    """Complete frontend-owned public facts for one Figure-derived signal.
 
-    model_id: str
-    parameter_name: str
+    A shell may prepend its own producer namespace, but it must not infer the
+    bare name, semantic contract, labels, or description from name prefixes or
+    private selector/Fit metadata.
+    """
+
+    name: str
+    contract_id: str
+    short: str
+    axis_label: str
+    description: str
 
     def __post_init__(self) -> None:
-        for field in ("model_id", "parameter_name"):
-            value = str(getattr(self, field)).strip()
-            if not value:
-                raise ValueError(f"{field} must not be empty")
-            object.__setattr__(self, field, value)
+        for field, label in (
+            ("name", "Figure output name"),
+            ("contract_id", "Figure output contract id"),
+            ("short", "Figure output short label"),
+            ("axis_label", "Figure output axis label"),
+            ("description", "Figure output description"),
+        ):
+            object.__setattr__(
+                self,
+                field,
+                canonical_text(getattr(self, field), label),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,22 +219,213 @@ class FigureCrossCommit:
 
 
 @dataclass(frozen=True, slots=True)
-class FigureOutputSource:
-    """Exact immutable input accepted by a Figure output operation."""
+class FigureOutputRequest:
+    """Immutable Figure-output intent evaluated outside any GUI owner.
 
-    snapshot: OwnedSnapshot
-    site_map: SiteMapPresentation | None = None
+    The source has already been selected by the composition root.  Area and
+    Cross commits are generation-scoped, while a Fit result is exact-revision
+    scoped.  This request neither knows panel routing names nor publishes into
+    an application data plane.
+    """
+
+    source: FigureSource
+    area: FigureAreaCommit | None = None
+    cross: FigureCrossCommit | None = None
+    fit_result: object | None = None
+    fit_result_identity: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.snapshot, OwnedSnapshot):
-            raise TypeError("Figure signal source must be OwnedSnapshot")
-        if self.site_map is not None and not isinstance(
-            self.site_map,
-            SiteMapPresentation,
+        if not isinstance(self.source, FigureSource):
+            raise TypeError("Figure output request source must be FigureSource")
+        snapshot = self.source.snapshot
+        for label, commit, expected_type in (
+            ("Area", self.area, FigureAreaCommit),
+            ("Cross", self.cross, FigureCrossCommit),
         ):
-            raise TypeError(
-                "Figure output source site_map is not a SiteMapPresentation"
+            if commit is None:
+                continue
+            if not isinstance(commit, expected_type):
+                raise TypeError(f"{label} request has another commit type")
+            if not source_identity_matches_snapshot(commit.source_identity, snapshot):
+                raise ValueError(f"{label} commit belongs to another source generation")
+        if self.fit_result is None:
+            if self.fit_result_identity is not None:
+                raise ValueError("Fit identity requires a Fit result")
+        else:
+            from zlc_data import FitResultBatch
+
+            if not isinstance(self.fit_result, FitResultBatch):
+                raise TypeError("Figure output Fit result must be FitResultBatch")
+            if self.fit_result.source_ref != snapshot.ref:
+                raise ValueError("Figure output Fit belongs to another source revision")
+            identity = str(self.fit_result_identity or "").strip()
+            if not identity:
+                raise ValueError("Figure output Fit requires an exact result identity")
+            object.__setattr__(self, "fit_result_identity", identity)
+
+
+@dataclass(frozen=True, slots=True)
+class FigureOutputFront:
+    """One complete immutable answer from :class:`FigureOutputSession`."""
+
+    outputs: Mapping[str, "FigureDerivedSignal"]
+    failures: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        values = dict(self.outputs)
+        if any(not isinstance(value, FigureDerivedSignal) for value in values.values()):
+            raise TypeError("Figure output front contains another value type")
+        mismatched = tuple(
+            key
+            for key, value in values.items()
+            if key != value.presentation.name
+        )
+        if mismatched:
+            raise ValueError(
+                "Figure output mapping keys differ from frontend presentation names: "
+                f"{mismatched}"
             )
+        failures = tuple(str(value) for value in self.failures)
+        object.__setattr__(self, "outputs", MappingProxyType(values))
+        object.__setattr__(self, "failures", failures)
+
+
+def _area_dependency(request: FigureOutputRequest) -> tuple[object, ...] | None:
+    commit = request.area
+    if commit is None:
+        return None
+    selection = commit.selection
+    if isinstance(selection, Selection):
+        selection_identity: object = selection_to_tree(selection)
+    else:
+        selection_identity = {
+            "histogram_value_range": [selection.lower, selection.upper]
+        }
+    site_map = request.source.site_map
+    return (
+        request.source.snapshot.ref,
+        request.source.source_contract_id,
+        None if site_map is None else site_map.view_identity,
+        canonical_digest(selection_identity),
+    )
+
+
+def _cross_dependency(request: FigureOutputRequest) -> tuple[object, ...] | None:
+    commit = request.cross
+    if commit is None:
+        return None
+    return (
+        request.source.snapshot.ref,
+        commit.point,
+        tuple((axis.axis_id, axis.name, axis.unit) for axis in commit.axes),
+    )
+
+
+class FigureOutputSession:
+    """Persistent headless materializer for one Figure's derived signals.
+
+    A live Area depends on each exact source revision and is therefore rebuilt
+    when the source advances.  Cross and Fit work is cached by its own exact
+    dependency rather than being repeated merely because a raster was painted.
+    The session keeps no queue, policy, routing, or Qt state.
+    """
+
+    def __init__(self) -> None:
+        self._area_key: tuple[object, ...] | None = None
+        self._area_outputs: Mapping[str, FigureDerivedSignal] = MappingProxyType({})
+        self._area_failures: tuple[str, ...] = ()
+        self._cross_key: tuple[object, ...] | None = None
+        self._cross_outputs: Mapping[str, FigureDerivedSignal] = MappingProxyType({})
+        self._cross_failures: tuple[str, ...] = ()
+        self._fit_key: tuple[object, ...] | None = None
+        self._fit_outputs: Mapping[str, FigureDerivedSignal] = MappingProxyType({})
+        self._fit_failures: tuple[str, ...] = ()
+
+    @staticmethod
+    def _materialize(
+        label: str,
+        operation,
+    ) -> tuple[Mapping[str, "FigureDerivedSignal"], tuple[str, ...]]:
+        try:
+            outputs = operation()
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            return MappingProxyType({}), (f"{label}: {error}",)
+        return MappingProxyType(dict(outputs)), ()
+
+    def evaluate(self, request: FigureOutputRequest) -> FigureOutputFront:
+        if not isinstance(request, FigureOutputRequest):
+            raise TypeError("Figure output session requires FigureOutputRequest")
+
+        area_key = _area_dependency(request)
+        if area_key != self._area_key:
+            self._area_key = area_key
+            if request.area is None:
+                self._area_outputs, self._area_failures = MappingProxyType({}), ()
+            else:
+                self._area_outputs, self._area_failures = self._materialize(
+                    "Area",
+                    lambda: materialize_area_outputs(
+                        request.source,
+                        request.area.selection,
+                    ),
+                )
+
+        cross_key = _cross_dependency(request)
+        if cross_key != self._cross_key:
+            self._cross_key = cross_key
+            if request.cross is None:
+                self._cross_outputs, self._cross_failures = MappingProxyType({}), ()
+            else:
+                self._cross_outputs, self._cross_failures = self._materialize(
+                    "Cross",
+                    lambda: materialize_cross_outputs(
+                        request.source,
+                        request.cross.point,
+                        request.cross.axes,
+                    ),
+                )
+
+        fit_key = (
+            None
+            if request.fit_result is None
+            else (request.source.snapshot.ref, request.fit_result_identity)
+        )
+        if fit_key != self._fit_key:
+            self._fit_key = fit_key
+            if request.fit_result is None:
+                self._fit_outputs, self._fit_failures = MappingProxyType({}), ()
+            else:
+                self._fit_outputs, self._fit_failures = self._materialize(
+                    "Fit",
+                    lambda: materialize_fit_outputs(
+                        request.source,
+                        request.fit_result,
+                    ),
+                )
+
+        outputs: dict[str, FigureDerivedSignal] = {}
+        for group in (self._area_outputs, self._cross_outputs, self._fit_outputs):
+            overlap = outputs.keys() & group.keys()
+            if overlap:
+                raise RuntimeError(
+                    f"Figure output owners overlap: {tuple(sorted(overlap))}"
+                )
+            outputs.update(group)
+        return FigureOutputFront(
+            outputs,
+            self._area_failures + self._cross_failures + self._fit_failures,
+        )
+
+    def close(self) -> None:
+        self._area_key = None
+        self._area_outputs = MappingProxyType({})
+        self._area_failures = ()
+        self._cross_key = None
+        self._cross_outputs = MappingProxyType({})
+        self._cross_failures = ()
+        self._fit_key = None
+        self._fit_outputs = MappingProxyType({})
+        self._fit_failures = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,15 +434,16 @@ class FigureDerivedSignal:
 
     Run identity and routing names intentionally do not appear here.  Those are
     application-shell concerns; the Figure owns only the immutable snapshot,
-    exact derivation, optional display metadata, and whether source coverage
-    remains meaningful for the derived value.
+    exact derivation, complete frontend-owned presentation, and whether source
+    coverage remains meaningful for the derived value.
     """
 
     snapshot: OwnedSnapshot
     source_ref: DatasetRevisionRef
     derivation_digest: str
+    presentation: FigureOutputPresentation
     preserve_source_coverage: bool = False
-    metadata: SelectorAxisMetadata | FitParameterMetadata | None = None
+    source_transform: DataTransformSpec | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, OwnedSnapshot):
@@ -240,13 +453,17 @@ class FigureDerivedSignal:
         if self.snapshot.ref.revision != self.source_ref.revision:
             raise ValueError("Figure signal revision differs from its source")
         sha256_text(self.derivation_digest, "Figure signal derivation_digest")
+        if not isinstance(self.presentation, FigureOutputPresentation):
+            raise TypeError(
+                "Figure signal presentation must be FigureOutputPresentation"
+            )
         if type(self.preserve_source_coverage) is not bool:
             raise TypeError("preserve_source_coverage must be bool")
-        if self.metadata is not None and not isinstance(
-            self.metadata,
-            (SelectorAxisMetadata, FitParameterMetadata),
-        ):
-            raise TypeError("Figure output metadata is not supported")
+        if self.source_transform is not None:
+            if not isinstance(self.source_transform, DataTransformSpec):
+                raise TypeError("Figure signal source_transform must be DataTransformSpec")
+            if not self.source_transform.operations:
+                raise ValueError("Figure signal source_transform must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +573,23 @@ def area_range_output_name(axis_id: AxisId) -> str:
     if not isinstance(axis_id, AxisId):
         raise TypeError("axis_id must be AxisId")
     return f"area.range.{axis_id.value}"
+
+
+def area_data_output_presentation(
+    source_contract_id: str | None,
+) -> FigureOutputPresentation:
+    """Return the sole public presentation of a Figure Area dataset."""
+
+    return FigureOutputPresentation(
+        AREA_DATA_OUTPUT,
+        figure_output_contract_id(
+            AREA_DATA_OUTPUT,
+            source_contract_id=source_contract_id,
+        ),
+        "Area data",
+        "Area data",
+        "Dataset inside the committed Figure Area selection.",
+    )
 
 
 def figure_output_revision_ref(
@@ -489,14 +723,15 @@ def _term_bounds(
 def figure_derived_signal(
     output_name: str,
     snapshot: OwnedSnapshot,
-    source: FigureOutputSource,
+    source: FigureSource,
     *,
     preserve_source_coverage: bool,
-    metadata: SelectorAxisMetadata | FitParameterMetadata | None = None,
+    presentation: FigureOutputPresentation,
+    source_transform: DataTransformSpec | None = None,
     derivation_digest: str | None = None,
 ) -> FigureDerivedSignal:
-    if not isinstance(source, FigureOutputSource):
-        raise TypeError("Figure output source must be FigureOutputSource")
+    if not isinstance(source, FigureSource):
+        raise TypeError("Figure output source must be FigureSource")
     return FigureDerivedSignal(
         snapshot=snapshot,
         source_ref=source.snapshot.ref,
@@ -509,13 +744,14 @@ def figure_derived_signal(
             if derivation_digest is None
             else derivation_digest
         ),
+        presentation=presentation,
         preserve_source_coverage=preserve_source_coverage,
-        metadata=metadata,
+        source_transform=source_transform,
     )
 
 
 def materialize_area_range_output(
-    source: FigureOutputSource,
+    source: FigureSource,
     source_ref: DatasetRevisionRef,
     axis: AxisSpec,
     values: tuple[float, ...],
@@ -556,7 +792,13 @@ def materialize_area_range_output(
         bound,
         source,
         preserve_source_coverage=False,
-        metadata=SelectorAxisMetadata(axis.axis_id, axis.name, axis.unit),
+        presentation=FigureOutputPresentation(
+            output_name,
+            FIGURE_AREA_RANGE_OUTPUT_CONTRACT_ID,
+            f"{axis.name} range",
+            f"{axis.name} range",
+            f"Committed Figure Area bounds on {axis.name}.",
+        ),
         derivation_digest=derivation_digest,
     )
 
@@ -564,13 +806,13 @@ def materialize_area_range_output(
 
 
 def materialize_area_outputs(
-    source: FigureOutputSource,
+    source: FigureSource,
     selection: Selection | HistogramValueRangeSelection,
 ) -> dict[str, FigureDerivedSignal]:
     """Return selected data plus one typed bound vector per selected axis."""
 
-    if not isinstance(source, FigureOutputSource):
-        raise TypeError("Area source must be FigureOutputSource")
+    if not isinstance(source, FigureSource):
+        raise TypeError("Area source must be FigureSource")
     if isinstance(selection, HistogramValueRangeSelection):
         snapshot = source.snapshot
         if not isinstance(snapshot, OwnedSnapshot):
@@ -603,6 +845,9 @@ def materialize_area_outputs(
                 selected,
                 source,
                 preserve_source_coverage=True,
+                presentation=area_data_output_presentation(
+                    source.source_contract_id,
+                ),
             )
         }
         value_axis = AxisSpec(
@@ -639,6 +884,10 @@ def materialize_area_outputs(
         selected,
         source,
         preserve_source_coverage=True,
+        presentation=area_data_output_presentation(
+            source.source_contract_id,
+        ),
+        source_transform=DataTransformSpec((selection,)),
     )
     selection_tree = selection_to_tree(selection)
     for term in selection.terms:
@@ -661,14 +910,14 @@ def materialize_area_outputs(
 
 
 def materialize_cross_outputs(
-    source: FigureOutputSource,
+    source: FigureSource,
     point: tuple[float, float],
     axes: tuple[SelectorAxisMetadata, SelectorAxisMetadata],
 ) -> dict[str, FigureDerivedSignal]:
     """Publish a locked Cross point; mouse movement is intentionally irrelevant."""
 
-    if not isinstance(source, FigureOutputSource):
-        raise TypeError("Cross source must be FigureOutputSource")
+    if not isinstance(source, FigureSource):
+        raise TypeError("Cross source must be FigureSource")
     snapshot = source.snapshot
     if not isinstance(snapshot, OwnedSnapshot):
         raise TypeError("Cross source signal does not own a dataset snapshot")
@@ -710,13 +959,19 @@ def materialize_cross_outputs(
             coordinate,
             source,
             preserve_source_coverage=False,
-            metadata=axis,
+            presentation=FigureOutputPresentation(
+                output_name,
+                FIGURE_CROSS_COORDINATE_OUTPUT_CONTRACT_ID,
+                axis.name,
+                axis.name,
+                f"Locked Figure Cross coordinate on {axis.name}.",
+            ),
         )
     return result
 
 
 def materialize_fit_outputs(
-    source: FigureOutputSource,
+    source: FigureSource,
     result,
 ) -> dict[str, FigureDerivedSignal]:
     """Publish one typed ``fit.<parameter>`` dataset per model parameter.
@@ -729,8 +984,8 @@ def materialize_fit_outputs(
 
     from zlc_data import FitResultBatch
 
-    if not isinstance(source, FigureOutputSource):
-        raise TypeError("Fit source must be FigureOutputSource")
+    if not isinstance(source, FigureSource):
+        raise TypeError("Fit source must be FigureSource")
     if not isinstance(result, FitResultBatch):
         raise TypeError("Fit result must be FitResultBatch")
     snapshot = source.snapshot
@@ -759,6 +1014,16 @@ def materialize_fit_outputs(
         output[output_name] = FigureDerivedSignal(
             snapshot=fit_snapshot,
             source_ref=result.source_ref,
+            presentation=FigureOutputPresentation(
+                output_name,
+                FIGURE_FIT_PARAMETER_OUTPUT_CONTRACT_ID,
+                parameter_name,
+                parameter_name,
+                (
+                    f"Figure Fit parameter {parameter_name} from model "
+                    f"{result.spec.model_id}."
+                ),
+            ),
             preserve_source_coverage=False,
             derivation_digest=canonical_digest(
                 {
@@ -767,10 +1032,6 @@ def materialize_fit_outputs(
                     "fit_spec": spec_tree,
                     "parameter_name": parameter_name,
                 }
-            ),
-            metadata=FitParameterMetadata(
-                result.spec.model_id,
-                parameter_name,
             ),
         )
     return output

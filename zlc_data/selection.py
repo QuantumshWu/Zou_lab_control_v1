@@ -7,6 +7,7 @@ from numbers import Real
 from typing import Any
 
 from zlc_storage.canonical import (
+    encode as _encode,
     exact_mapping as _exact_map,
     integer,
     nonnegative_integer,
@@ -406,7 +407,10 @@ def selection_from_tree(tree: Any) -> Selection:
             )
         else:
             raise ValueError(f"invalid selection term for kind {kind!r}")
-    return Selection(tuple(terms))
+    selection = Selection(tuple(terms))
+    if _encode(selection_to_tree(selection)) != _encode(tree):
+        raise ValueError("Selection tree is typed but non-canonical")
+    return selection
 
 
 __all__ = [

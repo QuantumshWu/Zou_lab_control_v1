@@ -14,7 +14,7 @@ from PyQt5 import QtGui, QtWidgets
 
 from .console_records import PanelConfig
 from zlc_frontend import board_layout as _layout
-from zlc_frontend.qt_widgets import CARD_PAD, CARD_TITLE_PX, scaled_px
+from zlc_frontend.qt_widgets import CARD_PAD, CARD_TITLE_PX, SURFACE, scaled_px
 from zlc_frontend.render_style import panel_display_size
 
 
@@ -22,25 +22,12 @@ GRID_UNIT = 8
 GAP = GRID_UNIT
 
 
-def cell_size() -> tuple[int, int]:
-    """Return the pixel footprint of the narrowest ``1x2`` card."""
-
-    width = panel_display_size("1x2")[0] + 2 * CARD_PAD
-    height = (
-        scaled_px(CARD_TITLE_PX)
-        + scaled_px(2)
-        + panel_display_size("1x2")[1]
-        + CARD_PAD
-    )
-    return width, height
-
-
 def card_size(size: str) -> tuple[int, int]:
     """Convert one declared panel-size preset to its exact card pixels."""
 
     # FigureSpec owns the complete logical panel size, including its fixed
     # margins.  Wider presets share those margins rather than repeating a
-    # whole 1x2 card, so multiplying ``cell_size`` stretches the Qt surface
+    # whole 1x2 card, so multiplying a nominal cell stretches the Qt surface
     # beyond the worker raster (1x4 is 816 px, not two 480 px plots).  The
     # board packer already accepts arbitrary rectangles; the card therefore
     # wraps the exact authored panel width and nothing else.
@@ -81,7 +68,7 @@ def opaque_white_composite(pixmap: QtGui.QPixmap) -> QtGui.QPixmap:
 
     canvas = QtGui.QPixmap(pixmap.size())
     canvas.setDevicePixelRatio(pixmap.devicePixelRatio())
-    canvas.fill(QtGui.QColor("#FFFFFF"))
+    canvas.fill(QtGui.QColor(SURFACE))
     painter = QtGui.QPainter(canvas)
     painter.drawPixmap(0, 0, pixmap)
     painter.end()

@@ -13,8 +13,8 @@ from .pipeline import (
     PipelineResult,
     _admit_capture_preview,
     _admit_exact_dataset_preview,
-    _open_exact_capture_transaction,
     _settle_unbound_preview,
+    open_exact_capture_transaction,
 )
 from zlc_neutral_atom.runtime.preview import (
     ExactDatasetPreviewPort,
@@ -37,6 +37,7 @@ from zlc_neutral_atom.devices.sequencer.port import (
     BoundPulsePort,
     FinitePulseExecutionRequest,
     PulseSession,
+    PulseTerminalAck,
 )
 
 
@@ -68,9 +69,9 @@ class TriggeredCaptureSpec:
             trigger_channel,
             cell_plan,
         )
-        contract = self.capture.measurement.capture_contract
+        contract = self.capture.capture.capture_contract
         validate_single_trigger_capture_binding(
-            capture_spec=self.capture.measurement.capture_spec,
+            capture_spec=self.capture.capture.capture_spec,
             contract=contract,
             pulse_binding=pulse_binding,
         )
@@ -151,6 +152,31 @@ class TriggeredPipelineResult:
         return self._lineage
 
 
+def finalize_triggered_pipeline_result(
+    spec: TriggeredCaptureSpec,
+    capture: PipelineResult,
+    pulse_terminal: PulseTerminalAck,
+    *,
+    exact_preview: ExactDatasetPreviewPort | None = None,
+) -> TriggeredPipelineResult:
+    """Bind exact Camera completion to the terminal receipt of the same pulse.
+
+    ``compile_triggered_pipeline`` and domain Runs that execute several
+    sequential camera arms share this one association proof.  No caller can
+    manufacture the process-local result token or bypass the frozen
+    ``PulseCaptureBinding`` validation.
+    """
+
+    if not isinstance(spec, TriggeredCaptureSpec):
+        raise TypeError("spec must be TriggeredCaptureSpec")
+    return TriggeredPipelineResult(
+        _TRIGGERED_RESULT_TOKEN,
+        capture=capture,
+        exact_preview=exact_preview,
+        lineage=PulseCaptureLineage(spec.pulse_binding, pulse_terminal),
+    )
+
+
 def compile_triggered_pipeline(
     spec: TriggeredCaptureSpec,
     *,
@@ -161,7 +187,7 @@ def compile_triggered_pipeline(
 
     if not isinstance(spec, TriggeredCaptureSpec):
         raise TypeError("spec must be TriggeredCaptureSpec")
-    camera_port = spec.capture.measurement.capture_port
+    camera_port = spec.capture.capture.capture_port
     pulse_port = spec.pulse_port
     preview_spec = _admit_capture_preview(spec.capture, preview)
     exact_preview_spec = _admit_exact_dataset_preview(spec.capture, exact_preview)
@@ -174,7 +200,7 @@ def compile_triggered_pipeline(
     def preflight(
         context: RunContext,
     ) -> tuple[ExactCaptureTransaction, PulseSession]:
-        capture = _open_exact_capture_transaction(
+        capture = open_exact_capture_transaction(
             spec.capture,
             context,
             preview=preview,
@@ -199,11 +225,11 @@ def compile_triggered_pipeline(
             pulse=pulse,
             capture=capture,
         )
-        return TriggeredPipelineResult(
-            _TRIGGERED_RESULT_TOKEN,
-            capture=capture_result,
+        return finalize_triggered_pipeline_result(
+            spec,
+            capture_result,
+            pulse_terminal,
             exact_preview=capture.exact_preview_port,
-            lineage=PulseCaptureLineage(spec.pulse_binding, pulse_terminal),
         )
 
     def cleanup(
@@ -276,6 +302,7 @@ def compile_triggered_pipeline(
 
 __all__ = [
     "compile_triggered_pipeline",
+    "finalize_triggered_pipeline_result",
     "TriggeredCaptureSpec",
     "TriggeredPipelineResult",
 ]

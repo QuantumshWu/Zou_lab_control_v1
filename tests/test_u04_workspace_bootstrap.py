@@ -54,15 +54,15 @@ def test_a_file_in_the_way_fails_closed(tmp_path: Path):
         durable_makedirs(blocker / "below")
 
 
-def test_both_launchers_prepare_the_workspace_before_connecting():
-    """Neither launcher may hand the composition root a missing ancestor."""
+def test_composition_root_prepares_the_workspace_before_children():
+    """Workspace creation belongs to ``connect``, not to each GUI launcher."""
 
-    root = Path(__file__).resolve().parents[1]
-    # pulse_gui.py now opens the OFFLINE editor and never connects (main behaviour,
-    # C22), so the workspace-bootstrap obligation applies to the console launcher only.
-    for name in ("task_console.py",):
-        source = (root / name).read_text(encoding="utf-8")
-        assert "durable_makedirs(" in source, name
-        prepare = source.index("durable_makedirs(")
-        connect_call = source.index("experiment = connect(")
-        assert prepare < connect_call, name
+    import inspect
+
+    from Zou_lab_control.notebook import connect
+
+    source = inspect.getsource(connect)
+    prepare = source.index("durable_makedirs(repository_root)")
+    first_child = source.index("CaptureRepository(")
+    installation = source.index("create_installation(")
+    assert prepare < first_child < installation

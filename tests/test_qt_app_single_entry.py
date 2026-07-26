@@ -283,7 +283,7 @@ def test_every_gui_user_flow_uses_the_same_offscreen_fast_path() -> None:
                 )
         if "capture_offscreen_window" not in calls:
             offenders.append(f"{path.name}: does not capture the formal outer window")
-        if not any(name.startswith("open_") for name in calls):
+        if not any(name == "open" or name.startswith("open_") for name in calls):
             offenders.append(f"{path.name}: does not call a formal GUI composition entry")
         mutated = sorted(calls & forbidden_methods)
         if mutated:

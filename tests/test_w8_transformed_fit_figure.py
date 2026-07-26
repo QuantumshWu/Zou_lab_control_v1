@@ -25,7 +25,7 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     BlockId,
-    ComponentValidity,
+    DatasetComponentValidity,
     CoordinateFrameId,
     DataBlock,
     DataTransformSpec,
@@ -168,7 +168,7 @@ def _selection_image_product():
         BlockId("w8-transform-source"),
         DatasetRevision(4),
         values,
-        ComponentValidity(
+        DatasetComponentValidity(
             (site.axis_id, y_axis.axis_id, x_axis.axis_id),
             validity,
         ),

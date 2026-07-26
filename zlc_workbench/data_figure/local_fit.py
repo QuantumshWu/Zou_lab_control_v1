@@ -10,6 +10,7 @@ explicitly saved result by rebuilding that same immutable figure with
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 from zlc_data import (
@@ -22,6 +23,7 @@ from zlc_data import (
 from zlc_frontend import (
     DataFigure,
     FitAuthoringOption,
+    FigurePresentationContract,
     prepare_fit_authoring_options,
 )
 
@@ -30,10 +32,10 @@ from .archive_repository import (
     load_figure_archive,
     save_figure_archive,
 )
-from .projection import (
-    _DEFAULT_FIT_TIMEOUT_SECONDS,
-    _FitSaveReceipt,
-    _FitWorkbenchBindings,
+from .fit_contract import (
+    DEFAULT_FIT_TIMEOUT_SECONDS,
+    FitSaveReceipt,
+    FitWorkbenchBindings,
 )
 
 
@@ -60,9 +62,10 @@ def local_fit_bindings(
     initial_selection: Selection | None = None,
     open_fit: bool = False,
     archive_path: str | Path | None = None,
+    archive_presentation: FigurePresentationContract,
     archive_metadata: Mapping[str, object] | None = None,
-    timeout_seconds: float = _DEFAULT_FIT_TIMEOUT_SECONDS,
-) -> _FitWorkbenchBindings:
+    timeout_seconds: float = DEFAULT_FIT_TIMEOUT_SECONDS,
+) -> FitWorkbenchBindings:
     """Bind one exact single-layer figure to the shared Fit host."""
 
     if not isinstance(figure, DataFigure):
@@ -71,6 +74,9 @@ def local_fit_bindings(
         raise TypeError("initial_selection must be Selection or None")
     if archive_metadata is not None and not isinstance(archive_metadata, Mapping):
         raise TypeError("archive_metadata must be a mapping or None")
+    if not isinstance(archive_presentation, FigurePresentationContract):
+        raise TypeError("archive_presentation must be FigurePresentationContract")
+    archive_presentation.validate_figure(figure)
     if len(figure.document.layers) != 1:
         raise ValueError("local Fit requires exactly one Figure layer")
     layer = figure.document.layers[0]
@@ -122,7 +128,7 @@ def local_fit_bindings(
             raise TypeError("local Figure Fit must return FitResultBatch")
         return execution
 
-    def save(execution, destination, display) -> _FitSaveReceipt:
+    def save(execution, destination, display) -> FitSaveReceipt:
         if not isinstance(execution, FitResultBatch):
             raise TypeError("local Figure Fit save requires FitResultBatch")
         if destination is None:
@@ -133,7 +139,7 @@ def local_fit_bindings(
         saved_path = save_figure_archive(
             fitted,
             Path(destination),
-            display=display,
+            presentation=replace(archive_presentation, display=display),
             metadata=frozen_metadata,
         )
         reopened = load_figure_archive(saved_path)
@@ -143,7 +149,7 @@ def local_fit_bindings(
             != encode_fit_result_batch(execution)
         ):
             raise RuntimeError("saved Figure archive did not reopen the exact Fit result")
-        return _FitSaveReceipt(
+        return FitSaveReceipt(
             reopened,
             f"figure-archive:{reopened.archive.payload_digest}",
             str(reopened.path),
@@ -158,7 +164,7 @@ def local_fit_bindings(
             raise ValueError("saved Figure archive lost its fitted layer")
         return reopened_result
 
-    return _FitWorkbenchBindings(
+    return FitWorkbenchBindings(
         prepare,
         execute,
         result,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from zlc_data import READOUT_EVENT, AxisId, BlockId, DatasetSchema
+from zlc_data import READOUT_EVENT, AxisId
 from zlc_neutral_atom.capture.artifact import (
     AdmittedCapture,
     CaptureRepository,
@@ -16,24 +16,14 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
-    calibration_artifact_ref_to_tree,
 )
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
-from .processor import (
-    OccupancyProcessorSpec,
-    resolve_occupancy_processor_schema,
-)
-from .pipeline import OccupancyPipelineSpec
-from zlc_neutral_atom.capture.pipeline import BoundMeasurement
 from zlc_neutral_atom.runtime.run import RunPlan
-from zlc_neutral_atom.runtime.streams import StreamId
-from zlc_storage import canonical_digest
 
 
 _DETECTION_RUN_DEADLINE_SECONDS = 300.0
 
 __all__ = [
-    "bind_occupancy_pipeline",
     "build_detection_request",
     "DetectionRequest",
     "prepare_detection_plan",
@@ -139,49 +129,3 @@ def prepare_detection_plan(
         model_kind=request.model_kind,
         timeout_seconds=_DETECTION_RUN_DEADLINE_SECONDS,
     )
-
-
-def bind_occupancy_pipeline(
-    measurement: BoundMeasurement,
-    calibration: ResolvedCalibration,
-    *,
-    model_kind: ReadoutModelKind | None,
-    timing_identity: object,
-    name: str,
-) -> tuple[OccupancyPipelineSpec, DatasetSchema, DatasetSchema]:
-    if not isinstance(measurement, BoundMeasurement):
-        raise TypeError("measurement must be BoundMeasurement")
-    if type(calibration) is not ResolvedCalibration:
-        raise TypeError("calibration must be an exact ResolvedCalibration")
-    calibration._require_authority()
-    selected_kind = calibration.artifact.select_model(model_kind).kind
-    identity = canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.logic_nodes.readout.occupancy.finite-application",
-            "timing": timing_identity,
-            "camera_schema": measurement.capture_contract.dataset_schema.fingerprint,
-            "camera_arm": measurement.capture_spec.digest,
-            "calibration": calibration_artifact_ref_to_tree(
-                calibration.reference
-            ),
-            "model_kind": selected_kind.value,
-        }
-    )
-    processor = OccupancyProcessorSpec(
-        calibration,
-        StreamId(f"finite-occupancy-{identity}"),
-        f"finite-occupancy-{identity}",
-        selected_kind,
-    )
-    resolved = resolve_occupancy_processor_schema(
-        processor,
-        measurement.capture_contract.dataset_schema,
-    )
-    pipeline = OccupancyPipelineSpec(
-        name,
-        measurement,
-        processor,
-        BlockId(f"occupancy-counts-{identity[:20]}"),
-        BlockId(f"occupancy-occupied-{identity[:20]}"),
-    )
-    return pipeline, resolved.counts_schema, resolved.occupied_schema

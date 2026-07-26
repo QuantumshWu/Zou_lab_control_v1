@@ -33,6 +33,7 @@ def test_notebook_x_hides_and_reopens_same_dirty_editor_then_owner_retires(tmp_p
         QtTest.QTest.mouseClick(editor, QtCore.Qt.LeftButton)
         QtTest.QTest.keyClick(editor, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
         QtTest.QTest.keyClicks(editor, "operator unsaved pulse")
+        QtTest.QTest.keyClick(editor, QtCore.Qt.Key_Return)
         _until(
             application,
             lambda: body.current_document.name == "operator unsaved pulse"

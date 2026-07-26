@@ -47,11 +47,10 @@ from zlc_storage import (
     positive_integer,
     sha256_text,
 )
-
-from .contracts import (
+from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSlotSegmentedProgram,
     AutonomousScanSlotProgram,
-    PulseScanProgram,
+    PulseParameterScanProgram,
 )
 from .source_binding import ScanSignalBinding
 
@@ -497,7 +496,7 @@ def pulse_scan_execution_to_tree(value: PulseScanExecution) -> dict[str, object]
 
 def pulse_scan_execution_from_tree(
     tree: object,
-    program: PulseScanProgram,
+    program: PulseParameterScanProgram,
     compiled_artifacts: tuple[CompiledPulseArtifact, ...],
 ) -> PulseScanExecution:
     if not isinstance(tree, dict):

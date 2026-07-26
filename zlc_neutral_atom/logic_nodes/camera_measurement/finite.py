@@ -30,12 +30,15 @@ from zlc_neutral_atom.capture.pipeline import (
     CapturePreviewSpec,
     MinimalPipelineSpec,
 )
+from zlc_neutral_atom.capture.binding import (
+    CameraCaptureBindingRequest,
+    bind_camera_capture,
+)
 from zlc_neutral_atom.runtime.cleanup import CleanupReport, run_cleanup_steps
 from zlc_neutral_atom.runtime.preview import notify_preview_failure
 from zlc_neutral_atom.runtime.run import RunHandle, RunPlan
 from zlc_storage import positive_integer
 
-from .binding import CameraCaptureBindingRequest, bind_camera_measurement
 from .definition import (
     CameraMeasurementDescriptor,
     CameraMeasurementRequest,
@@ -122,7 +125,7 @@ class PreparedFiniteCameraMeasurement(PreparedExactCapture):
         return self._start_run(
             _compile_exposure_configured_camera_artifact(
                 self._request,
-                self._pipeline.measurement.capture_port,
+                self._pipeline.capture.capture_port,
                 self._repository,
             )
         )
@@ -150,7 +153,7 @@ class PreparedFiniteCameraMeasurement(PreparedExactCapture):
         preview = factory(preview_spec)
         plan = _compile_exposure_configured_camera_artifact(
             self._request,
-            self._pipeline.measurement.capture_port,
+            self._pipeline.capture.capture_port,
             self._repository,
             preview=preview,
         )
@@ -313,13 +316,11 @@ def bind_finite_camera_measurement(
             for event_index in range(events)
         ),
     )
-    measurement = bind_camera_measurement(
+    camera_capture = bind_camera_capture(
         camera_port,
         CameraCaptureBindingRequest(
             request.camera_ref.role,
-            repeat_axis,
-            (event_axis,),
-            point_layout,
+            schema,
             schedule,
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             tuple(facts.event_setting(index) for index in range(events)),
@@ -327,7 +328,7 @@ def bind_finite_camera_measurement(
     )
     pipeline = MinimalPipelineSpec(
         f"Camera {request.camera_ref.role}",
-        measurement,
+        camera_capture,
         BlockId(f"camera-{schema.fingerprint[:20]}"),
     )
     descriptor = CameraMeasurementDescriptor(

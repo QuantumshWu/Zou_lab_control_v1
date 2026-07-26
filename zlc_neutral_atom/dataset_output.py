@@ -8,7 +8,7 @@ reconstruct arrays, axes, coverage, or lineage.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generic, Mapping, Protocol, TypeVar, runtime_checkable
+from typing import Mapping, Protocol, runtime_checkable
 
 from zlc_data import OwnedSnapshot, dataset_revision_ref_to_tree
 from zlc_neutral_atom.runtime.dataset import (
@@ -18,13 +18,7 @@ from zlc_neutral_atom.runtime.dataset import (
     MonitorDatasetSnapshot,
 )
 from zlc_storage import canonical_digest, canonical_text, sha256_text
-
-
-def _bare_name(value: str) -> str:
-    name = canonical_text(value, "dataset output name")
-    if "/" in name or name.startswith("@"):
-        raise ValueError("dataset output name must be bare, not namespaced")
-    return name
+from .output_name import bare_output_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,7 +29,11 @@ class DatasetOutputDeclaration:
     contract_id: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _bare_name(self.name))
+        object.__setattr__(
+            self,
+            "name",
+            bare_output_name(self.name, kind="dataset output"),
+        )
         object.__setattr__(
             self,
             "contract_id",
@@ -130,24 +128,6 @@ class LiveDatasetSnapshotSource(Protocol):
     def close(self) -> None: ...
 
 
-ResultT = TypeVar("ResultT")
-
-
-class FinalDatasetOutputOwner(Protocol, Generic[ResultT]):
-    """Prepared application that materializes its own successful result.
-
-    This is deliberately an object capability, not a caller-supplied projector
-    callback.  The prepared command retains the exact repository/request state
-    needed to interpret ``result``; a desktop host only schedules this method
-    off the Qt thread and routes the returned named values.
-    """
-
-    def final_dataset_outputs(
-        self,
-        result: ResultT,
-    ) -> Mapping[str, FinalDatasetOutput]: ...
-
-
 def single_live_dataset_output(
     declaration: DatasetOutputDeclaration,
     frozen: DatasetPreviewSnapshot | MonitorDatasetSnapshot,
@@ -214,7 +194,6 @@ def final_dataset_join_digest(
 __all__ = [
     "DatasetOutputDeclaration",
     "FinalDatasetOutput",
-    "FinalDatasetOutputOwner",
     "LiveDatasetOutput",
     "LiveDatasetOutputOwner",
     "LiveDatasetSnapshotSource",

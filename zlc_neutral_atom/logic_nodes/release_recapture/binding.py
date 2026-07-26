@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 from zlc_data import AxisId, AxisSpec, PointLayout
-from zlc_neutral_atom.catalog import MeasurementDefinition
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import CalibrationArtifact, ResolvedCalibration
 from zlc_neutral_atom.logic_nodes.readout.measurement_values import scale_authored_value
 from zlc_neutral_atom.logic_nodes.readout.physical_context import (
@@ -13,7 +12,6 @@ from zlc_neutral_atom.logic_nodes.readout.physical_context import (
     digital_outputs_falling_after_period,
 )
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
-from zlc_neutral_atom.capture.pipeline import BoundMeasurement
 from zlc_neutral_atom.timing.lineage import PulseCaptureBinding
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
 from zlc_neutral_atom.capture.binding import (
@@ -215,7 +213,6 @@ def bind_release_recapture_camera(
     readout_event_axis_id: AxisId,
     scan_axes: tuple[AxisSpec, ...],
     point_layout: PointLayout,
-    definition: MeasurementDefinition,
     calibration: ResolvedCalibration,
 ) -> tuple[PulseDocument, TriggeredCameraBinding]:
     """Bind the shared two-image physical acquisition, once, for both domains."""
@@ -242,19 +239,6 @@ def bind_release_recapture_camera(
             scan_point_layout=point_layout,
         ),
     )
-    base = binding.measurement
-    binding = TriggeredCameraBinding(
-        binding.pulse_port,
-        binding.pulse_request,
-        binding.trigger_channel,
-        BoundMeasurement(
-            definition,
-            base.capture_port,
-            base.capture_contract,
-            base.capture_spec,
-        ),
-        binding.cell_plan,
-    )
     validate_live_release_recapture_calibration(binding, calibration)
     return logical_document, binding
 
@@ -263,7 +247,7 @@ def validate_live_release_recapture_calibration(
     binding: TriggeredCameraBinding,
     calibration: ResolvedCalibration,
 ) -> None:
-    contract = binding.measurement.capture_contract
+    contract = binding.capture.capture_contract
     provenance = contract.camera_provenance
     frame_contract = calibration.artifact.frame_contract
     for event in (0, 1):

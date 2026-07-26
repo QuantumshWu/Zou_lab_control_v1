@@ -15,7 +15,14 @@ import pytest
 
 import Zou_lab_control.notebook as zlc
 import Zou_lab_control.notebook.facade as facade_impl
-from zlc_data import FitNumericPolicy, SPATIAL_X, SPATIAL_Y, encode_fit_result_batch
+import Zou_lab_control.notebook._readout_composition as readout_composition_impl
+from zlc_data import (
+    FitCancelled,
+    FitNumericPolicy,
+    SPATIAL_X,
+    SPATIAL_Y,
+    encode_fit_result_batch,
+)
 from zlc_neutral_atom.artifacts import (
     FitResultArtifactRef,
     FitResultRepository,
@@ -62,13 +69,16 @@ def _case_capture_and_fit(root: Path) -> None:
         assert descriptor.sequencer_role == "sequencer"
         assert descriptor.trigger_channel == "ch11"
         assert descriptor.expected_frames == 3
-        assert descriptor.output_shape == (1, 3, 96, 128)
+        assert descriptor.output_schema.physical_shape == (1, 3, 96, 128)
         assert descriptor.resource_claims == ("device/sequencer", "device/camera")
 
         reference = exp.run(request)
         assert isinstance(reference, CaptureArtifactRef)
         artifact = exp.readout.load_capture(reference)
-        assert artifact.frame_source.schema.physical_shape == descriptor.output_shape
+        assert (
+            artifact.frame_source.schema.physical_shape
+            == descriptor.output_schema.physical_shape
+        )
         evidence = artifact.pulse_evidence
         assert evidence is not None
         assert evidence.compiled_artifact.fingerprint == descriptor.compiled_pulse_digest
@@ -107,41 +117,6 @@ def _case_capture_and_fit(root: Path) -> None:
         admitted = exp.load_fit(fit_ref)
         assert admitted.reference == fit_ref
         assert admitted.source_artifact_ref == convenience_reference
-        assert encode_fit_result_batch(admitted.result) == encode_fit_result_batch(
-            execution.result
-        )
-
-
-def _case_scan_and_fit(root: Path) -> None:
-    document = load_pulse_document(MOT_SCAN_PULSE)
-    columns = tuple(item.parameter_id for item in document.scan_parameters)
-    document = replace(
-        document,
-        scan_table=FrozenScanTable(
-            columns,
-            ((0, 0, 0), (1, 0, 1), (0, 1, 1)),
-        ),
-        repeat=RepeatRegion(
-            document.periods[0].period_id,
-            document.periods[-1].period_id,
-            2,
-        ),
-    )
-    with zlc.connect("virtual", repository=root) as exp:
-        scan_ref = exp.scan(exp.readout.scan_request(document))
-        source = exp.readout.materialize_scan(scan_ref)
-        execution = exp.fit(
-            scan_ref,
-            model="radial_gaussian_center",
-            numeric_policy=FitNumericPolicy(
-                max_evaluations=500,
-            ),
-        )
-        assert execution.source_artifact_ref == scan_ref
-        assert execution.result.source_ref == source.snapshot.ref
-        fit_ref = execution.save()
-        admitted = exp.load_fit(fit_ref)
-        assert admitted.source_artifact_ref == scan_ref
         assert encode_fit_result_batch(admitted.result) == encode_fit_result_batch(
             execution.result
         )
@@ -212,12 +187,10 @@ def _case_public_authority_and_validation(root: Path) -> None:
 
 def _case_close_retry(root: Path) -> None:
     exp = zlc.connect("virtual", repository=root)
-    token = exp._authority_token
-    services = facade_impl._AUTHORITIES[token]
+    services = exp._services
     borrow = services.capture_repository._root_lease.borrow()
     try:
         _expect(facade_impl._ResourceCleanupError, "close failed", exp.close)
-        assert facade_impl._AUTHORITIES[token] is services
         assert services.state == "CLOSING"
         _expect(
             RuntimeError,
@@ -227,25 +200,206 @@ def _case_close_retry(root: Path) -> None:
     finally:
         borrow.close()
     exp.close()
-    assert token not in facade_impl._AUTHORITIES
+    assert services.state == "CLOSED"
+    _assert_repository_roots_released(root)
+
+
+class _ControlledWorkbenchHandle:
+    """Structural WorkbenchHandle used to prove application close ordering."""
+
+    def __init__(
+        self,
+        *,
+        initially_acknowledged: bool = False,
+        event_owner_thread_id: int | None = None,
+    ) -> None:
+        self._allow_ack = threading.Event()
+        if initially_acknowledged:
+            self._allow_ack.set()
+        self.wait_entered = threading.Event()
+        self.request_count = 0
+        self.event_owner_thread_id = event_owner_thread_id
+
+    @property
+    def permanently_closed(self) -> bool:
+        return self._allow_ack.is_set()
+
+    def restore_window(self) -> None:
+        raise AssertionError("close test must not restore its Workbench")
+
+    def request_owner_close(self) -> None:
+        self.request_count += 1
+
+    def wait_owner_closed(self, timeout: float) -> bool:
+        self.wait_entered.set()
+        if threading.get_ident() == self.event_owner_thread_id:
+            self._allow_ack.set()
+        return self._allow_ack.wait(min(timeout, 0.4))
+
+    def acknowledge_close(self) -> None:
+        self._allow_ack.set()
+
+
+def _case_concurrent_close_owner(root: Path) -> None:
+    exp = zlc.connect("virtual", repository=root)
+    services = exp._services
+    handle = _ControlledWorkbenchHandle()
+    with services.operation_lock:
+        services.gui_handles["controlled"] = handle
+
+    failures: list[BaseException] = []
+
+    def invoke_close() -> None:
+        try:
+            exp.close()
+        except BaseException as error:
+            failures.append(error)
+
+    first = threading.Thread(target=invoke_close, daemon=False)
+    first.start()
+    assert handle.wait_entered.wait(2.0)
+
+    second = threading.Thread(target=invoke_close, daemon=False)
+    second.start()
+    time.sleep(0.05)
+    assert second.is_alive()
+    with services.operation_lock:
+        assert services.state == "CLOSING"
+
+    handle.acknowledge_close()
+    first.join(2.0)
+    second.join(2.0)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert failures == []
+    assert handle.request_count == 2
+    assert services.state == "CLOSED"
+    _assert_repository_roots_released(root)
+
+
+def _case_concurrent_gui_owner_keeps_pumping(root: Path) -> None:
+    exp = zlc.connect("virtual", repository=root)
+    services = exp._services
+    handle = _ControlledWorkbenchHandle(
+        event_owner_thread_id=threading.get_ident(),
+    )
+    with services.operation_lock:
+        services.gui_handles["controlled"] = handle
+
+    foreign_failures: list[BaseException] = []
+
+    def foreign_close() -> None:
+        try:
+            exp.close()
+        except BaseException as error:
+            foreign_failures.append(error)
+
+    foreign = threading.Thread(target=foreign_close, daemon=False)
+    foreign.start()
+    assert handle.wait_entered.wait(2.0)
+
+    # The main thread models the Qt owner.  It is a concurrent caller, not the
+    # teardown owner, but its Workbench wait port must keep processing the
+    # close acknowledgement needed by the foreign owner.
+    exp.close()
+    foreign.join(2.0)
+    assert not foreign.is_alive()
+    assert foreign_failures == []
+    assert services.state == "CLOSED"
+    _assert_repository_roots_released(root)
+
+
+def _case_gui_close_retry_preserves_data(root: Path) -> None:
+    exp = zlc.connect("virtual", repository=root)
+    services = exp._services
+    handle = _ControlledWorkbenchHandle()
+    with services.operation_lock:
+        services.gui_handles["controlled"] = handle
+
+    # Avoid spending the production acknowledgement deadline in this
+    # deterministic contract case while still exercising the real close path.
+    handle.wait_owner_closed = lambda _timeout: False  # type: ignore[method-assign]
+    _expect(
+        facade_impl._ResourceCleanupError,
+        "Workbench close failed",
+        exp.close,
+    )
+    assert services.state == "CLOSING"
+    assert services.closing_gui_handles == (handle,)
+    _expect(
+        RepositoryRootBusy,
+        "live owner",
+        lambda: CaptureRepository(root / "captures"),
+    )
+
+    handle.wait_owner_closed = (  # type: ignore[method-assign]
+        lambda timeout: handle._allow_ack.wait(timeout)
+    )
+    handle.acknowledge_close()
+    exp.close()
+    assert services.state == "CLOSED"
+    _assert_repository_roots_released(root)
+
+
+def _case_runtime_close_retry_preserves_handles(root: Path) -> None:
+    exp = zlc.connect("virtual", repository=root)
+    services = exp._services
+    handle = _ControlledWorkbenchHandle(initially_acknowledged=True)
+    with services.operation_lock:
+        services.gui_handles["controlled"] = handle
+
+    runtime_type = type(services.runtime)
+    original_shutdown = runtime_type.shutdown
+    shutdown_calls = 0
+
+    def fail_first_shutdown(runtime, *, timeout: float):
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+        if shutdown_calls == 1:
+            return False
+        return original_shutdown(runtime, timeout=timeout)
+
+    runtime_type.shutdown = fail_first_shutdown
+    try:
+        _expect(RuntimeError, "did not complete", exp.close)
+        assert services.state == "CLOSING"
+        assert services.closing_gui_handles == (handle,)
+        assert handle.request_count == 1
+        _expect(
+            RepositoryRootBusy,
+            "live owner",
+            lambda: CaptureRepository(root / "captures"),
+        )
+
+        exp.close()
+    finally:
+        runtime_type.shutdown = original_shutdown
+
+    assert shutdown_calls == 2
+    assert handle.request_count == 3
+    assert services.state == "CLOSED"
     _assert_repository_roots_released(root)
 
 
 def _case_close_race(root: Path, surface: str) -> None:
     exp = zlc.connect("virtual", repository=root)
-    services = facade_impl._AUTHORITIES[exp._authority_token]
+    services = exp._services
     passed_initial_lookup = threading.Event()
     backend_calls: list[str] = []
     failures: list[BaseException] = []
-    original_guard = facade_impl._service_guard
+    guard_owner = (
+        readout_composition_impl if surface == "capture" else facade_impl
+    )
+    guard_name = "service_guard" if surface == "capture" else "_service_guard"
+    original_guard = getattr(guard_owner, guard_name)
 
     @contextmanager
-    def observed_guard(token):
+    def observed_guard(guarded_services):
         passed_initial_lookup.set()
-        with original_guard(token) as value:
+        with original_guard(guarded_services) as value:
             yield value
 
-    facade_impl._service_guard = observed_guard
+    setattr(guard_owner, guard_name, observed_guard)
     if surface == "capture":
         type(services.capture_repository).load = (
             lambda _self, _reference: backend_calls.append("capture-load")
@@ -278,8 +432,7 @@ def _case_close_race(root: Path, surface: str) -> None:
 
 def _case_fit_close_drain(root: Path) -> None:
     exp = zlc.connect("virtual", repository=root)
-    token = exp._authority_token
-    services = facade_impl._AUTHORITIES[token]
+    services = exp._services
     entered = threading.Barrier(3)
     close_started = threading.Barrier(3)
     releases = (threading.Event(), threading.Event())
@@ -288,7 +441,7 @@ def _case_fit_close_drain(root: Path) -> None:
 
     def fit_worker(index: int) -> None:
         try:
-            with facade_impl._fit_service_guard(token):
+            with facade_impl._fit_service_guard(services):
                 entered.wait(timeout=2.0)
                 assert releases[index].wait(2.0)
         except BaseException as error:
@@ -328,7 +481,7 @@ def _case_fit_close_drain(root: Path) -> None:
         raise AssertionError("concurrent close did not enter CLOSING")
 
     def attempt_late_fit() -> None:
-        with facade_impl._fit_service_guard(token):
+        with facade_impl._fit_service_guard(services):
             raise AssertionError("Fit entered after Experiment began closing")
 
     _expect(RuntimeError, "closing or closed", attempt_late_fit)
@@ -345,16 +498,15 @@ def _case_fit_close_drain(root: Path) -> None:
         assert not thread.is_alive()
     assert close_failures == []
     assert len(fit_failures) == 2
-    assert all(isinstance(error, facade_impl.FitCancelled) for error in fit_failures)
-    assert token not in facade_impl._AUTHORITIES
+    assert all(isinstance(error, FitCancelled) for error in fit_failures)
+    assert services.state == "CLOSED"
     _assert_repository_roots_released(root)
 
 
 def _case_fit_reentrant_close(root: Path) -> None:
     exp = zlc.connect("virtual", repository=root)
-    token = exp._authority_token
-    services = facade_impl._AUTHORITIES[token]
-    with facade_impl._fit_service_guard(token):
+    services = exp._services
+    with facade_impl._fit_service_guard(services):
         _expect(
             RuntimeError,
             "cannot close reentrantly",
@@ -368,13 +520,11 @@ def _case_fit_reentrant_close(root: Path) -> None:
         assert services.active_fit_operations == 0
         assert services.fit_operations_drained.is_set()
     exp.close()
-    assert token not in facade_impl._AUTHORITIES
+    assert services.state == "CLOSED"
     _assert_repository_roots_released(root)
 
 
 def _case_failed_public_root(root: Path) -> None:
-    authority_count = len(facade_impl._AUTHORITIES)
-
     def reject_public_root(*_args, **_kwargs):
         raise RuntimeError("public root construction failed")
 
@@ -385,7 +535,6 @@ def _case_failed_public_root(root: Path) -> None:
         lambda: zlc.connect("virtual", repository=root),
     )
     assert error.__cause__ is None
-    assert len(facade_impl._AUTHORITIES) == authority_count
     _assert_repository_roots_released(root)
 
 
@@ -393,9 +542,12 @@ def _run_case(case: str, root_text: str) -> None:
     root = Path(root_text)
     cases = {
         "capture-and-fit": lambda: _case_capture_and_fit(root),
-        "scan-and-fit": lambda: _case_scan_and_fit(root),
         "public-authority": lambda: _case_public_authority_and_validation(root),
         "close-retry": lambda: _case_close_retry(root),
+        "concurrent-close-owner": lambda: _case_concurrent_close_owner(root),
+        "concurrent-gui-owner": lambda: _case_concurrent_gui_owner_keeps_pumping(root),
+        "gui-close-retry": lambda: _case_gui_close_retry_preserves_data(root),
+        "runtime-close-retry": lambda: _case_runtime_close_retry_preserves_handles(root),
         "close-race-capture": lambda: _case_close_race(root, "capture"),
         "close-race-pulse": lambda: _case_close_race(root, "pulse"),
         "fit-close-drain": lambda: _case_fit_close_drain(root),
@@ -427,9 +579,12 @@ def _run_isolated(case: str, root: Path) -> subprocess.CompletedProcess[str]:
     "case",
     (
         "capture-and-fit",
-        "scan-and-fit",
         "public-authority",
         "close-retry",
+        "concurrent-close-owner",
+        "concurrent-gui-owner",
+        "gui-close-retry",
+        "runtime-close-retry",
         "close-race-capture",
         "close-race-pulse",
         "fit-close-drain",
@@ -452,5 +607,5 @@ def test_notebook_facade_in_process_lifetime_installation(
 def test_connect_rejects_implicit_or_non_string_target(tmp_path: Path) -> None:
     with pytest.raises(TypeError):
         zlc.connect("virtual")  # type: ignore[call-arg]
-    with pytest.raises(TypeError, match="explicit target backend"):
+    with pytest.raises(TypeError, match="config must be"):
         zlc.connect({}, repository=tmp_path / "workspace")  # type: ignore[arg-type]

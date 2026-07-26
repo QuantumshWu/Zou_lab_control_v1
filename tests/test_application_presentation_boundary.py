@@ -6,6 +6,7 @@ import ast
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from zlc_data import (
     REPEAT,
@@ -28,6 +29,7 @@ from zlc_frontend import (
     build_frozen_data_figure,
     build_frozen_figure_document,
 )
+from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +78,17 @@ def test_frontend_builds_the_frozen_document_and_data_figure() -> None:
     assert figure.datasets.resolve(figure.document.datasets[0].dataset_id) == (
         source.snapshot
     )
+
+
+def test_artifact_dataset_source_binds_metadata_and_owned_snapshot() -> None:
+    source = _source()
+    metadata = ArtifactDatasetSource(source.schema, source.ref)
+    assert metadata.snapshot is None
+    with pytest.raises(RuntimeError, match="not materialised"):
+        metadata.require_owned_snapshot()
+
+    materialized = ArtifactDatasetSource(source.schema, source.ref, source.snapshot)
+    assert materialized.require_owned_snapshot() is source.snapshot
 
 
 def test_notebook_facade_does_not_reimplement_frontend_figure_policy() -> None:
@@ -158,4 +171,61 @@ def test_application_boundary_does_not_construct_domain_or_view_owners() -> None
         "Zou_lab_control is public facade and explicit composition only; domain "
         "and presentation values must be constructed by their owner exports:\n"
         + "\n".join(violations)
+    )
+
+
+def test_application_tree_delegates_artifact_dataset_interpretation() -> None:
+    """Split helpers cannot hide artifact storage knowledge from the ratchet."""
+
+    application_root = ROOT / "Zou_lab_control"
+    forbidden_attributes = {
+        "frame_source",
+        "output_schema",
+        "output_dataset_ref",
+    }
+    allowed_materialize_hosts = {
+        ("notebook/_readout_composition.py", "materialize_capture_artifact"),
+        ("notebook/_readout_composition.py", "materialize_pulse_scan"),
+    }
+    violations = []
+    for path in sorted(application_root.rglob("*.py")):
+        relative = path.relative_to(application_root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                if node.attr in forbidden_attributes:
+                    violations.append(f"{relative}:{node.lineno} reads .{node.attr}")
+                if (
+                    node.attr in {"occupied", "counts"}
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "artifact"
+                ):
+                    violations.append(
+                        f"{relative}:{node.lineno} interprets Occupancy artifact output"
+                    )
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"materialize", "materialize_final"}
+            ):
+                continue
+            owner = parents.get(node)
+            while owner is not None and not isinstance(
+                owner,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            ):
+                owner = parents.get(owner)
+            owner_name = None if owner is None else owner.name
+            if (relative, owner_name) not in allowed_materialize_hosts:
+                violations.append(
+                    f"{relative}:{node.lineno} directly calls {node.func.attr}"
+                )
+    assert not violations, (
+        "Zou_lab_control may select typed owner adapters, but artifact fields and "
+        "repository materialisation stay with those owners:\n" + "\n".join(violations)
     )

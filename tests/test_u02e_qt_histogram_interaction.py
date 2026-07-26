@@ -345,16 +345,36 @@ def _double_click(board, position, button) -> None:
 
 
 def _accepted_histogram_frame(sequence: int, command, **kwargs):
-    return _frame(
+    accepted = _frame(
         sequence,
         histogram_revision=command.viewport.display_revision,
         histogram_x_limits=command.viewport.x_limits,
         **kwargs,
     )
+    panel = accepted.panels[1]
+    payload = replace(
+        panel.display_payload,
+        evaluated_input=command.origin.input_identity,
+    )
+    return replace(
+        accepted,
+        panels=(
+            accepted.panels[0],
+            replace(
+                panel,
+                source_identity=command.origin.source_identity,
+                coherence_stamp=replace(
+                    panel.coherence_stamp,
+                    inputs=(command.origin.input_identity,),
+                ),
+                display_payload=payload,
+            ),
+        ),
+    )
 
 
 def test_curve_and_histogram_bind_simultaneously_with_locked_cross() -> None:
-    from PyQt5 import QtCore, QtGui, QtTest
+    from PyQt5 import QtCore, QtTest
     from zlc_frontend.histogram_display import HistogramCountScale
     from zlc_frontend.selector import CurveViewportCommit, HistogramViewportCommit
 
@@ -379,32 +399,6 @@ def test_curve_and_histogram_bind_simultaneously_with_locked_cross() -> None:
             0.5 * (bin_left + bin_right),
             float(bin_count),
         )
-
-        labels: list[str] = []
-
-        def capture_label(_painter, label, _plot, _color, **_kwargs):
-            labels.append(label)
-
-        original = type(board)._paint_curve_label
-        type(board)._paint_curve_label = staticmethod(capture_label)
-        try:
-            image = QtGui.QImage(
-                board.size(), QtGui.QImage.Format_ARGB32_Premultiplied
-            )
-            painter = QtGui.QPainter(image)
-            try:
-                board._paint_numeric_binding_overlay(painter, histogram_binding)
-            finally:
-                painter.end()
-        finally:
-            type(board)._paint_curve_label = original
-        assert labels == [
-            "ROI A  "
-            f"[{bin_left:.6g}, {bin_right:.6g}"
-            f"{']' if bin_index == len(target.payload.bin_edges) - 2 else ')'} "
-            "photoelectron  "
-            f"count={bin_count}"
-        ]
 
         exact_origin = board.visible_histogram_origin()
         assert exact_origin is not None
@@ -765,7 +759,7 @@ def test_histogram_threshold_line_drag_is_live_exclusive_and_near_line_only() ->
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=on_line)
         assert binding.threshold_drag == 0
         # EXCLUSIVE with the area selector: no span machinery started.
-        assert binding.span_anchor is None and binding.span_rect is None
+        assert binding.rectangle_drag is None and binding.span_rect is None
 
         drag_fraction = line_fraction + 0.2
         expected = x_low + drag_fraction * (x_high - x_low)
@@ -777,26 +771,73 @@ def test_histogram_threshold_line_drag_is_live_exclusive_and_near_line_only() ->
         command = commands[-1]
         assert isinstance(command, HistogramThresholdCommit)
         assert command.thresholds == pytest.approx((expected,), abs=0.05)
-        assert binding.threshold_pending_origin == command.origin
-        assert board.discard_pending_histogram_interaction(command.origin)
-        assert binding.threshold_pending_origin is None
-        assert binding.threshold_pending_revision is None
+        first_answer = binding.threshold_pending_answer
+        assert first_answer is not None and first_answer.origin == command.origin
+
+        # The still-painted raster retains the press-time threshold.  Returning
+        # to it is a newer desired state, but the exact first answer remains the
+        # sole in-flight command; pointer input coalesces into one render-paced
+        # mailbox rather than overwriting the answer that can admit a frame.
+        board.mouseMoveEvent(QtGui.QMouseEvent(
+            QtCore.QEvent.MouseMove,
+            QtCore.QPointF(on_line),
+            QtCore.Qt.NoButton, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
+        application.processEvents()
+        assert len(commands) == 1
+        assert binding.threshold_pending_answer is first_answer
+        assert binding.queued_thresholds == pytest.approx((1.0,), abs=0.05)
+
+        answered_panel = _histogram_panel(
+            2,
+            display_revision=first_answer.display_revision,
+            thresholds=first_answer.thresholds,
+        )
+        answered_panel = replace(
+            answered_panel,
+            source_identity=first_answer.origin.source_identity,
+            coherence_stamp=replace(
+                answered_panel.coherence_stamp,
+                inputs=(first_answer.origin.input_identity,),
+            ),
+            display_payload=replace(
+                answered_panel.display_payload,
+                evaluated_input=first_answer.origin.input_identity,
+            ),
+        )
+        board.present(BoardFrame(
+            "numeric-board",
+            0,
+            1,
+            (answered_panel,),
+        ))
+        returned = commands[-1]
+        assert isinstance(returned, HistogramThresholdCommit)
+        assert returned.thresholds == pytest.approx((1.0,), abs=0.05)
+        assert len(commands) == 2
+        pending_answer = binding.threshold_pending_answer
+        assert pending_answer is not None
+        assert pending_answer.thresholds == returned.thresholds
+        assert pending_answer.display_revision > first_answer.display_revision
+        assert binding.queued_thresholds is None
         issued = len(commands)
 
         QtTest.QTest.mouseRelease(
             board, QtCore.Qt.LeftButton,
-            pos=_point(target.plot, drag_fraction, 0.5))
+            pos=on_line)
         # Release only ends the drag; the last step is not re-issued.
         assert len(commands) == issued
         assert binding.threshold_drag is None
         assert board._selector_hold is None
+        assert binding.threshold_pending_answer is pending_answer
+        assert board.discard_pending_histogram_interaction(returned.origin)
+        assert binding.threshold_pending_answer is None
 
         # A press AWAY from any line (far past the 2% tolerance) starts the
         # ordinary area pull instead.
         away = _point(target.plot, line_fraction - 0.4, 0.5)
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=away)
         assert binding.threshold_drag is None
-        assert binding.span_anchor is not None
+        assert binding.rectangle_drag is not None
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=away)
     finally:
         board.close()

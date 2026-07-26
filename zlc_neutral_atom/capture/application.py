@@ -134,7 +134,7 @@ def bind_finite_capture_spec(
 
     pipeline = MinimalPipelineSpec(
         f"{name_prefix} {binding.pulse_request.document.name}",
-        binding.measurement,
+        binding.capture,
         block_id,
     )
     triggered = TriggeredCaptureSpec(
@@ -151,11 +151,11 @@ def bind_finite_capture_spec(
         execution_form,
         binding.trigger_channel,
         binding.expected_frames,
-        binding.measurement.capture_contract.dataset_schema,
+        binding.capture.capture_contract.dataset_schema,
         binding.compiled_artifact.fingerprint,
         (
             str(binding.pulse_port.resource_claim.key),
-            str(binding.measurement.capture_port.resource_claim.key),
+            str(binding.capture.capture_port.resource_claim.key),
         ),
     )
     return triggered, descriptor

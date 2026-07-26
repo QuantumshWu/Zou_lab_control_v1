@@ -31,6 +31,7 @@ from ._raster_front import (
     _HeldPanelFront,
     _panel_bounds,
     _panel_presentation,
+    _presentation_answers,
     _panel_semantics_changed,
     _hold_matches_frame,
     _raster_geometry,
@@ -58,6 +59,71 @@ _NUMERIC_PAYLOAD_TYPES: dict[_NumericKind, type] = {
     "histogram": HistogramPanelPayload,
     "pulse": PulsePanelPayload,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpectedNumericViewportAnswer:
+    """Authored viewport semantics that one exact frame must echo."""
+
+    origin: PanelInteractionOrigin
+    kind: _NumericKind
+    viewport: _NumericViewport
+
+    def matches(self, panel: PanelFrame) -> bool:
+        payload = _numeric_payload(panel, self.kind)
+        if payload is None:
+            return False
+        candidate = payload.viewport
+        expected = self.viewport
+        if (
+            type(candidate) is not type(expected)
+            or not _presentation_answers(
+                self.origin,
+                panel,
+                expected.display_revision,
+            )
+            or candidate.display_revision != expected.display_revision
+            or candidate.x_limits != expected.x_limits
+        ):
+            return False
+        if isinstance(expected, HistogramViewportTransform):
+            if not isinstance(candidate, HistogramViewportTransform):
+                return False
+            return (
+                candidate.x_limits_are_auto == expected.x_limits_are_auto
+                and candidate.count_scale is expected.count_scale
+                and candidate.relim_mode is expected.relim_mode
+                and candidate.bin_count == expected.bin_count
+                and (
+                    expected.relim_mode is not RelimMode.FIXED
+                    or candidate.count_limits == expected.count_limits
+                )
+            )
+        assert isinstance(expected, NumericViewportTransform)
+        assert isinstance(candidate, NumericViewportTransform)
+        return candidate.x_axis == expected.x_axis
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpectedHistogramThresholdAnswer:
+    """Complete threshold state reserved by one live drag command."""
+
+    origin: PanelInteractionOrigin
+    display_revision: int
+    thresholds: tuple[float, ...]
+
+    def matches(self, panel: PanelFrame) -> bool:
+        payload = _numeric_payload(panel, "histogram")
+        return (
+            isinstance(payload, HistogramPanelPayload)
+            and _presentation_answers(
+                self.origin,
+                panel,
+                self.display_revision,
+            )
+            and payload.viewport.display_revision == self.display_revision
+            and payload.thresholds == self.thresholds
+        )
 
 
 def _numeric_payload(
@@ -196,21 +262,36 @@ class _NumericPanelBinding:
     revision_floor: int = 0
     binding_enabled: bool = True
     interaction_ready: bool = False
-    pending_viewport: _NumericViewport | None = None
-    pending_origin: PanelInteractionOrigin | None = None
+    pending_viewport_answer: _ExpectedNumericViewportAnswer | None = None
+    queued_viewport_limits: tuple[float, float] | None = None
     applied_span: tuple[float, float] | None = None
     span_candidate: tuple[float, float] | None = None
     span_rect: tuple[float, float, float, float] | None = None
     rectangle_drag: RectangleDrag | None = None
     threshold_drag: int | None = None
     threshold_candidate: tuple[float, ...] | None = None
-    threshold_pending_revision: int | None = None
-    threshold_pending_origin: PanelInteractionOrigin | None = None
+    threshold_pending_answer: _ExpectedHistogramThresholdAnswer | None = None
+    queued_thresholds: tuple[float, ...] | None = None
     pan_anchor: float | None = None
     pan_origin: _NumericViewport | None = None
     pan_candidate: tuple[float, float] | None = None
     cross: tuple[float, float] | None = None
     fault: RuntimeError | None = None
+
+    @property
+    def pending_viewport(self) -> _NumericViewport | None:
+        answer = self.pending_viewport_answer
+        return None if answer is None else answer.viewport
+
+    @property
+    def authored_viewport(self) -> _NumericViewport | None:
+        """Newest requested viewport, including the render-paced mailbox."""
+
+        viewport = self.pending_viewport or self.viewport
+        limits = self.queued_viewport_limits
+        if viewport is None or limits is None:
+            return viewport
+        return replace(viewport, x_limits=limits)
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,6 +477,15 @@ def _numeric_interaction_armed(
     )
 
 
+def _numeric_interaction_is_pending(binding: _NumericPanelBinding) -> bool:
+    """Whether this panel already owns one exact render answer."""
+
+    return (
+        binding.pending_viewport_answer is not None
+        or binding.threshold_pending_answer is not None
+    )
+
+
 def _active_numeric_binding(
     bindings: dict[str, _NumericPanelBinding],
     hold: _HeldPanelFront | None,
@@ -413,8 +503,6 @@ def _cancel_numeric_gesture(
     binding.rectangle_drag = None
     binding.threshold_drag = None
     binding.threshold_candidate = None
-    binding.threshold_pending_revision = None
-    binding.threshold_pending_origin = None
     binding.pan_anchor = None
     binding.pan_origin = None
     binding.pan_candidate = None
@@ -432,8 +520,10 @@ def _clear_numeric_transient(
     if clear_applied_span:
         binding.applied_span = None
     if clear_pending:
-        binding.pending_viewport = None
-        binding.pending_origin = None
+        binding.pending_viewport_answer = None
+        binding.queued_viewport_limits = None
+        binding.threshold_pending_answer = None
+        binding.queued_thresholds = None
     binding.cross = None
 
 
@@ -457,8 +547,28 @@ def _commit_histogram_thresholds(
             hold=painted_hold,
         )[0]
     )
-    if payload is None or tuple(thresholds) == tuple(payload.thresholds):
+    if payload is None:
         return False
+    if binding.pending_viewport_answer is not None:
+        return False
+    thresholds = tuple(thresholds)
+    pending_threshold = binding.threshold_pending_answer
+    authored_thresholds = (
+        binding.queued_thresholds
+        if binding.queued_thresholds is not None
+        else (
+            tuple(payload.thresholds)
+            if pending_threshold is None
+            else pending_threshold.thresholds
+        )
+    )
+    if thresholds == authored_thresholds:
+        return False
+    if pending_threshold is not None:
+        binding.queued_thresholds = (
+            None if thresholds == pending_threshold.thresholds else thresholds
+        )
+        return True
     if front is None:
         return False
     if hold is not None and not _hold_matches_frame(
@@ -478,21 +588,26 @@ def _commit_histogram_thresholds(
         raise RuntimeError(
             f"{binding.kind} interaction origin has no exact payload"
         )
-    command = HistogramThresholdCommit(origin, tuple(thresholds))
+    command = HistogramThresholdCommit(origin, thresholds)
     expected = payload.viewport.display_revision
     if binding.viewport is not None:
         expected = max(expected, binding.viewport.display_revision)
     expected = max(expected, binding.revision_floor)
-    if binding.threshold_pending_revision is not None:
-        expected = max(expected, binding.threshold_pending_revision)
-    binding.threshold_pending_revision = expected + 1
-    binding.revision_floor = binding.threshold_pending_revision
-    binding.threshold_pending_origin = origin
+    if pending_threshold is not None:
+        expected = max(expected, pending_threshold.display_revision)
+    expected += 1
+    binding.revision_floor = expected
+    binding.threshold_pending_answer = _ExpectedHistogramThresholdAnswer(
+        origin,
+        expected,
+        thresholds,
+    )
+    binding.queued_thresholds = None
     try:
         binding.callback(command)
     except BaseException as error:
-        binding.threshold_pending_revision = None
-        binding.threshold_pending_origin = None
+        binding.threshold_pending_answer = None
+        binding.queued_thresholds = None
         if binding.fault is None:
             binding.fault = detached_render_fault(error)
         binding.binding_enabled = False
@@ -523,9 +638,17 @@ def _commit_numeric_viewport(
     if payload is None:
         return False
     assert isinstance(payload, _NUMERIC_PAYLOAD_TYPES[binding.kind])
-    authored_viewport = binding.pending_viewport or payload.viewport
+    if binding.threshold_pending_answer is not None:
+        return False
+    pending_viewport = binding.pending_viewport
+    authored_viewport = binding.authored_viewport or payload.viewport
     if x_limits == authored_viewport.x_limits:
         return False
+    if pending_viewport is not None:
+        binding.queued_viewport_limits = (
+            None if x_limits == pending_viewport.x_limits else x_limits
+        )
+        return True
     base_revision = authored_viewport.display_revision
     if binding.viewport is not None:
         base_revision = max(
@@ -573,13 +696,17 @@ def _commit_numeric_viewport(
         else CurveViewportCommit(origin, candidate)
     )
     binding.revision_floor = candidate.display_revision
-    binding.pending_viewport = candidate
-    binding.pending_origin = origin
+    binding.pending_viewport_answer = _ExpectedNumericViewportAnswer(
+        origin,
+        binding.kind,
+        candidate,
+    )
+    binding.queued_viewport_limits = None
     try:
         binding.callback(command)
     except BaseException as error:
-        binding.pending_viewport = None
-        binding.pending_origin = None
+        binding.pending_viewport_answer = None
+        binding.queued_viewport_limits = None
         if binding.fault is None:
             binding.fault = detached_render_fault(error)
         binding.binding_enabled = False

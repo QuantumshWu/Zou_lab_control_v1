@@ -12,11 +12,10 @@ import textwrap
 
 import pytest
 
-import zlc_neutral_atom.logic_nodes.readout.calibration.analysis as analysis_module
+import zlc_neutral_atom.logic_nodes.readout.calibration.analysis as calibration_analysis_module
 from zlc_neutral_atom.logic_nodes.readout.calibration.analysis import (
     CalibrationAnalysisResult,
     CalibrationComputation,
-    compute_calibration,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     CalibrationAnalysisRequest,
@@ -30,6 +29,7 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.application import (
 from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
     compile_calibration_artifact_plan,
 )
+from zlc_neutral_atom.logic_nodes.readout.bimodal import BimodalFit, fit_bimodal
 from zlc_neutral_atom.logic_nodes.readout.calibration.sitemap import (
     SitemapCalibrationRequest,
     build_sitemap_calibration_request,
@@ -66,13 +66,19 @@ def _run_isolated(script: str, workspace: Path) -> dict[str, object]:
 
 
 def test_calibration_analysis_owner_is_split_from_commit_authority():
-    assert CalibrationAnalysisRequest.__module__.endswith(
-        "logic_nodes.calibration.calibration"
+    assert CalibrationAnalysisRequest.__module__ == (
+        "zlc_neutral_atom.logic_nodes.readout.calibration.calibration"
     )
-    assert compute_calibration.__module__.endswith(
-        "logic_nodes.calibration.analysis"
+    assert CalibrationComputation.__module__ == (
+        "zlc_neutral_atom.logic_nodes.readout.calibration.analysis"
     )
-    assert not hasattr(analysis_module, "analyze_calibration")
+    assert CalibrationAnalysisResult.__module__ == CalibrationComputation.__module__
+    assert BimodalFit.__module__ == (
+        "zlc_neutral_atom.logic_nodes.readout.bimodal"
+    )
+    assert fit_bimodal.__module__ == BimodalFit.__module__
+    assert not hasattr(calibration_analysis_module, "BimodalFit")
+    assert not hasattr(calibration_analysis_module, "fit_bimodal")
     assert inspect.isclass(CalibrationComputation)
     with pytest.raises(TypeError, match="returned by a committed calibration Run"):
         CalibrationAnalysisResult()

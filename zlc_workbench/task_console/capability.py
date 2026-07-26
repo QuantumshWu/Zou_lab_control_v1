@@ -15,9 +15,11 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Protocol, runtime_checkable
 
 from zlc_neutral_atom.node_input import BoundNodeInputs
-from zlc_workbench.input_binding import (
+from zlc_neutral_atom.runtime.signal_source import SignalEventSource
+from .input_binding import (
     ResolvedArtifactInput,
     ResolvedDatasetInput,
     ResolvedNodeInput,
@@ -119,6 +121,20 @@ class ConsoleNodeHost:
         return value
 
 
+@runtime_checkable
+class ConsoleSignalEventSourceProvider(Protocol):
+    """Stable Workbench seam for a running row's actual event source.
+
+    The provider itself never pretends to own optional association methods.
+    Callers inspect the returned neutral source against the exact capability
+    protocol they require.  The row's Python type therefore stays stable across
+    prepare, start, and terminal transitions.
+    """
+
+    def signal_event_source(self) -> SignalEventSource:
+        """Return the currently running typed source or raise explicitly."""
+
+
 ConsoleNodeFactory = Callable[
     [
         ConsoleNodeHost,
@@ -160,4 +176,5 @@ __all__ = [
     "ConsoleNodeFactory",
     "ConsoleNodeHost",
     "ConsoleNodeInputs",
+    "ConsoleSignalEventSourceProvider",
 ]

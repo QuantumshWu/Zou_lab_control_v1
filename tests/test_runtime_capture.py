@@ -45,7 +45,12 @@ from zlc_neutral_atom.capture.triggered import (
     compile_triggered_pipeline,
 )
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
-from zlc_pulse import PulseExecutionForm, load_deployed_pulse_target, load_pulse_document
+from zlc_pulse import (
+    PulseExecutionForm,
+    load_deployed_pulse_target,
+    load_pulse_document,
+    pulse_target_manifest_from_lanes,
+)
 from zlc_storage import canonical_digest
 
 
@@ -197,8 +202,7 @@ class _RuntimeFixture:
             interrupt_operations={SafetyOperation.DISARM: self.endpoint.interrupt},
         )
         capture_port = BoundCapturePort(
-            self.broker.verify_capability(binding),
-            (SafetyOperation.DISARM,),
+            self.broker.verify_capability(binding)
         )
         pulse_target = load_deployed_pulse_target()
         self.sequencer = VirtualSequencer(
@@ -206,7 +210,10 @@ class _RuntimeFixture:
             clock_hz=default_clock_hz(DEFAULT_CONFIG_PATH),
             sleep_scale=0,
         )
-        pulse_endpoint = VirtualSequencerExecutionEndpoint(self.sequencer)
+        pulse_endpoint = VirtualSequencerExecutionEndpoint(
+            self.sequencer,
+            pulse_target_manifest_from_lanes(pulse_target),
+        )
         pulse_identity = PhysicalDeviceIdentity(
             "fixture-sequencer",
             DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
@@ -256,10 +263,10 @@ class _RuntimeFixture:
                 readout_events_per_repeat=3,
             ),
         )
-        self.measurement = binding_result.measurement
+        self.camera_capture = binding_result.capture
         self.spec = MinimalPipelineSpec(
             "current direct camera capture",
-            self.measurement,
+            self.camera_capture,
             BlockId("runtime-capture"),
         )
         self.triggered = TriggeredCaptureSpec(
@@ -305,8 +312,8 @@ def test_capture_contract_has_one_capability_owner_and_result_has_no_mirrors(
 ) -> None:
     fixture = _RuntimeFixture(tmp_path)
     try:
-        contract = fixture.measurement.capture_contract
-        assert contract.capability is fixture.measurement.capture_port.capability
+        contract = fixture.camera_capture.capture_contract
+        assert contract.capability is fixture.camera_capture.capture_port.capability
         result = fixture.controller.start(
             compile_triggered_pipeline(fixture.triggered)
         ).result(3.0)

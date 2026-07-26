@@ -1,5 +1,4 @@
-"""The saved-figure viewer application package (window W3).
+"""Saved-figure viewer application package.
 
-Qt-free at import time: the composition lives in :mod:`.app`, entered explicitly by the
-launchers (C13).
+The package root is Qt-free; launchers enter the explicit :mod:`.app` owner.
 """

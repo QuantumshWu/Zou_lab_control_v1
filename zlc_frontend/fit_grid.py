@@ -493,10 +493,11 @@ class FitGridModel:
             result.spec.model_id != self.model_id
             or result.fit_axis_specs != self.fit_axes
             or result.batch_axis_specs != self.axes
-            or result.batch_layout is not self.layout
+            or result.batch_layout != self.layout
         ):
-            # The exact-ref loader normally shares these immutable values.
-            # Refuse any composition callback that substitutes another result.
+            # Archive decoding reconstructs immutable value objects.  Physical
+            # layout identity is therefore its exact logical/storage mapping,
+            # never Python object residency.
             raise ValueError("fit cell summary result differs from grid metadata")
         storage, _multi, address = self.resolve_selection(selection)
         status = result.statuses[storage]

@@ -2,12 +2,13 @@
 
 This catalog is deliberately small.  A declaration belongs here only when the
 current panel renderer consumes the same key.  Fit authoring is the typed
-``FitSpec`` flow exposed by DataFigure, not a histogram display toggle, and
-unused legacy controls are not preserved as saved-layout vocabulary.
+``FitSpec`` flow exposed by DataFigure, not a histogram display toggle; fields
+without a current renderer consumer are not saved-layout vocabulary.
 """
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Mapping
 
 from .form import FormFieldProps, FormSpec, choice_value_from_tree
@@ -39,7 +40,7 @@ _HISTOGRAM_FIT_MODE = _canonical_field(
 )
 
 
-PANEL_PARAMS: dict[str, tuple[FormFieldProps, ...]] = {
+PANEL_PARAMS: Mapping[str, tuple[FormFieldProps, ...]] = MappingProxyType({
     "2d": (
         _IMAGE_COLORMAP,
     ),
@@ -60,7 +61,7 @@ PANEL_PARAMS: dict[str, tuple[FormFieldProps, ...]] = {
         _HISTOGRAM_COUNT_SCALE,
         _HISTOGRAM_FIT_MODE,
     ),
-}
+})
 
 
 def panel_param_decls(param_kind: str) -> tuple[FormFieldProps, ...]:

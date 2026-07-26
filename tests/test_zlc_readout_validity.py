@@ -24,7 +24,6 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.analysis import (
     CalibrationAnalysisResult,
     CalibrationAnalysisRequest,
     CalibrationComputation,
-    _calibrate_readout_frames,
     reference_labels,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
@@ -39,7 +38,7 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     ReadoutModelKind,
     SiteMap,
     _annulus_background,
-    apply_calibration,
+    apply_readout_model,
     classify_occupancy,
     extract_readout_features,
 )
@@ -49,6 +48,7 @@ from zlc_neutral_atom.logic_nodes.readout.contracts import (
 )
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.logic_nodes.readout.physical_context import ReadoutPhysicalContext
+from tests.calibration_physics_oracle import calibrate_readout_arrays_for_test
 
 
 def _physical_context(contract: FrameContract) -> ReadoutPhysicalContext:
@@ -163,7 +163,7 @@ def _constant_short_calibration(
         histogram_bins=20,
         max_drop=0,
     )
-    return _calibrate_readout_frames(
+    return calibrate_readout_arrays_for_test(
         references,
         short,
         source_binding=source,
@@ -306,7 +306,7 @@ def test_reversed_short_polarity_is_diagnostic_only_and_bad_component_survives()
         max_drop=0,
     )
 
-    result = _calibrate_readout_frames(
+    result = calibrate_readout_arrays_for_test(
         references,
         short,
         source_binding=source,
@@ -347,7 +347,7 @@ def test_reversed_short_polarity_is_diagnostic_only_and_bad_component_survives()
         kind=ReadoutModelKind.PER_SITE_PSF,
         site_fidelity=(missing_metric,),
     )
-    use_reference_thresholds = analysis._main_reference_thresholds_available(
+    use_reference_thresholds = analysis._reference_thresholds_available(
         (report, missing_method)
     )
     assert not use_reference_thresholds
@@ -419,15 +419,20 @@ def test_public_apply_is_non_authoritative_but_rejects_structural_schema_drift()
         np.ones(contract.frame_schema.data_shape, dtype=bool),
     )
 
-    apply_calibration(result.artifact, frame)
+    apply_readout_model(
+        result.artifact.select_model(),
+        frame,
+        expected_frame_schema=contract.frame_schema,
+    )
     drifted = replace(
         frame,
         schema=replace(frame.schema, value_unit="different-count-unit"),
     )
     with pytest.raises(ValueError, match="schema differs"):
-        apply_calibration(
-            result.artifact,
+        apply_readout_model(
+            result.artifact.select_model(),
             drifted,
+            expected_frame_schema=contract.frame_schema,
         )
 
 
@@ -485,7 +490,7 @@ def test_invalid_psf_site_placeholder_does_not_pollute_uniform_kernel() -> None:
         max_drop=0,
     )
 
-    result = _calibrate_readout_frames(
+    result = calibrate_readout_arrays_for_test(
         references,
         short,
         source_binding=source,

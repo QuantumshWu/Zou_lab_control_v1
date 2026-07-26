@@ -19,7 +19,7 @@ from zlc_pulse import (
     load_deployed_pulse_target,
     new_pulse_document,
 )
-from zlc_workbench.pulse import PulseEditorSession
+from zlc_workbench.pulse_editor.session import PulseEditorSession
 from zlc_workbench.pulse_editor.controller import PulseEditorController
 from zlc_workbench.pulse_editor.window import PulseEditorWindowBody
 

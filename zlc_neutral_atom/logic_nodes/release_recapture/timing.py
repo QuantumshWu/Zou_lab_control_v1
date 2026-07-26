@@ -67,9 +67,9 @@ class TriggeredReleaseRecaptureSpec:
             cell_plan,
         )
         validate_single_trigger_capture_binding(
-            capture_spec=self.release_recapture.measurement.capture_spec,
+            capture_spec=self.release_recapture.camera_capture.capture_spec,
             contract=(
-                self.release_recapture.measurement.capture_contract
+                self.release_recapture.camera_capture.capture_contract
             ),
             pulse_binding=binding,
         )
@@ -214,7 +214,7 @@ def compile_triggered_release_recapture_pipeline(
 
     if not isinstance(spec, TriggeredReleaseRecaptureSpec):
         raise TypeError("spec must be TriggeredReleaseRecaptureSpec")
-    camera_port = spec.release_recapture.measurement.capture_port
+    camera_port = spec.release_recapture.camera_capture.capture_port
     pulse_port = spec.pulse_port
     if camera_port.device.key == pulse_port.device.key:
         raise ValueError("camera and sequencer must be distinct physical resources")

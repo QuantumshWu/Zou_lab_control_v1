@@ -17,7 +17,7 @@ from zlc_neutral_atom.logic_node_declaration import (
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import ReadoutModelKind, ResolvedCalibration
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
-from zlc_neutral_atom.logic_nodes.pulse_scan import AutonomousScanSlotProgram
+from zlc_neutral_atom.timing.pulse_parameter_scan import AutonomousScanSlotProgram
 from zlc_neutral_atom.logic_nodes.readout.calibration_input import (
     calibration_input_specs,
     calibration_reference,
@@ -245,11 +245,6 @@ class BoundTemperatureReleaseRecapture:
             raise TypeError("program must be AutonomousScanSlotProgram")
         if not isinstance(self.camera_binding, TriggeredCameraBinding):
             raise TypeError("camera_binding must be TriggeredCameraBinding")
-        if (
-            self.camera_binding.measurement.definition
-            != TEMPERATURE_RELEASE_RECAPTURE_DEFINITION
-        ):
-            raise ValueError("bound Measurement uses another definition")
 
 
 def bind_temperature_release_recapture(
@@ -290,7 +285,6 @@ def bind_temperature_release_recapture(
             ),
         ),
         point_layout=point_table.point_layout,
-        definition=TEMPERATURE_RELEASE_RECAPTURE_DEFINITION,
         calibration=calibration,
     )
     program = AutonomousScanSlotProgram(logical_document)

@@ -13,11 +13,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from zlc_data import OwnedSnapshot, ValueSchema
-from zlc_neutral_atom.logic_nodes.camera_measurement import CameraMeasurementRequest
-from zlc_neutral_atom.dataset_output import (
-    DatasetOutputDeclaration,
-    LiveDatasetOutput,
+from zlc_neutral_atom.logic_nodes.camera_measurement.output_binding import (
+    CameraFrameOutputBinding,
 )
+from zlc_neutral_atom.dataset_output import LiveDatasetOutput
 from zlc_neutral_atom.node_input import BoundNodeInputs
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     ReadoutModelKind,
@@ -27,14 +26,13 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
     calibration_artifact_input_ref,
 )
-from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
     OCCUPANCY_CALIBRATION_INPUT_SPEC,
     OCCUPANCY_CAMERA_INPUT_SPEC,
     OCCUPANCY_LIVE_OUTPUT_DECLARATIONS,
     OccupancyProcessorConfig,
     OccupancyProcessorEvaluation,
-    evaluate_occupancy_processor,
+    _evaluate_occupancy_processor,
 )
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_neutral_atom.runtime.signal_source import SignalEventSource
@@ -55,19 +53,14 @@ class OccupancyProcessorRequest:
     Camera application's own typed request and exact output declaration.
     """
 
-    camera_request: CameraMeasurementRequest
-    camera_output: DatasetOutputDeclaration
+    camera_output_binding: CameraFrameOutputBinding
     calibration_ref: CalibrationArtifactRef
     model_kind: ReadoutModelKind | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.camera_request, CameraMeasurementRequest):
-            raise TypeError("camera_request must be CameraMeasurementRequest")
-        if not isinstance(self.camera_output, DatasetOutputDeclaration):
-            raise TypeError("camera_output must be DatasetOutputDeclaration")
-        if self.camera_output not in self.camera_request.output_declarations:
-            raise ValueError(
-                "camera_output is absent from the Camera Measurement request"
+        if not isinstance(self.camera_output_binding, CameraFrameOutputBinding):
+            raise TypeError(
+                "camera_output_binding must be CameraFrameOutputBinding"
             )
         if not isinstance(self.calibration_ref, CalibrationArtifactRef):
             raise TypeError("calibration_ref must be CalibrationArtifactRef")
@@ -79,7 +72,7 @@ class OccupancyProcessorRequest:
 
     @property
     def camera_output_name(self) -> str:
-        return self.camera_output.name
+        return self.camera_output_binding.output.name
 
 
 def bind_occupancy_processor_request(
@@ -100,13 +93,17 @@ def bind_occupancy_processor_request(
         raise ValueError("Occupancy source must be a Camera Measurement output")
     if camera.transform_spec is not None:
         raise ValueError("Occupancy source must be an untransformed Camera frame")
-    if not isinstance(camera.producer_request, CameraMeasurementRequest):
-        raise TypeError("Camera source has another request type")
+    if not isinstance(camera.output_binding, CameraFrameOutputBinding):
+        raise ValueError(
+            "Occupancy requires an active Camera output with endpoint-read "
+            "physical binding"
+        )
+    if camera.output_binding.output != camera.output:
+        raise ValueError("Camera output binding names another Dataset output")
     if not isinstance(calibration.reference, CalibrationArtifactRef):
         raise TypeError("Calibration input has another artifact reference type")
     return OccupancyProcessorRequest(
-        camera.producer_request,
-        camera.output,
+        camera.output_binding,
         calibration.reference,
         config.model_kind,
     )
@@ -142,13 +139,12 @@ class PreparedOccupancyProcessor:
             raise ValueError(
                 "admitted calibration differs from the frozen application request"
             )
-        expected_binding = ReadoutBindingKey(
-            request.camera_request.camera_ref.role
+        source_binding = request.camera_output_binding
+        calibration.artifact.frame_contract.assert_compatible_working_point(
+            source_binding.readout_binding,
+            source_binding.capability_evidence.physical_facts,
+            source_binding.frame_schema,
         )
-        if calibration.artifact.frame_contract.binding != expected_binding:
-            raise ValueError(
-                "Camera Measurement role differs from the calibration readout binding"
-            )
         selected = calibration.artifact.select_model(request.model_kind)
         self._request = request
         self._calibration = calibration
@@ -157,6 +153,7 @@ class PreparedOccupancyProcessor:
             frame_contract=calibration.artifact.frame_contract,
             model=selected,
             artifact_input=calibration_artifact_input_ref(calibration.reference),
+            source_binding=source_binding,
         )
 
     @property
@@ -202,9 +199,16 @@ class PreparedOccupancyProcessor:
             raise TypeError(
                 "Occupancy Processor requires Camera delivery coverage"
             )
+        source_binding = self._request.camera_output_binding
+        if source.ref.stream_generation != source_binding.stream_generation:
+            raise ValueError(
+                "Camera snapshot belongs to another live stream generation"
+            )
+        if source.block.schema.cell_schema != source_binding.frame_schema:
+            raise ValueError("Camera snapshot differs from its bound frame schema")
         digest = sha256_text(source_event_digest, "source_event_digest")
         assert digest is not None
-        evaluation = evaluate_occupancy_processor(
+        evaluation = _evaluate_occupancy_processor(
             source,
             self._calibration,
             coverage,

@@ -20,12 +20,15 @@ the same way -- that shared step is what this module holds.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 from zlc_data import Selection
+from zlc_storage import sha256_text
 
 from .curve_display import CurveDisplayState
-from .data_figure import DataFigure, FigurePanelRegion
+from .data_figure import (
+    DataFigure,
+    FacetedOverviewArtifact,
+)
 from .figure import (
     DatasetDescriptor,
     DatasetId,
@@ -34,6 +37,7 @@ from .figure import (
     EvaluatedImage,
     EvaluatedInput,
     EvaluatedMeter,
+    EvaluatedProjectionIdentity,
     FigureDocument,
     FigureLayer,
     ResolvedDataset,
@@ -54,6 +58,8 @@ from .image_display import (
     image_viewport_for_display_state,
     resolve_image_color_limits,
 )
+from .plot_layout import panel_surface_geometry
+from .render import PanelPresentationIdentity
 
 __all__ = [
     "PanelComposer",
@@ -69,7 +75,7 @@ class PanelRenderError(RuntimeError):
     """A snapshot that cannot be shown as asked, with the reason the host shows."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PanelProvenance:
     """Where one composed front came from -- the facts a coherence stamp needs.
 
@@ -82,6 +88,13 @@ class PanelProvenance:
     run_id: object
     epoch_id: object
     join_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "join_digest",
+            sha256_text(self.join_digest, "panel join_digest"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +128,7 @@ class FacetedPanelResult:
     """
 
     figure: DataFigure
-    overview_png: bytes | None = None
-    regions: tuple[FigurePanelRegion, ...] = ()
+    overview: FacetedOverviewArtifact | None = None
     frame: object | None = None
     focus: FacetedPanelFocus | None = None
 
@@ -125,32 +137,28 @@ class FacetedPanelResult:
 
         if not isinstance(self.figure, DataFigure):
             raise TypeError("faceted result figure must be DataFigure")
-        regions = tuple(self.regions)
-        object.__setattr__(self, "regions", regions)
-        overview = self.overview_png is not None
+        overview = self.overview is not None
         focused = self.frame is not None
         if overview == focused:
             raise ValueError(
                 "faceted result requires exactly one overview or focus front"
             )
         if overview:
-            if not isinstance(self.overview_png, bytes):
-                raise TypeError("faceted overview must be owned PNG bytes")
+            if not isinstance(self.overview, FacetedOverviewArtifact):
+                raise TypeError(
+                    "faceted overview must be FacetedOverviewArtifact"
+                )
+            if self.overview.figure is not self.figure:
+                raise ValueError(
+                    "faceted result and overview must share one Figure owner"
+                )
             if self.focus is not None:
                 raise ValueError("faceted overview cannot carry focus")
-            if len(regions) <= 1 or any(
-                not isinstance(item, FigurePanelRegion) for item in regions
-            ):
-                raise ValueError(
-                    "faceted overview requires multiple exact panel regions"
-                )
         else:
             if not isinstance(self.frame, BoardFrame):
                 raise TypeError("faceted focus frame must be BoardFrame")
             if self.focus is None:
                 raise ValueError("faceted focus result requires its exact focus")
-            if regions:
-                raise ValueError("faceted focus does not carry overview regions")
 
 
 def view_for_schema(
@@ -205,7 +213,6 @@ class PanelComposer:
         panel_id: str,
         *,
         intent: ViewIntent = ViewIntent.IMAGE,
-        size: tuple[int, int] = (800, 520),
         size_name: str = "2x2",
         pixel_ratio: float = 1.0,
         selection=None,
@@ -223,15 +230,10 @@ class PanelComposer:
             raise PanelRenderError(str(error)) from error
         self._panel_id = str(panel_id)
         self._intent = intent
-        self._size = (int(size[0]), int(size[1]))
-        from zlc_frontend.panel_size import panel_size_cells
-
-        panel_size_cells(size_name)
-        self._size_name = str(size_name)
-        pixel_ratio = float(pixel_ratio)
-        if not math.isfinite(pixel_ratio) or pixel_ratio <= 0.0:
-            raise ValueError("pixel_ratio must be positive and finite")
-        self._pixel_ratio = pixel_ratio
+        self._surface_geometry = panel_surface_geometry(
+            size_name,
+            pixel_ratio=pixel_ratio,
+        )
         self._selection = selection
         if view is not None and not isinstance(view, ViewSpec):
             raise TypeError("view must be ViewSpec or None")
@@ -245,6 +247,12 @@ class PanelComposer:
         self._document_fingerprint = None
         self._source_figure_ref = None
         self._source_figure: DataFigure | None = None
+        self._faceted_focus: FacetedPanelFocus | None = None
+        self._faceted_focus_source: DataFigure | None = None
+        self._faceted_focus_figure: DataFigure | None = None
+        self._faceted_renderer_document: FigureDocument | None = None
+        self._faceted_renderer = None
+        self._faceted_overview_renderer = None
         self._renderer = None
         self._image_home_viewport = None
         self._image_color_cache_key = None
@@ -292,6 +300,8 @@ class PanelComposer:
         self._document_fingerprint = fingerprint
         self._source_figure_ref = None
         self._source_figure = None
+        self._discard_faceted_overview()
+        self._discard_faceted_focus()
         self._image_home_viewport = None
         self._image_color_cache_key = None
         self._image_color_cache_value = None
@@ -314,6 +324,8 @@ class PanelComposer:
         self._document_fingerprint = None
         self._source_figure_ref = None
         self._source_figure = None
+        self._discard_faceted_overview()
+        self._discard_faceted_focus()
         self._image_home_viewport = None
         self._image_color_cache_key = None
         self._image_color_cache_value = None
@@ -357,17 +369,7 @@ class PanelComposer:
         # every wheel/pan event is both redundant and observably expensive for
         # camera frames.  Retain exactly the last resolved revision; a new ref
         # replaces it, while this composer never accumulates historical data.
-        if self._source_figure_ref == ref and self._source_figure is not None:
-            figure = self._source_figure
-        else:
-            figure = DataFigure(
-                document,
-                ResolvedDatasetMap((ResolvedDataset(self._dataset_id, snapshot),)),
-            )
-            self._source_figure_ref = ref
-            self._source_figure = figure
-            self._image_color_cache_key = None
-            self._image_color_cache_value = None
+        figure = self._source_figure_for(document, snapshot)
         fit_result = self._validated_transient_fit(
             figure,
             fit_result,
@@ -427,10 +429,7 @@ class PanelComposer:
                 "a faceted panel needs an owned (ref, block) snapshot"
             )
         document = self.document_for(block.schema)
-        datasets = ResolvedDatasetMap(
-            (ResolvedDataset(self._dataset_id, snapshot),)
-        )
-        source_figure = DataFigure(document, datasets)
+        source_figure = self._source_figure_for(document, snapshot)
         fit_result = self._validated_transient_fit(
             source_figure,
             fit_result,
@@ -445,54 +444,51 @@ class PanelComposer:
                 ViewIntent.CURVE,
                 ViewIntent.HISTOGRAM,
                 ViewIntent.IMAGE,
+                ViewIntent.METER,
             )
         ):
             raise PanelRenderError(
-                "a grid requires one multi-cell CURVE, HISTOGRAM, or IMAGE view"
+                "a grid requires one multi-cell CURVE, HISTOGRAM, IMAGE, or METER view"
             )
         if focus is None:
-            from .plot_layout import LIVE_PANEL_DPI
-
-            options = {
-                "size": self._size_name,
-                "width": self._size[0],
-                "height": self._size[1],
-                "dpi": LIVE_PANEL_DPI * self._pixel_ratio,
-                "display_state": display,
-                "title": self._label,
-                "value_label": self._value_label,
-            }
-            if fit_result is None:
-                payload, regions = (
-                    source_figure.to_panel_png_bytes_with_panel_regions(
-                        **options
-                    )
+            rendered_figure = source_figure
+            if fit_result is not None:
+                rendered_figure = source_figure.with_fit_results(
+                    {source_figure.document.layers[0].layer_id: fit_result}
                 )
-            else:
-                payload, regions = (
-                    source_figure.transient_fit_to_panel_png_bytes_with_panel_regions(
-                        fit_result,
-                        **options,
-                    )
+            renderer = self._faceted_overview_agg()
+            try:
+                raster, regions = renderer.render(
+                    rendered_figure.document,
+                    rendered_figure.evaluated,
+                    dict(rendered_figure.fit_results),
+                    display_state=display,
                 )
+            except BaseException:
+                if self._faceted_overview_renderer is renderer:
+                    self._faceted_overview_renderer = None
+                    renderer.close()
+                raise
             if len(regions) != len(layers[0].cells):
                 raise PanelRenderError(
                     "grid hit regions do not cover every evaluated cell"
                 )
-            return FacetedPanelResult(
+            overview = FacetedOverviewArtifact(
                 source_figure,
-                overview_png=payload,
-                regions=regions,
+                raster,
+                regions,
+                self._surface_geometry.logical_size,
+                PanelPresentationIdentity(
+                    self._panel_id,
+                    source_figure.document.document_id,
+                    source_figure.document.revision,
+                    0,
+                    getattr(display, "revision", 0) or 0,
+                ),
             )
+            return FacetedPanelResult(source_figure, overview=overview)
 
-        try:
-            focused = source_figure.focused_typed_panel(
-                focus.panel_index,
-                expected_selection=focus.selection,
-                expected_intent=self._intent,
-            )
-        except (TypeError, ValueError, IndexError, RuntimeError) as error:
-            raise PanelRenderError(f"grid focus is stale: {error}") from error
+        focused = self._focused_figure_for(source_figure, focus)
         focused_display = display
         if self._intent is ViewIntent.HISTOGRAM:
             if not isinstance(display, FacetedHistogramDisplayState):
@@ -519,6 +515,70 @@ class PanelComposer:
             frame=frame,
             focus=focus,
         )
+
+    def _source_figure_for(self, document, snapshot) -> DataFigure:
+        """Resolve and evaluate exactly one immutable source revision once."""
+
+        ref = snapshot.ref
+        if (
+            self._source_figure_ref == ref
+            and self._source_figure is not None
+            and self._source_figure.document is document
+        ):
+            return self._source_figure
+        # A source revision changes the exact evaluated values, not the focus
+        # selection or renderer topology.  Discard only the derived frozen
+        # focus; the worker-owned Agg surface remains the same owner.
+        self._faceted_focus_source = None
+        self._faceted_focus_figure = None
+        figure = DataFigure(
+            document,
+            ResolvedDatasetMap((ResolvedDataset(self._dataset_id, snapshot),)),
+        )
+        self._source_figure_ref = ref
+        self._source_figure = figure
+        self._image_color_cache_key = None
+        self._image_color_cache_value = None
+        return figure
+
+    def _focused_figure_for(
+        self,
+        source_figure: DataFigure,
+        focus: FacetedPanelFocus,
+    ) -> DataFigure:
+        """Return one display-only focus without rebuilding it per gesture."""
+
+        if (
+            self._faceted_focus_source is source_figure
+            and self._faceted_focus == focus
+            and self._faceted_focus_figure is not None
+        ):
+            return self._faceted_focus_figure
+        if self._faceted_focus != focus:
+            self._discard_faceted_focus()
+        try:
+            focused = source_figure.focused_typed_panel(
+                focus.panel_index,
+                expected_selection=focus.selection,
+                expected_intent=self._intent,
+            )
+        except (TypeError, ValueError, IndexError, RuntimeError) as error:
+            raise PanelRenderError(f"grid focus is stale: {error}") from error
+        self._faceted_focus = focus
+        self._faceted_focus_source = source_figure
+        self._faceted_focus_figure = focused
+        return focused
+
+    def _discard_faceted_focus(self) -> None:
+        """Retire the one focus surface; no historical focus cache is kept."""
+
+        renderer, self._faceted_renderer = self._faceted_renderer, None
+        if renderer is not None:
+            renderer.close()
+        self._faceted_renderer_document = None
+        self._faceted_focus = None
+        self._faceted_focus_source = None
+        self._faceted_focus_figure = None
 
     def _frame_for(
         self,
@@ -619,6 +679,12 @@ class PanelComposer:
                 data,
                 display,
                 ref,
+                projection_identity=self._projection_identity(
+                    evaluated,
+                    evaluated.layers[0],
+                    evaluated.layers[0].cells[0],
+                    series[0],
+                ),
                 fit_overlay=fit_overlay,
             )
         if self._intent is ViewIntent.CURVE:
@@ -682,20 +748,16 @@ class PanelComposer:
                 series[0].data,
                 display,
                 resolved.ref,
+                projection_identity=self._projection_identity(
+                    figure.evaluated,
+                    layer,
+                    layer.cells[0],
+                    series[0],
+                ),
                 fit_overlay=fit_overlay,
             )
 
-        from .matplotlib_render import SinglePanelAggRenderer
-
-        renderer = SinglePanelAggRenderer(
-            figure.document,
-            width=self._size[0],
-            height=self._size[1],
-            dpi=self._live_dpi(),
-            size_name=self._size_name,
-            value_label=self._value_label,
-            title=self._label,
-        )
+        renderer = self._faceted_agg(figure)
         try:
             if self._intent is ViewIntent.CURVE:
                 overlays = ()
@@ -736,11 +798,76 @@ class PanelComposer:
                 self._histogram_relim_mode = display.relim_mode
                 self._histogram_count_scale = display.count_scale
                 return raster, payload
-        finally:
-            renderer.close()
+            if self._intent is ViewIntent.METER:
+                if not isinstance(display, MeterDisplayState):
+                    raise TypeError("focused meter grid requires MeterDisplayState")
+                if fit_result is not None or fit_result_identity is not None:
+                    raise PanelRenderError("METER display cannot carry a Fit overlay")
+                return renderer.render_meter(
+                    figure.evaluated,
+                    display_revision=display.revision,
+                )
+        except BaseException:
+            # A newly created surface may have acquired only part of its artist
+            # topology before Matplotlib rejected the front.  Never retain that
+            # half-prepared surface as the stable owner for a later gesture.
+            if self._faceted_renderer is renderer:
+                self._faceted_renderer = None
+                self._faceted_renderer_document = None
+                renderer.close()
+            raise
         raise PanelRenderError(
             f"no focused renderer for view intent {self._intent!r}"
         )
+
+    def _faceted_agg(self, figure: DataFigure):
+        """One persistent Agg owner for the current exact focused cell."""
+
+        from .matplotlib_render import SinglePanelAggRenderer
+
+        if (
+            self._faceted_renderer is not None
+            and self._faceted_renderer_document == figure.document
+        ):
+            return self._faceted_renderer
+        if self._faceted_renderer is not None:
+            self._faceted_renderer.close()
+        renderer = SinglePanelAggRenderer(
+            figure.document,
+            width=self._surface_geometry.raster_size[0],
+            height=self._surface_geometry.raster_size[1],
+            dpi=self._surface_geometry.dpi,
+            size_name=self._surface_geometry.size_name,
+            value_label=self._value_label,
+            title=self._label,
+        )
+        self._faceted_renderer = renderer
+        self._faceted_renderer_document = figure.document
+        return renderer
+
+    def _faceted_overview_agg(self):
+        """One persistent board-level Agg owner for the live grid overview."""
+
+        if self._faceted_overview_renderer is None:
+            from .matplotlib_render import FacetedPanelAggRenderer
+
+            self._faceted_overview_renderer = FacetedPanelAggRenderer(
+                size_name=self._surface_geometry.size_name,
+                width=self._surface_geometry.raster_size[0],
+                height=self._surface_geometry.raster_size[1],
+                dpi=self._surface_geometry.dpi,
+                title=self._label,
+                value_label=self._value_label,
+            )
+        return self._faceted_overview_renderer
+
+    def _discard_faceted_overview(self) -> None:
+        renderer, self._faceted_overview_renderer = (
+            self._faceted_overview_renderer,
+            None,
+        )
+        if renderer is not None:
+            renderer.close()
 
     def _agg(self):
         from .matplotlib_render import SinglePanelAggRenderer
@@ -749,13 +876,15 @@ class PanelComposer:
             if self._document is None:
                 raise PanelRenderError("the panel has no document to render")
             self._renderer = SinglePanelAggRenderer(
-                self._document, width=self._size[0], height=self._size[1],
-                dpi=self._live_dpi(),
+                self._document,
+                width=self._surface_geometry.raster_size[0],
+                height=self._surface_geometry.raster_size[1],
+                dpi=self._surface_geometry.dpi,
                 rolling_trace=self._rolling_trace,
                 rolling_distribution=self._rolling_distribution,
                 value_label=self._value_label,
                 title=self._label,
-                size_name=self._size_name,
+                size_name=self._surface_geometry.size_name,
             )
         if not isinstance(self._renderer, SinglePanelAggRenderer):
             raise PanelRenderError("panel renderer family changed without a source reset")
@@ -766,19 +895,14 @@ class PanelComposer:
 
         if self._renderer is None:
             self._renderer = ImagePanelAggRenderer(
-                width=self._size[0],
-                height=self._size[1],
-                dpi=self._live_dpi(),
-                size_name=self._size_name,
+                width=self._surface_geometry.raster_size[0],
+                height=self._surface_geometry.raster_size[1],
+                dpi=self._surface_geometry.dpi,
+                size_name=self._surface_geometry.size_name,
             )
         if not isinstance(self._renderer, ImagePanelAggRenderer):
             raise PanelRenderError("panel renderer family changed without a source reset")
         return self._renderer
-
-    def _live_dpi(self) -> float:
-        from .plot_layout import LIVE_PANEL_DPI
-
-        return LIVE_PANEL_DPI * self._pixel_ratio
 
     def _image_front(
         self,
@@ -786,6 +910,7 @@ class PanelComposer:
         display: ImageDisplayState,
         ref,
         *,
+        projection_identity: EvaluatedProjectionIdentity,
         fit_overlay=None,
     ):
         from .render import ImagePanelPayload
@@ -833,7 +958,7 @@ class PanelComposer:
             data_range=data_range,
             title=self._label,
             value_label=self._value_label,
-            distribution_identity=ref,
+            projection_identity=projection_identity,
             fit_overlay=fit_overlay,
         )
         payload = ImagePanelPayload(
@@ -850,6 +975,26 @@ class PanelComposer:
             fit_overlay=fit_overlay,
         )
         return raster, payload
+
+    @staticmethod
+    def _projection_identity(evaluated, layer, cell, series):
+        matches = tuple(
+            item for item in evaluated.inputs if item.dataset_id == layer.dataset_id
+        )
+        if len(matches) != 1:
+            raise PanelRenderError(
+                "image projection has no unique evaluated dataset input"
+            )
+        return EvaluatedProjectionIdentity(
+            evaluated.document_id,
+            evaluated.document_revision,
+            matches[0],
+            layer.layer_id,
+            layer.resolutions,
+            cell.facet_address,
+            series.batch_address,
+            series.data,
+        )
 
     def _curve_front(
         self,

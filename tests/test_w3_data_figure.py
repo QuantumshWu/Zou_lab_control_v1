@@ -21,7 +21,7 @@ from zlc_data import (
     AxisSpec,
     BlockId,
     CellValidity,
-    ComponentValidity,
+    DatasetComponentValidity,
     DataBlock,
     DataTransformSpec,
     DatasetRevision,
@@ -85,7 +85,7 @@ def _curve_figure():
                 (1.0, 2.0, 99.0, 4.0),
                 (3.0, 4.0, 101.0, 6.0),
             )
-        ),
+        )[..., np.newaxis],
         CellValidity(
             np.asarray(
                 (
@@ -149,7 +149,7 @@ def _site_curve_fit_figure():
         BlockId("site-curve-block"),
         DatasetRevision(1),
         values,
-        ComponentValidity((site.axis_id,), valid),
+        DatasetComponentValidity((site.axis_id,), valid),
         schema,
     )
     snapshot = OwnedSnapshot(block.ref(StreamGenerationId("site-curve-generation")), block)
@@ -204,7 +204,7 @@ def _sparse_curve_fit_figure():
             curve[scan_index] + x_index + 0.25 * y_index
             for x_index, y_index, scan_index in mapping
         ]
-    )[None, :]
+    )[None, :, None]
     schema = DatasetSchema(
         repeat,
         (grid_x, grid_y, scan),
@@ -215,7 +215,7 @@ def _sparse_curve_fit_figure():
         BlockId("sparse-curve-block"),
         DatasetRevision(1),
         values,
-        CellValidity(np.ones(values.shape, dtype=np.bool_)),
+        CellValidity(np.ones(values.shape[:2], dtype=np.bool_)),
         schema,
     )
     snapshot = OwnedSnapshot(
@@ -284,7 +284,8 @@ def test_import_is_lazy_and_invalid_curve_is_masked_in_png_and_svg(tmp_path):
     assert "reduce: mean(repeat, n=0..2)" in rendered.axes[0].get_title()
     png = data_figure.to_png_bytes()
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
-    svg = data_figure.export(tmp_path / "curve.svg")
+    svg = tmp_path / "curve.svg"
+    svg.write_bytes(data_figure.to_bytes(image_format="svg"))
     assert svg.read_text(encoding="utf-8").lstrip().startswith("<?xml")
 
 
@@ -295,7 +296,7 @@ def test_product_render_dpi_and_save_draw_use_the_render_owner_context(
     import matplotlib
     from matplotlib.figure import Figure
 
-    from zlc_frontend.render_style import RENDER_TEXT
+    from zlc_frontend.render_style import NEW_BLACK
 
     data_figure = _curve_figure()
     rendered = data_figure.render(dpi=80.0)
@@ -319,8 +320,10 @@ def test_product_render_dpi_and_save_draw_use_the_render_owner_context(
     try:
         for _ in range(3):
             assert data_figure.to_png_bytes(dpi=80.0).startswith(b"\x89PNG")
-        data_figure.export(tmp_path / "owned.svg", dpi=80.0)
-        assert observed == [RENDER_TEXT] * 4
+        (tmp_path / "owned.svg").write_bytes(
+            data_figure.to_bytes(image_format="svg", dpi=80.0)
+        )
+        assert observed == [NEW_BLACK] * 4
         assert released_figures and all(ref() is None for ref in released_figures)
         assert matplotlib.rcParams["axes.edgecolor"] == "magenta"
     finally:
@@ -328,7 +331,7 @@ def test_product_render_dpi_and_save_draw_use_the_render_owner_context(
             gc.enable()
         matplotlib.rcParams["axes.edgecolor"] = original_edge
 
-    import zlc_frontend.matplotlib_render as render_module
+    import zlc_frontend._mpl_document as render_module
 
     partial_canvases = []
 

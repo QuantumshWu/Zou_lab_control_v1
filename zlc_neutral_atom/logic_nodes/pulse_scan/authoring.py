@@ -17,8 +17,7 @@ from zlc_pulse import (
 )
 from zlc_pulse.scan_template import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
 from zlc_storage.paths import resolve_under_project
-
-from .contracts import (
+from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSegmentTable,
     ApiSlotSegmentedProgram,
     AutonomousScanSlotProgram,

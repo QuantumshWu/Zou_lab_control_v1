@@ -13,12 +13,9 @@ from tests.gui_user_flow import (
     capture_offscreen_window,
     configure_offscreen_fast_path,
     until,
+    widget_gone,
 )
-from zlc_frontend.qt_widgets import (
-    ensure_qt_app,
-    fluent_scale,
-    set_fluent_scale,
-)
+from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_neutral_atom.installation_config import (
     InstallationConfigDocument,
     save_installation_config,
@@ -83,6 +80,7 @@ def test_formal_device_manager_edits_locally_then_initializes_and_closes(
             == {
                 "camera",
                 "mot_camera",
+                "rf",
                 "sequencer",
             },
         )
@@ -135,7 +133,6 @@ def test_task_console_launcher_initializes_through_device_manager_then_reuses_ow
     device_wrapper = devices.window()
     console_wrapper = None
     try:
-        assert fluent_scale() == set_fluent_scale(None)
         device_capture = capture_offscreen_window(
             application,
             devices,
@@ -169,13 +166,12 @@ def test_task_console_launcher_initializes_through_device_manager_then_reuses_ow
         assert console_capture["image_pixels"]["width"] > 0
 
         console_wrapper.close()
-        until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+        until(application, lambda: widget_gone(console_wrapper), timeout=15.0)
         until(application, lambda: devices.permanently_closed, timeout=15.0)
         assert devices._controller.state.active_config is None
     finally:
-        if console_wrapper is not None and console_wrapper.isVisible():
-            console_wrapper.close()
-            until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+        if flow.console is not None:
+            flow.console.window().close()
         flow.close()
         application.processEvents()
 

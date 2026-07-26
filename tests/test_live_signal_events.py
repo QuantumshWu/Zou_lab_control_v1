@@ -29,9 +29,14 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraSampleContract,
 )
 from zlc_neutral_atom.catalog import DefinitionKey, ProcessorDefinition
+from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.input_spec import DatasetInputSpec
+from zlc_neutral_atom.logic_node_declaration import (
+    LogicNodeDeclaration,
+    OutputPresentation,
+)
 from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
     CameraMeasurementRequest,
 )
@@ -45,7 +50,7 @@ from zlc_neutral_atom.runtime.streams import (
     StreamId,
     TraceContext,
 )
-from zlc_neutral_atom.runtime.run import RunState
+from zlc_neutral_atom.runtime.run import RunId, RunState
 from zlc_neutral_atom.runtime.signal_source import (
     SignalAssociationScheduleRequirement,
     SignalEventAssociationSource,
@@ -53,16 +58,18 @@ from zlc_neutral_atom.runtime.signal_source import (
     StreamSignalEventSource,
     authoritative_signal_event_source,
 )
-from zlc_workbench.input_binding import (
-    ConsoleProducerBinding,
+from zlc_workbench.task_console.input_binding import (
+    ConsoleDatasetProducerBinding,
     DatasetInputSelection,
     ResolvedDatasetInput,
 )
 from zlc_workbench.task_console import attachment_builders
-from zlc_workbench.task_console.capability import ConsoleNodeHost
-from zlc_workbench.task_console.catalog_bridge import (
-    ConsoleNodeSpec,
-    ConsoleSignalDecl,
+from zlc_workbench.task_console.capability import (
+    ConsoleNodeHost,
+    ConsoleSignalEventSourceProvider,
+)
+from zlc_workbench.task_console.declaration_projection import (
+    project_declaration_spec,
 )
 from zlc_workbench.task_console.data_plane import ConsoleDataPlane
 from zlc_workbench.task_console.processor_node import ConsoleProcessorNode
@@ -242,7 +249,8 @@ def test_console_processor_starts_and_owns_the_optional_event_source() -> None:
         def __init__(self) -> None:
             self.output_names = output_names
             self.worker_idle = False
-            self.close_calls = 0
+            self.request_close_calls = 0
+            self.join_calls = 0
 
         @staticmethod
         def value_schema(output_name: str) -> ValueSchema:
@@ -260,9 +268,16 @@ def test_console_processor_starts_and_owns_the_optional_event_source() -> None:
         def signal_association_schedule_requirement(output_name: str):
             return SignalAssociationScheduleRequirement()
 
-        def close(self) -> None:
-            lifecycle.append("derived.close")
-            self.close_calls += 1
+        def request_close(self) -> None:
+            lifecycle.append("derived.request_close")
+            self.request_close_calls += 1
+
+        def join_closed(self) -> None:
+            assert self.worker_idle
+            lifecycle.append("derived.join_closed")
+            self.join_calls += 1
+
+        def finish_worker(self) -> None:
             self.worker_idle = True
 
     upstream = Upstream()
@@ -290,6 +305,7 @@ def test_console_processor_starts_and_owns_the_optional_event_source() -> None:
             lifecycle.append("latest.withdraw")
 
     node = object.__new__(ConsoleProcessorNode)
+    node._run_id = RunId("processor-test")
     node._state = RunState.RUNNING
     node._cancel_requested = False
     node._phase = "preparing"
@@ -297,7 +313,11 @@ def test_console_processor_starts_and_owns_the_optional_event_source() -> None:
     node._output_names = output_names
     node._source_event_source = upstream
     node._signal_event_source = None
+    node._signal_events_close_requested = False
     node._signal_events_closed = False
+    node._processor_lane_retired = False
+    node._pending_terminal_state = None
+    node._pending_terminal_error = None
     node._data_plane = DataPlane()
 
     node._processor_application_ready(Application())
@@ -306,12 +326,15 @@ def test_console_processor_starts_and_owns_the_optional_event_source() -> None:
     assert node.output_names == output_names
     assert node.value_schema("counts") is schemas["counts"]
     assert node.open_signal_cursor("occupied") == ("derived", "occupied")
-    assert isinstance(node, SignalEventAssociationSource)
-    assert node.open_associated_signal_cursor("rate") == (
+    assert isinstance(node, ConsoleSignalEventSourceProvider)
+    exposed = node.signal_event_source()
+    assert exposed is derived
+    assert isinstance(exposed, SignalEventAssociationSource)
+    assert exposed.open_associated_signal_cursor("rate") == (
         "derived-associated",
         "rate",
     )
-    assert node.signal_association_schedule_requirement(
+    assert exposed.signal_association_schedule_requirement(
         "occupied"
     ) == SignalAssociationScheduleRequirement()
     assert not node.worker_idle
@@ -320,23 +343,31 @@ def test_console_processor_starts_and_owns_the_optional_event_source() -> None:
 
     assert lifecycle == [
         "derived.start",
-        "derived.close",
+        "derived.request_close",
         "latest.cancel",
         "latest.withdraw",
     ]
-    assert derived.close_calls == 1
+    assert derived.request_close_calls == 1
+    assert derived.join_calls == 0
     assert upstream.cancel_calls == 0
+    assert not node.worker_idle
+    assert node._state is RunState.RUNNING
+    assert isinstance(node, ConsoleSignalEventSourceProvider)
+    with pytest.raises(RuntimeError, match="not running"):
+        node.signal_event_source()
+
+    derived.finish_worker()
+    assert node.poll().state is RunState.CANCELLED
+    assert lifecycle[-1] == "derived.join_closed"
+    assert derived.join_calls == 1
     assert node.worker_idle
-    assert node._state is RunState.CANCELLED
-    assert not isinstance(node, SignalEventAssociationSource)
-    assert not hasattr(node, "open_associated_signal_cursor")
-    assert not hasattr(node, "signal_association_schedule_requirement")
 
     node.shutdown()
-    assert derived.close_calls == 1
+    assert derived.request_close_calls == 1
+    assert derived.join_calls == 1
 
 
-def test_console_run_node_conditionally_exposes_prepared_association_source() -> None:
+def test_console_run_node_exposes_one_stable_typed_source_provider() -> None:
     class AssociatedCommand:
         @staticmethod
         def value_schema(_output_name: str) -> ValueSchema:
@@ -369,22 +400,20 @@ def test_console_run_node_conditionally_exposes_prepared_association_source() ->
     node._handle = None
     node._prepared_command = AssociatedCommand()
 
-    node._refresh_signal_association_capability(node._prepared_command)
-
-    assert isinstance(node, SignalEventAssociationSource)
-    assert node.open_associated_signal_cursor("frame_0") == (
+    assert isinstance(node, ConsoleSignalEventSourceProvider)
+    exposed = node.signal_event_source()
+    assert isinstance(exposed, SignalEventAssociationSource)
+    assert exposed.open_associated_signal_cursor("frame_0") == (
         "associated",
         "frame_0",
     )
-    assert node.signal_association_schedule_requirement(
+    assert exposed.signal_association_schedule_requirement(
         "frame_0"
     ) == SignalAssociationScheduleRequirement()
 
     node._prepared_command = OrderingOnlyCommand()
-    node._refresh_signal_association_capability(node._prepared_command)
-    assert not isinstance(node, SignalEventAssociationSource)
-    assert not hasattr(node, "open_associated_signal_cursor")
-    assert not hasattr(node, "signal_association_schedule_requirement")
+    exposed = node.signal_event_source()
+    assert not isinstance(exposed, SignalEventAssociationSource)
 
 
 def test_console_processor_keeps_live_events_optional() -> None:
@@ -400,6 +429,7 @@ def test_console_processor_keeps_live_events_optional() -> None:
     node._output_names = ("result",)
     node._source_event_source = None
     node._signal_event_source = None
+    node._signal_events_close_requested = False
     node._signal_events_closed = False
 
     node._processor_application_ready(Application())
@@ -434,41 +464,45 @@ def test_processor_attachment_injects_only_the_structural_source_capability(
     source_node = SourceNode()
     resolved = ResolvedDatasetInput(
         DatasetInputSelection(input_spec, "camera/frame"),
-        ConsoleProducerBinding(
+        ConsoleDatasetProducerBinding(
             "camera/frame",
             "Camera",
             DefinitionKey("test", "camera"),
             camera_output,
             object(),
             source_node,
-            False,
-            None,
         ),
     )
-    spec = ConsoleNodeSpec(
-        ProcessorDefinition(
-            DefinitionKey("test", "processor"),
-            "Processor",
-            "test.processor.config",
-        ),
-        "Processor",
-        "test processor",
-        SimpleNamespace(
-            keys=("threshold",),
-            fields=(SimpleNamespace(key="threshold"),),
-            default_values=lambda: {"threshold": 1.0},
-        ),
-        (
-            ConsoleSignalDecl(
-                DatasetOutputDeclaration("result", "test.result"),
-                "result",
-                "Result",
-                "",
+    spec = project_declaration_spec(
+        LogicNodeDeclaration(
+            definition=ProcessorDefinition(
+                DefinitionKey("test", "processor"),
+                "Processor",
+                "test.processor.config",
             ),
-        ),
-        lambda values: values["threshold"],
-        input_specs=(input_spec,),
-        input_fields=(SimpleNamespace(key="camera"),),
+            description="test processor",
+            authoring_schema=AuthoringSchema(
+                (
+                    AuthoringField(
+                        "threshold",
+                        "float",
+                        "Threshold",
+                        default=1.0,
+                    ),
+                )
+            ),
+            input_specs=(input_spec,),
+            outputs=(
+                OutputPresentation(
+                    DatasetOutputDeclaration("result", "test.result"),
+                    "result",
+                    "Result",
+                    "",
+                ),
+            ),
+            build_request=lambda values: values["threshold"],
+            bind_request=lambda request, _inputs: request,
+        )
     )
     plane = ConsoleDataPlane()
     host = ConsoleNodeHost(

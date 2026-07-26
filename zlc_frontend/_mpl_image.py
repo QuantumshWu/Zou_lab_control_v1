@@ -6,11 +6,10 @@ import gc
 from io import BytesIO
 import math
 import threading
-import warnings
 from numbers import Integral, Number
 import matplotlib
 import numpy as np
-from zlc_data import DatasetRevisionRef, FitBatchStatus, FitResultBatch
+from zlc_data import FitBatchStatus, FitResultBatch
 from zlc_storage import positive_integer
 from .figure import (
     EvaluatedAxis,
@@ -19,6 +18,7 @@ from .figure import (
     EvaluatedHistogram,
     EvaluatedImage,
     EvaluatedMeter,
+    EvaluatedProjectionIdentity,
     FigureDocument,
 )
 from .fit_image_projection import (
@@ -671,14 +671,23 @@ def encode_radial_gaussian_image_fit_panels(
 
 def _decimate_image_view(
     grid: np.ndarray,
+    validity: np.ndarray,
     extent: tuple[float, float, float, float],
     x_limits: tuple[float, float],
     y_limits: tuple[float, float],
     display_pixel_shape: tuple[int, int],
 ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
-    """Main's view slice + NaN-aware integer-block area average."""
+    """Slice and area-average one typed image without promoting its source.
+
+    Invalid samples remain a boolean mask.  Only an actually decimated,
+    display-sized result uses floating-point means; a full-resolution uint8 or
+    uint16 view is handed to Matplotlib with its native dtype.
+    """
 
     grid = np.asarray(grid)
+    validity = np.asarray(validity, dtype=bool)
+    if validity.shape != grid.shape:
+        raise ValueError("image validity shape differs from image values")
     rows, columns = grid.shape
     x0, x1 = float(extent[0]), float(extent[1])
     y1, y0 = float(extent[2]), float(extent[3])
@@ -696,6 +705,7 @@ def _decimate_image_view(
     col0, col1 = index_window(*x_limits, x0, x1, columns)
     row0, row1 = index_window(*y_limits, y0, y1, rows)
     subset = grid[row0:row1, col0:col1]
+    subset_validity = validity[row0:row1, col0:col1]
     subset_rows, subset_columns = subset.shape
     display_width, display_height = (
         max(1, int(display_pixel_shape[0])),
@@ -704,26 +714,40 @@ def _decimate_image_view(
     factor_x = max(1, subset_columns // display_width)
     factor_y = max(1, subset_rows // display_height)
     if factor_x == 1 and factor_y == 1:
-        small = subset
+        small = (
+            subset
+            if _all_true(subset_validity)
+            else np.ma.array(
+                subset,
+                mask=np.logical_not(subset_validity),
+                copy=False,
+            )
+        )
         kept_rows, kept_columns = subset_rows, subset_columns
     else:
         kept_rows = (subset_rows // factor_y) * factor_y
         kept_columns = (subset_columns // factor_x) * factor_x
-        blocks = subset[:kept_rows, :kept_columns].reshape(
-            kept_rows // factor_y,
-            factor_y,
-            kept_columns // factor_x,
-            factor_x,
+        blocks = _block_view_2d(
+            subset[:kept_rows, :kept_columns],
+            (factor_y, factor_x),
         )
-        if (
-            np.issubdtype(blocks.dtype, np.floating)
-            and np.isnan(blocks).any()
-        ):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                small = np.nanmean(blocks, axis=(1, 3))
-        else:
+        valid_blocks = _block_view_2d(
+            subset_validity[:kept_rows, :kept_columns],
+            (factor_y, factor_x),
+        )
+        if _all_true(valid_blocks):
             small = blocks.mean(axis=(1, 3))
+        else:
+            counts = np.sum(valid_blocks, axis=(1, 3), dtype=np.int64)
+            summed = np.sum(
+                blocks,
+                axis=(1, 3),
+                dtype=np.float64,
+                where=valid_blocks,
+            )
+            means = np.zeros(counts.shape, dtype=np.float64)
+            np.divide(summed, counts, out=means, where=counts != 0)
+            small = np.ma.array(means, mask=counts == 0, copy=False)
     x_step = (x1 - x0) / columns
     y_step = (y1 - y0) / rows
     return small, (
@@ -732,6 +756,51 @@ def _decimate_image_view(
         y0 + (row0 + kept_rows) * y_step,
         y0 + row0 * y_step,
     )
+
+
+def _block_view_2d(
+    array: np.ndarray,
+    block_shape: tuple[int, int],
+) -> np.ndarray:
+    """Group a regular 2-D view into blocks without materialising its strides."""
+
+    array = np.asarray(array)
+    if array.ndim != 2:
+        raise ValueError("image block input must be two-dimensional")
+    block_rows, block_columns = (int(value) for value in block_shape)
+    if block_rows <= 0 or block_columns <= 0:
+        raise ValueError("image block shape must be positive")
+    rows, columns = array.shape
+    if rows % block_rows or columns % block_columns:
+        raise ValueError("image dimensions must be divisible by block shape")
+    row_stride, column_stride = array.strides
+    return np.lib.stride_tricks.as_strided(
+        array,
+        shape=(
+            rows // block_rows,
+            block_rows,
+            columns // block_columns,
+            block_columns,
+        ),
+        strides=(
+            row_stride * block_rows,
+            row_stride,
+            column_stride * block_columns,
+            column_stride,
+        ),
+        writeable=False,
+    )
+
+
+def _all_true(value: np.ndarray) -> bool:
+    """Read a compact broadcast scalar without scanning its logical plane."""
+
+    array = np.asarray(value, dtype=bool)
+    if not array.size:
+        return True
+    if all(stride == 0 for stride in array.strides):
+        return bool(array.flat[0])
+    return bool(np.all(array))
 
 
 _DISTRIBUTION_SAMPLE_TARGET = 200_000
@@ -750,17 +819,24 @@ def _image_distribution_values(
     small ROI cannot render as a blank distribution.
     """
 
-    flat_values = np.asarray(values).reshape(-1)
-    flat_validity = np.asarray(validity, dtype=bool).reshape(-1)
+    values = np.asarray(values)
+    validity = np.asarray(validity, dtype=bool)
+    flatten_order = (
+        "F"
+        if values.flags.f_contiguous and not values.flags.c_contiguous
+        else "C"
+    )
+    flat_values = np.ravel(values, order=flatten_order)
+    flat_validity = np.ravel(validity, order=flatten_order)
     if flat_values.size > _DISTRIBUTION_SAMPLE_TARGET:
         step = flat_values.size // _DISTRIBUTION_SAMPLE_TARGET + 1
         sampled = flat_values[::step]
         sampled_validity = flat_validity[::step]
-        if bool(np.all(sampled_validity)):
+        if _all_true(sampled_validity):
             return sampled
         if bool(np.any(sampled_validity)):
             return sampled[sampled_validity]
-    if bool(np.all(flat_validity)):
+    if _all_true(flat_validity):
         return flat_values
     return flat_values[flat_validity]
 
@@ -1069,7 +1145,7 @@ class ImagePanelAggRenderer:
         value_label: str = "Signal",
         distribution_guides: bool = True,
         distribution_bins: int | None = None,
-        distribution_identity: DatasetRevisionRef | None = None,
+        projection_identity: EvaluatedProjectionIdentity,
         site_centers_xy: np.ndarray | None = None,
         site_radius: float | None = None,
         site_occupied: np.ndarray | None = None,
@@ -1084,12 +1160,13 @@ class ImagePanelAggRenderer:
             raise TypeError("viewport must be ImageViewportTransform")
         if not isinstance(display, ImageDisplayState):
             raise TypeError("display must be ImageDisplayState")
-        if distribution_identity is not None and not isinstance(
-            distribution_identity,
-            DatasetRevisionRef,
-        ):
+        if not isinstance(projection_identity, EvaluatedProjectionIdentity):
             raise TypeError(
-                "distribution_identity must be DatasetRevisionRef or None"
+                "projection_identity must be EvaluatedProjectionIdentity"
+            )
+        if projection_identity.data is not image:
+            raise ValueError(
+                "projection_identity does not name this exact EvaluatedImage"
             )
         with render_style_context():
             width, height = self._size
@@ -1100,15 +1177,11 @@ class ImagePanelAggRenderer:
             visible_y_limits = visible_extent[2:]
             x_limits = display_extent[:2]
             y_limits = display_extent[2:]
-            prepared_key = distribution_identity
-            if (
-                prepared_key is not None
-                and prepared_key == self._prepared_image_key
-            ):
+            prepared_key = projection_identity
+            if prepared_key == self._prepared_image_key:
                 (
                     values,
                     finite_validity,
-                    display_values,
                 ) = self._prepared_image_value
             else:
                 values = np.asarray(image.values)
@@ -1121,19 +1194,10 @@ class ImagePanelAggRenderer:
                     if values.dtype.kind in "biu"
                     else validity & np.isfinite(values)
                 )
-                if bool(np.all(finite_validity)):
-                    display_values = values
-                else:
-                    display_values = np.asarray(
-                        values,
-                        dtype=np.float64,
-                    ).copy()
-                    display_values[~finite_validity] = np.nan
                 self._prepared_image_key = prepared_key
                 self._prepared_image_value = (
-                    (values, finite_validity, display_values)
-                    if prepared_key is not None
-                    else None
+                    values,
+                    finite_validity,
                 )
             colormap_name = str(display.colormap.value)
             if self._image_artist.get_cmap().name != colormap_name:
@@ -1159,7 +1223,8 @@ class ImagePanelAggRenderer:
                 max(1, round(float(self._axis.bbox.height))),
             )
             shown, shown_extent = _decimate_image_view(
-                display_values,
+                values,
+                finite_validity,
                 extent,
                 visible_x_limits,
                 visible_y_limits,
@@ -1201,18 +1266,11 @@ class ImagePanelAggRenderer:
                 )
             )
             distribution_cache_key = (
-                (
-                    distribution_identity,
-                    bin_count,
-                    tuple(float(value) for value in color_limits),
-                )
-                if distribution_identity is not None
-                else None
+                projection_identity,
+                bin_count,
+                tuple(float(value) for value in color_limits),
             )
-            if (
-                distribution_cache_key is not None
-                and distribution_cache_key == self._distribution_cache_key
-            ):
+            if distribution_cache_key == self._distribution_cache_key:
                 counts, edges = self._distribution_cache_value
             else:
                 finite_values = _image_distribution_values(
@@ -1229,9 +1287,7 @@ class ImagePanelAggRenderer:
                     range=color_limits,
                 )
                 self._distribution_cache_key = distribution_cache_key
-                self._distribution_cache_value = (
-                    None if distribution_cache_key is None else (counts, edges)
-                )
+                self._distribution_cache_value = (counts, edges)
             vertices = np.empty((bin_count, 4, 2), dtype=np.float64)
             for index, count in enumerate(counts):
                 low, high = edges[index], edges[index + 1]
@@ -1304,7 +1360,7 @@ class ImagePanelAggRenderer:
                     self._colorbar.update_ticks()
                 self._colorbar_state = colorbar_state
             side_key = (
-                distribution_identity,
+                projection_identity,
                 bin_count,
                 str(display.colormap.value),
                 tuple(float(value) for value in color_limits),
@@ -1321,8 +1377,7 @@ class ImagePanelAggRenderer:
                 tuple(float(value) for value in y_limits),
             )
             viewport_only = (
-                distribution_identity is not None
-                and side_key == self._last_side_key
+                side_key == self._last_side_key
                 and viewport_key != self._last_viewport_key
             )
             if viewport_only:

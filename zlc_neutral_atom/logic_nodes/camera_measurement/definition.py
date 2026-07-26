@@ -22,6 +22,7 @@ from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
 from zlc_neutral_atom.logic_node_declaration import (
     DynamicChoicePresentation,
     LogicNodeDeclaration,
+    OutputPresentation,
 )
 from zlc_neutral_atom.node_input import bind_no_node_inputs
 from zlc_neutral_atom.capture.reference import (
@@ -565,10 +566,19 @@ class CameraMeasurementDescriptor:
 
 def _camera_request_outputs(
     request: object,
-) -> tuple[DatasetOutputDeclaration, ...]:
+) -> tuple[OutputPresentation, ...]:
     if not isinstance(request, (CameraMeasurementIntent, CameraMeasurementRequest)):
         raise TypeError("Camera output owner requires an authored or bound request")
-    return request.output_declarations
+    return tuple(
+        OutputPresentation(
+            declaration,
+            declaration.name,
+            "Counts",
+            "ordered camera readout event; repeat, point, and trailing data axes "
+            "are preserved",
+        )
+        for declaration in request.output_declarations
+    )
 
 
 def _camera_role_choices(context: object) -> tuple[DynamicChoicePresentation, ...]:
@@ -593,12 +603,7 @@ CAMERA_MEASUREMENT_LOGIC_NODE = LogicNodeDeclaration(
     outputs=(),
     build_request=build_camera_measurement_intent_from_authoring,
     bind_request=bind_no_node_inputs,
-    request_output_declarations=_camera_request_outputs,
-    request_output_axis_label="Counts",
-    request_output_description=(
-        "ordered camera readout event; repeat, point, and trailing data axes "
-        "are preserved"
-    ),
+    resolve_outputs=_camera_request_outputs,
     resolve_dynamic_choices=_camera_role_choices,
 )
 

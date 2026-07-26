@@ -14,6 +14,7 @@ from zlc_neutral_atom.logic_nodes.readout.occupancy.declaration import (
     OCCUPANCY_LOGIC_NODE,
 )
 from zlc_neutral_atom.catalog import definition_key_to_tree
+from zlc_neutral_atom.logic_node_declaration import OutputPresentation
 from zlc_workbench.task_console.application_ports import TaskConsoleApplicationPorts
 from zlc_workbench.task_console.catalog_bridge import ConsoleCatalogView
 from zlc_workbench.task_console.declaration_projection import (
@@ -57,6 +58,7 @@ def test_every_supplied_attachment_projects_once_with_definition_owned_kind() ->
         assert view.spec_for_definition(definition_key_to_tree(spec.key)) is spec
         assert spec.form.fields
         assert spec.title and spec.description
+        assert spec.definition is spec.declaration.definition
 
 
 def test_application_ports_reject_duplicate_definition_keys() -> None:
@@ -82,11 +84,17 @@ def test_camera_is_a_measurement_and_request_owns_frame_vocabulary() -> None:
         "frame_1",
         "frame_2",
     )
-    assert tuple(output.name for output in camera.outputs_for(request)) == (
+    presentations = camera.outputs_for(request)
+    assert all(isinstance(output, OutputPresentation) for output in presentations)
+    assert tuple(output.name for output in presentations) == (
         "frame_0",
         "frame_1",
         "frame_2",
     )
+    assert tuple(output.declaration for output in presentations) == (
+        request.output_declarations
+    )
+    assert {output.axis_label for output in presentations} == {"Counts"}
     configured = camera.build_request(
         {
             "camera_role": "camera",

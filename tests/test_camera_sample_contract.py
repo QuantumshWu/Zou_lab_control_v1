@@ -23,6 +23,7 @@ from zlc_data import (
     Value,
     ValuePayloadContract,
     ValueSchema,
+    is_intrinsically_immutable_array,
 )
 from zlc_neutral_atom.devices.camera.contract import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
@@ -31,6 +32,7 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraDatasetEventAdapter,
     CameraFrameMetadata,
     CameraFrameMetadataContract,
+    CameraFrameRecord,
     CameraSample,
     CameraSampleContract,
     decode_camera_capture_spec,
@@ -61,12 +63,12 @@ from zlc_neutral_atom.runtime.resources import (
     PhysicalDeviceIdentity,
 )
 from zlc_neutral_atom.runtime.streams import StreamId
-from zlc_neutral_atom.logic_nodes.camera_measurement.binding import (
+from zlc_neutral_atom.capture.binding import (
     CameraCaptureBindingRequest,
     _source_group_sizes,
-    bind_camera_measurement,
+    bind_camera_capture,
 )
-from zlc_neutral_atom.capture.pipeline import BoundMeasurement
+from zlc_neutral_atom.capture.pipeline import BoundCameraCapture
 from zlc_storage import decode, encode
 
 
@@ -124,13 +126,11 @@ def test_camera_source_groups_come_only_from_the_frozen_cell_schedule() -> None:
     )
     scalar_request = CameraCaptureBindingRequest(
         "camera",
-        repeat,
-        (scan,),
-        scalar_layout,
+        scalar_schema,
         DatasetCellSchedule.from_cells(scalar_schema, scalar_cells),
         CameraAcquisitionMode.EXTERNAL_TRIGGERED,
     )
-    assert _source_group_sizes(scalar_request, scalar_schema) == (1,) * 6
+    assert _source_group_sizes(scalar_request) == (1,) * 6
 
     event = _axis("event.grouping", READOUT_EVENT, 2)
     layout = PointLayout.rect_c((scan.size, event.size))
@@ -147,13 +147,11 @@ def test_camera_source_groups_come_only_from_the_frozen_cell_schedule() -> None:
     )
     request = CameraCaptureBindingRequest(
         "camera",
-        repeat,
-        (scan, event),
-        layout,
+        schema,
         DatasetCellSchedule.from_cells(schema, cells),
         CameraAcquisitionMode.EXTERNAL_TRIGGERED,
     )
-    assert _source_group_sizes(request, schema) == (2,) * 6
+    assert _source_group_sizes(request) == (2,) * 6
 
     split = (
         address(0, 0, 0),
@@ -172,7 +170,7 @@ def test_camera_source_groups_come_only_from_the_frozen_cell_schedule() -> None:
         cell_schedule=DatasetCellSchedule.from_cells(schema, split),
     )
     with pytest.raises(ValueError, match="incomplete READOUT_EVENT group"):
-        _source_group_sizes(split_request, schema)
+        _source_group_sizes(split_request)
 
 
 def _metadata(**changes) -> CameraFrameMetadata:
@@ -240,6 +238,29 @@ def test_camera_sample_contract_preserves_all_data_axes_and_owned_pixels():
     assert contract.source_ordinal(frozen) == 0
     assert contract.captured_at(frozen) == pytest.approx(301.000401)
     assert contract.correlation_id(frozen) == "camera-session:0"
+
+
+def test_camera_record_snapshots_mutable_driver_pixels_once_then_value_reuses():
+    value_schema, _dataset_schema = _schemas()
+    mutable = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    record = CameraFrameRecord(
+        mutable,
+        source_ordinal=0,
+        produced_count=1,
+        frame_stamp=101,
+        camera_stamp=201,
+        timestamp_seconds=301,
+        timestamp_microseconds=401,
+        host_received_at_ns=501,
+        driver_buffer_index=0,
+    )
+    assert not np.shares_memory(record.image, mutable)
+    assert is_intrinsically_immutable_array(record.image)
+
+    value = Value(record.image, VALID, value_schema)
+    assert np.shares_memory(value.values, record.image)
+    mutable[:] = 0
+    assert np.any(value.values != 0)
 
 
 def test_metadata_digest_covers_every_physical_observation():
@@ -413,36 +434,30 @@ def test_camera_capture_owner_proof_belongs_to_the_bound_camera_contract():
             schema,
             (DatasetCellAddress(0, 0),),
         )
-        measurement = bind_camera_measurement(
+        camera_capture = bind_camera_capture(
             port,
             CameraCaptureBindingRequest(
                 "camera",
-                repeat,
-                (event,),
-                layout,
+                schema,
                 schedule,
                 CameraAcquisitionMode.EXTERNAL_TRIGGERED,
                 (port.capability.camera_physical_facts.event_setting(0),),
             ),
         )
 
-        assert not hasattr(
-            measurement.definition,
-            "capture_spec_owner_fingerprint",
-        )
-        assert measurement.capture_spec.owner_fingerprint == (
-            measurement.capture_contract.capture_spec_owner_fingerprint
+        assert not hasattr(camera_capture, "definition")
+        assert camera_capture.capture_spec.owner_fingerprint == (
+            camera_capture.capture_contract.capture_spec_owner_fingerprint
         )
         with pytest.raises(
             ValueError,
             match="capture spec and camera contract owner differ",
         ):
-            BoundMeasurement(
-                measurement.definition,
-                measurement.capture_port,
-                measurement.capture_contract,
+            BoundCameraCapture(
+                camera_capture.capture_port,
+                camera_capture.capture_contract,
                 replace(
-                    measurement.capture_spec,
+                    camera_capture.capture_spec,
                     owner_fingerprint="f" * 64,
                 ),
             )

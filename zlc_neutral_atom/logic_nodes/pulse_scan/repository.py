@@ -66,15 +66,18 @@ from zlc_storage import (
     sha256_digest,
     sha256_text,
 )
-
-from .contracts import (
+from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
+from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSlotSegmentedProgram,
     AutonomousScanSlotProgram,
-    PulseScanProgram,
+    PulseParameterScanProgram,
+    pulse_parameter_scan_program_from_tree,
+    pulse_parameter_scan_program_to_tree,
+)
+
+from .contracts import (
     ScanOutputContract,
     bind_scan_output_contract,
-    pulse_scan_program_from_tree,
-    pulse_scan_program_to_tree,
     scan_output_contract_from_tree,
     scan_output_contract_to_tree,
 )
@@ -342,7 +345,7 @@ class _PreparedScanDataset:
 
 
 def _scan_output_dataset_ref(
-    program: PulseScanProgram,
+    program: PulseParameterScanProgram,
     source_ref: DatasetRevisionRef,
     output_contract: ScanOutputContract,
 ) -> DatasetRevisionRef:
@@ -350,7 +353,7 @@ def _scan_output_dataset_ref(
         program,
         (AutonomousScanSlotProgram, ApiSlotSegmentedProgram),
     ):
-        raise TypeError("program must be a PulseScanProgram")
+        raise TypeError("program must be a PulseParameterScanProgram")
     if not isinstance(source_ref, DatasetRevisionRef):
         raise TypeError("source_ref must be DatasetRevisionRef")
     if not isinstance(output_contract, ScanOutputContract):
@@ -472,7 +475,7 @@ def _require_scan_dataset_facts(
 
 
 def _require_program_artifacts(
-    program: PulseScanProgram,
+    program: PulseParameterScanProgram,
     compiled_pulses: tuple[CompiledPulseArtifact, ...],
 ) -> tuple[CompiledPulseArtifact, ...]:
     """Fail before staging when compiled pulses do not implement the program."""
@@ -500,7 +503,7 @@ def _require_program_artifacts(
         ):
             raise ValueError("API compiled pulses differ from resolved point documents")
     else:
-        raise TypeError("program must be a PulseScanProgram")
+        raise TypeError("program must be a PulseParameterScanProgram")
     return pulses
 
 
@@ -621,16 +624,18 @@ def _decode_manifest(payload: bytes) -> tuple[str, ContentRef]:
     return value
 
 
-def _encode_program(program: PulseScanProgram) -> bytes:
-    return encode(pulse_scan_program_to_tree(program))
+def _encode_program(program: PulseParameterScanProgram) -> bytes:
+    return encode(pulse_parameter_scan_program_to_tree(program))
 
 
-def _decode_program(payload: bytes) -> PulseScanProgram:
-    program = pulse_scan_program_from_tree(
+def _decode_program(payload: bytes) -> PulseParameterScanProgram:
+    program = pulse_parameter_scan_program_from_tree(
         decode(payload, admit_structure=_reject_arrays)
     )
     if _encode_program(program) != payload:
-        raise ValueError("PulseScanProgram blob is typed but non-canonical")
+        raise ValueError(
+            "PulseParameterScanProgram blob is typed but non-canonical"
+        )
     return program
 
 
@@ -746,7 +751,7 @@ class ScanRepository:
 
     def _stage_static_lineage(
         self,
-        program: PulseScanProgram,
+        program: PulseParameterScanProgram,
         compiled_pulses: tuple[CompiledPulseArtifact, ...],
     ) -> _StagedScanLineage:
         """Persist immutable lineage before delegating to hardware preflight."""
@@ -842,7 +847,9 @@ class ScanRepository:
             authority.read_blob(index.pulse_program_blob)
         )
         if index.pulse_program_blob.digest != program.fingerprint:
-            raise ValueError("PulseScanProgram blob identity differs from fingerprint")
+            raise ValueError(
+                "PulseParameterScanProgram blob identity differs from fingerprint"
+            )
         execution = pulse_scan_execution_from_tree(
             index.execution_tree,
             program,
@@ -939,6 +946,39 @@ class ScanRepository:
                 index.output_contract,
                 snapshot,
             )
+
+    def project_dataset_source(
+        self,
+        reference: ScanArtifactRef,
+        *,
+        materialize: bool,
+        abort_check: Callable[[], None] | None = None,
+    ) -> ArtifactDatasetSource:
+        """Project the FINAL scan output as one exact generic Dataset source."""
+
+        if type(materialize) is not bool:
+            raise TypeError("materialize must be bool")
+        if abort_check is not None and not callable(abort_check):
+            raise TypeError("abort_check must be callable or None")
+        if materialize:
+            snapshot = self.materialize(
+                reference,
+                abort_check=abort_check,
+            ).snapshot
+            return ArtifactDatasetSource(
+                snapshot.block.schema,
+                snapshot.ref,
+                snapshot,
+            )
+        if abort_check is not None:
+            abort_check()
+        artifact = self.admit(reference)
+        if abort_check is not None:
+            abort_check()
+        return ArtifactDatasetSource(
+            artifact.output_schema,
+            artifact.output_dataset_ref,
+        )
 
     def has(self, reference: ScanArtifactRef) -> bool:
         with self._root_lease.borrow() as borrow:

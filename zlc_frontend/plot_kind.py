@@ -15,6 +15,8 @@ the vocabulary creates a convincing UI that does nothing.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Mapping
 
 __all__ = ["PLOT_KIND_SPECS", "PLOT_KIND_SPEC_BY_KEY", "PlotKindSpec"]
 
@@ -89,4 +91,8 @@ PLOT_KIND_SPECS: tuple[PlotKindSpec, ...] = (
 )
 
 #: ``key -> PlotKindSpec`` for O(1) lookup.  Insertion order = menu order.
-PLOT_KIND_SPEC_BY_KEY: dict[str, PlotKindSpec] = {spec.key: spec for spec in PLOT_KIND_SPECS}
+if len({spec.key for spec in PLOT_KIND_SPECS}) != len(PLOT_KIND_SPECS):
+    raise RuntimeError("plot kind keys must be unique")
+PLOT_KIND_SPEC_BY_KEY: Mapping[str, PlotKindSpec] = MappingProxyType(
+    {spec.key: spec for spec in PLOT_KIND_SPECS}
+)

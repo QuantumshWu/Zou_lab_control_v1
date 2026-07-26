@@ -9,6 +9,7 @@ from typing import Callable, Mapping
 from zlc_data import DataTransformSpec
 from zlc_frontend.form import FormChoice, FormFieldProps
 from zlc_neutral_atom.catalog import DefinitionKey
+from zlc_neutral_atom.artifact_output import ArtifactOutputDeclaration
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
 from zlc_neutral_atom.input_spec import (
     ArtifactInputSpec,
@@ -16,15 +17,13 @@ from zlc_neutral_atom.input_spec import (
     NodeInputSpec,
     require_input_specs,
 )
+from zlc_neutral_atom.logic_node_declaration import PathPresentationHint
 from zlc_neutral_atom.node_input import (
     BoundArtifactInput,
     BoundDatasetInput,
     BoundNodeInputs,
 )
 from zlc_storage import canonical_text
-
-from .form_projection import PathPresentation
-
 
 @dataclass(frozen=True, slots=True)
 class DatasetInputSelection:
@@ -40,20 +39,20 @@ class DatasetInputSelection:
 @dataclass(frozen=True, slots=True)
 class ArtifactInputSelection:
     spec: ArtifactInputSpec
-    producer_signal_key: str | None = None
+    producer_output_key: str | None = None
     reference_path: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.spec, ArtifactInputSpec):
             raise TypeError("spec must be ArtifactInputSpec")
-        if (self.producer_signal_key is None) == (self.reference_path is None):
+        if (self.producer_output_key is None) == (self.reference_path is None):
             raise ValueError(
                 "artifact input requires exactly one producer or saved reference"
             )
-        if self.producer_signal_key is not None:
+        if self.producer_output_key is not None:
             canonical_text(
-                self.producer_signal_key,
-                f"{self.spec.key} producer signal key",
+                self.producer_output_key,
+                f"{self.spec.key} producer output key",
             )
         if self.reference_path is not None:
             canonical_text(self.reference_path, f"{self.spec.key} reference path")
@@ -65,8 +64,8 @@ NodeInputSelection = DatasetInputSelection | ArtifactInputSelection
 
 
 @dataclass(frozen=True, slots=True)
-class ConsoleProducerBinding:
-    """One exact output resolved against one row in this TaskConsole."""
+class ConsoleDatasetProducerBinding:
+    """One exact Dataset output resolved against one TaskConsole row."""
 
     signal_key: str
     producer_label: str
@@ -74,8 +73,7 @@ class ConsoleProducerBinding:
     output: DatasetOutputDeclaration
     request: object
     run_node: object | None
-    final_result_resolved: bool
-    final_result: object | None
+    output_binding: object | None = None
 
     def __post_init__(self) -> None:
         canonical_text(self.signal_key, "signal_key")
@@ -84,10 +82,47 @@ class ConsoleProducerBinding:
             raise TypeError("definition_key must be DefinitionKey")
         if not isinstance(self.output, DatasetOutputDeclaration):
             raise TypeError("output must be DatasetOutputDeclaration")
-        if type(self.final_result_resolved) is not bool:
-            raise TypeError("final_result_resolved must be bool")
-        if not self.final_result_resolved and self.final_result is not None:
-            raise ValueError("an unresolved producer cannot expose a FINAL result")
+
+    @property
+    def running(self) -> bool:
+        return bool(
+            self.run_node is not None
+            and getattr(self.run_node, "running", False)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ConsoleArtifactProducerBinding:
+    """One exact FINAL Artifact output resolved against one TaskConsole row.
+
+    A Run currently owns at most one Artifact declaration, so its committed
+    FINAL result is that exact Artifact value.  Dataset bindings intentionally
+    have no corresponding result fields: a Dataset is consumed through the
+    data plane, never by smuggling the Run's unrelated Python result object.
+    """
+
+    output_key: str
+    producer_label: str
+    definition_key: DefinitionKey
+    output: ArtifactOutputDeclaration
+    request: object
+    run_node: object | None
+    artifact_resolved: bool
+    artifact: object | None
+
+    def __post_init__(self) -> None:
+        canonical_text(self.output_key, "output_key")
+        canonical_text(self.producer_label, "producer_label")
+        if not isinstance(self.definition_key, DefinitionKey):
+            raise TypeError("definition_key must be DefinitionKey")
+        if not isinstance(self.output, ArtifactOutputDeclaration):
+            raise TypeError("output must be ArtifactOutputDeclaration")
+        if type(self.artifact_resolved) is not bool:
+            raise TypeError("artifact_resolved must be bool")
+        if self.artifact_resolved != (self.artifact is not None):
+            raise ValueError(
+                "Artifact resolution and concrete Artifact value must agree"
+            )
 
     @property
     def running(self) -> bool:
@@ -100,14 +135,14 @@ class ConsoleProducerBinding:
 @dataclass(frozen=True, slots=True)
 class ResolvedDatasetInput:
     selection: DatasetInputSelection
-    producer: ConsoleProducerBinding
+    producer: ConsoleDatasetProducerBinding
     transform_spec: DataTransformSpec | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.selection, DatasetInputSelection):
             raise TypeError("selection must be DatasetInputSelection")
-        if not isinstance(self.producer, ConsoleProducerBinding):
-            raise TypeError("producer must be ConsoleProducerBinding")
+        if not isinstance(self.producer, ConsoleDatasetProducerBinding):
+            raise TypeError("producer must be ConsoleDatasetProducerBinding")
         if not self.selection.spec.accepts(
             self.producer.output.contract_id
         ):
@@ -122,20 +157,19 @@ class ResolvedDatasetInput:
 @dataclass(frozen=True, slots=True)
 class ResolvedArtifactInput:
     selection: ArtifactInputSelection
-    producer: ConsoleProducerBinding | None = None
+    producer: ConsoleArtifactProducerBinding | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.selection, ArtifactInputSelection):
             raise TypeError("selection must be ArtifactInputSelection")
-        if (self.producer is None) != (self.selection.producer_signal_key is None):
+        if (self.producer is None) != (self.selection.producer_output_key is None):
             raise ValueError("resolved artifact producer differs from its selection")
         if self.producer is not None:
-            if not isinstance(self.producer, ConsoleProducerBinding):
-                raise TypeError("producer must be ConsoleProducerBinding or None")
-            if (
-                self.producer.output.contract_id
-                not in self.selection.spec.accepted_output_contract_ids
-            ):
+            if not isinstance(self.producer, ConsoleArtifactProducerBinding):
+                raise TypeError(
+                    "producer must be ConsoleArtifactProducerBinding or None"
+                )
+            if not self.selection.spec.accepts(self.producer.output.contract_id):
                 raise ValueError("Artifact producer has an unaccepted output contract")
 
 
@@ -166,11 +200,12 @@ def bind_resolved_node_inputs(
         if isinstance(value, ResolvedDatasetInput):
             producer = value.producer
             bound[key] = BoundDatasetInput(
-                value.selection.spec,
-                producer.definition_key,
-                producer.request,
-                producer.output,
-                value.transform_spec,
+                spec=value.selection.spec,
+                producer_definition=producer.definition_key,
+                producer_request=producer.request,
+                output=producer.output,
+                transform_spec=value.transform_spec,
+                output_binding=producer.output_binding,
             )
             continue
         if not isinstance(value, ResolvedArtifactInput):
@@ -189,7 +224,7 @@ def bind_resolved_node_inputs(
 def project_input_fields(
     specs,
     *,
-    path_presentations: Mapping[str, PathPresentation] | None = None,
+    path_presentations: Mapping[str, PathPresentationHint] | None = None,
 ) -> tuple[FormFieldProps, ...]:
     """Mechanically project current Dataset/Artifact input declarations."""
 
@@ -202,8 +237,13 @@ def project_input_fields(
     }
     if not set(paths) <= saved_keys:
         raise ValueError("input path presentation names no saved Artifact input")
-    if any(not isinstance(value, PathPresentation) for value in paths.values()):
-        raise TypeError("input path presentations must be PathPresentation values")
+    if any(
+        not isinstance(value, PathPresentationHint) or key != value.field_key
+        for key, value in paths.items()
+    ):
+        raise TypeError(
+            "input path presentations must map input keys to their exact owner hint"
+        )
     fields: list[FormFieldProps] = []
     for spec in declared:
         if isinstance(spec, DatasetInputSpec):
@@ -255,16 +295,16 @@ def project_input_fields(
         )
         path_key = spec.reference_path_key
         assert path_key is not None
-        path = paths.get(spec.key, PathPresentation())
+        path = paths.get(spec.key)
         fields.append(
             FormFieldProps(
                 path_key,
                 "path",
                 f"Saved {spec.label.lower()}",
                 default=spec.default_reference_path,
-                path_mode=path.mode,
-                file_filter=path.file_filter,
-                base_dir=path.base_dir,
+                path_mode="file" if path is None else path.mode,
+                file_filter="All files (*)" if path is None else path.file_filter,
+                base_dir="" if path is None else path.base_dir,
                 description=(
                     f"Exact saved {spec.label.lower()} pointer; used when "
                     f"{spec.label} source is Saved {spec.label.lower()}"
@@ -304,7 +344,7 @@ def freeze_input_selections(
                 raise ValueError(f"select {spec.label}")
             frozen[spec.key] = ArtifactInputSelection(
                 spec,
-                producer_signal_key=value.strip(),
+                producer_output_key=value.strip(),
             )
             continue
         source = values.get(spec.source_key, "producer")
@@ -314,7 +354,7 @@ def freeze_input_selections(
                 raise ValueError(f"select a {spec.label} Task output")
             frozen[spec.key] = ArtifactInputSelection(
                 spec,
-                producer_signal_key=value.strip(),
+                producer_output_key=value.strip(),
             )
         elif source == "saved":
             path_key = spec.reference_path_key
@@ -333,7 +373,8 @@ def freeze_input_selections(
 
 __all__ = [
     "ArtifactInputSelection",
-    "ConsoleProducerBinding",
+    "ConsoleArtifactProducerBinding",
+    "ConsoleDatasetProducerBinding",
     "DatasetInputSelection",
     "NodeInputSelection",
     "ResolvedArtifactInput",

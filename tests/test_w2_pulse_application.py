@@ -32,7 +32,7 @@ from zlc_pulse import (
     compile_pulse_artifact,
     save_pulse_document,
 )
-from zlc_workbench.pulse import PulseEditorSession
+from zlc_workbench.pulse_editor.session import PulseEditorSession
 
 
 def _target() -> PulseTarget:
@@ -124,12 +124,14 @@ def _rekeyed_target(target: PulseTarget) -> PulseTarget:
     )
 
 
-def test_preview_is_exact_for_delayed_digital_repeat_and_dac_ramp():
+def test_preview_is_exact_for_authored_pass_repeat_bracket_and_dac_ramp():
     document = _document()
     _revision, timeline = PulseEditorSession(document).preview()
 
-    assert timeline.logical_duration_ticks == 40
-    assert timeline.duration_ticks == 40
+    # The editor projects one authored pass.  Repeat remains explicit as an
+    # annotation instead of duplicating periods and waveforms in the picture.
+    assert timeline.logical_duration_ticks == 20
+    assert timeline.duration_ticks == 22
     assert timeline.reference_label == "compiled static pulse"
     digital, dac = timeline.rows
     assert [
@@ -139,26 +141,20 @@ def test_preview_is_exact_for_delayed_digital_repeat_and_dac_ramp():
         (0, 2, 0, 0),
         (2, 12, 1, 1),
         (12, 22, 0, 0),
-        (22, 32, 1, 1),
-        (32, 40, 0, 0),
     ]
     assert [
         (item.start_tick, item.stop_tick, item.start_value, item.stop_value)
         for item in dac.segments
     ] == [
-        (0, 10, 1, 1),
-        (10, 20, 1, -1),
-        (20, 30, 1, 1),
-        (30, 40, 1, -1),
+        (0, 16, 1, 1),
+        (16, 22, 0, 0),
     ]
     assert [item.label for item in timeline.annotations if item.kind == "period"] == [
         "on",
         "ramp",
-        "on",
-        "ramp",
     ]
     assert [item.label for item in timeline.annotations if item.kind == "repeat"] == [
-        "repeat ×2"
+        "×2"
     ]
 
 
@@ -179,7 +175,7 @@ def test_scan_preview_uses_visible_nominal_values_not_the_first_scan_row():
     _revision, timeline = PulseEditorSession(document).preview()
 
     assert timeline.reference_label == "nominal scan/API reference"
-    assert timeline.logical_duration_ticks == 40
+    assert timeline.logical_duration_ticks == 20
 
 
 def test_timeline_rejects_labels_from_another_source_document():
@@ -271,7 +267,7 @@ def test_editor_serializes_concurrent_saves(
     tmp_path,
     monkeypatch,
 ):
-    import zlc_workbench.pulse as pulse_module
+    import zlc_workbench.pulse_editor.session as pulse_module
 
     session = PulseEditorSession(_document())
     entered = threading.Event()
@@ -324,7 +320,7 @@ def test_editor_serializes_concurrent_saves(
 
 
 def test_edit_during_save_remains_dirty(tmp_path, monkeypatch):
-    import zlc_workbench.pulse as pulse_module
+    import zlc_workbench.pulse_editor.session as pulse_module
 
     session = PulseEditorSession(_document())
     entered = threading.Event()

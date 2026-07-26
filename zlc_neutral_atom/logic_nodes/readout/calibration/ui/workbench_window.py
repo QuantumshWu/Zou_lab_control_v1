@@ -1,4 +1,4 @@
-"""Read-only Workbench for one committed calibration artifact/report pair."""
+"""Calibration creation/editing Workbench with a committed report view."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from concurrent.futures import CancelledError, Future
 
 from PyQt5 import QtCore, QtWidgets
 
+from zlc_frontend import PlotReportDocument
 from zlc_frontend.encoded_raster import EncodedRasterDocument
 from zlc_frontend.qt_widgets import (
     FluentButton,
@@ -31,16 +32,16 @@ from .view_projection import (
 from zlc_workbench.form_projection import project_authoring_form
 from zlc_workbench.run_owner import QtRunOwnerMailbox
 
-from zlc_workbench.frozen_raster import FrozenRasterWindow
 from zlc_workbench.window_runtime import error_summary
 
+from .report_window import CalibrationReportSurfaceWindow
 from .workbench_jobs import (
+    _load_calibration_report_document,
     _prepare_calibration_editor,
-    _render_calibration,
 )
 
 
-class CalibrationWorkbenchWindow(FrozenRasterWindow):
+class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
     """Edit one frozen calibration request and run an atomic FINAL commit."""
 
     def __init__(
@@ -80,10 +81,10 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
         self._run_warnings: tuple[str, ...] = ()
         self._saved_reference: CalibrationArtifactRef | None = None
         self._raster_job_kind: str | None = None
+        self._report_surface_restore_state: tuple[str, str, str] | None = None
         self._mailbox_closed = False
 
         super().__init__(
-            None,
             window_title="Readout Calibration",
             mode_text="FORMAL CALIBRATION · ATOMIC FINAL COMMIT",
             loading_summary="Resolving immutable calibration authority…",
@@ -451,10 +452,11 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             "reopening the paired artifact/report from this exact reference."
         )
         self._diagnostic.setText(self._diagnostic_with_run_warnings())
-        self._raster_job_kind = "report"
+        self._discard_report_document()
+        self._raster_job_kind = "report-load"
         self._set_busy("report")
         if not self._submit_future(
-            _render_calibration,
+            _load_calibration_report_document,
             self._computation_loader,
             reference,
             self._cancelled,
@@ -464,22 +466,27 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
             self._set_busy(None)
 
     def _accept_finished_future(self, future: Future) -> None:
+        if self._report_render_active is not None:
+            super()._accept_finished_future(future)
+            return
         kind, self._raster_job_kind = self._raster_job_kind, None
         if kind == "prepare":
             try:
-                request, bundle, render_error = future.result()
-                if bundle is not None and not isinstance(
-                    bundle,
-                    EncodedRasterDocument,
+                request, document, render_error = future.result()
+                if document is not None and not isinstance(
+                    document,
+                    PlotReportDocument,
                 ):
-                    raise TypeError("prepare worker returned an invalid raster")
+                    raise TypeError("prepare worker returned an invalid report")
             except CancelledError:
                 if not self._closing:
                     self._status.setText("CALIBRATION PREPARATION CANCELLED")
+                    self._set_busy(None)
             except BaseException as error:
                 if not self._closing:
                     self._status.setText("CALIBRATION PREPARATION FAILED")
                     self._diagnostic.setText(error_summary(error))
+                    self._set_busy(None)
             else:
                 if not self._closing:
                     try:
@@ -487,65 +494,165 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
                             request,
                             previous_reference=self._opened_reference,
                         )
-                        displayed = bundle is not None and self._present_bundle(bundle)
-                        self._status.setText(
-                            "CALIBRATION READY"
-                            if render_error is None and (bundle is None or displayed)
-                            else "CALIBRATION READY · PRIOR REPORT DISPLAY FAILED"
-                        )
                         self._summary.setText(
                             calibration_authority_summary(
                                 request,
                                 self._opened_reference,
                             )
                         )
-                        if render_error is not None:
+                        if document is not None:
+                            self._install_report_document(document)
+                        else:
+                            self._status.setText(
+                                "CALIBRATION READY · PRIOR REPORT DISPLAY FAILED"
+                            )
                             self._diagnostic.setText(render_error)
-                        elif bundle is None or displayed:
-                            self._diagnostic.setText("")
+                            self._set_busy(None)
                     except BaseException as error:
                         self._status.setText("CALIBRATION PRESENTATION FAILED")
                         self._diagnostic.setText(error_summary(error))
-            self._set_busy(None)
+                        self._set_busy(None)
             return
-        if kind != "report":
+        if kind != "report-load":
             super()._accept_finished_future(future)
             return
         try:
-            bundle = future.result()
-            if not isinstance(bundle, EncodedRasterDocument):
-                raise TypeError("report worker returned an invalid raster")
+            document = future.result()
+            if not isinstance(document, PlotReportDocument):
+                raise TypeError("report loader returned an invalid document")
         except CancelledError:
             if not self._closing:
                 self._status.setText(self._terminal_status(display_failed=True))
                 self._diagnostic.setText(
                     self._diagnostic_with_run_warnings(
-                        "Report rendering was cancelled after commit."
+                        "Report projection was cancelled after commit."
                     )
                 )
+                self._set_busy(None)
         except BaseException as error:
             if not self._closing:
                 self._status.setText(self._terminal_status(display_failed=True))
                 self._diagnostic.setText(
                     self._diagnostic_with_run_warnings(error_summary(error))
                 )
+                self._set_busy(None)
         else:
             if not self._closing:
-                displayed = self._present_bundle(bundle)
-                self._status.setText(
-                    self._terminal_status(display_failed=not displayed)
+                self._install_report_document(document)
+
+    def _report_render_started(
+        self,
+        surface_revision: int,
+        reason: str,
+    ) -> None:
+        if reason == "surface":
+            restore = self._report_surface_restore_state
+            current_status = self._status.text()
+            if restore is None or (
+                current_status not in {
+                    restore[0],
+                    f"{restore[0]} · REPORT DISPLAY FAILED",
+                }
+                and not current_status.startswith(
+                    "REFRESHING REPORT SURFACE r"
                 )
-                reference = self._saved_reference
-                if reference is not None:
-                    self._summary.setText(
-                        f"FINAL {reference.repository_id}:{reference.manifest_digest}\n"
-                        f"{bundle.summary}"
-                    )
+            ):
+                self._report_surface_restore_state = (
+                    current_status,
+                    self._summary.text(),
+                    self._diagnostic.text(),
+                )
+            self._set_busy("report")
+            self._status.setText(
+                f"REFRESHING REPORT SURFACE r{surface_revision}"
+            )
+            return
+        self._report_surface_restore_state = None
+        self._set_busy("report")
+        self._status.setText(
+            self._terminal_status("BUILDING CALIBRATION REPORT")
+            if self._run_revision is not None
+            else f"BUILDING PRIOR REPORT SURFACE r{surface_revision}"
+        )
+        self._diagnostic.setText(self._diagnostic_with_run_warnings())
+
+    def _report_render_succeeded(
+        self,
+        bundle: EncodedRasterDocument,
+        *,
+        displayed: bool,
+        reason: str,
+    ) -> None:
+        if reason == "surface":
+            restore = self._report_surface_restore_state
+            if displayed:
+                self._report_surface_restore_state = None
+            if restore is not None:
+                status, summary, diagnostic = restore
+                self._status.setText(
+                    status
+                    if displayed
+                    else f"{status} · REPORT DISPLAY FAILED"
+                )
+                self._summary.setText(summary)
                 if displayed:
+                    self._diagnostic.setText(diagnostic)
+                elif diagnostic:
                     self._diagnostic.setText(
-                        self._diagnostic_with_run_warnings()
+                        f"{diagnostic}\n{self._diagnostic.text()}"
                     )
+            self._set_busy(None)
+            return
+        if self._run_revision is None:
+            self._status.setText(
+                "CALIBRATION READY"
+                if displayed
+                else "CALIBRATION READY · PRIOR REPORT DISPLAY FAILED"
+            )
+        else:
+            self._status.setText(
+                self._terminal_status(display_failed=not displayed)
+            )
+        reference = self._saved_reference
+        if reference is not None:
+            self._summary.setText(
+                f"FINAL {reference.repository_id}:{reference.manifest_digest}\n"
+                f"{bundle.summary}"
+            )
+        if displayed:
+            self._diagnostic.setText(self._diagnostic_with_run_warnings())
         self._set_busy(None)
+
+    def _report_render_failed(self, error: BaseException, *, reason: str) -> None:
+        if reason == "surface":
+            restore = self._report_surface_restore_state
+            if restore is not None:
+                status, summary, diagnostic = restore
+                self._status.setText(f"{status} · REPORT DISPLAY FAILED")
+                self._summary.setText(summary)
+                message = error_summary(error)
+                self._diagnostic.setText(
+                    message if not diagnostic else f"{diagnostic}\n{message}"
+                )
+            self._set_busy(None)
+            return
+        self._status.setText(
+            self._terminal_status(display_failed=True)
+            if self._run_revision is not None
+            else "CALIBRATION READY · PRIOR REPORT DISPLAY FAILED"
+        )
+        self._diagnostic.setText(
+            self._diagnostic_with_run_warnings(error_summary(error))
+        )
+        self._set_busy(None)
+
+    def _start_report_render_if_ready(self) -> None:
+        # The formal Run has priority over re-rasterizing the already-committed
+        # report.  A screen change still clears stale pixels immediately; the
+        # newest surface request remains queued until the Run resolves.
+        if self._run_active:
+            return
+        super()._start_report_render_if_ready()
 
     @QtCore.pyqtSlot()
     def _owner_cycle(self) -> None:
@@ -567,6 +674,8 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
                 raise RuntimeError(
                     f"unknown calibration completion {completion.kind!r}"
                 )
+        if not self._run_active:
+            self._start_report_render_if_ready()
         self._finish_close_if_ready()
 
     def shutdown(self) -> None:
@@ -604,6 +713,4 @@ class CalibrationWorkbenchWindow(FrozenRasterWindow):
 
 __all__ = [
     "CalibrationWorkbenchWindow",
-    "open_calibration_report_workbench",
-    "open_calibration_workbench",
 ]

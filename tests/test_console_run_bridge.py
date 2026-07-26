@@ -64,6 +64,7 @@ def test_successful_run_result_is_the_only_final_artifact_authority() -> None:
     spec = SimpleNamespace(
         key=SimpleNamespace(stable_definition_id="final-result"),
         name="Pulse scan",
+        artifact_outputs=(),
         build_request=lambda values: values,
         outputs_for=lambda request: (),
     )

@@ -16,10 +16,7 @@ window.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from concurrent.futures import CancelledError, Future
-import math
-from numbers import Real
 from pathlib import Path
 
 from PyQt5 import QtCore, QtWidgets
@@ -256,84 +253,44 @@ class FigureViewer(QtWidgets.QWidget):
         """Build a hidden candidate; its admitted first front commits the generation."""
 
         from zlc_workbench.data_figure.app import create_data_figure_pane
-        from zlc_workbench.data_figure.projection import (
-            _classify_single_typed,
-            _classify_typed_grid,
-            _default_typed_state,
+        from zlc_frontend.data_figure_presentation import (
+            classify_faceted_data_figure,
+            classify_single_data_figure,
         )
         from zlc_frontend.figure import ViewIntent
 
         value = archive.archive
-        metadata = value.metadata
-        if not isinstance(metadata, Mapping):
-            raise TypeError("FigureArchive metadata must be a mapping")
+        presentation = value.presentation
         if not isinstance(info, tuple) or len(info) != 5:
             raise TypeError("Figure info worker returned invalid values")
-        single_intent, _single_reason = _classify_single_typed(value.figure)
-        grid_intent, grid_panel_count, _grid_reason = _classify_typed_grid(
+        single_intent, _single_reason = classify_single_data_figure(value.figure)
+        grid_intent, grid_panel_count, _grid_reason = classify_faceted_data_figure(
             value.figure
         )
-        size_name = metadata.get("size_name")
-        if size_name is not None:
-            if not isinstance(size_name, str):
-                raise TypeError("FigureArchive size_name must be text or null")
-            from zlc_frontend.panel_size import panel_size_cells
-
-            panel_size_cells(size_name)
-        raw_pixel_ratio = metadata.get("pixel_ratio", 1.0)
-        if isinstance(raw_pixel_ratio, bool) or not isinstance(
-            raw_pixel_ratio,
-            Real,
-        ):
-            raise TypeError("FigureArchive pixel_ratio must be a real number")
-        pixel_ratio = float(raw_pixel_ratio)
-        if not math.isfinite(pixel_ratio) or pixel_ratio <= 0.0:
-            raise ValueError(
-                "FigureArchive pixel_ratio must be positive and finite"
-            )
-        presentation_title = metadata.get("presentation_title")
-        presentation_value_label = metadata.get(
-            "presentation_value_label"
-        )
-        for name, value in (
-            ("presentation_title", presentation_title),
-            ("presentation_value_label", presentation_value_label),
-        ):
-            if value is not None and not isinstance(value, str):
-                raise TypeError(
-                    f"FigureArchive {name} must be text or null"
-                )
-        is_grid = grid_intent is not None and grid_panel_count is not None
-        if is_grid and size_name is None:
-            authored_display = (
-                value.display is not None
-                and value.display != _default_typed_state(grid_intent)
-            )
-            if (
-                authored_display
-                or pixel_ratio != 1.0
-                or presentation_title is not None
-                or presentation_value_label is not None
-            ):
-                raise ValueError(
-                    "authored Grid archive presentation requires size_name"
-                )
+        is_grid = bool(presentation.faceted)
+        if is_grid:
+            if grid_intent is not presentation.intent or grid_panel_count is None:
+                raise ValueError("archive presentation requires another Grid topology")
+        elif single_intent is not presentation.intent:
+            raise ValueError("archive presentation requires another single-panel topology")
         local_fit = bool(
-            single_intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
+            not is_grid
+            and presentation.intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
         )
         local_fit_options = (
             {
                 "local_fit": True,
                 "local_fit_archive_path": archive.path,
+                "local_fit_archive_presentation": presentation,
                 "local_fit_archive_metadata": value.metadata,
             }
             if local_fit
             else {}
         )
         display_options = (
-            {"initial_grid_display": value.display}
+            {"initial_grid_display": presentation.display}
             if is_grid
-            else {"initial_display": value.display}
+            else {"initial_display": presentation.display}
         )
         candidate = create_data_figure_pane(
             value.figure,
@@ -343,10 +300,9 @@ class FigureViewer(QtWidgets.QWidget):
                 else None
             ),
             embedded=True,
-            size_name=size_name,
-            pixel_ratio=pixel_ratio,
-            presentation_title=presentation_title,
-            presentation_value_label=presentation_value_label,
+            size_name=presentation.size_name,
+            presentation_title=presentation.title,
+            presentation_value_label=presentation.value_label,
             **display_options,
             **local_fit_options,
         )

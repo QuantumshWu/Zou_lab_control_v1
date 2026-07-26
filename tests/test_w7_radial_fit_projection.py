@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from io import BytesIO
 
 import numpy as np
 import pytest
@@ -266,9 +265,9 @@ def test_projected_radial_export_honors_current_view_cmap_clim_and_formats(
     monkeypatch,
 ):
     from zlc_frontend.matplotlib_render import (
+        encode_radial_gaussian_image_fit_panels,
         release_agg_figure,
         render_radial_gaussian_image_fit_panels,
-        save_radial_gaussian_image_fit_panels,
     )
 
     figure, model, _result = _sparse_radial_figure()
@@ -333,14 +332,12 @@ def test_projected_radial_export_honors_current_view_cmap_clim_and_formats(
         "jpg": b"\xff\xd8",
     }
     for image_format, signature in signatures.items():
-        output = BytesIO()
-        save_radial_gaussian_image_fit_panels(
+        encoded = encode_radial_gaussian_image_fit_panels(
             panels[:1],
             display,
             limits,
-            output,
             image_format=image_format,
             columns=1,
             dpi=72.0,
         )
-        assert output.getvalue().startswith(signature)
+        assert encoded.startswith(signature)

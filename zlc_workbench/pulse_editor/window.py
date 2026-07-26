@@ -10,9 +10,9 @@ behind :class:`PulseEditorController`.
 from __future__ import annotations
 
 from dataclasses import replace as dataclass_replace
-import math
 import os
 from pathlib import Path
+import threading
 from typing import Callable
 
 from PyQt5 import QtCore, QtWidgets
@@ -32,6 +32,7 @@ from zlc_frontend.qt_widgets import (
     FluentStatusDot,
     FluentTabWidget,
     QtOwnerWake,
+    RasterPixelRatioObserver,
     SinglePanelHost,
     ensure_qt_app,
     fluent_confirm,
@@ -69,6 +70,7 @@ from .scan_view import (
 )
 from .schedule_view import PulseScheduleView
 from .target_view import PulseTargetView
+from zlc_workbench.window_runtime import wait_for_owner_retirement
 
 
 _PULSE_FILES_ENV = "ZLC_PULSE_DIR"
@@ -124,14 +126,14 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._owner_cycle_active = False
         self._owner_cycle_pending = False
         self._shown_preview_key: tuple[int, int, int] | None = None
+        self._preview_surface_pixel_ratio = 1.0
         self._pending_preview_origin = None
         self._pending_preview_revision: int | None = None
-        self._preview_window_handle = None
-        self._observed_preview_screens: set[int] = set()
         self._close_decided = False
         self._close_requested = False
         self._owner_retiring = False
         self._permanently_closed = False
+        self._owner_closed = threading.Event()
 
         set_fluent_scale(None)
         self.setWindowTitle("PulseGUI@Zou lab")
@@ -142,6 +144,13 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         initial_preview = controller.preview_update()
         self._build_ui(initial_editor, initial_runtime)
         self._wire_ui()
+        self._preview_pixel_ratio_observer = RasterPixelRatioObserver(
+            self,
+            self._apply_preview_pixel_ratio,
+        )
+        self._preview_surface_pixel_ratio = (
+            self._preview_pixel_ratio_observer.current_ratio
+        )
 
         self._wake = QtOwnerWake(self)
         self._wake.bind(self._owner_cycle)
@@ -642,7 +651,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 
     def _tab_changed(self, index: int) -> None:
         if self.tabs.widget(index) is self.preview_view:
-            self._sync_preview_pixel_ratio()
+            self._preview_pixel_ratio_observer.refresh(force=True)
             self.preview_view.reset_preview_size_pin()
             self._invoke_preview(self._controller.reset_preview_size)
             self._invoke_preview(self._controller.request_preview)
@@ -676,24 +685,20 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             return
         self._apply_editor_projection(self._controller.editor_projection())
 
-    def _current_preview_pixel_ratio(self) -> float:
-        """Read the physical/logical ratio of the screen painting this window."""
-
-        window = self._window
-        ratio = (
-            float(window.devicePixelRatioF())
-            if window is not None
-            else float(self.devicePixelRatioF())
-        )
-        if not math.isfinite(ratio) or ratio <= 0.0:
-            return 1.0
-        return ratio
-
-    def _sync_preview_pixel_ratio(self, *_args) -> None:
+    def _apply_preview_pixel_ratio(self, ratio: float) -> None:
         """Keep the worker raster at one source pixel per physical screen pixel."""
 
         if self._owner_retiring or self._permanently_closed:
             return
+        changed = ratio != self._preview_surface_pixel_ratio
+        if changed:
+            self._preview_surface_pixel_ratio = ratio
+            self.preview_host.clear()
+            self.preview_host.hide()
+            self.preview_view.show_placeholder("Rendering preview for this display…")
+            self._shown_preview_key = None
+            self._pending_preview_origin = None
+            self._pending_preview_revision = None
         if self.tabs.currentWidget() is not self.preview_view:
             # DPR is presentation state, not editor state.  Screen binding may
             # complete just after launch while Edit is visible; defer both the
@@ -701,39 +706,8 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             return
         self._invoke_preview(
             self._controller.set_preview_pixel_ratio,
-            self._current_preview_pixel_ratio(),
+            ratio,
         )
-
-    def _observe_preview_screen(self, screen) -> None:
-        if screen is None or id(screen) in self._observed_preview_screens:
-            return
-        self._observed_preview_screens.add(id(screen))
-        for name in (
-            "logicalDotsPerInchChanged",
-            "physicalDotsPerInchChanged",
-        ):
-            signal = getattr(screen, name, None)
-            if signal is not None:
-                signal.connect(self._sync_preview_pixel_ratio)
-
-    def _preview_screen_changed(self, screen) -> None:
-        self._observe_preview_screen(screen)
-        # Qt finalises per-monitor DPR after the screen-change notification.
-        QtCore.QTimer.singleShot(0, self._sync_preview_pixel_ratio)
-
-    def _bind_preview_screen(self) -> None:
-        window = self._window
-        if window is None or self._permanently_closed:
-            return
-        handle = window.windowHandle()
-        if handle is None:
-            QtCore.QTimer.singleShot(0, self._bind_preview_screen)
-            return
-        if handle is not self._preview_window_handle:
-            self._preview_window_handle = handle
-            handle.screenChanged.connect(self._preview_screen_changed)
-        self._observe_preview_screen(handle.screen())
-        self._sync_preview_pixel_ratio()
 
     def _run_from_edit(self) -> None:
         document = self._controller.current_document
@@ -1197,7 +1171,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         if not runtime.close_complete or self._window is None:
             return
         if self._owner_retiring:
-            self._commit_owner_retirement()
+            self._commit_permanent_close()
         else:
             QtCore.QTimer.singleShot(0, self._window.close)
 
@@ -1515,9 +1489,9 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     ) -> None:
         """Resolve only the pending view intent reached by this worker answer.
 
-        A completed intermediate may be older than the newest pointer motion.
-        Its Qt presentation failure therefore cannot discard the newer intent
-        merely because both originated from the same held gesture.
+        Discard may synchronously promote the mailbox's queued human intent.
+        Clear this window-side receipt only if that re-entrant callback did not
+        replace it with a newer exact command.
         """
 
         pending_revision = self._pending_preview_revision
@@ -1526,10 +1500,16 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             or int(presentation_revision) < pending_revision
         ):
             return
-        if failed and self._pending_preview_origin is not None:
+        origin = self._pending_preview_origin
+        if failed and origin is not None:
             self.preview_host.discard_pending_interaction(
-                self._pending_preview_origin
+                origin
             )
+        if (
+            self._pending_preview_origin != origin
+            or self._pending_preview_revision != pending_revision
+        ):
+            return
         self._pending_preview_origin = None
         self._pending_preview_revision = None
 
@@ -1552,6 +1532,8 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
                 diagnostic = f"Preview unavailable:\n{snapshot.preview_error}"
                 self.preview_view.set_status(diagnostic)
                 self.preview_view.preview_status.setToolTip(diagnostic)
+            return
+        if rendered.pixel_ratio != self._preview_surface_pixel_ratio:
             return
         key = (
             rendered.document_generation,
@@ -1608,6 +1590,8 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         return None if self._last_runtime is None else self._last_runtime.run_snapshot
 
     def request_close(self, *, discard_unsaved: bool = False) -> bool:
+        if self._permanently_closed:
+            return True
         if not self._close_decided:
             dirty = self._controller.dirty
             if dirty and not discard_unsaved:
@@ -1626,6 +1610,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         update = self._controller.runtime_update()
         self._apply_runtime_update(update)
         if update.close_complete and self._window is not None:
+            self._preview_pixel_ratio_observer.detach()
             # ``request_close`` is also a public notebook/test entry point; a
             # synchronously completed controller close has no later worker wake
             # on which ``_owner_cycle`` could hide the wrapper.
@@ -1648,6 +1633,13 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         window.raise_()
         window.activateWindow()
 
+    def wait_owner_closed(self, timeout: float) -> bool:
+        return wait_for_owner_retirement(
+            self,
+            self._owner_closed,
+            timeout=timeout,
+        )
+
     def request_owner_close(self) -> None:
         """Thread-safe invalidation when the borrowing application closes."""
 
@@ -1656,17 +1648,22 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._owner_retiring = True
         self._controller.retire_borrowed_authority()
 
-    def _commit_owner_retirement(self) -> None:
+    def _commit_permanent_close(self) -> None:
+        """Release the wrapper after either standalone or borrowed close commits."""
+
         if self._permanently_closed:
             return
         self._permanently_closed = True
+        self._preview_pixel_ratio_observer.detach()
         window = self._window
         self._window = None
         if window is None:
+            self._owner_closed.set()
             return
         release_window(window)
         window.hide()
         window.deleteLater()
+        self._owner_closed.set()
 
     def _attach_window(self, window) -> None:
         self._window = window
@@ -1674,7 +1671,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         # until the next owner turn.  Bind then and re-render Preview at the
         # actual per-monitor DPR; the initial controller frame is only a
         # provisional logical-pixel result.
-        QtCore.QTimer.singleShot(0, self._bind_preview_screen)
+        self._preview_pixel_ratio_observer.schedule_bind()
 
 
 def launch_pulse_editor_window(
@@ -1691,6 +1688,7 @@ def launch_pulse_editor_window(
         body._attach_window(window)
         if not hide_on_close:
             window.set_close_guard(body.request_close)
+            window.closed.connect(body._commit_permanent_close)
 
     launch_fluent_window(
         body,

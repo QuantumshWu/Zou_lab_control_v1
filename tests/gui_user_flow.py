@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import time
 
-from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
+from PyQt5 import QtCore, QtGui, QtTest, QtWidgets, sip
 
 
 _FAST_PLATFORM = "offscreen"
@@ -53,6 +53,73 @@ def until(
         time.sleep(0.005)
     if not predicate():
         raise AssertionError("GUI user-flow condition did not become true")
+
+
+def widget_gone(widget: QtWidgets.QWidget | None) -> bool:
+    """Accept either hidden or QObject-deleted as a completed window close."""
+
+    return widget is None or sip.isdeleted(widget) or not widget.isVisible()
+
+
+def close_pulse_editor(
+    application: QtWidgets.QApplication,
+    body,
+    *,
+    timeout: float = 10.0,
+) -> None:
+    """Close a Pulse editor through its lifecycle owner, discarding test edits."""
+
+    wrapper = body.window()
+    body.request_close(discard_unsaved=True)
+    until(
+        application,
+        lambda: body.permanently_closed and widget_gone(wrapper),
+        timeout=timeout,
+    )
+    # ``deleteLater`` is the product's safe post-close QObject boundary.  The
+    # desktop event loop naturally consumes it; a short-lived offscreen process
+    # must do the same before Python/SIP interpreter teardown begins.
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+
+
+def close_task_console(
+    application: QtWidgets.QApplication,
+    body,
+    *,
+    timeout: float = 10.0,
+) -> None:
+    """Close TaskConsole through its non-blocking product lifecycle."""
+
+    if getattr(body, "_window", None) is None:
+        deadline = time.monotonic() + float(timeout)
+        while not body.shutdown() and time.monotonic() < deadline:
+            application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+            time.sleep(0.005)
+        if getattr(body, "_shutdown_state", None) != "TERMINATED":
+            raise AssertionError(
+                "direct TaskConsole body did not terminate: "
+                f"state={getattr(body, '_shutdown_state', None)!r}"
+            )
+        body.close()
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        return
+
+    body.request_window_close()
+    deadline = time.monotonic() + float(timeout)
+    while not body.permanently_closed and time.monotonic() < deadline:
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        time.sleep(0.005)
+    if not body.permanently_closed:
+        raise AssertionError(
+            "TaskConsole did not close: "
+            f"state={getattr(body, '_shutdown_state', None)!r}, "
+            f"render_complete={body._render_lane.shutdown_complete}, "
+            f"fit_complete={body._fit_lane.shutdown_complete}, "
+            f"render_wake_fault={body._render_lane._wake.fault!r}, "
+            f"fit_wake_fault={body._fit_lane._wake.fault!r}, "
+            f"owner_wake_fault={body._owner_wake.fault!r}"
+        )
 
 
 def click_tab(body, page) -> None:
@@ -161,6 +228,8 @@ def capture_offscreen_window(
 __all__ = [
     "capture_offscreen_window",
     "click_tab",
+    "close_pulse_editor",
+    "close_task_console",
     "configure_offscreen_fast_path",
     "drag_mouse_move",
     "require_offscreen_platform",

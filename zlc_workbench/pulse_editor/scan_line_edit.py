@@ -16,6 +16,7 @@ from zlc_frontend.qt_widgets import (
     PADDING_V,
     PLACEHOLDER,
     RADIUS,
+    SURFACE,
     FluentLineEdit,
     Metrics,
     fluent_font_size,
@@ -60,7 +61,7 @@ class _FluentScanDot(QtWidgets.QAbstractButton):
             painter.setPen(QtCore.Qt.NoPen)
             painter.drawEllipse(center, radius, radius)
             if self._number is not None:
-                painter.setPen(QtGui.QColor("#FFFFFF"))
+                painter.setPen(QtGui.QColor(SURFACE))
                 font = QtGui.QFont(FONT, max(6, fluent_font_size() - 5))
                 font.setBold(True)
                 painter.setFont(font)

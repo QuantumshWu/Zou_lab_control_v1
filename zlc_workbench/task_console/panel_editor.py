@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtWidgets
 
 import zlc_frontend.qt_widgets as _qt_widgets
 from zlc_frontend.qt_widgets import (
@@ -29,19 +29,15 @@ from zlc_frontend.qt_widgets import (
     FluentSectionLabel,
     FluentSettingRow,
     FluentSwitch,
-    GREEN,
     GREY,
-    ORANGE,
-    RED,
     scaled_px,
     signals_blocked as _signals_blocked,
 )
-from zlc_frontend.form import choice_value_from_tree, lenient_float as _safe_float
+from zlc_frontend.form import choice_value_from_tree
 from zlc_frontend.panel_params import panel_param_decls as _panel_param_decls
 from zlc_frontend import RELIM_PARAM as _RELIM_PARAM
 from zlc_frontend.render_style import panel_display_size
 from zlc_storage.paths import display_path, user_output_path
-from .logic_node_parameter_panel import LogicNodeParameterPanel
 
 
 FORM_WIDGET_HANDLERS = _qt_widgets.FORM_WIDGET_HANDLERS
@@ -64,15 +60,7 @@ def _front_qimage(frame):
     panels = tuple(getattr(frame, "panels", ()) or ())
     if not panels:
         return None
-    raster = panels[0].raster
-    image = QtGui.QImage(
-        bytes(raster.pixels),
-        raster.width,
-        raster.height,
-        raster.width * 4,
-        QtGui.QImage.Format_RGBA8888,
-    )
-    return image.copy()          # own the bytes: the raster is not ours to keep
+    return _qt_widgets.owned_qimage_for_raster(panels[0].raster)
 
 
 class PanelEditor(QtWidgets.QWidget):
@@ -80,17 +68,14 @@ class PanelEditor(QtWidgets.QWidget):
 
     Opened from a panel's ``Edit...`` button as its OWN closable tab, so several
     panels can be edited side by side.  Holds a FROZEN snapshot of that panel's
-    current data plus the heavy controls that do NOT belong in the lightweight
-    Setting popup AND do NOT duplicate it (Setting owns source / size / colormap
-    / relim / unit):
+    current data plus a second projection of the same Figure-owned controls:
 
       * another editable view of the panel's Figure-owned Fit request; the
         same card state also backs Setting and no second window is opened;
       * manual x/y limits + Save Fig;
-      * for a panel that came from a measurement, that measurement's
-        AUTO-generated parameter form (the same FormSpec the launcher
-        uses, bound to the one spec) whose Start RE-RUNS the measurement into
-        this very Monitor panel with the edited params.
+
+    Acquisition/Processor parameters remain on their one Logic-node form.  A
+    plot tab never embeds a second copy or restarts its producer implicitly.
 
     The whole page lives in a scroll area, so the snapshot never pushes the
     fit/limits row off-screen."""
@@ -113,10 +98,7 @@ class PanelEditor(QtWidgets.QWidget):
         self._snapshot_value = None
         self._snapshot_figure = None
         self._snapshot_display = None
-        self._snapshot_size_name = None
-        self._snapshot_pixel_ratio = None
-        self._snapshot_title = None
-        self._snapshot_value_label = None
+        self._snapshot_contract = None
         self._render_request_revision = 0
         self._pending_render_result = None
         self._presented_render_request_revision = 0
@@ -177,33 +159,6 @@ class PanelEditor(QtWidgets.QWidget):
         self.title_edit.setToolTip("Rename this panel (also the default save name).")
         self.title_edit.editingFinished.connect(self._commit_title)
         col.addWidget(FluentSettingRow("title", self.title_edit, label_width=label_w))
-
-        # ---- Source: the producing node's declarative form.  Figure-owned Area,
-        # Cross and Fit state never appears here as a Measurement parameter.  Apply
-        # rebuilds + restarts that node; it is
-        # started and stopped from its OWN Logic-tab Edit, so no Start/Stop here.
-        self._source_row = None
-        self.source_form = None
-        self._source_row = console._producing_row(card)
-        source_spec = (console._spec_for_logic(self._source_row.node)
-                       if self._source_row is not None else None)
-        if source_spec is not None:
-            section("Source: %s" % source_spec.name)
-            self.source_form = LogicNodeParameterPanel(
-                [source_spec],
-                parent=page,
-                single=True,
-                controls=False,
-                runtime=console.form_runtime_for_logic(self._source_row),
-            )
-            self.source_form.seed_values(self._source_row.node.values or {})
-            col.addWidget(self.source_form)
-            self.source_apply_button = FluentButton("Apply", color=ACCENT)
-            self.source_apply_button.setToolTip(
-                "Apply these parameters to the source node (rebuild + restart it); "
-                "the plot keeps reading its published signal.")
-            self.source_apply_button.clicked.connect(self._apply_source_form)
-            col.addWidget(self.source_apply_button)
 
         # ---- Parameters: the plot's own functional params, auto-discovered from the
         # kind's declarations, so a kind that gains a knob shows it with no wiring here.
@@ -393,20 +348,21 @@ class PanelEditor(QtWidgets.QWidget):
         card = self.card
         source_host = None if card is None else card.board
         front = None if source_host is None else source_host.front_frame
-        overview_png = (
+        overview_artifact = (
             None
             if source_host is None
-            else getattr(source_host, "overview_png", None)
+            else getattr(source_host, "overview_artifact", None)
         )
-        if front is None and overview_png is None:
+        if front is None and overview_artifact is None:
             self.status.setText("open the panel with data first")
             return
         try:
             value = card.frozen_render_value()
-            size_name, pixel_ratio = card.frozen_panel_geometry()
-            title, value_label = card.frozen_panel_labels()
+            contract = card.frozen_plot_panel_contract()
+            size_name = contract.size_name
             if card.config.kind == "sites":
-                figure = display = None
+                figure = None
+                display = card.frozen_display_state()
             else:
                 figure = card.frozen_data_figure()
                 display = card.frozen_display_state()
@@ -418,13 +374,8 @@ class PanelEditor(QtWidgets.QWidget):
         logical_size = tuple(
             int(value) for value in panel_display_size(size_name)
         )
-        if isinstance(board, FacetedPanelHost) and overview_png is not None:
-            regions = tuple(getattr(source_host, "overview_regions", ()) or ())
-            board.present_overview(
-                overview_png,
-                regions,
-                logical_size=logical_size,
-            )
+        if isinstance(board, FacetedPanelHost) and overview_artifact is not None:
+            board.present_overview(overview_artifact)
         elif front is not None:
             board.present_frame(front, logical_size=logical_size)
         else:
@@ -440,10 +391,7 @@ class PanelEditor(QtWidgets.QWidget):
         self._snapshot_value = value
         self._snapshot_figure = figure
         self._snapshot_display = display
-        self._snapshot_size_name = size_name
-        self._snapshot_pixel_ratio = pixel_ratio
-        self._snapshot_title = title
-        self._snapshot_value_label = value_label
+        self._snapshot_contract = contract
         self._refresh_unit_readout()
         if self._fit_pane is not None:
             card.refresh_fit_authoring_pane(self._fit_pane)
@@ -460,7 +408,7 @@ class PanelEditor(QtWidgets.QWidget):
             self._snapshot_figure,
         )
 
-    def freeze_current_view_request(self):
+    def freeze_current_view_request(self, *, axis_labels=None, short_labels=None):
         """Freeze one display answer against the explicit Refresh input."""
 
         if self.card is None or self._snapshot_value is None:
@@ -470,12 +418,20 @@ class PanelEditor(QtWidgets.QWidget):
             self._snapshot_value,
             surface_id=self.render_surface_id,
             request_revision=self._render_request_revision,
-            display=self.card._display_state(),
             frame_key=(
                 "edit-snapshot",
                 self._snapshot_value.snapshot.ref,
             ),
+            axis_labels=axis_labels,
+            short_labels=short_labels,
         )
+
+    def invalidate_raster_surface(self) -> None:
+        """Make a prior-screen front ineligible without rebuilding this tab."""
+
+        self._pending_render_result = None
+        if self._board is not None:
+            self._board.clear()
 
     def accept_render_result(
         self,
@@ -493,6 +449,7 @@ class PanelEditor(QtWidgets.QWidget):
             value is None
             or request.render_surface_id != self.render_surface_id
             or request.value.snapshot.ref != value.snapshot.ref
+            or request.contract.pixel_ratio != self.card.raster_pixel_ratio
         ):
             return False
         pending_revision = (
@@ -516,7 +473,7 @@ class PanelEditor(QtWidgets.QWidget):
             )
             self.status.setText(str(error))
             return True
-        if request.faceted:
+        if request.contract.faceted:
             from zlc_frontend.panel_render import FacetedPanelResult
 
             if not isinstance(faceted_result, FacetedPanelResult):
@@ -548,15 +505,11 @@ class PanelEditor(QtWidgets.QWidget):
         request, frame, faceted, figure = pending
         board = self._ensure_snapshot_surface()
         logical_size = tuple(
-            int(value) for value in panel_display_size(request.size_name)
+            int(value) for value in panel_display_size(request.contract.size_name)
         )
         if faceted is not None:
-            if faceted.overview_png is not None:
-                board.present_overview(
-                    faceted.overview_png,
-                    faceted.regions,
-                    logical_size=logical_size,
-                )
+            if faceted.overview is not None:
+                board.present_overview(faceted.overview)
             else:
                 board.present_frame(
                     faceted.frame,
@@ -567,10 +520,7 @@ class PanelEditor(QtWidgets.QWidget):
             board.present_frame(frame, logical_size=logical_size)
         self._snapshot_figure = figure
         self._snapshot_display = request.display
-        self._snapshot_size_name = request.size_name
-        self._snapshot_pixel_ratio = request.pixel_ratio
-        self._snapshot_title = request.label
-        self._snapshot_value_label = request.value_label
+        self._snapshot_contract = request.contract
         self._presented_render_request_revision = int(
             request.request_revision
         )
@@ -771,28 +721,8 @@ class PanelEditor(QtWidgets.QWidget):
         self._request_snapshot_render()
         self._update_save_preview()               # default save name follows the title
 
-    def _apply_source_form(self) -> None:
-        """Apply the source node's edited parameter form to the producing node --
-        rebuild + restart it (or live where it accepts), then re-snapshot."""
-        if self._source_row is None or self.source_form is None:
-            return
-        try:
-            values = self.source_form.collect_values()
-        except Exception as exc:
-            self.status.setText(f"apply failed: {exc}")
-            return
-        if not self.console._apply_source_params(self._source_row, values):
-            self.status.setText("locked: a task is running — Stop it first")
-            return
-        self.console.refresh_once()
-        self.status.setText("source parameters applied")
-
     def refresh_on_show(self) -> None:
-        """When this panel's Edit tab becomes visible, refresh anything that may have changed
-        since it was last shown: re-seed the display knobs from config.params, snap the manual-limit
-        fields to current view and refresh
-        any embedded source form's dynamic combos (the ONE hook the tab-switch handler calls -- nothing
-        special-cases PanelEditor versus LogicNodeEditor)."""
+        """Re-seed this Figure projection from the card's sole authored state."""
         card = self.card
         self._refresh_display_params()
         if card is not None:
@@ -806,9 +736,6 @@ class PanelEditor(QtWidgets.QWidget):
             )
         self._seed_limit_boxes()        # re-seed the pin from config.params (may have changed in Setting)
         self.refresh_limit_hints()
-        hook = getattr(getattr(self, "source_form", None), "refresh_on_show", None)
-        if callable(hook):
-            hook()
 
     def _refresh_display_params(self) -> None:
         """Re-seed the Edit tab's display-knob controls (``ed_params``) from the live card's
@@ -851,12 +778,12 @@ class PanelEditor(QtWidgets.QWidget):
         return tuple(rows)
 
     def _visible_snapshot_pixels(self):
-        """Return the immutable front or overview that is actually on screen."""
+        """Return the immutable front or overview artifact actually on screen."""
 
         board = self._board
         return (
             None if board is None else getattr(board, "front_frame", None),
-            None if board is None else getattr(board, "overview_png", None),
+            None if board is None else getattr(board, "overview_artifact", None),
         )
 
     def _front_view_bounds(self):
@@ -867,7 +794,7 @@ class PanelEditor(QtWidgets.QWidget):
         picture rather than a range derived beside it.
         """
 
-        front, _overview_png = self._visible_snapshot_pixels()
+        front, _overview_artifact = self._visible_snapshot_pixels()
         panels = tuple(getattr(front, "panels", ()) or ())
         if not panels:
             return None
@@ -1085,8 +1012,8 @@ class PanelEditor(QtWidgets.QWidget):
     def save(self) -> None:
         """Write the exact visible pixels and their exact typed data revision."""
 
-        front, overview_png = self._visible_snapshot_pixels()
-        if front is None and overview_png is None:
+        front, overview_artifact = self._visible_snapshot_pixels()
+        if front is None and overview_artifact is None:
             self.status.setText("no snapshot to save")
             return
         try:
@@ -1096,7 +1023,9 @@ class PanelEditor(QtWidgets.QWidget):
             image = (
                 _front_qimage(front)
                 if front is not None
-                else QtGui.QImage.fromData(overview_png, "PNG")
+                else _qt_widgets.owned_qimage_for_raster(
+                    overview_artifact.raster
+                )
             )
             if image is None or not image.save(str(target)):
                 raise RuntimeError("Qt refused to write %s" % target.name)
@@ -1108,22 +1037,21 @@ class PanelEditor(QtWidgets.QWidget):
                 return
             figure = self._snapshot_figure
             display = self._snapshot_display
-            if figure is None or display is None:
+            contract = self._snapshot_contract
+            if figure is None or display is None or contract is None:
                 raise RuntimeError("the editor has no exact typed figure to save")
+            from zlc_frontend import FigurePresentationContract
             from zlc_workbench.data_figure.archive_repository import save_figure_archive
+
+            presentation = FigurePresentationContract.from_plot_panel(
+                contract,
+                display,
+            )
 
             save_figure_archive(
                 figure,
                 stem.with_suffix(".npz"),
-                display=display,
-                metadata={
-                    "panel_kind": str(self.card.config.kind),
-                    "title": str(self._snapshot_title or ""),
-                    "size_name": self._snapshot_size_name,
-                    "pixel_ratio": self._snapshot_pixel_ratio,
-                    "presentation_title": self._snapshot_title,
-                    "presentation_value_label": self._snapshot_value_label,
-                },
+                presentation=presentation,
             )
             self.console._last_save_dir = str(stem.parent)
             self._update_save_preview()

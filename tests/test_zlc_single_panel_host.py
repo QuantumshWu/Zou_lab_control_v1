@@ -103,6 +103,83 @@ def test_present_frame_binds_the_image_family_and_forwards_typed_intents() -> No
         application.processEvents()
 
 
+def test_live_color_limits_track_the_latest_authored_value_until_answered() -> None:
+    """A live H drag may return to the still-painted limits before Agg answers.
+
+    The return is a newer desired state, but only one exact answer may be in
+    flight; the latest value is issued from the admitted frame immediately
+    after that answer arrives.
+    """
+
+    from zlc_frontend.qt_widgets._raster_image_interaction import (
+        _held_panel_from_target,
+    )
+    from dataclasses import replace
+
+    from zlc_frontend.render import BoardFrame
+    from zlc_frontend.selector import ImageColorLimitsCommit
+
+    application, host = _host_with_image_front()
+    try:
+        host.set_selectors_enabled(True)
+        board = host.board
+        binding = board._image_bindings["image"]
+        target = board._selector_target(binding)
+        assert target is not None
+        hold = _held_panel_from_target(target)
+        board._selector_hold = hold
+
+        commits: list[ImageColorLimitsCommit] = []
+        host.colorLimitsCommitted.connect(commits.append)
+        painted = board.visible_image_payload().color_limits
+        span = painted[1] - painted[0]
+        changed = (painted[0] + 0.1 * span, painted[1] - 0.1 * span)
+
+        assert board._commit_color_limits(binding, changed, hold=hold)
+        first_answer = binding.pending_color_answer
+        assert first_answer is not None
+        assert first_answer.color_limits == changed
+
+        assert board._commit_color_limits(binding, painted, hold=hold)
+        assert binding.pending_color_answer is first_answer
+        assert binding.queued_color_limits == painted
+        assert [commit.color_limits for commit in commits] == [changed]
+
+        answered = image_fixtures._image_panel(
+            1,
+            viewport_revision=first_answer.display_revision,
+        )
+        answered = replace(
+            answered,
+            source_identity=first_answer.origin.source_identity,
+            coherence_stamp=replace(
+                answered.coherence_stamp,
+                inputs=(first_answer.origin.input_identity,),
+            ),
+            display_payload=replace(
+                answered.display_payload,
+                evaluated_input=first_answer.origin.input_identity,
+                color_limits=changed,
+            ),
+        )
+        host.present_frame(BoardFrame("image-board", 0, 1, (answered,)))
+        latest_answer = binding.pending_color_answer
+        assert latest_answer is not None
+        assert latest_answer.color_limits == painted
+        assert latest_answer.display_revision > first_answer.display_revision
+        assert binding.queued_color_limits is None
+        assert [commit.color_limits for commit in commits] == [changed, painted]
+
+        board._cancel_image_gesture(binding, clear_draft=False)
+        assert board._selector_hold is None
+        assert binding.pending_color_answer is latest_answer
+        assert board.discard_pending_image_interaction(commits[-1].origin)
+        assert binding.pending_color_answer is None
+    finally:
+        host.close()
+        application.processEvents()
+
+
 def test_present_frame_refuses_a_frame_for_another_panel() -> None:
     """The host is ONE panel: a coherent frame minted for a different panel id
     must be refused before it can desynchronise board layout and binding."""

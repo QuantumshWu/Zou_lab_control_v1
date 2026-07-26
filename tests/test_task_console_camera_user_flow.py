@@ -7,15 +7,12 @@ inspect the resulting typed fronts, but never bypass a button to create them.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import time
 from unittest.mock import patch
 
 import numpy as np
 
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 
@@ -24,7 +21,9 @@ from gui_user_flow import (
     click_tab,
     configure_offscreen_fast_path,
     drag_mouse_move,
+    require_offscreen_platform,
     until,
+    widget_gone,
 )
 from zlc_workbench.task_console.console_records import console_signal_key
 from zlc_frontend.qt_widgets import ensure_qt_app
@@ -195,6 +194,13 @@ def _visible_form_widgets(editor) -> dict[str, QtWidgets.QWidget]:
     return {key: form.widget_for(key) for key in form.spec.keys}
 
 
+def _resolved_artifact(console, output_key: str):
+    """Read one retained FINAL Artifact through the typed producer boundary."""
+
+    producer = console.resolve_console_producer(output_key)
+    return producer.artifact if producer.artifact_resolved else None
+
+
 def _wheel(widget, position, delta: int) -> None:
     """Deliver one wheel step through the real Qt widget event path."""
 
@@ -235,6 +241,7 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
 
     configure_offscreen_fast_path()
     application = ensure_qt_app()
+    require_offscreen_platform(application)
     from task_console import _StandaloneTaskConsoleFlow, _build_parser
 
     from zlc_data import (
@@ -650,9 +657,9 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         ) <= 1
         assert visible_top_levels() == top_levels_before
     finally:
-        if console_wrapper is not None and console_wrapper.isVisible():
+        if not widget_gone(console_wrapper):
             console_wrapper.close()
-            until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+            until(application, lambda: widget_gone(console_wrapper), timeout=15.0)
         flow.close()
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
@@ -946,9 +953,9 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             settle_ms=100,
         )
     finally:
-        if console_wrapper is not None and console_wrapper.isVisible():
+        if not widget_gone(console_wrapper):
             console_wrapper.close()
-            until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+            until(application, lambda: widget_gone(console_wrapper), timeout=15.0)
         flow.close()
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
@@ -1035,7 +1042,7 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             calibration_row.node.node_id,
             "calibration",
         )
-        assert console._data.freeze().value(calibration_final) is not None, (
+        assert _resolved_artifact(console, calibration_final) is not None, (
             calibration_row.status_label.text()
         )
         fidelity_site = console_signal_key(
@@ -1093,7 +1100,10 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             ),
             timeout=15.0,
         )
-        assert fidelity_card._signal_axis_label(fidelity_site) == "Readout fidelity"
+        assert (
+            fidelity_card.frozen_plot_panel_contract().value_label
+            == "Readout fidelity"
+        )
 
         _choose_combo_text(console.kind_combo, "Task: Optimize MOT field", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
@@ -1159,9 +1169,9 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         assert mot_shape in mot_row.publishes_label.text()
         assert "points:" not in mot_row.publishes_label.text()
     finally:
-        if console_wrapper is not None and console_wrapper.isVisible():
+        if not widget_gone(console_wrapper):
             console_wrapper.close()
-            until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+            until(application, lambda: widget_gone(console_wrapper), timeout=15.0)
         flow.close()
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
@@ -1253,7 +1263,7 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
         until(
             application,
             lambda: (
-                console._data.freeze().value(calibration_signal) is not None
+                _resolved_artifact(console, calibration_signal) is not None
                 and not console._task_locked
             ),
             timeout=25.0,
@@ -1261,16 +1271,16 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
         assert console._logic_nodes.get(id(camera_row)) is None
         assert not camera_row.stop_button.isEnabled()
         assert camera_row.status_label.text() == "stopped"
-        assert console._data.freeze().value(calibration_signal) is not None
+        assert _resolved_artifact(console, calibration_signal) is not None
         assert camera_run_id != getattr(
             getattr(console._last_node[id(calibration_row)], "handle", None),
             "run_id",
             None,
         )
     finally:
-        if console_wrapper is not None and console_wrapper.isVisible():
+        if not widget_gone(console_wrapper):
             console_wrapper.close()
-            until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+            until(application, lambda: widget_gone(console_wrapper), timeout=15.0)
         flow.close()
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
@@ -1339,13 +1349,13 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         until(
             application,
             lambda: (
-                console._data.freeze().value(calibration_signal) is not None
+                _resolved_artifact(console, calibration_signal) is not None
                 and not console._task_locked
             ),
             timeout=25.0,
         )
 
-        # Temperature takes only the explicit calibration signal in addition
+        # Temperature takes only the explicit calibration Artifact in addition
         # to Main's visible physics parameters.  A Measurement never auto-opens
         # a panel; the operator creates and wires the 1-D view afterwards.
         _choose_combo_text(console.kind_combo, "Measurement: Temperature", application)
@@ -1529,13 +1539,13 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             "model_kind",
             "camera_frame",
             "calibration_source",
-            "calibration_signal",
+            "calibration_output",
             "calibration_path",
         }
         assert _signal_leaf_keys(occupancy_widgets["camera_frame"]) == {
             camera_signal
         }
-        assert _signal_leaf_keys(occupancy_widgets["calibration_signal"]) == {
+        assert _signal_leaf_keys(occupancy_widgets["calibration_output"]) == {
             calibration_signal
         }
         _choose_signal_leaf(
@@ -1650,9 +1660,9 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
                 and pulse_body.active_snapshot.state.terminal,
                 timeout=15.0,
             )
-        if console_wrapper is not None and console_wrapper.isVisible():
+        if not widget_gone(console_wrapper):
             console_wrapper.close()
-            until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+            until(application, lambda: widget_gone(console_wrapper), timeout=15.0)
         flow.finish_close(application, timeout_seconds=15.0)
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
@@ -1721,7 +1731,7 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
         until(
             application,
             lambda: (
-                console._data.freeze().value(calibration_signal) is not None
+                _resolved_artifact(console, calibration_signal) is not None
                 and not console._task_locked
             ),
             timeout=25.0,
@@ -1806,11 +1816,11 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
             lambda: card.board is not None and card.board.front_frame is not None,
             timeout=15.0,
         )
-        assert card._signal_axis_label(recapture_signal) == "Recapture rate"
+        assert card.frozen_plot_panel_contract().value_label == "Recapture rate"
     finally:
-        if console_wrapper is not None and console_wrapper.isVisible():
+        if not widget_gone(console_wrapper):
             console_wrapper.close()
-            until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+            until(application, lambda: widget_gone(console_wrapper), timeout=15.0)
         flow.finish_close(application, timeout_seconds=15.0)
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
@@ -1956,8 +1966,8 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
         assert value.snapshot.block.schema.repeat_axis.size >= 1
         assert value.snapshot.block.schema.point_layout.storage_size >= 1
     finally:
-        if console_wrapper is not None and console_wrapper.isVisible():
+        if not widget_gone(console_wrapper):
             console_wrapper.close()
-            until(application, lambda: not console_wrapper.isVisible(), timeout=15.0)
+            until(application, lambda: widget_gone(console_wrapper), timeout=15.0)
         flow.close()
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)

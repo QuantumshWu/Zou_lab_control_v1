@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from zlc_neutral_atom.authoring import AuthoringChoice
 from zlc_neutral_atom.logic_node_declaration import (
+    ArtifactOutputPresentation,
     DefaultOutputView,
     DynamicChoicePresentation,
     LogicNodeDeclaration,
@@ -12,7 +13,10 @@ from zlc_neutral_atom.logic_node_declaration import (
 )
 from zlc_neutral_atom.node_input import bind_no_node_inputs
 
-from .projection import CALIBRATION_FINAL_OUTPUT_DECLARATIONS
+from .projection import (
+    CALIBRATION_ARTIFACT_OUTPUT_DECLARATION,
+    CALIBRATION_FINAL_OUTPUT_DECLARATIONS,
+)
 from .sitemap import SITEMAP_CALIBRATION_TASK_DEFINITION
 from .task import (
     CALIBRATION_LIVE_OUTPUT_DECLARATIONS,
@@ -62,9 +66,9 @@ CALIBRATION_LOGIC_NODE = LogicNodeDeclaration(
         ),
         OutputPresentation(
             _FINAL[0],
-            "calibration",
-            "Calibration",
-            "FINAL Calibration artifact",
+            "site map",
+            "Counts",
+            "reference-average image with calibrated site geometry",
         ),
         OutputPresentation(
             _FINAL[1],
@@ -99,6 +103,13 @@ CALIBRATION_LOGIC_NODE = LogicNodeDeclaration(
     ),
     build_request=build_calibration_task_intent_from_authoring,
     bind_request=bind_no_node_inputs,
+    artifact_outputs=(
+        ArtifactOutputPresentation(
+            CALIBRATION_ARTIFACT_OUTPUT_DECLARATION,
+            "calibration",
+            "FINAL Calibration artifact",
+        ),
+    ),
     default_views=(
         DefaultOutputView(_LIVE_REFERENCE.name, "2d"),
         DefaultOutputView(_FINAL[0].name, "sites"),

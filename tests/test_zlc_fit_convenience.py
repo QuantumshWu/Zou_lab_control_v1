@@ -23,7 +23,7 @@ from zlc_data import (
     AxisLayout,
     AxisSpec,
     BlockId,
-    ComponentValidity,
+    DatasetComponentValidity,
     CoordinateFrameId,
     DataBlock,
     DatasetRevision,
@@ -97,11 +97,16 @@ def _schema(
     point_axes: tuple[AxisSpec, ...] = (),
     data_axes: tuple[AxisSpec, ...] = (),
 ) -> DatasetSchema:
+    cell_schema = (
+        ValueSchema(data_axes, ValidityContract.value(), np.dtype("<f8"), "count")
+        if data_axes
+        else ValueSchema.scalar(np.dtype("<f8"), "count")
+    )
     return DatasetSchema(
         _axis("repeat", REPEAT, repeat),
         point_axes,
         PointLayout.rect_c(tuple(axis.size for axis in point_axes)),
-        ValueSchema(data_axes, ValidityContract.value(), np.dtype("<f8"), "count"),
+        cell_schema,
     )
 
 
@@ -215,7 +220,7 @@ def test_arbitrary_multidimensional_data_axes_remain_named_batches(
         BlockId("fit-many-data-axes"),
         DatasetRevision(1),
         values,
-        ComponentValidity(
+        DatasetComponentValidity(
             tuple(axis.axis_id for axis in data_axes),
             validity,
         ),
@@ -319,7 +324,7 @@ def test_role_driven_selection_rejects_semantic_ambiguity_and_incomplete_axes():
             "radial_gaussian_center",
             fit_axis_ids=(x.axis_id,),
         )
-    with pytest.raises(ValueError, match="cover the effective schema"):
+    with pytest.raises(ValueError, match="cover every information axis exactly"):
         fit_spec_for(
             image,
             "radial_gaussian_center",
@@ -345,7 +350,7 @@ def _gaussian_snapshot() -> OwnedSnapshot:
     block = DataBlock(
         BlockId("fit-binding-source"),
         DatasetRevision(2),
-        np.tile(curve, (2, 1)),
+        np.tile(curve, (2, 1))[..., np.newaxis],
         VALID,
         schema,
     )

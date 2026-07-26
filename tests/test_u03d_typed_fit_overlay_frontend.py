@@ -18,7 +18,7 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     BlockId,
-    ComponentValidity,
+    DatasetComponentValidity,
     CoordinateFrameId,
     DataBlock,
     DataTransformSpec,
@@ -109,7 +109,7 @@ def _curve_fixture(
         BlockId("u03d-curve"),
         DatasetRevision(7),
         values,
-        ComponentValidity((component.axis_id,), validity),
+        DatasetComponentValidity((component.axis_id,), validity),
         schema,
     )
     snapshot = OwnedSnapshot(
@@ -202,7 +202,7 @@ def _radial_fixture(*, committed_box: bool = False):
         BlockId("u03d-image"),
         DatasetRevision(2),
         values,
-        ComponentValidity((y_axis.axis_id, x_axis.axis_id), validity),
+        DatasetComponentValidity((y_axis.axis_id, x_axis.axis_id), validity),
         schema,
     )
     snapshot = OwnedSnapshot(
@@ -486,7 +486,7 @@ def test_transient_selector_fit_stays_on_cached_full_view_and_only_draws_roi():
 
 
 def test_curve_overlay_materialization_checks_cancel_between_batches(monkeypatch):
-    import zlc_workbench.data_figure.render_lane as figure_module
+    import zlc_frontend.data_figure_render as figure_module
 
     base, result = _curve_fixture(committed_range=(6, 25))
     state = CurveDisplayState()
@@ -501,15 +501,20 @@ def test_curve_overlay_materialization_checks_cancel_between_batches(monkeypatch
         return prediction
 
     monkeypatch.setattr(type(result), "evaluate_batch", traced)
+
+    def check_cancelled():
+        if cancelled.is_set():
+            raise CancelledError()
+
     with pytest.raises(CancelledError):
-        figure_module._render_typed_front(
+        figure_module.render_data_figure_front(
             base,
             state,
             current_value_limits=None,
             previous_relim_mode=None,
             previous_count_scale=None,
             sequence=1,
-            cancelled=cancelled,
+            check_cancelled=check_cancelled,
             fit_result=result,
             fit_result_identity="cancel:1",
         )

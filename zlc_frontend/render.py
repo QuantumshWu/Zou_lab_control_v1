@@ -11,9 +11,7 @@ bytes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 import math
-from typing import Protocol, runtime_checkable
 
 import numpy as np
 
@@ -74,14 +72,6 @@ def detached_render_fault(error: BaseException) -> RuntimeError:
     """Return string-only diagnostics without retaining a failed render stack."""
 
     return RuntimeError(f"{type(error).__name__}: {error}")
-
-
-class RenderSurface(Enum):
-    """The three deliberately supported rendering ownership modes."""
-
-    GUI_ARTIST = "gui-artist"
-    WORKER_RASTER_LIVE = "worker-raster-live"
-    WORKER_HEADLESS_EXPORT = "worker-headless-export"
 
 
 @dataclass(frozen=True)
@@ -1302,18 +1292,8 @@ class BoardFrame:
         object.__setattr__(self, "panels", panels)
 
 
-@runtime_checkable
-class BoardPresenter(Protocol):
-    """GUI-side sink; one call atomically installs one complete board frame."""
-
-    def present(self, frame: BoardFrame) -> None: ...
-
-    def clear(self) -> None: ...
-
-
 __all__ = [
     "BoardFrame",
-    "BoardPresenter",
     "CoherenceStamp",
     "CurveFitOverlay",
     "CurvePanelPayload",
@@ -1332,6 +1312,5 @@ __all__ = [
     "SiteMapPanelPayload",
     "PulsePanelPayload",
     "RasterBuffer",
-    "RenderSurface",
     "SITE_MAP_JOIN_SCHEMA_DIGEST",
 ]

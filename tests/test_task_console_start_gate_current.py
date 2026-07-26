@@ -21,7 +21,7 @@ def test_stop_during_prepare_never_calls_the_hardware_starter() -> None:
         name="Pulse scan",
         title="Pulse scan",
         kind="measurement",
-        declared_outputs=(),
+        artifact_outputs=(),
         build_request=lambda values: build_calls.append(dict(values)),
         outputs_for=lambda request: (),
     )

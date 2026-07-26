@@ -5,7 +5,10 @@ from __future__ import annotations
 from zlc_neutral_atom.logic_nodes.pulse_scan.application import PreparedExactScan
 from zlc_neutral_atom.logic_nodes.pulse_scan.declaration import PULSE_SCAN_LOGIC_NODE
 from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import PulseScanBoundRequest
-from zlc_workbench.task_console.capability import ConsoleCapabilityAttachment
+from zlc_workbench.task_console.capability import (
+    ConsoleCapabilityAttachment,
+    ConsoleSignalEventSourceProvider,
+)
 from zlc_workbench.task_console.declaration_projection import project_declaration_spec
 from zlc_workbench.task_console.run_bridge import ConsoleRunNode
 
@@ -46,7 +49,7 @@ def pulse_scan_task_console_adapter(*, prepare, read_pulse_template):
             raise TypeError("PulseScan owner returned another bound request type")
         source_input = resolved.only_dataset()
         source_node = source_input.producer.run_node
-        if source_node is None:
+        if not isinstance(source_node, ConsoleSignalEventSourceProvider):
             raise ValueError("PulseScan source must be a running Logic node")
 
         def prepare_scan(current):
@@ -56,7 +59,7 @@ def pulse_scan_task_console_adapter(*, prepare, read_pulse_template):
                 raise RuntimeError(
                     "start the selected signal producer before PulseScan"
                 )
-            return prepare(current, source_node)
+            return prepare(current, source_node.signal_event_source())
 
         node = ConsoleRunNode(
             spec,

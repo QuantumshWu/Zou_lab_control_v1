@@ -16,20 +16,18 @@ from zlc_frontend.qt_widgets import (
     FluentTabWidget,
     GREY,
     FrozenRasterView,
-    QtOwnerWake,
 )
 from zlc_storage import canonical_text
 
 from .window_runtime import (
-    RASTER_WORK_EXECUTOR,
+    SerialWorkerWindow,
     error_summary,
     load_raster_bundle,
     open_workbench_window,
-    release_window,
 )
 
 
-class FrozenRasterWindow(QtWidgets.QWidget):
+class FrozenRasterWindow(SerialWorkerWindow):
     """Present one atomic set of immutable PNG pages on the Qt owner thread."""
 
     def __init__(
@@ -42,25 +40,18 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         object_prefix: str,
         subject: str,
         executor: Executor | None = None,
+        worker_release: Callable[[], object] | None = None,
     ) -> None:
-        super().__init__()
+        super().__init__(executor=executor, worker_release=worker_release)
         if loader is not None and not callable(loader):
             raise TypeError("loader must be callable or None")
-        if executor is not None and not isinstance(executor, Executor):
-            raise TypeError("executor must implement concurrent.futures.Executor")
-        self._executor = RASTER_WORK_EXECUTOR if executor is None else executor
         self._prefix = canonical_text(object_prefix, "object_prefix")
         self._subject = canonical_text(subject, "subject").upper()
-        self._future: Future[EncodedRasterDocument] | None = None
-        self._cancelled = threading.Event()
         self._bundle: EncodedRasterDocument | None = None
         self._boards: tuple[FrozenRasterView, ...] = ()
         self._tab_hosts: tuple[
             tuple[FrozenRasterView, QtWidgets.QWidget], ...
         ] = ()
-        self._closing = False
-        self._closed = False
-        self._allow_close = False
 
         self.setWindowTitle(canonical_text(window_title, "window_title"))
         self._mode = FluentLabel(canonical_text(mode_text, "mode_text"), self)
@@ -101,8 +92,6 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         self._layout.addWidget(self._diagnostic)
         self._layout.addLayout(controls)
 
-        self._wake = QtOwnerWake(self)
-        self._wake.bind(self._owner_cycle)
         self._close_button.clicked.connect(self.shutdown)
         if loader is not None:
             self._submit_future(
@@ -111,32 +100,19 @@ class FrozenRasterWindow(QtWidgets.QWidget):
                 self._cancelled,
             )
 
-    def _submit_future(self, function, *args) -> bool:
-        if self._future is not None:
-            raise RuntimeError("frozen raster window already has active work")
-        try:
-            future = self._executor.submit(function, *args)
-        except BaseException as error:
-            self._status.setText(f"{self._subject} FAILED")
-            self._diagnostic.setText(error_summary(error))
-            return False
-        self._future = future
-        future.add_done_callback(lambda _done: self._wake.request_owner_wake())
-        return True
-
-    @property
-    def worker_idle(self) -> bool:
-        return self._future is None
-
     @property
     def raster_ready(self) -> bool:
         return self._bundle is not None and bool(self._boards) and all(
             board.has_front for board in self._boards
         )
 
-    @property
-    def closed(self) -> bool:
-        return self._closed
+    def _worker_submit_failed(self, error: BaseException) -> None:
+        self._status.setText(f"{self._subject} FAILED")
+        self._diagnostic.setText(error_summary(error))
+
+    def _worker_release_failed(self, error: BaseException) -> None:
+        self._status.setText("CLOSE FAILED")
+        self._diagnostic.setText(error_summary(error))
 
     def _build_boards(self, bundle: EncodedRasterDocument) -> tuple[FrozenRasterView, ...]:
         self._retire_tab_pages()
@@ -235,14 +211,6 @@ class FrozenRasterWindow(QtWidgets.QWidget):
             if not self._closing:
                 self._present_bundle(bundle)
 
-    @QtCore.pyqtSlot()
-    def _owner_cycle(self) -> None:
-        future = self._future
-        if future is not None and future.done():
-            self._future = None
-            self._accept_finished_future(future)
-        self._finish_close_if_ready()
-
     def _clear_bundle(self) -> None:
         self._bundle = None
         for board in self._boards:
@@ -250,34 +218,10 @@ class FrozenRasterWindow(QtWidgets.QWidget):
         self._boards = ()
         self._tab_hosts = ()
 
-    def shutdown(self) -> None:
-        if self._closing or self._closed:
-            return
-        self._closing = True
-        self._cancelled.set()
+    def _before_worker_shutdown(self) -> None:
         self._status.setText("CLOSING")
         self._close_button.setEnabled(False)
         self._clear_bundle()
-        future = self._future
-        if future is not None:
-            future.cancel()
-        self._finish_close_if_ready()
-
-    def _finish_close_if_ready(self) -> None:
-        if not self._closing or self._future is not None or self._closed:
-            return
-        self._wake.detach()
-        self._closed = True
-        self._allow_close = True
-        QtCore.QTimer.singleShot(0, self.close)
-
-    def closeEvent(self, event) -> None:
-        if self._allow_close:
-            release_window(self)
-            event.accept()
-            return
-        event.ignore()
-        self.shutdown()
 
 
 def open_frozen_raster_window(

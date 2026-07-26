@@ -25,7 +25,6 @@ from .mot_field import (
     mot_field_final_outputs,
     mot_field_source_identity,
     mot_intensity_schema,
-    mot_roi_intensity,
     refine_mot_optimum,
 )
 from .mot_field_live import (
@@ -33,7 +32,6 @@ from .mot_field_live import (
     MotFieldLiveProjection,
 )
 from .application import (
-    MotFieldAcquisitionHandle,
     PreparedMotFieldAcquisition,
     prepare_mot_field_acquisition,
 )
@@ -42,7 +40,6 @@ from .mot_field_task import (
     DEFAULT_MOT_FIELD_REPORT_FOLDER,
     MOT_FIELD_LOGIC_NODE,
     MotFieldTaskDependencies,
-    MotFieldTaskHandle,
     MotFieldTaskIntent,
     PreparedMotFieldTask,
     build_mot_field_intent_from_authoring,
@@ -71,14 +68,12 @@ __all__ = [
     "MOT_FIELD_TASK_DEFINITION",
     "MOT_FIELD_TASK_KEY",
     "MOT_SCAN_PARAMETER_IDS",
-    "MotFieldAcquisitionHandle",
     "MotFieldAcquisitionResult",
     "MotFieldLiveProjection",
     "MotFieldRequest",
     "MotFieldResult",
     "MotFieldProgram",
     "MotFieldTaskDependencies",
-    "MotFieldTaskHandle",
     "MotFieldTaskIntent",
     "MotFieldTaskLiveOutput",
     "MotRoiProjector",
@@ -94,7 +89,6 @@ __all__ = [
     "mot_field_final_outputs",
     "mot_field_source_identity",
     "mot_intensity_schema",
-    "mot_roi_intensity",
     "prepare_mot_field_task",
     "prepare_mot_field_acquisition",
     "refine_mot_optimum",

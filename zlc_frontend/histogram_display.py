@@ -32,6 +32,14 @@ from .display_range import (
     validated_display_range,
 )
 from .form import FormChoice, FormFieldProps, FormSpec
+from .numeric_viewport import (
+    data_x_to_normalized_widget,
+    normalized_plot_bounds,
+    normalized_plot_contains,
+    normalized_widget_x_to_data,
+    panned_x_limits as _panned_x_limits,
+    zoomed_x_limits as _zoomed_x_limits,
+)
 
 
 DEFAULT_HISTOGRAM_BINS = 60
@@ -491,18 +499,6 @@ def histogram_display_with_thresholds(
     return replace(candidate, revision=base.revision + 1)
 
 
-def _normalized_plot_bounds(value: object) -> tuple[float, float, float, float]:
-    if not isinstance(value, tuple) or len(value) != 4:
-        raise TypeError("plot_bounds must be (left, top, right, bottom)")
-    left, top, right, bottom = (
-        finite_real(item, f"plot_bounds[{index}]")
-        for index, item in enumerate(value)
-    )
-    if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
-        raise ValueError("plot_bounds must be a nonempty top-origin unit rectangle")
-    return left, top, right, bottom
-
-
 @dataclass(frozen=True, slots=True)
 class HistogramViewportTransform:
     """Exact draw-frozen mapping for one interactive histogram raster."""
@@ -529,7 +525,7 @@ class HistogramViewportTransform:
         object.__setattr__(
             self,
             "plot_bounds",
-            _normalized_plot_bounds(self.plot_bounds),
+            normalized_plot_bounds(self.plot_bounds),
         )
         if not isinstance(self.count_scale, HistogramCountScale):
             raise TypeError("count_scale must be HistogramCountScale")
@@ -561,10 +557,7 @@ class HistogramViewportTransform:
             raise ValueError("automatic histogram x limits must equal the home range")
 
     def contains_widget_normalized(self, x: object, y: object) -> bool:
-        x = finite_real(x, "widget x")
-        y = finite_real(y, "widget y")
-        left, top, right, bottom = self.plot_bounds
-        return left <= x <= right and top <= y <= bottom
+        return normalized_plot_contains(self.plot_bounds, x, y)
 
     def widget_normalized_to_data(
         self,
@@ -580,9 +573,7 @@ class HistogramViewportTransform:
         if require_inside and not self.contains_widget_normalized(x, y):
             raise ValueError("widget point lies outside the histogram plot")
         left, top, right, bottom = self.plot_bounds
-        x_fraction = (x - left) / (right - left)
         count_fraction = (y - top) / (bottom - top)
-        x_low, x_high = self.x_limits
         count_low, count_high = self.count_limits
         if self.count_scale is HistogramCountScale.LOG:
             log_low = math.log(count_low)
@@ -590,7 +581,7 @@ class HistogramViewportTransform:
             count = math.exp(log_high - count_fraction * (log_high - log_low))
         else:
             count = count_high - count_fraction * (count_high - count_low)
-        return x_low + x_fraction * (x_high - x_low), count
+        return normalized_widget_x_to_data(self.plot_bounds, self.x_limits, x), count
 
     def data_to_widget_normalized(
         self,
@@ -600,7 +591,6 @@ class HistogramViewportTransform:
         x = finite_real(x, "data x")
         count = finite_real(count, "data count")
         left, top, right, bottom = self.plot_bounds
-        x_low, x_high = self.x_limits
         count_low, count_high = self.count_limits
         if self.count_scale is HistogramCountScale.LOG:
             if count <= 0.0:
@@ -611,23 +601,12 @@ class HistogramViewportTransform:
         else:
             count_fraction = (count_high - count) / (count_high - count_low)
         return (
-            left + (x - x_low) / (x_high - x_low) * (right - left),
+            data_x_to_normalized_widget(self.plot_bounds, self.x_limits, x),
             top + count_fraction * (bottom - top),
         )
 
     def zoomed_x_limits(self, anchor_x: object, factor: object) -> DisplayRange:
-        anchor = finite_real(anchor_x, "zoom anchor x")
-        factor = finite_real(factor, "zoom factor")
-        if factor <= 0.0:
-            raise ValueError("zoom factor must be positive")
-        low, high = self.x_limits
-        return validated_display_range(
-            (
-                anchor + (low - anchor) * factor,
-                anchor + (high - anchor) * factor,
-            ),
-            "zoomed x limits",
-        )
+        return _zoomed_x_limits(self.x_limits, anchor_x, factor)
 
     def panned_x_limits(
         self,
@@ -636,19 +615,16 @@ class HistogramViewportTransform:
         *,
         start_x_limits: DisplayRange | None = None,
     ) -> DisplayRange:
-        press = finite_real(press_widget_x, "press widget x")
-        current = finite_real(current_widget_x, "current widget x")
         start = (
             self.x_limits
             if start_x_limits is None
             else validated_display_range(start_x_limits, "start_x_limits")
         )
-        left, _top, right, _bottom = self.plot_bounds
-        span = start[1] - start[0]
-        shift = -(current - press) / (right - left) * span
-        return validated_display_range(
-            (start[0] + shift, start[1] + shift),
-            "panned x limits",
+        return _panned_x_limits(
+            self.plot_bounds,
+            start,
+            press_widget_x,
+            current_widget_x,
         )
 
     def selection_x_span(

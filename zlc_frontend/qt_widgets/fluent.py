@@ -1470,7 +1470,7 @@ class _RoundedPopupCard(QtCore.QObject):
             return True
         if et == QtCore.QEvent.Move and self._combo is not None and isinstance(obj, QtWidgets.QWidget):
             geo = obj.geometry()
-            target = self._combo._popup_origin(geo.width(), geo.height())
+            target = self._combo._popup_origin(geo.width())
             if abs(geo.top() - target.y()) > 1 or geo.left() != target.x():
                 obj.move(target)
             return False
@@ -1829,23 +1829,26 @@ class FluentComboBox(QtWidgets.QComboBox):
         available = screen.availableGeometry() if screen is not None else None
         return int(min(width, available.width()) if available is not None else width)
 
-    def _popup_vertical_space(self) -> tuple[int, int, QtCore.QRect | None]:
-        """Return usable space below/above the field on its active screen."""
+    def _popup_space_below(self) -> tuple[int, QtCore.QRect | None]:
+        """Return usable space below the field on its active screen.
+
+        Fluent combo popups have one spatial contract: the field remains the
+        visible anchor and overflow is handled by the view's native scrollbar.
+        Qt's default "pick the roomier side" policy is deliberately not part of
+        that contract because it makes a list jump above the control near the
+        bottom of a screen.
+        """
 
         screen = self.screen() if hasattr(self, "screen") else None
         available = screen.availableGeometry() if screen is not None else None
         if available is None:
-            return (QtWidgets.QWIDGETSIZE_MAX, 0, None)
-        top = self.mapToGlobal(QtCore.QPoint(0, 0)).y()
+            return (QtWidgets.QWIDGETSIZE_MAX, None)
         bottom = self.mapToGlobal(QtCore.QPoint(0, self.height())).y()
         below_top = max(available.top(), bottom + self._gap)
-        above_bottom = min(available.bottom(), top - self._gap)
         below = max(0, available.bottom() - below_top + 1)
-        above = max(0, above_bottom - available.top() + 1)
-        return below, above, available
+        return below, available
 
-    def _popup_origin(self, popup_width: int, popup_height: int) -> QtCore.QPoint:
-        anchor_top = self.mapToGlobal(QtCore.QPoint(0, 0))
+    def _popup_origin(self, popup_width: int) -> QtCore.QPoint:
         anchor_bottom = self.mapToGlobal(QtCore.QPoint(0, self.height()))
         left = (
             anchor_bottom.x()
@@ -1854,34 +1857,23 @@ class FluentComboBox(QtWidgets.QComboBox):
         )
         screen = self.screen() if hasattr(self, "screen") else None
         available = screen.availableGeometry() if screen is not None else None
-        below, above, _ = self._popup_vertical_space()
-        if popup_height <= below or below >= above:
-            top = anchor_bottom.y() + self._gap
-        else:
-            top = anchor_top.y() - self._gap - popup_height
+        top = anchor_bottom.y() + self._gap
         if available is not None:
             left = max(available.left(), min(left, available.right() - popup_width + 1))
-            top = max(
-                available.top(),
-                min(top, available.bottom() - popup_height + 1),
-            )
         return QtCore.QPoint(int(left), int(top))
 
     def _place_popup(self) -> None:
-        """Place the open drop-down on the side with usable screen space.
+        """Anchor the open drop-down below its field.
 
-        Below is preferred when it fits.  Otherwise the popup moves above; if
-        neither side fits, the larger side gets a scrolling popup.  Wide
-        content still grows left from the field's right edge.  The Move filter
-        reapplies this same target after Qt's deferred native placement.
+        Wide content grows left from the field's right edge; vertical overflow
+        never changes the anchor and is instead consumed by native scrolling.
+        The Move filter reapplies this target after Qt's deferred placement.
         """
         view = self.view()
         container = view.window() if view is not None else None
         if container is None or container is self:
             return
-        container.move(
-            self._popup_origin(container.width(), container.height())
-        )
+        container.move(self._popup_origin(container.width()))
 
     def _popup_pad(self) -> int:
         return 2 * self._gap
@@ -1900,10 +1892,10 @@ class FluentComboBox(QtWidgets.QComboBox):
         if row_h <= 0:
             row_h = view.fontMetrics().height() + scaled_px(8)
         desired = rows * row_h + 2 * view.frameWidth() + self._popup_pad()
-        below, above, available = self._popup_vertical_space()
+        below, available = self._popup_space_below()
         if available is None:
             return int(desired)
-        return int(min(desired, max(below, above)))
+        return int(min(desired, below))
 
     def _resize_popup_to_contents(self, *_) -> None:
         """Apply one content/available-space height contract to list and tree popups."""

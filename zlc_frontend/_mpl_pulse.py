@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gc
 from io import BytesIO
-import math
 import matplotlib
 import numpy as np
 from .curve_display import (
@@ -203,11 +202,12 @@ def _draw_pulse_timeline(
     from matplotlib.ticker import FuncFormatter, MaxNLocator
 
     from .render_style import (
-        DESIGN_DPI, PALETTE, PANEL_DISPLAY_SCALE, PULSE_SCAN_ANNOTATION_COLOR,
+        PALETTE, PULSE_SCAN_ANNOTATION_COLOR,
         PULSE_SCAN_ANNOTATION_FONT_SIZE, PULSE_SCAN_REGION_COLOR, apply_title,
-        panel_axes_bounds, panel_display_size, panel_figure_size_inches,
+        panel_axes_bounds, panel_figure_size_inches,
         smaller_fontsize,
     )
+    from .plot_layout import panel_surface_geometry
 
     # The size PRESET is the one geometry knob: inches come from the frontend's single size source and
     # the raster dpi matches a panel's on-screen scale, so the emitted PNG is exactly the pixel box a
@@ -218,8 +218,12 @@ def _draw_pulse_timeline(
     # renders every on-screen Agg buffer at exactly the widget's device pixels
     # (design dpi x display scale x real screen ratio) so the blit is 1:1
     # crisp, never rendered at logical pixels and stretched up by Qt.
-    ratio = _render_dpi(pixel_ratio)
-    dpi = _render_dpi(DESIGN_DPI * PANEL_DISPLAY_SCALE * ratio)
+    geometry = panel_surface_geometry(
+        size,
+        pixel_ratio=_render_dpi(pixel_ratio),
+        kind="pulse",
+    )
+    dpi = _render_dpi(geometry.dpi)
     if screen_pixel_exact:
         # Qt scales a positive logical extent with qRound semantics (half up),
         # while Matplotlib otherwise rounds each ``figsize * dpi`` edge by its
@@ -228,9 +232,7 @@ def _draw_pulse_timeline(
         # the entire preview and making text/lines look soft.  Freeze the
         # existing logical panel size and make Agg's device raster exactly the
         # physical box Qt will paint.  This changes no layout token or UI size.
-        logical_width, logical_height = panel_display_size(size, kind="pulse")
-        physical_width = max(1, math.floor(logical_width * ratio + 0.5))
-        physical_height = max(1, math.floor(logical_height * ratio + 0.5))
+        physical_width, physical_height = geometry.raster_size
         size_inches = (physical_width / dpi, physical_height / dpi)
     pulses = [dict(row) for row in pulses]
     channels = [str(channel) for channel in channels]

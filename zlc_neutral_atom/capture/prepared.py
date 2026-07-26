@@ -83,7 +83,7 @@ class PreparedExactCapture:
         with self._lock:
             if self._preview_schema is not None:
                 return self._preview_schema
-            schema = self._pipeline.measurement.capture_contract.dataset_schema
+            schema = self._pipeline.capture.capture_contract.dataset_schema
             readout_axes = tuple(
                 axis for axis in schema.point_axes if axis.role == READOUT_EVENT
             )

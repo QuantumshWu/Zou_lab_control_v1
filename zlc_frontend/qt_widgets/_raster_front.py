@@ -21,6 +21,7 @@ from ..render import (
     PanelFrame,
     PanelPresentationIdentity,
     PulsePanelPayload,
+    RasterBuffer,
     SiteMapPanelPayload,
     SourceIdentity,
 )
@@ -50,6 +51,23 @@ def _prepared_qimage(panel_or_raster) -> tuple[bytes, QtGui.QImage]:
     if image.isNull():
         raise RuntimeError("Qt rejected the prepared immutable raster front")
     return raster.pixels, image
+
+
+def owned_qimage_for_raster(raster: RasterBuffer) -> QtGui.QImage:
+    """Return an owned Qt image for one immutable frontend raster.
+
+    Live presentation keeps the raster bytes alive alongside a zero-copy
+    ``QImage``.  File writers instead need an image whose storage outlives the
+    temporary conversion tuple, so this is the one deliberate copying owner.
+    """
+
+    if not isinstance(raster, RasterBuffer):
+        raise TypeError("raster must be RasterBuffer")
+    _owner, image = _prepared_qimage(raster)
+    owned = image.copy()
+    if owned.isNull():
+        raise RuntimeError("Qt could not own the immutable raster front")
+    return owned
 
 
 def _aspect_target_for_source(
@@ -207,6 +225,39 @@ def _panel_presentation(panel: PanelFrame) -> PanelPresentationIdentity:
     return matches[0]
 
 
+def _presentation_answers(
+    origin: PanelInteractionOrigin,
+    panel: PanelFrame,
+    target_revision: int,
+) -> bool:
+    """Whether one frame presentation exactly echoes an authored command.
+
+    A selector edits the immutable input the operator actually saw.  Both that
+    input and the panel/document/selection identity therefore remain exact;
+    only the reserved presentation revision advances.  Live producer updates
+    wait outside this interaction transaction instead of being spliced into it.
+    """
+
+    if not isinstance(origin, PanelInteractionOrigin):
+        raise TypeError("origin must be PanelInteractionOrigin")
+    if not isinstance(panel, PanelFrame):
+        raise TypeError("panel must be PanelFrame")
+    presentation = _panel_presentation(panel)
+    if not isinstance(presentation, PanelPresentationIdentity):
+        raise TypeError("presentation must be PanelPresentationIdentity")
+    return (
+        _payload_input(panel.display_payload) == origin.input_identity
+        and panel.source_identity == origin.source_identity
+        and presentation.panel_id == origin.presentation.panel_id
+        and presentation.document_id == origin.presentation.document_id
+        and presentation.document_revision
+        == origin.presentation.document_revision
+        and presentation.selection_revision
+        == origin.presentation.selection_revision
+        and presentation.panel_revision == target_revision
+    )
+
+
 def _raster_geometry(panel: PanelFrame) -> tuple[int, int]:
     raster = panel.raster
     return raster.width, raster.height
@@ -289,23 +340,6 @@ class _HeldPanelFront:
             self.sequence,
             self.source_identity,
         )
-
-
-def _presented_revision_state(
-    pending_revision: int | None,
-    candidate_revision: int | None,
-    held_revision: int | None,
-) -> tuple[bool, bool]:
-    """Classify one worker answer as final or useful intermediate."""
-
-    if pending_revision is None or candidate_revision is None:
-        return (False, False)
-    if candidate_revision >= pending_revision:
-        return (True, False)
-    return (
-        False,
-        held_revision is not None and candidate_revision > held_revision,
-    )
 
 
 def _advance_held_front(

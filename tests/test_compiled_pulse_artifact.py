@@ -93,7 +93,7 @@ def test_scan_artifact_preserves_each_physical_point_in_trigger_provenance():
         document,
         clock_hz=50e6,
         execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
-        trigger_channels=("ch11",),
+        trigger_channels=("ch06",),
     )
     schedule = artifact.trigger_schedules[0]
     assert schedule.point_count == 3

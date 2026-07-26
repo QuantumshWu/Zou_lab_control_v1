@@ -106,6 +106,47 @@ class SinglePanelHost(QtWidgets.QWidget):
 
         return self._board.front_frame
 
+    @property
+    def has_front(self) -> bool:
+        return self._board.has_front
+
+    @property
+    def selector_fault(self) -> RuntimeError | None:
+        """Return the current single-panel interaction fault, if any."""
+
+        if self._bound_kind == "image":
+            return self._board.image_selector_fault(self._panel_id)
+        if self._bound_kind == "curve":
+            return self._board.curve_selector_fault
+        if self._bound_kind == "histogram":
+            return self._board.histogram_selector_fault
+        if self._bound_kind == "pulse":
+            return self._board.pulse_selector_fault
+        return None
+
+    @property
+    def selectors_enabled(self) -> bool:
+        return self._board.selectors_enabled
+
+    def set_interaction_ready(self, ready: bool) -> None:
+        """Set readiness for this host's one bound gesture family."""
+
+        if not isinstance(ready, bool):
+            raise TypeError("interaction readiness must be bool")
+        self._board.set_interaction_readiness(
+            image=ready and self._bound_kind == "image",
+            curve=ready and self._bound_kind == "curve",
+            histogram=ready and self._bound_kind == "histogram",
+            pulse=ready and self._bound_kind == "pulse",
+        )
+
+    def set_rectangle_candidate(self, normalized_bounds) -> None:
+        """Echo one IMAGE rectangle on the exact single-panel binding."""
+
+        if self._bound_kind != "image":
+            raise RuntimeError("rectangle candidate requires an image binding")
+        self._board.set_image_rectangle_candidate(normalized_bounds)
+
     def set_selectors_enabled(self, on: bool) -> None:
         """The Selectors switch, same semantics as every console card: remember
         the desired state and gate the CURRENT binding now; a binding created
@@ -320,7 +361,6 @@ class SinglePanelHost(QtWidgets.QWidget):
         panel = PanelFrame(
             self._panel_id, self._group, source, stamp, raster, payload)
         self._sequence += 1
-        self._retire_incompatible_binding(payload)
         self.present_frame(
             BoardFrame(f"{self._group}-board", 0, self._sequence, (panel,)),
             logical_size=logical,
@@ -336,6 +376,14 @@ class SinglePanelHost(QtWidgets.QWidget):
         TaskConsole panels call it when their ``PanelConfig.size`` changes.
         """
 
+        width, height = self._validated_logical_size(logical_size)
+        self._board.setFixedSize(width, height)
+        self.setFixedSize(width, height)
+
+    @staticmethod
+    def _validated_logical_size(
+        logical_size: tuple[int, int],
+    ) -> tuple[int, int]:
         if (
             not isinstance(logical_size, tuple)
             or len(logical_size) != 2
@@ -349,9 +397,7 @@ class SinglePanelHost(QtWidgets.QWidget):
             raise ValueError(
                 "logical_size must be a pair of positive integer pixels"
             )
-        width, height = logical_size
-        self._board.setFixedSize(width, height)
-        self.setFixedSize(width, height)
+        return logical_size
 
     def present_frame(
         self,
@@ -375,15 +421,27 @@ class SinglePanelHost(QtWidgets.QWidget):
                 "SinglePanelHost requires its one configured panel"
             )
         payload = frame.panels[0].display_payload
+        target_kind = self._binding_kind(payload)
+        if logical_size is not None:
+            logical_size = self._validated_logical_size(logical_size)
         geometry_changes = logical_size is not None and (
             self.width(), self.height()
         ) != logical_size
         if geometry_changes:
             self.setUpdatesEnabled(False)
         try:
-            self._retire_incompatible_binding(payload)
-            self._board.present(frame)
-            self._ensure_binding(payload)
+            if self._bound_kind == target_kind:
+                self._board.present(frame)
+            else:
+                self._board.present_with_single_panel_interaction(
+                    frame,
+                    panel_id=self._panel_id,
+                    kind=target_kind,
+                    interaction_callback=self._on_intent,
+                    rectangle_callback=self.rectangleSelected.emit,
+                    selectors_enabled=self._selectors_on,
+                )
+                self._bound_kind = target_kind
             if logical_size is not None:
                 self.set_logical_size(logical_size)
         finally:
@@ -406,58 +464,6 @@ class SinglePanelHost(QtWidgets.QWidget):
         if isinstance(payload, (ImagePanelPayload, SiteMapPanelPayload)):
             return "image"
         return None
-
-    def _retire_incompatible_binding(self, payload) -> None:
-        """Unbind an old gesture family before the new front is validated."""
-
-        if self._bound_kind != self._binding_kind(payload):
-            self._unbind_current_interaction()
-
-    def _ensure_binding(self, payload) -> None:
-        """Bind the gesture family matching the currently presented payload.
-
-        A family change retires only the old interaction binding; the stable
-        host and newly presented raster remain in place.  The new binding is
-        created READY (the panel was just presented, so its provenance is
-        current) and inherits the host's remembered selector switch.
-        """
-
-        target_kind = self._binding_kind(payload)
-        if self._bound_kind == target_kind:
-            return
-        if self._bound_kind is not None:
-            raise RuntimeError("incompatible interaction binding was not retired")
-        if target_kind == "pulse":
-            self._board.bind_pulse_interaction(self._panel_id, self._on_intent)
-            self._bound_kind = "pulse"
-        elif target_kind == "curve":
-            self._board.bind_curve_interaction(self._panel_id, self._on_intent)
-            self._bound_kind = "curve"
-        elif target_kind == "histogram":
-            self._board.bind_histogram_interaction(
-                self._panel_id, self._on_intent)
-            self._bound_kind = "histogram"
-        elif target_kind == "image":
-            # The image family separates the operator's switch from readiness:
-            # bind unarmed, then declare the just-presented provenance current
-            # (the host's one source IS the frame the caller handed over).
-            image_payload = (
-                payload.background
-                if isinstance(payload, SiteMapPanelPayload)
-                else payload
-            )
-            self._board.bind_rectangle_selector(
-                self._panel_id,
-                image_payload.viewport,
-                self.rectangleSelected.emit,
-                enabled=False,
-                interaction_callback=self._on_intent,
-            )
-            self._board.set_interaction_readiness(
-                image=True, curve=False, histogram=False, pulse=False)
-            self._bound_kind = "image"
-        if self._bound_kind is not None:
-            self._board.set_selectors_enabled(self._selectors_on)
 
     def _echo_range_candidate(self, x_span) -> None:
         if self._bound_kind == "pulse":

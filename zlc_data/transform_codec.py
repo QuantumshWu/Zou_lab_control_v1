@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from zlc_storage.canonical import (
+    encode as _encode,
     exact_mapping as _exact_map,
 )
 
@@ -103,7 +104,10 @@ def data_transform_spec_from_tree(tree: Any) -> DataTransformSpec:
             )
         else:
             raise ValueError(f"invalid transform operation kind {raw['kind']!r}")
-    return DataTransformSpec(tuple(operations))
+    spec = DataTransformSpec(tuple(operations))
+    if _encode(data_transform_spec_to_tree(spec)) != _encode(tree):
+        raise ValueError("DataTransformSpec tree is typed but non-canonical")
+    return spec
 
 
 def committed_transform_to_tree(transform: CommittedTransform) -> dict[str, Any]:
@@ -128,11 +132,14 @@ def committed_transform_from_tree(tree: Any) -> CommittedTransform:
         },
         COMMITTED_TRANSFORM_SCHEMA,
     )
-    return CommittedTransform(
+    transform = CommittedTransform(
         data["input_schema_fingerprint"],
         data_transform_spec_from_tree(data["spec"]),
         data["output_schema_fingerprint"],
     )
+    if _encode(committed_transform_to_tree(transform)) != _encode(tree):
+        raise ValueError("CommittedTransform tree is typed but non-canonical")
+    return transform
 
 
 __all__ = [

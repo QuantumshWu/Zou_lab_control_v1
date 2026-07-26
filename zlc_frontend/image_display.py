@@ -150,6 +150,32 @@ def resolve_image_color_limits(
     ):
         raise TypeError("previous_relim_mode must be RelimMode or None")
     data_range = evaluated_image_data_range((image,))
+    return resolve_image_color_limits_from_range(
+        data_range,
+        state,
+        current_color_limits=current_color_limits,
+        previous_relim_mode=previous_relim_mode,
+    )
+
+
+def resolve_image_color_limits_from_range(
+    data_range: tuple[float, float] | None,
+    state: ImageDisplayState,
+    *,
+    current_color_limits: DisplayRange | None,
+    previous_relim_mode: RelimMode | None,
+) -> tuple[tuple[float, float] | None, tuple[float, float]]:
+    """Resolve authored clim from an already-owned exact image range."""
+
+    if data_range is not None:
+        data_range = validated_display_range(data_range, "image data_range")
+    if not isinstance(state, ImageDisplayState):
+        raise TypeError("state must be ImageDisplayState")
+    if previous_relim_mode is not None and not isinstance(
+        previous_relim_mode,
+        RelimMode,
+    ):
+        raise TypeError("previous_relim_mode must be RelimMode or None")
     if data_range is None:
         if (
             state.relim_mode is RelimMode.FIXED
@@ -371,4 +397,5 @@ __all__ = [
     "image_display_from_form",
     "image_viewport_for_display_state",
     "resolve_image_color_limits",
+    "resolve_image_color_limits_from_range",
 ]

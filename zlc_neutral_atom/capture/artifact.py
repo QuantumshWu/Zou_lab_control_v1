@@ -23,6 +23,7 @@ from zlc_storage import (
     sha256_digest,
 )
 from zlc_data import OwnedSnapshot
+from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 
 from zlc_neutral_atom.devices.camera.contract import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
@@ -74,7 +75,10 @@ from .pipeline import (
     PipelineResult,
     compile_pipeline,
 )
-from zlc_neutral_atom.runtime.preview import notify_preview_failure
+from zlc_neutral_atom.runtime.preview import (
+    ExactDatasetPreviewPort,
+    notify_preview_failure,
+)
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.run import PostSafetyContext, RunContext, RunPlan
 from .triggered import (
@@ -705,6 +709,34 @@ class CaptureRepository:
             abort_check=abort_check,
         )
 
+    def project_dataset_source(
+        self,
+        reference: CaptureArtifactRef,
+        *,
+        materialize: bool,
+        abort_check: Callable[[], None] | None = None,
+    ) -> ArtifactDatasetSource:
+        """Project this capture's exact Dataset without leaking storage fields."""
+
+        if type(materialize) is not bool:
+            raise TypeError("materialize must be bool")
+        if materialize:
+            snapshot = self.materialize_final(
+                reference,
+                abort_check=abort_check,
+            )
+            return ArtifactDatasetSource(
+                snapshot.block.schema,
+                snapshot.ref,
+                snapshot,
+            )
+        admitted = self.admit(reference, abort_check=abort_check)
+        artifact = admitted.artifact
+        return ArtifactDatasetSource(
+            artifact.frame_source.schema,
+            artifact.frame_source.ref(artifact.provenance.generation),
+        )
+
     def _final_commit(
         self,
         context: PostSafetyContext,
@@ -913,6 +945,43 @@ class CaptureRepository:
             raise ValueError("CaptureArtifactRef belongs to another repository")
 
 
+class PendingCaptureArtifact:
+    """Exact capture plus private repository admission awaiting FINAL commit.
+
+    A domain Task may inspect ``pipeline_result`` for deterministic validation
+    before FINAL.  Repository lifetime and staged pulse content remain owned by
+    this capture-artifact boundary.
+    """
+
+    __slots__ = ("_pipeline_result", "_repository_borrow", "_compiled_pulse_ref")
+
+    def __init_subclass__(cls, **_kwargs) -> None:
+        raise TypeError("PendingCaptureArtifact is final and cannot be subclassed")
+
+    def __init__(
+        self,
+        pipeline_result: PipelineResult | TriggeredPipelineResult,
+        repository_borrow: RepositoryRootLeaseBorrow,
+        compiled_pulse_ref: ContentRef | None,
+    ) -> None:
+        if not isinstance(pipeline_result, (PipelineResult, TriggeredPipelineResult)):
+            raise TypeError("pipeline_result must be an exact capture result")
+        if not isinstance(repository_borrow, RepositoryRootLeaseBorrow):
+            raise TypeError("repository_borrow must be RepositoryRootLeaseBorrow")
+        if compiled_pulse_ref is not None and not isinstance(compiled_pulse_ref, ContentRef):
+            raise TypeError("compiled_pulse_ref must be ContentRef or None")
+        object.__setattr__(self, "_pipeline_result", pipeline_result)
+        object.__setattr__(self, "_repository_borrow", repository_borrow)
+        object.__setattr__(self, "_compiled_pulse_ref", compiled_pulse_ref)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("PendingCaptureArtifact is immutable")
+
+    @property
+    def pipeline_result(self) -> PipelineResult | TriggeredPipelineResult:
+        return self._pipeline_result
+
+
 def _stage_compiled_pulse(
     spec: MinimalPipelineSpec | TriggeredCaptureSpec,
     repository: CaptureRepository,
@@ -935,6 +1004,7 @@ def compile_capture_artifact_pipeline(
     repository: CaptureRepository,
     *,
     preview: CapturePreviewPort | None = None,
+    exact_preview: ExactDatasetPreviewPort | None = None,
 ) -> RunPlan:
     """Add one post-safety CaptureArtifact commit to the exact pipeline."""
 
@@ -944,12 +1014,19 @@ def compile_capture_artifact_pipeline(
         capture_spec = spec.capture if isinstance(spec, TriggeredCaptureSpec) else spec
         if not isinstance(capture_spec, MinimalPipelineSpec):
             raise TypeError("capture artifact pipeline requires MinimalPipelineSpec")
+        if exact_preview is not None and not isinstance(spec, TriggeredCaptureSpec):
+            raise ValueError("exact dataset preview requires a triggered capture")
         repository._require_active()
     except BaseException as error:
         notify_preview_failure(preview, error)
+        notify_preview_failure(exact_preview, error)
         raise
     base = (
-        compile_triggered_pipeline(spec, preview=preview)
+        compile_triggered_pipeline(
+            spec,
+            preview=preview,
+            exact_preview=exact_preview,
+        )
         if isinstance(spec, TriggeredCaptureSpec)
         else compile_pipeline(spec, preview=preview)
     )
@@ -997,14 +1074,14 @@ def compile_capture_artifact_pipeline(
     def execute(
         context: RunContext,
         prepared: tuple[object, RepositoryRootLeaseBorrow, ContentRef | None],
-    ) -> tuple[
-        PipelineResult | TriggeredPipelineResult,
-        RepositoryRootLeaseBorrow,
-        ContentRef | None,
-    ]:
+    ) -> PendingCaptureArtifact:
         base_prepared, borrow, pulse_ref = prepared
         borrow.require_active()
-        return base_execute(context, base_prepared), borrow, pulse_ref
+        return PendingCaptureArtifact(
+            base_execute(context, base_prepared),
+            borrow,
+            pulse_ref,
+        )
 
     def cleanup(
         context: RunContext,
@@ -1025,13 +1102,13 @@ def compile_capture_artifact_pipeline(
 
     def finalize(
         context: PostSafetyContext,
-        result: tuple[
-            PipelineResult | TriggeredPipelineResult,
-            RepositoryRootLeaseBorrow,
-            ContentRef | None,
-        ],
+        result: PendingCaptureArtifact,
     ) -> CaptureArtifactRef:
-        base_result, borrow, pulse_ref = result
+        if not isinstance(result, PendingCaptureArtifact):
+            raise TypeError("capture finalize requires PendingCaptureArtifact")
+        base_result = result._pipeline_result
+        borrow = result._repository_borrow
+        pulse_ref = result._compiled_pulse_ref
         try:
             borrow.require_active()
             finalized = base_finalize(context, base_result)
@@ -1050,15 +1127,14 @@ def compile_capture_artifact_pipeline(
             borrow.close()
 
     def dispose_unfinalized(
-        result: tuple[
-            PipelineResult | TriggeredPipelineResult,
-            RepositoryRootLeaseBorrow,
-            ContentRef | None,
-        ],
+        result: PendingCaptureArtifact,
     ) -> None:
         """Release the sink hold when RunController skips finalize."""
 
-        base_result, borrow, _pulse_ref = result
+        if not isinstance(result, PendingCaptureArtifact):
+            raise TypeError("capture disposal requires PendingCaptureArtifact")
+        base_result = result._pipeline_result
+        borrow = result._repository_borrow
         error: BaseException | None = None
         if base_dispose_unfinalized is not None:
             try:
@@ -1147,4 +1223,5 @@ __all__ = [
     "CaptureArtifact",
     "CaptureRepository",
     "compile_capture_artifact_pipeline",
+    "PendingCaptureArtifact",
 ]

@@ -8,14 +8,10 @@ from zlc_neutral_atom.input_spec import ArtifactInputSpec
 from zlc_neutral_atom.logic_node_declaration import (
     DynamicChoicePresentation,
     LogicNodeDeclaration,
+    PathPresentationHint,
 )
-from zlc_workbench.form_projection import (
-    DynamicChoiceProjection,
-    PathPresentation,
-    PresentedChoice,
-    project_authoring_form,
-)
-from zlc_workbench.input_binding import ResolvedArtifactInput, project_input_fields
+from zlc_workbench.form_projection import project_authoring_form
+from .input_binding import ResolvedArtifactInput, project_input_fields
 from zlc_workbench.task_console.attachment_builders import (
     processor_attachment,
     run_attachment,
@@ -23,11 +19,7 @@ from zlc_workbench.task_console.attachment_builders import (
 from zlc_workbench.task_console.artifact_resolution import (
     resolve_producer_final_artifact,
 )
-from zlc_workbench.task_console.catalog_bridge import (
-    ConsoleDefaultPanel,
-    ConsoleNodeSpec,
-    ConsoleSignalDecl,
-)
+from zlc_workbench.task_console.catalog_bridge import ConsoleNodeSpec
 
 
 def _artifact_resolver(
@@ -56,7 +48,7 @@ def _artifact_resolver(
 def _dynamic_choice_projection(
     declaration: LogicNodeDeclaration,
     context: object | None,
-) -> dict[str, DynamicChoiceProjection]:
+) -> dict[str, DynamicChoicePresentation]:
     resolver = declaration.resolve_dynamic_choices
     if resolver is None:
         if context is not None:
@@ -75,28 +67,14 @@ def _dynamic_choice_projection(
     )
     if keys != expected:
         raise ValueError("dynamic choice resolver changed its declared field order")
-    return {
-        value.field_key: DynamicChoiceProjection(
-            tuple(
-                PresentedChoice(option.value, option.label)
-                for option in value.choices
-            ),
-            value.default,
-            value.unavailable_reason,
-        )
-        for value in resolved
-    }
+    return {value.field_key: value for value in resolved}
 
 
-def _path_projection(values) -> dict[str, PathPresentation]:
-    return {
-        value.field_key: PathPresentation(
-            mode=value.mode,
-            file_filter=value.file_filter,
-            base_dir=value.base_dir,
-        )
-        for value in values
-    }
+def _path_projection(values) -> dict[str, PathPresentationHint]:
+    hints = tuple(values)
+    if any(not isinstance(value, PathPresentationHint) for value in hints):
+        raise TypeError("path presentation owner returned another value type")
+    return {value.field_key: value for value in hints}
 
 
 def project_declaration_spec(
@@ -126,34 +104,14 @@ def project_declaration_spec(
     )
 
     return ConsoleNodeSpec(
-        definition=declaration.definition,
-        title=declaration.definition.title,
-        description=declaration.description,
+        declaration=declaration,
         form=projected_form,
-        declared_outputs=tuple(
-            ConsoleSignalDecl(
-                output.declaration,
-                output.short,
-                output.axis_label,
-                output.description,
-            )
-            for output in declaration.outputs
-        ),
-        build_request=declaration.build_request,
-        input_specs=declaration.input_specs,
         input_fields=project_input_fields(
             declaration.input_specs,
             path_presentations=_path_projection(
                 declaration.input_path_presentations
             ),
         ),
-        default_panels=tuple(
-            ConsoleDefaultPanel(view.output_name, view.kind, view.params)
-            for view in declaration.default_views
-        ),
-        request_output_declarations=declaration.request_output_declarations,
-        request_output_axis_label=declaration.request_output_axis_label,
-        request_output_description=declaration.request_output_description,
         editor_factory=editor_factory,
     )
 

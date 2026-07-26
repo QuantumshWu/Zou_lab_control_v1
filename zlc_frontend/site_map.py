@@ -13,7 +13,8 @@ from zlc_data import immutable_array
 if TYPE_CHECKING:
     from zlc_data import AxisSpec, CoordinateFrameId, Selection
     from .figure import EvaluatedImage, EvaluatedInput
-    from .figure_outputs import FigureDerivedSignal, FigureOutputSource
+    from .figure_outputs import FigureDerivedSignal
+    from .figure_source import FigureSource
     from .image_view import ImageViewportTransform
 
 
@@ -69,7 +70,7 @@ class SiteMapPresentation(Protocol):
 
     def materialize_area_outputs(
         self,
-        source: "FigureOutputSource",
+        source: "FigureSource",
         selection: "Selection",
     ) -> Mapping[str, "FigureDerivedSignal"]: ...
 

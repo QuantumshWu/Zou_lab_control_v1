@@ -1,4 +1,4 @@
-"""Headless PulseGUI editor state and exact preview orchestration."""
+"""PulseEditor-owned state and exact preview orchestration."""
 
 from __future__ import annotations
 

@@ -33,7 +33,7 @@ from zlc_pulse import (
 from zlc_workbench.pulse_editor.scan_view import PulseScanView
 from zlc_workbench.pulse_editor.schedule_view import PulseScheduleView
 from zlc_workbench.pulse_editor.target_view import PulseTargetView
-from zlc_workbench.pulse import project_pulse_preview
+from zlc_workbench.pulse_editor.session import project_pulse_preview
 
 
 def _target(count: int) -> PulseTarget:

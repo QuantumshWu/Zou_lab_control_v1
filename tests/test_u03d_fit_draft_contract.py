@@ -384,30 +384,24 @@ def test_projection_rejects_reduction_index_drop_and_batch_axis_range():
 
 
 @pytest.mark.parametrize(
-    ("factory", "repeats", "expected_role", "expected_code"),
+    ("factory", "repeats", "expected_role"),
     (
-        (_curve_product, 3, AxisViewRole.BATCH, None),
-        (_curve_product, 33, None, "BATCH_LIMIT"),
-        (_image_product, 2, AxisViewRole.FACET, None),
-        (_image_product, 37, None, "FACET_LIMIT"),
+        (_curve_product, 3, AxisViewRole.BATCH),
+        (_curve_product, 33, AxisViewRole.BATCH),
+        (_image_product, 2, AxisViewRole.FACET),
+        (_image_product, 37, AxisViewRole.FACET),
     ),
 )
-def test_fit_replay_never_samples_repeat_zero_or_latest(
+def test_fit_replay_preserves_every_repeat_without_sampling_or_limits(
     factory,
     repeats,
     expected_role,
-    expected_code,
 ):
     snapshot, _bound, result = factory(repeats)
 
     suggestion = suggest_fit_view(snapshot.block.schema, result)
 
     repeat_id = snapshot.block.schema.repeat_axis.axis_id
-    if expected_code is not None:
-        assert suggestion.status is SuggestionStatus.NEEDS_INPUT
-        assert suggestion.spec is None
-        assert suggestion.reasons[0].code == expected_code
-        return
     assert suggestion.status is SuggestionStatus.RESOLVED
     assert suggestion.spec is not None
     binding = suggestion.spec.binding(repeat_id)

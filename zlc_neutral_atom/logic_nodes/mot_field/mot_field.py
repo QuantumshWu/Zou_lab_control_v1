@@ -482,27 +482,6 @@ class MotRoiProjector:
         return float(np.mean(region[disc_valid]) - background)
 
 
-def mot_roi_intensity(
-    frame: np.ndarray,
-    cx: float,
-    cy: float,
-    radius: float,
-    *,
-    validity: np.ndarray | None = None,
-) -> float:
-    """Mean circular-ROI counts minus the surrounding annulus mean."""
-
-    data = np.asarray(frame)
-    if data.ndim != 2:
-        raise ValueError(
-            f"mot_roi_intensity takes one (H, W) frame; got shape {data.shape}"
-        )
-    return MotRoiProjector(data.shape, cx, cy, radius).intensity(
-        data,
-        validity=validity,
-    )
-
-
 def build_mot_intensity_projector(
     request: MotFieldRequest,
     source_schema: DatasetSchema,
@@ -795,6 +774,5 @@ __all__ = [
     "materialize_mot_field_snapshot",
     "mot_field_final_outputs",
     "mot_field_source_identity",
-    "mot_roi_intensity",
     "refine_mot_optimum",
 ]

@@ -65,7 +65,7 @@ from zlc_pulse import (
     pulse_target_manifest_from_lanes,
     validate_pulse_document_clock_grid,
 )
-from zlc_workbench.pulse import PulseEditorSession, project_pulse_preview
+from zlc_workbench.pulse_editor.session import PulseEditorSession, project_pulse_preview
 from zlc_pulse.authoring import clear_port as clear_document_port
 from zlc_pulse.authoring import clear_pulse_schedule
 from .preview_projection import (

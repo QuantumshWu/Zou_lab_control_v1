@@ -12,8 +12,6 @@ from typing import Any
 
 from zlc_storage import (
     canonical_text as _canonical_text,
-    decode,
-    encode,
     sha256_text as _sha256,
 )
 
@@ -61,43 +59,10 @@ def capture_artifact_ref_from_tree(tree: Any) -> CaptureArtifactRef:
     return value
 
 
-def encode_capture_artifact_ref(value: CaptureArtifactRef) -> bytes:
-    return encode(capture_artifact_ref_to_tree(value))
-
-
-def capture_artifact_input_ref(value: CaptureArtifactRef):
-    """Mint the runtime dependency edge through this reference owner's codec."""
-
-    from zlc_neutral_atom.runtime.streams import ArtifactInputRef
-
-    if not isinstance(value, CaptureArtifactRef):
-        raise TypeError("value must be CaptureArtifactRef")
-    return ArtifactInputRef(
-        CAPTURE_ARTIFACT_REF_SCHEMA,
-        encode_capture_artifact_ref(value),
-        value.manifest_digest,
-    )
-
-
-def decode_capture_artifact_ref(
-    payload: bytes | bytearray | memoryview,
-) -> CaptureArtifactRef:
-    if not isinstance(payload, (bytes, bytearray, memoryview)):
-        raise TypeError("CaptureArtifactRef payload must be bytes-like")
-    raw = bytes(payload)
-    value = capture_artifact_ref_from_tree(decode(raw))
-    if encode_capture_artifact_ref(value) != raw:
-        raise ValueError("CaptureArtifactRef payload is typed but non-canonical")
-    return value
-
-
 __all__ = [
     "CAPTURE_ARTIFACT_REF_SCHEMA",
     "CAPTURE_ARTIFACT_NAMESPACE",
     "CaptureArtifactRef",
     "capture_artifact_ref_from_tree",
-    "capture_artifact_input_ref",
     "capture_artifact_ref_to_tree",
-    "decode_capture_artifact_ref",
-    "encode_capture_artifact_ref",
 ]

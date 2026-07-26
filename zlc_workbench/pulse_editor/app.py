@@ -19,7 +19,7 @@ from zlc_pulse import (
     restrict_pulse_document_to_manifest,
     validate_pulse_document_clock_grid,
 )
-from zlc_workbench.pulse import PulseEditorSession
+from zlc_workbench.pulse_editor.session import PulseEditorSession
 
 from .controller import PulseEditorController, PulseRunFacade
 from .window import launch_pulse_editor_window

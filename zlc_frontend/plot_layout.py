@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from numbers import Real
 
 
 DESIGN_DPI = 300
@@ -88,6 +89,23 @@ class RollingPanelLayout:
     data: NormalizedBox
     history: NormalizedBox
     distribution: NormalizedBox
+
+
+@dataclass(frozen=True, slots=True)
+class PanelSurfaceGeometry:
+    """One named panel's logical box, device raster, and render DPI.
+
+    The named layout is authored in logical pixels.  ``pixel_ratio`` is only
+    the screen device-pixel ratio, so it scales both the immutable raster and
+    the Agg DPI without changing the FigureSpec/Divider geometry.
+    """
+
+    size_name: str
+    kind: str
+    pixel_ratio: float
+    logical_size: tuple[int, int]
+    raster_size: tuple[int, int]
+    dpi: float
 
 
 def square_image_extent(
@@ -179,6 +197,43 @@ def panel_display_size(
     return (
         round(width * DESIGN_DPI * PANEL_DISPLAY_SCALE),
         round(height * DESIGN_DPI * PANEL_DISPLAY_SCALE),
+    )
+
+
+def panel_surface_geometry(
+    size: str = "2x2",
+    *,
+    pixel_ratio: float = 1.0,
+    kind: str = "default",
+) -> PanelSurfaceGeometry:
+    """Resolve the sole live-surface geometry for one named panel."""
+
+    from zlc_frontend.panel_size import panel_size_cells
+
+    if not isinstance(size, str):
+        raise TypeError("panel size must be text")
+    rows, columns = panel_size_cells(size)
+    canonical_size = f"{rows}x{columns}"
+    canonical_kind = str(kind).strip().lower()
+    if canonical_kind not in {"default", "pulse"}:
+        raise ValueError("panel surface kind must be 'default' or 'pulse'")
+    if isinstance(pixel_ratio, bool) or not isinstance(pixel_ratio, Real):
+        raise TypeError("pixel_ratio must be a real number")
+    ratio = float(pixel_ratio)
+    if not math.isfinite(ratio) or ratio <= 0.0:
+        raise ValueError("pixel_ratio must be positive and finite")
+    logical = panel_display_size(canonical_size, kind=canonical_kind)
+    raster = tuple(
+        max(1, int(math.floor(float(component) * ratio + 0.5)))
+        for component in logical
+    )
+    return PanelSurfaceGeometry(
+        canonical_size,
+        canonical_kind,
+        ratio,
+        logical,
+        raster,
+        LIVE_PANEL_DPI * ratio,
     )
 
 
@@ -489,6 +544,7 @@ __all__ = [
     "DESIGN_DPI",
     "ImagePanelLayout",
     "NormalizedBox",
+    "PanelSurfaceGeometry",
     "RollingPanelLayout",
     "PANEL_DISPLAY_SCALE",
     "LIVE_PANEL_DPI",
@@ -510,6 +566,7 @@ __all__ = [
     "panel_display_size",
     "panel_figure_size_inches",
     "panel_margins_px",
+    "panel_surface_geometry",
     "rolling_panel_layout",
     "rolling_panel_layout_for_raster",
     "site_grid_geometry",

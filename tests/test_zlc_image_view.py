@@ -113,13 +113,7 @@ def test_coordinate_views_map_pixel_edges_for_ascending_and_descending_axes():
 @pytest.mark.parametrize(
     ("x_view", "y_view", "error", "message"),
     [
-        ((8.999, 25.0), (83.5, 101.5), ValueError, "outside"),
-        ((9.0, 25.001), (83.5, 101.5), ValueError, "outside"),
-        ((9.0, 25.0), (83.499, 101.5), ValueError, "outside"),
-        ((9.0, 25.0), (83.5, 101.501), ValueError, "outside"),
         ((10.0, 10.0), (83.5, 101.5), ValueError, "below high"),
-        ((9.0, 9.5), (83.5, 101.5), ValueError, "at least one raster cell"),
-        ((9.0, 25.0), (90.0, 91.0), ValueError, "at least one raster cell"),
         ([9.0, 25.0], (83.5, 101.5), TypeError, "two-item tuple"),
         ((9.0, float("nan")), (83.5, 101.5), ValueError, "finite"),
     ],
@@ -132,6 +126,39 @@ def test_coordinate_views_fail_closed_for_invalid_or_unrepresentable_ranges(
 ):
     with pytest.raises(error, match=message):
         _viewport().normalized_bounds_for_optional_coordinate_views(x_view, y_view)
+
+
+@pytest.mark.parametrize(
+    ("x_view", "y_view"),
+    [
+        ((8.999, 25.0), (83.5, 101.5)),
+        ((9.0, 25.001), (83.5, 101.5)),
+        ((9.0, 25.0), (83.499, 101.5)),
+        ((9.0, 25.0), (83.5, 101.501)),
+        ((9.0, 9.5), (83.5, 101.5)),
+        ((9.0, 25.0), (90.0, 91.0)),
+    ],
+)
+def test_coordinate_views_preserve_unbounded_and_subcell_physical_ranges(
+    x_view,
+    y_view,
+):
+    viewport = _viewport()
+    bounds = viewport.normalized_bounds_for_optional_coordinate_views(
+        x_view,
+        y_view,
+    )
+    round_trip_x, round_trip_y = (
+        viewport.optional_coordinate_views_for_normalized_bounds(bounds)
+    )
+    if tuple(x_view) == viewport.home_x_limits:
+        assert round_trip_x is None
+    else:
+        assert round_trip_x == pytest.approx(x_view)
+    if tuple(y_view) == viewport.home_y_limits:
+        assert round_trip_y is None
+    else:
+        assert round_trip_y == pytest.approx(y_view)
 
 
 def test_coordinate_views_fail_closed_for_irregular_and_singleton_axes():
@@ -167,11 +194,15 @@ def test_coordinate_views_fail_closed_for_irregular_and_singleton_axes():
         coordinate_frame=frame,
     )
     singleton_viewport = ImageViewportTransform((singleton_x, regular_y))
-    with pytest.raises(ValueError, match="at least two coordinates"):
-        singleton_viewport.normalized_bounds_for_optional_coordinate_views(
-            (41.5, 42.5),
-            (-0.5, 2.5),
-        )
+    bounds = singleton_viewport.normalized_bounds_for_optional_coordinate_views(
+        (41.5, 42.5),
+        (-0.5, 2.5),
+    )
+    x_view, y_view = (
+        singleton_viewport.optional_coordinate_views_for_normalized_bounds(bounds)
+    )
+    assert x_view == pytest.approx((41.5, 42.5))
+    assert y_view is None
 
 
 def test_random_coordinate_view_round_trips_preserve_physical_limits():
@@ -252,7 +283,7 @@ def test_visible_area_drag_intersects_source_in_the_coordinate_owner():
     ) == pytest.approx((0.0, 0.2, 0.25, 0.8))
 
 
-def test_centered_zoom_preserves_anchor_clamps_to_home_and_one_cell():
+def test_centered_zoom_preserves_anchor_and_continuous_unbounded_span():
     viewport = _viewport(width=100, height=80, revision=5)
     anchor = (0.25, 0.75)
     full_anchor = viewport.full_point_for_visible_point(anchor)
@@ -262,20 +293,29 @@ def test_centered_zoom_preserves_anchor_clamps_to_home_and_one_cell():
     assert zoomed.viewport_revision == 6
     assert zoomed.full_point_for_visible_point(anchor) == pytest.approx(full_anchor)
 
-    home = zoomed.centered_zoom(anchor, 100.0)
-    assert home.visible_bounds == (0.0, 0.0, 1.0, 1.0)
-    assert home.viewport_revision == 7
+    expanded = zoomed.centered_zoom(anchor, 100.0)
+    left, top, right, bottom = expanded.visible_bounds
+    assert right - left == pytest.approx(50.0)
+    assert bottom - top == pytest.approx(50.0)
+    assert expanded.full_point_for_visible_point(anchor) == pytest.approx(
+        full_anchor
+    )
+    assert expanded.viewport_revision == 7
 
-    one_cell = viewport.centered_zoom((0.5, 0.5), 1e-12)
-    left, top, right, bottom = one_cell.visible_bounds
-    assert right - left == pytest.approx(1 / 100)
-    assert bottom - top == pytest.approx(1 / 80)
+    home = expanded.home()
+    assert home.x_limits == home.home_x_limits
+    assert home.y_limits == home.home_y_limits
+
+    subcell = viewport.centered_zoom((0.5, 0.5), 1e-12)
+    left, top, right, bottom = subcell.visible_bounds
+    assert 0.0 < right - left < 1 / 100
+    assert 0.0 < bottom - top < 1 / 80
     assert viewport.centered_zoom(anchor, 1.0) is viewport
     with pytest.raises(ValueError, match="positive"):
         viewport.centered_zoom(anchor, 0.0)
 
 
-def test_pan_uses_press_time_pixel_delta_preserves_span_and_clamps():
+def test_pan_uses_press_time_pixel_delta_and_preserves_unbounded_span():
     viewport = _viewport(
         revision=3,
         visible_bounds=(0.25, 0.25, 0.75, 0.75),
@@ -288,10 +328,14 @@ def test_pan_uses_press_time_pixel_delta_preserves_span_and_clamps():
     assert panned.visible_bounds[3] - panned.visible_bounds[1] == pytest.approx(0.5)
     assert viewport.panned_by_pixels((0.0, 0.0), (200, 100)) is viewport
 
-    assert viewport.panned_by_pixels((10_000.0, 10_000.0), (200, 100)).visible_bounds \
-        == pytest.approx((0.0, 0.0, 0.5, 0.5))
-    assert viewport.panned_by_pixels((-10_000.0, -10_000.0), (200, 100)).visible_bounds \
-        == pytest.approx((0.5, 0.5, 1.0, 1.0))
+    assert viewport.panned_by_pixels(
+        (10_000.0, 10_000.0),
+        (200, 100),
+    ).visible_bounds == pytest.approx((-24.75, -49.75, -24.25, -49.25))
+    assert viewport.panned_by_pixels(
+        (-10_000.0, -10_000.0),
+        (200, 100),
+    ).visible_bounds == pytest.approx((25.25, 50.25, 25.75, 50.75))
     explicit = viewport.panned_by_pixels(
         (20.0, -10.0),
         (200, 100),
@@ -306,11 +350,11 @@ def test_pan_uses_press_time_pixel_delta_preserves_span_and_clamps():
         )
 
 
-def test_visible_window_rejects_less_than_one_sample_cell():
-    with pytest.raises(ValueError, match="at least one raster cell"):
-        _viewport(width=8, visible_bounds=(0.0, 0.0, 0.1, 1.0))
-    with pytest.raises(ValueError, match="at least one raster cell"):
-        _viewport(height=6, visible_bounds=(0.0, 0.0, 1.0, 0.1))
+def test_visible_window_preserves_subcell_continuous_ranges():
+    x_subcell = _viewport(width=8, visible_bounds=(0.0, 0.0, 0.1, 1.0))
+    y_subcell = _viewport(height=6, visible_bounds=(0.0, 0.0, 1.0, 0.1))
+    assert x_subcell.visible_bounds == pytest.approx((0.0, 0.0, 0.1, 1.0))
+    assert y_subcell.visible_bounds == pytest.approx((0.0, 0.0, 1.0, 0.1))
 
 
 def test_randomized_full_visible_round_trips_and_sample_cells_are_bounded():

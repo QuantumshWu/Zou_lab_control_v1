@@ -49,7 +49,6 @@ from .calibration import (
 if TYPE_CHECKING:
     from .analysis import (
         AblationPoint,
-        BimodalFit,
         CalibrationReport,
         ModelCalibrationReport,
         PsfFitDiagnostic,
@@ -68,6 +67,7 @@ from zlc_neutral_atom.logic_nodes.readout.physical_context import (
     readout_physical_context_from_tree,
     readout_physical_context_to_tree,
 )
+import zlc_neutral_atom.logic_nodes.readout.bimodal as _bimodal
 
 
 CALIBRATION_ARTIFACT_FORMAT = (
@@ -500,9 +500,8 @@ _BIMODAL_FLOATS = (
 )
 
 
-def _bimodal_to_tree(value: BimodalFit) -> dict[str, Any]:
-    analysis = _analysis_types()
-    if not isinstance(value, analysis.BimodalFit):
+def _bimodal_to_tree(value: _bimodal.BimodalFit) -> dict[str, Any]:
+    if not isinstance(value, _bimodal.BimodalFit):
         raise TypeError("value must be BimodalFit")
     tree = {field: _real(getattr(value, field), field) for field in _BIMODAL_FLOATS}
     tree.update(
@@ -514,15 +513,14 @@ def _bimodal_to_tree(value: BimodalFit) -> dict[str, Any]:
     return tree
 
 
-def _bimodal_from_tree(tree: Any) -> BimodalFit:
-    analysis = _analysis_types()
+def _bimodal_from_tree(tree: Any) -> _bimodal.BimodalFit:
     data = _fields(
         tree,
         set(_BIMODAL_FLOATS) | {"bright_above", "ok"},
         "bimodal fit",
     )
     values = {field: _real(data[field], field) for field in _BIMODAL_FLOATS}
-    return analysis.BimodalFit(
+    return _bimodal.BimodalFit(
         **values,
         bright_above=_bool(data["bright_above"], "bright_above"),
         ok=_bool(data["ok"], "ok"),

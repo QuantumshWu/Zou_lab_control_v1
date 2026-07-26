@@ -23,22 +23,30 @@ from zlc_data import (
     OwnedSnapshot,
     PointLayout,
     StreamGenerationId,
-    ValidityContract,
     ValueSchema,
+    dataset_cell_value,
     dataset_revision_ref_to_tree,
     expand_value_validity,
 )
-from zlc_neutral_atom.devices.camera.contract import (
-    CameraAcquisitionMode,
-    CameraCaptureSpec,
-    CameraSample,
-    freeze_camera_capture_spec,
+from zlc_neutral_atom.capture.binding import (
+    TriggeredCameraLayout,
+    bind_triggered_camera_acquisition,
+)
+from zlc_neutral_atom.capture.coordination import execute_autonomous_single_fire
+from zlc_neutral_atom.capture.pipeline import (
+    ExactCaptureTransaction,
+    MinimalPipelineSpec,
+    open_exact_capture_transaction,
+)
+from zlc_neutral_atom.capture.triggered import (
+    TriggeredCaptureSpec,
+    finalize_triggered_pipeline_result,
 )
 from zlc_neutral_atom.dataset_output import (
     FinalDatasetOutput,
     final_dataset_join_digest,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.analysis import fit_bimodal
+from zlc_neutral_atom.logic_nodes.readout.bimodal import fit_bimodal
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     ReadoutModelKind,
     ResolvedCalibration,
@@ -55,16 +63,8 @@ from zlc_neutral_atom.logic_nodes.readout.duration_fidelity.measurement import (
 )
 from zlc_neutral_atom.devices.camera.capture_port import (
     BoundCapturePort,
-    CameraExposureConfiguredAck,
-    CapturePreparedAck,
-    CaptureStartedAck,
     CaptureTerminalAck,
-    CapturedPayloadAck,
-    CompleteCaptureCommand,
-    ConfigureCameraExposureCommand,
-    PrepareCaptureCommand,
-    ReadCaptureCommand,
-    StartCaptureCommand,
+    configure_camera_exposure,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport, run_cleanup_steps
 from zlc_neutral_atom.runtime.run import PostSafetyContext, RunContext, RunHandle, RunPlan
@@ -74,6 +74,7 @@ from zlc_neutral_atom.devices.sequencer.port import (
     PulseTerminalAck,
 )
 from zlc_storage import canonical_digest, sha256_text
+from zlc_pulse import PulseExecutionForm
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,7 +228,7 @@ def prepare_bound_readout_duration_fidelity(
 class _PreparedReadoutDuration:
     exposure_lease_id: str
     exposure_lease_open: bool = False
-    current_camera_session_id: str | None = None
+    current_capture: ExactCaptureTransaction | None = None
     current_pulse: PulseSession | None = None
 
 
@@ -254,22 +255,16 @@ class PreparedReadoutDurationFidelity:
         return self._start_run(self._plan)
 
 
-def _validate_ack(ack: object, expected_type: type, session_id: str, binding) -> None:
-    if not isinstance(ack, expected_type):
-        raise TypeError(
-            f"camera returned {type(ack).__name__}, expected {expected_type.__name__}"
-        )
-    if ack.session_id != session_id:
-        raise RuntimeError("camera acknowledgement belongs to another session")
-    if ack.binding_instance_id != binding.binding_instance_id:
-        raise RuntimeError("camera acknowledgement belongs to another binding")
+def _point_samples(model, site: int | None, block: DataBlock) -> np.ndarray:
+    """Extract calibrated samples from one exact, fully sealed point capture."""
 
-
-def _point_samples(model, site: int | None, frames: list[CameraSample]) -> np.ndarray:
     samples: list[np.ndarray] = []
     usable_sites = np.asarray(model.usable_sites.mask, dtype=bool)
-    for frame in frames:
-        signals = extract_readout_features(model.feature, frame.image)
+    if block.schema.point_layout.storage_size != 1:
+        raise ValueError("readout-duration point capture must have one point cell")
+    for repeat_index in range(block.schema.repeat_axis.size):
+        frame = dataset_cell_value(block, repeat_index, 0)
+        signals = extract_readout_features(model.feature, frame)
         valid = np.asarray(
             expand_value_validity(signals.validity, signals.schema), dtype=bool
         ) & usable_sites
@@ -279,31 +274,6 @@ def _point_samples(model, site: int | None, frames: list[CameraSample]) -> np.nd
         elif valid[site]:
             samples.append(values[site : site + 1])
     return np.concatenate(samples) if samples else np.empty((0,), dtype=float)
-
-
-def _require_hardware_trigger_spacing(
-    pulse_request,
-    trigger_channel: str,
-    required_interval_seconds: float,
-) -> None:
-    schedules = tuple(
-        value
-        for value in pulse_request.artifact.trigger_schedules
-        if value.channel == trigger_channel
-    )
-    if len(schedules) != 1:
-        raise RuntimeError("frozen point lost its single camera trigger schedule")
-    ticks = schedules[0].ticks_from_run_start
-    clock_hz = pulse_request.artifact.target_ir.clock_hz
-    if any(
-        (following - previous) / clock_hz + 1e-12
-        < required_interval_seconds
-        for previous, following in zip(ticks, ticks[1:])
-    ):
-        raise RuntimeError(
-            "compiled hardware trigger spacing is shorter than the camera "
-            "working-point readback permits"
-        )
 
 
 def _result_snapshot(
@@ -372,8 +342,6 @@ def prepare_readout_duration_fidelity(
     model = calibration.artifact.select_model(bound.request.model_kind)
     pulse_port = bound.pulse_port
     camera_port = bound.camera_port
-    camera_timeout = camera_port.capability.max_blocking_call_seconds
-    camera_device = camera_port.device
 
     def preflight(_context: RunContext) -> _PreparedReadoutDuration:
         return _PreparedReadoutDuration(uuid.uuid4().hex)
@@ -382,7 +350,6 @@ def prepare_readout_duration_fidelity(
         context: RunContext,
         prepared: _PreparedReadoutDuration,
     ) -> ReadoutDurationFidelityResult:
-        device = context.device(camera_device.key)
         applied_durations: list[float] = []
         fidelities: list[float] = []
         valid_cells: list[bool] = []
@@ -396,99 +363,98 @@ def prepare_readout_duration_fidelity(
         ):
             context.checkpoint()
             prepared.exposure_lease_open = True
-            applied = device.execute(
-                ConfigureCameraExposureCommand(
-                    prepared.exposure_lease_id,
-                    requested,
-                    camera_port.capability.settings_fingerprint,
-                )
-            )
-            _validate_ack(
-                applied,
-                CameraExposureConfiguredAck,
+            configured_camera = configure_camera_exposure(
+                context,
+                camera_port,
                 prepared.exposure_lease_id,
-                camera_device,
-            )
-            if not np.isclose(
-                applied.applied_exposure_seconds,
                 requested,
-                rtol=1e-10,
-                atol=1e-12,
+            )
+            applied_exposure = (
+                configured_camera.capability.camera_physical_facts.exposure_seconds
+            )
+            point_binding = bind_triggered_camera_acquisition(
+                pulse_port,
+                configured_camera,
+                pulse_document=pulse_request.document,
+                execution_form=PulseExecutionForm.STATIC_ONCE,
+                trigger_channel=bound.trigger_channel,
+                layout=TriggeredCameraLayout(
+                    repeat_axis=AxisSpec(
+                        AxisId("readout-duration.capture-repeat"),
+                        "capture repeat",
+                        REPEAT,
+                        bound.request.shots,
+                        tuple(range(bound.request.shots)),
+                    ),
+                    ordinal_scan_axis_id=AxisId(
+                        "readout-duration.capture-point"
+                    ),
+                    readout_event_axis_id=AxisId(
+                        "readout-duration.capture-event"
+                    ),
+                    readout_events_per_repeat=1,
+                ),
+            )
+            if (
+                point_binding.pulse_request.artifact.fingerprint
+                != pulse_request.artifact.fingerprint
             ):
                 raise RuntimeError(
-                    "camera exposure readback differs from the frozen API row"
+                    "point capture recompiled a different frozen pulse artifact"
                 )
-            _require_hardware_trigger_spacing(
-                pulse_request,
-                bound.trigger_channel,
-                applied.required_external_trigger_interval_seconds,
+            capture_spec = MinimalPipelineSpec(
+                f"Readout duration point {len(applied_durations)}",
+                point_binding.capture,
+                BlockId(
+                    f"readout-duration-{context.run_id.value}-"
+                    f"{len(applied_durations)}"
+                ),
             )
-
-            capture_session_id = uuid.uuid4().hex
-            prepared.current_camera_session_id = capture_session_id
-            capture_spec = freeze_camera_capture_spec(
-                CameraCaptureSpec(
-                    CameraAcquisitionMode.EXTERNAL_TRIGGERED,
-                    bound.request.shots,
-                    tuple(1 for _ in range(bound.request.shots)),
-                    applied.settings_fingerprint,
-                )
+            triggered_spec = TriggeredCaptureSpec(
+                capture_spec,
+                point_binding.pulse_port,
+                point_binding.pulse_request,
+                point_binding.trigger_channel,
+                point_binding.cell_plan,
             )
-            ack = device.execute(
-                PrepareCaptureCommand(
-                    capture_session_id,
-                    capture_spec.payload,
-                    capture_spec.owner_fingerprint,
-                    capture_spec.digest,
-                    applied.capability_fingerprint,
-                    applied.settings_fingerprint,
-                    bound.request.shots,
-                    camera_timeout,
-                )
+            capture = open_exact_capture_transaction(capture_spec, context)
+            prepared.current_capture = capture
+            pulse = point_binding.pulse_port.open_session(
+                point_binding.pulse_request
             )
-            _validate_ack(ack, CapturePreparedAck, capture_session_id, camera_device)
-            ack = device.execute(StartCaptureCommand(capture_session_id, camera_timeout))
-            _validate_ack(ack, CaptureStartedAck, capture_session_id, camera_device)
-
-            pulse = pulse_port.open_session(pulse_request)
             prepared.current_pulse = pulse
-            pulse.prepare(context)
-            pulse.fire(context)
-            frames: list[CameraSample] = []
-            for _ in range(bound.request.shots):
-                context.checkpoint()
-                read = device.execute(
-                    ReadCaptureCommand(capture_session_id, camera_timeout)
-                )
-                _validate_ack(
-                    read, CapturedPayloadAck, capture_session_id, camera_device
-                )
-                if not isinstance(read.payload, CameraSample):
-                    raise TypeError("readout-duration camera returned another payload")
-                frames.append(read.payload)
-            pulse_terminal = pulse.complete(context)
-            capture_terminal = device.execute(
-                CompleteCaptureCommand(
-                    capture_session_id,
-                    bound.request.shots,
-                    camera_timeout,
-                )
+            capture_result, pulse_terminal = execute_autonomous_single_fire(
+                context,
+                pulse=pulse,
+                capture=capture,
             )
-            _validate_ack(
-                capture_terminal,
-                CaptureTerminalAck,
-                capture_session_id,
-                camera_device,
+            triggered_result = finalize_triggered_pipeline_result(
+                triggered_spec,
+                capture_result,
+                pulse_terminal,
             )
-            prepared.current_camera_session_id = None
-
-            samples = _point_samples(model, bound.request.site, frames)
+            point_block = triggered_result.capture.dataset.block
+            if point_block.schema.repeat_axis.size != bound.request.shots:
+                raise RuntimeError(
+                    "point CaptureCompletion covers another shot cardinality"
+                )
+            samples = _point_samples(model, bound.request.site, point_block)
             fit = fit_bimodal(samples)
             valid = bool(fit.ok and math.isfinite(float(fit.fidelity)))
-            applied_durations.append(applied.applied_exposure_seconds)
+            capture.release_completed_software(triggered_result.capture)
+
+            # Each point proves hardware completion before the next point is
+            # admitted, but only the Run cleanup phase owns physical session
+            # closure.  Retain the latest completed camera/pulse sessions so
+            # cleanup closes the endpoint state left by the final point.  A
+            # following point replaces these references only after installing
+            # its own sessions; clearing them here silently orphaned the final
+            # endpoint session and made the next Run fail admission.
+
+            applied_durations.append(applied_exposure)
             fidelities.append(float(fit.fidelity) if valid else float("nan"))
             valid_cells.append(valid)
-            capture_terminals.append(capture_terminal)
+            capture_terminals.append(triggered_result.capture.capture_terminal)
             pulse_terminals.append(pulse_terminal)
 
         return ReadoutDurationFidelityResult(
@@ -521,12 +487,8 @@ def prepare_readout_duration_fidelity(
         steps = []
         if prepared.current_pulse is not None:
             steps.append(lambda: prepared.current_pulse.cleanup(context))
-        if prepared.current_camera_session_id is not None:
-            steps.append(
-                lambda: camera_port.cleanup(
-                    context, prepared.current_camera_session_id
-                )
-            )
+        if prepared.current_capture is not None:
+            steps.append(lambda: prepared.current_capture.cleanup(context))
         if prepared.exposure_lease_open:
             steps.append(
                 lambda: camera_port.cleanup(context, prepared.exposure_lease_id)

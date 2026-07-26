@@ -34,6 +34,8 @@ API_VIOLET = "#9B86C9"
 API_VIOLET_DARK = "#5A4A8A"
 YELLOW = "#E5C85B"
 GREY = "#A2A2A2"
+GRAPHITE = "#808080"
+SURFACE = "#FFFFFF"
 
 MUTED_LABEL_STYLE = f"color: {GREY}; background: transparent; border: none;"
 
@@ -90,6 +92,7 @@ __all__ = [
     "FONT",
     "FONT_SIZE",
     "GREEN",
+    "GRAPHITE",
     "GREY",
     "HINT",
     "HOVER",
@@ -103,6 +106,7 @@ __all__ = [
     "RADIUS",
     "RED",
     "STEP_WIDTH",
+    "SURFACE",
     "TEXT",
     "TITLE_LEFT_INSET",
     "WINDOW_PAD",

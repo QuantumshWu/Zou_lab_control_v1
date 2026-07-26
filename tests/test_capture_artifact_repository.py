@@ -29,10 +29,8 @@ from zlc_neutral_atom.capture.binding import (
 from zlc_neutral_atom.devices.simulation.apparatus import VirtualSequencer
 from zlc_neutral_atom.capture.reference import (
     CaptureArtifactRef,
-    capture_artifact_input_ref,
     capture_artifact_ref_from_tree,
-    decode_capture_artifact_ref,
-    encode_capture_artifact_ref,
+    capture_artifact_ref_to_tree,
 )
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
 from zlc_neutral_atom.capture.pipeline import MinimalPipelineSpec
@@ -46,7 +44,12 @@ from zlc_neutral_atom.runtime.resources import (
 from zlc_neutral_atom.runtime.run import RunController, RunFailed
 from zlc_neutral_atom.capture.triggered import TriggeredCaptureSpec
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
-from zlc_pulse import PulseExecutionForm, load_deployed_pulse_target, load_pulse_document
+from zlc_pulse import (
+    PulseExecutionForm,
+    load_deployed_pulse_target,
+    load_pulse_document,
+    pulse_target_manifest_from_lanes,
+)
 from zlc_storage import (
     ContentCorruptionError,
     RepositoryRootBusy,
@@ -202,8 +205,7 @@ class _CaptureCase:
                 identity="fixture-camera",
                 endpoint=camera_endpoint,
                 cleanup_operation=SafetyOperation.DISARM,
-            ),
-            (SafetyOperation.DISARM,),
+            )
         )
         target = load_deployed_pulse_target()
         self.sequencer = VirtualSequencer(
@@ -211,7 +213,10 @@ class _CaptureCase:
             clock_hz=default_clock_hz(DEFAULT_CONFIG_PATH),
             sleep_scale=0,
         )
-        pulse_endpoint = VirtualSequencerExecutionEndpoint(self.sequencer)
+        pulse_endpoint = VirtualSequencerExecutionEndpoint(
+            self.sequencer,
+            pulse_target_manifest_from_lanes(target),
+        )
         pulse_port = BoundPulsePort(
             _bind_endpoint(
                 self.broker,
@@ -240,9 +245,8 @@ class _CaptureCase:
         )
         pipeline = MinimalPipelineSpec(
             "persist current exact capture",
-            binding.measurement,
+            binding.capture,
             BlockId("capture-artifact-test"),
-            timeout_seconds=2.0,
         )
         self.triggered = TriggeredCaptureSpec(
             pipeline,
@@ -355,9 +359,9 @@ def test_lazy_frame_read_fails_closed_on_chunk_corruption(tmp_path) -> None:
 
 def test_capture_ref_has_one_strict_leaf_owner() -> None:
     reference = CaptureArtifactRef("capture-repository", "a" * 64)
-    assert decode_capture_artifact_ref(encode_capture_artifact_ref(reference)) == reference
-    dependency = capture_artifact_input_ref(reference)
-    assert decode_capture_artifact_ref(dependency.canonical_reference) == reference
+    assert capture_artifact_ref_from_tree(
+        capture_artifact_ref_to_tree(reference)
+    ) == reference
     tree = {
         "schema": "zlc_neutral_atom.capture-artifact-ref",
         "repository_id": reference.repository_id,

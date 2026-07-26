@@ -29,6 +29,7 @@ from zlc_data import (
     Value,
     ValuePayloadContract,
     ValueSchema,
+    immutable_array,
 )
 from zlc_storage import (
     canonical_digest,
@@ -1360,8 +1361,12 @@ class CameraFrameRecord:
             raise ValueError("timestamp_microseconds must be less than 1_000_000")
         if (self.timestamp_seconds is None) != (self.timestamp_microseconds is None):
             raise ValueError("camera timestamp seconds and microseconds must appear together")
-        image = np.array(self.image, copy=True, order="C")
-        image.setflags(write=False)
+        source = np.asarray(self.image)
+        image = immutable_array(
+            source,
+            dtype=source.dtype.newbyteorder("<"),
+            shape=source.shape,
+        )
         object.__setattr__(self, "image", image)
 
 

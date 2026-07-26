@@ -6,10 +6,7 @@ from dataclasses import fields
 import inspect
 from pathlib import Path
 
-from Zou_lab_control.workbench import (
-    open_offline_pulse_workbench,
-    open_pulse_workbench,
-)
+from Zou_lab_control.workbench import open_pulse_editor
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.devices.sequencer.application import (
     PulseRunRequest,
@@ -18,6 +15,7 @@ from zlc_neutral_atom.devices.sequencer.application import (
 from zlc_pulse import (
     PulseExecutionForm,
     load_pulse_document,
+    pulse_target_manifest_from_lanes,
 )
 
 
@@ -29,7 +27,7 @@ def _descriptor() -> PulseTargetDescriptor:
     document = load_pulse_document(IMAGING_TEMPLATE)
     return PulseTargetDescriptor(
         DeviceRef("installation-a", "runtime-a", "sequencer"),
-        document.target,
+        pulse_target_manifest_from_lanes(document.target),
         50e6,
         0x1234ABCD,
     )
@@ -40,7 +38,7 @@ def test_pulse_target_descriptor_is_capability_free() -> None:
 
     assert {field.name for field in fields(PulseTargetDescriptor)} == {
         "sequencer_ref",
-        "target",
+        "manifest",
         "clock_hz",
         "geometry_fingerprint",
     }
@@ -91,13 +89,16 @@ def test_pulse_run_request_freezes_intent_without_a_hardware_callback() -> None:
 
 
 def test_current_workbench_entry_points_never_accept_a_raw_sequencer() -> None:
-    online = inspect.signature(open_pulse_workbench).parameters
-    offline = inspect.signature(open_offline_pulse_workbench).parameters
+    parameters = inspect.signature(open_pulse_editor).parameters
 
-    assert tuple(online) == ("experiment", "document", "path")
-    assert "sequencer" not in online and "command_port" not in online
-    assert "sequencer" not in offline and "command_port" not in offline
-    assert "target" in offline and "time_step_ns" in offline
+    assert tuple(parameters) == (
+        "experiment",
+        "document",
+        "path",
+        "remote_endpoint",
+        "repository",
+    )
+    assert "sequencer" not in parameters and "command_port" not in parameters
 
 
 def test_standalone_launcher_composes_the_current_product_surface() -> None:
@@ -105,7 +106,7 @@ def test_standalone_launcher_composes_the_current_product_surface() -> None:
     # root.  Remote selection is declarative; no raw device/client enters the script.
     source = (ROOT / "pulse_gui.py").read_text(encoding="utf-8")
 
-    assert "from zlc_workbench.pulse_editor.app import open_pulse_editor" in source
+    assert "from Zou_lab_control.workbench import open_pulse_editor" in source
     assert "remote_endpoint=remote_endpoint" in source
     assert '"--remote-host"' in source
     assert '"--document"' in source

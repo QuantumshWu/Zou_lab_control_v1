@@ -110,6 +110,15 @@ def _image_payload(window: DataFigureWindow) -> ImagePanelPayload:
     return payload
 
 
+def _fit_save_button(window: DataFigureWindow) -> QtWidgets.QAbstractButton:
+    button = window.findChild(
+        QtWidgets.QAbstractButton,
+        "figureViewerSaveFitButton",
+    )
+    assert button is not None
+    return button
+
+
 def _image_target(board: QtRasterBoard):
     binding = board._image_bindings[PANEL_ID]
     target = board._selector_target(binding)
@@ -159,9 +168,19 @@ def _drag_image_roi(window: DataFigureWindow) -> Selection:
     QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
     _drag_move(board, end, QtCore.Qt.LeftButton)
     QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
-    candidate = window._fit_candidate
+    candidate = window._fit_selection_candidate
     assert candidate is not None
-    return candidate.selection
+    return candidate
+
+
+def _clear_image_roi(window: DataFigureWindow) -> None:
+    board = _board(window)
+    _binding, target = _image_target(board)
+    QtTest.QTest.mouseClick(
+        board,
+        QtCore.Qt.LeftButton,
+        pos=_point(target, 0.05, 0.05),
+    )
 
 
 def _open_image_fit(application, experiment, reference) -> DataFigureWindow:
@@ -279,14 +298,15 @@ def test_figure_fit_is_one_step_save_reopen_refit_and_export(
         payload = _image_payload(window)
         assert payload.fit_overlay is not None
         assert payload.fit_overlay.result_identity.startswith("draft-fit:")
-        assert pane.save_button.isEnabled()
+        save_button = _fit_save_button(window)
+        assert save_button.isEnabled()
 
         destination = tmp_path / "image-fit-overlay.png"
         window._start_export(destination)
         _until(application, lambda: window.worker_idle and destination.exists())
         assert destination.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
-        QtTest.QTest.mouseClick(pane.save_button, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseClick(save_button, QtCore.Qt.LeftButton)
         _until(
             application,
             lambda: window.worker_idle
@@ -320,7 +340,7 @@ def test_figure_fit_is_one_step_save_reopen_refit_and_export(
     assert window._fit_options == {}
 
 
-def test_image_box_is_authority_and_use_full_range_removes_it(
+def test_image_box_is_authority_and_blank_click_clears_it(
     application,
     capture_product,
 ) -> None:
@@ -339,14 +359,12 @@ def test_image_box_is_authority_and_use_full_range_removes_it(
         bound = pane.current_option()
         assert bound.spec.committed_transform is not None
         assert tuple(bound.spec.committed_transform.spec.operations) == (selection,)
-        assert pane.full_range_button.isEnabled()
-        assert "AUTHORITATIVE" in pane.authority_summary.text()
+        assert "AUTHORITATIVE" in pane.authority_summary_text
 
-        QtTest.QTest.mouseClick(pane.full_range_button, QtCore.Qt.LeftButton)
+        _clear_image_roi(window)
         _until(application, lambda: window.worker_idle and bool(window.fit_models))
-        assert window._fit_candidate is None
+        assert window._fit_selection_candidate is None
         assert pane.current_option().spec.committed_transform is None
-        assert not pane.full_range_button.isEnabled()
         assert _board(window)._image_bindings[PANEL_ID].applied_bounds is None
     finally:
         _close(application, window)
@@ -418,7 +436,11 @@ def test_curve_range_promotes_only_x_while_display_cell_stays_presentation(
         assert tuple(term.axis_id for term in authority[0].terms) == (x_axis.axis_id,)
         assert batch_axis.axis_id in bound.spec.batch_axis_ids
 
-        QtTest.QTest.mouseClick(pane.full_range_button, QtCore.Qt.LeftButton)
+        clear = QtCore.QPoint(
+            int(round(target.plot.left() + 0.05 * target.plot.width())),
+            int(round(target.plot.center().y())),
+        )
+        QtTest.QTest.mouseClick(board, QtCore.Qt.LeftButton, pos=clear)
         _until(application, lambda: window.worker_idle and bool(window.fit_models))
         assert pane.current_option().spec.committed_transform is None
     finally:
@@ -461,7 +483,7 @@ def test_fit_solver_does_not_block_image_navigation_and_new_roi_revokes_it(
         _until(application, lambda: window.worker_idle)
         assert not window.draft_ready
         assert _image_payload(window).fit_overlay is None
-        assert window._fit_candidate is not None
+        assert window._fit_selection_candidate is not None
     finally:
         release.set()
         _close(application, window)
@@ -495,7 +517,8 @@ def test_fit_overlay_render_blocks_duplicate_fit_and_save_submission(
         assert window._active_kind == "fit_overlay"
         assert window.draft_ready
         assert not pane.fit_button.isEnabled()
-        assert not pane.save_button.isEnabled()
+        save_button = _fit_save_button(window)
+        assert not save_button.isEnabled()
 
         release.set()
         _until(
@@ -504,7 +527,7 @@ def test_fit_overlay_render_blocks_duplicate_fit_and_save_submission(
         )
         assert _image_payload(window).fit_overlay is not None
         assert pane.fit_button.isEnabled()
-        assert pane.save_button.isEnabled()
+        assert save_button.isEnabled()
     finally:
         release.set()
         _close(application, window)
@@ -588,7 +611,10 @@ def test_failed_save_cannot_restore_draft_after_selector_revision_changes(
             application,
             lambda: window.worker_idle and window.draft_ready and window.raster_ready,
         )
-        QtTest.QTest.mouseClick(pane.save_button, QtCore.Qt.LeftButton)
+        visible_before_save = _image_payload(window).fit_overlay
+        assert visible_before_save is not None
+        save_button = _fit_save_button(window)
+        QtTest.QTest.mouseClick(save_button, QtCore.Qt.LeftButton)
         _until(application, entered.is_set)
         assert window._fit_save_inflight is not None
 
@@ -598,13 +624,20 @@ def test_failed_save_cannot_restore_draft_after_selector_revision_changes(
         assert window.saved_reference is None
         assert window._fit_save_inflight is None
         assert not window.draft_ready
-        assert _image_payload(window).fit_overlay is None
-        assert window._fit_candidate is not None
-        assert window._fit_candidate.selection == selection
+        # Changing a selector candidate revokes the saveable draft but does not
+        # submit another raster job.  The last completed overlay remains a
+        # visible comparison until the user explicitly presses Fit or Clear.
+        visible_after_failure = _image_payload(window).fit_overlay
+        assert visible_after_failure is not None
+        assert (
+            visible_after_failure.result_identity
+            == visible_before_save.result_identity
+        )
+        assert window._fit_selection_candidate == selection
         bound = pane.current_option()
         assert bound.spec.committed_transform is not None
         assert tuple(bound.spec.committed_transform.spec.operations) == (selection,)
-        assert not pane.save_button.isEnabled()
+        assert not save_button.isEnabled()
     finally:
         release.set()
         _close(application, window)
@@ -638,7 +671,7 @@ def test_close_during_atomic_save_accepts_reference_then_releases_heavy_state(
         assert pane is not None
         QtTest.QTest.mouseClick(pane.fit_button, QtCore.Qt.LeftButton)
         _until(application, lambda: window.worker_idle and window.draft_ready)
-        QtTest.QTest.mouseClick(pane.save_button, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseClick(_fit_save_button(window), QtCore.Qt.LeftButton)
         _until(application, published.is_set)
         window.close()
         application.processEvents()

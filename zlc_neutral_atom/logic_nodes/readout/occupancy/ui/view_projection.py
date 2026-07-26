@@ -4,21 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from zlc_data import (
-    MONITOR_HISTORY,
-    SCAN_POINT,
-    SPATIAL_X,
-    SPATIAL_Y,
-    SPECTRAL,
-    DatasetSchema,
-    OwnedSnapshot,
-)
-from zlc_frontend.figure import RepeatViewMode, ViewIntent, ViewPreferences
+from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
+from zlc_frontend import automatic_figure_view
+from zlc_frontend.figure import ViewIntent, ViewPreferences
 from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import ExactOccupancyCellSource
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import ResolvedOccupancy
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
     OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION,
     OccupancyProcessorEvaluation,
+    occupancy_artifact_output_name,
 )
 from zlc_frontend.site_map_view import (
     SiteMapView,
@@ -31,17 +25,14 @@ from zlc_storage import canonical_text
 class OccupancyFigureProjection:
     """One admitted Occupancy output ready for generic Figure suggestion."""
 
-    schema: DatasetSchema
-    snapshot: OwnedSnapshot | None
+    source: ArtifactDatasetSource
     label: str
     default_intent: ViewIntent
     default_preferences: ViewPreferences | None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.schema, DatasetSchema):
-            raise TypeError("schema must be DatasetSchema")
-        if self.snapshot is not None and not isinstance(self.snapshot, OwnedSnapshot):
-            raise TypeError("snapshot must be OwnedSnapshot or None")
+        if not isinstance(self.source, ArtifactDatasetSource):
+            raise TypeError("source must be ArtifactDatasetSource")
         if not isinstance(self.label, str) or not self.label.strip():
             raise ValueError("label must be non-empty")
         if not isinstance(self.default_intent, ViewIntent):
@@ -173,48 +164,18 @@ def project_occupancy_figure(
 
     if type(resolved) is not ResolvedOccupancy:
         raise TypeError("resolved must be an exact ResolvedOccupancy")
-    selected_output = "occupied" if output is None else str(output)
-    if selected_output not in ("occupied", "counts"):
-        raise ValueError("occupancy output must be 'occupied' or 'counts'")
+    selected_output = occupancy_artifact_output_name(output)
     artifact = resolved.artifact
-    if selected_output == "occupied":
-        block = artifact.occupied
-        snapshot = artifact.occupied_snapshot if materialize else None
-    else:
-        block = artifact.counts
-        snapshot = artifact.counts_snapshot if materialize else None
-    schema = block.schema
-    roles = {
-        axis.role
-        for axis in (
-            schema.repeat_axis,
-            *schema.point_axes,
-            *schema.cell_schema.data_axes,
-        )
-    }
-    if selected_output == "occupied":
-        default_intent = (
-            ViewIntent.CURVE
-            if roles.intersection((SCAN_POINT, SPECTRAL, MONITOR_HISTORY))
-            else ViewIntent.METER
-        )
-        default_preferences = (
-            ViewPreferences(repeat_mode=RepeatViewMode.MEAN)
-            if default_intent is ViewIntent.METER
-            else None
-        )
-    elif SPATIAL_X in roles and SPATIAL_Y in roles:
-        default_intent = ViewIntent.IMAGE
-        default_preferences = None
-    elif roles.intersection((SCAN_POINT, SPECTRAL, MONITOR_HISTORY)):
-        default_intent = ViewIntent.CURVE
-        default_preferences = None
-    else:
-        default_intent = ViewIntent.HISTOGRAM
-        default_preferences = None
+    source = resolved.project_dataset_source(
+        output=selected_output,
+        materialize=materialize,
+    )
+    default_intent, default_preferences = automatic_figure_view(
+        source.schema,
+        prefer_meter=selected_output == "occupied",
+    )
     return OccupancyFigureProjection(
-        schema=schema,
-        snapshot=snapshot,
+        source=source,
         label=f"occupancy {selected_output} | {artifact.model_kind.value}",
         default_intent=default_intent,
         default_preferences=default_preferences,

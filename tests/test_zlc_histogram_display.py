@@ -13,7 +13,7 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     BlockId,
-    ComponentValidity,
+    DatasetComponentValidity,
     DataBlock,
     DatasetRevision,
     DatasetSchema,
@@ -53,10 +53,8 @@ from zlc_frontend.histogram_display import (
     histogram_home_x_limits,
     histogram_projection_home_x_limits,
 )
-from zlc_frontend.matplotlib_render import (
-    SinglePanelAggRenderer,
-    _histogram_left_fraction,
-)
+from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
+from zlc_frontend._mpl_histogram import _histogram_left_fraction
 from zlc_frontend.render import HistogramPanelPayload
 from zlc_frontend.render_style import PALETTE as RENDER_PALETTE
 
@@ -82,7 +80,7 @@ def test_histogram_form_freezes_exact_front_and_validates_log_and_bins() -> None
         current_count_limits=(0.0, 100.0),
     ) is fixed
 
-    with pytest.raises(ValueError, match="between 5 and 500"):
+    with pytest.raises(ValueError, match="at least 5"):
         HistogramDisplayState(bin_count=4)
     with pytest.raises(TypeError, match="integer"):
         HistogramDisplayState(bin_count=True)
@@ -314,7 +312,7 @@ def _histogram_document_and_evaluated():
     )
     valid_mask = np.ones_like(values, dtype=bool)
     valid_mask[0, 0, 1, 1] = False
-    validity = ComponentValidity(
+    validity = DatasetComponentValidity(
         (site.axis_id, channel.axis_id),
         valid_mask,
     )
@@ -498,7 +496,11 @@ def test_histogram_threshold_lines_render_and_echo_into_the_payload() -> None:
         assert columns.size > 0
         assert abs(float(np.median(columns)) - expected_x) < 6.0
         # The stats readout follows the reference's binned left fraction.
-        left_fraction = _histogram_left_fraction(cut, payload.bin_projection)
+        left_fraction = _histogram_left_fraction(
+            cut,
+            payload.bin_counts[0],
+            payload.bin_edges,
+        )
         samples = np.concatenate(
             [np.asarray(s) for s in payload.bin_projection.series_samples])
         exact = float(np.mean(samples <= cut))

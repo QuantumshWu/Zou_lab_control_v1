@@ -12,7 +12,7 @@ from zlc_pulse import FIELD_DAC, FIELD_DURATION, PORT_DAC, PulseFieldRef
 from zlc_pulse.authoring import cycle_field_binding, new_period, insert_period, set_analog_action
 from zlc_pulse.document import AnalogStep
 from zlc_pulse import load_deployed_pulse_target, new_pulse_document
-from zlc_workbench.pulse import PulseEditorSession
+from zlc_workbench.pulse_editor.session import PulseEditorSession
 from zlc_workbench.pulse_editor.controller import PulseEditorController
 from zlc_workbench.pulse_editor.scan_workspace import (
     default_scan_program,
@@ -40,7 +40,18 @@ def _controller_with_duration_columns(count: int = 2) -> PulseEditorController:
     first = controller.current_document.periods[0].period_id
     controller.cycle_binding(PulseFieldRef(FIELD_DURATION, first))
     for _ in range(1, count):
-        period_id = controller.add_period(duration=1, unit="us").period_ids[0]
+        before = {
+            period.period_id
+            for period in controller.current_document.periods
+        }
+        controller.add_period(duration=1, unit="us")
+        added = tuple(
+            period.period_id
+            for period in controller.current_document.periods
+            if period.period_id not in before
+        )
+        assert len(added) == 1
+        period_id = added[0]
         controller.cycle_binding(PulseFieldRef(FIELD_DURATION, period_id))
     return controller
 

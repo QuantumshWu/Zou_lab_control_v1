@@ -37,6 +37,7 @@ from zlc_pulse import (
     compile_pulse_artifact,
     freeze_scan_table,
     load_pulse_document,
+    pulse_target_manifest_from_lanes,
 )
 
 
@@ -50,7 +51,10 @@ def _bound_virtual_sequencer(document):
         clock_hz=50e6,
         sleep_scale=0,
     )
-    endpoint = VirtualSequencerExecutionEndpoint(sequencer)
+    endpoint = VirtualSequencerExecutionEndpoint(
+        sequencer,
+        pulse_target_manifest_from_lanes(document.target),
+    )
     broker = DeviceBroker()
     identity = broker.verify_identity(
         lambda: PhysicalDeviceIdentity(
@@ -172,7 +176,7 @@ def test_live_wire_geometry_mismatch_is_rejected_before_prepare() -> None:
     ("filename", "form", "trigger_channel"),
     [
         ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "ch11"),
-        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch11"),
+        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch06"),
     ],
 )
 def test_reference_and_scan_forms_execute_the_exact_compiled_ir(

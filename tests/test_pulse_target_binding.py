@@ -37,7 +37,7 @@ def test_every_shipped_document_matches_the_packaged_deployment_target():
     ("path", "form", "trigger_channel"),
     [
         (IMAGING_PULSE, PulseExecutionForm.STATIC_ONCE, "ch11"),
-        (ROOT / "pulses" / "mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch11"),
+        (ROOT / "pulses" / "mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch06"),
         (ROOT / "pulses" / "probe_template.json", PulseExecutionForm.STATIC_ONCE, "ch11"),
         (ROOT / "pulses" / "release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "ch11"),
     ],

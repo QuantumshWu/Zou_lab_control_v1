@@ -24,10 +24,11 @@ from zlc_data import (
     Value,
     ValuePayloadContract,
     ValueSchema,
+    StreamGenerationId,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     ReadoutModel,
-    _apply_readout_model,
+    apply_readout_model,
 )
 from zlc_neutral_atom.runtime._failure import safe_error_summary
 from zlc_neutral_atom.runtime.signal_source import (
@@ -62,6 +63,9 @@ from .processor import (
     _validate_sample_fields,
 )
 from ..contracts import FrameContract
+from zlc_neutral_atom.logic_nodes.camera_measurement.output_binding import (
+    CameraFrameOutputBinding,
+)
 
 
 _OUTPUT_NAMES = ("counts", "occupied", "rate")
@@ -453,6 +457,7 @@ class OccupancySignalProcessor:
         "_frame_schema",
         "_model",
         "_model_kind",
+        "_source_binding",
     )
 
     def __init__(
@@ -461,6 +466,7 @@ class OccupancySignalProcessor:
         frame_contract: FrameContract,
         model: ReadoutModel,
         artifact_input: ArtifactInputRef,
+        source_binding: CameraFrameOutputBinding,
     ) -> None:
         if not isinstance(frame_contract, FrameContract):
             raise TypeError("frame_contract must be FrameContract")
@@ -468,6 +474,8 @@ class OccupancySignalProcessor:
             raise TypeError("model must be ReadoutModel")
         if not isinstance(artifact_input, ArtifactInputRef):
             raise TypeError("artifact_input must be ArtifactInputRef")
+        if not isinstance(source_binding, CameraFrameOutputBinding):
+            raise TypeError("source_binding must be CameraFrameOutputBinding")
         counts_schema, occupied_schema = _output_schemas(
             frame_contract,
             model.feature.site_axis,
@@ -480,6 +488,7 @@ class OccupancySignalProcessor:
             artifact_input.canonical_reference,
             artifact_input.content_digest,
         )
+        self._source_binding = source_binding
         self._contract = OccupancySignalValuesContract(
             counts_schema,
             occupied_schema,
@@ -520,6 +529,7 @@ class OccupancySignalProcessor:
                     "output_contract": self._contract.fingerprint,
                     "calibration_input": self._artifact_input.fingerprint,
                     "model_kind": self._model_kind.value,
+                    "source_binding": self._source_binding.identity,
                 }
             ),
             (self._artifact_input,),
@@ -537,12 +547,20 @@ class OccupancySignalProcessor:
             classify=self._classify,
             artifact_input=self._artifact_input,
             processor_stage=processor_stage,
+            expected_source_stream_id=self._source_binding.stream_id,
+            expected_source_stream_generation=(
+                self._source_binding.stream_generation
+            ),
         )
 
     def _classify(self, frame: Value) -> OccupancySignalValues:
         if not isinstance(frame, Value) or frame.schema != self._frame_schema:
             raise TypeError("Occupancy received a Camera value with another schema")
-        result = _apply_readout_model(self._model, frame)
+        result = apply_readout_model(
+            self._model,
+            frame,
+            expected_frame_schema=self._frame_schema,
+        )
         validity = result.occupied.validity
         if not isinstance(validity, ComponentValidity):
             raise TypeError("readout result requires ComponentValidity")
@@ -594,6 +612,8 @@ class RunningOccupancySignalSource:
         classify: Callable[[Value], OccupancySignalValues],
         artifact_input: ArtifactInputRef,
         processor_stage: ProcessorStageProvenance,
+        expected_source_stream_id: StreamId,
+        expected_source_stream_generation: StreamGenerationId,
     ) -> None:
         if not isinstance(source, SignalEventSource):
             raise TypeError("Occupancy live input must implement SignalEventSource")
@@ -613,11 +633,25 @@ class RunningOccupancySignalSource:
             raise ValueError(
                 "Occupancy processor stage must name its calibration input"
             )
+        if not isinstance(expected_source_stream_id, StreamId):
+            raise TypeError("expected_source_stream_id must be StreamId")
+        if not isinstance(expected_source_stream_generation, StreamGenerationId):
+            raise TypeError(
+                "expected_source_stream_generation must be StreamGenerationId"
+            )
 
         cursor = source.open_signal_cursor(name)
         if cursor.value_schema is not source_schema:
             cursor.close()
             raise TypeError("Camera cursor lost its declared ValueSchema owner")
+        if (
+            cursor.stream_id != expected_source_stream_id
+            or cursor.stream_generation != expected_source_stream_generation
+        ):
+            cursor.close()
+            raise ValueError(
+                "Camera cursor belongs to another bound stream generation"
+            )
         try:
             stream_id = StreamId(f"occupancy-live:{uuid.uuid4().hex}")
             stream, producer = AcquisitionStream.create(
@@ -704,8 +738,16 @@ class RunningOccupancySignalSource:
     def open_signal_cursor(self, output_name: str):
         return self._signal_source.open_signal_cursor(output_name)
 
-    def close(self) -> None:
+    def request_close(self) -> None:
+        """Interrupt the upstream cursor without joining on the caller thread."""
+
         self._cursor.close()
+
+    def join_closed(self) -> None:
+        """Join only after the worker has published its terminal idle fact."""
+
+        if not self.worker_idle:
+            raise RuntimeError("Occupancy signal worker is not idle")
         thread = self._thread
         if thread is not threading.current_thread():
             thread.join()

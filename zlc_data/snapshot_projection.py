@@ -11,6 +11,7 @@ from collections.abc import Callable
 
 import numpy as np
 
+from ._arrays import canonical_dtype
 from .axis import REPEAT, AxisId, AxisSpec
 from .fit_contract import FitBatchStatus, FitResultBatch
 from .layout import PointLayout
@@ -20,7 +21,7 @@ from .transform import DataTransformSpec, apply_transform, commit_transform
 from .validity import (
     VALID,
     CellValidity,
-    ComponentValidity,
+    DatasetComponentValidity,
     RowComponentValidity,
     ValidityContract,
 )
@@ -88,11 +89,13 @@ def materialize_numeric_dataset(
     unit: str | None,
     reference_for: Callable[[DatasetSchema], DatasetRevisionRef],
 ) -> OwnedSnapshot:
-    """Materialize a real finite scalar/vector as one typed Dataset cell.
+    """Materialize a finite real or boolean scalar/vector as one typed Dataset cell.
 
     ``data_axes`` is always explicit.  Scalar values use the canonical
     ``(SCALAR_AXIS,)`` declaration and therefore the physical ``(1, 1, 1)``
     carrier; an empty declaration is rejected instead of being guessed.
+    Integer and boolean precision is preserved; only floating inputs require a
+    finite-value check.
     """
 
     axes = tuple(data_axes)
@@ -101,20 +104,21 @@ def materialize_numeric_dataset(
             "numeric dataset data_axes must contain at least one AxisSpec"
         )
     raw = np.asarray(values)
-    if raw.dtype.kind not in "iuf":
-        raise TypeError("numeric dataset values must be real numeric values")
-    array = np.asarray(raw, dtype="<f8")
+    dtype = canonical_dtype(raw.dtype)
+    if dtype.kind not in "biuf":
+        raise TypeError("numeric dataset values must be real numeric or boolean values")
+    array = np.asarray(raw, dtype=dtype)
     expected = tuple(axis.size for axis in axes)
     if array.shape != expected:
         raise ValueError(
             f"numeric dataset shape {array.shape} does not match axes {expected}"
         )
-    if not np.all(np.isfinite(array)):
+    if dtype.kind == "f" and not np.all(np.isfinite(array)):
         raise ValueError("numeric dataset values must be finite")
     cell_schema = ValueSchema(
         axes,
         ValidityContract.value(),
-        np.dtype("<f8"),
+        dtype,
         unit,
     )
     schema = _single_cell_schema(cell_schema)
@@ -194,7 +198,7 @@ def materialize_component_dataset(
         ref.block_id,
         ref.revision,
         array.reshape(schema.physical_shape),
-        ComponentValidity(
+        DatasetComponentValidity(
             validity_ids,
             mask.reshape(1, 1, *mask.shape),
         ),
@@ -245,7 +249,7 @@ def materialize_dataset_acceptance_mask(
             source_schema.cell_schema.dtype,
             source_schema.cell_schema.value_unit,
         )
-        validity = ComponentValidity(validity_ids, physical_validity)
+        validity = DatasetComponentValidity(validity_ids, physical_validity)
     schema = DatasetSchema(
         source_schema.repeat_axis,
         source_schema.point_axes,
@@ -396,7 +400,7 @@ def materialize_dataset_selection(
             else transformed_validity.mask[order]
         )
         if transformed_validity.axis_ids:
-            validity = ComponentValidity(
+            validity = DatasetComponentValidity(
                 transformed_validity.axis_ids,
                 mask.reshape(
                     output_schema.repeat_axis.size,

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from zlc_workbench.input_binding import ResolvedArtifactInput
+from .input_binding import ResolvedArtifactInput
 
 
 def resolve_producer_final_artifact(binding: ResolvedArtifactInput) -> object:
-    """Return the selected producer's completed FINAL result."""
+    """Return the selected producer's exact completed Artifact value."""
 
     if not isinstance(binding, ResolvedArtifactInput):
         raise TypeError("binding must be ResolvedArtifactInput")
@@ -17,12 +17,12 @@ def resolve_producer_final_artifact(binding: ResolvedArtifactInput) -> object:
         raise RuntimeError("artifact selection names no producing Logic node")
     if producer.running:
         raise RuntimeError("the selected artifact-producing Logic node is running")
-    if not producer.final_result_resolved:
+    if not producer.artifact_resolved:
         raise RuntimeError(
             "the selected artifact-producing Logic node has no successful "
-            "current FINAL result"
+            "current FINAL Artifact"
         )
-    return producer.final_result
+    return producer.artifact
 
 
 def resolve_final_or_saved_artifact(

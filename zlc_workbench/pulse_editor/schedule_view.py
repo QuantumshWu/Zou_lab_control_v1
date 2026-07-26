@@ -17,6 +17,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from zlc_frontend.qt_widgets import (
     ACCENT,
     GREEN,
+    GRAPHITE,
     GREY,
     ORANGE,
     RED,
@@ -1579,7 +1580,7 @@ class PulseDragContainer(QtWidgets.QWidget):
         drag.setPixmap(ghost)
         drag.setHotSpot(QtCore.QPoint(ghost.width() // 2, _px(16)))
         if hasattr(widget, "set_outline"):
-            widget.set_outline("#808080")
+            widget.set_outline(GRAPHITE)
         drag.exec_(QtCore.Qt.MoveAction)
         if hasattr(widget, "set_outline"):
             widget.set_outline(None)

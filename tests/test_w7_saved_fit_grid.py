@@ -53,6 +53,12 @@ from zlc_frontend import (
     ImagePanelPayload,
 )
 from zlc_frontend.image_display import ImageColormap
+from zlc_frontend.fit_grid_render import (
+    FitGridBoardFront,
+    FitGridRenderSession,
+    build_fit_image_grid_front,
+    reframe_fit_image_grid_front,
+)
 from zlc_frontend.figure import (
     AxisViewRole,
     DatasetDescriptor,
@@ -71,11 +77,7 @@ from zlc_neutral_atom.artifacts import FitResultRepository
 from zlc_neutral_atom.artifacts.fit_reference import FitResultArtifactRef
 from zlc_neutral_atom.capture.artifact import AdmittedCapture
 
-from zlc_workbench.fit_grid.render_lane import (
-    _build_image_grid_frame,
-    _reframe_existing_image_panels,
-    _rerasterize_grid_view,
-)
+from zlc_workbench.fit_grid.worker_jobs import _rerasterize_grid_view
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -231,16 +233,16 @@ def sparse_typed_page(sparse_fit_grid):
         "data",
         artifact_identity=model.artifact_identity,
     )
-    frame, color_limits = _build_image_grid_frame(
+    front = build_fit_image_grid_front(
         projected,
         ImageDisplayState(),
         current_color_limits=None,
         previous_relim_mode=None,
         layout_generation=0,
         sequence=1,
-        cancelled=threading.Event(),
+        check_cancelled=lambda: None,
     )
-    return result, model, page, view, projected, frame, color_limits
+    return result, model, page, view, projected, front, front.color_limits
 
 
 @pytest.fixture(scope="module")
@@ -336,9 +338,11 @@ def test_typed_image_page_preserves_repeat_sparse_holes_overlay_and_shared_clim(
         page,
         view,
         projected,
-        frame,
+        front,
         color_limits,
     ) = sparse_typed_page
+    assert isinstance(front, FitGridBoardFront)
+    frame = front.frame
     repeat_axis = next(axis for axis in model.axes if axis.role == REPEAT)
     assert page.preferences.repeat_mode is RepeatViewMode.FACET
     assert view.binding(repeat_axis.axis_id).role is AxisViewRole.FACET
@@ -349,6 +353,9 @@ def test_typed_image_page_preserves_repeat_sparse_holes_overlay_and_shared_clim(
     assert not hasattr(model, "result")
     assert model.layout.storage_size == result.batch_layout.storage_size == 4
     assert 0 < len(frame.panels) == len(projected) == 6 <= 36
+    panel_width, panel_height = front.surface_geometry.logical_size
+    assert (front.rows, front.columns) == (2, 3)
+    assert front.logical_size == (3 * panel_width, 2 * panel_height)
     assert all(
         len(panel.raster.pixels) == panel.raster.width * panel.raster.height * 4
         for panel in frame.panels
@@ -396,7 +403,7 @@ def test_typed_image_page_preserves_repeat_sparse_holes_overlay_and_shared_clim(
 def test_focus_and_overview_reframe_cached_typed_panels_without_copying_samples(
     sparse_typed_page,
 ):
-    _result, _model, _page, _view, projected, frame, _limits = (
+    _result, _model, _page, _view, projected, front, _limits = (
         sparse_typed_page
     )
     present_index = next(
@@ -404,39 +411,46 @@ def test_focus_and_overview_reframe_cached_typed_panels_without_copying_samples(
         for index, panel in enumerate(projected)
         if panel.fit_storage_index is not None
     )
-    focus = _reframe_existing_image_panels(
-        frame,
+    focus = reframe_fit_image_grid_front(
+        front,
         (projected[present_index],),
         layout_generation=1,
         sequence=2,
     )
-    restored = _reframe_existing_image_panels(
-        frame,
+    restored = reframe_fit_image_grid_front(
+        front,
         projected,
         layout_generation=2,
         sequence=3,
     )
 
-    assert focus.board_id == restored.board_id == frame.board_id
-    assert len(focus.panels) == 1
-    original = frame.panels[present_index]
-    assert focus.panels[0].raster is original.raster
-    assert focus.panels[0].display_payload is original.display_payload
+    assert focus.frame.board_id == restored.frame.board_id == front.frame.board_id
+    assert len(focus.frame.panels) == 1
+    assert (focus.rows, focus.columns) == (1, 1)
+    assert focus.logical_size == focus.surface_geometry.logical_size
+    assert restored.logical_size == front.logical_size
+    original = front.frame.panels[present_index]
+    assert focus.frame.panels[0].raster is original.raster
+    assert focus.frame.panels[0].display_payload is original.display_payload
     assert (
-        focus.panels[0].coherence_stamp.join_key_digest
-        != frame.panels[0].coherence_stamp.join_key_digest
+        focus.frame.panels[0].coherence_stamp.join_key_digest
+        != front.frame.panels[0].coherence_stamp.join_key_digest
     )
     assert (
-        restored.panels[0].coherence_stamp.join_key_digest
-        == frame.panels[0].coherence_stamp.join_key_digest
+        restored.frame.panels[0].coherence_stamp.join_key_digest
+        == front.frame.panels[0].coherence_stamp.join_key_digest
     )
-    assert tuple(panel.panel_id for panel in restored.panels) == tuple(
-        panel.panel_id for panel in frame.panels
+    assert tuple(panel.panel_id for panel in restored.frame.panels) == tuple(
+        panel.panel_id for panel in front.frame.panels
     )
     assert all(
         replacement.raster is source.raster
         and replacement.display_payload is source.display_payload
-        for replacement, source in zip(restored.panels, frame.panels, strict=True)
+        for replacement, source in zip(
+            restored.frame.panels,
+            front.frame.panels,
+            strict=True,
+        )
     )
 
 
@@ -448,31 +462,38 @@ def test_display_reraster_advances_only_the_presentation_and_keeps_shared_clim(
     )
     initial_display = ImageDisplayState()
     changed = ImageDisplayState(revision=1, colormap=ImageColormap.MAGMA)
-    (
-        request_revision,
-        returned_panels,
-        returned_display,
-        rerasterized,
-        rerasterized_limits,
-    ) = _rerasterize_grid_view(
-        projected,
-        changed,
-        initial_limits,
-        initial_display.relim_mode,
-        0,
-        2,
-        threading.Event(),
-    )
+    render_session = FitGridRenderSession()
+    try:
+        (
+            request_revision,
+            surface_revision,
+            returned_panels,
+            returned_display,
+            rerasterized,
+        ) = _rerasterize_grid_view(
+            render_session,
+            projected,
+            changed,
+            initial_limits,
+            initial_display.relim_mode,
+            0,
+            2,
+            threading.Event(),
+        )
+    finally:
+        render_session.close()
 
     assert request_revision == 2
+    assert surface_revision == 0
     assert returned_panels == projected
     assert returned_display is changed
-    assert rerasterized.layout_generation == initial.layout_generation
-    assert rerasterized.sequence > initial.sequence
-    assert rerasterized_limits == initial_limits
+    assert rerasterized.frame.layout_generation == initial.frame.layout_generation
+    assert rerasterized.frame.sequence > initial.frame.sequence
+    assert rerasterized.color_limits == initial_limits
+    assert rerasterized.logical_size == initial.logical_size
     for old, new, source in zip(
-        initial.panels,
-        rerasterized.panels,
+        initial.frame.panels,
+        rerasterized.frame.panels,
         projected,
         strict=True,
     ):
@@ -483,14 +504,45 @@ def test_display_reraster_advances_only_the_presentation_and_keeps_shared_clim(
         assert new_payload.image is source.image is old_payload.image
         assert new_payload.evaluated_input is source.evaluated_input
         assert new_payload.viewport.viewport_revision == changed.revision
-        assert new_payload.color_limits == rerasterized_limits
-        assert new_payload.base_palette != old_payload.base_palette
+        assert new_payload.color_limits == rerasterized.color_limits
+        assert new_payload.colormap != old_payload.colormap
         presentation = next(
             item
             for item in new.coherence_stamp.presentations
             if item.panel_id == new.panel_id
         )
         assert presentation.panel_revision == changed.revision
+
+
+def test_fit_grid_front_keeps_logical_geometry_stable_across_dpr(
+    sparse_typed_page,
+):
+    _result, _model, _page, _view, panels, baseline, _limits = sparse_typed_page
+    session = FitGridRenderSession(pixel_ratio=1.75)
+    try:
+        high_dpr = session.build_front(
+            panels,
+            ImageDisplayState(),
+            current_color_limits=None,
+            previous_relim_mode=None,
+            layout_generation=0,
+            sequence=2,
+        )
+    finally:
+        session.close()
+
+    assert high_dpr.logical_size == baseline.logical_size
+    assert high_dpr.surface_geometry.logical_size == (
+        baseline.surface_geometry.logical_size
+    )
+    assert high_dpr.surface_geometry.raster_size != (
+        baseline.surface_geometry.raster_size
+    )
+    assert all(
+        (panel.raster.width, panel.raster.height)
+        == high_dpr.surface_geometry.raster_size
+        for panel in high_dpr.frame.panels
+    )
 
 
 def test_grid_pages_are_bounded_and_axis_navigator_skips_sparse_holes(
@@ -526,6 +578,21 @@ def test_grid_pages_are_bounded_and_axis_navigator_skips_sparse_holes(
     finally:
         navigator.deleteLater()
         application.processEvents()
+
+
+def test_fit_grid_accepts_a_decoded_value_equal_layout(sparse_fit_grid) -> None:
+    from zlc_data import decode_fit_result_batch, encode_fit_result_batch
+
+    result, model, _page, _view, _figure = sparse_fit_grid
+    reopened = decode_fit_result_batch(encode_fit_result_batch(result))
+    assert reopened.batch_layout == model.layout
+    assert reopened.batch_layout is not model.layout
+    selection = model.selection_for_indices(model.layout.multi_index(0))
+
+    summary = model.cell_summary(reopened, selection)
+
+    assert summary.storage_index == 0
+    assert summary.status is reopened.statuses[0]
 
 
 def test_axis_navigator_preserves_bigint_sparse_indices_and_physical_order(
@@ -706,7 +773,14 @@ def test_saved_ref_uses_one_typed_board_cached_focus_display_and_exact_export(
         page_front = board.front_frame
         assert page_front is not None
         assert 0 < len(page_front.panels) <= 36
-        assert window._page_frame is page_front
+        assert window._page_front is not None
+        assert window._page_front.frame is page_front
+        assert (board.width(), board.height()) == window._page_front.logical_size
+        assert not window._typed_scroll.widgetResizable()
+        fixed_board_size = board.size()
+        window.resize(window.width() + 240, window.height() + 160)
+        application.processEvents()
+        assert board.size() == fixed_board_size
         page_payloads = tuple(panel.display_payload for panel in page_front.panels)
         assert all(isinstance(payload, ImagePanelPayload) for payload in page_payloads)
         assert {payload.color_limits for payload in page_payloads} == {
@@ -738,8 +812,8 @@ def test_saved_ref_uses_one_typed_board_cached_focus_display_and_exact_export(
             for panel in before_display.panels
             if isinstance(panel.display_payload, ImagePanelPayload)
         }
-        old_palettes = {
-            panel.panel_id: panel.display_payload.base_palette
+        old_colormaps = {
+            panel.panel_id: panel.display_payload.colormap
             for panel in before_display.panels
             if isinstance(panel.display_payload, ImagePanelPayload)
         }
@@ -766,7 +840,7 @@ def test_saved_ref_uses_one_typed_board_cached_focus_display_and_exact_export(
             assert isinstance(payload, ImagePanelPayload)
             assert payload.image is old_images[panel.panel_id]
             assert payload.viewport.viewport_revision == window._display.revision
-            assert payload.base_palette != old_palettes[panel.panel_id]
+            assert payload.colormap != old_colormaps[panel.panel_id]
 
         focused_panel = next(
             panel
@@ -779,7 +853,7 @@ def test_saved_ref_uses_one_typed_board_cached_focus_display_and_exact_export(
             panel
             for panel, rendered in zip(
                 window._page_panels,
-                window._page_frame.panels,
+                window._page_front.frame.panels,
                 strict=True,
             )
             if rendered.panel_id == focused_panel.panel_id
@@ -798,6 +872,11 @@ def test_saved_ref_uses_one_typed_board_cached_focus_display_and_exact_export(
         assert len(materialize_threads) == 1
         focused_front = board.front_frame
         assert focused_front is not None
+        assert window._current_front is not None
+        assert (board.width(), board.height()) == window._current_front.logical_size
+        assert window._current_front.logical_size == (
+            window._surface_geometry.logical_size
+        )
         assert focused_front.panels[0].panel_id == focused_panel.panel_id
         assert focused_front.panels[0].raster is focused_panel.raster
         assert (
@@ -821,6 +900,8 @@ def test_saved_ref_uses_one_typed_board_cached_focus_display_and_exact_export(
         assert window._current_selection is None
         assert window._board_widget is board
         assert board.front_frame is not None
+        assert window._current_front is not None
+        assert (board.width(), board.height()) == window._current_front.logical_size
         assert len(board.front_frame.panels) == len(after_display.panels)
         assert tuple(panel.panel_id for panel in board.front_frame.panels) == tuple(
             panel.panel_id for panel in after_display.panels
@@ -970,9 +1051,9 @@ def test_saved_fit_grid_close_during_load_is_nonblocking_and_releases_state(
         release.set()
         _until(application, lambda: window.closed and not window.isVisible())
         assert window._model is None
-        assert window._page_frame is None
+        assert window._page_front is None
         assert window._page_panels == ()
-        assert window._current_frame is None
+        assert window._current_front is None
         assert window._current_panels == ()
         assert window._bound_panel_ids == set()
         assert not window._board_widget.has_front
@@ -999,7 +1080,7 @@ def test_close_during_export_preserves_existing_destination_atomically(
     release = threading.Event()
     import zlc_frontend.matplotlib_render as matplotlib_render
 
-    original_export = matplotlib_render.save_radial_gaussian_image_fit_panels
+    original_export = matplotlib_render.encode_radial_gaussian_image_fit_panels
 
     def blocked_export(*args, **kwargs):
         exported = original_export(*args, **kwargs)
@@ -1010,7 +1091,7 @@ def test_close_during_export_preserves_existing_destination_atomically(
 
     monkeypatch.setattr(
         matplotlib_render,
-        "save_radial_gaussian_image_fit_panels",
+        "encode_radial_gaussian_image_fit_panels",
         blocked_export,
     )
     try:

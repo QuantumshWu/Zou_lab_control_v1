@@ -11,8 +11,8 @@ import numpy as np
 
 from zlc_data import (
     AxisId,
-    ComponentValidity,
     DataBlock,
+    DatasetComponentValidity,
     DatasetSchema,
     StreamGenerationId,
     dataset_schema_from_tree,
@@ -469,7 +469,7 @@ class OccupancyRepository:
         authority = self._content_authority()
         shape = resolved.counts_schema.physical_shape
         validity_payload = authority.read_blob(stored.validity_blob)
-        validity = ComponentValidity(
+        validity = DatasetComponentValidity(
             (resolved.selected_model.feature.site_axis.axis_id,),
             _decode_array_payload(
                 validity_payload,
@@ -602,8 +602,8 @@ class OccupancyRepository:
             field="occupancy occupied",
         )
         validity = artifact.counts.validity
-        if not isinstance(validity, ComponentValidity):
-            raise TypeError("occupancy artifact requires ComponentValidity")
+        if not isinstance(validity, DatasetComponentValidity):
+            raise TypeError("occupancy artifact requires DatasetComponentValidity")
         validity_payload = _array_payload(
             validity.mask,
             dtype=bool,

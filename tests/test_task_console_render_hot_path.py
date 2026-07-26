@@ -9,15 +9,106 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+import threading
 import time
-from types import SimpleNamespace
-
 import numpy as np
+
+from gui_user_flow import close_task_console, until
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_render_lane_releases_session_after_active_compose_on_its_worker() -> None:
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.task_console.render_lane import (
+        ConsoleRenderCompletion,
+        ConsoleRenderLane,
+    )
+
+    application = ensure_qt_app()
+    entered = threading.Event()
+    unblock = threading.Event()
+    released = threading.Event()
+    worker_threads: list[int] = []
+    shutdown_wakes: list[bool] = []
+
+    class Session:
+        def close(self) -> None:
+            worker_threads.append(threading.get_ident())
+            released.set()
+
+    lane = ConsoleRenderLane(
+        application,
+        accept_completion=lambda _completion: set(),
+        request_shutdown_wake=lambda: shutdown_wakes.append(True),
+    )
+
+    def blocking_compose(_requests, _outputs, _resets):
+        worker_threads.append(threading.get_ident())
+        lane._worker_composers["surface"] = (object(), Session())
+        entered.set()
+        if not unblock.wait(5.0):
+            raise RuntimeError("test compose was not released")
+        return ConsoleRenderCompletion((), ())
+
+    lane._compose = blocking_compose
+    lane._start((), (), ())
+    assert entered.wait(5.0)
+    assert not lane.shutdown()
+    assert not released.is_set()
+
+    unblock.set()
+    until(application, lambda: bool(shutdown_wakes), timeout=5.0)
+    assert lane.shutdown()
+    assert released.is_set()
+    assert len(set(worker_threads)) == 1
+    assert lane._future is None
+    assert lane._shutdown_future is None
+    assert not lane._worker_composers
+    assert not lane._worker_output_sessions
+    assert lane.shutdown_failures == ()
+
+
+def test_fit_lane_waits_for_cancelled_active_solver_before_close_ack() -> None:
+    from types import SimpleNamespace
+
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.task_console.panel_fit import PanelFitLane
+
+    application = ensure_qt_app()
+    entered = threading.Event()
+    returned = threading.Event()
+    shutdown_wakes: list[bool] = []
+    request = SimpleNamespace(cancelled=threading.Event())
+    lane = PanelFitLane(
+        application,
+        accept_completion=lambda _completion: None,
+        request_shutdown_wake=lambda: shutdown_wakes.append(True),
+    )
+
+    def blocking_execute(active):
+        entered.set()
+        if not active.cancelled.wait(5.0):
+            raise RuntimeError("test Fit cancellation was not delivered")
+        returned.set()
+        return active, None, "cancelled"
+
+    lane._execute = blocking_execute
+    lane._start(request)
+    assert entered.wait(5.0)
+    assert not lane.shutdown()
+    assert request.cancelled.is_set()
+
+    until(application, lambda: bool(shutdown_wakes), timeout=5.0)
+    assert returned.is_set()
+    assert lane.shutdown()
+    assert lane._future is None
+    assert lane._active is None
+    assert lane._completion is None
+    assert lane.shutdown_failures == ()
 
 
 def test_panel_title_is_a_local_draft_until_one_semantic_commit() -> None:
@@ -67,9 +158,7 @@ def test_panel_title_is_a_local_draft_until_one_semantic_commit() -> None:
         assert card.config.title == "one semantic title"
         assert requests == [False]
     finally:
-        assert console.shutdown()
-        console.close()
-        application.processEvents()
+        close_task_console(application, console)
 
 
 def test_timer_and_binding_commit_never_rediscover_signal_topology() -> None:
@@ -77,7 +166,7 @@ def test_timer_and_binding_commit_never_rediscover_signal_topology() -> None:
 
     from zlc_workbench.task_console.console_records import PanelConfig
     from zlc_workbench.task_console.console_state import TaskConsoleState
-    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_frontend.qt_widgets import ensure_qt_app, signal_tree_groups
     from zlc_workbench.task_console.window import TaskConsole
 
     application = ensure_qt_app()
@@ -99,20 +188,20 @@ def test_timer_and_binding_commit_never_rediscover_signal_topology() -> None:
         console._timer.stop()
         card = console.cards[0]
         provider_reads = 0
-        real_signal_providers = console._signal_providers
 
-        def counted_signal_providers():
+        def counted_signal_groups(_current: str):
             nonlocal provider_reads
             provider_reads += 1
-            return real_signal_providers()
+            return signal_tree_groups(
+                ("source_a", "source_b"),
+                {
+                    "source_a": ("producer",),
+                    "source_b": ("producer",),
+                },
+                {},
+            )
 
-        console._signal_providers = counted_signal_providers
-        card.names_provider = lambda: ("source_a", "source_b")
-        card.sources_provider = lambda: {
-            "source_a": ("producer",),
-            "source_b": ("producer",),
-        }
-        card.formats_provider = lambda: {}
+        card.signal_groups_provider = counted_signal_groups
 
         for _ in range(4):
             console._tick()
@@ -154,7 +243,7 @@ def test_timer_and_binding_commit_never_rediscover_signal_topology() -> None:
         finally:
             console._data.freeze = data_freeze
         assert card.config.signal == "source_b"
-        assert provider_reads == 0
+        assert provider_reads == 1
         reads_after_commit = provider_reads
 
         for _ in range(4):
@@ -162,9 +251,7 @@ def test_timer_and_binding_commit_never_rediscover_signal_topology() -> None:
         application.processEvents()
         assert provider_reads == reads_after_commit
     finally:
-        assert console.shutdown()
-        console.close()
-        application.processEvents()
+        close_task_console(application, console)
 
 
 def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
@@ -175,8 +262,14 @@ def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
         SCAN_POINT,
         AxisId,
         AxisSpec,
+        BlockId,
+        CellValidity,
+        DataBlock,
+        DatasetRevision,
         DatasetSchema,
+        OwnedSnapshot,
         PointLayout,
+        StreamGenerationId,
         ValidityContract,
         ValueSchema,
     )
@@ -189,6 +282,7 @@ def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
     )
     from zlc_frontend.panel_render import PanelComposer
     from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.task_console.data_plane import ConsoleSignalValue
     from zlc_workbench.task_console.window import TaskConsole
 
     repeat = AxisSpec(
@@ -212,6 +306,27 @@ def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
         PointLayout.rect_c((scan.size,)),
         ValueSchema.scalar(np.dtype("float64"), "V"),
     )
+    values = np.zeros(schema.physical_shape, dtype=np.float64)
+    block = DataBlock(
+        BlockId("task-console-repeat-block"),
+        DatasetRevision(1),
+        values,
+        CellValidity(np.ones(values.shape[:2], dtype=np.bool_)),
+        schema,
+    )
+    snapshot = OwnedSnapshot(
+        block.ref(StreamGenerationId("task-console-repeat-generation")),
+        block,
+    )
+    value = ConsoleSignalValue(
+        name="typed-repeat",
+        source="test",
+        snapshot=snapshot,
+        coverage=None,
+        run_id="run",
+        epoch_id="epoch",
+        join_digest="0" * 64,
+    )
 
     application = ensure_qt_app()
     console = TaskConsole(
@@ -225,9 +340,7 @@ def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
         application.processEvents()
         console._timer.stop()
         card = console.cards[0]
-        card._last_value = SimpleNamespace(
-            snapshot=SimpleNamespace(block=SimpleNamespace(schema=schema))
-        )
+        card._last_value = value
         requests: list[bool] = []
         card._render_request = (
             lambda _card, *, force=False: requests.append(bool(force)) or True
@@ -259,9 +372,7 @@ def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
         finally:
             composer.close()
     finally:
-        assert console.shutdown()
-        console.close()
-        application.processEvents()
+        close_task_console(application, console)
 
 
 def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
@@ -357,7 +468,9 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
         card = console.cards[0]
         # Producer injection stops at the immutable monitor boundary.  Every
         # product action below is real Qt input on the formal TaskConsole.
-        assert card._freeze_value_render_request(value, 1, force=True) is None
+        # A declared repeat axis gives Grid one deterministic frontend-owned
+        # default facet, so the first valid value is immediately renderable.
+        assert card._freeze_value_render_request(value, 1, force=True) is not None
 
         QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
         application.processEvents()
@@ -371,14 +484,16 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
         wait_until(
             lambda: card.board is not None
             and card.board.showing_overview
-            and card.board.overview_png is not None
+            and card.board.overview_artifact is not None
         )
         view = view_spec_from_tree(card.config.params["view_spec"])
         assert view.binding(repeat.axis_id).role is AxisViewRole.FACET
         board = card.board
-        assert len(board._regions) == repeat.size
+        artifact = board.overview_artifact
+        assert artifact is not None
+        assert len(artifact.regions) == repeat.size
 
-        region = board._regions[0]
+        region = artifact.regions[0]
         assert board._overview._front is not None
         target = board._overview._native_target(board._overview._front[1])
         position = QtCore.QPoint(
@@ -396,9 +511,7 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
         QtTest.QTest.keyClick(board.board, QtCore.Qt.Key_Escape)
         wait_until(lambda: board.showing_overview)
     finally:
-        assert console.shutdown()
-        console.close()
-        application.processEvents()
+        close_task_console(application, console)
 
 
 def test_only_the_task_console_worker_lane_may_compose() -> None:

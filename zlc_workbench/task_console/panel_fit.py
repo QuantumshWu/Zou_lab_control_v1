@@ -70,10 +70,19 @@ class PanelFitLane:
     or publishing a stale result.
     """
 
-    def __init__(self, qt_parent, *, accept_completion) -> None:
+    def __init__(
+        self,
+        qt_parent,
+        *,
+        accept_completion,
+        request_shutdown_wake,
+    ) -> None:
         if not callable(accept_completion):
             raise TypeError("accept_completion must be callable")
+        if not callable(request_shutdown_wake):
+            raise TypeError("request_shutdown_wake must be callable")
         self._accept_completion = accept_completion
+        self._request_shutdown_wake = request_shutdown_wake
         self._pool = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="zlc-task-console-fit",
@@ -84,12 +93,25 @@ class PanelFitLane:
         self._completion = None
         self._pending: dict[str, PanelFitRequest] = {}
         self._closing = False
+        self._shutdown_complete = False
+        self._shutdown_notified = False
+        self._shutdown_failures: tuple[str, ...] = ()
         self._wake = QtOwnerWake(qt_parent)
         self._wake.bind(self._owner_cycle)
 
     @property
     def closing(self) -> bool:
         return self._closing
+
+    @property
+    def shutdown_complete(self) -> bool:
+        with self._lock:
+            return self._shutdown_complete
+
+    @property
+    def shutdown_failures(self) -> tuple[str, ...]:
+        with self._lock:
+            return self._shutdown_failures
 
     def enqueue(self, request: PanelFitRequest) -> None:
         if not isinstance(request, PanelFitRequest):
@@ -145,21 +167,42 @@ class PanelFitLane:
         except BaseException as error:
             completion = (None, None, f"{type(error).__name__}: {error}")
         with self._lock:
+            if self._future is not future:
+                raise RuntimeError("TaskConsole Fit future identity changed")
+            self._future = None
+            self._active = None
             if self._closing:
-                return
-            self._completion = completion
+                self._completion = None
+                # Cancellation and an in-flight solver diagnostic are both
+                # already represented by the discarded completion.  The
+                # ownership fact needed by close is that the worker returned
+                # and no longer retains the request/snapshot.
+                self._shutdown_failures = ()
+                self._shutdown_complete = True
+                notify_shutdown = True
+            else:
+                self._completion = completion
+                notify_shutdown = False
+        if notify_shutdown:
+            self._wake.request_owner_wake()
+            return
         self._wake.request_owner_wake()
 
     def _owner_cycle(self) -> None:
         if self._closing:
+            with self._lock:
+                ready = self._shutdown_complete and not self._shutdown_notified
+                if ready:
+                    self._shutdown_notified = True
+            if ready:
+                self._wake.detach()
+                self._request_shutdown_wake()
             return
         with self._lock:
             completion = self._completion
             if completion is None:
                 return
             self._completion = None
-            self._future = None
-            self._active = None
         self._accept_completion(completion)
         with self._lock:
             if self._closing or not self._pending:
@@ -168,18 +211,28 @@ class PanelFitLane:
             request = self._pending.pop(panel_id)
         self._start(request)
 
-    def shutdown(self) -> None:
-        if self._closing:
-            return
-        self._closing = True
-        self._wake.detach()
+    def shutdown(self) -> bool:
+        """Cancel admission and report only after active solver work retires."""
+
         with self._lock:
+            if self._closing:
+                return self._shutdown_complete
+            self._closing = True
             active = self._active
             pending = tuple(self._pending.values())
             self._pending.clear()
             self._completion = None
+            active_future = self._future
         if active is not None:
             active.cancelled.set()
         for request in pending:
             request.cancelled.set()
         self._pool.shutdown(wait=False, cancel_futures=True)
+        if active_future is not None:
+            return False
+        with self._lock:
+            self._active = None
+            self._shutdown_complete = True
+            self._shutdown_notified = True
+        self._wake.detach()
+        return True

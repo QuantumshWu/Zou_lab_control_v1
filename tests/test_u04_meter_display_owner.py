@@ -115,9 +115,16 @@ def test_no_empty_form_spec_was_invented_to_match_the_siblings():
 
 
 def test_the_workbench_no_longer_owns_a_private_copy():
-    source = (
-        ROOT / "Zou_lab_control" / "workbench" / "_figure.py"
-    ).read_text(encoding="utf-8")
-    assert "_MeterDisplayState" not in source
-    assert "class MeterDisplayState" not in source
-    assert "MeterDisplayState," in source, "it must import the frontend owner"
+    workbench_sources = {
+        path: path.read_text(encoding="utf-8")
+        for path in (ROOT / "zlc_workbench").rglob("*.py")
+    }
+    assert workbench_sources
+    assert all("_MeterDisplayState" not in source for source in workbench_sources.values())
+    assert all(
+        "class MeterDisplayState" not in source
+        for source in workbench_sources.values()
+    )
+    assert any(
+        "MeterDisplayState" in source for source in workbench_sources.values()
+    ), "the workbench must consume the frontend owner"

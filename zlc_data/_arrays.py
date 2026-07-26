@@ -5,6 +5,10 @@ from __future__ import annotations
 import numpy as np
 
 
+_IMMUTABLE_FALSE = np.frombuffer(b"\x00", dtype=np.bool_)
+_IMMUTABLE_TRUE = np.frombuffer(b"\x01", dtype=np.bool_)
+
+
 def canonical_dtype(dtype) -> np.dtype:
     """Return the platform-independent little-endian spelling of ``dtype``."""
 
@@ -24,12 +28,51 @@ def canonical_dtype(dtype) -> np.dtype:
     return result.newbyteorder("<")
 
 
-def immutable_array(values, *, dtype: np.dtype, shape: tuple[int, ...]) -> np.ndarray:
-    """Copy values into an intrinsically read-only, C-contiguous ndarray.
+def is_intrinsically_immutable_array(value: object) -> bool:
+    """Return whether an ndarray view ultimately rests on immutable ``bytes``.
 
-    A normal owning ndarray can have ``writeable`` re-enabled by a consumer.  This
-    representation is backed by immutable ``bytes``, so the published value cannot
-    be made writable and cannot alias a producer or builder buffer.
+    ``flags.writeable = False`` is not sufficient: an owning ndarray, or a view
+    over one, can be made writable again.  By contrast, slices, transposes and
+    broadcasts whose complete base chain ends in ``bytes`` cannot acquire a
+    writable buffer.  Recognising that ownership fact lets every downstream
+    value object retain the exact view instead of copying the same camera frame
+    at every semantic boundary.
+    """
+
+    if type(value) is not np.ndarray or value.dtype.hasobject or value.dtype.fields:
+        return False
+    current: object = value
+    seen: set[int] = set()
+    while isinstance(current, np.ndarray):
+        identity = id(current)
+        if (
+            identity in seen
+            or current.flags.writeable
+            or current.flags.owndata
+        ):
+            return False
+        seen.add(identity)
+        current = current.base
+    if isinstance(current, bytes):
+        return True
+    while isinstance(current, memoryview):
+        identity = id(current)
+        if identity in seen or not current.readonly:
+            return False
+        seen.add(identity)
+        current = current.obj
+    return isinstance(current, bytes)
+
+
+def immutable_array(values, *, dtype: np.dtype, shape: tuple[int, ...]) -> np.ndarray:
+    """Return an intrinsically immutable ndarray, copying only mutable input.
+
+    A mutable producer/builder buffer crosses this boundary through one compact
+    ``bytes`` snapshot.  An already bytes-backed immutable slice, transpose or
+    broadcast is returned unchanged: it cannot be made writable and therefore
+    needs no second ownership copy.  Strides are part of the retained view;
+    canonical persistence owners may materialise contiguous bytes when they
+    actually serialize it.
     """
 
     source = np.asarray(values)
@@ -38,10 +81,27 @@ def immutable_array(values, *, dtype: np.dtype, shape: tuple[int, ...]) -> np.nd
         raise TypeError(f"values dtype {source.dtype} does not match schema dtype {dtype}")
     if source.shape != shape:
         raise ValueError(f"values shape {source.shape} does not match expected {shape}")
+    if source.dtype == dtype and is_intrinsically_immutable_array(source):
+        return source
     normalized = source.astype(dtype, copy=False)
     result = np.frombuffer(normalized.tobytes(order="C"), dtype=dtype).reshape(shape)
     result.setflags(write=False)
     return result
+
+
+def immutable_bool_broadcast(value: bool, shape: tuple[int, ...]) -> np.ndarray:
+    """Return a zero-allocation uniform boolean plane backed by one byte."""
+
+    if not isinstance(value, (bool, np.bool_)):
+        raise TypeError("immutable boolean broadcast value must be bool")
+    normalized_shape = tuple(shape)
+    if any(
+        isinstance(size, bool) or not isinstance(size, int) or size < 0
+        for size in normalized_shape
+    ):
+        raise ValueError("immutable boolean broadcast shape must be nonnegative integers")
+    scalar = _IMMUTABLE_TRUE if bool(value) else _IMMUTABLE_FALSE
+    return np.broadcast_to(scalar.reshape((1,) * len(normalized_shape)), normalized_shape)
 
 
 def immutable_bool_array(values, *, shape: tuple[int, ...]) -> np.ndarray:

@@ -169,9 +169,11 @@ PANEL_KINDS: dict[str, str] = {
 
 
 #: Per-panel display refresh intervals (ms) the operator can pick from.  The fixed harmonic set
-#: lets one lightweight base timer schedule every card without one timer per widget.  It controls
-#: presentation cadence only: each card reads its own producer revision, and cards sharing a timer
-#: beat do not thereby claim a common shot or coherence identity.
+#: lets one display timer schedule every visible, unpaused card without one timer per widget.
+#: The timer is stopped when no panel is active and never polls Run ownership.  Producer/worker
+#: completions use the queued owner-wake seam; the separate narrow terminal poll exists only while
+#: a Run is active and has no completion event.  Cards sharing a display beat do not thereby claim
+#: a common shot or coherence identity.
 UPDATE_INTERVALS = (100, 200, 400, 800)
 DEFAULT_UPDATE_MS = 400
 

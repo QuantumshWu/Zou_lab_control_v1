@@ -6,7 +6,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from zlc_storage import canonical_text
 
-from ..render import BoardFrame
+from ..render import BoardFrame, RasterBuffer
 from ._raster_front import _prepared_qimage
 from .style import BG
 
@@ -21,7 +21,7 @@ def _full_image_rect(image: QtGui.QImage) -> QtCore.QRectF:
 
 
 class FrozenRasterView(QtWidgets.QWidget):
-    """Single-panel BoardPresenter that paints directly from immutable bytes."""
+    """Single-panel raster widget that paints directly from immutable bytes."""
 
     normalizedDoubleClicked = QtCore.pyqtSignal(float, float)
 
@@ -52,6 +52,17 @@ class FrozenRasterView(QtWidgets.QWidget):
             raise ValueError("FrozenRasterView requires its one configured panel")
         self._front = _prepared_qimage(frame.panels[0])
         self._front_frame = frame
+        self.updateGeometry()
+        self.update()
+
+    def present_raster(self, raster: RasterBuffer) -> None:
+        """Present one frontend-owned immutable RGBA raster without decoding."""
+
+        self._require_owner()
+        if not isinstance(raster, RasterBuffer):
+            raise TypeError("raster must be RasterBuffer")
+        self._front = _prepared_qimage(raster)
+        self._front_frame = None
         self.updateGeometry()
         self.update()
 

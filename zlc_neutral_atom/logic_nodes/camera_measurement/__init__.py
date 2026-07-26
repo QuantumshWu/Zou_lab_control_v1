@@ -1,7 +1,6 @@
 """The complete Camera Measurement logic-node attachment."""
 
 from .application import bind_camera_measurement_intent
-from .binding import CameraCaptureBindingRequest, bind_camera_measurement
 from .definition import (
     CAMERA_FRAME_OUTPUT_CONTRACT_ID,
     CAMERA_MEASUREMENT_DEFINITION,
@@ -40,6 +39,7 @@ from .monitor import (
     PreparedLiveCameraMeasurement,
     prepare_live_camera_measurement,
 )
+from .output_binding import CameraFrameOutputBinding
 
 __all__ = [
     "CAMERA_FRAME_OUTPUT_CONTRACT_ID",
@@ -53,17 +53,16 @@ __all__ = [
     "DEFAULT_CAMERA_MONITOR_HISTORY_CYCLES",
     "MINIMUM_CAMERA_FRAMES_PER_CYCLE",
     "MINIMUM_CAMERA_MEASUREMENT_REPEAT",
-    "CameraCaptureBindingRequest",
     "CameraMeasurementDescriptor",
     "CameraMeasurementIntent",
     "CameraMeasurementRequest",
+    "CameraFrameOutputBinding",
     "CameraMonitorLiveDataset",
     "CameraMonitorViewPort",
     "CameraMonitorViewSpec",
     "PreparedFiniteCameraMeasurement",
     "PreparedLiveCameraMeasurement",
     "bind_camera_measurement_intent",
-    "bind_camera_measurement",
     "bind_finite_camera_measurement",
     "build_camera_measurement_intent_from_authoring",
     "camera_frame_output_declarations",

@@ -19,9 +19,9 @@ from zlc_frontend import (
     FIGURE_ARCHIVE_SCHEMA,
     DataFigure,
     FigureArchive,
-    FigureDisplayState,
-    decode_figure_archive,
-    encode_figure_archive,
+    FigurePresentationContract,
+    decode_figure_archive_payload,
+    encode_figure_archive_payload,
 )
 from zlc_storage import flush_directory
 
@@ -57,7 +57,7 @@ def save_figure_archive(
     figure: DataFigure,
     path: str | os.PathLike[str],
     *,
-    display: FigureDisplayState | None = None,
+    presentation: FigurePresentationContract,
     metadata: Mapping[str, object] | None = None,
 ) -> Path:
     """Atomically replace one exact current Figure archive."""
@@ -65,9 +65,9 @@ def save_figure_archive(
     target = _target_path(path)
     if not target.parent.is_dir():
         raise FileNotFoundError(f"figure archive directory does not exist: {target.parent}")
-    payload = encode_figure_archive(
+    payload = encode_figure_archive_payload(
         figure,
-        display=display,
+        presentation=presentation,
         metadata=metadata,
     )
     schema_array = np.frombuffer(
@@ -117,7 +117,7 @@ def load_figure_archive(
         payload = encoded_payload.tobytes(order="C")
     return LoadedFigureArchive(
         target,
-        decode_figure_archive(payload),
+        decode_figure_archive_payload(payload),
     )
 
 

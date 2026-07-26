@@ -25,6 +25,7 @@ from PyQt5 import QtCore, QtTest, QtWidgets
 from gui_user_flow import (
     capture_offscreen_window,
     click_tab,
+    close_pulse_editor,
     configure_offscreen_fast_path,
     require_offscreen_platform,
     until,
@@ -167,7 +168,6 @@ def capture_offscreen_pulse_gui_user_flow(
         repository_path = Path(repository).expanduser().resolve()
 
     body = open_pulse_editor(repository=repository_path)
-    wrapper = body.window()
     captures: list[dict[str, object]] = []
     try:
         captures.append(
@@ -253,9 +253,7 @@ def capture_offscreen_pulse_gui_user_flow(
             )
         )
     finally:
-        body.request_close(discard_unsaved=True)
-        until(application, lambda: body._controller.runtime_update().close_complete)
-        until(application, lambda: wrapper is None or not wrapper.isVisible())
+        close_pulse_editor(application, body)
         if temporary is not None:
             temporary.cleanup()
 

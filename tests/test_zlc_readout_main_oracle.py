@@ -30,7 +30,6 @@ from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.logic_nodes.readout.calibration.analysis import (
     CalibrationAnalysisRequest,
     CalibrationComputation,
-    _calibrate_readout_frames,
     _validate_site_center_admission,
     find_site_centers,
 )
@@ -43,7 +42,7 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     PerSitePsfFeature,
     ReadoutModelKind,
     UniformPsfFeature,
-    apply_calibration,
+    apply_readout_model,
     extract_readout_features,
 )
 from zlc_neutral_atom.logic_nodes.readout.contracts import (
@@ -52,6 +51,7 @@ from zlc_neutral_atom.logic_nodes.readout.contracts import (
 )
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.logic_nodes.readout.physical_context import ReadoutPhysicalContext
+from tests.calibration_physics_oracle import calibrate_readout_arrays_for_test
 
 
 _FIXTURES = Path(__file__).with_name("fixtures")
@@ -253,7 +253,7 @@ def test_main_quick_threshold_remains_runtime_fallback_when_label_fit_is_nan() -
         box_radius=0,
     )
 
-    result = _calibrate_readout_frames(
+    result = calibrate_readout_arrays_for_test(
         references,
         short,
         source_binding=source_binding,
@@ -281,15 +281,16 @@ def test_main_quick_threshold_remains_runtime_fallback_when_label_fit_is_nan() -
         _assert_close(model.thresholds, [expected_threshold])
         np.testing.assert_array_equal(model.usable_sites.mask, [True])
 
-        bright = apply_calibration(
-            result.artifact,
+        model = result.artifact.select_model(kind)
+        bright = apply_readout_model(
+            model,
             _frame(short[0], frame_contract),
-            model_kind=kind,
+            expected_frame_schema=frame_contract.frame_schema,
         )
-        dark = apply_calibration(
-            result.artifact,
+        dark = apply_readout_model(
+            model,
             _frame(short[-1], frame_contract),
-            model_kind=kind,
+            expected_frame_schema=frame_contract.frame_schema,
         )
         np.testing.assert_array_equal(bright.occupied.values, [True])
         np.testing.assert_array_equal(dark.occupied.values, [False])
@@ -309,7 +310,7 @@ def calibrated(
         expected_centers_xy=oracle["centers_row_major"],
         maximum_site_residual_px=0.1,
     )
-    result = _calibrate_readout_frames(
+    result = calibrate_readout_arrays_for_test(
         references,
         short,
         source_binding=source_binding,
@@ -431,7 +432,7 @@ def test_brighter_extra_peak_cannot_enter_an_authoritative_site_map():
         ValueError,
         match="differs from expected_centers_xy",
     ):
-        _calibrate_readout_frames(
+        calibrate_readout_arrays_for_test(
             references,
             short,
             source_binding=source,
@@ -723,10 +724,10 @@ def test_runtime_uses_training_features_and_preserves_repeat_point_site_shape(
         all_signals = np.empty_like(training_report.short_signals)
         all_occupied = np.empty_like(training_report.predictions)
         for group in range(short_frames.shape[0]):
-            applied = apply_calibration(
-                result.artifact,
+            applied = apply_readout_model(
+                result.artifact.select_model(kind),
                 _frame(short_frames[group], frame_contract),
-                model_kind=kind,
+                expected_frame_schema=frame_contract.frame_schema,
             )
             all_signals[group, :] = applied.signals.values
             all_occupied[group, :] = applied.occupied.values
@@ -740,10 +741,10 @@ def test_runtime_uses_training_features_and_preserves_repeat_point_site_shape(
         runtime_occupied = np.empty((*probe_grid.shape, site_count), dtype=bool)
         for repeat, point in np.ndindex(probe_grid.shape):
             frame_index = int(probe_grid[repeat, point])
-            applied = apply_calibration(
-                result.artifact,
+            applied = apply_readout_model(
+                result.artifact.select_model(kind),
                 _frame(short_frames[frame_index], frame_contract),
-                model_kind=kind,
+                expected_frame_schema=frame_contract.frame_schema,
             )
             runtime_signals[repeat, point, :] = applied.signals.values
             runtime_occupied[repeat, point, :] = applied.occupied.values

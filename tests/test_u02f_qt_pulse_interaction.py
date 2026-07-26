@@ -217,7 +217,7 @@ def test_pulse_cross_pins_and_clears() -> None:
         assert cross is not None, "right click must pin the continuous cross"
         payload = board.visible_pulse_payload()
         x_low, x_high = payload.viewport.x_limits
-        assert x_low <= cross.x <= x_high
+        assert x_low <= cross[0] <= x_high
 
         board.mouseDoubleClickEvent(
             QtGui.QMouseEvent(

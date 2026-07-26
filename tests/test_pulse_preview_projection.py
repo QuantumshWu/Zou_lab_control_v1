@@ -22,7 +22,7 @@ from zlc_frontend.render_style import (
     panel_axes_bounds,
     panel_display_size,
 )
-from zlc_workbench.pulse import project_pulse_preview
+from zlc_workbench.pulse_editor.session import project_pulse_preview
 from zlc_workbench.pulse_editor.preview_projection import (
     pulse_preview_status,
     pulse_timeline_render_kwargs,

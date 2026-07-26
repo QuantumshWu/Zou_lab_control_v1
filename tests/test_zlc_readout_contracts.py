@@ -374,6 +374,38 @@ def test_multievent_calibration_contract_matches_same_single_event_occupancy() -
     assert calibrated.readout_mode == "low-noise"
 
 
+def test_live_camera_working_point_requires_the_complete_frame_contract() -> None:
+    calibrated = _contract()
+    live_facts = replace(
+        _physical_facts(),
+        exposure_seconds=0.002,
+        gain=2.0,
+        readout_mode="low-noise",
+        opaque_frame_settings_fingerprint="1" * 64,
+    )
+    frame_schema = _schema().cell_schema
+    calibrated.assert_compatible_working_point(
+        BINDING,
+        live_facts,
+        frame_schema,
+    )
+
+    for change in (
+        {"optical_path": "alternate-imaging-v1"},
+        {"roi_origin_yx": (11, 20)},
+        {"exposure_seconds": 0.0021},
+        {"gain": 2.1},
+        {"readout_mode": "alternate-mode"},
+        {"opaque_frame_settings_fingerprint": "9" * 64},
+    ):
+        with pytest.raises(ValueError, match="readout frame contract mismatch"):
+            calibrated.assert_compatible_working_point(
+                BINDING,
+                replace(live_facts, **change),
+                frame_schema,
+            )
+
+
 def test_reference_schedule_and_capture_fingerprint_do_not_leak_into_frame_applicability() -> None:
     descriptor = _descriptor(
         event_settings=(

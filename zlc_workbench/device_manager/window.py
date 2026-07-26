@@ -11,6 +11,7 @@ lifecycle boundaries only (initialize and shutdown-for-restart).
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_frontend.qt_widgets import (
@@ -53,6 +54,7 @@ from zlc_neutral_atom.installation_config import (
 
 from .controller import DeviceAdminState, DeviceManagerController
 from .editor_session import form_spec
+from zlc_workbench.window_runtime import wait_for_owner_retirement
 
 
 _BACKEND_PRESENTATION = (
@@ -129,6 +131,7 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self._shutdown_on_owner_close = bool(shutdown_on_owner_close)
         self._window = None
         self._permanently_closed = False
+        self._owner_closed = threading.Event()
         self._owner_close_pending = False
         self._close_after_shutdown = False
         self._last_status = ("ready", "info")
@@ -623,6 +626,13 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self._window.raise_()
         self._window.activateWindow()
 
+    def wait_owner_closed(self, timeout: float) -> bool:
+        return wait_for_owner_retirement(
+            self,
+            self._owner_closed,
+            timeout=timeout,
+        )
+
     def request_owner_close(self) -> None:
         """Retire a notebook-owned window on the Qt owner thread."""
 
@@ -690,6 +700,7 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
             release_window(window)
             window.hide()
             window.deleteLater()
+        self._owner_closed.set()
 
     def _request_standalone_close(self) -> bool:
         return self._begin_owned_close()

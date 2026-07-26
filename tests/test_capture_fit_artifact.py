@@ -54,7 +54,12 @@ from zlc_neutral_atom.runtime.resources import (
 from zlc_neutral_atom.runtime.run import RunController
 from zlc_neutral_atom.capture.triggered import TriggeredCaptureSpec
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
-from zlc_pulse import PulseExecutionForm, load_deployed_pulse_target, load_pulse_document
+from zlc_pulse import (
+    PulseExecutionForm,
+    load_deployed_pulse_target,
+    load_pulse_document,
+    pulse_target_manifest_from_lanes,
+)
 from zlc_storage import (
     ContentCorruptionError,
     ContentStoreAuthority,
@@ -192,8 +197,7 @@ class _CaptureCase:
                 "fixture-camera",
                 camera_endpoint,
                 SafetyOperation.DISARM,
-            ),
-            (SafetyOperation.DISARM,),
+            )
         )
         target = load_deployed_pulse_target()
         self.sequencer = VirtualSequencer(
@@ -201,7 +205,10 @@ class _CaptureCase:
             clock_hz=default_clock_hz(DEFAULT_CONFIG_PATH),
             sleep_scale=0,
         )
-        pulse_endpoint = VirtualSequencerExecutionEndpoint(self.sequencer)
+        pulse_endpoint = VirtualSequencerExecutionEndpoint(
+            self.sequencer,
+            pulse_target_manifest_from_lanes(target),
+        )
         pulse_port = BoundPulsePort(
             _bind_endpoint(
                 self.broker,
@@ -230,9 +237,8 @@ class _CaptureCase:
         )
         pipeline = MinimalPipelineSpec(
             "capture fit source",
-            binding.measurement,
+            binding.capture,
             BlockId("capture-fit-source"),
-            timeout_seconds=2.0,
         )
         triggered = TriggeredCaptureSpec(
             pipeline,

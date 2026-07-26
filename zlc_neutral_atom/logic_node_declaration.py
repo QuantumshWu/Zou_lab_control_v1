@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from zlc_neutral_atom.authoring import AuthoringChoice, AuthoringSchema
+from zlc_neutral_atom.artifact_output import ArtifactOutputDeclaration
 from zlc_neutral_atom.catalog import (
     MeasurementDefinition,
     ProcessorDefinition,
@@ -85,6 +86,38 @@ class OutputPresentation:
         if not isinstance(self.description, str):
             raise TypeError("output presentation description must be str")
 
+    @property
+    def name(self) -> str:
+        return self.declaration.name
+
+    @property
+    def contract_id(self) -> str:
+        return self.declaration.contract_id
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactOutputPresentation:
+    """Human-facing label for one FINAL artifact, never a plottable signal."""
+
+    declaration: ArtifactOutputDeclaration
+    short: str
+    description: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.declaration, ArtifactOutputDeclaration):
+            raise TypeError("declaration must be ArtifactOutputDeclaration")
+        canonical_text(self.short, "artifact output short label")
+        if not isinstance(self.description, str):
+            raise TypeError("artifact output description must be str")
+
+    @property
+    def name(self) -> str:
+        return self.declaration.name
+
+    @property
+    def contract_id(self) -> str:
+        return self.declaration.contract_id
+
 
 @dataclass(frozen=True, slots=True)
 class DefaultOutputView:
@@ -113,11 +146,8 @@ class LogicNodeDeclaration:
     outputs: tuple[OutputPresentation, ...]
     build_request: Callable[[Mapping[str, object]], object]
     bind_request: Callable[[object, BoundNodeInputs], object]
-    request_output_declarations: (
-        Callable[[object], tuple[DatasetOutputDeclaration, ...]] | None
-    ) = None
-    request_output_axis_label: str | None = None
-    request_output_description: str = ""
+    artifact_outputs: tuple[ArtifactOutputPresentation, ...] = ()
+    resolve_outputs: Callable[[object], tuple[OutputPresentation, ...]] | None = None
     default_views: tuple[DefaultOutputView, ...] = ()
     path_presentations: tuple[PathPresentationHint, ...] = ()
     input_path_presentations: tuple[PathPresentationHint, ...] = ()
@@ -146,24 +176,34 @@ class LogicNodeDeclaration:
         outputs = tuple(self.outputs)
         if any(not isinstance(value, OutputPresentation) for value in outputs):
             raise TypeError("outputs must contain OutputPresentation values")
-        names = tuple(value.declaration.name for value in outputs)
+        names = tuple(value.name for value in outputs)
         if len(names) != len(set(names)):
             raise ValueError("Logic-node output names must be unique")
         object.__setattr__(self, "outputs", outputs)
-        dynamic = self.request_output_declarations
+        artifacts = tuple(self.artifact_outputs)
+        if any(
+            not isinstance(value, ArtifactOutputPresentation)
+            for value in artifacts
+        ):
+            raise TypeError(
+                "artifact_outputs must contain ArtifactOutputPresentation values"
+            )
+        artifact_names = tuple(value.name for value in artifacts)
+        if len(artifacts) > 1:
+            raise ValueError(
+                "one Logic-node Run has one FINAL result and therefore may declare "
+                "at most one Artifact output"
+            )
+        if len(artifact_names) != len(set(artifact_names)):
+            raise ValueError("Logic-node artifact output names must be unique")
+        if set(names) & set(artifact_names):
+            raise ValueError("Dataset and Artifact output names cannot overlap")
+        object.__setattr__(self, "artifact_outputs", artifacts)
+        dynamic = self.resolve_outputs
         if dynamic is not None and not callable(dynamic):
-            raise TypeError("request_output_declarations must be callable or None")
+            raise TypeError("resolve_outputs must be callable or None")
         if dynamic is not None and outputs:
             raise ValueError("static and request-owned outputs are mutually exclusive")
-        if dynamic is None and self.request_output_axis_label is not None:
-            raise ValueError("static outputs cannot declare a dynamic axis label")
-        if dynamic is not None:
-            canonical_text(
-                self.request_output_axis_label,
-                "request output axis label",
-            )
-        if not isinstance(self.request_output_description, str):
-            raise TypeError("request_output_description must be str")
         views = tuple(self.default_views)
         if any(not isinstance(value, DefaultOutputView) for value in views):
             raise TypeError("default_views must contain DefaultOutputView values")
@@ -230,8 +270,29 @@ class LogicNodeDeclaration:
         if not callable(self.bind_request):
             raise TypeError("bind_request must be callable")
 
+    def outputs_for(self, request: object) -> tuple[OutputPresentation, ...]:
+        """Return the complete output vocabulary owned by this declaration.
+
+        Request-dependent cardinality never splits physical declarations from
+        their labels.  Every consumer receives the same immutable
+        :class:`OutputPresentation` values as static declarations.
+        """
+
+        resolver = self.resolve_outputs
+        outputs = self.outputs if resolver is None else tuple(resolver(request))
+        if any(not isinstance(value, OutputPresentation) for value in outputs):
+            raise TypeError("output resolver must return OutputPresentation values")
+        names = tuple(value.name for value in outputs)
+        if len(names) != len(set(names)):
+            raise ValueError("Logic-node output names must be unique")
+        artifact_names = {value.name for value in self.artifact_outputs}
+        if set(names) & artifact_names:
+            raise ValueError("Dataset and Artifact output names cannot overlap")
+        return tuple(outputs)
+
 
 __all__ = [
+    "ArtifactOutputPresentation",
     "DefaultOutputView",
     "DynamicChoicePresentation",
     "LogicNodeDeclaration",

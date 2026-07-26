@@ -90,11 +90,13 @@ from zlc_storage import (
     canonical_text,
     encode,
 )
-
-from .contracts import (
+from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSlotSegmentedProgram,
     AutonomousScanSlotProgram,
-    PulseScanProgram,
+    PulseParameterScanProgram,
+)
+
+from .contracts import (
     ScanOutputContract,
     bind_scan_output_contract,
 )
@@ -411,7 +413,7 @@ class PreparedExactScan:
     def __init__(
         self,
         *,
-        program: PulseScanProgram,
+        program: PulseParameterScanProgram,
         source_schema: DatasetSchema,
         output_contract: ScanOutputContract,
         descriptor: PulseScanPlanDescriptor,
@@ -623,9 +625,9 @@ def prepare_exact_scan(
 
 
 def _bind_program_target(
-    program: PulseScanProgram,
+    program: PulseParameterScanProgram,
     pulse_port: BoundPulsePort,
-) -> PulseScanProgram:
+) -> PulseParameterScanProgram:
     document = bind_pulse_document_target(
         program.document,
         pulse_port.capability.target,
@@ -642,7 +644,7 @@ def _bind_program_target(
 
 
 def _compile_pulse_requests(
-    program: PulseScanProgram,
+    program: PulseParameterScanProgram,
     pulse_port: BoundPulsePort,
     association_requirement: SignalAssociationScheduleRequirement,
 ) -> tuple[FinitePulseExecutionRequest, ...]:
@@ -847,7 +849,7 @@ def _execute_scan(
     prepared: _PreparedScan,
     *,
     request: PulseScanBoundRequest,
-    program: PulseScanProgram,
+    program: PulseParameterScanProgram,
     source: SignalEventAssociationSource,
     output_name: str,
     source_schema: DatasetSchema,
@@ -1005,7 +1007,7 @@ def _execute_scan(
 
 
 def _identity_output_snapshot(
-    program: PulseScanProgram,
+    program: PulseParameterScanProgram,
     source: OwnedSnapshot,
     output_contract: ScanOutputContract,
 ) -> OwnedSnapshot:
@@ -1029,7 +1031,7 @@ def _identity_output_snapshot(
 def _compile_scan_plan(
     request: PulseScanBoundRequest,
     *,
-    program: PulseScanProgram,
+    program: PulseParameterScanProgram,
     source: SignalEventAssociationSource,
     output_name: str,
     source_schema: DatasetSchema,

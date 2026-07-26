@@ -12,7 +12,6 @@ from zlc_data import (
     DatasetSchema,
     FitResultBatch,
     Selection,
-    dataset_revision_ref_to_tree,
     validate_fit_result_source_binding,
 )
 from zlc_storage import canonical_digest, canonical_text
@@ -28,15 +27,18 @@ from .figure import (
     EvaluatedHistogram,
     EvaluatedImage,
     EvaluatedLayer,
+    EvaluatedMeter,
     FigureDocument,
     FigureEvaluator,
     FigureLayer,
     FixedIndex,
     ResolvedDatasetMap,
     ViewIntent,
+    view_spec_to_tree,
 )
 from .figure.contract import _validate_selection_fit_view
 from .curve_display import numeric_curve_coordinates
+from .render import PanelPresentationIdentity, RasterBuffer
 
 if TYPE_CHECKING:
     from .fit_curve_projection import CurveFitOverlayPlan
@@ -354,10 +356,11 @@ class DataFigure:
             ViewIntent.CURVE: EvaluatedCurve,
             ViewIntent.HISTOGRAM: EvaluatedHistogram,
             ViewIntent.IMAGE: EvaluatedImage,
+            ViewIntent.METER: EvaluatedMeter,
         }.get(expected_intent)
         if data_type is None:
             raise ValueError(
-                "focused typed panels currently support CURVE, HISTOGRAM, or IMAGE"
+                "focused typed panels require CURVE, HISTOGRAM, IMAGE, or METER"
             )
         if (
             len(self._document.layers) != 1
@@ -465,17 +468,17 @@ class DataFigure:
             if incumbent != candidate:
                 raise RuntimeError("focused typed resolution conflicts with its facet")
 
+        descriptor = self._document.descriptor(layer.dataset_id)
         identity = canonical_digest(
             {
                 "schema": "zlc_frontend.FocusedTypedPanel",
                 "source_document_id": self._document.document_id,
                 "source_document_revision": self._document.revision,
                 "dataset_id": layer.dataset_id.value,
+                "schema_fingerprint": descriptor.schema_fingerprint,
                 "intent": expected_intent.value,
-                "dataset_revision_ref": dataset_revision_ref_to_tree(
-                    self._evaluated.inputs[0].ref
-                ),
                 "layer_id": layer.layer_id,
+                "view": view_spec_to_tree(source_layer.view),
                 "panel_index": panel_index,
                 "facet_indices": tuple(
                     (address.axis_id.value, address.index)
@@ -487,7 +490,6 @@ class DataFigure:
             }
         )
         document_id = f"typed-focus-{identity}"
-        descriptor = self._document.descriptor(layer.dataset_id)
         focused_document = FigureDocument(
             document_id,
             0,
@@ -803,7 +805,59 @@ class DataFigure:
     def _repr_png_(self) -> bytes:
         return self.to_png_bytes()
 
+
+@dataclass(frozen=True, slots=True)
+class FacetedOverviewArtifact:
+    """One indivisible rendered overview of one frozen ``DataFigure``."""
+
+    figure: DataFigure
+    raster: RasterBuffer
+    regions: tuple[FigurePanelRegion, ...]
+    logical_size: tuple[int, int]
+    presentation: PanelPresentationIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.figure, DataFigure):
+            raise TypeError("faceted overview figure must be DataFigure")
+        if not isinstance(self.raster, RasterBuffer):
+            raise TypeError("faceted overview raster must be RasterBuffer")
+        regions = tuple(self.regions)
+        if len(regions) <= 1 or any(
+            not isinstance(item, FigurePanelRegion) for item in regions
+        ):
+            raise ValueError(
+                "faceted overview requires multiple exact FigurePanelRegion values"
+            )
+        if len({item.key for item in regions}) != len(regions):
+            raise ValueError("faceted overview region keys must be unique")
+        if any(item.focus_selection is None for item in regions):
+            raise ValueError("faceted overview regions require exact selections")
+        logical_size = tuple(self.logical_size)
+        if len(logical_size) != 2 or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in logical_size
+        ):
+            raise ValueError(
+                "faceted overview logical_size must be two positive integers"
+            )
+        if not isinstance(self.presentation, PanelPresentationIdentity):
+            raise TypeError(
+                "faceted overview presentation must be PanelPresentationIdentity"
+            )
+        document = self.figure.document
+        if (
+            self.presentation.document_id != document.document_id
+            or self.presentation.document_revision != document.revision
+        ):
+            raise ValueError(
+                "faceted overview presentation belongs to another Figure"
+            )
+        object.__setattr__(self, "regions", regions)
+        object.__setattr__(self, "logical_size", logical_size)
+
+
 __all__ = [
     "DataFigure",
+    "FacetedOverviewArtifact",
     "FigurePanelRegion",
 ]

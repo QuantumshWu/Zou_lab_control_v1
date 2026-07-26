@@ -2,7 +2,11 @@
 
 from importlib import import_module
 
-from ._arrays import immutable_array
+from ._arrays import (
+    immutable_array,
+    immutable_bool_broadcast,
+    is_intrinsically_immutable_array,
+)
 from ._diagnostic import exact_integer_text
 from .axis import (
     COMPONENT,
@@ -55,6 +59,7 @@ from .validity import (
     VALID,
     CellValidity,
     ComponentValidity,
+    DatasetComponentValidity,
     Invalid,
     RowComponentValidity,
     Valid,
@@ -98,7 +103,6 @@ from .transform import (
     ValidityPolicy,
     apply_transform,
     commit_transform,
-    materialize_transformed_snapshot,
     resolve_transformed_schema,
 )
 from .transform_codec import (
@@ -182,6 +186,7 @@ __all__ = [
     "CoordinateFrameId",
     "DataBlock",
     "DataTransformSpec",
+    "DatasetComponentValidity",
     "DatasetRevision",
     "DatasetRevisionRef",
     "DatasetSchema",
@@ -205,6 +210,8 @@ __all__ = [
     "IndexRangeSelection",
     "IndexSelection",
     "immutable_array",
+    "immutable_bool_broadcast",
+    "is_intrinsically_immutable_array",
     "CoordinateRangeSelection",
     "MissingPolicy",
     "OwnedSnapshot",
@@ -256,7 +263,6 @@ __all__ = [
     "encode_fit_spec",
     "exact_integer_text",
     "resolve_transformed_schema",
-    "materialize_transformed_snapshot",
     "materialize_component_dataset",
     "materialize_dataset_acceptance_mask",
     "materialize_dataset_selection",

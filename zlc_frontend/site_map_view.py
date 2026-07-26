@@ -34,11 +34,12 @@ from zlc_frontend.figure import DatasetId, EvaluatedImage, EvaluatedInput, evalu
 from zlc_frontend.figure_outputs import (
     AREA_DATA_OUTPUT,
     FigureDerivedSignal,
-    FigureOutputSource,
+    area_data_output_presentation,
     figure_derived_signal,
     figure_output_revision_ref,
     materialize_area_range_output,
 )
+from zlc_frontend.figure_source import FigureSource
 from zlc_frontend.image_view import ImageViewportTransform
 from zlc_frontend.site_map import immutable_site_state, site_ring_radius
 
@@ -92,7 +93,7 @@ def _site_map_data_snapshot(
 
 
 def _site_map_area_outputs(
-    source: FigureOutputSource,
+    source: FigureSource,
     selection: Selection,
     view,
 ) -> dict[str, FigureDerivedSignal]:
@@ -218,6 +219,9 @@ def _site_map_area_outputs(
         result,
         source,
         preserve_source_coverage=False,
+        presentation=area_data_output_presentation(
+            source.source_contract_id,
+        ),
         derivation_digest=derivation_digest,
     )
     return outputs
@@ -532,7 +536,7 @@ class SiteMapView:
 
     def materialize_area_outputs(
         self,
-        source: FigureOutputSource,
+        source: FigureSource,
         selection: Selection,
     ) -> dict[str, FigureDerivedSignal]:
         return _site_map_area_outputs(source, selection, self)

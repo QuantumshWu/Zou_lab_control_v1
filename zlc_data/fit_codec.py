@@ -73,7 +73,7 @@ def fit_spec_from_tree(tree: Any) -> FitSpec:
     if not isinstance(fit_axes, list) or not isinstance(batch_axes, list) or not isinstance(constraints, list):
         raise ValueError("FitSpec axes and constraints must be lists")
     transform = data["committed_transform"]
-    return FitSpec(
+    spec = FitSpec(
         input_schema_fingerprint=data["input_schema_fingerprint"],
         committed_transform=(
             None if transform is None else committed_transform_from_tree(transform)
@@ -84,6 +84,9 @@ def fit_spec_from_tree(tree: Any) -> FitSpec:
         constraints=tuple(_constraint_from_tree(value) for value in constraints),
         numeric_policy=_numeric_policy_from_tree(data["numeric_policy"]),
     )
+    if encode(fit_spec_to_tree(spec)) != encode(tree):
+        raise ValueError("FitSpec tree is typed but non-canonical")
+    return spec
 
 
 def encode_fit_spec(spec: FitSpec) -> bytes:

@@ -35,6 +35,7 @@ from zlc_storage import (
 
 from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureDescriptor,
+    CameraPhysicalFacts,
     ReadoutBindingKey,
     camera_output_shape_yx,
     normalize_camera_count_dtype,
@@ -269,6 +270,66 @@ class FrameContract:
             count_unit=self.count_unit,
             frame_schema=self.frame_schema,
         )
+
+    @classmethod
+    def from_camera_working_point(
+        cls,
+        binding: ReadoutBindingKey,
+        physical_facts: CameraPhysicalFacts,
+        frame_schema: ValueSchema,
+    ) -> "FrameContract":
+        """Derive the complete readout contract from endpoint-read live facts."""
+
+        if not isinstance(binding, ReadoutBindingKey):
+            raise TypeError("binding must be ReadoutBindingKey")
+        if not isinstance(physical_facts, CameraPhysicalFacts):
+            raise TypeError("physical_facts must be CameraPhysicalFacts")
+        if not isinstance(frame_schema, ValueSchema):
+            raise TypeError("frame_schema must be ValueSchema")
+        return cls(
+            binding=binding,
+            camera_identity=physical_facts.camera_identity,
+            sensor_identity=physical_facts.sensor_identity,
+            optical_path=physical_facts.optical_path,
+            sensor_shape_yx=physical_facts.sensor_shape_yx,
+            roi_origin_yx=physical_facts.roi_origin_yx,
+            roi_shape_yx=physical_facts.roi_shape_yx,
+            binning_yx=physical_facts.binning_yx,
+            spatial_y_axis_id=physical_facts.spatial_y_axis_id,
+            spatial_x_axis_id=physical_facts.spatial_x_axis_id,
+            coordinate_frame=physical_facts.coordinate_frame,
+            dtype=physical_facts.dtype,
+            count_unit=physical_facts.count_unit,
+            exposure_seconds=physical_facts.exposure_seconds,
+            gain=physical_facts.gain,
+            readout_mode=physical_facts.readout_mode,
+            opaque_frame_settings_fingerprint=(
+                physical_facts.opaque_frame_settings_fingerprint
+            ),
+            frame_schema=frame_schema,
+        )
+
+    def assert_compatible_working_point(
+        self,
+        binding: ReadoutBindingKey,
+        physical_facts: CameraPhysicalFacts,
+        frame_schema: ValueSchema,
+    ) -> None:
+        """Reject a live source unless every calibration-relevant fact agrees."""
+
+        observed = type(self).from_camera_working_point(
+            binding,
+            physical_facts,
+            frame_schema,
+        )
+        if observed == self:
+            return
+        mismatches = tuple(
+            item.name
+            for item in fields(FrameContract)
+            if getattr(observed, item.name) != getattr(self, item.name)
+        )
+        raise ValueError("readout frame contract mismatch: " + ", ".join(mismatches))
 
     @classmethod
     def _from_schema_impl(

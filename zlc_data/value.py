@@ -21,6 +21,7 @@ from .validity import (
     VALID,
     CellValidity,
     ComponentValidity,
+    DatasetComponentValidity,
     Invalid,
     Valid,
     ValidityMode,
@@ -233,7 +234,7 @@ class DataBlock:
     block_id: BlockId
     revision: DatasetRevision
     values: np.ndarray
-    validity: Valid | Invalid | CellValidity | ComponentValidity
+    validity: Valid | Invalid | CellValidity | DatasetComponentValidity
     schema: DatasetSchema
     __hash__ = None
 
@@ -314,7 +315,7 @@ def dataset_cell_value(
             if bool(validity.mask[repeat_index, point_storage_index])
             else INVALID
         )
-    elif isinstance(validity, ComponentValidity):
+    elif isinstance(validity, DatasetComponentValidity):
         cell_validity = ComponentValidity(
             validity.axis_ids,
             validity.mask[repeat_index, point_storage_index],
@@ -371,7 +372,7 @@ def expand_component_validity(
 
 
 def expand_dataset_validity(
-    validity: Valid | Invalid | CellValidity | ComponentValidity,
+    validity: Valid | Invalid | CellValidity | DatasetComponentValidity,
     schema: DatasetSchema,
 ) -> np.ndarray:
     """Return validity aligned to ``(R, P, *data_shape)`` by named axes."""
@@ -401,7 +402,10 @@ def _axis_positions(axis_ids: tuple[AxisId, ...], schema: ValueSchema) -> tuple[
     return positions
 
 
-def _validate_component_axes(validity: ComponentValidity, schema: ValueSchema) -> tuple[int, ...]:
+def _validate_component_axes(
+    validity: ComponentValidity | DatasetComponentValidity,
+    schema: ValueSchema,
+) -> tuple[int, ...]:
     if schema.validity_contract.mode is not ValidityMode.COMPONENTS:
         raise ValueError("component validity is forbidden by VALUE validity contract")
     declared = schema.validity_contract.component_axis_ids
@@ -427,7 +431,7 @@ def _validate_value_validity(
 
 
 def _validate_dataset_validity(
-    validity: Valid | Invalid | CellValidity | ComponentValidity,
+    validity: Valid | Invalid | CellValidity | DatasetComponentValidity,
     schema: DatasetSchema,
 ) -> None:
     leading = (schema.repeat_axis.size, schema.point_layout.storage_size)
@@ -439,7 +443,7 @@ def _validate_dataset_validity(
                 f"cell validity shape {validity.mask.shape} does not match dataset cells {leading}"
             )
         return
-    if not isinstance(validity, ComponentValidity):
+    if not isinstance(validity, DatasetComponentValidity):
         raise TypeError("DataBlock validity has an unsupported type")
     positions = _validate_component_axes(validity, schema.cell_schema)
     expected = leading + tuple(schema.cell_schema.data_axes[index].size for index in positions)

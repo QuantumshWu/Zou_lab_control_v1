@@ -78,7 +78,7 @@ def _model_rising_ticks(ir, channel):
     ("path", "form", "channel"),
     [
         (IMAGING_PULSE, PulseExecutionForm.STATIC_ONCE, "ch11"),
-        (ROOT / "pulses" / "mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch11"),
+        (ROOT / "pulses" / "mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch06"),
         (ROOT / "pulses" / "release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "ch11"),
     ],
 )
@@ -104,7 +104,7 @@ def test_scan_schedule_keeps_point_identity_before_output_delay():
         clock_hz=50e6,
         execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
     )
-    trigger_channel = "ch11"
+    trigger_channel = "ch06"
     bit = ir.channels.index(trigger_channel)
     delayed = replace(
         ir,

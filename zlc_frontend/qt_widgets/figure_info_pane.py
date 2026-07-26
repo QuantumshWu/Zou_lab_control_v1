@@ -8,6 +8,7 @@ from pprint import pformat
 
 from PyQt5 import QtCore, QtWidgets
 
+from ..flow_graph import FlowGraph
 from .flow_graph_view import FlowGraphView
 from .fluent import (
     FluentCodeEdit,
@@ -142,7 +143,7 @@ class FigureInfoPane(QtWidgets.QWidget):
         plot_rows,
         measurement_rows,
         device_rows,
-        flow_graph,
+        flow_graph: FlowGraph | None,
         raw_text: str,
     ) -> None:
         """Replace the Info generation after a new pane has been admitted."""

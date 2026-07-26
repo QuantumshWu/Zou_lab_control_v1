@@ -7,12 +7,10 @@ Preview, and Scan pages from drifting while their controllers are separated.
 
 from __future__ import annotations
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 from zlc_frontend.qt_widgets import (
-    FONT,
     FluentLabel,
-    fluent_font_size,
     measure_text_width,
     scaled_px,
 )
@@ -29,10 +27,6 @@ PERIOD_CARD_WIDTH = 158
 
 def px(value: int | float, *, minimum: int = 1) -> int:
     return scaled_px(value, minimum=minimum)
-
-
-def font_metrics() -> QtGui.QFontMetrics:
-    return QtGui.QFontMetrics(QtGui.QFont(FONT, fluent_font_size()))
 
 
 def row_height() -> int:
@@ -143,14 +137,6 @@ def channel_row_height() -> int:
     return px(ROW_HEIGHT, minimum=22)
 
 
-def elide_text(text: object, width: int) -> str:
-    return font_metrics().elidedText(
-        str(text),
-        QtCore.Qt.ElideRight,
-        max(8, int(width)),
-    )
-
-
 __all__ = [
     "add_labeled_widget",
     "bus_mode_combo_width",
@@ -158,8 +144,6 @@ __all__ = [
     "channel_label_width",
     "channel_name_edit_width",
     "channel_row_height",
-    "elide_text",
-    "font_metrics",
     "form_control_cell",
     "hide_button_width",
     "panel_top_height",

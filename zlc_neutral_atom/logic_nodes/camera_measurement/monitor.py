@@ -38,6 +38,10 @@ from zlc_neutral_atom.logic_nodes.camera_measurement.signal_source import (
     CameraSignalAssociationAuthority,
     camera_signal_event_source,
 )
+from zlc_neutral_atom.logic_nodes.camera_measurement.output_binding import (
+    CameraFrameOutputBinding,
+)
+from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.dataset_output import LiveDatasetOutput
 from zlc_neutral_atom.runtime._failure import safe_error_summary
 from zlc_neutral_atom.runtime.cancellation import CancellationRequested
@@ -374,6 +378,7 @@ class PreparedLiveCameraMeasurement:
         "_descriptor",
         "_edge",
         "_lock",
+        "_active_output_bindings",
         "_port",
         "_request",
         "_signal_source",
@@ -472,6 +477,7 @@ class PreparedLiveCameraMeasurement:
         )
         self._start_run = start_run
         self._lock = threading.Lock()
+        self._active_output_bindings: dict[str, CameraFrameOutputBinding] | None = None
         self._started = False
 
     @property
@@ -506,6 +512,20 @@ class PreparedLiveCameraMeasurement:
         """Follow this running Camera producer without acquiring its device."""
 
         return self._signal_source.open_signal_cursor(output_name)
+
+    def dataset_output_binding(self, output_name: str) -> CameraFrameOutputBinding:
+        """Return the endpoint-read binding for one currently active frame signal."""
+
+        if output_name not in self._request.output_names:
+            raise KeyError(f"Camera has no output {output_name!r}")
+        with self._lock:
+            bindings = self._active_output_bindings
+            if bindings is None:
+                raise RuntimeError(
+                    "Camera frame binding is unavailable until monitor preflight "
+                    "has read back the active working point"
+                )
+            return bindings[output_name]
 
     def start_with_view(
         self,
@@ -544,6 +564,8 @@ class PreparedLiveCameraMeasurement:
                 )
                 else None
             ),
+            activate_output_bindings=self._activate_output_bindings,
+            deactivate_output_bindings=self._deactivate_output_bindings,
         )
         try:
             return self._start_run(plan)
@@ -563,6 +585,35 @@ class PreparedLiveCameraMeasurement:
             if self._started:
                 raise RuntimeError("PreparedLiveCameraMeasurement is one-shot")
             self._started = True
+
+    def _activate_output_bindings(self, port: BoundCameraMonitorPort) -> None:
+        capability = port.capability
+        if capability.payload_contract.value_schema != self._edge.schema.cell_schema:
+            raise RuntimeError(
+                "configured Camera working point changed the declared frame schema"
+            )
+        binding = ReadoutBindingKey(self._request.camera_ref.role)
+        values = {
+            output.name: CameraFrameOutputBinding(
+                output=output,
+                readout_event_index=index,
+                readout_binding=binding,
+                capability_evidence=capability.camera_capability_evidence,
+                binding_stamp=capability.binding_stamp,
+                frame_schema=capability.payload_contract.value_schema,
+                stream_id=self._stream.stream_id,
+                stream_generation=self._stream.generation,
+            )
+            for index, output in enumerate(self._request.output_declarations)
+        }
+        with self._lock:
+            if self._active_output_bindings is not None:
+                raise RuntimeError("Camera frame bindings are already active")
+            self._active_output_bindings = values
+
+    def _deactivate_output_bindings(self) -> None:
+        with self._lock:
+            self._active_output_bindings = None
 
 
 class PreparedAssociatedLiveCameraMeasurement(PreparedLiveCameraMeasurement):
@@ -616,6 +667,9 @@ def _compile_camera_monitor_plan(
     stream: AcquisitionStream[CameraSample],
     producer: AcquisitionProducer[CameraSample],
     association_source: CameraAssociatedSignalEventSource | None,
+    *,
+    activate_output_bindings: Callable[[BoundCameraMonitorPort], None],
+    deactivate_output_bindings: Callable[[], None],
 ) -> RunPlan[_CameraMonitorTransaction, None, None]:
     spec = getattr(view, "spec", None)
     if not isinstance(spec, CameraMonitorViewSpec):
@@ -625,6 +679,10 @@ def _compile_camera_monitor_plan(
         uuid.uuid4().hex if request.exposure_seconds is not None else None
     )
     exposure_attempted = False
+    if not callable(activate_output_bindings) or not callable(
+        deactivate_output_bindings
+    ):
+        raise TypeError("Camera output binding lifecycle callbacks must be callable")
 
     def preflight(context: RunContext) -> _CameraMonitorTransaction:
         nonlocal exposure_attempted
@@ -647,6 +705,7 @@ def _compile_camera_monitor_plan(
                 association_source.bind_capability_fingerprint(
                     active_port.capability.capability_fingerprint
                 )
+            activate_output_bindings(active_port)
             tap = stream.monitor()
             raw_dataset = MonitorDataset.append_window(
                 spec.block_id,
@@ -671,6 +730,7 @@ def _compile_camera_monitor_plan(
                 association_source,
             )
         except BaseException as error:
+            deactivate_output_bindings()
             try:
                 view.fail(safe_error_summary(error))
             except BaseException:
@@ -705,6 +765,7 @@ def _compile_camera_monitor_plan(
         prepared: _CameraMonitorTransaction | None,
         primary: BaseException | None,
     ) -> CleanupReport:
+        deactivate_output_bindings()
         restore_exposure = None
         if exposure_attempted:
             assert exposure_session_id is not None

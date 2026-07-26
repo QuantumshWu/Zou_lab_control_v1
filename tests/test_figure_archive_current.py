@@ -13,12 +13,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5 import QtCore, QtTest, QtWidgets  # noqa: E402
 
 from test_u03b_interactive_curve_figure import _curve_figure, _until  # noqa: E402
-from zlc_frontend import CurveDisplayState  # noqa: E402
+from zlc_frontend import (  # noqa: E402
+    CurveDisplayState,
+    FigurePresentationContract,
+)
+from zlc_frontend.figure import ViewIntent  # noqa: E402
 from zlc_frontend.display_range import RelimMode  # noqa: E402
 from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app  # noqa: E402
 from zlc_workbench.figure_viewer.app import open_figure_viewer  # noqa: E402
 from zlc_workbench.data_figure.archive_repository import (  # noqa: E402
     load_figure_archive,
+    save_figure_archive,
 )
 
 
@@ -35,9 +40,19 @@ def _saved_curve(path):
         fixed_y_limits=(0.0, 8.0),
         x_view=(-1.0, 1.0),
     )
-    figure.save_archive(
+    save_figure_archive(
+        figure,
         path,
-        display=display,
+        presentation=FigurePresentationContract(
+            ViewIntent.CURVE,
+            False,
+            False,
+            False,
+            "curve",
+            "value",
+            "2x2",
+            display,
+        ),
         metadata={"device": "virtual"},
     )
     return figure, display
@@ -48,6 +63,7 @@ def _fit_ready_curve_figure():
 
     from zlc_data import (
         REPEAT,
+        SCALAR_AXIS,
         SCAN_POINT,
         AxisId,
         AxisSpec,
@@ -59,7 +75,6 @@ def _fit_ready_curve_figure():
         PointLayout,
         StreamGenerationId,
         VALID,
-        ValidityContract,
         ValueSchema,
         bind_fit,
         fit_spec_for,
@@ -95,17 +110,12 @@ def _fit_ready_curve_figure():
         "MHz",
     )
     x = np.asarray(scan.coordinates, dtype=np.float64)
-    values = (1.5 + 6.0 * np.exp(-((x - 14.0) / 3.5) ** 2))[None, :]
+    values = (1.5 + 6.0 * np.exp(-((x - 14.0) / 3.5) ** 2))[None, :, None]
     schema = DatasetSchema(
         repeat,
         (scan,),
         PointLayout.rect_c((scan.size,)),
-        ValueSchema(
-            (),
-            ValidityContract.value(),
-            values.dtype,
-            "count",
-        ),
+        ValueSchema.scalar(values.dtype, "count"),
     )
     block = DataBlock(
         BlockId("archive-local-curve"),
@@ -128,6 +138,11 @@ def _fit_ready_curve_figure():
                 selector=FixedIndex(0),
             ),
             AxisViewBinding(scan.axis_id, AxisViewRole.X),
+            AxisViewBinding(
+                SCALAR_AXIS.axis_id,
+                AxisViewRole.SELECTED,
+                selector=FixedIndex(0),
+            ),
         ),
     )
     dataset_id = DatasetId("archive-local-source")
@@ -171,7 +186,7 @@ def _archive_has_model(path, model_id: str) -> bool:
         archive = load_figure_archive(path)
     except Exception:
         return False
-    results = tuple(archive.figure.fit_results.values())
+    results = tuple(archive.archive.figure.fit_results.values())
     return len(results) == 1 and results[0].spec.model_id == model_id
 
 
@@ -185,9 +200,9 @@ def test_archive_roundtrip_preserves_multidimensional_source_and_validity(tmp_pa
 
     loaded = load_figure_archive(path)
     source = figure.datasets.entries[0].snapshot
-    reopened = loaded.figure.datasets.entries[0].snapshot
-    assert loaded.display == display
-    assert loaded.metadata["device"] == "virtual"
+    reopened = loaded.archive.figure.datasets.entries[0].snapshot
+    assert loaded.archive.presentation.display == display
+    assert loaded.archive.metadata["device"] == "virtual"
     assert reopened.ref == source.ref
     assert reopened.block.schema == source.block.schema
     assert reopened.block.values.shape == (2, 21, 3, 2)
@@ -266,7 +281,7 @@ def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
         )
         assert pane is not None and pane.isVisible()
         assert board is not None and board.isVisible()
-        digest = viewer.archive.payload_digest
+        digest = viewer.archive.archive.payload_digest
         assert not wrapper.grab().isNull()
 
         missing = tmp_path / "missing.npz"
@@ -283,7 +298,7 @@ def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
             lambda: viewer.worker_idle and status.severity == "error",
         )
         assert viewer.figure_pane is pane
-        assert viewer.archive.payload_digest == digest
+        assert viewer.archive.archive.payload_digest == digest
     finally:
         wrapper.close()
         _until(application, lambda: viewer._closed)
@@ -295,7 +310,21 @@ def test_formal_viewer_refits_and_reopens_the_same_archive(
 ):
     path = tmp_path / "refitted-curve.npz"
     original = _fit_ready_curve_figure()
-    original.save_archive(path, metadata={"source": "formal archive refit"})
+    save_figure_archive(
+        original,
+        path,
+        presentation=FigurePresentationContract(
+            ViewIntent.CURVE,
+            False,
+            False,
+            False,
+            "fitted curve",
+            "count",
+            "2x2",
+            CurveDisplayState(),
+        ),
+        metadata={"source": "formal archive refit"},
+    )
     original_ref = original.datasets.entries[0].snapshot.ref
 
     viewer = open_figure_viewer()
@@ -335,7 +364,7 @@ def test_formal_viewer_refits_and_reopens_the_same_archive(
         )
         save = pane.findChild(
             QtWidgets.QPushButton,
-            "fitAuthoringSaveButton",
+            "figureViewerSaveFitButton",
         )
         assert model is not None and fit is not None and save is not None
         assert model.currentData() == "gaussian_offset"
@@ -360,7 +389,7 @@ def test_formal_viewer_refits_and_reopens_the_same_archive(
             lambda: (
                 pane.worker_idle
                 and viewer.archive is not None
-                and tuple(viewer.archive.figure.fit_results.values())[0]
+                and tuple(viewer.archive.archive.figure.fit_results.values())[0]
                 .spec.model_id
                 == "lorentzian"
                 and _archive_has_model(path, "lorentzian")
@@ -368,8 +397,8 @@ def test_formal_viewer_refits_and_reopens_the_same_archive(
         )
 
         reopened = load_figure_archive(path)
-        assert reopened.metadata["source"] == "formal archive refit"
-        assert reopened.figure.datasets.entries[0].snapshot.ref == original_ref
+        assert reopened.archive.metadata["source"] == "formal archive refit"
+        assert reopened.archive.figure.datasets.entries[0].snapshot.ref == original_ref
         assert pane.saved_reference is None
         assert not wrapper.grab().isNull()
     finally:
@@ -412,7 +441,6 @@ def test_formal_viewer_keeps_old_generation_when_candidate_first_render_fails(
         old_front = old_board.front_frame
 
         import zlc_workbench.data_figure.app as workbench
-        import zlc_workbench.data_figure.render_lane as figure_workbench
 
         original_create = workbench.create_data_figure_pane
         candidates = []
@@ -427,8 +455,8 @@ def test_formal_viewer_keeps_old_generation_when_candidate_first_render_fails(
 
         monkeypatch.setattr(workbench, "create_data_figure_pane", tracked_create)
         monkeypatch.setattr(
-            figure_workbench,
-            "_render_typed_front",
+            workbench.DataFigureRenderSession,
+            "render_front",
             reject_initial_render,
         )
 

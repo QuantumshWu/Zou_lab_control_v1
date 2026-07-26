@@ -8,7 +8,7 @@ import pytest
 
 from zlc_pulse.scan_template import scan_table_template
 from zlc_neutral_atom.pulse_catalog import PROBE_PULSE_PATH
-from zlc_neutral_atom.logic_nodes.pulse_scan import (
+from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSegmentTable,
     ApiSlotSegmentedProgram,
 )

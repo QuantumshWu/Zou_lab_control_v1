@@ -72,6 +72,13 @@ class CellValidity:
 
 @dataclass(frozen=True, eq=False)
 class ComponentValidity:
+    """Validity over exactly the named axes of one :class:`Value`.
+
+    Dataset carrier axes are deliberately not implicit here.  A materialized
+    dataset uses :class:`DatasetComponentValidity`, whose leading repeat and
+    physical-point dimensions are part of that distinct carrier contract.
+    """
+
     axis_ids: tuple[AxisId, ...]
     mask: np.ndarray
     __hash__ = None
@@ -85,6 +92,44 @@ class ComponentValidity:
         if len(set(axis_ids)) != len(axis_ids):
             raise ValueError("ComponentValidity axis_ids must be unique")
         mask = np.asarray(self.mask)
+        if mask.ndim != len(axis_ids):
+            raise ValueError(
+                "ComponentValidity mask rank must equal its named-axis count"
+            )
+        object.__setattr__(self, "axis_ids", axis_ids)
+        object.__setattr__(self, "mask", immutable_bool_array(mask, shape=mask.shape))
+
+
+@dataclass(frozen=True, eq=False)
+class DatasetComponentValidity:
+    """Physical dataset validity over ``(R, P, *named component axes)``.
+
+    ``P`` is the dataset's physical point-storage index, not another guessed
+    logical axis.  Keeping this representation separate from
+    :class:`ComponentValidity` makes both ranks explicit and prevents a mask
+    meant for a single Value from being mistaken for a whole Dataset mask (or
+    vice versa).
+    """
+
+    axis_ids: tuple[AxisId, ...]
+    mask: np.ndarray
+    __hash__ = None
+
+    def __post_init__(self) -> None:
+        axis_ids = tuple(self.axis_ids)
+        if not axis_ids:
+            raise ValueError("DatasetComponentValidity requires a named component axis")
+        if any(not isinstance(axis_id, AxisId) for axis_id in axis_ids):
+            raise TypeError(
+                "DatasetComponentValidity axis_ids must contain AxisId values"
+            )
+        if len(set(axis_ids)) != len(axis_ids):
+            raise ValueError("DatasetComponentValidity axis_ids must be unique")
+        mask = np.asarray(self.mask)
+        if mask.ndim != 2 + len(axis_ids):
+            raise ValueError(
+                "DatasetComponentValidity mask rank must be 2 + named-axis count"
+            )
         object.__setattr__(self, "axis_ids", axis_ids)
         object.__setattr__(self, "mask", immutable_bool_array(mask, shape=mask.shape))
 

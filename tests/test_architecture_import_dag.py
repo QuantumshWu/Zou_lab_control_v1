@@ -255,6 +255,36 @@ def test_framework_and_device_owners_do_not_import_concrete_logic_nodes(
     )
 
 
+def test_task_console_does_not_reconstruct_figure_output_presentation():
+    """Figure owns derived-output vocabulary; Workbench only namespaces it."""
+
+    owner_path, _owner = _sole_definition("FigureOutputPresentation")
+    assert owner_path.relative_to(ROOT) == Path(
+        "zlc_frontend/figure_outputs.py"
+    )
+    forbidden = (
+        "FitParameterMetadata",
+        "figure_output_contract_id",
+        "AREA_DATA_OUTPUT",
+        "CROSS_X_OUTPUT",
+        "CROSS_Y_OUTPUT",
+        "FIT_OUTPUT_PREFIX",
+        "area.range.",
+    )
+    violations = []
+    task_console = ROOT / "zlc_workbench" / "task_console"
+    for source in sorted(task_console.rglob("*.py")):
+        text = source.read_text(encoding="utf-8")
+        for token in forbidden:
+            if token in text:
+                violations.append(f"{source.relative_to(ROOT)} contains {token}")
+    assert not violations, (
+        "TaskConsole may adapt FigureOutputPresentation into its panel namespace, "
+        "but must not parse or recreate Figure output names/contracts/labels:\n"
+        + "\n".join(violations)
+    )
+
+
 def test_device_owners_do_not_depend_back_on_installation_dispatch():
     """Concrete attachments consume low-level installation owners, never dispatch."""
 
@@ -322,6 +352,22 @@ if loaded:
         text=True,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_readout_bimodal_algorithm_is_owned_by_the_family_not_a_leaf():
+    duration = (
+        ROOT
+        / "zlc_neutral_atom"
+        / "logic_nodes"
+        / "readout"
+        / "duration_fidelity"
+        / "application.py"
+    )
+    imported = set(_imports(duration))
+    assert "zlc_neutral_atom.logic_nodes.readout.bimodal" in imported
+    assert (
+        "zlc_neutral_atom.logic_nodes.readout.calibration.analysis" not in imported
+    )
 
 
 def test_zlc_pulse_has_no_historical_target_importer():
@@ -938,10 +984,7 @@ def test_content_ref_codec_and_cas_address_have_one_storage_owner():
 
 def test_artifact_finalizers_do_not_replay_published_payload_digests():
     violations = []
-    for relative in (
-        Path("zlc_neutral_atom/capture/artifact.py"),
-        Path("zlc_neutral_atom/logic_nodes/readout/occupancy/pipeline.py"),
-    ):
+    for relative in (Path("zlc_neutral_atom/capture/artifact.py"),):
         path = ROOT / relative
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):

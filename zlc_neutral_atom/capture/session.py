@@ -78,7 +78,6 @@ from zlc_neutral_atom.runtime.streams import (
 
 
 _COMPLETION_TOKEN = object()
-_PROCESSOR_INPUT_BINDING_TOKEN = object()
 
 
 
@@ -468,113 +467,6 @@ class CaptureCompletion:
 
 
 
-class CaptureProcessorInputBinding:
-    """The exact stream edge and reservation minted by one capture session."""
-
-    __slots__ = (
-        "_capture_contract",
-        "_stream",
-        "_join_key_contract",
-        "_input_edge",
-        "_session_reservation",
-    )
-
-    def __init_subclass__(cls, **_kwargs) -> None:
-        raise TypeError("CaptureProcessorInputBinding is sealed")
-
-    def __init__(
-        self,
-        authority: object,
-        *,
-        capture_contract: CameraCaptureContract,
-        stream: AcquisitionStream,
-    ) -> None:
-        if authority is not _PROCESSOR_INPUT_BINDING_TOKEN:
-            raise PermissionError(
-                "CaptureProcessorInputBinding can only be minted by CaptureSession"
-            )
-        if not isinstance(capture_contract, CameraCaptureContract):
-            raise TypeError("capture_contract must be CameraCaptureContract")
-        if not isinstance(stream, AcquisitionStream):
-            raise TypeError("stream must be AcquisitionStream")
-        input_edge = capture_contract.dataset_edge
-        join_key_contract = stream._join_key_contract
-        if not isinstance(join_key_contract, DatasetCellKeyContract):
-            raise TypeError("capture stream has no DatasetCellKeyContract owner")
-        input_edge.validate_stream(stream)
-        if stream.stream_id != capture_contract.stream_id:
-            raise ValueError("processor stream id differs from capture contract")
-        object.__setattr__(self, "_capture_contract", capture_contract)
-        object.__setattr__(self, "_stream", stream)
-        object.__setattr__(self, "_join_key_contract", join_key_contract)
-        object.__setattr__(self, "_input_edge", input_edge)
-        object.__setattr__(self, "_session_reservation", None)
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("CaptureProcessorInputBinding is immutable")
-
-    @property
-    def capture_contract(self) -> CameraCaptureContract:
-        return self._capture_contract
-
-    @property
-    def stream(self) -> AcquisitionStream:
-        return self._stream
-
-    @property
-    def payload_contract(self) -> CapturePayloadContract:
-        return self._input_edge.payload_contract
-
-    @property
-    def join_key_contract(self) -> DatasetCellKeyContract:
-        return self._join_key_contract
-
-    @property
-    def input_edge(self) -> FrozenDatasetEdge:
-        return self._input_edge
-
-    def _bind_session_reservation(
-        self,
-        authority: object,
-        reservation: ExactReservation,
-    ) -> None:
-        """Record the one reservation minted through ``CaptureSession`` itself."""
-
-        if authority is not _PROCESSOR_INPUT_BINDING_TOKEN:
-            raise PermissionError("capture reservation binding is session-owned")
-        if type(reservation) is not ExactReservation:
-            raise TypeError("reservation must be an exact ExactReservation")
-        stream = self._stream
-        if reservation._stream is not stream:
-            raise PermissionError("reservation belongs to another capture stream")
-        with stream._condition:
-            if self._session_reservation is not None:
-                raise RuntimeError("capture session reservation was already bound")
-            if stream._reservations.get(reservation._token) is not reservation:
-                raise RuntimeError("capture session reservation is not registered")
-            if reservation.state is not ReservationState.RESERVED:
-                raise RuntimeError("capture session reservation is not RESERVED")
-            object.__setattr__(self, "_session_reservation", reservation)
-
-    def require_reservation(self, reservation: ExactReservation) -> None:
-        """Require the active reservation minted by this exact CaptureSession."""
-
-        if type(reservation) is not ExactReservation:
-            raise TypeError("reservation must be an exact ExactReservation")
-        stream = self._stream
-        if reservation is not self._session_reservation:
-            raise PermissionError(
-                "reservation was not minted by this CaptureSession"
-            )
-        with stream._condition:
-            if stream._reservations.get(reservation._token) is not reservation:
-                raise RuntimeError(
-                    "reservation is no longer registered with the capture stream"
-                )
-            if reservation.state is not ReservationState.ACTIVE:
-                raise RuntimeError("capture session reservation is not ACTIVE")
-
-
 class CaptureSession:
     """One owner of producer, device session id, ordinal, and terminal receipt."""
 
@@ -606,14 +498,8 @@ class CaptureSession:
                 contract.dataset_schema
             ),
         )
-        processor_input_binding = CaptureProcessorInputBinding(
-            _PROCESSOR_INPUT_BINDING_TOKEN,
-            capture_contract=contract,
-            stream=stream,
-        )
         self._stream = stream
         self._producer: AcquisitionProducer = producer
-        self._processor_input_binding = processor_input_binding
         self._state = CaptureSessionState.NEW
         self._delivered = 0
         self._metadata_hasher = OrderedDatasetMetadataHasher(
@@ -631,16 +517,6 @@ class CaptureSession:
     @property
     def stream(self) -> AcquisitionStream:
         return self._stream
-
-    @property
-    def processor_input_binding(self) -> CaptureProcessorInputBinding:
-        with self._lock:
-            if self._state is not CaptureSessionState.NEW:
-                raise RuntimeError(
-                    "processor input binding is only available while capture session is NEW"
-                )
-            binding = self._processor_input_binding
-            return binding
 
     @property
     def state(self) -> CaptureSessionState:
@@ -670,15 +546,6 @@ class CaptureSession:
                 self._stream.generation,
                 reservation.start_sequence,
             )
-            try:
-                self._processor_input_binding._bind_session_reservation(
-                    _PROCESSOR_INPUT_BINDING_TOKEN,
-                    reservation,
-                )
-            except BaseException:
-                reservation.abort()
-                reservation.release()
-                raise
             with self._lock:
                 self._reservation = reservation
                 self._source_event_span_hasher = source_event_span_hasher
@@ -1128,7 +995,6 @@ __all__ = [
     "CameraCaptureContract",
     "CameraCaptureProvenance",
     "CaptureCompletion",
-    "CaptureProcessorInputBinding",
     "CaptureSession",
     "CaptureSessionState",
     "camera_capture_provenance_from_tree",

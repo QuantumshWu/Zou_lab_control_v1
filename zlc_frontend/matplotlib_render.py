@@ -7,6 +7,7 @@ from ._mpl_document import (
     encode_evaluated_figure,
     encode_evaluated_figure_with_panel_regions,
     encode_evaluated_panel_with_regions,
+    FacetedPanelAggRenderer,
     render_evaluated_figure,
 )
 from ._mpl_image import (
@@ -25,6 +26,7 @@ __all__ = [
     "encode_evaluated_figure",
     "encode_evaluated_figure_with_panel_regions",
     "encode_evaluated_panel_with_regions",
+    "FacetedPanelAggRenderer",
     "encode_image_panel_png",
     "encode_radial_gaussian_image_fit_panels",
     "ImagePanelAggRenderer",

@@ -12,6 +12,8 @@ import time
 
 import numpy as np
 
+from gui_user_flow import close_task_console
+
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -31,7 +33,7 @@ def _image_value(
         AxisId,
         AxisSpec,
         BlockId,
-        ComponentValidity,
+        DatasetComponentValidity,
         CoordinateFrameId,
         DataBlock,
         DatasetRevision,
@@ -94,7 +96,7 @@ def _image_value(
         BlockId("current-image"),
         DatasetRevision(int(revision)),
         values,
-        ComponentValidity(
+        DatasetComponentValidity(
             (y_axis.axis_id, x_axis.axis_id),
             np.ones(values.shape, dtype=np.bool_),
         ),
@@ -137,8 +139,8 @@ def _present_value(console, card, value, *, frame_key) -> None:
 
 def test_cross_coordinates_keep_the_declared_scalar_data_axis() -> None:
     from zlc_data import AxisId
+    from zlc_frontend import FigureSource
     from zlc_frontend.figure_outputs import (
-        FigureOutputSource,
         SelectorAxisMetadata,
         materialize_cross_outputs,
     )
@@ -146,7 +148,7 @@ def test_cross_coordinates_keep_the_declared_scalar_data_axis() -> None:
 
     value = _image_value(revision=1)
     outputs = materialize_cross_outputs(
-        FigureOutputSource(value.snapshot),
+        FigureSource(value.snapshot),
         (12.5, 27.25),
         (
             SelectorAxisMetadata(AxisId("current.x"), "camera x", "pixel"),
@@ -180,7 +182,6 @@ def test_viewport_renders_reuse_one_prepared_plane_for_the_same_revision() -> No
     composer = PanelComposer(
         "current-performance",
         intent=ViewIntent.IMAGE,
-        size=(800, 520),
         view=suggestion.spec,
     )
     provenance = PanelProvenance("current-run", "current-epoch", "0" * 64)
@@ -192,11 +193,17 @@ def test_viewport_renders_reuse_one_prepared_plane_for_the_same_revision() -> No
         )
         renderer = composer._renderer
         prepared = renderer._prepared_image_value
-        assert renderer._prepared_image_key == first.snapshot.ref
+        first_key = renderer._prepared_image_key
+        assert first_key.evaluated_input.ref == first.snapshot.ref
         assert prepared is not None
         assert first.snapshot.block.values.dtype == np.dtype(np.uint8)
         assert prepared[0].dtype == np.dtype(np.uint8)
-        assert prepared[2].dtype == np.dtype(np.uint8)
+        assert np.shares_memory(prepared[0], first.snapshot.block.values)
+        assert prepared[1].dtype == np.dtype(bool)
+        assert np.shares_memory(
+            prepared[1],
+            first.snapshot.block.validity.mask,
+        )
 
         composer.compose_with_figure(
             first.snapshot,
@@ -208,18 +215,71 @@ def test_viewport_renders_reuse_one_prepared_plane_for_the_same_revision() -> No
             provenance=provenance,
         )
         assert renderer._prepared_image_value is prepared
-        assert renderer._prepared_image_key == first.snapshot.ref
+        assert renderer._prepared_image_key == first_key
 
         composer.compose_with_figure(
             second.snapshot,
             display=ImageDisplayState(),
             provenance=provenance,
         )
-        assert renderer._prepared_image_key == second.snapshot.ref
+        assert renderer._prepared_image_key.evaluated_input.ref == second.snapshot.ref
         assert renderer._prepared_image_value is not prepared
         assert second.snapshot.block.values.dtype == np.dtype(np.uint8)
     finally:
         composer.close()
+
+
+def test_task_console_dpr_change_retires_every_old_panel_front() -> None:
+    from zlc_frontend.plot_layout import panel_surface_geometry
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
+    from zlc_workbench.task_console.window import TaskConsole
+
+    application = ensure_qt_app()
+    console = TaskConsole(
+        state=TaskConsoleState(
+            panels=(PanelConfig(kind="2d", title="Camera", signal="image"),),
+        ),
+        window_px=(900, 700),
+    )
+    try:
+        console.show()
+        application.processEvents()
+        console._timer.stop()
+        card = console.cards[0]
+        _present_value(
+            console,
+            card,
+            _image_value(revision=1),
+            frame_key=("image", 1),
+        )
+        _wait(
+            application,
+            lambda: console._render_lane.idle
+            and card.board is not None
+            and card.board.front_frame is not None,
+        )
+        previous = card.board.front_frame
+        ratio = card.raster_pixel_ratio + 0.5
+
+        console._apply_raster_pixel_ratio(ratio)
+        assert card.board.front_frame is None
+        _wait(
+            application,
+            lambda: console._render_lane.idle
+            and card.board.front_frame is not None,
+        )
+
+        current = card.board.front_frame
+        assert current is not previous
+        geometry = panel_surface_geometry(card.config.size, pixel_ratio=ratio)
+        raster = current.panels[0].raster
+        assert (raster.width, raster.height) == geometry.raster_size
+        assert (card.board.width(), card.board.height()) == geometry.logical_size
+    finally:
+        console.close()
+        application.processEvents()
 
 
 def test_fit_button_presents_overlay_and_publishes_readable_figure_signals() -> None:
@@ -352,9 +412,7 @@ def test_fit_button_presents_overlay_and_publishes_readable_figure_signals() -> 
             if "/fit." in key
         } == {second.run_id}
     finally:
-        assert console.shutdown()
-        console.close()
-        application.processEvents()
+        close_task_console(application, console)
 
 
 def test_edit_view_recomposes_the_frozen_input_until_explicit_refresh() -> None:
@@ -402,7 +460,8 @@ def test_edit_view_recomposes_the_frozen_input_until_explicit_refresh() -> None:
         _wait(
             application,
             lambda: editor._snapshot_display is not None
-            and editor._snapshot_display.revision == card._display_state().revision,
+            and editor._snapshot_display.revision
+            == card._display_state(card.frozen_plot_panel_contract()).revision,
         )
         edit_payload = editor._board.front_frame.panels[0].display_payload
         live_payload = card.frozen_render_payload()
@@ -417,6 +476,4 @@ def test_edit_view_recomposes_the_frozen_input_until_explicit_refresh() -> None:
             == second.snapshot.ref
         )
     finally:
-        assert console.shutdown()
-        console.close()
-        application.processEvents()
+        close_task_console(application, console)
