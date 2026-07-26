@@ -316,11 +316,11 @@ def _addr_width(depth: int) -> int:
 def region_bases(p: StreamerParams) -> dict:
     """Word-address bases of each AXI write region (the host<->top contract).
 
-    TTL channel delays live in their own DELAY register region (one 32-bit word per
-    channel, delay_region_words reserved).  The CTRL block is the 20 command/mailbox
-    words 0..19, the CLK_ENABLE mask at 20..21, scratch from ctrl_scratch_base, and the
-    hardwired LAYOUT_ID readback at word 63 -- no delay words in CTRL.  Bus delays
-    (ring-capped) and the clk mask stay in CTRL."""
+    TTL channel delays followed by per-bus DAC delays live in their own DELAY
+    register region (one 32-bit word per signal, delay_region_words reserved).
+    The CTRL block is the 20 command/mailbox words 0..19, the CLK_ENABLE mask at
+    20..21, scratch from ctrl_scratch_base, and the hardwired LAYOUT_ID readback
+    at word 63 -- no delay words live in CTRL."""
     ctrl = 0
     tick = CTRL_WORDS
     coeff = tick + p.max_edges * 1

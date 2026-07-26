@@ -771,7 +771,7 @@ class PulseDocument:
         if start == 0 and end == len(period_ids) - 1:
             return ()
         cells = self.digital_output_cells()
-        first_period_id = self.periods[0].period_id
+        first_period_id = repeat.start_period_id
         return tuple(
             port.key
             for port in self.target.ports

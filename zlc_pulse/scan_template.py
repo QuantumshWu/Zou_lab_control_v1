@@ -36,33 +36,34 @@ class ScanTemplateColumn(Protocol):
     unit: str
     label: str
     quantum: float | None
+    is_delay: bool
 
 
-def _duration_tick_bounds(spec: ScanTemplateColumn) -> tuple[int, int]:
+def _time_tick_bounds(spec: ScanTemplateColumn) -> tuple[int, int]:
     """Return exact integer bounds from domain-authored physical values."""
 
     if spec.quantum is None:
         raise ValueError(
-            f"duration column {spec.name!r} has no native-unit quantum"
+            f"time column {spec.name!r} has no native-unit quantum"
         )
     quantum = Fraction(str(spec.quantum))
     ratios = tuple(Fraction(str(value)) / quantum for value in (spec.lo, spec.hi))
     if any(ratio.denominator != 1 for ratio in ratios):
         raise ValueError(
-            f"duration column {spec.name!r} bounds are not multiples of its quantum"
+            f"time column {spec.name!r} bounds are not multiples of its quantum"
         )
     lo_ticks, hi_ticks = (ratio.numerator for ratio in ratios)
-    if lo_ticks < 1:
+    if not spec.is_delay and lo_ticks < 1:
         raise ValueError(f"duration column {spec.name!r} must start at one tick")
     return lo_ticks, hi_ticks
 
 
-def _duration_decimal_places(spec: ScanTemplateColumn) -> int:
+def _time_decimal_places(spec: ScanTemplateColumn) -> int:
     """Digits needed to recover canonical decimal tick values after NumPy math."""
 
     if spec.quantum is None:
         raise ValueError(
-            f"duration column {spec.name!r} has no native-unit quantum"
+            f"time column {spec.name!r} has no native-unit quantum"
         )
     exponent = Decimal(str(spec.quantum)).normalize().as_tuple().exponent
     return max(0, -int(exponent))
@@ -89,8 +90,8 @@ def scan_table_template(
     def sweep(spec: ScanTemplateColumn, size: object) -> str:
         if spec.is_dac:
             return f"np.linspace({spec.lo:g}, {spec.hi:g}, {size}).round().astype(int)"
-        lo_ticks, hi_ticks = _duration_tick_bounds(spec)
-        decimals = _duration_decimal_places(spec)
+        lo_ticks, hi_ticks = _time_tick_bounds(spec)
+        decimals = _time_decimal_places(spec)
         ticks = (
             f"np.linspace({lo_ticks}, {hi_ticks}, {size})"
             ".round().astype(np.int64)"
@@ -105,7 +106,7 @@ def scan_table_template(
             f"{subject}: DAC code [{spec.lo:g}..{spec.hi:g}], 0 = 0 V"
             if spec.is_dac
             else (
-                f"{subject}: duration [{spec.unit}], "
+                f"{subject}: {'delay' if spec.is_delay else 'duration'} [{spec.unit}], "
                 f"tick = {spec.quantum:g} {spec.unit}"
             )
         )
@@ -137,7 +138,7 @@ def scan_table_template(
         "import numpy as np",
         "",
         f"# {n} bound slot(s) {cols[0].name}..{cols[-1].name}: build an (N_points x {n}) array -- one row",
-        "# per scan point, one column per slot (each in its OWN unit: ns for a duration, integer",
+        "# per scan point, one column per slot (each in its OWN unit: time for a duration/delay, integer",
         "# code for a DAC).  Edit each column; the columns advance together (lockstep).",
         "N = 21        # number of scan points",
     ]

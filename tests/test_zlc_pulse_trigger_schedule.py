@@ -8,10 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from fpga.pulse_streamer.host.engine_model import reference_play
+from fpga.pulse_streamer.host import engine_model as engine
 from zlc_pulse import (
     CompiledPulseArtifact,
     PulseExecutionForm,
+    TargetBusSegment,
     TargetIR,
     build_digital_trigger_schedules,
     compile_pulse_document,
@@ -19,6 +20,9 @@ from zlc_pulse import (
     load_pulse_document,
     pack_target_ir,
 )
+
+
+reference_play = engine.reference_play
 
 
 ROOT = Path(__file__).parents[1]
@@ -175,3 +179,130 @@ def test_compact_trigger_projection_does_not_expand_a_loop_without_rises():
         (),
     )
     assert artifact.trigger_schedules == ()
+
+
+def _bounded_edge_model(*, scan_points=()) -> engine.EngineProgram:
+    slot_count = 1 if scan_points else 0
+    return engine.EngineProgram(
+        ticks=[0, 1, 2, 4, 6],
+        masks=[1, 3, 1, 7, 0],
+        tick_slot_coeffs=[[0] * slot_count for _ in range(5)],
+        scan_points=[list(point) for point in scan_points],
+        slot_count=slot_count,
+        frac_bits=0,
+        loop_start_index=0,
+        loop_end_tick=6,
+        loop_end_slot_coeffs=[0] * slot_count,
+        loop_count=1,
+        repeat_forever=False,
+    )
+
+
+@pytest.mark.parametrize("read_latency", (1, 2, 3))
+def test_prefetch_and_register_mirrors_match_the_bounded_reference(read_latency):
+    program = _bounded_edge_model()
+    expected = engine.reference_play(program, 12)
+    fifo_depth = read_latency + 2
+
+    assert engine.prefetch_play(
+        program,
+        12,
+        read_latency=read_latency,
+        fifo_depth=fifo_depth,
+    ) == expected
+    assert engine.rtl_mirror_play(
+        program,
+        12,
+        rd_lat=read_latency,
+        fifo_depth=fifo_depth,
+    ) == expected
+
+
+def test_stale_seed_counterexample_distinguishes_the_current_mirror():
+    program = _bounded_edge_model()
+    expected = engine.rtl_mirror_play(program, 12)
+
+    assert engine.rtl_mirror_play_stale_seed(
+        program,
+        12,
+        prior_count=len(program.ticks),
+    ) == expected
+    assert engine.rtl_mirror_play_stale_seed(
+        program,
+        12,
+        prior_count=1,
+    ) != expected
+
+
+def test_streamed_scan_is_gapless_when_ready_and_reports_a_late_refill():
+    program = _bounded_edge_model(scan_points=((0,), (1,), (2,), (3,), (4,)))
+    expected = engine.reference_play(program, 40)
+    actual, stalled, points_played = engine.streaming_scan_play(
+        program,
+        40,
+        bank_size=2,
+        refill_delay=0,
+    )
+
+    assert actual == expected
+    assert not stalled
+    assert points_played == len(program.scan_points)
+    with pytest.raises(engine.ScanUnderflow):
+        engine.streaming_scan_play(
+            program,
+            40,
+            bank_size=2,
+            refill_delay=20,
+            raise_on_underflow=True,
+        )
+
+
+def test_ttl_delay_register_mirror_matches_stream_shift():
+    undelayed = [0, 1, 1, 0, 2, 3, 2, 0, 0, 0]
+    delays = {0: 2, 1: 1}
+
+    assert engine.rtl_delay_line_mirror(
+        undelayed,
+        delays,
+        depth=16,
+        evt_depth=8,
+    ) == engine.delay_line_reference(undelayed, delays)
+
+
+def test_dac_closed_form_and_segment_delay_match_their_references():
+    segment = TargetBusSegment(
+        0,
+        "dac",
+        0,
+        4,
+        512,
+        516,
+        "ramp",
+        0,
+        0,
+        (),
+        (),
+    )
+    program = SimpleNamespace(
+        bus_segments=(segment,),
+        scan_points=(),
+        scan_coeff_frac_bits=0,
+        loop_end_tick=7,
+        ticks=(0, 7),
+        repeat_forever=False,
+    )
+    undelayed = engine.bus_play(program, 0, 10)
+
+    assert [engine.bus_value_at(program, 0, tick) for tick in range(10)] == undelayed
+    physical_undelayed, _log = engine.bus_undelayed_and_log(program, 0, 10)
+    assert engine.rtl_bus_segment_delay_mirror(
+        program,
+        0,
+        2,
+        10,
+    ) == engine.bus_delay_line_reference(physical_undelayed, 2)
+
+
+def test_effective_tick_rejects_mismatched_slot_cardinality():
+    with pytest.raises(ValueError):
+        engine.effective_tick(0, (1,), (), 0)

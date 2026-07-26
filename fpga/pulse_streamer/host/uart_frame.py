@@ -8,9 +8,10 @@ address) and ``READ`` (a run of words back).  Everything else -- a COMMAND risin
 step, a layout/PING check -- is COMPOSED by the host from WRITE/READ frames, so this codec and the
 RTL bridge FSM stay tiny and ``image.py`` remains the single source.
 
-This module is imported by BOTH ``zlc_pulse.transport`` and the behavioural model
-(``uart_bridge_model.py``) and drives the xsim test-vector generator, so the encoder, the decoder,
-the Python oracle and the Verilog testbench can never disagree on a byte.
+This module is imported by BOTH ``zlc_pulse.transport`` and the behavioural
+model (``uart_bridge_model.py``).  Bounded Python contract tests cover every
+host-emittable frame size; xsim remains a separately run hardware-development
+check rather than an always-run proof.
 
 Frame (LSB-first bytes; all multi-byte fields little-endian):
 
@@ -49,9 +50,10 @@ HDR_LEN = 10          # SYNC0 SYNC1 OP SEQ ADDR[4] COUNT[2]  (before PAYLOAD)
 CRC_LEN = 2
 MASK32 = 0xFFFFFFFF
 
-# Max data words in ONE WRITE frame.  == the RTL bridge's frame buffer depth: the bridge buffers a
-# whole frame, verifies CRC, and ONLY THEN commits (so a corrupt frame commits NOTHING -- RTL matches
-# the Python model exactly).  The host splits a program upload into runs of <= this; at 3 Mbaud 8N1
+# Max data words in ONE WRITE frame.  This equals the RTL bridge buffer depth.
+# The host and Python model reject larger counts; within this host-emittable
+# domain the bridge buffers a whole frame and verifies CRC before commit.  The
+# host splits a program upload into runs of <= this; at 3 Mbaud 8N1
 # (10 bits/byte = 300 KB/s) a 256-word frame is ~1 KB ~3.4 ms, so a 24 KB program is ~24 frames ~82 ms
 # (framing overhead tiny).
 MAX_FRAME_WORDS = 256

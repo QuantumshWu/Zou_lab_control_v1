@@ -18,7 +18,10 @@ from fpga.pulse_streamer.host.image import (
     build_fingerprint,
 )
 from fpga.pulse_streamer.host import uart_frame
-from fpga.pulse_streamer.host.uart_bridge_model import UartBridgeModel
+from fpga.pulse_streamer.host.uart_bridge_model import (
+    UartBridgeModel,
+    committed_writes,
+)
 from zlc_pulse import (
     PulseExecutionForm,
     PulseExecutionService,
@@ -337,3 +340,37 @@ def test_fire_and_await_are_constant_time_identity_checks_after_prepare(
     )
     session.fire(artifact)
     assert session.await_completion(artifact, timeout=1.0) is not None
+
+
+def _raw_uart_write_frame(count: int, *, seq: int = 7) -> bytes:
+    body = (
+        bytes((uart_frame.OP_WRITE, seq))
+        + (12).to_bytes(4, "little")
+        + int(count).to_bytes(2, "little")
+        + b"\x00\x00\x00\x00" * int(count)
+    )
+    return (
+        bytes((uart_frame.SYNC0, uart_frame.SYNC1))
+        + body
+        + uart_frame.crc16_ccitt(body).to_bytes(2, "little")
+    )
+
+
+def test_uart_model_accepts_the_host_maximum_and_rejects_oversized_count():
+    values = tuple(range(uart_frame.MAX_FRAME_WORDS))
+    maximum = uart_frame.encode_write(100, values, seq=3)
+    assert committed_writes(maximum) == {
+        100 + index: value for index, value in enumerate(values)
+    }
+
+    with pytest.raises(ValueError, match="count"):
+        uart_frame.encode_write(100, (*values, 999), seq=4)
+
+    model = UartBridgeModel()
+    events = model.feed(_raw_uart_write_frame(uart_frame.MAX_FRAME_WORDS + 1))
+    assert model.regfile == {}
+    assert any(
+        event.op == "reject"
+        and event.count == uart_frame.MAX_FRAME_WORDS + 1
+        for event in events
+    )

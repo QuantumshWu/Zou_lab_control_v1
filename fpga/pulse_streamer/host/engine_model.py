@@ -106,7 +106,7 @@ def effective_tick(base_tick: int, coeffs: Sequence[int], slots: Sequence[int], 
     bits exactly as the RTL does.  Python ``>>`` on a negative int is an arithmetic
     (floor) shift, identical to Verilog ``>>>`` on the signed accumulator."""
     total = 0
-    for c, s in zip(coeffs, slots):
+    for c, s in zip(coeffs, slots, strict=True):
         total += int(c) * _narrow_slot(s)
     return int(base_tick) + (total >> int(frac_bits))
 

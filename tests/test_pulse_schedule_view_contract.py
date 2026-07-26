@@ -113,8 +113,8 @@ def test_summary_keeps_expanded_pulse_and_repeat_warnings() -> None:
         target,
         10.0,
         (
-            PulsePeriod("p1", 100, "ns", "one", (1, 1)),
-            PulsePeriod("p2", 100, "ns", "two", (0, 0)),
+            PulsePeriod("p1", 100, "ns", "one", (0, 1)),
+            PulsePeriod("p2", 100, "ns", "two", (1, 0)),
             PulsePeriod("p3", 100, "ns", "three", (0, 0)),
         ),
         visible_ports=("ch0",),
@@ -124,8 +124,8 @@ def test_summary_keeps_expanded_pulse_and_repeat_warnings() -> None:
     try:
         assert view.summary_text() == (
             "1/2 ports visible | 3 periods | step 10 ns | 500 ns | "
-            "2 pulses | repeat ∞ + P2-P3 x2 | hidden active: B | "
-            "table restart high every 500 ns: A, B"
+            "3 pulses | repeat ∞ + P2-P3 x2 | hidden active: B | "
+            "table restart high every 500 ns: A"
         )
     finally:
         view.close()

@@ -7,10 +7,10 @@
 # sole observer refills each released bank through the frozen mailbox; total N
 # is not limited by the two-bank window, and the FPGA remains the timing owner.
 #
-# *** The engine + control FSM have cycle-accurate Python models
-# (engine_model.rtl_mirror_play == reference at read latency 1/2/3 incl. 1-tick;
-# streaming_scan_play gapless/stall) and contract tests, but the multi-BRAM AXI
-# integration also has targeted xsim benches and still needs on-board evidence.  IP
+# *** The engine + control FSM have bounded Python model contracts
+# (including reference comparisons at read latency 1/2/3, streamed refill/stall,
+# and delay cases).  The multi-BRAM AXI integration has optional xsim benches,
+# but no tracked automatic xsim runner, and still needs on-board evidence.  IP
 # property names are version-specific: each is set defensively (zlc_try warns,
 # does not abort); the real CONFIG.* are dumped -- grep "ZLC IPDUMP"/"ZLC
 # TRY-FAIL".  CRITICAL: the 3 edge BRAMs are forced to READ_LATENCY_B = 2 (both

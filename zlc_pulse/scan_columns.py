@@ -42,7 +42,8 @@ class ScanColumnSpec:
     ``name`` is the human-readable Python/table column identifier supplied by
     the pulse authoring owner.  DAC columns carry signed device codes.  Timing
     columns carry values in ``unit`` and require their positive native-unit
-    ``quantum`` so a frontend template cannot seed off-clock values.
+    ``quantum`` so a frontend template cannot seed off-clock values.  Duration
+    values are positive; delay values are signed and carry ``is_delay=True``.
     """
 
     name: str
@@ -52,6 +53,7 @@ class ScanColumnSpec:
     unit: str = "ns"
     label: str = ""
     quantum: float | None = None
+    is_delay: bool = False
 
     def __post_init__(self) -> None:
         name = canonical_text(self.name, "scan column name")
@@ -63,6 +65,10 @@ class ScanColumnSpec:
             raise ValueError("ScanColumnSpec.hi must not be below lo")
         if type(self.is_dac) is not bool:
             raise TypeError("ScanColumnSpec.is_dac must be bool")
+        if type(self.is_delay) is not bool:
+            raise TypeError("ScanColumnSpec.is_delay must be bool")
+        if self.is_dac and self.is_delay:
+            raise ValueError("a DAC scan column cannot also be a delay column")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "unit", unit)
         object.__setattr__(self, "label", label)
@@ -77,7 +83,7 @@ class ScanColumnSpec:
             "quantum",
             positive_real(
                 self.quantum,
-                "duration scan column native-unit quantum",
+                "time scan column native-unit quantum",
             ),
         )
 
@@ -300,14 +306,21 @@ def api_column_specs(document: PulseDocument) -> tuple[ScanColumnSpec, ...]:
         if parameter.field.kind not in (FIELD_DURATION, FIELD_DELAY):
             raise ValueError("API parameter has an unsupported pulse field kind")
         tick = float(document.time_step_ns) / TIME_UNIT_TO_NS[parameter.unit]
+        is_delay = parameter.field.kind == FIELD_DELAY
+        if is_delay:
+            extent = max(abs(float(value)) * 2.0, 100.0 * tick)
+            lo, hi = -extent, extent
+        else:
+            lo, hi = tick, max(float(value) * 2.0, 100.0 * tick)
         result.append(
             ScanColumnSpec(
                 parameter.parameter_id,
-                tick,
-                max(float(value) * 2.0, 100.0 * tick),
+                lo,
+                hi,
                 unit=parameter.unit,
                 label=parameter.parameter_id,
                 quantum=tick,
+                is_delay=is_delay,
             )
         )
     return tuple(result)

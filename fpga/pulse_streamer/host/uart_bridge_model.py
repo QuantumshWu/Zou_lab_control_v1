@@ -1,19 +1,20 @@
-"""Behavioural model of the RTL UART bridge decoder -- the EQUIVALENCE ORACLE.
+"""Behavioural model of the host-emittable UART bridge protocol domain.
 
-It mirrors ``zlc_uart_bridge.v``'s decoder FSM byte-for-byte at the protocol level: hunt for the
-SYNC pair, parse the header, buffer the payload, verify CRC, and ONLY THEN commit writes (a corrupt
-frame NEVER mis-writes -- the strongest guarantee, and what the RTL is built to match).  A WRITE
-commits value[i] to word_addr+i (auto-increment); a READ returns CTRL words (STATUS/CURSOR/LAYOUT_ID
--- the BRAM regions are host-write-only, so only CTRL is readable).  On any fault (bad SYNC, bad
-opcode, CRC fail, truncation) it resynchronises by advancing one byte and re-hunting for SYNC.
+For frames whose count is at most ``uart_frame.MAX_FRAME_WORDS`` it mirrors the
+bridge protocol: hunt for the SYNC pair, parse the header, buffer the payload,
+verify CRC, and only then commit writes.  The frozen RTL has no independently
+qualified oversized-frame behavior, so this model rejects a larger count and
+does not present that out-of-contract boundary as equivalence evidence.  A
+WRITE commits value[i] to word_addr+i; a READ returns CTRL words.  On a bad
+SYNC/opcode/CRC, truncation, or oversized count it re-hunts for SYNC.
 
 Two uses:
-  * the equivalence oracle -- feed the host's encoded byte stream, get the committed ``{word:value}``
-    map, compare to ``image.pack_program`` (proves the UART path is a byte-identical transport swap);
+  * a bounded codec oracle -- feed a host-encoded byte stream and compare the
+    committed ``{word:value}`` map to the packed image;
   * a test-only backing store for the current UART register transport -- apply
     writes into a register file and serve READ replies without a serial port.
 
-Mirrors the role of ``engine_model.py`` for the engine: one Python truth the RTL is checked against.
+It is replayable host-domain evidence, not a substitute for RTL or board qualification.
 """
 
 from __future__ import annotations
@@ -79,6 +80,9 @@ class UartBridgeModel:
         seq = buf[3]
         addr = int.from_bytes(buf[4:8], "little")
         count = int.from_bytes(buf[8:10], "little")
+        if count > uf.MAX_FRAME_WORDS:
+            del buf[0]
+            return BridgeEvent(op="reject", ok=False, seq=seq, count=count)
         if op == uf.OP_WRITE:
             need = uf.HDR_LEN + 4 * count + uf.CRC_LEN
         elif op == uf.OP_READ:
@@ -110,8 +114,7 @@ class UartBridgeModel:
 
 
 def committed_writes(stream: bytes, *, layout_id: int = REGISTER_LAYOUT_ID) -> dict[int, int]:
-    """Convenience oracle: the ``{word:value}`` map a byte stream commits (ignoring reads/rejects).
-    Used by the equivalence test to compare against ``image.pack_program``."""
+    """Return writes committed by a host-domain stream, ignoring reads/rejects."""
     model = UartBridgeModel(layout_id=layout_id)
     model.feed(stream)
     return dict(model.regfile)

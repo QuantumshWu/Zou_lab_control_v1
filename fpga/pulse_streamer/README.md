@@ -35,8 +35,8 @@ invariants live in `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` and
 - `diagnose_hw_target.tcl`: non-destructive hardware-target diagnostic.
 - `host/`: the host-side Python that the runtime uses --- `image.py` packs the
   compiled program into the BRAM image and reports `solve_capacity`;
-  `engine_model.py` is the cycle-accurate behavioral model used by the contract
-  tests.
+  `engine_model.py` contains bounded behavioral oracles exercised by the
+  current Python contract tests.
 - `sim/`: xsim (Vivado simulator) testbenches that run the REAL RTL --- and,
   where it matters, the real block-RAM IP netlists --- covering the prefetch
   pipeline, seamless scan wrap, event-scheduler delays, ramp scans, DA clock
@@ -110,5 +110,7 @@ Lifecycle: `prepare` (SAFE, upload the static image and first two scan chunks,
 arm both banks, LOAD) / `fire` (FIRE) / `wait_done` (the sole observer polls and
 refills released banks) / `safe_state`.
 `STATUS_UNDERFLOW` is fatal evidence that seamless timing was not achieved; the
-run is rejected. The cycle-accurate behavior is locked by
-`host.engine_model` against the reference player + 200 fuzz programs.
+run is rejected.  Current always-run Python tests compare a bounded set of
+prefetch, streamed-scan, stale-seed, TTL-delay, and DAC-delay cases against
+their reference models.  They do not replace the optional xsim or on-board
+qualification described below.

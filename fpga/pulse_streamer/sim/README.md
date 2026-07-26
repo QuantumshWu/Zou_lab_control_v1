@@ -4,6 +4,13 @@ These optional Vivado `xsim` benches exercise the checked-in frozen RTL. They
 are hardware-development evidence, not part of normal experiment startup and
 not permission to rebuild or program a board.
 
+There is currently no tracked runner that turns every bench's textual result
+into a process-level pass/fail result.  Several benches print `**FAIL**` or
+`TB RESULT: FAIL` and then call `$finish`; a zero simulator exit code alone is
+therefore not evidence of success.  Until an approved runner checks the exact
+PASS marker and rejects any FAIL marker, retain the complete transcript and
+review it explicitly.  The normal Python test suite does not run Vivado.
+
 The maintained benches are self-contained except where explicitly noted:
 
 - `tb_1tick.v`, `tb_edge_streamer.v`, `tb_gapsweep.v`, and `tb_loop.v` cover
@@ -44,6 +51,12 @@ IPM=../../build/ps/ps.srcs/sources_1/ip/blk_mem_gen_edge_mask
 "$VIV/xelab" work.tb_real_engine -s sreal
 "$VIV/xsim" sreal -runall
 ```
+
+This particular `tb_real_engine.v` example prints diagnostic pulse widths and
+a final `DONE` note but has no self-checking PASS marker.  Its transcript must
+be inspected against the stated expected widths; it is not a stand-alone pass
+oracle.  For self-checking benches, absence of the exact success marker or any
+`FAIL` text is failure even when `xsim` itself exits successfully.
 
 Every bench must use the checked-in `zlc_geometry.vh` geometry. A bench that
 needs a different geometry is a hardware change proposal, not a valid oracle
