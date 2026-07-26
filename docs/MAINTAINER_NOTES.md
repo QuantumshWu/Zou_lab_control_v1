@@ -11,8 +11,10 @@ Use these sources in order:
 3. `docs/DESIGN_CHARTER_zh.md` for durable design constraints.
 4. `docs/REAL_HARDWARE_BRINGUP_zh.md` and `fpga/README.md` for hardware
    qualification and troubleshooting.
-5. `docs/MIGRATION_LEDGER_zh.md` only when historical migration evidence is
-   explicitly needed.
+
+Use `main` only as an on-demand oracle for a specifically identified legacy
+behavior or physical algorithm. It is not the default UI or architecture
+authority.
 
 ## Current ownership
 
@@ -21,16 +23,20 @@ Use these sources in order:
 - `zlc_storage/`: canonical encoding and content-addressed persistence.
 - `zlc_pulse/`: `PulseDocument`, compilation, target contracts, and wire
   protocol.
-- `zlc_neutral_atom/`: experiment domains, runtime, repositories, and device
-  ports.
-- `zlc_frontend/`: headless display values, figure projections, renderers,
-  selector semantics, and the shared plot vocabulary in
-  `zlc_frontend.plot_kind`.
+- `zlc_neutral_atom/`: experiment domains, repositories, devices, and generic
+  runtime. `SignalDataPlane`, `HostedRun`, `HostedProcessor`, and
+  `LiveDatasetHost` are the sole generic signal/data/hosted-lifecycle owners.
+- `zlc_frontend/`: display values, figure projections, Fit/selector semantics,
+  renderers, and the shared plot vocabulary in `zlc_frontend.plot_kind`.
 - `zlc_frontend.qt_widgets/`: the sole Qt widget and Fluent component owner.
-- `zlc_workbench/`: Qt composition and product windows. TaskConsole's layout,
-  panel, logic-row, and stable producer-instance records live only in
-  `zlc_workbench.task_console.console_records/console_state`.
-- `Zou_lab_control/notebook/`: public typed facade and application composition.
+  `FigureSurfaceHost`, `FigureOutputAuthority`, and `FigureSurfaceLane` own the
+  reusable interactive figure surface, derived outputs, and render lane.
+- `zlc_workbench/`: Qt product composition and layout. It consumes the neutral
+  runtime and frontend surfaces; it does not own their signal, run, processor,
+  dataset, Figure, selector, Fit, or renderer contracts.
+- `Zou_lab_control/api/`: the stable public Experiment API and application
+  composition used by scripts, notebooks, and desktop products.
+- `Zou_lab_control/workbench/`: the narrow desktop composition adapter.
 
 Ordinary notebook and GUI code must use typed facades and immutable artifacts;
 it must not reach into raw camera, sequencer, registry, runtime-service, or SDK
@@ -43,11 +49,11 @@ Qt owns widgets and transient overlays. Worker lanes own Matplotlib figures,
 artists, rendering, and expensive projections. Cross-thread publication uses
 immutable fronts and revision checks.
 
-There are two intentionally different raster surfaces:
+There are two intentionally different raster roles:
 
-- Interactive typed plots use `QtRasterBoard` with the same-revision
-  `ViewportTransform`; zoom and pan update typed display state and trigger a
-  worker re-render.
+- Interactive typed plots enter through `FigureSurfaceHost`. Its internal
+  `QtRasterBoard` consumes the same-revision `ViewportTransform`; zoom and pan
+  update typed display state and trigger `FigureSurfaceLane` to re-render.
 - Static encoded or multi-page reports use `FrozenRasterView` at native pixels
   inside `FluentScrollArea`. They do not resample a bitmap to imitate data-space
   zoom or pan, and they do not produce Selection, Fit, or ROI authority.
@@ -61,6 +67,10 @@ selector owner, renderer, or GUI-side data transform.
   payload arrays are not accepted.
 - Data preserves named axes, physical shape, dtype, validity, lineage, and exact
   artifact identity across runtime, storage, analysis, and display boundaries.
+- A producer publishes through `SignalDataPlane`; generic Task/Measurement
+  lifecycle uses `HostedRun`, Processor lifecycle uses `HostedProcessor`, and
+  live dataset publication uses `LiveDatasetHost`. Workbench only projects
+  these typed states into Qt.
 - Autonomous pulse/scan execution is device-timed. Host-stepped execution must
   not be described as timing-equivalent or substituted silently.
 - The sequencer is a player. Camera, threshold, calibration, and feedback
@@ -70,9 +80,12 @@ selector owner, renderer, or GUI-side data transform.
 
 ## Hardware troubleshooting boundary
 
-The currently supported real product is pulse-only. A successful remote pulse
-connection does not qualify qCMOS capture, calibration, occupancy, or complete
-real readout composition.
+There are two real installation products: sequencer-only `remote_pulse`, and
+the complete `hardware` package (remote FPGA + qCMOS DCAM + Pylon MOT camera).
+The latter is software-ready for real-device E0/bring-up, but no apparatus is
+qualified until DeviceManager initialization completes the active trigger-path
+checks on those exact devices. A successful pulse connection alone proves only
+the sequencer path.
 
 For pulse hardware, record the current target manifest, server snapshot, run
 diagnostics, bitstream/build fingerprint, and oscilloscope evidence. Follow
@@ -82,7 +95,8 @@ alone and do not rely on untracked session state.
 The FPGA pin/clock source is `fpga/board_config/board.xdc` (override only through
 the documented deployment mechanism). The default clock is 50 MHz, or 20 ns per
 tick. Server and deployment details live in `fpga/README.md` and
-`fpga/pulse_streamer/README.md`.
+`fpga/pulse_streamer/README.md`. Launcher overrides are
+`ZLC_FPGA_PYTHON` for Python and `ZLC_PS_VIVADO_BIN` for Vivado.
 
 ## Verification
 

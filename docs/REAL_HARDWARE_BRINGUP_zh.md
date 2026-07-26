@@ -1,9 +1,10 @@
-# 实机上线 checklist(真 FPGA + 真 qCMOS)
+# 实机上线 checklist（remote FPGA + qCMOS DCAM + Pylon MOT camera）
 
 > 核心原则：virtual 与 real 共用 declarative Request、typed Port、RunController 和 artifact
-> 语义；GUI 不接 raw device。当前已发布的真实入口仅是 **pulse-only remote installation**，
-> 完整 qCMOS + sequencer installation 仍为 NO-GO，不能用旧 config/session 绕过这一边界。
-> 本清单只把已经交付的能力写成可执行步骤。
+> 语义；GUI 不接 raw device。当前同时提供 sequencer-only `remote_pulse` 与完整 `hardware`
+> installation package。后者已经闭合 remote FPGA、qCMOS DCAM 和 Pylon MOT camera 的软件
+> composition，可以进入真实设备 E0/bring-up；“软件入口存在”不等于“这台装置已经合格”。
+> 每次完整 installation 初始化都必须在当前设备上通过主动 E0，失败时不发布 runtime。
 
 > ⚠️ 运行前确认 import 的是这份代码(`python -c "import Zou_lab_control, sys; print(Zou_lab_control.__file__)"`),
 > 别误跑到机器上另一份旧 checkout。
@@ -13,7 +14,8 @@
 ## 0. 前置环境(到机器前先备齐)
 
 ### FPGA 端(运行 sequencer server 的那台)
-- [ ] Vivado 已装,`vivado` 在 PATH(或设 `ZLC_PS_VIVADO_BIN`);`hw_server` 能起。
+- [ ] Python 使用安装器记录的 `.zlc_python_path`，或显式设 `ZLC_FPGA_PYTHON`；Vivado 在 PATH
+      （或设 `ZLC_PS_VIVADO_BIN`）；`hw_server` 能起。
 - [ ] JTAG 线连好、板子上电;Vivado 硬件管理器能单独看到目标。
 - [ ] **bitstream 已 program**,且其 `ZLC_LAYOUT_ID` 与主机 `image.REGISTER_LAYOUT_ID` 一致。
       不一致时第一次 `prepare()` 会**在写任何配置寄存器前**明确报 `geometry/layout mismatch`(这是设计的保护,
@@ -24,15 +26,21 @@
       `ZLC_PS_TARGET`与**server-side** `ZLC_PS_XDC`，并通过target/XDC逐lane校验后监听端口(默认18861)。
 
 ### 主机端(跑 notebook / GUI 的那台)
-- [ ] 安装 hardware/workbench extra（其中包含 current pulse RPC 所需的 `rpyc`）。
+- [ ] 安装 hardware/workbench extra（包含 current pulse RPC 的 `rpyc` 与 `pypylon`；DCAM SDK
+      仍由相机厂商安装）。
 - [ ] Hamamatsu DCAM SDK 装好,`dcamapi.dll` 在 PATH;qCMOS 物理连接、`device_index` 对。
+- [ ] Basler pylon runtime 与 `pypylon` 装好；相机 serial、trigger source 和物理连接正确。
 - [ ] 网络能 ping 通 FPGA 端 IP;防火墙放行 server 端口(18861)。
 
 ### 当前可上线边界
-- [ ] Pulse-only real composition 不读取旧 `remote_template.json`或客户端XDC，显式使用server的`host:port`；
+- [ ] `remote_pulse` real composition 不读取旧 `remote_template.json`或客户端XDC，显式使用server的`host:port`；
       target manifest（含package-pin endpoints）、clock、geometry与connection generation全从current server snapshot取得并在每次Run重验。
-- [ ] 完整 qCMOS + sequencer real installation 尚未闭合，不能把 pulse server 连通冒充相机也已可用。
-      相机 bring-up 继续先做独立contract qualification；不得恢复旧 `RemoteSequencer/QCMOSCamera` raw session 绕过runtime。
+- [ ] 完整 `hardware` composition 由 DeviceManager 或
+      `InstallationConfigDocument.from_parameters("hardware", values)` 创建；它会在发布 Experiment 前
+      主动验证两个相机的工作点、trigger lane、帧顺序/计数与 FPGA terminal evidence。
+- [ ] Pulse server 连通只证明 sequencer transport。只有本次完整 initialization 的主动 E0 成功，
+      才能说当前 connection generation 上的相机 trigger path 已取得运行期 qualification；不得恢复
+      raw `RemoteSequencer/QCMOSCamera` session 或旧 config 绕过这一边界。
 
 ---
 
@@ -50,46 +58,93 @@ python pulse_gui.py            # 默认 Offline，可编辑/Preview但执行按�
   连接失败会在同一窗口明确显示，修正地址后可重试；尚未取得installation authority前绝不调用硬件)。
 - 连上后：**Run Once** 编译整段 `PulseDocument`、上传并执行一次；**On Pulse (HOLD)** 在FPGA侧持续；
   **Run Scan** 执行冻结的无缝自主scan table；**Stop** 经RunHandle cancel、远端interrupt SAFE与安全验证收尾。
-- notebook使用同一入口：
+- 脚本/notebook 使用同一个 public API：
 
   ```python
   from pathlib import Path
-  import Zou_lab_control.notebook as zlc
+  from Zou_lab_control.api import InstallationConfigDocument, connect
 
-  installation = zlc.InstallationConfigDocument.remote_pulse(
-      host="<FPGA_IP>",
-      port=18861,
+  installation = InstallationConfigDocument.from_parameters(
+      "remote_pulse",
+      {
+          "host": "<FPGA_IP>",
+          "port": 18861,
+          "transport_timeout_seconds": 120.0,
+      },
   )
-  repository = Path("results") / "pulse-only"
+  repository = Path("results") / "remote-pulse"
   repository.parent.mkdir(exist_ok=True)
-  exp = zlc.connect(installation, repository=repository)
+  exp = connect(installation, repository=repository)
   exp.pulse_gui()
   ```
 
-  该Experiment只有sequencer能力，没有camera/readout能力。窗口复用该Experiment，关闭窗口不关闭notebook中的Experiment；standalone窗口则拥有并在关闭时安全关闭自己的Experiment。
+  该 Experiment 只有 sequencer 能力，没有 camera/readout 能力。窗口复用该 Experiment，
+  关闭窗口不关闭调用者持有的 Experiment；standalone 窗口则拥有并在关闭时安全关闭自己的
+  Experiment。所有 backend 都只使用 `from_parameters(backend, values)` 或 DeviceManager，
+  不存在 backend-specific 配置 classmethod。
 
 ---
 
-## 2. task console(实时看板)
+## 2. 完整 hardware installation（首选 DeviceManager）
 
-当前没有可发布的完整 qCMOS real installation，因此这里**没有**合法的真机 TaskConsole、
-calibration 或 occupancy 启动命令。旧 `remote_template.json`、`open_devices=True`、
-`task_console.py --config/--grid` 与 raw `RemoteSequencer/QCMOSCamera` 路径均不是 current 产品入口，
-不得用于首光。相机 AssetMap、adapter qualification、SAFE/terminal evidence 与 pulse/camera
-同一 installation composition 闭合后，本节才增加真实的人类操作步骤；在此之前只验收第 1 节的
-pulse-only 路径。
+先运行 `device_manager.bat`，选择 **Real hardware**，填写 pulse server、qCMOS、Pylon、trigger
+lane、readout grid 与 site centers，保存 config 后点 **Initialize**。Initialize 是唯一真实
+bring-up 边界：它先连接 remote FPGA，再建立两个相机 adapter，读取并冻结 working point，随后
+分别运行一段只切换目标 trigger lane、其余数字/DAC 保持 SAFE 的四触发 E0 program。只有相机帧
+ordinal、hardware stamp、produced count、terminal drain 与 FPGA completed schedule 全部一致，才
+发布可供 TaskConsole/PulseGUI 共用的同一个 Experiment。任一步失败都会清理已打开设备，不发布
+部分 runtime。
+
+也可以显式构造同一个配置；未写字段由 installation leaf 的 authoring schema 填入其当前默认值：
+
+```python
+from pathlib import Path
+from Zou_lab_control.api import InstallationConfigDocument, connect
+
+installation = InstallationConfigDocument.from_parameters(
+    "hardware",
+    {
+        "pulse_host": "<FPGA_IP>",
+        "pylon_serial": "<BASLER_SERIAL>",
+        "readout_grid_rows": 2,
+        "readout_grid_columns": 2,
+        "readout_site_centers_json": "[[120.0,80.0],[160.0,80.0],[120.0,120.0],[160.0,120.0]]",
+        # 按实际布线覆盖 readout_trigger_lane / mot_trigger_lane，
+        # 按实际工作点覆盖 exposure / ROI / binning / trigger source。
+    },
+)
+exp = connect(installation, repository=Path("results") / "hardware")
+exp.task_console()
+```
+
+这里的示例坐标只是合法格式，不是装置标定值；真机必须填写实际 site centers 与 camera 参数。
+旧 `remote_template.json`、`open_devices=True`、raw SDK/session 和已删除的 backend-specific
+constructor 都不是 current 入口。
 
 ---
 
 ## 3. 首次上电逐步验证
 
-1. FPGA端起`run_server.bat`；主机打开Pulse GUI，选Remote并连接。状态必须显示READY，
-   Target tab必须只读，Edit左列必须显示server XDC发布的package pin（如`F15`）而非`ch00`；否则不运行。
-2. 先用 **Run Once** 跑一个全safe短pulse，再跑一个单通道短pulse；示波器确认波形与编译Preview一致。
-3. 用 **On Pulse (HOLD)** 验证持续输出，再点 **Stop**；只有窗口显示STOPPED/SAFE且server snapshot为SAFE才继续。
-4. 冻结一张小scan table，用 **Run Scan** 验证整表由FPGA自主无缝运行；不得改成host逐点fire-and-wait。
-5. qCMOS、calibration、occupancy必须等完整real installation与相机qualification闭合后再按独立清单验收；
-   当前pulse-only成功不等于这些流程已READY。
+1. FPGA 端起 `run_server.bat`；先用 Pulse GUI 的 Remote 模式连接。状态必须显示 READY，
+   Target tab 必须只读，Edit 左列必须显示 server XDC 发布的 package pin（如 `F15`）而非
+   `ch00`；否则不运行。
+2. 用 **Run Once** 依次跑全 SAFE 短 pulse 与一个单通道短 pulse；示波器确认实际波形、lane 与
+   编译 Preview 一致。再用 **On Pulse (HOLD)** / **Stop** 验证 terminal SAFE。
+3. 在 DeviceManager 载入完整 `hardware` config 并点 **Initialize**。此动作会在真实输出上主动
+   运行两个四触发 E0；先确保 camera trigger lane 已接好、其它输出的 SAFE 值正确。只有两个
+   qualification 都成功且 DeviceManager 发布 initialized Experiment 才继续。
+4. 在 TaskConsole 分别运行 qCMOS 与 MOT camera 的 monitor/finite measurement，确认 shape、dtype、
+   frame ordinal、working point 与实际设备一致；这一步不得用 GUI 是否有图替代 terminal evidence。
+5. 运行一个最小 Calibration → Occupancy 链，核对 site centers、validity、artifact identity 与原始
+   qCMOS frame；再运行 MOT-field 路径确认 Pylon 数据来自同一 installation。算法结果必须由真实
+   输入交叉验证，不能把 E0 成功外推成物理标定成功。
+6. 冻结一张小 scan table，用 qCMOS signal 运行 Formal PulseScan。FPGA 必须一次 FIRE、自主无缝
+   执行；FIRE 前 association boundary、FIRE 后 camera produced count/stamp、pulse terminal trigger
+   count 与 collector coverage 必须完全对账。任何 gap/错序/多帧/少帧都使整 run INVALID，不提交
+   ScanArtifact，也不得改成 host 逐点 fire-and-wait。
+7. 通过小表后再按 §5 的单 bank、跨 bank、长表、cyclic/cancel 顺序扩大；每次保存 server
+   snapshot、Run diagnostics、camera terminal 与示波器证据。只有这些真机证据通过，才把该装置
+   标记为 qualified；软件包存在或 virtual 测试通过都不能代替这一步。
 
 ---
 
@@ -98,10 +153,12 @@ pulse-only 路径。
 | 现象 | 根因 | 处理 |
 |---|---|---|
 | `ModuleNotFoundError: ...dcam` / `failed to open qCMOS` | DCAM SDK / DLL 缺失或相机没连 | 装 SDK、确认 `dcamapi.dll` 在 PATH、`device_index` 对 |
+| `pypylon` 缺失 / Basler serial 找不到 | pylon runtime、Python binding、serial 或相机连接错误 | 安装匹配版本的 pylon/pypylon，使用设备工具核对 serial 与 trigger source |
 | `ConnectionRefused` / `socket.timeout` | server 没起 / IP 端口错 / 防火墙 | 先起 `run_server.bat`;核对Pulse GUI的host:port;放行端口 |
 | 首次 `prepare()` 报 `geometry/layout mismatch` | 运行image的几何指纹与current host `build_fingerprint(params)`不一致 | 停止运行并核对已批准的软件/bitstream资产；不得为迁就架构自动重烧，只有证实现有RTL bug或偏离既定设计才启动bitstream变更流程 |
 | server 起不来 / JTAG 报错 | hw_server 没起 / JTAG 接触 / 板掉电 | 查电源、JTAG 线;Vivado 硬件管理器单独验证 |
 | `qCMOS timed out` 等不到帧 | 相机收不到触发(通道/触发名不匹配) | 核对 XDC 的 `channels` 与相机 config 的 `capture_trigger_channels`;示波器看触发线 |
+| Initialize 在 E0 拒绝 stamp/count/terminal | 工作点不满足 deterministic trigger contract、发生漏帧/乱序，或 trigger lane 配错 | 保留本次 pulse terminal、camera records 与示波器证据；先修实际布线/工作点/adapter，不绕过 qualification、不伪造 digest |
 
 > 真机出问题记录current server snapshot、Run diagnostics、示波器/相机证据，并按
 > `docs/MAINTAINER_NOTES.md` 的现行排查边界定位；不要依赖仓外memory key或旧session路径。
@@ -120,7 +177,7 @@ scan table 会在 `FIRE` 前冻结，长度不改变 streamed 执行路径。
 `DeployedStreamerSession` 在 `FIRE` 后只允许一个 observer 拥有该 transport 的运行期 I/O。
 它同时读取 STATUS/CURSOR、选择并补充下一个 bank、发布 progress、判定 terminal、处理 cancel，
 以及在失败时进入 SAFE；`await_completion()` 只等待该 owner 的结果，不再创建第二个读写方。
-禁止 notebook、GUI、server handler 或另一线程并行轮询状态或写 bank。
+禁止 public API client、GUI、server handler 或另一线程并行轮询状态或写 bank。
 
 每个 refill 事务遵守同一个硬件握手：先将对应 `BANK_READY` 清零，再写该 bank 的全部 wire
 words 与 `BANKx_CHUNK`，最后重新置位 `BANK_READY`。finite scan 按冻结 chunk 的单调序号装入；

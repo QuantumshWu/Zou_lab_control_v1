@@ -14,7 +14,7 @@ notes live in `docs/MAINTAINER_NOTES.md`; the authoritative architecture is
 - `build_and_program.bat`: evidence-driven recovery tool for an established RTL
   defect or design mismatch; it is not part of normal experiment startup.
 - `run_server.bat`: start the RPyC sequencer server. It opens a persistent
-  Vivado `hw_axi` (JTAG-to-AXI) session before accepting GUI or notebook clients.
+  Vivado `hw_axi` (JTAG-to-AXI) session before accepting GUI or public API clients.
 - `pulse_streamer/`: HDL (`zlc_edge_streamer.v`, `zlc_pulse_streamer_top.v`),
   Vivado Tcl, and the `host/` Python image packer + behavioral engine model.
 - Generated Vivado projects and server state default to `fpga\build`. The
@@ -22,13 +22,17 @@ notes live in `docs/MAINTAINER_NOTES.md`; the authoritative architecture is
   Vivado's deep run/.Xil temp path under the Windows MAX_PATH limit while the
   build stays in-repo. The default server state dir is `fpga\build\state`.
 
-The root-level `pulse_gui.bat` is the frontend entry point; the FPGA batch files
-stay here so hardware setup is separate from the GUI.
+The root-level `pulse_gui.bat` is the direct frontend entry point. The
+sequencer-only `remote_pulse` installation and the complete `hardware`
+installation (remote FPGA + qCMOS DCAM + Pylon MOT camera) both use this same
+server contract; camera qualification remains on the client installation
+machine. The FPGA batch files stay here so hardware setup is separate from the
+GUI and camera SDKs.
 
 ## Runtime Chain
 
 ```text
-Pulse GUI / notebook
+Pulse GUI / Zou_lab_control.api
   -> RemoteSequencer.prepare/fire/wait_done
   -> sequencer_server on the Vivado computer (jtag-axi backend)
   -> VivadoAxiStreamerSession (persistent Vivado hw_axi session)
@@ -62,15 +66,16 @@ more points: preparation preloads the first two chunks, then the sole host
 observer refills each released bank through `BANK_READY` / `BANK*_CHUNK`. The
 FPGA still clocks every point autonomously; the host moves chunks, never drives
 individual point timing. Any observed `UNDERFLOW` invalidates the run. The
-deployed clock is fixed at 50 MHz. `ZLC_PS_XDC` and
-`ZLC_PS_VIVADO_BIN` select deployment/build inputs; neither changes the running
-bitstream.
+deployed clock is fixed at 50 MHz. `ZLC_PS_XDC` selects the approved
+board-description input and `ZLC_PS_VIVADO_BIN` selects the Vivado executable;
+neither changes the running bitstream.
 
 ## Path Rules
 
 Vivado 2019 debug cores are path-length sensitive. Keep the checkout short
 (`D:\ZLC`). The batch files print `ZLC build root` / `ZLC project dir`; those
 printed paths are the source of truth for the generated
-`impl_1\zlc_pulse_streamer_top.{bit,ltx}`. `run_server.bat` uses the interpreter
-in `.zlc_python_path` before falling back to PATH; override with
-`ZLC_FPGA_SERVER_PYTHON`. Set `ZLC_NO_PAUSE=1` for automation.
+`impl_1\zlc_pulse_streamer_top.{bit,ltx}`. All FPGA launchers share the same
+resolver: Python comes from `ZLC_FPGA_PYTHON`, then `.zlc_python_path`, then
+PATH; Vivado comes from `ZLC_PS_VIVADO_BIN`, known installation roots, then
+PATH. Set `ZLC_NO_PAUSE=1` for automation.
