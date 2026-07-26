@@ -48,25 +48,17 @@ from zlc_neutral_atom.installation_plan import (
     InstallationDevicePlan,
     installation_device_plan,
 )
-from zlc_neutral_atom.installation_config import (
-    SUPPORTED_INSTALLATION_BACKENDS,
-)
+from zlc_neutral_atom.installation_package import discover_installation_packages
 
 from .controller import DeviceAdminState, DeviceManagerController
 from .editor_session import form_spec
 from zlc_workbench.window_runtime import wait_for_owner_retirement
 
 
-_BACKEND_PRESENTATION = (
-    ("virtual", "Virtual"),
-    ("remote_pulse", "Remote pulse"),
+_BACKEND_PRESENTATION = tuple(
+    (package.backend, package.label)
+    for package in discover_installation_packages()
 )
-if frozenset(backend for backend, _label in _BACKEND_PRESENTATION) != (
-    SUPPORTED_INSTALLATION_BACKENDS
-):
-    raise RuntimeError(
-        "DeviceManager backend labels differ from the supported config backends"
-    )
 
 
 class _DeviceSummaryCard(FluentFrame):
@@ -634,7 +626,7 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         )
 
     def request_owner_close(self) -> None:
-        """Retire a notebook-owned window on the Qt owner thread."""
+        """Retire an application-owned window on the Qt owner thread."""
 
         if self._permanently_closed:
             return

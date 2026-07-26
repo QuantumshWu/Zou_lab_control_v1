@@ -9,11 +9,11 @@ reimplement kind/view/display policy themselves.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeAlias
 
-from zlc_data import FitResultBatch, OwnedSnapshot
+from zlc_data import MONITOR_HISTORY, DatasetSchema, FitResultBatch, OwnedSnapshot
 from zlc_storage import canonical_text
 
 from .curve_display import CurveDisplayState
@@ -143,11 +143,40 @@ def plot_panel_input(
     """Bind one immutable source under the plot kind's input contract."""
 
     key = canonical_text(kind, "plot kind")
+    if not isinstance(snapshot, OwnedSnapshot):
+        raise TypeError("plot panel input requires OwnedSnapshot")
+    validate_plot_panel_schema(key, snapshot.block.schema)
     if key == "sites":
         if not isinstance(presentation, SiteMapPresentation):
             raise TypeError("SiteMap plot requires SiteMapPresentation")
         return FigureSource(snapshot, presentation)
     return FigureSource(snapshot)
+
+
+def validate_plot_panel_schema(kind: str, schema: DatasetSchema) -> None:
+    """Validate source semantics that distinguish otherwise similar views.
+
+    A Meter reads one scalar projection from the supplied dataset.  A rolling
+    Monitor is different: its x domain must already be an explicit
+    ``MONITOR_HISTORY`` point axis produced by the data owner.  The frontend
+    never turns successive unrelated snapshots into a hidden GUI-side buffer.
+    """
+
+    key = canonical_text(kind, "plot kind")
+    if key not in PLOT_KIND_SPEC_BY_KEY:
+        raise ValueError(f"unknown plot kind {key!r}")
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("plot panel schema must be DatasetSchema")
+    if key != "monitor":
+        return
+    history_axes = tuple(
+        axis for axis in schema.point_axes if axis.role == MONITOR_HISTORY
+    )
+    if len(history_axes) != 1:
+        raise ValueError(
+            "rolling monitor requires exactly one explicit MONITOR_HISTORY "
+            "point axis; use Meter for a scalar dataset"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +189,8 @@ class PlotPanelComposeRequest:
     focus: FacetedPanelFocus | None = None
     fit_result: FitResultBatch | None = None
     fit_result_identity: str | None = None
+    histogram_projection_value_range: tuple[float, float] | None = None
+    check_cancelled: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source, FigureSource):
@@ -188,6 +219,27 @@ class PlotPanelComposeRequest:
             raise TypeError("fit_result must be FitResultBatch or None")
         if self.fit_result_identity is not None:
             canonical_text(self.fit_result_identity, "fit_result_identity")
+        if self.check_cancelled is not None and not callable(self.check_cancelled):
+            raise TypeError("check_cancelled must be callable or None")
+        value_range = self.histogram_projection_value_range
+        if value_range is not None:
+            if not isinstance(
+                self.display,
+                (HistogramDisplayState, FacetedHistogramDisplayState),
+            ):
+                raise ValueError(
+                    "only histogram composition accepts a projection value range"
+                )
+            from .display_range import validated_display_range
+
+            object.__setattr__(
+                self,
+                "histogram_projection_value_range",
+                validated_display_range(
+                    value_range,
+                    "histogram projection value range",
+                ),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -643,6 +695,7 @@ class PlotPanelSession:
                 focus=request.focus,
                 fit_result=request.fit_result,
                 fit_result_identity=request.fit_result_identity,
+                check_cancelled=request.check_cancelled,
             )
             return PlotPanelComposeResult(None, result, result.figure)
         frame, figure = self._composer.compose_with_figure(
@@ -651,8 +704,114 @@ class PlotPanelSession:
             provenance=request.provenance,
             fit_result=request.fit_result,
             fit_result_identity=request.fit_result_identity,
+            histogram_projection_value_range=(
+                request.histogram_projection_value_range
+            ),
+            check_cancelled=request.check_cancelled,
         )
         return PlotPanelComposeResult(frame, None, figure)
+
+    def compose_data_figure(
+        self,
+        figure: DataFigure,
+        request: PlotPanelComposeRequest,
+    ) -> PlotPanelComposeResult:
+        """Paint an already-evaluated single panel without a second owner.
+
+        This is the saved/archive counterpart to :meth:`compose`: the input
+        ``DataFigure`` retains its exact evaluated arrays, while the same
+        PlotPanel composer owns pixels, style, display continuity, and Fit
+        overlays.
+        """
+
+        from .data_figure import DataFigure
+
+        if not isinstance(figure, DataFigure):
+            raise TypeError("figure must be DataFigure")
+        if not isinstance(request, PlotPanelComposeRequest):
+            raise TypeError("request must be PlotPanelComposeRequest")
+        contract = self.contract
+        if contract.faceted or contract.kind == "sites":
+            raise ValueError(
+                "already-evaluated single-panel composition rejects grid/SiteMap"
+            )
+        source_ref = request.source.snapshot.ref
+        inputs = figure.evaluated.inputs
+        if len(inputs) != 1 or inputs[0].ref != source_ref:
+            raise ValueError("Figure and PlotPanel request name another source")
+        if self._composer is None:
+            from .panel_render import PanelComposer
+
+            self._composer = PanelComposer(
+                contract.panel_id,
+                intent=contract.intent,
+                size_name=contract.size_name,
+                pixel_ratio=contract.pixel_ratio,
+                label=contract.title,
+                value_label=contract.value_label,
+                view=contract.view,
+            )
+        frame, visible = self._composer.compose_data_figure(
+            figure,
+            display=request.display,
+            provenance=request.provenance,
+            fit_result=request.fit_result,
+            fit_result_identity=request.fit_result_identity,
+            histogram_projection_value_range=(
+                request.histogram_projection_value_range
+            ),
+            check_cancelled=request.check_cancelled,
+        )
+        return PlotPanelComposeResult(frame, None, visible)
+
+    def compose_data_figure_grid(
+        self,
+        figure: DataFigure,
+        request: PlotPanelComposeRequest,
+    ) -> PlotPanelComposeResult:
+        """Paint an already-evaluated grid without rebuilding its evaluation."""
+
+        from .data_figure import DataFigure
+
+        if not isinstance(figure, DataFigure):
+            raise TypeError("figure must be DataFigure")
+        if not isinstance(request, PlotPanelComposeRequest):
+            raise TypeError("request must be PlotPanelComposeRequest")
+        contract = self.contract
+        if not contract.faceted:
+            raise ValueError("already-evaluated grid composition requires grid kind")
+        if request.focus is not None:
+            raise ValueError("already-evaluated grid composition is overview-only")
+        if request.source.site_map is not None:
+            raise ValueError("dataset grid cannot carry SiteMapPresentation")
+        if request.histogram_projection_value_range is not None:
+            raise ValueError(
+                "grid overview does not accept one focused histogram value range"
+            )
+        source_ref = request.source.snapshot.ref
+        inputs = figure.evaluated.inputs
+        if len(inputs) != 1 or inputs[0].ref != source_ref:
+            raise ValueError("Figure and PlotPanel request name another source")
+        if self._composer is None:
+            from .panel_render import PanelComposer
+
+            self._composer = PanelComposer(
+                contract.panel_id,
+                intent=contract.intent,
+                size_name=contract.size_name,
+                pixel_ratio=contract.pixel_ratio,
+                label=contract.title,
+                value_label=contract.value_label,
+                view=contract.view,
+            )
+        result = self._composer.compose_data_figure_faceted(
+            figure,
+            display=request.display,
+            fit_result=request.fit_result,
+            fit_result_identity=request.fit_result_identity,
+            check_cancelled=request.check_cancelled,
+        )
+        return PlotPanelComposeResult(None, result, result.figure)
 
     def close(self) -> None:
         composer, self._composer = self._composer, None

@@ -27,9 +27,13 @@ from zlc_data import (
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     CalibrationAnalysisRequest,
-    ReadoutModelKind,
 )
 from zlc_neutral_atom.logic_nodes.readout.contracts import CalibrationCaptureLayout
+from zlc_neutral_atom.logic_nodes.readout.model_contract import (
+    ReadoutModelKind,
+    readout_model_authoring_schema,
+    readout_model_kind_from_authoring,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -133,13 +137,13 @@ def test_current_sitemap_preserves_repeat_event_image_and_site_axes(tmp_path):
         from pathlib import Path
         import sys
 
-        from Zou_lab_control.notebook import connect
+        from Zou_lab_control.api import connect
 
         workspace = Path(sys.argv[1])
         experiment = connect("virtual", repository=workspace, seed=7)
         try:
-            reference = experiment.readout.sitemap(frames=4)
-            computation = experiment.readout.load_calibration_computation(reference)
+            reference = experiment.nodes.calibration.sitemap(frames=4)
+            computation = experiment.nodes.calibration.load_calibration_computation(reference)
             artifact = computation.artifact
             source = experiment.readout.load_capture(
                 artifact.source_binding.source_capture_ref
@@ -212,3 +216,17 @@ def test_model_batch_is_real_current_domain_not_a_scalar_only_placeholder():
         "psf",
         "uniform_psf",
     )
+
+
+def test_readout_model_selection_contract_is_owned_by_the_readout_family():
+    authored_default = readout_model_authoring_schema().freeze({})["model_kind"]
+    assert readout_model_kind_from_authoring(authored_default) is None
+    assert readout_model_kind_from_authoring("psf") is ReadoutModelKind.PER_SITE_PSF
+    with pytest.raises(ValueError, match="unknown readout model choice"):
+        readout_model_kind_from_authoring("missing")
+
+    from zlc_neutral_atom.logic_nodes.readout.calibration import (
+        calibration as calibration_values,
+    )
+
+    assert not hasattr(calibration_values, "ReadoutModelKind")

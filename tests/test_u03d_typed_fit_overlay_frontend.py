@@ -510,9 +510,6 @@ def test_curve_overlay_materialization_checks_cancel_between_batches(monkeypatch
         figure_module.render_data_figure_front(
             base,
             state,
-            current_value_limits=None,
-            previous_relim_mode=None,
-            previous_count_scale=None,
             sequence=1,
             check_cancelled=check_cancelled,
             fit_result=result,

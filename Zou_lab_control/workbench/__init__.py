@@ -3,61 +3,6 @@
 from __future__ import annotations
 
 
-def open_calibration_report_workbench(
-    computation_loader,
-    reference,
-):
-    """Open one committed calibration report without eager Qt imports."""
-
-    from zlc_neutral_atom.logic_nodes.readout.calibration.ui.workbench import (
-        open_calibration_report_workbench as _open,
-    )
-
-    return _open(computation_loader, reference)
-
-
-def open_calibration_workbench(
-    computation_loader,
-    run_starter,
-    *,
-    request=None,
-    reference=None,
-):
-    """Open formal calibration creation/editing without eager Qt imports."""
-
-    from zlc_neutral_atom.logic_nodes.readout.calibration.ui.workbench import (
-        open_calibration_workbench as _open,
-    )
-
-    return _open(
-        computation_loader,
-        run_starter,
-        request=request,
-        reference=reference,
-    )
-
-
-def open_occupancy_cell_workbench(
-    navigation_loader,
-    cell_loader,
-    reference,
-    *,
-    selection=None,
-):
-    """Open one exact same-shot occupancy map without eager Qt imports."""
-
-    from zlc_neutral_atom.logic_nodes.readout.occupancy.ui.workbench import (
-        open_occupancy_cell_workbench as _open,
-    )
-
-    return _open(
-        navigation_loader,
-        cell_loader,
-        reference,
-        selection=selection,
-    )
-
-
 def open_figure_workbench(
     figure_factory,
     source,
@@ -264,10 +209,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
 
 
 __all__ = [
-    "open_calibration_workbench",
-    "open_calibration_report_workbench",
     "open_figure_workbench",
-    "open_occupancy_cell_workbench",
     "open_device_manager",
     "open_pulse_editor",
     "open_saved_fit_grid_workbench",

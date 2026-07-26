@@ -1,4 +1,4 @@
-"""Figure-owned fit preparation and the TaskConsole's one solver lane.
+"""Figure-owned Fit preparation and one reusable Qt-owned solver lane.
 
 The Figure owns the fit request and publishes its parameters.  This module has
 no QWidget, Measurement, ROI processor, artifact window, or persistence
@@ -19,21 +19,29 @@ from zlc_data import (
     OwnedSnapshot,
     bind_fit,
 )
-from zlc_frontend.qt_widgets import QtOwnerWake
+from .owner_wake import QtOwnerWake
 
 
 __all__ = [
-    "PanelFitLane",
-    "PanelFitRequest",
+    "FigureFitLane",
+    "FigureFitRequest",
 ]
 
 
 @dataclass(frozen=True, slots=True)
-class PanelFitRequest:
+class FigureFitRequest:
     panel_id: str
     request_revision: int
     source: object
     spec: FitSpec
+    # Opaque causal ancestry captured by the composition root when the command
+    # surface froze its source.  The solver never reads it; publication uses it
+    # to admit fit parameters beside the exact source revision they derive from.
+    source_component: object | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
     cancelled: threading.Event = field(
         default_factory=threading.Event,
         compare=False,
@@ -60,7 +68,7 @@ class PanelFitRequest:
             raise ValueError("panel Fit spec belongs to another source schema")
 
 
-class PanelFitLane:
+class FigureFitLane:
     """One serial worker for explicit/continuous Figure fit requests.
 
     A panel may replace its not-yet-started request with a newer source
@@ -89,9 +97,9 @@ class PanelFitLane:
         )
         self._lock = threading.Lock()
         self._future: Future | None = None
-        self._active: PanelFitRequest | None = None
+        self._active: FigureFitRequest | None = None
         self._completion = None
-        self._pending: dict[str, PanelFitRequest] = {}
+        self._pending: dict[str, FigureFitRequest] = {}
         self._closing = False
         self._shutdown_complete = False
         self._shutdown_notified = False
@@ -113,9 +121,9 @@ class PanelFitLane:
         with self._lock:
             return self._shutdown_failures
 
-    def enqueue(self, request: PanelFitRequest) -> None:
-        if not isinstance(request, PanelFitRequest):
-            raise TypeError("fit lane requires PanelFitRequest")
+    def enqueue(self, request: FigureFitRequest) -> None:
+        if not isinstance(request, FigureFitRequest):
+            raise TypeError("fit lane requires FigureFitRequest")
         with self._lock:
             if self._closing:
                 return
@@ -135,7 +143,7 @@ class PanelFitLane:
         if active is not None and active.panel_id == identity:
             active.cancelled.set()
 
-    def _start(self, request: PanelFitRequest) -> None:
+    def _start(self, request: FigureFitRequest) -> None:
         future = self._pool.submit(self._execute, request)
         with self._lock:
             if self._closing:
@@ -148,7 +156,7 @@ class PanelFitLane:
         future.add_done_callback(self._finished)
 
     @staticmethod
-    def _execute(request: PanelFitRequest):
+    def _execute(request: FigureFitRequest):
         snapshot = request.source.snapshot
         try:
             result = bind_fit(request.spec, snapshot.block.schema).run(
@@ -168,7 +176,7 @@ class PanelFitLane:
             completion = (None, None, f"{type(error).__name__}: {error}")
         with self._lock:
             if self._future is not future:
-                raise RuntimeError("TaskConsole Fit future identity changed")
+                raise RuntimeError("Figure Fit future identity changed")
             self._future = None
             self._active = None
             if self._closing:

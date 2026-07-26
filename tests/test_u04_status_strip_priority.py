@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import time
 
 from zlc_frontend.qt_widgets import FluentStatusStrip, ensure_qt_app
-from zlc_workbench.task_console.run_bridge import ConsoleRunNode
+from zlc_neutral_atom.catalog import DefinitionKey
+from zlc_neutral_atom.runtime.hosted_run import HostedRun
 
 
 def test_console_has_no_external_running_node_injection_seam() -> None:
@@ -42,37 +43,31 @@ def test_console_owns_one_explicit_priority_ladder() -> None:
     from zlc_workbench.task_console.window import TaskConsole
 
     ensure_qt_app()
-    spec = SimpleNamespace(
-        key=SimpleNamespace(stable_definition_id="status-failure"),
-        name="Camera",
-        kind="measurement",
-        artifact_outputs=(),
-        build_request=lambda values: values,
-        outputs_for=lambda request: (),
-    )
-
     def fail_prepare(_request):
         raise RuntimeError("device refused")
 
-    fault = ConsoleRunNode(
-        spec,
-        {},
+    fault = HostedRun(
+        definition_key=DefinitionKey("test", "status-failure"),
+        request={},
         instance_id="status-failure-instance",
-        instance_label="Camera",
+        dataset_output_declarations=(),
         prepare=fail_prepare,
+        qualify_output=lambda name: f"@logic/status-failure-instance/{name}",
         request_owner_wake=lambda: None,
     )
     fault.bind_starter(lambda command: command)
     surface = SimpleNamespace(
         cards=[],
+        logic_nodes=[],
         _tick_data=SimpleNamespace(names=lambda: ()),
         _logic_nodes={-1: fault},
+        _last_node={},
         _task_status_text="scanning",
         _note_display_drops=lambda: 3,
-        _node_label=TaskConsole._node_label,
         summary=SimpleNamespace(setText=lambda _text: None),
         status_strip=FluentStatusStrip(),
     )
+    surface._node_label = lambda node: TaskConsole._node_label(surface, node)
     try:
         fault.start()
         deadline = time.monotonic() + 2.0

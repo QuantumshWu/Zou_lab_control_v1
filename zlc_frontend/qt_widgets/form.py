@@ -182,16 +182,13 @@ class _TextHandler(_StaticHandler):
 class _IntHandler(_StaticHandler):
     @staticmethod
     def _spin_range(field: FormFieldProps) -> tuple[int, int] | None:
+        # QSpinBox is a numeric value editor, not a tagged ``None | int``
+        # control.  Optional numbers use the validated blank-or-number editor
+        # below; never steal an out-of-domain integer and paint it as text.
+        if field.blank_allowed:
+            return None
         minimum = _QT_INT_MIN if field.minimum is None else int(field.minimum)
         maximum = _QT_INT_MAX if field.maximum is None else int(field.maximum)
-        if field.blank_allowed:
-            # QSpinBox has no nullable value.  Reserve one presentation-only
-            # value immediately below the owner's declared domain and expose it
-            # as ``Auto`` through Qt's native special-value contract.  The
-            # sentinel never leaves this handler: read() maps it back to None.
-            if field.minimum is None or minimum <= _QT_INT_MIN:
-                return None
-            minimum -= 1
         if not (_QT_INT_MIN <= minimum <= maximum <= _QT_INT_MAX):
             return None
         return minimum, maximum
@@ -202,11 +199,6 @@ class _IntHandler(_StaticHandler):
         if spin_range is None:
             raise ValueError("field cannot be represented by FluentSpinBox")
         widget.setRange(*spin_range)
-        widget.setSpecialValueText("Auto" if field.blank_allowed else "")
-
-    @staticmethod
-    def _is_blank_spin(field: FormFieldProps, widget: FluentSpinBox) -> bool:
-        return field.blank_allowed and widget.value() == widget.minimum()
 
     def normalize(self, field: FormFieldProps, value: object) -> int | None:
         if value is None:
@@ -233,6 +225,11 @@ class _IntHandler(_StaticHandler):
             widget = FluentLineEdit()
             widget.setMinimumWidth(scaled_px(120, minimum=96))
             widget.setPlaceholderText("(optional)" if field.blank_allowed else "")
+            widget.set_numeric_validator(
+                "int",
+                bottom=field.minimum,
+                top=field.maximum,
+            )
             self.write(field, widget, value)
             _connect_change(widget.textChanged, on_change)
         widget.setToolTip(field.description)
@@ -240,8 +237,6 @@ class _IntHandler(_StaticHandler):
 
     def read(self, field, widget):
         if isinstance(widget, FluentSpinBox):
-            if self._is_blank_spin(field, widget):
-                return self.normalize(field, None)
             if not widget.hasAcceptableInput():
                 raise _value_error(field, "value is not a base-10 integer")
             return self.normalize(field, int(widget.value()))
@@ -256,17 +251,14 @@ class _IntHandler(_StaticHandler):
         prepared = self.normalize(field, value)
         if isinstance(widget, FluentSpinBox):
             if prepared is None:
-                if not field.blank_allowed:
-                    raise _value_error(field, "bounded spin cannot represent None")
-                widget.setValue(widget.minimum())
-            else:
-                widget.setValue(prepared)
+                raise _value_error(field, "numeric spin cannot represent None")
+            widget.setValue(prepared)
         else:
             widget.setText("" if prepared is None else str(prepared))
 
     def is_empty(self, field, widget):
         if isinstance(widget, FluentSpinBox):
-            return self._is_blank_spin(field, widget)
+            return False
         return not widget.text().strip()
 
 
@@ -303,6 +295,11 @@ class _NumberHandler(_StaticHandler):
         widget = FluentLineEdit()
         widget.setMinimumWidth(scaled_px(120, minimum=96))
         widget.setPlaceholderText("(optional)" if field.blank_allowed else "")
+        widget.set_numeric_validator(
+            "float",
+            bottom=field.minimum,
+            top=field.maximum,
+        )
         widget.setToolTip(field.description)
         self.write(field, widget, value)
         _connect_change(widget.textChanged, on_change)
@@ -368,6 +365,11 @@ class _LosslessFloatSpinBox(FluentDoubleSpinBox):
 class _FloatHandler(_StaticHandler):
     @staticmethod
     def _spin_range(field: FormFieldProps) -> tuple[float, float] | None:
+        # QDoubleSpinBox owns one real number only.  Optional numbers remain a
+        # typed blank-or-number edit instead of smuggling None through an
+        # out-of-domain floating-point value and specialValueText.
+        if field.blank_allowed:
+            return None
         minimum = (
             -sys.float_info.max
             if field.minimum is None
@@ -378,16 +380,6 @@ class _FloatHandler(_StaticHandler):
             if field.maximum is None
             else float(field.maximum)
         )
-        if field.blank_allowed:
-            # As for integers, reserve exactly one GUI-only value below the
-            # declared domain.  ``nextafter`` works for zero and for the
-            # smallest positive float without stealing a legal owner value.
-            if field.minimum is None:
-                return None
-            sentinel = math.nextafter(minimum, -math.inf)
-            if not math.isfinite(sentinel) or sentinel < -sys.float_info.max:
-                return None
-            minimum = sentinel
         return minimum, maximum
 
     @classmethod
@@ -400,14 +392,6 @@ class _FloatHandler(_StaticHandler):
         if spin_range is None:
             raise ValueError("field cannot be represented by FluentDoubleSpinBox")
         widget.setRange(*spin_range)
-        widget.setSpecialValueText("Auto" if field.blank_allowed else "")
-
-    @staticmethod
-    def _is_blank_spin(
-        field: FormFieldProps,
-        widget: FluentDoubleSpinBox,
-    ) -> bool:
-        return field.blank_allowed and widget.value() == widget.minimum()
 
     def normalize(self, field: FormFieldProps, value: object) -> float | None:
         if value is None:
@@ -437,6 +421,11 @@ class _FloatHandler(_StaticHandler):
             widget = FluentLineEdit()
             widget.setMinimumWidth(scaled_px(120, minimum=96))
             widget.setPlaceholderText("(optional)" if field.blank_allowed else "")
+            widget.set_numeric_validator(
+                "float",
+                bottom=field.minimum,
+                top=field.maximum,
+            )
             self.write(field, widget, value)
             _connect_change(widget.textChanged, on_change)
         widget.setToolTip(field.description)
@@ -444,8 +433,6 @@ class _FloatHandler(_StaticHandler):
 
     def read(self, field, widget):
         if isinstance(widget, FluentDoubleSpinBox):
-            if self._is_blank_spin(field, widget):
-                return self.normalize(field, None)
             if not widget.hasAcceptableInput():
                 raise _value_error(field, "value is not a finite decimal number")
             return self.normalize(field, float(widget.value()))
@@ -460,17 +447,14 @@ class _FloatHandler(_StaticHandler):
         prepared = self.normalize(field, value)
         if isinstance(widget, FluentDoubleSpinBox):
             if prepared is None:
-                if not field.blank_allowed:
-                    raise _value_error(field, "bounded spin cannot represent None")
-                widget.setValue(widget.minimum())
-            else:
-                widget.setValue(prepared)
+                raise _value_error(field, "numeric spin cannot represent None")
+            widget.setValue(prepared)
         else:
             widget.setText("" if prepared is None else repr(prepared))
 
     def is_empty(self, field, widget):
         if isinstance(widget, FluentDoubleSpinBox):
-            return self._is_blank_spin(field, widget)
+            return False
         return not widget.text().strip()
 
 

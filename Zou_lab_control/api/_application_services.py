@@ -1,8 +1,7 @@
 """Application-owned Experiment service graph and lifecycle borrows.
 
-This module contains only composition mechanics shared by notebook facades.
-Concrete Logic-node behavior belongs to its node-local notebook adapter and
-concrete readout resources belong to the readout composition.
+This module contains only composition mechanics shared by application facades.
+Concrete Logic-node behavior and resources belong to each node-local API.
 """
 
 from __future__ import annotations
@@ -11,7 +10,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Protocol, TYPE_CHECKING, runtime_checkable
+from typing import Iterator, Protocol, runtime_checkable
 
 from zlc_data import FitCancelled
 from zlc_neutral_atom.artifacts import FitResultRepository
@@ -21,10 +20,6 @@ from zlc_neutral_atom.installation import DeviceCatalogView
 from zlc_neutral_atom.installation_config import InstallationConfigDocument
 from zlc_pulse import PulseDocument, load_pulse_document
 from zlc_storage.paths import resolve_under_project
-
-if TYPE_CHECKING:
-    from ._readout_repositories import ReadoutApplicationResources
-
 
 @runtime_checkable
 class WorkbenchHandle(Protocol):
@@ -86,11 +81,12 @@ def wait_for_close_attempt(
 
 @dataclass
 class ExperimentServices:
+    repository_root: Path
+    installation: object
     runtime: object
     capture_repository: CaptureRepository
     fit_repository: FitResultRepository
     catalog: DeviceCatalogView
-    readout_resources: "ReadoutApplicationResources"
     installation_config: InstallationConfigDocument
     pulse_application: PulseApplicationOwner
     operation_lock: threading.RLock

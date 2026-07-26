@@ -130,7 +130,7 @@ def build_frozen_figure_document(
 
     dataset_id = DatasetId("source")
     resolved_document_id = (
-        f"notebook-{uuid4().hex}" if document_id is None else document_id
+        f"figure-{uuid4().hex}" if document_id is None else document_id
     )
     return FigureDocument(
         document_id=resolved_document_id,

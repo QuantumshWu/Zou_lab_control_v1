@@ -19,9 +19,6 @@ WORKBENCH_MODULES = tuple(
     for path in sorted((ROOT / "zlc_workbench").rglob("*.py"))
     if "__pycache__" not in path.parts and path.name != "__init__.py"
 )
-CURRENT_ROOT_QT_LAUNCHERS = tuple(
-    ROOT / name for name in ("figure_viewer.py", "pulse_gui.py", "task_console.py")
-)
 RAW_COMMON_CONTROLS = {
     "QCheckBox",
     "QComboBox",
@@ -43,6 +40,21 @@ RAW_NATIVE_DIALOG_PREFIXES = {
 
 def _tree(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def _root_qt_launchers() -> tuple[Path, ...]:
+    launchers = []
+    for path in sorted(ROOT.glob("*.py")):
+        tree = _tree(path)
+        if any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "zlc_frontend.qt_widgets"
+            and any(alias.name == "ensure_qt_app" for alias in node.names)
+            for node in ast.walk(tree)
+        ):
+            launchers.append(path)
+    assert launchers, "no root Qt launcher imports the shared QApplication owner"
+    return tuple(launchers)
 
 
 def _production_python_files():
@@ -406,7 +418,7 @@ def test_frontend_and_workbench_roots_remain_headless() -> None:
     result = _run_fresh(
         "import sys\n"
         "import zlc_frontend, zlc_frontend.figure, zlc_frontend.render\n"
-        "import zlc_workbench, Zou_lab_control.notebook, Zou_lab_control.workbench\n"
+        "import zlc_workbench, Zou_lab_control.api, Zou_lab_control.workbench\n"
         "assert not any(k == 'PyQt5' or k.startswith('PyQt5.') for k in sys.modules)\n"
         "assert 'qframelesswindow' not in sys.modules\n"
         "assert not any(k == 'matplotlib' or k.startswith('matplotlib.') for k in sys.modules)\n"
@@ -1005,7 +1017,7 @@ def test_w1_w2_w3_take_existing_common_controls_from_qt_widgets() -> None:
         source = path.read_text(encoding="utf-8")
         assert re.search(r"#[0-9A-Fa-f]{3,8}", source) is None, path
 
-    for path in CURRENT_ROOT_QT_LAUNCHERS:
+    for path in _root_qt_launchers():
         tree = _tree(path)
         ensure_imports = [
             node

@@ -67,8 +67,15 @@ PLOT_KIND_SPECS: tuple[PlotKindSpec, ...] = (
         input_format="value must be a 1D vector (N,) or per-site array",
     ),
     PlotKindSpec(
+        key="meter", label="Meter",
+        input_format="value must resolve to one explicit scalar",
+    ),
+    PlotKindSpec(
         key="monitor", label="Rolling trace",
-        input_format="value must be a scalar per shot (rolling trace)",
+        input_format=(
+            "value must carry one explicit MONITOR_HISTORY point axis; "
+            "the panel does not manufacture history"
+        ),
     ),
     PlotKindSpec(
         key="hist", label="Distribution",

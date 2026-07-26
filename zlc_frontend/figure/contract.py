@@ -11,7 +11,6 @@ from typing import Sequence
 from zlc_data import (
     COMPONENT,
     AxisId,
-    BoundFit,
     CommittedTransform,
     CoordinateRangeSelection,
     FitResultBatch,
@@ -140,12 +139,12 @@ IMAGE_CONTRACT = ViewContract(
     (
         AxisRolePolicy(SCAN_POINT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(SPECTRAL, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SITE, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
-        AxisRolePolicy(COMPONENT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
-        AxisRolePolicy(SPATIAL_X, ()),
-        AxisRolePolicy(SPATIAL_Y, ()),
+        AxisRolePolicy(SITE, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(COMPONENT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SPATIAL_X, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SPATIAL_Y, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
     ),
     (
         RepeatViewMode.MEAN,
@@ -174,16 +173,17 @@ CURVE_CONTRACT = ViewContract(
         ),
     ),
     (
-        AxisRolePolicy(SCAN_POINT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
-        AxisRolePolicy(SPECTRAL, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(SCAN_POINT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SPECTRAL, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(READOUT_EVENT, (AxisViewRole.BATCH, AxisViewRole.FACET)),
-        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(SITE, (AxisViewRole.BATCH, AxisViewRole.FACET)),
         AxisRolePolicy(COMPONENT, (AxisViewRole.BATCH, AxisViewRole.FACET)),
-        # A spatial curve requires an explicit pixel/ROI/page selection.  It
-        # is never made scalar by an automatic mean or automatic gallery.
-        AxisRolePolicy(SPATIAL_X, ()),
-        AxisRolePolicy(SPATIAL_Y, ()),
+        # A spatial curve is a named lineout: one declared spatial axis is X
+        # and every other spatial axis is an explicit, visible slider.  No
+        # spatial axis is silently averaged or flattened.
+        AxisRolePolicy(SPATIAL_X, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SPATIAL_Y, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
     ),
     (
         RepeatViewMode.MEAN,
@@ -201,14 +201,38 @@ HISTOGRAM_CONTRACT = ViewContract(
     ViewIntent.HISTOGRAM,
     (),
     (
-        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.SAMPLE,)),
-        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SAMPLE,)),
-        AxisRolePolicy(SITE, (AxisViewRole.FACET, AxisViewRole.BATCH)),
-        AxisRolePolicy(COMPONENT, (AxisViewRole.FACET, AxisViewRole.BATCH)),
-        AxisRolePolicy(SCAN_POINT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
-        AxisRolePolicy(SPECTRAL, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
-        AxisRolePolicy(SPATIAL_X, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
-        AxisRolePolicy(SPATIAL_Y, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(
+            READOUT_EVENT,
+            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+        ),
+        AxisRolePolicy(
+            MONITOR_HISTORY,
+            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+        ),
+        AxisRolePolicy(
+            SITE,
+            (AxisViewRole.SAMPLE, AxisViewRole.BATCH, AxisViewRole.FACET),
+        ),
+        AxisRolePolicy(
+            COMPONENT,
+            (AxisViewRole.SAMPLE, AxisViewRole.BATCH, AxisViewRole.FACET),
+        ),
+        AxisRolePolicy(
+            SCAN_POINT,
+            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+        ),
+        AxisRolePolicy(
+            SPECTRAL,
+            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+        ),
+        AxisRolePolicy(
+            SPATIAL_X,
+            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+        ),
+        AxisRolePolicy(
+            SPATIAL_Y,
+            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+        ),
     ),
     (
         RepeatViewMode.SAMPLE,
@@ -229,12 +253,12 @@ METER_CONTRACT = ViewContract(
     (
         AxisRolePolicy(SCAN_POINT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(SPECTRAL, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.FACET,)),
+        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
         AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SITE, (AxisViewRole.FACET,)),
-        AxisRolePolicy(COMPONENT, (AxisViewRole.FACET,)),
-        AxisRolePolicy(SPATIAL_X, ()),
-        AxisRolePolicy(SPATIAL_Y, ()),
+        AxisRolePolicy(SITE, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(COMPONENT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SPATIAL_X, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SPATIAL_Y, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
     ),
     (RepeatViewMode.LATEST, RepeatViewMode.MEAN, RepeatViewMode.SUM),
     RepeatViewMode.LATEST,
@@ -416,25 +440,6 @@ def _selection_transform_projection(
             "transformed fit display cannot faithfully represent the resolved cell layout"
         )
     return resolved, effective_schema, authority_selection
-
-
-def selection_fit_view_projection(
-    bound: BoundFit,
-) -> tuple[DatasetSchema, Selection]:
-    """Return the exact raw-snapshot projection for one displayable bound Fit."""
-
-    if not isinstance(bound, BoundFit):
-        raise TypeError("bound must be BoundFit")
-    resolved, effective_schema, authority_selection = (
-        _selection_transform_projection(
-            bound.expected_schema,
-            bound.spec.committed_transform,
-            bound.spec.fit_axis_ids,
-        )
-    )
-    if bound.effective_schema != resolved:
-        raise ValueError("bound Fit effective schema differs from its transform")
-    return effective_schema, authority_selection
 
 
 def _selection_fit_projection(

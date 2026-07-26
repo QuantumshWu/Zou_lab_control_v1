@@ -1234,11 +1234,9 @@ class CameraCapabilityEvidence:
             if (
                 self.physical_facts.required_external_trigger_interval_seconds
                 is None
-                or self.physical_facts.external_trigger_integration_start_offset_seconds
-                is None
             ):
                 raise ValueError(
-                    "exact external-trigger qualification requires timing readback"
+                    "exact external-trigger qualification requires trigger-interval readback"
                 )
 
     @property
@@ -1516,6 +1514,21 @@ class CameraAdapter(Protocol):
     def capture_state(self) -> tuple[bool, int]: ...
 
 
+@runtime_checkable
+class CameraAssociationProgress(Protocol):
+    """Physical produced-frame counter required by exact live association.
+
+    This is intentionally separate from :class:`CameraAdapter`: finite capture
+    and display-only monitoring do not need it.  A hardware endpoint may expose
+    live Camera→Pulse association only when its adapter can read the actual
+    produced count without consuming a frame.  That read closes the otherwise
+    unsafe gap between the monitor's drained ordinal and frames already waiting
+    in the driver ring before FPGA FIRE.
+    """
+
+    def observed_produced_count(self) -> int: ...
+
+
 
 __all__ = [
     "CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT",
@@ -1523,6 +1536,7 @@ __all__ = [
     "CAMERA_FRAME_FACT_FIELDS",
     "CameraAcquisitionMode",
     "CameraAdapter",
+    "CameraAssociationProgress",
     "CameraCapabilityEvidence",
     "CameraCaptureDescriptor",
     "CameraCaptureSpec",

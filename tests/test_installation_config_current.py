@@ -8,12 +8,12 @@ from zlc_neutral_atom.installation_config import (
     INSTALLATION_CONFIG_FORMAT,
     InstallationConfigConflict,
     InstallationConfigDocument,
-    RemotePulseInstallationConfig,
-    VirtualInstallationConfig,
     load_installation_config,
     save_installation_config,
     default_installation_authoring_schema,
 )
+from zlc_neutral_atom.devices.sequencer.config import RemotePulseInstallationConfig
+from zlc_neutral_atom.devices.simulation.config import VirtualInstallationConfig
 from zlc_workbench.device_manager.editor_session import (
     DeviceConfigEditorSession,
     form_spec,
@@ -21,10 +21,29 @@ from zlc_workbench.device_manager.editor_session import (
 from zlc_workbench.form_projection import project_authoring_form
 
 
+def _virtual(seed=7):
+    return InstallationConfigDocument.from_parameters("virtual", {"seed": seed})
+
+
+def _remote(
+    host="pulse-host",
+    port=18861,
+    transport_timeout_seconds=120.0,
+):
+    return InstallationConfigDocument.from_parameters(
+        "remote_pulse",
+        {
+            "host": host,
+            "port": port,
+            "transport_timeout_seconds": transport_timeout_seconds,
+        },
+    )
+
+
 def test_current_configs_round_trip_through_canonical_json(tmp_path):
     documents = (
-        InstallationConfigDocument.virtual(seed=19),
-        InstallationConfigDocument.remote_pulse(
+        _virtual(seed=19),
+        _remote(
             host="pulse-host",
             port=18862,
             transport_timeout_seconds=45.5,
@@ -77,14 +96,14 @@ def test_decoder_is_current_only_and_rejects_legacy_or_ambiguous_json():
 
 
 def test_field_contracts_reject_non_current_values():
-    with pytest.raises(TypeError, match="integer"):
-        InstallationConfigDocument.virtual(seed=True)
+    with pytest.raises(TypeError, match="int"):
+        _virtual(seed=True)
     with pytest.raises(ValueError, match="canonical"):
-        InstallationConfigDocument.remote_pulse(host=" pulse-host ")
-    with pytest.raises(ValueError, match="at most 65535"):
-        InstallationConfigDocument.remote_pulse(host="pulse-host", port=65536)
-    with pytest.raises(ValueError, match="positive"):
-        InstallationConfigDocument.remote_pulse(
+        _remote(host=" pulse-host ")
+    with pytest.raises(ValueError, match="maximum"):
+        _remote(host="pulse-host", port=65536)
+    with pytest.raises(ValueError, match="minimum"):
+        _remote(
             host="pulse-host",
             transport_timeout_seconds=0.0,
         )
@@ -99,7 +118,7 @@ def test_field_contracts_reject_non_current_values():
             "adapter_class": "module.RemoteSequencer",
         },
     }
-    with pytest.raises(ValueError, match="exactly"):
+    with pytest.raises(ValueError, match="unknown fields"):
         InstallationConfigDocument.from_dict(extra_parameter)
 
 
@@ -145,7 +164,7 @@ def test_backend_owner_declares_device_manager_form_semantics():
     assert timeout.minimum == float.fromhex("0x0.0000000000001p-1022")
     assert all(field.description for field in remote_schema.fields)
 
-    current = InstallationConfigDocument.remote_pulse(
+    current = _remote(
         host="pulse-host",
         port=18862,
         transport_timeout_seconds=45.5,
@@ -157,7 +176,7 @@ def test_backend_owner_declares_device_manager_form_semantics():
     }
     editor = DeviceConfigEditorSession(current)
     editor.set_field("port", 18863)
-    assert editor.candidate() == InstallationConfigDocument.remote_pulse(
+    assert editor.candidate() == _remote(
         host="pulse-host",
         port=18863,
         transport_timeout_seconds=45.5,
@@ -166,9 +185,9 @@ def test_backend_owner_declares_device_manager_form_semantics():
 
 def test_expected_digest_is_a_real_compare_and_swap(tmp_path):
     path = tmp_path / "installation.json"
-    first = InstallationConfigDocument.virtual(seed=1)
-    second = InstallationConfigDocument.virtual(seed=2)
-    third = InstallationConfigDocument.virtual(seed=3)
+    first = _virtual(seed=1)
+    second = _virtual(seed=2)
+    third = _virtual(seed=3)
 
     first_digest = save_installation_config(path, first)
     second_digest = save_installation_config(
@@ -192,7 +211,7 @@ def test_expected_digest_is_a_real_compare_and_swap(tmp_path):
 
 def test_expected_digest_accepts_semantically_identical_reformat(tmp_path):
     path = tmp_path / "installation.json"
-    document = InstallationConfigDocument.remote_pulse(host="pulse-host")
+    document = _remote(host="pulse-host")
     path.write_text(
         json.dumps(document.to_dict(), indent=2),
         encoding="utf-8",

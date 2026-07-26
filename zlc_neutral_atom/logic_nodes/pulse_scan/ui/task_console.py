@@ -5,12 +5,13 @@ from __future__ import annotations
 from zlc_neutral_atom.logic_nodes.pulse_scan.application import PreparedExactScan
 from zlc_neutral_atom.logic_nodes.pulse_scan.declaration import PULSE_SCAN_LOGIC_NODE
 from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import PulseScanBoundRequest
+from zlc_neutral_atom.runtime.hosted_run import HostedRun
 from zlc_workbench.task_console.capability import (
     ConsoleCapabilityAttachment,
     ConsoleSignalEventSourceProvider,
 )
 from zlc_workbench.task_console.declaration_projection import project_declaration_spec
-from zlc_workbench.task_console.run_bridge import ConsoleRunNode
+from zlc_workbench.task_console.console_records import console_signal_key
 
 from .task_console_form import pulse_scan_form
 
@@ -39,7 +40,7 @@ def pulse_scan_task_console_adapter(*, prepare, read_pulse_template):
         editor_factory=editor_factory,
     )
 
-    def create_node(host, current_spec, values, instance_id, instance_label):
+    def create_node(host, current_spec, values, instance_id):
         if current_spec is not spec:
             raise RuntimeError("attachment received another ConsoleNodeSpec")
         resolved = host.bind_inputs(spec, values)
@@ -61,14 +62,19 @@ def pulse_scan_task_console_adapter(*, prepare, read_pulse_template):
                 )
             return prepare(current, source_node.signal_event_source())
 
-        node = ConsoleRunNode(
-            spec,
-            values,
+        node = HostedRun(
+            definition_key=spec.key,
+            request=request,
             instance_id=instance_id,
-            instance_label=instance_label,
+            dataset_output_declarations=tuple(
+                output.declaration for output in spec.outputs_for(request)
+            ),
+            artifact_output_declarations=tuple(
+                output.declaration for output in spec.artifact_outputs
+            ),
             prepare=prepare_scan,
+            qualify_output=lambda name: console_signal_key(instance_id, name),
             request_owner_wake=host.request_owner_wake,
-            frozen_request=request,
         )
 
         def start_scan(command):

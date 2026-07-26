@@ -131,21 +131,17 @@ def test_public_calibration_and_detection_requests_are_deadline_free():
             function
         ).parameters
 
-    from Zou_lab_control.notebook.facade import ReadoutFacade
-    from Zou_lab_control.workbench import open_calibration_workbench
-    from zlc_neutral_atom.logic_nodes.readout.calibration.ui.workbench import (
-        open_calibration_workbench as open_calibration_workbench_app,
-    )
+    from zlc_neutral_atom.logic_nodes.readout.calibration.api import CalibrationApi
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.api import OccupancyApi
 
     for function in (
-        ReadoutFacade.sitemap_request,
-        ReadoutFacade.sitemap,
-        ReadoutFacade.calibration_request,
-        ReadoutFacade.start_calibration_analysis,
-        ReadoutFacade.calibration_edit_gui,
-        ReadoutFacade.detection_request,
-        open_calibration_workbench,
-        open_calibration_workbench_app,
+        CalibrationApi.sitemap_request,
+        CalibrationApi.sitemap,
+        CalibrationApi.calibration_request,
+        CalibrationApi.start_calibration_analysis,
+        CalibrationApi.calibration_gui,
+        CalibrationApi.calibration_edit_gui,
+        OccupancyApi.detection_request,
     ):
         parameters = inspect.signature(function).parameters
         assert "timeout_seconds" not in parameters
@@ -159,7 +155,7 @@ def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_pa
         from pathlib import Path
         import sys
 
-        from Zou_lab_control.notebook import connect
+        from Zou_lab_control.api import connect
         from zlc_neutral_atom.capture.artifact import CaptureRepository
         from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
             CalibrationRepository,
@@ -167,9 +163,9 @@ def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_pa
 
         workspace = Path(sys.argv[1])
         experiment = connect("virtual", repository=workspace, seed=7)
-        reference = experiment.readout.sitemap(frames=4)
-        resolved = experiment.readout.load_calibration(reference)
-        computation = experiment.readout.load_calibration_computation(reference)
+        reference = experiment.nodes.calibration.sitemap(frames=4)
+        resolved = experiment.nodes.calibration.load_calibration(reference)
+        computation = experiment.nodes.calibration.load_calibration_computation(reference)
         source_reference = resolved.artifact.source_binding.source_capture_ref
         live_result = {
             "reference_repository": reference.repository_id,

@@ -3,7 +3,7 @@
 The Python editor is presentation, but the meaning of its ``scan_table``
 result is pulse authoring: exact column order, clock/range normalization and
 recipe provenance.  Keeping that transaction here gives PulseGUI,
-TaskConsole and notebook code one implementation without one GUI importing
+TaskConsole and public API code one implementation without one GUI importing
 another GUI's workspace.
 """
 

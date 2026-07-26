@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from PyQt5 import QtCore
 
-    from Zou_lab_control.notebook import device_manager
+    from Zou_lab_control.api import device_manager
     from zlc_frontend.qt_widgets import ensure_qt_app
 
     application = ensure_qt_app()

@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtCore, QtTest
 
-from Zou_lab_control.notebook.facade import connect
+from Zou_lab_control.api import connect
 from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_neutral_atom.runtime.run import RunState
 from zlc_pulse import (

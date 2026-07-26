@@ -1,8 +1,8 @@
-"""Declarative Sequencer application seam shared by notebook and Workbench."""
+"""Declarative Sequencer seam shared by the public API and Workbench."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import threading
 from typing import Callable
@@ -26,6 +26,7 @@ from zlc_neutral_atom.devices.sequencer.port import (
     PulseTerminalEvidenceKind,
 )
 from zlc_pulse import (
+    apply_api_values_to_authoring_document,
     CompiledPulseArtifact,
     PulseDocument,
     PulseExecutionForm,
@@ -269,6 +270,11 @@ class AppliedPulseSnapshot:
     execution_document: PulseDocument
     execution_form: PulseExecutionForm
     artifact_digest: str
+    authoring_document: PulseDocument = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         canonical_text(self.run_id, "run_id")
@@ -278,6 +284,14 @@ class AppliedPulseSnapshot:
             raise TypeError("execution_document must be PulseDocument")
         api_values = _ordered_api_values(self.source_document, self.api_values)
         object.__setattr__(self, "api_values", api_values)
+        object.__setattr__(
+            self,
+            "authoring_document",
+            apply_api_values_to_authoring_document(
+                self.source_document,
+                dict(api_values),
+            ),
+        )
         if (
             isinstance(self.scan_sweep_count, bool)
             or not isinstance(self.scan_sweep_count, int)
@@ -297,6 +311,19 @@ class AppliedPulseSnapshot:
     @property
     def execution_document_digest(self) -> str:
         return self.execution_document.fingerprint
+
+    @property
+    def authoring_document_digest(self) -> str:
+        """Fingerprint of source intent with the exact accepted API values."""
+
+        return self.authoring_document.fingerprint
+
+    def matches_authoring_document(self, document: PulseDocument) -> bool:
+        """Whether ``document`` is exactly the authoring intent now applied."""
+
+        if not isinstance(document, PulseDocument):
+            raise TypeError("document must be PulseDocument")
+        return self.authoring_document_digest == document.fingerprint
 
 
 @dataclass(frozen=True, slots=True)

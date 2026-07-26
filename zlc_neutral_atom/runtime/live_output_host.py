@@ -1,29 +1,31 @@
-"""Domain-neutral attachment of one prepared command's live Dataset output."""
+"""Headless attachment of one prepared command's live Dataset output."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-import uuid
 
-from zlc_frontend.figure import DatasetId
 from zlc_neutral_atom.dataset_output import LiveDatasetOutputOwner
+from zlc_neutral_atom.processing.signal_plane import SignalDataPlane, SignalProducer
 from zlc_neutral_atom.runtime.preview import LiveDatasetViewSpec
-from zlc_storage import canonical_text
-from .live_slot import LiveDatasetSlot
+from .live_dataset import LiveDatasetPort
 
 
-class ConsoleLiveDatasetHost:
-    """Attach at most one live Dataset slot to one Console node generation."""
+class LiveDatasetHost:
+    """Attach at most one live Dataset slot to one hosted producer generation."""
 
-    __slots__ = ("_data_plane", "_dataset_id", "_node", "_opened")
+    __slots__ = ("_data_plane", "_node", "_opened")
 
-    def __init__(self, node, data_plane, *, dataset_namespace: str) -> None:
-        namespace = canonical_text(dataset_namespace, "dataset_namespace")
+    def __init__(
+        self,
+        node: SignalProducer,
+        data_plane: SignalDataPlane,
+    ) -> None:
+        if not isinstance(node, SignalProducer):
+            raise TypeError("node must implement SignalProducer")
+        if not isinstance(data_plane, SignalDataPlane):
+            raise TypeError("data_plane must be SignalDataPlane")
         self._node = node
         self._data_plane = data_plane
-        self._dataset_id = DatasetId(
-            f"console-{namespace}-{uuid.uuid4().hex}"
-        )
         self._opened = False
 
     def open_live_dataset(
@@ -32,14 +34,13 @@ class ConsoleLiveDatasetHost:
         *,
         output_owner: LiveDatasetOutputOwner,
         retain_on_terminal: bool = True,
-    ) -> LiveDatasetSlot:
+    ) -> LiveDatasetPort:
         """Create and attach the sole slot; it interprets no domain semantics."""
 
         if self._opened:
-            raise RuntimeError("one Console start may attach only one live Dataset")
-        slot = LiveDatasetSlot(
+            raise RuntimeError("one hosted start may attach only one live Dataset")
+        slot = LiveDatasetPort(
             spec,
-            dataset_id=self._dataset_id,
             retain_on_terminal=retain_on_terminal,
             output_owner=output_owner,
         )
@@ -59,7 +60,7 @@ class ConsoleLiveDatasetHost:
         *,
         output_owner: LiveDatasetOutputOwner,
         retain_on_terminal: bool = True,
-    ) -> Callable[[LiveDatasetViewSpec], LiveDatasetSlot]:
+    ) -> Callable[[LiveDatasetViewSpec], LiveDatasetPort]:
         """Return the factory shape used by prepared live/preview commands."""
 
         return lambda spec: self.open_live_dataset(
@@ -72,7 +73,7 @@ class ConsoleLiveDatasetHost:
         """Attach an application-owned live source that already implements the slot."""
 
         if self._opened:
-            raise RuntimeError("one Console start may attach only one live Dataset")
+            raise RuntimeError("one hosted start may attach only one live Dataset")
         if not callable(getattr(live_output, "freeze_live_outputs", None)):
             raise TypeError("live output exposes no typed Dataset materializer")
         try:
@@ -90,22 +91,20 @@ class ConsoleLiveDatasetHost:
             self._data_plane.detach_live(self._node)
 
 
-def start_with_console_live_output(
+def start_with_live_output(
     command,
-    node,
-    host,
+    node: SignalProducer,
+    data_plane: SignalDataPlane,
     *,
-    start: Callable[[object, ConsoleLiveDatasetHost], object],
+    start: Callable[[object, LiveDatasetHost], object],
 ):
     """Run one capability-owned start adapter with generic slot cleanup."""
 
     if not callable(start):
         raise TypeError("start must be callable")
-    namespace = node.spec.key.stable_definition_id
-    live_host = ConsoleLiveDatasetHost(
+    live_host = LiveDatasetHost(
         node,
-        host.data_plane,
-        dataset_namespace=namespace,
+        data_plane,
     )
     try:
         return start(command, live_host)
@@ -114,4 +113,4 @@ def start_with_console_live_output(
         raise
 
 
-__all__ = ["ConsoleLiveDatasetHost", "start_with_console_live_output"]
+__all__ = ["LiveDatasetHost", "start_with_live_output"]

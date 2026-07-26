@@ -7,18 +7,19 @@ no Qt, renderer, runtime node, buffering, or producer-control code.
 
 Area data is evaluated by :mod:`zlc_data.transform`, so a selection keeps every
 axis it did not explicitly name and carries component validity with it.  Cross
-publishes only the two coordinates of a locked click.  Fit publishes one typed
-``fit.<parameter>`` dataset per parameter while preserving its named batch
-layout and failed-cell validity.  Derived values retain the source join digest
-while receiving stable Figure/output dataset identities; a composition root may
-attach its own run/epoch routing metadata afterwards.
+publishes the data value selected on the displayed IMAGE, CURVE, or HISTOGRAM;
+its coordinates remain derivation metadata and never masquerade as separate
+signals.  Fit publishes one typed ``fit.<parameter>`` dataset per parameter
+while preserving its named batch layout and failed-cell validity.  Derived
+values retain the source join digest while receiving stable Figure/output
+dataset identities; a composition root may attach its own run/epoch routing
+metadata afterwards.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
-from numbers import Real
 from types import MappingProxyType
 from typing import Mapping
 
@@ -27,28 +28,47 @@ from zlc_storage import canonical_digest, canonical_text, sha256_text
 
 from zlc_data import (
     AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID,
-    COMPONENT,
-    SCALAR_AXIS,
     AxisId,
-    AxisSpec,
     BlockId,
-    CoordinateRangeSelection,
     DataTransformSpec,
     DatasetRevisionRef,
     IndexRangeSelection,
     IndexSelection,
+    MissingPolicy,
     OwnedSnapshot,
+    ReductionMethod,
+    ReductionSpec,
     Selection,
     StreamGenerationId,
+    ValidityPolicy,
+    apply_transform,
+    commit_transform,
     dataset_revision_ref_to_tree,
+    expand_dataset_validity,
     selection_to_tree,
     fit_spec_to_tree,
-    materialize_component_dataset,
     materialize_dataset_acceptance_mask,
     materialize_dataset_selection,
     materialize_fit_parameter_snapshots,
-    materialize_numeric_dataset,
+    materialize_scalar_dataset,
     projected_dataset_output_contract_id,
+)
+from .curve_display import numeric_curve_coordinates
+from .data_figure import DataFigure
+from .figure import (
+    AxisViewBinding,
+    AxisViewRole,
+    EvaluatedCurve,
+    EvaluatedHistogram,
+    EvaluatedImage,
+    FigureDocument,
+    FigureLayer,
+    FixedIndex,
+    ResolvedDataset,
+    ResolvedDatasetMap,
+    ViewIntent,
+    figure_document_to_tree,
+    view_spec_to_tree,
 )
 from .site_map import SiteMapPresentation
 from .figure_source import FigureSource
@@ -60,13 +80,9 @@ from .render import (
     SourceIdentity,
 )
 AREA_DATA_OUTPUT = "area.data"
-CROSS_X_OUTPUT = "cross.x"
-CROSS_Y_OUTPUT = "cross.y"
+CROSS_DATA_OUTPUT = "cross.data"
 FIT_OUTPUT_PREFIX = "fit."
-FIGURE_AREA_RANGE_OUTPUT_CONTRACT_ID = "zlc_frontend.figure.area-range"
-FIGURE_CROSS_COORDINATE_OUTPUT_CONTRACT_ID = (
-    "zlc_frontend.figure.cross-coordinate"
-)
+FIGURE_CROSS_DATA_OUTPUT_CONTRACT_ID = "zlc_frontend.figure.cross-data"
 FIGURE_FIT_PARAMETER_OUTPUT_CONTRACT_ID = "zlc_frontend.figure.fit-parameter"
 
 
@@ -84,21 +100,17 @@ def figure_output_contract_id(
             source_contract_id,
             AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID,
         )
-    if output_name.startswith("area.range."):
-        return FIGURE_AREA_RANGE_OUTPUT_CONTRACT_ID
-    if output_name in {CROSS_X_OUTPUT, CROSS_Y_OUTPUT}:
-        return FIGURE_CROSS_COORDINATE_OUTPUT_CONTRACT_ID
+    if output_name == CROSS_DATA_OUTPUT:
+        return FIGURE_CROSS_DATA_OUTPUT_CONTRACT_ID
     if output_name.startswith(FIT_OUTPUT_PREFIX) and output_name != FIT_OUTPUT_PREFIX:
         return FIGURE_FIT_PARAMETER_OUTPUT_CONTRACT_ID
     raise ValueError(f"unknown Figure output {output_name!r}")
 
 __all__ = [
     "AREA_DATA_OUTPUT",
-    "CROSS_X_OUTPUT",
-    "CROSS_Y_OUTPUT",
+    "CROSS_DATA_OUTPUT",
     "FIT_OUTPUT_PREFIX",
-    "FIGURE_AREA_RANGE_OUTPUT_CONTRACT_ID",
-    "FIGURE_CROSS_COORDINATE_OUTPUT_CONTRACT_ID",
+    "FIGURE_CROSS_DATA_OUTPUT_CONTRACT_ID",
     "FIGURE_FIT_PARAMETER_OUTPUT_CONTRACT_ID",
     "FigureDerivedSignal",
     "FigureAreaCommit",
@@ -108,44 +120,19 @@ __all__ = [
     "FigureOutputRequest",
     "FigureOutputSession",
     "HistogramValueRangeSelection",
-    "SelectorAxisMetadata",
-    "area_range_output_name",
     "area_data_output_presentation",
+    "bind_area_data_commit",
+    "bind_cross_data_commit",
     "figure_derived_signal",
     "figure_derivation_digest",
     "figure_output_contract_id",
     "figure_output_revision_ref",
     "materialize_area_outputs",
-    "materialize_area_range_output",
     "materialize_area_snapshot",
     "materialize_cross_outputs",
     "materialize_fit_outputs",
-    "materialize_numeric_snapshot",
-    "selector_axes_for_payload",
     "source_identity_matches_snapshot",
 ]
-
-
-@dataclass(frozen=True)
-class SelectorAxisMetadata:
-    """The declared axis identity needed to publish one locked coordinate."""
-
-    axis_id: AxisId
-    name: str
-    unit: str | None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.axis_id, AxisId):
-            raise TypeError("axis_id must be AxisId")
-        name = str(self.name).strip()
-        if not name:
-            raise ValueError("selector axis name must not be empty")
-        object.__setattr__(self, "name", name)
-        if self.unit is not None:
-            unit = str(self.unit).strip()
-            if not unit:
-                raise ValueError("selector axis unit must not be empty")
-            object.__setattr__(self, "unit", unit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,25 +184,69 @@ class FigureAreaCommit:
 
 @dataclass(frozen=True, slots=True)
 class FigureCrossCommit:
-    """One completed locked Cross intent bound to a producer generation."""
+    """One locked Cross value selection bound to a producer generation.
+
+    ``sample_document`` is a narrowed copy of the exact displayed Figure: its
+    focused facet, chosen batch series, and selected image/curve sample are
+    explicit in the frontend-owned ViewSpec.  Re-evaluating that document on a
+    newer snapshot therefore computes the same semantic value without
+    rasterising a Figure or asking a Workbench to understand axis roles.
+
+    Histogram bins are renderer display state rather than Dataset axes, so the
+    selected immutable bin interval is carried separately.  ``point`` is only
+    provenance for the gesture; it is never published as a signal.
+    """
 
     source_identity: SourceIdentity
+    sample_document: FigureDocument
     point: tuple[float, float]
-    axes: tuple[SelectorAxisMetadata, SelectorAxisMetadata]
+    histogram_bin: tuple[float, float, bool] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_identity, SourceIdentity):
             raise TypeError("Cross source_identity must be SourceIdentity")
+        if not isinstance(self.sample_document, FigureDocument):
+            raise TypeError("Cross sample_document must be FigureDocument")
+        if (
+            len(self.sample_document.datasets) != 1
+            or len(self.sample_document.layers) != 1
+        ):
+            raise ValueError("Cross sample document must contain one dataset and layer")
+        intent = self.sample_document.layers[0].view.intent
+        if intent not in {
+            ViewIntent.IMAGE,
+            ViewIntent.CURVE,
+            ViewIntent.HISTOGRAM,
+        }:
+            raise ValueError("Cross data requires IMAGE, CURVE, or HISTOGRAM")
+        unresolved = tuple(
+            binding.role
+            for binding in self.sample_document.layers[0].view.axis_bindings
+            if binding.role in {AxisViewRole.BATCH, AxisViewRole.FACET}
+        )
+        if unresolved:
+            raise ValueError("Cross sample document retained unresolved batch/facet axes")
         point = tuple(float(value) for value in self.point)
         if len(point) != 2 or not all(math.isfinite(value) for value in point):
             raise ValueError("Cross point must contain two finite coordinates")
-        axes = tuple(self.axes)
-        if len(axes) != 2 or any(
-            not isinstance(axis, SelectorAxisMetadata) for axis in axes
-        ):
-            raise TypeError("Cross axes must contain x and y metadata")
+        histogram_bin = self.histogram_bin
+        if intent is ViewIntent.HISTOGRAM:
+            if histogram_bin is None or len(tuple(histogram_bin)) != 3:
+                raise ValueError("Histogram Cross requires one selected bin")
+            lower, upper, include_upper = histogram_bin
+            lower, upper = float(lower), float(upper)
+            if (
+                not math.isfinite(lower)
+                or not math.isfinite(upper)
+                or lower >= upper
+                or type(include_upper) is not bool
+            ):
+                raise ValueError("Histogram Cross bin is invalid")
+            histogram_bin = (lower, upper, include_upper)
+        elif histogram_bin is not None:
+            raise ValueError("Only Histogram Cross may carry a bin interval")
         object.__setattr__(self, "point", point)
-        object.__setattr__(self, "axes", axes)
+        object.__setattr__(self, "histogram_bin", histogram_bin)
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,7 +330,12 @@ def _area_dependency(request: FigureOutputRequest) -> tuple[object, ...] | None:
         selection_identity: object = selection_to_tree(selection)
     else:
         selection_identity = {
-            "histogram_value_range": [selection.lower, selection.upper]
+            "histogram_value_range": [selection.lower, selection.upper],
+            "source_selection": (
+                None
+                if selection.source_selection is None
+                else selection_to_tree(selection.source_selection)
+            ),
         }
     site_map = request.source.site_map
     return (
@@ -316,8 +352,13 @@ def _cross_dependency(request: FigureOutputRequest) -> tuple[object, ...] | None
         return None
     return (
         request.source.snapshot.ref,
-        commit.point,
-        tuple((axis.axis_id, axis.name, axis.unit) for axis in commit.axes),
+        canonical_digest(
+            {
+                "sample_document": figure_document_to_tree(commit.sample_document),
+                "point": commit.point,
+                "histogram_bin": commit.histogram_bin,
+            }
+        ),
     )
 
 
@@ -380,8 +421,7 @@ class FigureOutputSession:
                     "Cross",
                     lambda: materialize_cross_outputs(
                         request.source,
-                        request.cross.point,
-                        request.cross.axes,
+                        request.cross,
                     ),
                 )
 
@@ -478,6 +518,7 @@ class HistogramValueRangeSelection:
 
     lower: float
     upper: float
+    source_selection: Selection | None = None
 
     def __post_init__(self) -> None:
         lower = float(self.lower)
@@ -486,62 +527,334 @@ class HistogramValueRangeSelection:
             raise ValueError("histogram Area bounds must be finite")
         if lower > upper:
             raise ValueError("histogram Area lower bound exceeds upper bound")
+        if self.source_selection is not None and not isinstance(
+            self.source_selection,
+            Selection,
+        ):
+            raise TypeError("histogram Area source_selection must be Selection or None")
         object.__setattr__(self, "lower", lower)
         object.__setattr__(self, "upper", upper)
 
 
-def selector_axes_for_payload(
-    payload: object,
-) -> tuple[SelectorAxisMetadata, SelectorAxisMetadata]:
-    """Return the exact painted x/y coordinate semantics for Cross output.
+def _area_context_selection(
+    figure: DataFigure,
+    *,
+    gesture_axis_ids: frozenset[AxisId],
+) -> Selection | None:
+    """Freeze the named data context visible behind one Area gesture.
 
-    Synthetic display coordinates have stable Figure-owned identities.  A
-    Workbench panel route never enters an AxisId, so two panels displaying the
-    same source cannot manufacture different physical data identities.
+    The gesture itself owns the axes it draws over.  Every other explicit
+    display restriction and evaluated SELECTED/SLIDER/focused-FACET resolution
+    is part of the data the operator actually selected.  REDUCED and BATCH
+    axes remain untouched: a display mean must never become authority, while
+    every simultaneously visible batch series remains selected as a group.
     """
 
+    if not isinstance(figure, DataFigure):
+        raise TypeError("Area binding requires one DataFigure")
+    entries = tuple(figure.datasets.entries)
+    layers = tuple(figure.evaluated.layers)
+    inputs = tuple(figure.evaluated.inputs)
+    if (
+        len(entries) != 1
+        or len(figure.document.layers) != 1
+        or len(layers) != 1
+        or len(layers[0].cells) != 1
+        or len(inputs) != 1
+    ):
+        raise ValueError("Area requires one resolved Figure dataset/cell")
+
+    terms_by_axis = {
+        term.axis_id: term
+        for selection in figure.document.layers[0].view.display_selections
+        for term in selection.terms
+        if term.axis_id not in gesture_axis_ids
+    }
+    for resolution in layers[0].resolutions:
+        if resolution.axis_id not in gesture_axis_ids:
+            # The evaluated resolution is the exact fixed/latest index painted
+            # on this immutable front.  Keep it as a one-element range rather
+            # than dropping the named axis: Area publishes sub-data, so its
+            # facet coordinate must survive in the result schema/provenance.
+            terms_by_axis[resolution.axis_id] = IndexRangeSelection(
+                resolution.axis_id,
+                resolution.index,
+                resolution.index + 1,
+            )
+    if not terms_by_axis:
+        return None
+    return Selection(tuple(terms_by_axis.values()))
+
+
+def bind_area_data_commit(
+    source_identity: SourceIdentity,
+    selection: Selection | HistogramValueRangeSelection,
+    figure: DataFigure | None,
+) -> FigureAreaCommit:
+    """Bind one completed Area to the exact typed data view it was drawn on.
+
+    This is the Area counterpart of :func:`bind_cross_data_commit`.  A focused
+    Grid child is therefore not merely a rectangle/range over the base source:
+    its frozen facet coordinates travel in the authoritative selection and in
+    the derived signal's provenance.
+    """
+
+    if not isinstance(source_identity, SourceIdentity):
+        raise TypeError("Area source_identity must be SourceIdentity")
+    if not isinstance(selection, (Selection, HistogramValueRangeSelection)):
+        raise TypeError("Area binding requires a Figure selection")
+    # SiteMap is the sole non-DataFigure surface: its frontend presentation
+    # already turns the rectangle into a complete logical-site Selection.
+    if figure is None:
+        if not isinstance(selection, Selection):
+            raise TypeError("only SiteMap Area may omit a DataFigure context")
+        return FigureAreaCommit(source_identity, selection)
+    entries = tuple(figure.datasets.entries)
+    if len(entries) != 1:
+        raise ValueError("Area requires one resolved Figure dataset")
+    if not source_identity_matches_snapshot(source_identity, entries[0].snapshot):
+        raise ValueError("Area Figure belongs to another source generation")
+
+    gesture_axis_ids = (
+        frozenset(term.axis_id for term in selection.terms)
+        if isinstance(selection, Selection)
+        else frozenset()
+    )
+    context = _area_context_selection(
+        figure,
+        gesture_axis_ids=gesture_axis_ids,
+    )
+    if isinstance(selection, Selection):
+        terms_by_axis = (
+            {}
+            if context is None
+            else {term.axis_id: term for term in context.terms}
+        )
+        # The explicit gesture is the strongest statement on an axis.
+        terms_by_axis.update((term.axis_id, term) for term in selection.terms)
+        bound = Selection(tuple(terms_by_axis.values()))
+    else:
+        bound = replace(selection, source_selection=context)
+    return FigureAreaCommit(source_identity, bound)
+
+
+def _nearest_axis_position(axis, coordinate: float) -> int:
+    coordinates = np.asarray(
+        tuple(float(value) for value in numeric_curve_coordinates(axis)),
+        dtype=np.float64,
+    )
+    return int(np.argmin(np.abs(coordinates - float(coordinate))))
+
+
+def _nearest_curve_series(payload: CurvePanelPayload, x_position: int, y: float):
+    eligible: list[tuple[float, int]] = []
+    for index, series in enumerate(payload.series):
+        curve = series.data
+        if not bool(curve.validity[x_position]):
+            continue
+        value = curve.values[x_position]
+        scalar = value.item() if isinstance(value, np.generic) else value
+        try:
+            distance = abs(float(scalar) - float(y))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(distance):
+            eligible.append((distance, index))
+    # An invalid clicked sample is still a meaningful typed result: preserve
+    # its false validity rather than silently retargeting to another x value.
+    return payload.series[min(eligible)[1] if eligible else 0]
+
+
+def _histogram_hit(
+    payload: HistogramPanelPayload,
+    point: tuple[float, float],
+):
+    x, y = point
+    edges = payload.bin_edges
+    if x < float(edges[0]) or x > float(edges[-1]):
+        raise ValueError("Cross point lies outside the displayed histogram bins")
+    if x == float(edges[-1]):
+        bin_index = len(edges) - 2
+    else:
+        bin_index = int(np.searchsorted(edges, x, side="right") - 1)
+    if not 0 <= bin_index < len(edges) - 1:
+        raise ValueError("Cross point does not identify a histogram bin")
+    series_index = min(
+        range(len(payload.series)),
+        key=lambda index: (
+            abs(float(payload.bin_counts[index][bin_index]) - y),
+            index,
+        ),
+    )
+    return (
+        payload.series[series_index],
+        (
+            float(edges[bin_index]),
+            float(edges[bin_index + 1]),
+            bin_index == len(edges) - 2,
+        ),
+    )
+
+
+def _cross_sample_document(
+    figure: DataFigure,
+    *,
+    cell,
+    series,
+    sampled_indices: tuple[tuple[AxisId, int], ...],
+) -> FigureDocument:
+    """Narrow one exact display view to the selected cell/series/sample.
+
+    The operation remains a display-derived Figure document.  It neither
+    mutates the source block nor creates an authority transform.  Evaluating
+    the narrowed document on later revisions avoids a second full raster/data
+    projection for IMAGE and CURVE Cross outputs.
+    """
+
+    document = figure.document
+    if len(document.layers) != 1:
+        raise ValueError("Cross requires one Figure layer")
+    layer = document.layers[0]
+    view = layer.view
+    address_by_id = {
+        address.axis_id: address
+        for address in (*cell.facet_address, *series.batch_address)
+    }
+    if len(address_by_id) != len(cell.facet_address) + len(series.batch_address):
+        raise ValueError("Cross cell/series addresses repeat an axis")
+    bindings = []
+    for binding in view.axis_bindings:
+        if binding.role not in {AxisViewRole.FACET, AxisViewRole.BATCH}:
+            bindings.append(binding)
+            continue
+        try:
+            address = address_by_id[binding.axis_id]
+        except KeyError as exc:
+            raise ValueError("Cross display omitted a facet/batch address") from exc
+        bindings.append(
+            AxisViewBinding(
+                binding.axis_id,
+                AxisViewRole.SELECTED,
+                selector=FixedIndex(address.index),
+            )
+        )
+
+    sampled_by_id = dict(sampled_indices)
+    if len(sampled_by_id) != len(sampled_indices):
+        raise ValueError("Cross sample repeats an axis")
+    retained_terms = tuple(
+        term
+        for selection in view.display_selections
+        for term in selection.terms
+        if term.axis_id not in sampled_by_id
+    )
+    sample_terms = tuple(
+        IndexSelection(axis_id, index)
+        for axis_id, index in sampled_indices
+    )
+    terms = (*retained_terms, *sample_terms)
+    sample_view = replace(
+        view,
+        axis_bindings=tuple(bindings),
+        display_selections=(() if not terms else (Selection(tuple(terms)),)),
+    )
+    identity = canonical_digest(
+        {
+            "owner": "zlc_frontend.figure-cross-sample-document",
+            "source_document": figure_document_to_tree(document),
+            "sample_view": view_spec_to_tree(sample_view),
+        }
+    )
+    return FigureDocument(
+        f"cross-sample-{identity}",
+        0,
+        document.datasets,
+        (FigureLayer(layer.layer_id, layer.dataset_id, sample_view),),
+        document.selections,
+    )
+
+
+def bind_cross_data_commit(
+    source_identity: SourceIdentity,
+    point: tuple[float, float],
+    figure: DataFigure,
+    payload: object,
+) -> FigureCrossCommit:
+    """Bind one painted Cross gesture to the value that Figure displayed."""
+
+    if not isinstance(source_identity, SourceIdentity):
+        raise TypeError("Cross source_identity must be SourceIdentity")
+    if not isinstance(figure, DataFigure):
+        raise TypeError("Cross binding requires one DataFigure")
+    point = tuple(float(value) for value in point)
+    if len(point) != 2 or not all(math.isfinite(value) for value in point):
+        raise ValueError("Cross point must contain two finite coordinates")
+    entries = tuple(figure.datasets.entries)
+    layers = tuple(figure.evaluated.layers)
+    inputs = tuple(figure.evaluated.inputs)
+    if (
+        len(entries) != 1
+        or len(layers) != 1
+        or len(layers[0].cells) != 1
+        or len(inputs) != 1
+    ):
+        raise ValueError("Cross requires one resolved Figure dataset/cell")
+    if not source_identity_matches_snapshot(source_identity, entries[0].snapshot):
+        raise ValueError("Cross Figure belongs to another source generation")
+    cell = layers[0].cells[0]
+    histogram_bin = None
+
     if isinstance(payload, SiteMapPanelPayload):
-        payload = payload.background
+        raise TypeError("SiteMap Cross has no unambiguous single data value")
+    if not isinstance(
+        payload,
+        (ImagePanelPayload, CurvePanelPayload, HistogramPanelPayload),
+    ):
+        raise TypeError("painted payload has no Cross data semantics")
+    if payload.evaluated_input.ref != inputs[0].ref:
+        raise ValueError("Cross payload and Figure revisions differ")
+
     if isinstance(payload, ImagePanelPayload):
-        return (
-            SelectorAxisMetadata(
-                payload.viewport.x_axis.axis_id,
-                payload.viewport.x_axis.name,
-                payload.viewport.x_axis.unit,
-            ),
-            SelectorAxisMetadata(
-                payload.viewport.y_axis.axis_id,
-                payload.viewport.y_axis.name,
-                payload.viewport.y_axis.unit,
-            ),
+        matches = tuple(
+            candidate for candidate in cell.series if candidate.data is payload.image
         )
-    if isinstance(payload, CurvePanelPayload):
-        return (
-            SelectorAxisMetadata(
-                payload.viewport.x_axis.axis_id,
-                payload.viewport.x_axis.name,
-                payload.viewport.x_axis.unit,
-            ),
-            SelectorAxisMetadata(
-                AxisId("figure-value"),
-                "value",
-                payload.value_unit,
-            ),
+        if len(matches) != 1:
+            raise ValueError("Cross image is absent or ambiguous in its Figure cell")
+        series = matches[0]
+        x_position = _nearest_axis_position(payload.image.x_axis, point[0])
+        y_position = _nearest_axis_position(payload.image.y_axis, point[1])
+        sampled_indices = (
+            (payload.image.x_axis.axis_id, payload.image.x_axis.indices[x_position]),
+            (payload.image.y_axis.axis_id, payload.image.y_axis.indices[y_position]),
         )
-    if isinstance(payload, HistogramPanelPayload):
-        return (
-            SelectorAxisMetadata(
-                AxisId("histogram-value"),
-                "value",
-                payload.series[0].data.value_unit,
-            ),
-            SelectorAxisMetadata(
-                AxisId("histogram-count"),
-                "count",
-                None,
-            ),
-        )
-    raise TypeError("painted payload does not expose Cross coordinates")
+    elif isinstance(payload, CurvePanelPayload):
+        if tuple(candidate.batch_address for candidate in cell.series) != tuple(
+            candidate.batch_address for candidate in payload.series
+        ):
+            raise ValueError("Cross curve series differ from their Figure cell")
+        x_axis = payload.series[0].data.x_axis
+        x_position = _nearest_axis_position(x_axis, point[0])
+        series = _nearest_curve_series(payload, x_position, point[1])
+        sampled_indices = ((x_axis.axis_id, x_axis.indices[x_position]),)
+    else:
+        if tuple(candidate.batch_address for candidate in cell.series) != tuple(
+            candidate.batch_address for candidate in payload.series
+        ):
+            raise ValueError("Cross histogram series differ from their Figure cell")
+        series, histogram_bin = _histogram_hit(payload, point)
+        sampled_indices = ()
+
+    return FigureCrossCommit(
+        source_identity,
+        _cross_sample_document(
+            figure,
+            cell=cell,
+            series=series,
+            sampled_indices=sampled_indices,
+        ),
+        point,
+        histogram_bin,
+    )
 
 
 def source_identity_matches_snapshot(
@@ -567,12 +880,6 @@ def _output_name(output_name: str) -> str:
     if not output:
         raise ValueError("Figure output name must be non-empty")
     return output
-
-
-def area_range_output_name(axis_id: AxisId) -> str:
-    if not isinstance(axis_id, AxisId):
-        raise TypeError("axis_id must be AxisId")
-    return f"area.range.{axis_id.value}"
 
 
 def area_data_output_presentation(
@@ -652,74 +959,6 @@ def materialize_area_snapshot(
     )
 
 
-def materialize_numeric_snapshot(
-    output_name: str,
-    source_ref: DatasetRevisionRef,
-    values: object,
-    *,
-    unit: str | None,
-    data_axes: tuple[AxisSpec, ...] = (SCALAR_AXIS,),
-    semantic_identity: Mapping[str, object],
-) -> OwnedSnapshot:
-    """Build a typed scalar/vector selector dataset tied to one source revision."""
-
-    if not isinstance(source_ref, DatasetRevisionRef):
-        raise TypeError("selector source_ref must be DatasetRevisionRef")
-    axes = tuple(data_axes)
-    output = _output_name(output_name)
-    return materialize_numeric_dataset(
-        source_ref,
-        values,
-        data_axes=axes,
-        unit=unit,
-        reference_for=lambda schema: figure_output_revision_ref(
-            output,
-            source_ref,
-            schema,
-            semantic_identity,
-        ),
-    )
-
-
-def _source_axis(source: OwnedSnapshot, axis_id: AxisId) -> AxisSpec:
-    schema = source.block.schema
-    for axis in (
-        schema.repeat_axis,
-        *schema.point_axes,
-        *schema.cell_schema.data_axes,
-    ):
-        if axis.axis_id == axis_id:
-            return axis
-    raise KeyError(f"selector axis {axis_id} is absent from source schema")
-
-
-def _real_coordinate(value: object) -> float | None:
-    scalar = value.item() if isinstance(value, np.generic) else value
-    if isinstance(scalar, bool) or not isinstance(scalar, Real):
-        return None
-    numeric = float(scalar)
-    return numeric if math.isfinite(numeric) else None
-
-
-def _term_bounds(
-    source: OwnedSnapshot,
-    term: CoordinateRangeSelection | IndexRangeSelection | IndexSelection,
-) -> tuple[tuple[float, ...], tuple[str, ...], str | None]:
-    axis = _source_axis(source, term.axis_id)
-    if isinstance(term, CoordinateRangeSelection):
-        return (float(term.lower), float(term.upper)), ("lower", "upper"), axis.unit
-    if isinstance(term, IndexRangeSelection):
-        lower = _real_coordinate(axis.coordinate_at(term.start))
-        upper = _real_coordinate(axis.coordinate_at(term.stop - 1))
-        if lower is not None and upper is not None:
-            return (lower, upper), ("lower", "upper"), axis.unit
-        return (float(term.start), float(term.stop)), ("start", "stop"), None
-    coordinate = _real_coordinate(axis.coordinate_at(term.index))
-    if coordinate is not None:
-        return (coordinate,), ("coordinate",), axis.unit
-    return (float(term.index),), ("index",), None
-
-
 def figure_derived_signal(
     output_name: str,
     snapshot: OwnedSnapshot,
@@ -750,61 +989,6 @@ def figure_derived_signal(
     )
 
 
-def materialize_area_range_output(
-    source: FigureSource,
-    source_ref: DatasetRevisionRef,
-    axis: AxisSpec,
-    values: tuple[float, ...],
-    labels: tuple[str, ...],
-    semantic_identity: Mapping[str, object],
-    *,
-    unit: str | None,
-    derivation_digest: str | None = None,
-) -> tuple[str, FigureDerivedSignal]:
-    """Build the one shared typed representation of an Area axis bound."""
-
-    output_name = area_range_output_name(axis.axis_id)
-    identity = canonical_digest(
-        {
-            "owner": "zlc_frontend.figure-area-bound-axis",
-            "output_name": output_name,
-            "source_block_id": source_ref.block_id.value,
-            "semantic_identity": dict(semantic_identity),
-        }
-    )
-    bound_axis = AxisSpec(
-        AxisId(f"figure-output-{identity[:24]}-bound"),
-        f"{axis.name} bound",
-        COMPONENT,
-        len(values),
-        labels,
-    )
-    bound = materialize_numeric_snapshot(
-        output_name,
-        source_ref,
-        np.asarray(values, dtype="<f8"),
-        unit=unit,
-        data_axes=(bound_axis,),
-        semantic_identity=semantic_identity,
-    )
-    return output_name, figure_derived_signal(
-        output_name,
-        bound,
-        source,
-        preserve_source_coverage=False,
-        presentation=FigureOutputPresentation(
-            output_name,
-            FIGURE_AREA_RANGE_OUTPUT_CONTRACT_ID,
-            f"{axis.name} range",
-            f"{axis.name} range",
-            f"Committed Figure Area bounds on {axis.name}.",
-        ),
-        derivation_digest=derivation_digest,
-    )
-
-
-
-
 def materialize_area_outputs(
     source: FigureSource,
     selection: Selection | HistogramValueRangeSelection,
@@ -817,8 +1001,24 @@ def materialize_area_outputs(
         snapshot = source.snapshot
         if not isinstance(snapshot, OwnedSnapshot):
             raise TypeError("Histogram Area source does not own a dataset snapshot")
-        schema = snapshot.block.schema
-        values = snapshot.block.values
+        source_selection = selection.source_selection
+        working = snapshot
+        if source_selection is not None:
+            context_identity = {
+                "kind": "histogram-area-context",
+                "source_selection": selection_to_tree(source_selection),
+            }
+            working = materialize_dataset_selection(
+                snapshot,
+                source_selection,
+                reference_for=lambda output_schema: figure_output_revision_ref(
+                    AREA_DATA_OUTPUT,
+                    snapshot.ref,
+                    output_schema,
+                    context_identity,
+                ),
+            )
+        values = working.block.values
         if values.dtype.kind not in "biuf":
             raise TypeError("Histogram Area requires real numeric source values")
         accepted = (
@@ -828,9 +1028,14 @@ def materialize_area_outputs(
         )
         semantic_identity = {
             "histogram_value_range": [selection.lower, selection.upper],
+            "source_selection": (
+                None
+                if source_selection is None
+                else selection_to_tree(source_selection)
+            ),
         }
         selected = materialize_dataset_acceptance_mask(
-            snapshot,
+            working,
             accepted,
             reference_for=lambda output_schema: figure_output_revision_ref(
                 AREA_DATA_OUTPUT,
@@ -839,7 +1044,7 @@ def materialize_area_outputs(
                 semantic_identity,
             ),
         )
-        outputs = {
+        return {
             AREA_DATA_OUTPUT: figure_derived_signal(
                 AREA_DATA_OUTPUT,
                 selected,
@@ -848,27 +1053,16 @@ def materialize_area_outputs(
                 presentation=area_data_output_presentation(
                     source.source_contract_id,
                 ),
+                # The published values include both the optional Figure
+                # context selection and this histogram value-range acceptance
+                # mask.  Until that mask has a first-class authoritative
+                # DataTransform operation, exposing only ``source_selection``
+                # would claim a replayable transform that produces different
+                # data.  Keep the complete materialized output, but do not
+                # advertise it as association-preserving.
+                source_transform=None,
             )
         }
-        value_axis = AxisSpec(
-            AxisId(f"histogram-value-{schema.fingerprint[:24]}"),
-            "value",
-            COMPONENT,
-            1,
-            ("value",),
-            unit=schema.cell_schema.value_unit,
-        )
-        range_key, range_value = materialize_area_range_output(
-            source,
-            snapshot.ref,
-            value_axis,
-            (selection.lower, selection.upper),
-            ("lower", "upper"),
-            semantic_identity,
-            unit=schema.cell_schema.value_unit,
-        )
-        outputs[range_key] = range_value
-        return outputs
     site_map = source.site_map
     if site_map is not None:
         if not isinstance(selection, Selection):
@@ -878,96 +1072,268 @@ def materialize_area_outputs(
     if not isinstance(snapshot, OwnedSnapshot):
         raise TypeError("Area source signal does not own a dataset snapshot")
     selected = materialize_area_snapshot(snapshot, selection)
-    output: dict[str, FigureDerivedSignal] = {}
-    output[AREA_DATA_OUTPUT] = figure_derived_signal(
-        AREA_DATA_OUTPUT,
-        selected,
-        source,
-        preserve_source_coverage=True,
-        presentation=area_data_output_presentation(
-            source.source_contract_id,
-        ),
-        source_transform=DataTransformSpec((selection,)),
-    )
-    selection_tree = selection_to_tree(selection)
-    for term in selection.terms:
-        axis = _source_axis(snapshot, term.axis_id)
-        values, labels, unit = _term_bounds(snapshot, term)
-        key, value = materialize_area_range_output(
+    return {
+        AREA_DATA_OUTPUT: figure_derived_signal(
+            AREA_DATA_OUTPUT,
+            selected,
             source,
-            snapshot.ref,
-            axis,
-            values,
-            labels,
-            {
-                "selection": selection_tree,
-                "axis_id": term.axis_id.value,
-            },
-            unit=unit,
+            preserve_source_coverage=True,
+            presentation=area_data_output_presentation(
+                source.source_contract_id,
+            ),
+            source_transform=DataTransformSpec((selection,)),
         )
-        output[key] = value
-    return output
+    }
 
 
 def materialize_cross_outputs(
     source: FigureSource,
-    point: tuple[float, float],
-    axes: tuple[SelectorAxisMetadata, SelectorAxisMetadata],
+    commit: FigureCrossCommit,
 ) -> dict[str, FigureDerivedSignal]:
-    """Publish a locked Cross point; mouse movement is intentionally irrelevant."""
+    """Publish the data value at a locked Cross; never publish coordinates."""
 
     if not isinstance(source, FigureSource):
         raise TypeError("Cross source must be FigureSource")
+    if not isinstance(commit, FigureCrossCommit):
+        raise TypeError("Cross output requires FigureCrossCommit")
     snapshot = source.snapshot
     if not isinstance(snapshot, OwnedSnapshot):
         raise TypeError("Cross source signal does not own a dataset snapshot")
-    if len(tuple(point)) != 2:
-        raise ValueError("Cross point must contain x and y coordinates")
-    metadata = tuple(axes)
-    if len(metadata) != 2 or any(
-        not isinstance(axis, SelectorAxisMetadata) for axis in metadata
-    ):
-        raise TypeError("Cross axes must contain x and y SelectorAxisMetadata")
-    coordinates = tuple(float(value) for value in point)
-    if not all(math.isfinite(value) for value in coordinates):
-        raise ValueError("Cross coordinates must be finite")
+    if not source_identity_matches_snapshot(commit.source_identity, snapshot):
+        raise ValueError("Cross commit belongs to another source generation")
 
-    result: dict[str, FigureDerivedSignal] = {}
-    for output_name, value, axis in zip(
-        (CROSS_X_OUTPUT, CROSS_Y_OUTPUT),
-        coordinates,
-        metadata,
-        strict=True,
+    descriptor = commit.sample_document.datasets[0]
+    figure = DataFigure(
+        commit.sample_document,
+        ResolvedDatasetMap((ResolvedDataset(descriptor.dataset_id, snapshot),)),
+    )
+    layers = tuple(figure.evaluated.layers)
+    if (
+        len(layers) != 1
+        or len(layers[0].cells) != 1
+        or len(layers[0].cells[0].series) != 1
     ):
-        coordinate = materialize_numeric_snapshot(
-            output_name,
-            snapshot.ref,
-            # ``SCALAR_AXIS`` is still one declared component axis.  Keep the
-            # canonical physical carrier ``(R=1, P=1, data=1)`` instead of
-            # passing a zero-rank ndarray and asking the data kernel to guess
-            # whether an absent trailing dimension meant scalar data.
-            np.asarray((value,), dtype="<f8"),
-            unit=axis.unit,
-            semantic_identity={
-                "kind": "cross-coordinate",
-                "axis_id": axis.axis_id.value,
-                "value": value,
-            },
+        raise RuntimeError("Cross sample document did not resolve one value series")
+    data = layers[0].cells[0].series[0].data
+    intent = commit.sample_document.layers[0].view.intent
+    if intent is ViewIntent.IMAGE:
+        if not isinstance(data, EvaluatedImage):
+            raise TypeError("Cross image evaluation returned another data kind")
+        values = np.asarray(data.values)
+        validity = np.asarray(data.validity, dtype=np.bool_)
+        if values.shape != (1, 1) or validity.shape != (1, 1):
+            raise RuntimeError("Cross image sample did not narrow to one pixel")
+        scalar_values = values.reshape(1)
+        scalar_validity = validity.reshape(1)
+        unit = data.value_unit
+        coordinates = (
+            (data.x_axis.name, data.x_axis.coordinates[0]),
+            (data.y_axis.name, data.y_axis.coordinates[0]),
         )
-        result[output_name] = figure_derived_signal(
-            output_name,
-            coordinate,
+        description = "Cross-selected image value at " + ", ".join(
+            f"{name}={value}" for name, value in coordinates
+        )
+    elif intent is ViewIntent.CURVE:
+        if not isinstance(data, EvaluatedCurve):
+            raise TypeError("Cross curve evaluation returned another data kind")
+        values = np.asarray(data.values)
+        validity = np.asarray(data.validity, dtype=np.bool_)
+        if values.shape != (1,) or validity.shape != (1,):
+            raise RuntimeError("Cross curve sample did not narrow to one point")
+        scalar_values = values
+        scalar_validity = validity
+        unit = data.value_unit
+        description = (
+            "Cross-selected curve value at "
+            f"{data.x_axis.name}={data.x_axis.coordinates[0]}"
+        )
+    elif intent is ViewIntent.HISTOGRAM:
+        if not isinstance(data, EvaluatedHistogram):
+            raise TypeError("Cross histogram evaluation returned another data kind")
+        if commit.histogram_bin is None:
+            raise RuntimeError("Histogram Cross lost its committed bin")
+        lower, upper, include_upper = commit.histogram_bin
+        samples = np.asarray(data.samples)
+        selected = (samples >= lower) & (
+            (samples <= upper) if include_upper else (samples < upper)
+        )
+        scalar_values = np.asarray(
+            (int(np.count_nonzero(selected)),),
+            dtype=np.dtype("<i8"),
+        )
+        scalar_validity = np.ones((1,), dtype=np.bool_)
+        unit = None
+        close = "]" if include_upper else ")"
+        description = (
+            f"Cross-selected histogram bin count for [{lower}, {upper}{close}."
+        )
+    else:  # FigureCrossCommit closes this; retain the materializer boundary.
+        raise RuntimeError("Cross sample document has no data-value semantics")
+
+    semantic_identity = {
+        "kind": "cross-data",
+        "sample_document": figure_document_to_tree(commit.sample_document),
+        "point": commit.point,
+        "histogram_bin": commit.histogram_bin,
+    }
+    output_snapshot = materialize_scalar_dataset(
+        snapshot.ref,
+        scalar_values,
+        valid=bool(scalar_validity[0]),
+        unit=unit,
+        reference_for=lambda schema: figure_output_revision_ref(
+            CROSS_DATA_OUTPUT,
+            snapshot.ref,
+            schema,
+            semantic_identity,
+        ),
+    )
+    source_transform = _cross_source_transform(
+        snapshot,
+        commit,
+        output_snapshot,
+    )
+    return {
+        CROSS_DATA_OUTPUT: figure_derived_signal(
+            CROSS_DATA_OUTPUT,
+            output_snapshot,
             source,
             preserve_source_coverage=False,
             presentation=FigureOutputPresentation(
-                output_name,
-                FIGURE_CROSS_COORDINATE_OUTPUT_CONTRACT_ID,
-                axis.name,
-                axis.name,
-                f"Locked Figure Cross coordinate on {axis.name}.",
+                CROSS_DATA_OUTPUT,
+                FIGURE_CROSS_DATA_OUTPUT_CONTRACT_ID,
+                "Cross data",
+                "Cross data",
+                description,
+            ),
+            source_transform=source_transform,
+            derivation_digest=figure_derivation_digest(
+                CROSS_DATA_OUTPUT,
+                output_snapshot,
+                semantic_identity,
             ),
         )
-    return result
+    }
+
+
+def _cross_source_transform(
+    source: OwnedSnapshot,
+    commit: FigureCrossCommit,
+    output: OwnedSnapshot,
+) -> DataTransformSpec | None:
+    """Return the exact per-event projection behind an IMAGE/CURVE Cross.
+
+    Association can be preserved only when the painted value is a pure
+    selection/reduction inside one producer event.  A multi-cell Figure or a
+    histogram bin count crosses that boundary: the former combines event
+    carriers and the latter is a value predicate not expressible by
+    ``DataTransformSpec``.  Those outputs remain ordinary causal signals but
+    intentionally expose no exact PulseScan association capability.
+
+    The transform is derived from the already-committed sample ``ViewSpec``;
+    ndarray rank and axis spelling never participate.  A final byte/value and
+    validity comparison proves that this authority computes the same scalar
+    the Figure published before it is attached to the signal.
+    """
+
+    if not isinstance(source, OwnedSnapshot):
+        raise TypeError("Cross transform source must be OwnedSnapshot")
+    if not isinstance(commit, FigureCrossCommit):
+        raise TypeError("Cross transform requires FigureCrossCommit")
+    if not isinstance(output, OwnedSnapshot):
+        raise TypeError("Cross transform output must be OwnedSnapshot")
+    view = commit.sample_document.layers[0].view
+    if view.intent is ViewIntent.HISTOGRAM:
+        return None
+    schema = source.block.schema
+    if schema.cell_layout.storage_size != 1:
+        return None
+
+    data_axes = tuple(schema.cell_schema.data_axes)
+    data_ids = {axis.axis_id for axis in data_axes}
+    selected_by_id = {
+        term.axis_id: term
+        for selection in view.display_selections
+        for term in selection.terms
+        if term.axis_id in data_ids
+    }
+    if len(selected_by_id) != sum(
+        1
+        for selection in view.display_selections
+        for term in selection.terms
+        if term.axis_id in data_ids
+    ):
+        raise RuntimeError("Cross sample repeats a data-axis selection")
+
+    reduced: list[AxisId] = []
+    reduction_method = None
+    for axis in data_axes:
+        binding = view.binding(axis.axis_id)
+        if binding.role is AxisViewRole.REDUCED:
+            if binding.reduction is None:
+                raise RuntimeError("Cross reduced axis lost its reducer")
+            method = {
+                "MEAN": ReductionMethod.MEAN,
+                "SUM": ReductionMethod.SUM,
+            }.get(binding.reduction.method.value)
+            if method is None:
+                return None
+            if reduction_method is not None and reduction_method is not method:
+                return None
+            reduction_method = method
+            reduced.append(axis.axis_id)
+            continue
+        if axis.axis_id in selected_by_id:
+            continue
+        if binding.role in {AxisViewRole.SELECTED, AxisViewRole.SLIDER}:
+            selector = binding.selector
+            if isinstance(selector, FixedIndex):
+                selected_by_id[axis.axis_id] = IndexSelection(
+                    axis.axis_id,
+                    selector.index,
+                )
+                continue
+            if axis.size == 1:
+                selected_by_id[axis.axis_id] = IndexSelection(axis.axis_id, 0)
+                continue
+            return None
+        if axis.size == 1:
+            selected_by_id[axis.axis_id] = IndexSelection(axis.axis_id, 0)
+            continue
+        return None
+
+    operations = []
+    if selected_by_id:
+        operations.append(Selection(tuple(selected_by_id.values())))
+    if reduced:
+        assert reduction_method is not None
+        operations.append(
+            ReductionSpec(
+                tuple(reduced),
+                reduction_method,
+                missing_policy=MissingPolicy.OMIT_MISSING,
+                validity_policy=ValidityPolicy.OMIT_INVALID,
+            )
+        )
+    if not operations:
+        return None
+    spec = DataTransformSpec(tuple(operations))
+    transformed = apply_transform(source, commit_transform(schema, spec))
+    expected = output.block
+    actual_values = np.asarray(transformed.values)
+    actual_validity = np.asarray(transformed.expanded_validity(), dtype=np.bool_)
+    if (
+        actual_values.shape != (1, 1)
+        or actual_validity.shape != (1, 1)
+        or expected.values.shape != (1, 1, 1)
+        or not np.array_equal(actual_values.reshape(1), expected.values.reshape(1))
+        or bool(actual_validity[0, 0])
+        != bool(expand_dataset_validity(expected.validity, expected.schema)[0, 0, 0])
+    ):
+        raise RuntimeError(
+            "Cross authoritative transform differs from its published scalar"
+        )
+    return spec
 
 
 def materialize_fit_outputs(

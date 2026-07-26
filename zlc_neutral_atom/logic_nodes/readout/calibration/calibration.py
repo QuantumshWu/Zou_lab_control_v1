@@ -43,6 +43,9 @@ from zlc_neutral_atom.authoring import (
     AuthoringField,
     AuthoringSchema,
 )
+from zlc_neutral_atom.logic_nodes.readout.model_contract import (
+    ReadoutModelKind as _ReadoutModelKind,
+)
 
 from .reference import CalibrationArtifactRef
 from zlc_neutral_atom.logic_nodes.readout.physical_context import (
@@ -108,56 +111,6 @@ def site_grid_positions_yx(
             else range(rows)
         )
     )
-
-
-class ReadoutModelKind(str, Enum):
-    BOX = "box"
-    PER_SITE_PSF = "psf"
-    UNIFORM_PSF = "uniform_psf"
-
-
-CALIBRATION_DEFAULT_MODEL_CHOICE = "calibration_default"
-_READOUT_MODEL_AUTHORING_SCHEMA = AuthoringSchema(
-    (
-        AuthoringField(
-            "model_kind",
-            "choice",
-            "Readout method",
-            default=CALIBRATION_DEFAULT_MODEL_CHOICE,
-            required=True,
-            choices=(
-                AuthoringChoice(
-                    CALIBRATION_DEFAULT_MODEL_CHOICE,
-                    "Calibration default",
-                ),
-                AuthoringChoice(ReadoutModelKind.BOX.value, "box"),
-                AuthoringChoice(ReadoutModelKind.PER_SITE_PSF.value, "per-site PSF"),
-                AuthoringChoice(ReadoutModelKind.UNIFORM_PSF.value, "uniform PSF"),
-            ),
-            description=(
-                "Use the calibration's default model or explicitly select one "
-                "model already stored in that calibration"
-            ),
-        ),
-    )
-)
-
-
-def readout_model_authoring_schema() -> AuthoringSchema:
-    """Return the one visible model-selection declaration."""
-
-    return _READOUT_MODEL_AUTHORING_SCHEMA
-
-
-def readout_model_kind_from_authoring(value: object) -> ReadoutModelKind | None:
-    """Resolve the visible default-reference token without choosing a model."""
-
-    if value == CALIBRATION_DEFAULT_MODEL_CHOICE:
-        return None
-    try:
-        return ReadoutModelKind(value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"unknown readout model choice {value!r}") from error
 
 
 class BoxReducer(str, Enum):
@@ -234,12 +187,12 @@ class CalibrationAnalysisRequest:
     psf_half_width: int = 3
     psf_background: BackgroundMode = BackgroundMode.ANNULUS_MEDIAN
     psf_background_padding: int = 3
-    model_kinds: tuple[ReadoutModelKind, ...] = (
-        ReadoutModelKind.BOX,
-        ReadoutModelKind.PER_SITE_PSF,
-        ReadoutModelKind.UNIFORM_PSF,
+    model_kinds: tuple[_ReadoutModelKind, ...] = (
+        _ReadoutModelKind.BOX,
+        _ReadoutModelKind.PER_SITE_PSF,
+        _ReadoutModelKind.UNIFORM_PSF,
     )
-    default_model_kind: ReadoutModelKind = ReadoutModelKind.BOX
+    default_model_kind: _ReadoutModelKind = _ReadoutModelKind.BOX
     threshold_method: ThresholdMethod = ThresholdMethod.OTSU
     train_fraction: float = 0.9
     split_seed: int = 0
@@ -292,12 +245,12 @@ class CalibrationAnalysisRequest:
             "psf_background_padding",
         )
         kinds = tuple(self.model_kinds)
-        if not kinds or any(not isinstance(kind, ReadoutModelKind) for kind in kinds):
+        if not kinds or any(not isinstance(kind, _ReadoutModelKind) for kind in kinds):
             raise TypeError("model_kinds must contain ReadoutModelKind values")
         if len(set(kinds)) != len(kinds):
             raise ValueError("model_kinds must be unique")
-        kinds = tuple(kind for kind in ReadoutModelKind if kind in kinds)
-        if not isinstance(self.default_model_kind, ReadoutModelKind):
+        kinds = tuple(kind for kind in _ReadoutModelKind if kind in kinds)
+        if not isinstance(self.default_model_kind, _ReadoutModelKind):
             raise TypeError("default_model_kind must be ReadoutModelKind")
         if self.default_model_kind not in kinds:
             raise ValueError("default_model_kind must be present in model_kinds")
@@ -434,7 +387,7 @@ def calibration_analysis_authoring_schema(
                 "All enabled models are calibrated and committed atomically."
             ),
         )
-        for kind in ReadoutModelKind
+        for kind in _ReadoutModelKind
     )
     return AuthoringSchema(
         (
@@ -445,7 +398,7 @@ def calibration_analysis_authoring_schema(
                 "Default model",
                 default=request.default_model_kind,
                 choices=tuple(
-                    AuthoringChoice(kind, kind.value) for kind in ReadoutModelKind
+                    AuthoringChoice(kind, kind.value) for kind in _ReadoutModelKind
                 ),
             ),
             AuthoringField(
@@ -575,7 +528,7 @@ def build_calibration_analysis_request_from_authoring(
     authored = calibration_analysis_authoring_schema(request).freeze(values)
     model_kinds = tuple(
         kind
-        for kind in ReadoutModelKind
+        for kind in _ReadoutModelKind
         if authored[f"model.{kind.value}.enabled"] is True
     )
     default_model_kind = authored["default_model_kind"]
@@ -844,8 +797,8 @@ class BoxFeature:
         )
 
     @property
-    def kind(self) -> ReadoutModelKind:
-        return ReadoutModelKind.BOX
+    def kind(self) -> _ReadoutModelKind:
+        return _ReadoutModelKind.BOX
 
 
 @dataclass(frozen=True, eq=False)
@@ -880,8 +833,8 @@ class PerSitePsfFeature:
         object.__setattr__(self, "valid_sites", validity)
 
     @property
-    def kind(self) -> ReadoutModelKind:
-        return ReadoutModelKind.PER_SITE_PSF
+    def kind(self) -> _ReadoutModelKind:
+        return _ReadoutModelKind.PER_SITE_PSF
 
 
 @dataclass(frozen=True, eq=False)
@@ -911,8 +864,8 @@ class UniformPsfFeature:
         object.__setattr__(self, "valid_sites", validity)
 
     @property
-    def kind(self) -> ReadoutModelKind:
-        return ReadoutModelKind.UNIFORM_PSF
+    def kind(self) -> _ReadoutModelKind:
+        return _ReadoutModelKind.UNIFORM_PSF
 
 
 ReadoutFeature: TypeAlias = BoxFeature | PerSitePsfFeature | UniformPsfFeature
@@ -954,7 +907,7 @@ class ReadoutModel:
         object.__setattr__(self, "usable_sites", usable)
 
     @property
-    def kind(self) -> ReadoutModelKind:
+    def kind(self) -> _ReadoutModelKind:
         return self.feature.kind
 
 
@@ -967,7 +920,7 @@ class CalibrationArtifact:
     readout_physical_context: ReadoutPhysicalContext
     site_map: SiteMap
     models: tuple[ReadoutModel, ...]
-    default_model_kind: ReadoutModelKind
+    default_model_kind: _ReadoutModelKind
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_binding, CalibrationSourceBinding):
@@ -993,9 +946,9 @@ class CalibrationArtifact:
         kinds = tuple(model.kind for model in models)
         if len(set(kinds)) != len(kinds):
             raise ValueError("models must contain at most one model of each kind")
-        if kinds != tuple(kind for kind in ReadoutModelKind if kind in kinds):
+        if kinds != tuple(kind for kind in _ReadoutModelKind if kind in kinds):
             raise ValueError("models must follow ReadoutModelKind declaration order")
-        if not isinstance(self.default_model_kind, ReadoutModelKind):
+        if not isinstance(self.default_model_kind, _ReadoutModelKind):
             raise TypeError("default_model_kind must be ReadoutModelKind")
         if self.default_model_kind not in kinds:
             raise ValueError("default_model_kind must name a stored model")
@@ -1022,9 +975,9 @@ class CalibrationArtifact:
             raise ValueError("SiteMap and FrameContract coordinate frames differ")
         object.__setattr__(self, "models", models)
 
-    def select_model(self, kind: ReadoutModelKind | None = None) -> ReadoutModel:
+    def select_model(self, kind: _ReadoutModelKind | None = None) -> ReadoutModel:
         selected = self.default_model_kind if kind is None else kind
-        if not isinstance(selected, ReadoutModelKind):
+        if not isinstance(selected, _ReadoutModelKind):
             raise TypeError("kind must be ReadoutModelKind or None")
         for model in self.models:
             if model.kind is selected:
@@ -1373,7 +1326,6 @@ __all__ = [
     "CalibrationAnalysisRequest",
     "CalibrationArtifact",
     "CalibrationSourceBinding",
-    "CALIBRATION_DEFAULT_MODEL_CHOICE",
     "CALIBRATION_MAXIMUM_DETECTOR_THRESHOLD_REL",
     "CALIBRATION_MAXIMUM_SITE_FIDELITY",
     "CALIBRATION_MINIMUM_BOX_RADIUS",
@@ -1390,7 +1342,6 @@ __all__ = [
     "PerSitePsfFeature",
     "ReadoutFeature",
     "ReadoutModel",
-    "ReadoutModelKind",
     "ReadoutResult",
     "ResolvedCalibration",
     "SiteMap",
@@ -1402,7 +1353,5 @@ __all__ = [
     "classify_occupancy",
     "derive_calibration_readout_physical_context",
     "extract_readout_features",
-    "readout_model_authoring_schema",
-    "readout_model_kind_from_authoring",
     "site_grid_positions_yx",
 ]

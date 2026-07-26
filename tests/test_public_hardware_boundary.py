@@ -7,7 +7,7 @@ catalog VALUES, never raw device objects.
 
 from __future__ import annotations
 
-from Zou_lab_control.notebook import connect
+from Zou_lab_control.api import connect
 
 
 

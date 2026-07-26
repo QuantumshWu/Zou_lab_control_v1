@@ -58,22 +58,16 @@ from .image_display import (
     image_display_from_form,
 )
 from .image_view import image_viewport_for_evaluated_image
+from .plot_layout import panel_surface_geometry
+from .plot_panel import PlotPanelContract
 from zlc_storage import canonical_digest
-
-DATA_FIGURE_BOARD_ID = "generic-typed-figure"
 
 DATA_FIGURE_PANEL_ID = "generic-typed"
 
-DEFAULT_DATA_FIGURE_RASTER_SIZE = (800, 520)
 DEFAULT_DATA_FIGURE_SIZE_NAME = "4x4"
-
-DATA_FIGURE_JOIN_SCHEMA_DIGEST = canonical_digest(
-    {
-        "schema": "zlc_frontend.FrozenTypedFigureJoin",
-        "fields": ("document", "input", "intent", "fit_result_identity"),
-    }
-)
-
+DEFAULT_DATA_FIGURE_RASTER_SIZE = panel_surface_geometry(
+    DEFAULT_DATA_FIGURE_SIZE_NAME
+).raster_size
 
 def data_figure_summary(figure: DataFigure) -> str:
     document = figure.document
@@ -508,6 +502,7 @@ class DataFigureFront:
     transient_fit_result_owner: FitResultBatch | None
     release_initial_canonical_on_commit: bool
     raster_size: tuple[int, int]
+    surface_contract: PlotPanelContract
 
     def __post_init__(self) -> None:
         if self.intent not in (
@@ -539,6 +534,14 @@ class DataFigureFront:
             raise ValueError("typed figure summary must be non-empty")
         if not isinstance(self.frame, BoardFrame) or len(self.frame.panels) != 1:
             raise TypeError("typed figure front requires one BoardFrame panel")
+        if not isinstance(self.surface_contract, PlotPanelContract):
+            raise TypeError("typed figure front requires PlotPanelContract")
+        if (
+            self.surface_contract.panel_id != DATA_FIGURE_PANEL_ID
+            or self.surface_contract.intent is not self.intent
+            or self.surface_contract.faceted
+        ):
+            raise ValueError("typed figure front has another surface contract")
         if (
             not isinstance(self.data_contract, tuple)
             or len(self.data_contract) != 2
@@ -797,44 +800,7 @@ def validate_rendered_data_figure_payload(
         raise ValueError("histogram worker returned conflicting authored state")
 
 
-def data_figure_initial_payload_context(
-    figure: DataFigure,
-    display: DataFigureDisplayState,
-    payload: DataFigurePanelPayload | None,
-    fit_result_identity: str | None,
-) -> tuple[
-    tuple[float, float] | None,
-    RelimMode | None,
-    HistogramCountScale | None,
-]:
-    """Validate and recover the visual state carried by one admitted payload."""
-
-    if payload is None:
-        return None, None, None
-    intent = display_state_intent(display)
-    if data_figure_payload_intent(payload) is not intent:
-        raise ValueError("initial payload does not match the figure display intent")
-    if payload.evaluated_input != figure.evaluated.inputs[0]:
-        raise ValueError("initial payload belongs to another evaluated input")
-    validate_rendered_data_figure_payload(payload, display, fit_result_identity)
-    if isinstance(payload, ImagePanelPayload):
-        return payload.color_limits, display.relim_mode, None
-    if isinstance(payload, CurvePanelPayload):
-        return payload.viewport.y_limits, display.relim_mode, None
-    if isinstance(payload, HistogramPanelPayload):
-        return (
-            payload.viewport.count_limits,
-            display.relim_mode,
-            display.count_scale,
-        )
-    if not isinstance(payload, MeterPanelPayload):
-        raise TypeError("initial payload has another typed panel kind")
-    return None, None, None
-
-
 __all__ = [
-    "DATA_FIGURE_BOARD_ID",
-    "DATA_FIGURE_JOIN_SCHEMA_DIGEST",
     "DATA_FIGURE_PANEL_ID",
     "DEFAULT_DATA_FIGURE_RASTER_SIZE",
     "DEFAULT_DATA_FIGURE_SIZE_NAME",
@@ -851,7 +817,6 @@ __all__ = [
     "data_figure_display_state_from_form",
     "data_figure_display_state_with_x_view",
     "data_figure_front_contract",
-    "data_figure_initial_payload_context",
     "data_figure_join_digest",
     "data_figure_payload_intent",
     "data_figure_summary",

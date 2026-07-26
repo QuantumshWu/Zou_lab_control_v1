@@ -552,6 +552,13 @@ class QtRasterBoard(QtWidgets.QWidget):
                 (viewport_answered or color_answered)
                 and hold is not None
                 and hold.panel_id == panel_id
+                # Area is a Qt-only gesture against the exact raster held at
+                # press time.  A render-backed answer may be admitted in the
+                # background, but advancing this held front would change the
+                # coordinate transform halfway through the drag.  Keep the
+                # old raster/viewport until release; the newly admitted front
+                # becomes visible as soon as the hold is cleared.
+                and binding.rectangle_drag is None
             ):
                 index = target_panel_ids.index(panel_id)
                 self._selector_hold = _advance_held_front(
@@ -1613,7 +1620,28 @@ class QtRasterBoard(QtWidgets.QWidget):
             return
         hits_image = target is not None and target[0].contains(event.pos())
         hits_rail = rail_target is not None and rail_target[0].contains(event.pos())
-        if _image_interaction_is_pending(binding) or self._selector_hold is not None:
+        # Area and Cross do not author a raster answer: both can safely consume
+        # the exact panel that is still painted while a viewport/clim answer is
+        # pending.  Pan and clim remain serialized because they author another
+        # render-backed transaction.  Silently consuming every press here made
+        # a quick Area/Cross action disappear whenever Agg was answering a
+        # preceding wheel step.
+        if self._selector_hold is not None:
+            if hits_image or hits_rail:
+                event.accept()
+            else:
+                super().mousePressEvent(event)
+            return
+        if (
+            _image_interaction_is_pending(binding)
+            and not (
+                hits_image
+                and event.button() in (
+                    QtCore.Qt.LeftButton,
+                    QtCore.Qt.RightButton,
+                )
+            )
+        ):
             if hits_image or hits_rail:
                 event.accept()
             else:

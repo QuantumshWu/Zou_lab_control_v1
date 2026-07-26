@@ -5,8 +5,8 @@ import time
 
 import pytest
 
-from Zou_lab_control.notebook import PulseFacade, connect
-from Zou_lab_control.notebook.facade import _service_guard
+from Zou_lab_control.api import PulseFacade, connect
+from Zou_lab_control.api.facade import _service_guard
 from zlc_neutral_atom.devices.sequencer.application import (
     PulseApplicationOwner,
     prepare_pulse_execution,

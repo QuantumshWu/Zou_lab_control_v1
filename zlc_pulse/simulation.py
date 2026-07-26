@@ -195,7 +195,7 @@ def sample_compiled_bus_codes(
 
     This is the pulse-owned virtual-hardware projection of the waveform the
     FPGA plays.  It deliberately consumes the compiled TargetIR rather than
-    notebook parameters.  A sample that lands inside a live ramp is rejected:
+    authoring parameters.  A sample that lands inside a live ramp is rejected:
     the compact IR does not expose a second approximate ramp evaluator, and a
     virtual sensor must not silently invent a different physical waveform.
     """

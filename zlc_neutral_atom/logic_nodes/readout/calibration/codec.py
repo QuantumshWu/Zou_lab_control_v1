@@ -40,11 +40,11 @@ from .calibration import (
     PerSitePsfFeature,
     ReadoutFeature,
     ReadoutModel,
-    ReadoutModelKind,
     ThresholdMethod,
     SiteMap,
     UniformPsfFeature,
 )
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 
 if TYPE_CHECKING:
     from .analysis import (

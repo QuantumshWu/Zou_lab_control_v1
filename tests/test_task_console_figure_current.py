@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import time
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -44,7 +45,7 @@ def _image_value(
         ValidityContract,
         ValueSchema,
     )
-    from zlc_workbench.task_console.data_plane import ConsoleSignalValue
+    from zlc_neutral_atom.processing.signal_plane import SignalValue
 
     repeat = AxisSpec(AxisId("current.repeat"), "repeat", REPEAT, 1, (0,))
     point = AxisSpec(AxisId("current.point"), "point", SCAN_POINT, 1, (0,))
@@ -106,9 +107,9 @@ def _image_value(
         block.ref(StreamGenerationId("current-image-generation")),
         block,
     )
-    return ConsoleSignalValue(
+    return SignalValue(
         name="image",
-        source="current immutable boundary",
+        source_instance_id="current-immutable-boundary",
         snapshot=snapshot,
         coverage=None,
         run_id=f"current-run-{int(revision)}",
@@ -128,6 +129,51 @@ def _wait(application, predicate, *, timeout: float = 15.0) -> None:
 
 
 def _present_value(console, card, value, *, frame_key) -> None:
+    from zlc_neutral_atom.dataset_output import (
+        DatasetOutputDeclaration,
+        LiveDatasetOutput,
+    )
+    from zlc_neutral_atom.runtime.dataset import MonitorCoverage
+
+    state = getattr(console, "_current_test_source", None)
+    if state is None:
+        declaration = DatasetOutputDeclaration(
+            "image",
+            "tests.current-image",
+        )
+        state = SimpleNamespace(current=None)
+        node = SimpleNamespace(
+            instance_id="current-image",
+            dataset_output_declarations=(declaration,),
+            signal_key=lambda name: str(name),
+        )
+        slot = SimpleNamespace(
+            freeze_live_outputs=lambda: state.current,
+            close=lambda: None,
+            notification_failure=None,
+        )
+        state.declaration = declaration
+        state.node = node
+        state.slot = slot
+        console._data.attach(node, slot)
+        console._current_test_source = state
+    state.current = (
+        value.run_id,
+        value.epoch_id,
+        {
+            "image": LiveDatasetOutput(
+                state.declaration,
+                value.snapshot,
+                MonitorCoverage(1, 1, 0, False),
+                value.join_digest,
+            )
+        },
+    )
+    console._data.mark_changed(state.node)
+    front = console._data.freeze()
+    console._promote_data_front(front)
+    value = front.value("image")
+    assert value is not None
     request = card._freeze_value_render_request(
         value,
         frame_key,
@@ -137,37 +183,112 @@ def _present_value(console, card, value, *, frame_key) -> None:
     console._render_lane.enqueue((request,))
 
 
-def test_cross_coordinates_keep_the_declared_scalar_data_axis() -> None:
-    from zlc_data import AxisId
-    from zlc_frontend import FigureSource
+def test_cross_publishes_selected_native_data_with_scalar_shape() -> None:
+    from zlc_frontend import FigureSource, ImageDisplayState
     from zlc_frontend.figure_outputs import (
-        SelectorAxisMetadata,
+        CROSS_DATA_OUTPUT,
+        bind_cross_data_commit,
         materialize_cross_outputs,
     )
+    from zlc_frontend.figure import ViewIntent, suggest_view
+    from zlc_frontend.panel_render import PanelComposer, PanelProvenance
     from zlc_frontend.shape_text import describe_dataset_shape
 
-    value = _image_value(revision=1)
-    outputs = materialize_cross_outputs(
-        FigureSource(value.snapshot),
-        (12.5, 27.25),
-        (
-            SelectorAxisMetadata(AxisId("current.x"), "camera x", "pixel"),
-            SelectorAxisMetadata(AxisId("current.y"), "camera y", "pixel"),
-        ),
+    value = _image_value(revision=1, dtype=np.uint8)
+    suggestion = suggest_view(value.schema, ViewIntent.IMAGE)
+    assert suggestion.spec is not None
+    composer = PanelComposer(
+        "cross-data",
+        intent=ViewIntent.IMAGE,
+        view=suggestion.spec,
+    )
+    try:
+        frame, figure = composer.compose_with_figure(
+            value.snapshot,
+            display=ImageDisplayState(),
+            provenance=PanelProvenance("run", "epoch", "0" * 64),
+        )
+        panel = frame.panels[0]
+        commit = bind_cross_data_commit(
+            panel.source_identity,
+            (31.0, 29.0),
+            figure,
+            panel.display_payload,
+        )
+        outputs = materialize_cross_outputs(FigureSource(value.snapshot), commit)
+    finally:
+        composer.close()
+
+    assert set(outputs) == {CROSS_DATA_OUTPUT}
+    snapshot = outputs[CROSS_DATA_OUTPUT].snapshot
+    assert snapshot.block.values.shape == (1, 1, 1)
+    assert snapshot.block.values.dtype == np.dtype(np.uint8)
+    assert snapshot.block.values[0, 0, 0] == value.values[0, 0, 29, 31]
+    assert snapshot.block.schema.cell_schema.data_shape == (1,)
+    assert describe_dataset_shape(snapshot.block.schema, snapshot.block.values) == (
+        "1 × 1 × (1)"
     )
 
-    assert set(outputs) == {"cross.x", "cross.y"}
-    for output in outputs.values():
-        snapshot = output.snapshot
-        assert snapshot.block.values.shape == (1, 1, 1)
-        assert snapshot.block.schema.cell_schema.data_shape == (1,)
-        assert (
-            describe_dataset_shape(
-                snapshot.block.schema,
-                snapshot.block.values,
-            )
-            == "1 × 1 × (1)"
+
+def test_auto_view_is_explicit_and_slider_edits_persist_the_typed_spec() -> None:
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_frontend.figure import AxisViewRole, FixedIndex, dataset_axes
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
+    from zlc_workbench.task_console.window import TaskConsole
+
+    application = ensure_qt_app()
+    console = TaskConsole(
+        state=TaskConsoleState(
+            panels=(PanelConfig(kind="1d", title="Lineout", signal="image"),),
+        ),
+        window_px=(900, 700),
+    )
+    try:
+        console.show()
+        application.processEvents()
+        console._timer.stop()
+        card = console.cards[0]
+        value = _image_value(revision=1)
+        _present_value(console, card, value, frame_key=("image", 1))
+        _wait(application, lambda: card.frozen_render_payload() is not None)
+
+        schema = card.frozen_render_value().schema
+        view = card._effective_view_spec(schema)
+        assert view is not None
+        assert set(card.view_spec_editor._rows) == {
+            axis.axis_id for axis in dataset_axes(schema)
+        }
+        slider = next(
+            binding
+            for binding in view.axis_bindings
+            if binding.role is AxisViewRole.SLIDER
         )
+        _row, combo = card.view_spec_editor._rows[slider.axis_id]
+        assert combo.isEnabled()
+        combo.setCurrentIndex(5)
+        _wait(
+            application,
+            lambda: isinstance(
+                card._saved_view_spec(schema).binding(slider.axis_id).selector,
+                FixedIndex,
+            )
+            and card._saved_view_spec(schema).binding(slider.axis_id).selector.index
+            == 5,
+        )
+
+        QtTest.QTest.mouseClick(card.edit_button, QtCore.Qt.LeftButton)
+        _wait(application, lambda: id(card) in console._panel_editors)
+        editor = console._panel_editors[id(card)]
+        assert set(editor.view_spec_editor._rows) == set(card.view_spec_editor._rows)
+        assert (
+            editor.view_spec_editor._view.binding(slider.axis_id).selector.index
+            == 5
+        )
+    finally:
+        close_task_console(application, console)
 
 
 def test_viewport_renders_reuse_one_prepared_plane_for_the_same_revision() -> None:
@@ -361,14 +482,18 @@ def test_fit_button_presents_overlay_and_publishes_readable_figure_signals() -> 
         assert edit_overlay.result_identity == card._fit_result_identity
         _wait(
             application,
-            lambda: console.figure_signals_label is not None
-            and "center_x" in console.figure_signals_label.text(),
+            lambda: card.panel_id in console._passive_publisher_rows
+            and "center_x"
+            in console._passive_publisher_rows[
+                card.panel_id
+            ].publishes_label.text(),
         )
-        inventory = console.figure_signals_label.text()
+        publisher_row = console._passive_publisher_rows[card.panel_id]
+        inventory = publisher_row.publishes_label.text()
         assert "center_y" in inventory
         assert "one_over_e_radius" in inventory
         assert "1 × 1 × (1)" in inventory
-        assert "fit.center_x" in console.figure_signals_label.toolTip()
+        assert "fit.center_x" in publisher_row.publishes_label.toolTip()
         fit_keys = tuple(
             key for key in console._tick_data.names() if "/fit." in key
         )

@@ -7,14 +7,8 @@ from dataclasses import replace
 from zlc_data import (
     DatasetSchema,
     FitResultBatch,
-    MONITOR_HISTORY,
     REPEAT,
     SCALAR,
-    SCAN_POINT,
-    SITE,
-    SPATIAL_X,
-    SPATIAL_Y,
-    SPECTRAL,
     Selection,
 )
 
@@ -32,7 +26,6 @@ from .model import (
     AxisViewBinding,
     AxisViewRole,
     DecisionReason,
-    DisplaySlot,
     DisplayReduction,
     DisplayReductionMethod,
     FixedIndex,
@@ -44,22 +37,6 @@ from .model import (
     ViewPreferences,
     ViewSpec,
     ViewSuggestion,
-)
-
-
-_AUTO_CURVE_CONTRACT = replace(
-    CURVE_CONTRACT,
-    display_slots=(
-        DisplaySlot(
-            AxisViewRole.X,
-            (
-                SPECTRAL,
-                SCAN_POINT,
-                MONITOR_HISTORY,
-                SITE,
-            ),
-        ),
-    ),
 )
 
 
@@ -120,23 +97,14 @@ def _plan_automatic_bindings(
     allowed,
     point_defaults,
 ):
-    """Choose the first declared visible role without inventing work caps."""
+    """Choose each declared axis' first legal role in schema order.
 
-    policy_order = {
-        policy.axis_role: position
-        for position, policy in enumerate(contract.role_policies)
-    }
-    ordered_axes = tuple(
-        sorted(
-            axes,
-            key=lambda axis: (
-                policy_order.get(axis.role, len(policy_order)),
-                axis.axis_id.value,
-            ),
-        )
-    )
+    Schema order is authored metadata.  AxisId spelling, ndarray rank, axis
+    length, and live values are deliberately absent from this decision.
+    """
+
     planned = {}
-    for axis in ordered_axes:
+    for axis in axes:
         policy = contract.policy_for(axis.role)
         if policy is None or not policy.automatic_roles:
             return None
@@ -230,6 +198,7 @@ def _suggest_view(
     unbound = set(axis_by_id)
     bindings: dict = {}
     reasons: list[DecisionReason] = []
+    alternatives: list[ViewAlternative] = []
     review_required = False
 
     for slot in contract.display_slots:
@@ -279,19 +248,29 @@ def _suggest_view(
                 else role_candidates
             )
             for role, candidates in candidate_groups:
-                if len(candidates) == 1:
+                if candidates:
                     chosen = candidates[0]
+                    if len(candidates) > 1:
+                        alternatives.extend(
+                            ViewAlternative(
+                                axis.axis_id,
+                                slot.binding_role,
+                                axis.name,
+                            )
+                            for axis in candidates
+                        )
+                        reasons.append(
+                            DecisionReason(
+                                "DISPLAY_AXIS_DEFAULT",
+                                (
+                                    f"{chosen.name} is the first declared {role.value} "
+                                    f"axis eligible for {slot.binding_role.value}; "
+                                    "the ViewSpec records the choice explicitly"
+                                ),
+                                chosen.axis_id,
+                            )
+                        )
                     break
-                if len(candidates) > 1:
-                    alternatives = tuple(
-                        ViewAlternative(axis.axis_id, slot.binding_role, axis.name)
-                        for axis in sorted(candidates, key=lambda item: item.axis_id.value)
-                    )
-                    return _needs(
-                        "AMBIGUOUS_DISPLAY_AXIS",
-                        f"multiple {role.value} axes can fill {slot.binding_role.value}",
-                        alternatives=alternatives,
-                    )
             if chosen is None:
                 return _needs(
                     "MISSING_DISPLAY_AXIS",
@@ -444,7 +423,7 @@ def _suggest_view(
         spec,
         SuggestionStatus.REVIEW_REQUIRED if review_required else SuggestionStatus.RESOLVED,
         tuple(reasons),
-        (),
+        tuple(alternatives),
     )
 
 
@@ -462,11 +441,7 @@ def suggest_view(
         intent,
         selection,
         preferences,
-        contract=(
-            _AUTO_CURVE_CONTRACT
-            if intent is ViewIntent.CURVE
-            else contract
-        ),
+        contract=contract,
     )
 
 

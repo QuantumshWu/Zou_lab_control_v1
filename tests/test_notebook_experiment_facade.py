@@ -1,4 +1,4 @@
-"""The short notebook facade without leaking process-owned hardware authority."""
+"""The public Experiment API without leaking process-owned hardware authority."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ import time
 
 import pytest
 
-import Zou_lab_control.notebook as zlc
-import Zou_lab_control.notebook.facade as facade_impl
-import Zou_lab_control.notebook._readout_composition as readout_composition_impl
+import Zou_lab_control.api as zlc
+import Zou_lab_control.api.facade as facade_impl
+import Zou_lab_control.api._readout_core as readout_core_impl
 from zlc_data import (
     FitCancelled,
     FitNumericPolicy,
@@ -387,9 +387,7 @@ def _case_close_race(root: Path, surface: str) -> None:
     passed_initial_lookup = threading.Event()
     backend_calls: list[str] = []
     failures: list[BaseException] = []
-    guard_owner = (
-        readout_composition_impl if surface == "capture" else facade_impl
-    )
+    guard_owner = readout_core_impl if surface == "capture" else facade_impl
     guard_name = "service_guard" if surface == "capture" else "_service_guard"
     original_guard = getattr(guard_owner, guard_name)
 
@@ -592,13 +590,13 @@ def _run_isolated(case: str, root: Path) -> subprocess.CompletedProcess[str]:
         "failed-public-root",
     ),
 )
-def test_notebook_facade_in_process_lifetime_installation(
+def test_public_api_in_process_lifetime_installation(
     case: str,
     tmp_path: Path,
 ) -> None:
     completed = _run_isolated(case, tmp_path / case)
     assert completed.returncode == 0, (
-        f"isolated notebook case {case!r} failed\n"
+        f"isolated public API case {case!r} failed\n"
         f"stdout:\n{completed.stdout}\n"
         f"stderr:\n{completed.stderr}"
     )

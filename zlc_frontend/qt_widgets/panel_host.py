@@ -30,7 +30,8 @@ from ..figure_outputs import (
     FigureAreaCommit,
     FigureCrossCommit,
     HistogramValueRangeSelection,
-    selector_axes_for_payload,
+    bind_area_data_commit,
+    bind_cross_data_commit,
 )
 from ..selector import (
     CrossGesture, CurveRangeGesture, CurveViewportCommit, HistogramRangeGesture,
@@ -147,6 +148,17 @@ class SinglePanelHost(QtWidgets.QWidget):
             raise RuntimeError("rectangle candidate requires an image binding")
         self._board.set_image_rectangle_candidate(normalized_bounds)
 
+    def set_range_candidate(self, x_span) -> None:
+        """Echo one completed numeric Area on this exact binding."""
+
+        if self._bound_kind == "curve":
+            self._board.set_curve_range_candidate(x_span)
+            return
+        if self._bound_kind == "histogram":
+            self._board.set_histogram_range_candidate(x_span)
+            return
+        raise RuntimeError("range candidate requires a numeric binding")
+
     def set_selectors_enabled(self, on: bool) -> None:
         """The Selectors switch, same semantics as every console card: remember
         the desired state and gate the CURRENT binding now; a binding created
@@ -180,6 +192,11 @@ class SinglePanelHost(QtWidgets.QWidget):
         elif self._bound_kind == "image":
             self._board.unbind_rectangle_selector(self._panel_id)
         self._bound_kind = None
+
+    def unbind_interaction(self) -> None:
+        """Retire this surface's gesture binding without clearing its pixels."""
+
+        self._unbind_current_interaction()
 
     def visible_interaction_origin(self) -> PanelInteractionOrigin | None:
         """Return the exact painted origin for this host's bound family.
@@ -226,6 +243,8 @@ class SinglePanelHost(QtWidgets.QWidget):
     def area_commit_for_range_gesture(
         self,
         gesture: CurveRangeGesture | HistogramRangeGesture,
+        *,
+        figure,
     ) -> FigureAreaCommit | None:
         """Resolve a completed numeric Area against this exact painted front."""
 
@@ -243,11 +262,13 @@ class SinglePanelHost(QtWidgets.QWidget):
             if isinstance(gesture, HistogramRangeGesture)
             else self.selection_for_curve_range_gesture(gesture)
         )
-        return FigureAreaCommit(source_identity, selection)
+        return bind_area_data_commit(source_identity, selection, figure)
 
     def area_commit_for_rectangle_gesture(
         self,
         gesture: RectangleGesture,
+        *,
+        figure,
     ) -> FigureAreaCommit | None:
         """Resolve a completed image Area against this exact painted front."""
 
@@ -256,13 +277,15 @@ class SinglePanelHost(QtWidgets.QWidget):
         if gesture.normalized_bounds is None:
             return None
         selection = self.selection_for_rectangle_gesture(gesture)
-        return FigureAreaCommit(gesture.source_identity, selection)
+        return bind_area_data_commit(gesture.source_identity, selection, figure)
 
     def cross_commit_for_gesture(
         self,
         gesture: CrossGesture,
+        *,
+        figure,
     ) -> FigureCrossCommit | None:
-        """Resolve one locked Cross through the exact painted payload."""
+        """Resolve one locked Cross to the exact value the Figure displayed."""
 
         if not isinstance(gesture, CrossGesture):
             raise TypeError("Cross output requires CrossGesture")
@@ -276,8 +299,12 @@ class SinglePanelHost(QtWidgets.QWidget):
         front = self.front_frame
         if front is None or len(front.panels) != 1:
             raise RuntimeError("Cross output requires one exact painted panel")
-        axes = selector_axes_for_payload(front.panels[0].display_payload)
-        return FigureCrossCommit(source_identity, gesture.point, axes)
+        return bind_cross_data_commit(
+            source_identity,
+            gesture.point,
+            figure,
+            front.panels[0].display_payload,
+        )
 
     def discard_pending_interaction(self, origin: PanelInteractionOrigin) -> bool:
         """Release only the exact failed display commit for this host."""

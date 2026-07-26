@@ -1,14 +1,11 @@
-"""Notebook surface owned by Temperature release-recapture."""
+"""Public Experiment API owned by Temperature release-recapture."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
 
-from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
-    ReadoutModelKind,
-)
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
 )
@@ -24,35 +21,38 @@ from .application import (
 from .measurement import TemperatureReleaseRecaptureRequest
 
 
-class TemperatureReleaseRecaptureNotebookHost(Protocol):
-    def load_temperature_pulse(
+class TemperatureReleaseRecaptureApi:
+    __slots__ = (
+        "_bind_request",
+        "_load_pulse",
+        "_resolve_camera_ref",
+        "_resolve_sequencer_ref",
+        "_wait_run",
+    )
+
+    def __init__(
         self,
-        value: PulseDocument | str | Path,
-    ) -> PulseDocument: ...
-
-    def resolve_temperature_camera_ref(self, requested: str | None) -> DeviceRef: ...
-
-    def resolve_temperature_sequencer_ref(
-        self,
-        requested: str | None,
-    ) -> DeviceRef: ...
-
-    def bind_temperature_release_recapture(
-        self,
-        request: TemperatureReleaseRecaptureRequest,
-    ) -> PreparedReleaseRecapture: ...
-
-    def wait_temperature_release_recapture(self, handle: RunHandle): ...
-
-
-class TemperatureReleaseRecaptureNotebookAdapter:
-    __slots__ = ()
-
-    @property
-    def _temperature_notebook_host(
-        self,
-    ) -> TemperatureReleaseRecaptureNotebookHost:
-        raise NotImplementedError
+        *,
+        load_pulse: Callable,
+        resolve_camera_ref: Callable,
+        resolve_sequencer_ref: Callable,
+        bind_request: Callable,
+        wait_run: Callable,
+    ) -> None:
+        operations = (
+            load_pulse,
+            resolve_camera_ref,
+            resolve_sequencer_ref,
+            bind_request,
+            wait_run,
+        )
+        if any(not callable(operation) for operation in operations):
+            raise TypeError("temperature API operations must be callable")
+        self._load_pulse = load_pulse
+        self._resolve_camera_ref = resolve_camera_ref
+        self._resolve_sequencer_ref = resolve_sequencer_ref
+        self._bind_request = bind_request
+        self._wait_run = wait_run
 
     def temperature_release_recapture_request(
         self,
@@ -67,13 +67,12 @@ class TemperatureReleaseRecaptureNotebookAdapter:
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
     ) -> TemperatureReleaseRecaptureRequest:
-        host = self._temperature_notebook_host
         return TemperatureReleaseRecaptureRequest(
-            host.load_temperature_pulse(pulse),
+            self._load_pulse(pulse),
             tuple(trap_off_seconds),
             shots,
-            host.resolve_temperature_camera_ref(camera_role),
-            host.resolve_temperature_sequencer_ref(sequencer_role),
+            self._resolve_camera_ref(camera_role),
+            self._resolve_sequencer_ref(sequencer_role),
             calibration_ref,
             model_kind,
             per_site,
@@ -86,9 +85,13 @@ class TemperatureReleaseRecaptureNotebookAdapter:
     ) -> RunHandle:
         if not isinstance(request, TemperatureReleaseRecaptureRequest):
             raise TypeError("request must be TemperatureReleaseRecaptureRequest")
-        return self._temperature_notebook_host.bind_temperature_release_recapture(
-            request
-        ).start()
+        return self._bind(request).start()
+
+    def _bind(
+        self,
+        request: TemperatureReleaseRecaptureRequest,
+    ) -> PreparedReleaseRecapture:
+        return self._bind_request(request)
 
     def prepare_temperature_release_recapture_application(
         self,
@@ -107,15 +110,10 @@ class TemperatureReleaseRecaptureNotebookAdapter:
     ):
         if not isinstance(request, TemperatureReleaseRecaptureRequest):
             raise TypeError("request must be TemperatureReleaseRecaptureRequest")
-        handle = self._temperature_notebook_host.bind_temperature_release_recapture(
-            request
-        ).start()
-        return self._temperature_notebook_host.wait_temperature_release_recapture(
-            handle
-        )
+        handle = self._bind(request).start()
+        return self._wait_run(handle)
 
 
 __all__ = [
-    "TemperatureReleaseRecaptureNotebookAdapter",
-    "TemperatureReleaseRecaptureNotebookHost",
+    "TemperatureReleaseRecaptureApi",
 ]

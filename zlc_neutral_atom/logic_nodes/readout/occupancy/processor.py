@@ -28,6 +28,7 @@ from zlc_data import (
     DatasetComponentValidity,
     DatasetRevisionRef,
     DatasetSchema,
+    IndexSelection,
     OwnedSnapshot,
     Selection,
     StreamGenerationId,
@@ -48,12 +49,9 @@ from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.input_spec import ArtifactInputSpec, DatasetInputSpec
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     ReadoutModel,
-    ReadoutModelKind,
     ResolvedCalibration,
     SiteMap,
     apply_readout_model,
-    readout_model_authoring_schema,
-    readout_model_kind_from_authoring,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CALIBRATION_ARTIFACT_REF_FORMAT,
@@ -63,11 +61,15 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.logic_nodes.camera_measurement import (
     CAMERA_FRAME_OUTPUT_CONTRACT_ID,
-    current_camera_monitor_selection,
 )
 from zlc_neutral_atom.logic_nodes.readout.contracts import FrameContract
 from zlc_neutral_atom.logic_nodes.readout.physical_context import (
     _derive_readout_physical_context_from_evidence,
+)
+from zlc_neutral_atom.logic_nodes.readout.model_contract import (
+    ReadoutModelKind,
+    readout_model_authoring_schema,
+    readout_model_kind_from_authoring,
 )
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_storage import canonical_digest, canonical_text, sha256_text
@@ -989,9 +991,27 @@ def _evaluate_occupancy_processor(
         model_kind=model.kind,
     )
     rate = occupancy_rate_snapshot(occupied)
-    point_index, logical_point, selection = current_camera_monitor_selection(
-        source.block.schema,
-        coverage,
+    source_schema = source.block.schema
+    if coverage.written_cells != 1 or coverage.total_cells != 1:
+        raise ValueError("Occupancy requires one committed public Camera frame cell")
+    if source_schema.repeat_axis.size != 1 or (
+        source_schema.point_layout.storage_size != 1
+    ):
+        raise ValueError("Occupancy requires a public Camera frame with R=1 and P=1")
+    point_index = 0
+    logical_point = source_schema.point_layout.multi_index(point_index)
+    selection = Selection(
+        (
+            IndexSelection(source_schema.repeat_axis.axis_id, 0),
+            *(
+                IndexSelection(axis.axis_id, index)
+                for axis, index in zip(
+                    source_schema.point_axes,
+                    logical_point,
+                    strict=True,
+                )
+            ),
+        )
     )
     reference = calibration.reference
     join_digest = canonical_digest(

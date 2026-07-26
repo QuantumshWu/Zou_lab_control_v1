@@ -18,7 +18,7 @@ from PyQt5 import QtCore, QtWidgets
 from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     build_calibration_analysis_request_from_authoring,
     calibration_analysis_authoring_schema,
@@ -40,8 +40,8 @@ def application():
 def calibration_product(tmp_path_factory):
     workspace = tmp_path_factory.mktemp("w6-calibration-workspace")
     with zlc.connect("virtual", repository=workspace) as experiment:
-        reference = experiment.readout.sitemap(frames=12)
-        computation = experiment.readout.load_calibration_computation(reference)
+        reference = experiment.nodes.calibration.sitemap(frames=12)
+        computation = experiment.nodes.calibration.load_calibration_computation(reference)
         yield experiment, reference, computation, workspace
 
 
@@ -84,7 +84,7 @@ def test_calibration_owner_presenter_and_public_imports_remain_headless() -> Non
                 "        name == prefix or name.startswith(prefix + '.')\n"
                 "        for name in sys.modules\n"
                 "    ), prefix\n"
-                "import Zou_lab_control.notebook\n"
+                "import Zou_lab_control.api\n"
                 "import Zou_lab_control.workbench\n"
                 "for prefix in ('PyQt5', 'matplotlib'):\n"
                 "    assert not any(\n"
@@ -142,7 +142,7 @@ def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
 ) -> None:
     experiment, _prior, computation, workspace = calibration_product
     original = computation.report.request
-    request = experiment.readout.calibration_request(
+    request = experiment.nodes.calibration.calibration_request(
         computation.artifact.source_binding.source_capture_ref,
         replace(original, split_seed=original.split_seed + 1),
     )
@@ -151,7 +151,7 @@ def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
     committed = threading.Event()
     release_receipt = threading.Event()
     run_threads: list[int] = []
-    window = experiment.readout.calibration_gui(request)
+    window = experiment.nodes.calibration.calibration_gui(request)
     try:
         _until(application, lambda: window.worker_idle and window.editor_ready)
         assert window.saved_reference is None
@@ -228,7 +228,7 @@ def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
         assert "post-commit cleanup warning" in window._diagnostic.text()
         assert "post-commit report failure" in window._diagnostic.text()
         assert _manifest_count(workspace) == before + 1
-        admitted = experiment.readout.load_calibration_computation(saved)
+        admitted = experiment.nodes.calibration.load_calibration_computation(saved)
         assert admitted.report.request.train_fraction == 0.8
         assert admitted.report.request.split_seed == original.split_seed + 1
         assert admitted.artifact.source_binding.source_capture_ref == (
@@ -245,7 +245,7 @@ def test_exact_saved_calibration_reopens_for_new_revision_without_mutation(
 ) -> None:
     experiment, reference, _computation, workspace = calibration_product
     before = _manifest_count(workspace)
-    window = experiment.readout.calibration_edit_gui(reference)
+    window = experiment.nodes.calibration.calibration_edit_gui(reference)
     try:
         _until(
             application,
@@ -276,7 +276,7 @@ def test_committed_invalid_receipt_never_claims_failure_or_auto_closes(
     calibration_product,
 ) -> None:
     experiment, _reference, computation, workspace = calibration_product
-    request = experiment.readout.calibration_request(
+    request = experiment.nodes.calibration.calibration_request(
         computation.artifact.source_binding.source_capture_ref,
         replace(computation.report.request, split_seed=23),
     )
@@ -284,7 +284,7 @@ def test_committed_invalid_receipt_never_claims_failure_or_auto_closes(
     committed = threading.Event()
     release = threading.Event()
     actual_references: list[CalibrationArtifactRef] = []
-    window = experiment.readout.calibration_gui(request)
+    window = experiment.nodes.calibration.calibration_gui(request)
     try:
         original_starter = window._run_starter
 
@@ -320,7 +320,7 @@ def test_committed_invalid_receipt_never_claims_failure_or_auto_closes(
         assert "Run reports FINAL commit" in window._summary.text()
         assert _manifest_count(workspace) == before + 1
         assert len(actual_references) == 1
-        experiment.readout.load_calibration_computation(actual_references[0])
+        experiment.nodes.calibration.load_calibration_computation(actual_references[0])
     finally:
         release.set()
         _close(application, window)
@@ -331,11 +331,11 @@ def test_typed_reference_without_commit_evidence_is_not_admitted_as_final(
     calibration_product,
 ) -> None:
     experiment, reference, computation, _workspace = calibration_product
-    request = experiment.readout.calibration_request(
+    request = experiment.nodes.calibration.calibration_request(
         computation.artifact.source_binding.source_capture_ref,
         computation.report.request,
     )
-    window = experiment.readout.calibration_gui(request)
+    window = experiment.nodes.calibration.calibration_gui(request)
     try:
         generation = window._run_owner.begin_generation()
         window._run_active = True
@@ -370,7 +370,7 @@ def test_stop_before_finalize_publishes_no_calibration(
     monkeypatch,
 ) -> None:
     experiment, _reference, computation, workspace = calibration_product
-    request = experiment.readout.calibration_request(
+    request = experiment.nodes.calibration.calibration_request(
         computation.artifact.source_binding.source_capture_ref,
         replace(computation.report.request, split_seed=19),
     )
@@ -393,7 +393,7 @@ def test_stop_before_finalize_publishes_no_calibration(
         "_analyze_calibration_resolved",
         blocked_after_analysis,
     )
-    window = experiment.readout.calibration_gui(request)
+    window = experiment.nodes.calibration.calibration_gui(request)
     try:
         _until(application, lambda: window.worker_idle and window.editor_ready)
         window._calibrate_button.click()

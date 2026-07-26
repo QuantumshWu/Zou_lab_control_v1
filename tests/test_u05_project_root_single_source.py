@@ -1,35 +1,19 @@
-"""Where the project root is, said once -- not re-derived by each shell from its own depth.
+"""Where the project root is, said once -- not re-derived by each shell from its depth.
 
-``zlc_storage/paths.py`` owns it, and its own docstring already names the folders it
-anchors: "the folder that holds the packages alongside ``pulses/`` ``calibrations/``
-``tasks/`` ``docs/``".  Yet both GUI shells computed it a SECOND time, from the depth of
-their own file:
-
-    task_console.py   Path(__file__).resolve().parents[2] / "tasks"
-    pulse_gui.py      Path(__file__).resolve().parents[2] / "pulses"
-
-Those agreed with the seam only for as long as both files stayed exactly two levels down
--- and moving those files is precisely what this migration does.  The failure would not
-be an import error either: the GUI would quietly start saving layouts and pulse programs
-into a different folder, and the operator would find their work missing rather than see a
-crash.  ``parents[3]`` in ``fpga_pulse_streamer`` is deliberately NOT swept in: it looks
-for an in-repo resource, tries the CWD first and returns None when absent, which is a
-different question from "where is the project root".
+``zlc_storage/paths.py`` owns the folders alongside ``pulses/``, ``calibrations/``,
+``tasks/``, and ``docs/``. GUI shells must ask that seam instead of deriving a path
+from their own source depth; otherwise a file move silently changes where operator
+work is stored.
 
 Capturing the golden also turned up a real defect on the very line being changed: with
 ``ZLC_TASK_DIR`` set to whitespace, ``_task_files_dir`` raised FileNotFoundError from
 ``Path("   ").mkdir()``, while its sibling ``_pulse_files_dir`` stripped and fell back.
 A blank environment variable is a human typo, not a directory; the two now agree.
 
-The tests that cover these helpers (test_frontend_smoke.py) sit outside
-``tests/migration_active_tests.txt`` and are frozen, so the cases below were captured from
-the shells immediately before the change.
+The cases below directly preserve the current storage-seam behavior.
 """
 
 from __future__ import annotations
-
-#: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
-#: file guards the NEW structure and is permanent (swept by test_design_charter).
 
 import ast
 import os
@@ -42,11 +26,8 @@ from zlc_storage.paths import PROJECT_ROOT, project_path, user_output_path
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 #: (module path, helper name, env var name, folder) for the two shells that keep a
-#: user-facing folder of saved files.
-#: The tasks entry named ``task_console._task_files_dir`` until S5-shell(w) moved the whole
-#: saved-layout cluster into ``zlc_workbench.task_console``.  The claim is unchanged -- ask
-#: the seam, never count your own parents -- so it follows the function rather than being
-#: deleted along with the shell that used to hold it.
+#: user-facing folder of saved files. Each must ask the storage seam rather than
+#: count parents from its own source path.
 SHELLS = [
     (
         "zlc_workbench/task_console/layout_repository.py",

@@ -1,4 +1,4 @@
-"""Static notebook rendering facade over one frozen frontend evaluation."""
+"""Static Figure facade over one frozen frontend evaluation."""
 
 from __future__ import annotations
 
@@ -214,7 +214,7 @@ def _validated_fit_result_mapping(
 
 
 class DataFigure:
-    """Own one immutable, already-resolved notebook figure.
+    """Own one immutable, already-resolved Figure session.
 
     ``DataFigure`` never resolves repositories, sessions, devices, or live
     streams.  Construction evaluates the supplied frozen snapshots once and

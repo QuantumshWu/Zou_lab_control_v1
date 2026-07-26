@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 from zlc_data.fit_model import fit_model_catalog
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.logic_nodes.mot_field import MotFieldTaskIntent
@@ -83,7 +83,7 @@ def test_mot_task_analyzes_once_and_reuses_that_result_for_every_output(
     workspace = tmp_path / "mot-workspace"
     report_folder = tmp_path / "mot-report"
     with zlc.connect("virtual", repository=workspace) as exp:
-        command = exp.readout.prepare_mot_field_task(
+        command = exp.nodes.mot_field.prepare_mot_field_task(
             MotFieldTaskIntent(
                 pulse=str(MOT_FIELD_PULSE),
                 center_x=0.0,

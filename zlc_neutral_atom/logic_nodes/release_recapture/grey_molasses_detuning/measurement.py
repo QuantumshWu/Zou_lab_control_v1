@@ -17,8 +17,9 @@ from zlc_neutral_atom.logic_node_declaration import (
     OutputPresentation,
     PathPresentationHint,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import ReadoutModelKind, ResolvedCalibration
+from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import ResolvedCalibration
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.logic_nodes.readout.calibration_input import (
     calibration_input_specs,
     calibration_reference,

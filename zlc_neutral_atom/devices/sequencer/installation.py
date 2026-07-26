@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from fpga.pulse_streamer.host.image import StreamerParams, build_fingerprint
 from zlc_neutral_atom.installation_assets import (
@@ -18,15 +20,25 @@ from zlc_neutral_atom.installation_runtime import (
     _identity_for,
 )
 from zlc_neutral_atom.devices.sequencer.remote_pulse import RemotePulseExecutionEndpoint
-from zlc_neutral_atom.installation_plan import installation_device_plan
+from zlc_neutral_atom.installation_plan import InstallationDevicePlan
 from zlc_neutral_atom.runtime.ports import BoundDevice, DeviceBroker, SafetyOperation
 from zlc_neutral_atom.runtime.resources import DeviceIdentityEvidenceKind, ResourceArbiter, ResourceKey
 from zlc_neutral_atom.runtime.run import RunController
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
-from zlc_pulse import PulseDocument, RemotePulseExecutionClient, bind_pulse_document_target, validate_pulse_document_clock_grid
+from zlc_pulse import PulseDocument, PulseServerSnapshot, RemotePulseExecutionClient, bind_pulse_document_target, validate_pulse_document_clock_grid
 from zlc_storage import canonical_digest, normalized_text
 
-def _bind_remote_sequencer(
+@dataclass(frozen=True, slots=True)
+class RemotePulseConnection:
+    """One validated current-protocol client and its frozen live target facts."""
+
+    client: RemotePulseExecutionClient
+    snapshot: PulseServerSnapshot
+    endpoint_label: str
+    max_blocking_call_seconds: float | None
+
+
+def bind_remote_sequencer(
     broker: DeviceBroker,
     asset: InstallationAsset,
     asset_map_revision: str,
@@ -93,21 +105,16 @@ def _bind_remote_sequencer(
     )
 
 
-def create_remote_pulse_installation(
+def connect_remote_pulse_client(
     *,
     host: str,
     port: int,
     transport_timeout_seconds: float,
     max_blocking_call_seconds: float | None = None,
     required_pulse_document: PulseDocument | None = None,
-) -> _InstallationComposition:
-    """Compose one sequencer-only installation over the current pulse RPC.
-
-    Network reachability is proven before publishing the owned installation.
-    A typo or an unavailable server therefore remains retryable.  Once the remote
-    generation has entered SAFE and is bound, all later failures are treated like
-    any other partial hardware startup and fail closed.
-    """
+    client_factory: Callable[..., RemotePulseExecutionClient] | None = None,
+) -> RemotePulseConnection:
+    """Connect, validate geometry/target, and enter verified SAFE once."""
 
     endpoint_host = normalized_text(host, "remote pulse host")
     if isinstance(port, bool) or not isinstance(port, int):
@@ -115,8 +122,7 @@ def create_remote_pulse_installation(
     if not 1 <= port <= 65535:
         raise ValueError("remote pulse port must be between 1 and 65535")
     if isinstance(transport_timeout_seconds, bool) or not isinstance(
-        transport_timeout_seconds,
-        (int, float),
+        transport_timeout_seconds, (int, float)
     ):
         raise TypeError("transport_timeout_seconds must be a number")
     transport_timeout = float(transport_timeout_seconds)
@@ -126,8 +132,7 @@ def create_remote_pulse_installation(
         blocking_limit = None
     else:
         if isinstance(max_blocking_call_seconds, bool) or not isinstance(
-            max_blocking_call_seconds,
-            (int, float),
+            max_blocking_call_seconds, (int, float)
         ):
             raise TypeError("max_blocking_call_seconds must be a number or None")
         blocking_limit = float(max_blocking_call_seconds)
@@ -138,15 +143,19 @@ def create_remote_pulse_installation(
                 "max_blocking_call_seconds must be shorter than the transport timeout"
             )
     if required_pulse_document is not None and not isinstance(
-        required_pulse_document,
-        PulseDocument,
+        required_pulse_document, PulseDocument
     ):
         raise TypeError("required_pulse_document must be PulseDocument or None")
-    client = RemotePulseExecutionClient.connect(
+    factory = RemotePulseExecutionClient.connect if client_factory is None else client_factory
+    client = factory(
         endpoint_host,
         port,
         transport_timeout_seconds=transport_timeout,
     )
+    if not isinstance(client, RemotePulseExecutionClient):
+        # Test doubles may subclass the current client, but arbitrary lookalikes
+        # are not accepted by production composition.
+        raise TypeError("remote pulse client factory returned the wrong type")
     try:
         snapshot = client.snapshot()
         host_geometry = build_fingerprint(StreamerParams())
@@ -157,37 +166,67 @@ def create_remote_pulse_installation(
                 f"host=0x{host_geometry:08x}"
             )
         if required_pulse_document is not None:
-            bind_pulse_document_target(
-                required_pulse_document,
-                snapshot.target,
-            )
-            validate_pulse_document_clock_grid(
-                required_pulse_document,
-                snapshot.clock_hz,
-            )
+            bind_pulse_document_target(required_pulse_document, snapshot.target)
+            validate_pulse_document_clock_grid(required_pulse_document, snapshot.clock_hz)
+        safe_timeout = (
+            client.transport_timeout_seconds * 0.9
+            if blocking_limit is None
+            else blocking_limit
+        )
+        safe_snapshot = client.safe_state(timeout=safe_timeout)
+        if safe_snapshot.connection_generation != snapshot.connection_generation:
+            raise RuntimeError("remote pulse generation changed while entering SAFE")
+        snapshot = safe_snapshot
     except BaseException as primary:
         try:
             client.close()
         except BaseException as close_error:
-            try:
-                primary.add_note(
-                    "close error: "
-                    f"{type(close_error).__name__}: {close_error}"
-                )
-            except BaseException:
-                pass
+            primary.add_note(f"remote client close also failed: {close_error}")
         raise
-    endpoint_label = f"{endpoint_host}:{port}"
+    return RemotePulseConnection(
+        client,
+        snapshot,
+        f"{endpoint_host}:{port}",
+        blocking_limit,
+    )
+
+
+def create_remote_pulse_installation(
+    *,
+    host: str,
+    port: int,
+    transport_timeout_seconds: float,
+    max_blocking_call_seconds: float | None = None,
+    required_pulse_document: PulseDocument | None = None,
+    device_plan: tuple[InstallationDevicePlan, ...] | None = None,
+) -> _InstallationComposition:
+    """Compose one sequencer-only installation over the current pulse RPC.
+
+    Network reachability is proven before publishing the owned installation.
+    A typo or an unavailable server therefore remains retryable.  Once the remote
+    generation has entered SAFE and is bound, all later failures are treated like
+    any other partial hardware startup and fail closed.
+    """
+
+    if device_plan is None:
+        from .package import INSTALLATION_PACKAGE
+
+        device_plan = INSTALLATION_PACKAGE.device_plan
+    connection = connect_remote_pulse_client(
+        host=host,
+        port=port,
+        transport_timeout_seconds=transport_timeout_seconds,
+        max_blocking_call_seconds=max_blocking_call_seconds,
+        required_pulse_document=required_pulse_document,
+    )
+    client = connection.client
+    blocking_limit = connection.max_blocking_call_seconds
+    endpoint_label = connection.endpoint_label
+    endpoint_host = endpoint_label.rsplit(":", 1)[0]
     devices: dict[str, object] = {"sequencer": client}
     resources: ResourceArbiter | None = None
     broker: DeviceBroker | None = None
     try:
-        safe_timeout = (
-            client.transport_timeout_seconds * 0.9
-            if max_blocking_call_seconds is None
-            else blocking_limit
-        )
-        client.safe_state(timeout=safe_timeout)
         endpoint_identity = canonical_digest(
             {
                 "protocol": "zlc.current-pulse-rpc",
@@ -212,7 +251,7 @@ def create_remote_pulse_installation(
         installation_id = f"installation-{assets.revision[:20]}"
         runtime_instance_id = uuid.uuid4().hex
         broker = DeviceBroker()
-        pulse_port = _bind_remote_sequencer(
+        pulse_port = bind_remote_sequencer(
             broker,
             assets.require("sequencer", client),
             assets.revision,
@@ -225,7 +264,7 @@ def create_remote_pulse_installation(
             runtime_instance_id,
             assets,
             devices,
-            installation_device_plan("remote_pulse"),
+            device_plan,
         )
         resources = ResourceArbiter()
         controller = RunController(resources)
@@ -273,4 +312,9 @@ def create_remote_pulse_installation(
                 pass
         raise
 
-__all__ = ["create_remote_pulse_installation"]
+__all__ = [
+    "RemotePulseConnection",
+    "bind_remote_sequencer",
+    "connect_remote_pulse_client",
+    "create_remote_pulse_installation",
+]

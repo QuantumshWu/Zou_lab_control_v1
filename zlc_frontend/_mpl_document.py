@@ -59,9 +59,12 @@ from .plot_layout import (
 from .render_style import (
     ANNOTATION_FONT_SIZE,
     FIT_FAILURE_COLOR,
+    FIT_RADIAL_CENTER_SIZE,
+    FIT_RADIAL_COLOR,
+    FIT_RADIAL_RING_ALPHA,
+    FIT_RADIAL_RING_LINEWIDTH,
     FIT_LINESTYLE,
     HIST_FILL_ALPHA,
-    PALETTE,
     apply_title,
     axis_label_fontsize,
     render_style_context,
@@ -759,16 +762,17 @@ class FacetedPanelAggRenderer:
                 )
                 state.source = (axis.images[0],)
                 state.image_center = axis.scatter(
-                    (), (), color=PALETTE["fit_right"], s=8, clip_on=True
+                    (), (), color=FIT_RADIAL_COLOR,
+                    s=FIT_RADIAL_CENTER_SIZE, clip_on=True
                 )
                 state.image_center.set_visible(False)
                 state.image_ring = Circle(
                     (0.0, 0.0),
                     radius=1.0,
-                    edgecolor=PALETTE["fit_right"],
+                    edgecolor=FIT_RADIAL_COLOR,
                     facecolor="none",
-                    linewidth=1.8,
-                    alpha=0.9,
+                    linewidth=FIT_RADIAL_RING_LINEWIDTH,
+                    alpha=FIT_RADIAL_RING_ALPHA,
                     clip_on=True,
                 )
                 state.image_ring.set_visible(False)

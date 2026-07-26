@@ -127,13 +127,13 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
         import sys
 
         import numpy as np
-        from Zou_lab_control.notebook import connect
+        from Zou_lab_control.api import connect
         from zlc_pulse import RepeatRegion, load_pulse_document
 
         workspace = Path(sys.argv[1])
         experiment = connect("virtual", repository=workspace, seed=7)
         try:
-            calibration_ref = experiment.readout.sitemap(frames=4)
+            calibration_ref = experiment.nodes.calibration.sitemap(frames=4)
             document = load_pulse_document(
                 Path("pulses/imaging_template.json")
             )
@@ -160,12 +160,12 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
             )
             descriptor = experiment.inspect(capture_request)
             capture_ref = experiment.run(capture_request)
-            detection_request = experiment.readout.detection_request(
+            detection_request = experiment.nodes.occupancy.detection_request(
                 capture_ref,
                 calibration_ref,
             )
-            occupancy_ref = experiment.readout.detect(detection_request)
-            resolved = experiment.readout.load_occupancy(occupancy_ref)
+            occupancy_ref = experiment.nodes.occupancy.detect(detection_request)
+            resolved = experiment.nodes.occupancy.load_occupancy(occupancy_ref)
             artifact = resolved.artifact
             validity = artifact.counts.validity
             invalid = ~validity.mask

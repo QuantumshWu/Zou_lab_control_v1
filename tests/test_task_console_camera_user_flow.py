@@ -13,9 +13,16 @@ from unittest.mock import patch
 
 import numpy as np
 
-
 from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 
+from zlc_data import (
+    MONITOR_HISTORY,
+    READOUT_EVENT,
+    REPEAT,
+    SPATIAL_X,
+    SPATIAL_Y,
+    PointLayout,
+)
 from gui_user_flow import (
     capture_offscreen_window,
     click_tab,
@@ -157,8 +164,9 @@ def _signal_leaf_keys(combo) -> set[str]:
 def _replace_spin_value(spin, text: str) -> None:
     """Edit the visible numeric control exactly as an operator would.
 
-    Numeric owner declarations project to shared Fluent spin controls; an
-    optional value uses the control's explicit ``Auto`` state for ``None``.
+    Required bounded numbers project to Fluent spin controls; optional numbers
+    project to validated blank-or-number Fluent edits.  This helper drives both
+    through their shared visible editor without inventing a sentinel value.
     """
 
     edit = spin.lineEdit() if hasattr(spin, "lineEdit") else spin
@@ -264,6 +272,7 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
     )
     from zlc_frontend.figure import (
         AxisViewRole,
+        FixedIndex,
         ViewIntent,
         grid_facet_axes,
         grid_facet_axis,
@@ -274,7 +283,7 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         FluentSectionLabel,
         FluentSettingRow,
     )
-    from zlc_workbench.task_console.data_plane import ConsoleSignalValue
+    from zlc_neutral_atom.processing.signal_plane import SignalValue
 
     repeat = AxisSpec(
         AxisId("formal.grid.repeat"),
@@ -338,9 +347,9 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         block.ref(StreamGenerationId("formal-grid-generation")),
         block,
     )
-    grid_value = ConsoleSignalValue(
+    grid_value = SignalValue(
         name="formal-grid",
-        source="formal immutable monitor boundary",
+        source_instance_id="formal-immutable-monitor-boundary",
         snapshot=snapshot,
         coverage=None,
         run_id="formal-run",
@@ -389,12 +398,22 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         click_tab(console, console.tabs.widget(0))
 
         # A producer fixture may enter only at the immutable monitor boundary.
-        # Two equally legal declared point axes intentionally leave the Grid
-        # facet unresolved until the operator chooses one in Setting.
+        # The first valid Grid value receives one deterministic frontend-owned
+        # ViewSpec.  Every role remains explicit even though Setting still lets
+        # the operator replace the default facet below.
         card.config.signal = grid_value.name
-        assert card._freeze_value_render_request(grid_value, 1, force=True) is None
+        request = card._freeze_value_render_request(grid_value, 1, force=True)
+        assert request is not None
+        default_view = request.contract.view
+        assert default_view.intent is ViewIntent.IMAGE
+        assert grid_facet_axis(default_view) == repeat.axis_id
+        for axis in (scan_x, scan_y):
+            binding = default_view.binding(axis.axis_id)
+            assert binding.role is AxisViewRole.SLIDER
+            assert binding.selector == FixedIndex(0)
+        assert default_view.binding(image_x.axis_id).role is AxisViewRole.IMAGE_X
+        assert default_view.binding(image_y.axis_id).role is AxisViewRole.IMAGE_Y
         assert card._current_schema() == schema
-        assert "choose a named facet axis" in card._status_text
 
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
         outer_geometry = QtCore.QRect(console_wrapper.geometry())
@@ -410,6 +429,18 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         top_levels_before = visible_top_levels()
         QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
         until(application, lambda: card.settings_popup.isVisible())
+        assert card.view_spec_editor.isVisible()
+        visible_roles = {
+            axis_id: combo.currentText().split(" ·", 1)[0]
+            for axis_id, (_row, combo) in card.view_spec_editor._rows.items()
+        }
+        assert visible_roles == {
+            repeat.axis_id: "facet",
+            scan_x.axis_id: "slider",
+            scan_y.axis_id: "slider",
+            image_y.axis_id: "image y",
+            image_x.axis_id: "image x",
+        }
         popup_width = card.settings_popup.width()
         assert popup_width == card.settings_popup.minimumWidth()
         assert popup_width == card.settings_popup.maximumWidth()
@@ -714,6 +745,10 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         # deterministic live Camera role for an operator-path acceptance run.
         widgets = _visible_form_widgets(editor)
         role_combo = widgets["camera_role"]
+        assert tuple(
+            role_combo.itemData(index) for index in range(role_combo.count())
+        ) == ("camera", "mot_camera")
+        assert role_combo.currentData() == "camera"
         _choose_combo_data(role_combo, "mot_camera", application)
         _replace_spin_value(widgets["frames_per_cycle"], "3")
         _replace_spin_value(widgets["exposure"], "0.013")
@@ -731,12 +766,58 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             ),
             timeout=15.0,
         )
-        first_value = console._data.freeze().value(signal)
+        atomic_front = console._data.freeze()
+        atomic_values = tuple(atomic_front.value(key) for key in frame_signals)
+        assert all(value is not None for value in atomic_values)
+        schemas = tuple(value.snapshot.block.schema for value in atomic_values)
+        assert len(set(schemas)) == 1
+        frame_schema = schemas[0]
+        assert frame_schema.repeat_axis.role == REPEAT
+        assert frame_schema.repeat_axis.size == 1
+        assert frame_schema.point_axes == ()
+        assert frame_schema.point_layout == PointLayout.rect_c(())
+        assert tuple(axis.role for axis in frame_schema.cell_schema.data_axes) == (
+            SPATIAL_Y,
+            SPATIAL_X,
+        )
+        assert not any(
+            axis.role in (MONITOR_HISTORY, READOUT_EVENT)
+            for schema in schemas
+            for axis in (
+                schema.repeat_axis,
+                *schema.point_axes,
+                *schema.cell_schema.data_axes,
+            )
+        )
+        expected_shape = (1, 1, *frame_schema.cell_schema.data_shape)
+        assert all(value.shape == expected_shape for value in atomic_values)
+        assert len({value.run_id for value in atomic_values}) == 1
+        assert len({value.epoch_id for value in atomic_values}) == 1
+        assert len(
+            {value.snapshot.ref.revision for value in atomic_values}
+        ) == 1
+        assert all(value.coverage.total_cells == 1 for value in atomic_values)
+        first_refs = tuple(value.snapshot.ref for value in atomic_values)
         until(
             application,
             lambda: (
-                (value := console._data.freeze().value(signal)) is not None
-                and value.snapshot.ref != first_value.snapshot.ref
+                (front := console._data.freeze()) is not None
+                and all(
+                    (value := front.value(key)) is not None
+                    and value.snapshot.ref != first_ref
+                    for key, first_ref in zip(
+                        frame_signals,
+                        first_refs,
+                        strict=True,
+                    )
+                )
+                and len(
+                    {
+                        front.value(key).snapshot.ref.revision
+                        for key in frame_signals
+                    }
+                )
+                == 1
             ),
             timeout=10.0,
         )
@@ -761,26 +842,56 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         assert len(console.cards) == 1
         card = console.cards[0]
         click_tab(console, console.tabs.widget(0))
-        QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
-        until(application, lambda: card.settings_popup.isVisible())
-        _choose_signal_leaf(card.signal_combo, signal, application)
-        assert card.config.signal == signal
+        surface = None
+        first_front = second_front = None
+        # All declared frames use one stable PlotPanel surface.  Switching a
+        # binding changes only the typed source; every selected output must then
+        # continue advancing on its own live Camera revisions.
+        for selected_signal in (
+            frame_signals[0],
+            frame_signals[2],
+            frame_signals[1],
+        ):
+            if not card.settings_popup.isVisible():
+                QtTest.QTest.mouseClick(
+                    card.setting_button,
+                    QtCore.Qt.LeftButton,
+                )
+                until(application, lambda: card.settings_popup.isVisible())
+            _choose_signal_leaf(card.signal_combo, selected_signal, application)
+            assert card.config.signal == selected_signal
+            until(
+                application,
+                lambda: (
+                    card.board is not None
+                    and card.board.front_frame is not None
+                    and card._presented_value is not None
+                    and card._presented_value.name == selected_signal
+                ),
+                timeout=15.0,
+            )
+            if surface is None:
+                surface = card.board.board
+            else:
+                assert card.board.board is surface
+            selected_front = card.board.front_frame
+            selected_ref = card._presented_value.snapshot.ref
+            until(
+                application,
+                lambda: (
+                    card._presented_value is not None
+                    and card._presented_value.name == selected_signal
+                    and card._presented_value.snapshot.ref != selected_ref
+                    and card.board.front_frame is not None
+                    and card.board.front_frame.sequence > selected_front.sequence
+                ),
+                timeout=10.0,
+            )
+            if selected_signal == signal:
+                first_front = selected_front
+                second_front = card.board.front_frame
 
-        until(
-            application,
-            lambda: card.board is not None and card.board.front_frame is not None,
-            timeout=15.0,
-        )
-        first_front = card.board.front_frame
-        until(
-            application,
-            lambda: (
-                card.board.front_frame is not None
-                and card.board.front_frame.sequence > first_front.sequence
-            ),
-            timeout=10.0,
-        )
-        second_front = card.board.front_frame
+        assert first_front is not None and second_front is not None
         assert bytes(second_front.panels[0].raster.pixels) != bytes(
             first_front.panels[0].raster.pixels
         )
@@ -1614,7 +1725,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         rate_card = _add_plot_and_bind(
             console,
             add,
-            "monitor",
+            "meter",
             rate_signal,
             application,
         )

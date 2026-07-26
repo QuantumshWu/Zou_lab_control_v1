@@ -48,7 +48,7 @@ def test_production_fit_consumers_use_the_public_zlc_data_facade():
         repository / "zlc_neutral_atom",
         repository / "zlc_frontend",
         repository / "zlc_workbench",
-        repository / "Zou_lab_control" / "notebook",
+        repository / "Zou_lab_control" / "api",
     )
     implementation_modules = {
         "zlc_data.fit_codec",

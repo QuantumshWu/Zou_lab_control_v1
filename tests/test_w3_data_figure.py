@@ -12,7 +12,7 @@ import weakref
 import numpy as np
 import pytest
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 from zlc_data import (
     REPEAT,
     SCAN_POINT,
@@ -268,7 +268,7 @@ def test_import_is_lazy_and_invalid_curve_is_masked_in_png_and_svg(tmp_path):
             sys.executable,
             "-c",
             (
-                "import sys; import zlc_frontend; import Zou_lab_control.notebook; "
+                "import sys; import zlc_frontend; import Zou_lab_control.api; "
                 "assert not any(n == 'matplotlib' or n.startswith('matplotlib.') "
                 "for n in sys.modules)"
             ),

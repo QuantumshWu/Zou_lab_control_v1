@@ -31,7 +31,6 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraSample,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
-    ReadoutModelKind,
     ResolvedCalibration,
     apply_readout_model,
 )
@@ -40,6 +39,7 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     calibration_artifact_input_ref,
     calibration_artifact_ref_to_tree,
 )
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.runtime._failure import (
     record_secondary_failure,
     safe_error_summary,

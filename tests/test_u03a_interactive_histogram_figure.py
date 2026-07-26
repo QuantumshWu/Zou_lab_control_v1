@@ -442,6 +442,7 @@ def test_multi_cell_histogram_uses_typed_grid_overview(application) -> None:
         assert window._view_family == "histogram-overview"
         assert window._grid_overview is not None
         assert window._grid_overview.intent is ViewIntent.HISTOGRAM
+        assert window._grid_overview.figure.evaluated is figure.evaluated
         assert len(window._grid_overview.regions) == 2
         assert window._board_widget.front_frame is None
         assert window.findChild(QtWidgets.QLabel, "figureViewerMode").text() == (

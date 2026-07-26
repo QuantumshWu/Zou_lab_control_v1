@@ -10,7 +10,7 @@ import time
 import numpy as np
 import pytest
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 from zlc_data import (
     SITE,
     VALID,
@@ -113,12 +113,12 @@ class _LiveCameraView:
 
 
 def _start_virtual_readout_camera(experiment, *, frames_per_cycle: int = 1):
-    request = experiment.readout.camera_measurement_request(
+    request = experiment.nodes.camera_measurement.camera_measurement_request(
         camera_role="camera",
         repeat=0,
         frames_per_cycle=frames_per_cycle,
     )
-    source = experiment.readout.prepare_camera_measurement(request)
+    source = experiment.nodes.camera_measurement.prepare_camera_measurement(request)
     assert isinstance(source, SignalEventAssociationSource)
     views: list[_LiveCameraView] = []
 
@@ -175,12 +175,12 @@ def test_pulse_scan_consumes_virtual_camera_without_claiming_producer(
     with zlc.connect("virtual", repository=tmp_path / "workspace") as experiment:
         source, camera_handle = _start_virtual_readout_camera(experiment)
         try:
-            prepared = experiment.readout.prepare_scan_source(request, source)
+            prepared = experiment.nodes.pulse_scan.prepare_scan_source(request, source)
             assert len(prepared.descriptor.resource_claims) == 1
             assert "sequencer" in prepared.descriptor.resource_claims[0]
             reference = prepared.start().result(5.0)
-            materialized = experiment.readout.materialize_scan(reference)
-            artifact = experiment.readout.load_scan(reference)
+            materialized = experiment.nodes.pulse_scan.materialize_scan(reference)
+            artifact = experiment.nodes.pulse_scan.load_scan(reference)
             assert not camera_handle.snapshot().state.terminal
         finally:
             _stop_virtual_readout_camera(camera_handle)
@@ -192,7 +192,7 @@ def test_pulse_scan_consumes_virtual_camera_without_claiming_producer(
     associations = artifact.execution.source.associations
     assert len(associations) == 1
     assert associations[0].evidence_schema_id.endswith(
-        "camera-measurement.virtual-pulse-association"
+        "camera-measurement.pulse-association"
     )
     assert associations[0].request.expected_event_count == 2
     assert associations[0].request.cause_id == artifact.execution.terminal.session_id
@@ -209,12 +209,12 @@ def test_camera_association_is_unavailable_before_the_producer_is_armed(
     tmp_path,
 ) -> None:
     with zlc.connect("virtual", repository=tmp_path / "workspace") as experiment:
-        request = experiment.readout.camera_measurement_request(
+        request = experiment.nodes.camera_measurement.camera_measurement_request(
             camera_role="camera",
             repeat=0,
             frames_per_cycle=1,
         )
-        source = experiment.readout.prepare_camera_measurement(request)
+        source = experiment.nodes.camera_measurement.prepare_camera_measurement(request)
         assert isinstance(source, SignalEventAssociationSource)
         with pytest.raises(SignalAssociationUnavailable, match="already-running"):
             source.open_associated_signal_cursor("frame_0")
@@ -312,10 +312,10 @@ def test_occupancy_scan_artifact_round_trips_expandable_same_shot_lineage(
         )
         try:
             source = occupancy
-            prepared = experiment.readout.prepare_scan_source(request, source)
+            prepared = experiment.nodes.pulse_scan.prepare_scan_source(request, source)
             reference = prepared.start().result(5.0)
-            materialized = experiment.readout.materialize_scan(reference)
-            artifact = experiment.readout.load_scan(reference)
+            materialized = experiment.nodes.pulse_scan.materialize_scan(reference)
+            artifact = experiment.nodes.pulse_scan.load_scan(reference)
             assert not camera_handle.snapshot().state.terminal
         finally:
             occupancy.request_close()
@@ -343,11 +343,11 @@ def test_occupancy_scan_artifact_round_trips_expandable_same_shot_lineage(
     )
     assert (
         association_payload["upstream_evidence"]["evidence_schema_id"]
-        .endswith("camera-measurement.virtual-pulse-association")
+        .endswith("camera-measurement.pulse-association")
     )
 
     with zlc.connect("virtual", repository=repository) as experiment:
-        reloaded = experiment.readout.load_scan(reference)
+        reloaded = experiment.nodes.pulse_scan.load_scan(reference)
     assert reloaded.execution.source == sequence
 
 
@@ -371,10 +371,10 @@ def test_api_segmented_scan_uses_one_terminal_bound_association_per_cell(
     with zlc.connect("virtual", repository=tmp_path / "workspace") as experiment:
         source, camera_handle = _start_virtual_readout_camera(experiment)
         try:
-            prepared = experiment.readout.prepare_scan_source(request, source)
+            prepared = experiment.nodes.pulse_scan.prepare_scan_source(request, source)
             reference = prepared.start().result(5.0)
-            artifact = experiment.readout.load_scan(reference)
-            materialized = experiment.readout.materialize_scan(reference)
+            artifact = experiment.nodes.pulse_scan.load_scan(reference)
+            materialized = experiment.nodes.pulse_scan.materialize_scan(reference)
             assert not camera_handle.snapshot().state.terminal
         finally:
             _stop_virtual_readout_camera(camera_handle)
@@ -394,7 +394,7 @@ def test_api_segmented_scan_uses_one_terminal_bound_association_per_cell(
     assert len({item.request.cause_id for item in associations}) == 2
     assert all(
         item.evidence_schema_id.endswith(
-            "camera-measurement.virtual-pulse-association"
+            "camera-measurement.pulse-association"
         )
         for item in associations
     )
@@ -423,14 +423,14 @@ def test_scan_persists_the_single_committed_signal_projection_authority(
             _camera_scan_binding(transform=transform),
         )
         try:
-            prepared = experiment.readout.prepare_scan_source(request, source)
+            prepared = experiment.nodes.pulse_scan.prepare_scan_source(request, source)
             reference = prepared.start().result(5.0)
-            materialized = experiment.readout.materialize_scan(reference)
+            materialized = experiment.nodes.pulse_scan.materialize_scan(reference)
         finally:
             _stop_virtual_readout_camera(camera_handle)
 
     with zlc.connect("virtual", repository=repository) as experiment:
-        artifact = experiment.readout.load_scan(reference)
+        artifact = experiment.nodes.pulse_scan.load_scan(reference)
     projection = artifact.execution.source.projection_authority
     assert projection.input_value_schema == image_schema
     assert projection.input_schema_fingerprint == image_schema.fingerprint
@@ -495,7 +495,7 @@ def test_pulse_scan_refuses_ordering_only_source_before_any_fire(
             SignalAssociationUnavailable,
             match="software order only",
         ):
-            experiment.readout.prepare_scan_source(request, source)
+            experiment.nodes.pulse_scan.prepare_scan_source(request, source)
 
     assert not opened.is_set()
     assert fire_calls == []

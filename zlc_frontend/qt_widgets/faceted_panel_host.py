@@ -101,6 +101,12 @@ class FacetedPanelHost(QtWidgets.QWidget):
     def showing_overview(self) -> bool:
         return self._stack.currentWidget() is self._overview
 
+    @property
+    def selectors_enabled(self) -> bool:
+        """The stable selector switch shared by overview and focused cell."""
+
+        return self._selectors_on
+
     def present_overview(
         self,
         artifact: FacetedOverviewArtifact,
@@ -172,23 +178,38 @@ class FacetedPanelHost(QtWidgets.QWidget):
             )
         return self._focus.selection_for_curve_range_gesture(gesture)
 
-    def area_commit_for_range_gesture(self, gesture):
+    def set_rectangle_candidate(self, normalized_bounds) -> None:
+        self._focus.set_rectangle_candidate(normalized_bounds)
+
+    def set_range_candidate(self, x_span) -> None:
+        self._focus.set_range_candidate(x_span)
+
+    def area_commit_for_range_gesture(self, gesture, *, figure):
         if self._stack.currentWidget() is not self._focus:
             raise RuntimeError("faceted overview has no interactive Area")
-        return self._focus.area_commit_for_range_gesture(gesture)
+        return self._focus.area_commit_for_range_gesture(
+            gesture,
+            figure=figure,
+        )
 
-    def area_commit_for_rectangle_gesture(self, gesture):
+    def area_commit_for_rectangle_gesture(self, gesture, *, figure):
         if self._stack.currentWidget() is not self._focus:
             raise RuntimeError("faceted overview has no interactive Area")
-        return self._focus.area_commit_for_rectangle_gesture(gesture)
+        return self._focus.area_commit_for_rectangle_gesture(
+            gesture,
+            figure=figure,
+        )
 
-    def cross_commit_for_gesture(self, gesture):
+    def cross_commit_for_gesture(self, gesture, *, figure):
         if self._stack.currentWidget() is not self._focus:
             raise RuntimeError("faceted overview has no interactive Cross")
-        return self._focus.cross_commit_for_gesture(gesture)
+        return self._focus.cross_commit_for_gesture(gesture, figure=figure)
 
     def discard_pending_interaction(self, origin) -> bool:
         return self._focus.discard_pending_interaction(origin)
+
+    def unbind_interaction(self) -> None:
+        self._focus.unbind_interaction()
 
     def clear(self) -> None:
         self._overview_artifact = None

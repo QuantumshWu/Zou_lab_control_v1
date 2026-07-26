@@ -13,7 +13,7 @@ from PyQt5 import QtCore, QtTest, QtWidgets
 from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 from zlc_workbench.data_figure.window import DataFigureWindow
 from zlc_workbench.fit_grid.window import SavedFitGridWindow
 from zlc_data import (
@@ -110,13 +110,13 @@ def test_saved_fit_requires_explicit_cell_then_replays_exact_ref_for_refit(
 
         execute_sources = []
         opened_sources = []
-        original_execute = FitResultRepository.execute_capture
+        original_execute = FitResultRepository.execute
         experiment_type = type(experiment)
         original_open = experiment_type._open_fit_capable_figure_gui
 
         def observed_execute(
             self,
-            capture_repository,
+            artifacts,
             source,
             spec,
             *args,
@@ -125,7 +125,7 @@ def test_saved_fit_requires_explicit_cell_then_replays_exact_ref_for_refit(
             execute_sources.append(source)
             return original_execute(
                 self,
-                capture_repository,
+                artifacts,
                 source,
                 spec,
                 *args,
@@ -136,7 +136,7 @@ def test_saved_fit_requires_explicit_cell_then_replays_exact_ref_for_refit(
             opened_sources.append((display_source, fit_source, dict(kwargs)))
             return original_open(self, display_source, fit_source, **kwargs)
 
-        monkeypatch.setattr(FitResultRepository, "execute_capture", observed_execute)
+        monkeypatch.setattr(FitResultRepository, "execute", observed_execute)
         monkeypatch.setattr(
             experiment_type,
             "_open_fit_capable_figure_gui",

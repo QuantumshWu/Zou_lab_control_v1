@@ -53,10 +53,7 @@ def _python_files():
             if "__pycache__" in path.parts:
                 continue
             yield path
-    for name in ("task_console.py", "pulse_gui.py", "figure_viewer.py"):
-        candidate = REPO / name
-        if candidate.is_file():
-            yield candidate
+    yield from sorted(REPO.glob("*.py"))
 
 
 def test_only_ensure_qt_app_constructs_the_application() -> None:

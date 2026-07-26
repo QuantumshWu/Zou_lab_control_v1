@@ -35,13 +35,13 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     GridOrder,
     PerSitePsfFeature,
     ReadoutModel,
-    ReadoutModelKind,
     SiteMap,
     _annulus_background,
     apply_readout_model,
     classify_occupancy,
     extract_readout_features,
 )
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.logic_nodes.readout.contracts import (
     CalibrationCaptureLayout,
     FrameContract,

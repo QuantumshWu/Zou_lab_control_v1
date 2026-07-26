@@ -18,7 +18,7 @@ from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 from zlc_data import (
     COMPONENT,
     REPEAT,
@@ -163,12 +163,12 @@ class _LiveCameraView:
 
 
 def _start_virtual_camera_source(experiment):
-    request = experiment.readout.camera_measurement_request(
+    request = experiment.nodes.camera_measurement.camera_measurement_request(
         camera_role="camera",
         repeat=0,
         frames_per_cycle=1,
     )
-    source = experiment.readout.prepare_camera_measurement(request)
+    source = experiment.nodes.camera_measurement.prepare_camera_measurement(request)
     views: list[_LiveCameraView] = []
 
     def factory(spec: CameraMonitorViewSpec) -> _LiveCameraView:
@@ -676,7 +676,7 @@ def test_public_autonomous_occupancy_scan_opens_exact_curve_grid(
     owner_thread = threading.get_ident()
     calls = []
     with zlc.connect("virtual", repository=tmp_path / "u03h-public") as experiment:
-        calibration = experiment.readout.sitemap(frames=6)
+        calibration = experiment.nodes.calibration.sitemap(frames=6)
         document = _occupancy_scan_document()
         program = AutonomousScanSlotProgram.from_api_values(
             document,
@@ -692,12 +692,12 @@ def test_public_autonomous_occupancy_scan_opens_exact_curve_grid(
         camera_source, camera_handle = _start_virtual_camera_source(experiment)
         occupancy_source = None
         try:
-            occupancy = experiment.readout.prepare_occupancy_processor(
+            occupancy = experiment.nodes.occupancy.prepare_occupancy_processor(
                 camera_source.dataset_output_binding("frame_0"),
                 calibration_ref=calibration,
             )
             occupancy_source = occupancy.start_signal_events(camera_source)
-            reference = experiment.readout.prepare_scan_source(
+            reference = experiment.nodes.pulse_scan.prepare_scan_source(
                 request,
                 occupancy_source,
             ).start().result(20.0)
@@ -715,9 +715,9 @@ def test_public_autonomous_occupancy_scan_opens_exact_curve_grid(
                 occupancy_source.join_closed()
             _stop_virtual_camera_source(camera_handle)
         assert isinstance(reference, zlc.ScanArtifactRef)
-        artifact = experiment.readout.load_scan(reference)
+        artifact = experiment.nodes.pulse_scan.load_scan(reference)
         assert isinstance(artifact.execution, AutonomousScanExecution)
-        materialized = experiment.readout.materialize_scan(reference)
+        materialized = experiment.nodes.pulse_scan.materialize_scan(reference)
         assert materialized.values.shape == (2, 2, 35)
         site_axis = materialized.schema.cell_schema.data_axes[0]
         preferences = ViewPreferences(facet_axis_ids=(site_axis.axis_id,))

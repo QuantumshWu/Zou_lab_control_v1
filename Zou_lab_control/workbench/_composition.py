@@ -11,16 +11,42 @@ from __future__ import annotations
 
 import os
 import threading
-from functools import partial
 from pathlib import Path
 from typing import Callable
 
 from zlc_neutral_atom.installation_config import InstallationConfigDocument
-from zlc_pulse import PulseDocument, describe_pulse_template
+from zlc_pulse import PulseDocument
+
+
+class _TaskConsoleProjection:
+    """Explicit domain-neutral projectors supplied to capability packages."""
+
+    __slots__ = ("_processor", "_resolve_final_or_saved", "_run")
+
+    def __init__(self, *, run, processor, resolve_final_or_saved) -> None:
+        for value, name in (
+            (run, "run"),
+            (processor, "processor"),
+            (resolve_final_or_saved, "resolve_final_or_saved"),
+        ):
+            if not callable(value):
+                raise TypeError(f"TaskConsole {name} projector must be callable")
+        self._run = run
+        self._processor = processor
+        self._resolve_final_or_saved = resolve_final_or_saved
+
+    def run(self, declaration, **kwargs):
+        return self._run(declaration, **kwargs)
+
+    def processor(self, declaration, **kwargs):
+        return self._processor(declaration, **kwargs)
+
+    def resolve_final_or_saved(self, binding, **kwargs):
+        return self._resolve_final_or_saved(binding, **kwargs)
 
 
 def _require_experiment(value):
-    from Zou_lab_control.notebook.facade import Experiment
+    from Zou_lab_control.api.facade import Experiment
 
     if not isinstance(value, Experiment):
         raise TypeError("experiment must be the current Experiment")
@@ -31,138 +57,31 @@ def task_console_ports(experiment):
     """Decompose one Experiment into TaskConsole's explicit application port."""
 
     experiment = _require_experiment(experiment)
-    readout = experiment.readout
-    catalog = experiment.device_catalog
-
     from zlc_workbench.task_console.application_ports import (
         TaskConsoleApplicationPorts,
     )
-    from zlc_neutral_atom.logic_nodes.readout.calibration.declaration import (
-        CALIBRATION_LOGIC_NODE,
-    )
-    from zlc_neutral_atom.logic_nodes.camera_measurement import (
-        CAMERA_MEASUREMENT_LOGIC_NODE,
-        bind_camera_measurement_intent,
-    )
-    from zlc_neutral_atom.logic_nodes.camera_measurement.workbench_adapter import (
-        start_camera_measurement_command,
-    )
-    from zlc_neutral_atom.logic_nodes.release_recapture.grey_molasses_detuning import (
-        GREY_MOLASSES_DETUNING_LOGIC_NODE,
-        prepare_bound_grey_molasses_detuning,
-    )
-    from zlc_neutral_atom.logic_nodes.mot_field import (
-        MOT_FIELD_LOGIC_NODE,
-    )
-    from zlc_neutral_atom.logic_nodes.mot_field.workbench_adapter import (
-        start_mot_field_task_command,
-    )
-    from zlc_neutral_atom.logic_nodes.readout.occupancy.declaration import (
-        OCCUPANCY_LOGIC_NODE,
-    )
-    from zlc_neutral_atom.logic_nodes.readout.occupancy.workbench_adapter import (
-        resolve_occupancy_calibration_input,
-    )
-    from zlc_neutral_atom.logic_nodes.pulse_scan.ui.task_console import (
-        pulse_scan_task_console_adapter,
-    )
-    from zlc_neutral_atom.logic_nodes.readout.duration_fidelity import (
-        READOUT_DURATION_FIDELITY_LOGIC_NODE,
-        prepare_bound_readout_duration_fidelity,
-    )
-    from zlc_neutral_atom.logic_nodes.release_recapture.temperature import (
-        TEMPERATURE_RELEASE_RECAPTURE_LOGIC_NODE,
-        prepare_bound_temperature_release_recapture,
+    from zlc_workbench.task_console.artifact_resolution import (
+        resolve_final_or_saved_artifact,
     )
     from zlc_workbench.task_console.declaration_projection import (
         project_processor_declaration,
         project_run_declaration,
     )
-    from zlc_workbench.task_console.artifact_resolution import (
-        resolve_final_or_saved_artifact,
-    )
-    from zlc_neutral_atom.logic_nodes.readout.calibration.workbench_adapter import (
-        start_calibration_task_command,
-    )
-    from zlc_neutral_atom.logic_nodes.readout.calibration.ui.view_projection import (
-        project_calibration_final_views,
-    )
-    from zlc_neutral_atom.logic_nodes.readout.occupancy.ui.view_projection import (
-        project_occupancy_views,
+    from Zou_lab_control.api._logic_node_api import (
+        compose_task_console_attachments,
     )
 
-    camera_roles = catalog.roles("camera")
-    rf_roles = catalog.roles("rf")
-    calibration_roles = readout.sitemap_camera_roles()
-
-    bind_camera_request = partial(
-        bind_camera_measurement_intent,
-        request_builder=readout.camera_measurement_request,
+    return TaskConsoleApplicationPorts(
+        attachments=compose_task_console_attachments(
+            experiment.nodes,
+            experiment.device_catalog,
+            _TaskConsoleProjection(
+                run=project_run_declaration,
+                processor=project_processor_declaration,
+                resolve_final_or_saved=resolve_final_or_saved_artifact,
+            ),
+        )
     )
-    prepare_temperature = partial(
-        prepare_bound_temperature_release_recapture,
-        application=readout,
-    )
-    prepare_readout_duration = partial(
-        prepare_bound_readout_duration_fidelity,
-        application=readout,
-    )
-    prepare_grey_molasses = partial(
-        prepare_bound_grey_molasses_detuning,
-        application=readout,
-    )
-    resolve_occupancy_calibration = partial(
-        resolve_occupancy_calibration_input,
-        resolve_final_or_saved=resolve_final_or_saved_artifact,
-        load_saved_calibration=readout.load_saved_calibration,
-    )
-
-    attachments = (
-        project_run_declaration(
-            CAMERA_MEASUREMENT_LOGIC_NODE,
-            bind_request=bind_camera_request,
-            prepare=readout.prepare_camera_measurement,
-            dynamic_choice_context=camera_roles,
-            start_with_live_output=start_camera_measurement_command,
-        ),
-        project_run_declaration(
-            TEMPERATURE_RELEASE_RECAPTURE_LOGIC_NODE,
-            prepare=prepare_temperature,
-        ),
-        project_run_declaration(
-            READOUT_DURATION_FIDELITY_LOGIC_NODE,
-            prepare=prepare_readout_duration,
-        ),
-        project_run_declaration(
-            GREY_MOLASSES_DETUNING_LOGIC_NODE,
-            prepare=prepare_grey_molasses,
-            dynamic_choice_context=rf_roles,
-        ),
-        project_processor_declaration(
-            OCCUPANCY_LOGIC_NODE,
-            prepare=readout.prepare_occupancy_processor_request,
-            resolve_artifact_reference=resolve_occupancy_calibration,
-            project_presentations=project_occupancy_views,
-        ),
-        project_run_declaration(
-            CALIBRATION_LOGIC_NODE,
-            prepare=readout.prepare_calibration_task,
-            dynamic_choice_context=calibration_roles,
-            start_with_live_output=start_calibration_task_command,
-            materialize_final_presentations=project_calibration_final_views,
-        ),
-        project_run_declaration(
-            MOT_FIELD_LOGIC_NODE,
-            prepare=readout.prepare_mot_field_task,
-            dynamic_choice_context=camera_roles,
-            start_with_live_output=start_mot_field_task_command,
-        ),
-        pulse_scan_task_console_adapter(
-            prepare=readout.prepare_scan_source,
-            read_pulse_template=describe_pulse_template,
-        ),
-    )
-    return TaskConsoleApplicationPorts(attachments=attachments)
 
 
 def standalone_pulse_workspace(value: str | Path | None) -> Path:
@@ -187,13 +106,16 @@ def standalone_pulse_connection_factory(workspace: Path):
         port: int | None,
         required_document: PulseDocument,
     ):
-        from Zou_lab_control.notebook.facade import connect
+        from Zou_lab_control.api.facade import connect
         from zlc_workbench.pulse_editor.controller import OwnedPulseConnection
 
         if not isinstance(required_document, PulseDocument):
             raise TypeError("required_document must be PulseDocument")
         if mode == "virtual":
-            document = InstallationConfigDocument.virtual()
+            document = InstallationConfigDocument.from_parameters(
+                "virtual",
+                {},
+            )
             connection = connect(
                 document,
                 repository=root,
@@ -202,9 +124,12 @@ def standalone_pulse_connection_factory(workspace: Path):
         elif mode == "remote":
             if host is None or port is None:
                 raise ValueError("remote Pulse connection requires host and port")
-            document = InstallationConfigDocument.remote_pulse(
-                host=host,
-                port=port,
+            document = InstallationConfigDocument.from_parameters(
+                "remote_pulse",
+                {
+                    "host": host,
+                    "port": port,
+                },
             )
             connection = connect(
                 document,
@@ -270,7 +195,7 @@ class ExperimentDeviceAdmin:
         active=None,
         owns_active: bool,
     ) -> None:
-        from Zou_lab_control.notebook.facade import connect
+        from Zou_lab_control.api.facade import connect
 
         if active is not None:
             active = _require_experiment(active)

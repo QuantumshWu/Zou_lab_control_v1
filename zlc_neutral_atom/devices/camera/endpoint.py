@@ -18,6 +18,7 @@ from zlc_data import (
 )
 from zlc_neutral_atom.devices.camera.contract import (
     CameraAdapter,
+    CameraAssociationProgress,
     CameraCaptureTerminalRecord,
     CameraFrameRecord,
     CameraWorkingPoint,
@@ -178,6 +179,28 @@ class _EndpointSession:
     last_captured_at: float | None = None
     closed: bool = False
     superseded: bool = False
+
+
+@dataclass
+class _MonitorSignalAssociation:
+    """One E0-qualified external-trigger interval over a live camera arm."""
+
+    association_id: str
+    cause_digest: str
+    expected_trigger_count: int
+    trigger_group_size: int
+    expected_group_count: int
+    physical_start_ordinal: int
+    session: _EndpointSession
+    qualification_digest: str
+    observed_count: int = 0
+    previous_produced_count: int | None = None
+    previous_frame_stamp: int | None = None
+    previous_camera_stamp: int | None = None
+    trigger_channel: str | None = None
+    terminal_evidence_digest: str | None = None
+    bound: bool = False
+    error: RuntimeError | None = None
 
 
 @dataclass
@@ -1110,7 +1133,302 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             raise TypeError(
                 "monitor_acquisition_mode must be CameraAcquisitionMode"
             )
+        if (
+            monitor_acquisition_mode
+            is CameraAcquisitionMode.EXTERNAL_TRIGGERED
+            and exact_external_trigger_qualification_digest is not None
+            and not isinstance(camera, CameraAssociationProgress)
+        ):
+            raise TypeError(
+                "an exact external-trigger monitor requires a non-consuming "
+                "physical produced-frame counter"
+            )
         self._monitor_acquisition_mode = monitor_acquisition_mode
+        self._signal_association: _MonitorSignalAssociation | None = None
+
+    def arm_signal_event_association(
+        self,
+        association_id: str,
+        cause_digest: str,
+        expected_trigger_count: int,
+        trigger_group_size: int,
+        expected_group_count: int,
+    ) -> tuple[object, int]:
+        """Freeze the next live-camera ordinal interval before hardware FIRE."""
+
+        identity = _canonical_text(association_id, "association_id")
+        digest = _sha256(cause_digest, "cause_digest")
+        for value, name in (
+            (expected_trigger_count, "expected_trigger_count"),
+            (trigger_group_size, "trigger_group_size"),
+            (expected_group_count, "expected_group_count"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if expected_trigger_count != trigger_group_size * expected_group_count:
+            raise ValueError(
+                "camera signal-association groups do not cover its trigger count"
+            )
+        with self._lock:
+            if self._monitor_acquisition_mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
+                raise ValueError(
+                    "a free-running camera monitor has no pulse association"
+                )
+            qualification = self._exact_external_trigger_qualification_digest
+            if qualification is None:
+                raise RuntimeError(
+                    "real camera signal association requires active E0 qualification"
+                )
+            if self._signal_association is not None:
+                raise RuntimeError("camera monitor already owns a signal association")
+            session = self._session
+            if (
+                session is None
+                or not session.started
+                or session.closed
+                or session.superseded
+            ):
+                raise RuntimeError(
+                    "camera signal association requires a running monitor arm"
+                )
+        progress = self._camera
+        if not isinstance(progress, CameraAssociationProgress):
+            raise RuntimeError(
+                "camera signal association has no physical produced-frame counter"
+            )
+        produced_count = progress.observed_produced_count()
+        if isinstance(produced_count, bool) or not isinstance(produced_count, int):
+            raise TypeError("camera produced-frame counter must be an integer")
+        if produced_count < 0:
+            raise RuntimeError("camera produced-frame counter cannot be negative")
+        with self._lock:
+            if self._monitor_acquisition_mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
+                raise RuntimeError("camera monitor acquisition mode changed during arm")
+            if self._exact_external_trigger_qualification_digest != qualification:
+                raise RuntimeError("camera E0 qualification changed during arm")
+            if self._signal_association is not None:
+                raise RuntimeError("camera monitor already owns a signal association")
+            if (
+                self._session is not session
+                or not session.started
+                or session.closed
+                or session.superseded
+            ):
+                raise RuntimeError(
+                    "camera signal-association monitor arm changed during "
+                    "physical-boundary observation"
+                )
+            start = session.drained_count
+            if produced_count != start:
+                raise RuntimeError(
+                    "camera has produced frames that the monitor has not drained; "
+                    "the pre-FIRE association boundary is not exact"
+                )
+            if start % trigger_group_size:
+                raise RuntimeError(
+                    "camera monitor is not at a complete readout-cycle boundary"
+                )
+            association = _MonitorSignalAssociation(
+                identity,
+                digest,
+                expected_trigger_count,
+                trigger_group_size,
+                expected_group_count,
+                start,
+                session,
+                qualification,
+                previous_produced_count=session.last_produced_count,
+                previous_frame_stamp=session.last_frame_stamp,
+                previous_camera_stamp=session.last_camera_stamp,
+            )
+            self._signal_association = association
+            return association, start
+
+    def bind_signal_event_association(
+        self,
+        token: object,
+        *,
+        artifact_digest: str,
+        trigger_counts: tuple[tuple[str, int], ...],
+        terminal_evidence_digest: str,
+        terminal_evidence_kind: str,
+    ) -> tuple[str, int, int]:
+        """Bind the admitted interval to the FPGA hardware-terminal receipt."""
+
+        artifact = _sha256(artifact_digest, "artifact_digest")
+        terminal_digest = _sha256(
+            terminal_evidence_digest,
+            "terminal_evidence_digest",
+        )
+        if terminal_evidence_kind != "HARDWARE_RAW_REGISTERS":
+            raise ValueError(
+                "real camera association requires a hardware pulse terminal"
+            )
+        with self._lock:
+            association = self._require_signal_association(token)
+            if association.error is not None:
+                raise association.error
+            if artifact != association.cause_digest:
+                raise ValueError(
+                    "camera association terminal belongs to another pulse artifact"
+                )
+            capability = self._capability_snapshot()
+            channels = (
+                capability.camera_capability_evidence
+                .physical_facts.capture_trigger_channels
+            )
+            if len(channels) != 1:
+                raise RuntimeError(
+                    "camera pulse association requires one physical trigger channel"
+                )
+            channel = channels[0]
+            counts = tuple(trigger_counts)
+            matching = tuple(count for name, count in counts if name == channel)
+            if matching != (association.expected_trigger_count,):
+                raise RuntimeError(
+                    "hardware pulse-terminal trigger count differs from camera association"
+                )
+            association.trigger_channel = channel
+            association.terminal_evidence_digest = terminal_digest
+            association.bound = True
+            return (
+                channel,
+                association.physical_start_ordinal,
+                association.physical_start_ordinal
+                + association.expected_trigger_count,
+            )
+
+    def finish_signal_event_association(
+        self,
+        token: object,
+    ) -> tuple[str, int, int, str]:
+        """Reconcile one hardware FIRE with exactly its delivered camera frames."""
+
+        with self._lock:
+            association = self._require_signal_association(token)
+            if association.error is not None:
+                raise association.error
+            if not association.bound:
+                raise RuntimeError("camera signal association has no pulse terminal")
+            session = association.session
+            end = (
+                association.physical_start_ordinal
+                + association.expected_trigger_count
+            )
+            if association.observed_count != association.expected_trigger_count:
+                raise RuntimeError(
+                    "camera did not deliver the complete hardware-trigger interval"
+                )
+            if session.drained_count != end:
+                raise RuntimeError(
+                    "camera delivered frames outside the associated hardware FIRE"
+                )
+            if self._exact_external_trigger_qualification_digest != association.qualification_digest:
+                raise RuntimeError(
+                    "camera E0 qualification changed during signal association"
+                )
+            channel = association.trigger_channel
+            terminal_digest = association.terminal_evidence_digest
+            if channel is None or terminal_digest is None:
+                raise RuntimeError("camera association lost its terminal binding")
+            self._signal_association = None
+            return (
+                channel,
+                association.physical_start_ordinal,
+                end,
+                terminal_digest,
+            )
+
+    def cancel_signal_event_association(self, token: object) -> None:
+        with self._lock:
+            association = self._signal_association
+            if association is None:
+                return
+            if association is not token:
+                raise RuntimeError(
+                    "camera association token belongs to another request"
+                )
+            self._signal_association = None
+
+    def _require_signal_association(
+        self,
+        token: object,
+    ) -> _MonitorSignalAssociation:
+        association = self._signal_association
+        if association is None or association is not token:
+            raise RuntimeError("camera association token is not current")
+        session = association.session
+        if (
+            self._session is not session
+            or session.closed
+            or session.superseded
+        ):
+            raise RuntimeError("camera association monitor arm is no longer current")
+        return association
+
+    def _accept_signal_association_metadata(
+        self,
+        session: _EndpointSession,
+        metadata: CameraFrameMetadata,
+    ) -> None:
+        association = self._signal_association
+        if association is None:
+            return
+        if association.session is not session:
+            association.error = RuntimeError(
+                "camera association crossed monitor arm generations"
+            )
+            raise association.error
+        expected_ordinal = (
+            association.physical_start_ordinal + association.observed_count
+        )
+        if (
+            association.observed_count >= association.expected_trigger_count
+            or metadata.source_ordinal != expected_ordinal
+        ):
+            association.error = RuntimeError(
+                "camera ordinal interval differs from the associated hardware FIRE"
+            )
+            raise association.error
+        if metadata.produced_count is not None:
+            if metadata.produced_count != metadata.source_ordinal + 1:
+                association.error = RuntimeError(
+                    "camera produced-count does not identify its delivered ordinal"
+                )
+                raise association.error
+            previous = association.previous_produced_count
+            if previous is not None and metadata.produced_count != previous + 1:
+                association.error = RuntimeError(
+                    "camera produced-count has a gap inside the hardware FIRE"
+                )
+                raise association.error
+            association.previous_produced_count = metadata.produced_count
+        for field, previous_field, label in (
+            ("frame_stamp", "previous_frame_stamp", "frame stamp"),
+            ("camera_stamp", "previous_camera_stamp", "camera stamp"),
+        ):
+            current = getattr(metadata, field)
+            previous = getattr(association, previous_field)
+            if current is not None:
+                if previous is not None and current != previous + 1:
+                    association.error = RuntimeError(
+                        f"camera {label} has a gap inside the hardware FIRE"
+                    )
+                    raise association.error
+                setattr(association, previous_field, current)
+        if all(
+            value is None
+            for value in (
+                metadata.produced_count,
+                metadata.frame_stamp,
+                metadata.camera_stamp,
+            )
+        ):
+            association.error = RuntimeError(
+                "camera frame lacks E0-qualified hardware ordinal evidence"
+            )
+            raise association.error
+        association.observed_count += 1
 
     def _make_capability_snapshot(
         self,
@@ -1290,6 +1608,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                     raise RuntimeError(
                         "camera monitor produced-count gap proves pre-broker loss"
                     )
+                self._accept_signal_association_metadata(session, payload.metadata)
                 # Frame/camera stamps have adapter-specific scales and rollover
                 # rules; the generic record contract only promises monotonicity.
                 # Contiguous delivery is proved here by the owner-assigned source

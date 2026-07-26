@@ -1,24 +1,16 @@
-"""The board packer, moved into the target package, still places every pixel identically.
+"""The frontend board packer places every panel by its current pixel contract.
 
-``zlc_frontend.board_layout`` is the console's shelf packer and drop-placement rule,
-lifted out of the legacy shell.  It could only move once it stopped reaching for two
-things it may not import: the Qt chrome tokens and the figure size.  Those now arrive
-as :class:`BoardMetrics`.
+``zlc_frontend.board_layout`` is the console's shelf packer and drop-placement rule.
+Qt chrome tokens and figure size arrive explicitly through :class:`BoardMetrics`.
 
-The layouts below are a GOLDEN captured from the legacy implementation immediately
-before the move, on the real card-size table at the default display scale.  That table
-is baked in as literal data, so this file drives the moved module directly - no Qt, no
-Matplotlib, no legacy import - and still reproduces the exact pixels the GUI produced.
+The layouts below are the current product golden at the default display scale. The
+real card-size table is literal test data, so the packer can be checked without Qt or
+Matplotlib while preserving the exact pixels the GUI promises.
 
-``tests/test_board_gravity.py`` covers this code but sits outside
-``tests/migration_active_tests.txt``, so it is frozen: not run, not modified, not
-evidence.  This file is the oracle.
+These captured layouts remain the product oracle for ordering, width, and pixels.
 """
 
 from __future__ import annotations
-
-#: C41 -- these specific tests guard legacy artifacts and die with them; the rest of the
-#: file guards the NEW structure and is permanent (swept by test_design_charter).
 
 import ast
 import pathlib
@@ -28,7 +20,7 @@ import pytest
 from zlc_frontend.board_layout import (
     BoardMetrics, GeomProxy, board_width, drop_index, min_board_width, pack)
 
-#: Card outer sizes at the default scale, captured from the legacy ``_card_size``.
+#: Current card outer sizes at the default scale.
 CARD_PX = {
     "1x2": (500, 275), "2x2": (500, 401), "4x2": (500, 653),
     "1x4": (1008, 275), "2x4": (1008, 401), "4x4": (1008, 653),
@@ -74,7 +66,7 @@ def _packed(sizes, board_w):
 
 @pytest.mark.parametrize("sizes", list(CASES))
 def test_every_captured_layout_is_reproduced_pixel_for_pixel(sizes):
-    """The move must be invisible: same order, same width, same pixels."""
+    """The current contract fixes order, width, and pixels."""
 
     for board_w, expected in CASES[sizes].items():
         assert _packed(sizes, board_w) == expected, f"width {board_w}"
@@ -139,11 +131,11 @@ def test_the_widths_scale_with_the_widest_card():
 
 
 def test_the_module_reaches_for_no_renderer_and_no_toolkit():
-    """The whole reason it could move, asserted rather than assumed."""
+    """The headless layout owner must remain independent of rendering and Qt."""
 
-    import zlc_frontend.board_layout as moved
+    import zlc_frontend.board_layout as layout_owner
 
-    tree = ast.parse(pathlib.Path(moved.__file__).read_text(encoding="utf-8"))
+    tree = ast.parse(pathlib.Path(layout_owner.__file__).read_text(encoding="utf-8"))
     modules = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

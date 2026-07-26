@@ -51,6 +51,7 @@ _PANEL_VIEW_INTENTS = MappingProxyType(
     {
         "2d": ViewIntent.IMAGE,
         "1d": ViewIntent.CURVE,
+        "meter": ViewIntent.METER,
         "monitor": ViewIntent.CURVE,
         "hist": ViewIntent.HISTOGRAM,
     }
@@ -111,7 +112,7 @@ def automatic_panel_kind(schema) -> str | None:
 
 
 def automatic_figure_intent(schema):
-    """Choose the ordinary notebook Figure intent from declared axis roles."""
+    """Choose the ordinary Figure intent from declared axis roles."""
 
     return automatic_figure_view(schema)[0]
 

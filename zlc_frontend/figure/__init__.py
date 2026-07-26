@@ -2,9 +2,7 @@
 
 from .codec import (
     decode_figure_document,
-    decode_view_spec,
     encode_figure_document,
-    encode_view_spec,
     figure_document_from_tree,
     figure_document_to_tree,
     view_spec_from_tree,
@@ -23,7 +21,6 @@ from .contract import (
     dataset_axes,
     display_axis_indices,
     fit_single_panel_presentation,
-    selection_fit_view_projection,
     validate_view_spec,
 )
 from .evaluate import (
@@ -101,7 +98,7 @@ __all__ = [
     "ResolvedDatasetMap", "SampleCoordinates", "SuggestionStatus", "VIEW_CONTRACTS",
     "ViewAlternative", "ViewContract", "ViewIntent", "ViewPreferences", "ViewSpec",
     "ViewSuggestion", "contract_for", "dataset_contract_for", "dataset_axes", "display_axis_indices", "fit_single_panel_presentation", "decode_figure_document",
-    "decode_view_spec", "encode_figure_document", "encode_view_spec",
+    "encode_figure_document",
     "GRID_INTENTS", "figure_document_from_tree", "figure_document_to_tree", "grid_facet_axes", "grid_facet_axis", "resolve_grid_view", "suggest_default_grid_view", "suggest_fit_view", "suggest_view",
-    "selection_fit_view_projection", "validate_view_spec", "view_spec_from_tree", "view_spec_to_tree",
+    "validate_view_spec", "view_spec_from_tree", "view_spec_to_tree",
 ]

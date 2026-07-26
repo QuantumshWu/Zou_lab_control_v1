@@ -1,12 +1,11 @@
-"""Notebook surface owned by grey-molasses detuning release-recapture."""
+"""Public Experiment API owned by grey-molasses detuning release-recapture."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
 
-from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import ReadoutModelKind
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
 from zlc_neutral_atom.runtime.run import RunHandle
 from zlc_pulse import PulseDocument
@@ -17,38 +16,46 @@ from .application import (
     GreyMolassesDetuningIntent,
     prepare_grey_molasses_detuning_application,
 )
-from .measurement import GreyMolassesDetuningRequest
+from .measurement import (
+    GreyMolassesDetuningRequest,
+)
 
 
-class GreyMolassesDetuningNotebookHost(Protocol):
-    def load_grey_molasses_pulse(
+class GreyMolassesDetuningApi:
+    __slots__ = (
+        "_bind_request",
+        "_load_pulse",
+        "_resolve_camera_ref",
+        "_resolve_rf_role_operation",
+        "_resolve_sequencer_ref",
+    )
+
+    def __init__(
         self,
-        value: PulseDocument | str | Path,
-    ) -> PulseDocument: ...
+        *,
+        load_pulse: Callable,
+        resolve_camera_ref: Callable,
+        resolve_sequencer_ref: Callable,
+        resolve_rf_role: Callable,
+        bind_request: Callable,
+    ) -> None:
+        operations = (
+            load_pulse,
+            resolve_camera_ref,
+            resolve_sequencer_ref,
+            resolve_rf_role,
+            bind_request,
+        )
+        if any(not callable(operation) for operation in operations):
+            raise TypeError("grey-molasses API operations must be callable")
+        self._load_pulse = load_pulse
+        self._resolve_camera_ref = resolve_camera_ref
+        self._resolve_sequencer_ref = resolve_sequencer_ref
+        self._resolve_rf_role_operation = resolve_rf_role
+        self._bind_request = bind_request
 
-    def resolve_grey_molasses_camera_ref(self, requested: str | None) -> DeviceRef: ...
-
-    def resolve_grey_molasses_sequencer_ref(
-        self,
-        requested: str | None,
-    ) -> DeviceRef: ...
-
-    def resolve_grey_molasses_rf_role(self, requested: str) -> str: ...
-
-    def bind_grey_molasses_detuning(
-        self,
-        request: GreyMolassesDetuningRequest,
-    ) -> PreparedReleaseRecapture: ...
-
-
-class GreyMolassesDetuningNotebookAdapter:
-    __slots__ = ()
-
-    @property
-    def _grey_molasses_notebook_host(
-        self,
-    ) -> GreyMolassesDetuningNotebookHost:
-        raise NotImplementedError
+    def _resolve_rf_role(self, requested: str) -> str:
+        return self._resolve_rf_role_operation(requested)
 
     def grey_molasses_detuning_request(
         self,
@@ -65,15 +72,14 @@ class GreyMolassesDetuningNotebookAdapter:
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
     ) -> GreyMolassesDetuningRequest:
-        host = self._grey_molasses_notebook_host
         return GreyMolassesDetuningRequest(
-            host.load_grey_molasses_pulse(pulse),
+            self._load_pulse(pulse),
             tuple(detuning_gamma),
             trap_off_seconds,
             shots,
-            host.resolve_grey_molasses_camera_ref(camera_role),
-            host.resolve_grey_molasses_sequencer_ref(sequencer_role),
-            host.resolve_grey_molasses_rf_role(rf_role),
+            self._resolve_camera_ref(camera_role),
+            self._resolve_sequencer_ref(sequencer_role),
+            self._resolve_rf_role(rf_role),
             calibration_ref,
             model_kind,
             per_site,
@@ -86,9 +92,13 @@ class GreyMolassesDetuningNotebookAdapter:
     ) -> RunHandle:
         if not isinstance(request, GreyMolassesDetuningRequest):
             raise TypeError("request must be GreyMolassesDetuningRequest")
-        return self._grey_molasses_notebook_host.bind_grey_molasses_detuning(
-            request
-        ).start()
+        return self._bind(request).start()
+
+    def _bind(
+        self,
+        request: GreyMolassesDetuningRequest,
+    ) -> PreparedReleaseRecapture:
+        return self._bind_request(request)
 
     def prepare_grey_molasses_detuning_application(
         self,
@@ -103,6 +113,5 @@ class GreyMolassesDetuningNotebookAdapter:
 
 
 __all__ = [
-    "GreyMolassesDetuningNotebookAdapter",
-    "GreyMolassesDetuningNotebookHost",
+    "GreyMolassesDetuningApi",
 ]

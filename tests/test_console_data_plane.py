@@ -39,7 +39,7 @@ from zlc_neutral_atom.dataset_output import (
     LiveDatasetOutput,
 )
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
-from zlc_workbench.task_console.data_plane import ConsoleDataFront, ConsoleDataPlane
+from zlc_neutral_atom.processing.signal_plane import SignalFront, SignalDataPlane
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -86,10 +86,7 @@ def _live_output(
 def _node(instance_id: str, output: LiveDatasetOutput):
     return SimpleNamespace(
         instance_id=instance_id,
-        display_label=instance_id,
-        output_declarations=(
-            SimpleNamespace(declaration=output.declaration),
-        ),
+        dataset_output_declarations=(output.declaration,),
         signal_key=lambda name: f"{instance_id}/{name}",
     )
 
@@ -135,7 +132,7 @@ class _GatedProcessorApplication:
 class _GatedProcessorNode:
     def __init__(
         self,
-        plane: ConsoleDataPlane,
+        plane: SignalDataPlane,
         *,
         instance_id: str,
         source_name: str,
@@ -144,17 +141,14 @@ class _GatedProcessorNode:
         published_outputs: tuple[str, ...] | None = None,
     ) -> None:
         self.instance_id = instance_id
-        self.display_label = instance_id
         self._plane = plane
         self._source_name = source_name
         self._gates = gates
         self._published_outputs = (
             declared_outputs if published_outputs is None else published_outputs
         )
-        self.output_declarations = tuple(
-            SimpleNamespace(
-                declaration=_live_output(name, 1, "a" * 64).declaration,
-            )
+        self.dataset_output_declarations = tuple(
+            _live_output(name, 1, "a" * 64).declaration
             for name in declared_outputs
         )
         self.failure = None
@@ -162,52 +156,50 @@ class _GatedProcessorNode:
     def signal_key(self, name: str) -> str:
         return f"{self.instance_id}/{name}"
 
-    def _prepare_processor_application(self):
+    def prepare_processor_application(self):
         return _GatedProcessorApplication(self._published_outputs, self._gates)
 
-    def _validate_processor_source(self, source) -> None:
+    def validate_processor_source(self, source) -> None:
         if source.name != self._source_name:
             raise ValueError("wrong test source")
 
     @staticmethod
-    def _processor_application_ready(_application) -> None:
+    def processor_application_ready(_application) -> None:
         return None
 
     @staticmethod
-    def _processor_work_started(_source) -> None:
+    def processor_work_started(_source) -> None:
         return None
 
-    def _accept_processor_result(self, source, evaluation) -> None:
+    def accept_processor_result(self, source, evaluation) -> None:
         self._plane.publish_processor(
             self,
             evaluation.outputs,
             source=source,
         )
 
-    def _accept_processor_failure(self, error) -> None:
+    def accept_processor_failure(self, error) -> None:
         self.failure = error
 
     @staticmethod
-    def _accept_processor_cancelled() -> None:
+    def accept_processor_cancelled() -> None:
         return None
 
     @staticmethod
-    def _request_processor_owner_wake() -> None:
+    def request_processor_owner_wake() -> None:
         return None
 
 
 def _live_source_plane():
-    plane = ConsoleDataPlane()
+    plane = SignalDataPlane()
     state = {
         "frame": _live_output("frame", 1, "1" * 64),
         "frame_aux": _live_output("frame_aux", 1, "2" * 64),
     }
     node = SimpleNamespace(
         instance_id="camera",
-        display_label="camera",
-        output_declarations=tuple(
-            SimpleNamespace(declaration=output.declaration)
-            for output in state.values()
+        dataset_output_declarations=tuple(
+            output.declaration for output in state.values()
         ),
         signal_key=lambda name: f"camera/{name}",
     )
@@ -224,10 +216,10 @@ def _live_source_plane():
 
 
 def _wait_for_signal_revision(
-    plane: ConsoleDataPlane,
+    plane: SignalDataPlane,
     name: str,
     revision: int,
-) -> ConsoleDataFront:
+) -> SignalFront:
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
         front = plane.freeze()
@@ -281,7 +273,7 @@ def test_reactive_processor_wakes_only_for_its_declared_source() -> None:
 
 
 def test_unchanged_sources_reuse_their_immutable_front() -> None:
-    plane = ConsoleDataPlane()
+    plane = SignalDataPlane()
     output = _live_output("frame", 1, "a" * 64)
     node = _node("camera", output)
     slot = _slot(run="run", epoch="epoch", outputs={"frame": output})
@@ -302,7 +294,7 @@ def test_unchanged_sources_reuse_their_immutable_front() -> None:
 def test_the_data_plane_holds_no_toolkit_and_no_domain_authority():
     """It receives slots; it never reaches for Qt, matplotlib or the facade."""
 
-    tree = ast.parse((REPO / "zlc_workbench" / "task_console" / "data_plane.py")
+    tree = ast.parse((REPO / "zlc_neutral_atom" / "processing" / "signal_plane.py")
                      .read_text(encoding="utf-8"))
     roots = set()
     for node in ast.walk(tree):
@@ -320,20 +312,20 @@ def test_live_slot_cannot_publish_an_undeclared_output_contract() -> None:
     undeclared = _live_output("roi", 1, "b" * 64)
     node = _node("camera", declared)
     slot = _slot(run="run", epoch="epoch", outputs={"roi": undeclared})
-    plane = ConsoleDataPlane()
+    plane = SignalDataPlane()
     plane.attach(node, slot)
     plane.mark_changed(node)
 
     front = plane.freeze()
 
     assert front.names() == ()
-    assert "absent from the Workbench vocabulary" in front.failures["camera"]
+    assert "absent from the producer vocabulary" in front.failures["camera"]
 
 
 def test_independent_producers_keep_independent_causation_in_one_present_cycle() -> None:
     """Latest values from two producers are not promoted into one fake shot."""
 
-    plane = ConsoleDataPlane()
+    plane = SignalDataPlane()
 
     def attach(name: str, *, run: str, epoch: str, sequence: int, digest: str) -> None:
         output_name = f"{name}_frame"
@@ -357,6 +349,10 @@ def test_independent_producers_keep_independent_causation_in_one_present_cycle()
     fast = front.value("fast/fast_frame")
 
     assert slow is not None and fast is not None
+    assert slow.source_instance_id == "slow"
+    assert fast.source_instance_id == "fast"
+    assert not hasattr(slow, "source")
+    assert not hasattr(slow, "presentation")
     assert (slow.run_id, slow.epoch_id, slow.join_digest) == (
         "run-slow", "epoch-slow", "a" * 64,
     )
@@ -373,7 +369,7 @@ def test_source_and_processor_descendants_advance_as_one_local_component(
 ) -> None:
     """A slow Processor cannot expose source N beside derived N-1."""
 
-    plane = ConsoleDataPlane()
+    plane = SignalDataPlane()
     request.addfinalizer(plane.close)
     source_state = {
         "frame": _live_output("frame", 1, "1" * 64),
@@ -381,10 +377,8 @@ def test_source_and_processor_descendants_advance_as_one_local_component(
     }
     source_node = SimpleNamespace(
         instance_id="camera",
-        display_label="camera",
-        output_declarations=tuple(
-            SimpleNamespace(declaration=output.declaration)
-            for output in source_state.values()
+        dataset_output_declarations=tuple(
+            output.declaration for output in source_state.values()
         ),
         signal_key=lambda name: f"camera/{name}",
     )
@@ -429,13 +423,10 @@ def test_source_and_processor_descendants_advance_as_one_local_component(
 
     class ProcessorNode:
         instance_id = "occupancy"
-        display_label = "occupancy"
 
         def __init__(self) -> None:
             declaration = _live_output("occupied", 1, "a" * 64).declaration
-            self.output_declarations = (
-                SimpleNamespace(declaration=declaration),
-            )
+            self.dataset_output_declarations = (declaration,)
             self.failure = None
 
         @staticmethod
@@ -447,38 +438,38 @@ def test_source_and_processor_descendants_advance_as_one_local_component(
             return ("occupancy/occupied",)
 
         @staticmethod
-        def _prepare_processor_application():
+        def prepare_processor_application():
             return Application()
 
         @staticmethod
-        def _validate_processor_source(source) -> None:
+        def validate_processor_source(source) -> None:
             if source.name != "camera/frame":
                 raise ValueError("wrong test source")
 
         @staticmethod
-        def _processor_application_ready(_application) -> None:
+        def processor_application_ready(_application) -> None:
             return None
 
         @staticmethod
-        def _processor_work_started(_source) -> None:
+        def processor_work_started(_source) -> None:
             return None
 
-        def _accept_processor_result(self, source, evaluation) -> None:
+        def accept_processor_result(self, source, evaluation) -> None:
             plane.publish_processor(
                 self,
                 evaluation.outputs,
                 source=source,
             )
 
-        def _accept_processor_failure(self, error) -> None:
+        def accept_processor_failure(self, error) -> None:
             self.failure = error
 
         @staticmethod
-        def _accept_processor_cancelled() -> None:
+        def accept_processor_cancelled() -> None:
             return None
 
         @staticmethod
-        def _request_processor_owner_wake() -> None:
+        def request_processor_owner_wake() -> None:
             return None
 
     processor = ProcessorNode()
@@ -488,7 +479,7 @@ def test_source_and_processor_descendants_advance_as_one_local_component(
         initial_source=first_source,
     )
 
-    def wait_for_revision(revision: int) -> ConsoleDataFront:
+    def wait_for_revision(revision: int) -> SignalFront:
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             front = plane.freeze()
@@ -537,7 +528,7 @@ def test_source_and_processor_descendants_advance_as_one_local_component(
     source_state["frame_aux"] = _live_output("frame_aux", 3, "6" * 64)
     plane.mark_changed(source_node)
     assert plane.freeze().value("camera/frame").snapshot.ref.revision.value == 1
-    entry = plane._processor_lane._entries[id(processor)]
+    entry = plane._processor_lane._entries[processor.instance_id]
     assert entry.work_source.snapshot.ref.revision.value == 2
     assert entry.pending_source.snapshot.ref.revision.value == 3
 
@@ -619,7 +610,7 @@ def test_processor_chain_presents_the_completed_causal_edge_closure() -> None:
         plane.mark_changed(source_node)
         plane.freeze()
 
-        upstream_entry = plane._processor_lane._entries[id(upstream)]
+        upstream_entry = plane._processor_lane._entries[upstream.instance_id]
         assert upstream_entry.work_source.snapshot.ref.revision.value == 2
         assert upstream_entry.pending_source.snapshot.ref.revision.value == 3
         upstream_gates[2].set()
@@ -648,7 +639,7 @@ def test_processor_chain_presents_the_completed_causal_edge_closure() -> None:
         source_state["frame_aux"] = _live_output("frame_aux", 5, "a" * 64)
         plane.mark_changed(source_node)
         plane.freeze()
-        downstream_entry = plane._processor_lane._entries[id(downstream)]
+        downstream_entry = plane._processor_lane._entries[downstream.instance_id]
         assert downstream_entry.work_source.snapshot.ref.revision.value == 2
         downstream_gates[2].set()
         deadline = time.monotonic() + 2.0
@@ -710,7 +701,7 @@ def test_fan_out_can_bind_the_exact_staged_source_front() -> None:
         source_state["frame_aux"] = _live_output("frame_aux", 3, "6" * 64)
         plane.mark_changed(source_node)
         plane.freeze()
-        first_entry = plane._processor_lane._entries[id(first_processor)]
+        first_entry = plane._processor_lane._entries[first_processor.instance_id]
         first_gates[2].set()
         deadline = time.monotonic() + 2.0
         while not first_entry.work_future.done() and time.monotonic() < deadline:
@@ -735,7 +726,7 @@ def test_fan_out_can_bind_the_exact_staged_source_front() -> None:
             source_name="camera/frame",
             initial_source=staged.value("camera/frame"),
         )
-        second_entry = plane._processor_lane._entries[id(second_processor)]
+        second_entry = plane._processor_lane._entries[second_processor.instance_id]
         retained = second_entry.pending_source_component
         assert retained.signals["camera/frame"].snapshot.ref.revision.value == 2
         assert retained.signals[

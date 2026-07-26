@@ -49,13 +49,12 @@ def _unresolved(code: str, message: str, axis_id=None) -> ViewSuggestion:
 def _grid_contract(intent: ViewIntent):
     """Allow one explicit Grid facet without auto-inventing another one.
 
-    Ordinary IMAGE/CURVE contracts deliberately give spatial axes no automatic
-    page role: a one-panel plot must ask for an ROI/pixel instead of silently
-    paging an image.  Grid is the explicit page control, so FACET is legal for
-    every role the intent already knows, including those spatial roles.  It is
-    always placed last; the suggestion engine therefore uses an available
-    slider/batch/sample role for every *other* axis and can never manufacture a
-    second facet merely because the schema gained another dimension.
+    Ordinary contracts keep extra information axes visible as slider, batch,
+    or histogram-sample bindings; they never create implicit multi-cell output.
+    Grid is the explicit page control, so FACET remains legal for every role the
+    intent already knows.  It is always placed last; the suggestion engine uses
+    an available ordinary role for every *other* axis and can never manufacture
+    a second facet merely because the schema gained another dimension.
     """
 
     contract = dataset_contract_for(intent)
@@ -316,13 +315,15 @@ def grid_facet_axes(
 
 
 def suggest_default_grid_view(schema: DatasetSchema) -> ViewSuggestion:
-    """Suggest a schema-derived Grid view without naming a physical axis.
+    """Suggest a stable, visible Grid view from declared axis semantics.
 
-    Only declared point axes, their roles, and Figure contract resolution enter
-    the choice.  Intent preference is stable frontend policy: an image cell is
-    preferred when the schema can supply its plane, followed by a curve and a
-    histogram.  Within the first resolvable intent, more than one legal point
-    facet is a real authoring ambiguity and remains ``NEEDS_INPUT``.
+    Intent preference is stable frontend policy: an image cell is preferred
+    when the schema can supply its plane, followed by a curve and a histogram.
+    Within that intent the first legal declared axis is the default facet.  The
+    authored ``ViewSpec`` still records that exact choice and Setting exposes
+    every alternative, so this removes startup friction without introducing a
+    hidden projection.  Point, scan, repeat, and trailing data axes all use the
+    same resolver; ndarray rank, values, and AxisId spelling never participate.
     """
 
     if not isinstance(schema, DatasetSchema):
@@ -334,7 +335,7 @@ def suggest_default_grid_view(schema: DatasetSchema) -> ViewSuggestion:
     ):
         candidates = tuple(
             suggestion
-            for axis in schema.point_axes
+            for axis in dataset_axes(schema)
             if axis.size > 1
             for suggestion in (
                 resolve_grid_view(schema, intent, axis.axis_id),
@@ -343,15 +344,7 @@ def suggest_default_grid_view(schema: DatasetSchema) -> ViewSuggestion:
         )
         if not candidates:
             continue
-        if len(candidates) == 1:
-            return candidates[0]
-        return _unresolved(
-            "AMBIGUOUS_DEFAULT_GRID_FACET",
-            (
-                "multiple declared point axes can facet the default Grid; "
-                "choose the physical axis in Setting"
-            ),
-        )
+        return candidates[0]
     return _unresolved(
         "NO_DEFAULT_GRID_VIEW",
         "the DatasetSchema does not determine a complete Grid view",

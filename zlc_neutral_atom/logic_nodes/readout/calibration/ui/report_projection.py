@@ -29,6 +29,7 @@ from zlc_frontend import (
     ViewIntent,
     ViewSpec,
     plot_report_page,
+    render_plot_report,
 )
 from zlc_frontend.display_range import RelimMode
 from zlc_frontend.histogram_display import histogram_display_with_thresholds
@@ -296,4 +297,13 @@ def project_calibration_plot_report(
     return PlotReportDocument(summary, tuple(pages))
 
 
-__all__ = ["project_calibration_plot_report"]
+def render_calibration_plot_report(view: CalibrationReportProjection):
+    """Render through the same frontend report owner used by every caller."""
+
+    return render_plot_report(project_calibration_plot_report(view))
+
+
+__all__ = [
+    "project_calibration_plot_report",
+    "render_calibration_plot_report",
+]

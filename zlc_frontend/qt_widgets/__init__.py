@@ -35,6 +35,13 @@ _EXPORTS_BY_MODULE = {
     ".owner_wake": ("QtOwnerWake",),
     ".raster_surface": ("RasterPixelRatioObserver",),
     ".panel_host": ("SinglePanelHost",),
+    ".figure_surface_host": (
+        "FigureOutputAuthority",
+        "FigureSurfaceContext",
+        "FigureSurfaceHost",
+    ),
+    ".published_signals": ("PublishedSignalsLegend",),
+    ".view_spec_editor": ("ViewSpecEditor",),
     ".form": (
         "FORM_WIDGET_HANDLERS",
         "FluentParameterForm",
@@ -42,6 +49,13 @@ _EXPORTS_BY_MODULE = {
         "FormWidgetHandler",
     ),
     ".fit_authoring": ("FitAuthoringPane",),
+    ".figure_fit_lane": ("FigureFitLane", "FigureFitRequest"),
+    ".figure_surface_lane": (
+        "FigureSurfaceCompletion",
+        "FigureSurfaceLane",
+        "FigureSurfaceOutputRequest",
+        "FigureSurfaceRenderRequest",
+    ),
     ".figure_info_pane": ("FigureInfoPane",),
     ".flow_graph_view": ("FlowGraphView",),
     ".signal_picker": (

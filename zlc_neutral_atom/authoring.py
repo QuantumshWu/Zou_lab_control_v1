@@ -155,12 +155,19 @@ class AuthoringField:
     def freeze(self, value: object) -> object:
         """Validate one authored leaf without adding presentation coercions."""
 
-        blank = value is None or (isinstance(value, str) and not value.strip())
-        if blank:
+        if value is None:
             if self.required:
                 raise ValueError(f"{self.label} is required")
             if self.kind in {"int", "float", "number"} and not self.allow_blank:
                 raise ValueError(f"{self.label} cannot be blank")
+            return None
+        if isinstance(value, str) and not value.strip():
+            if self.kind in {"int", "float", "number"}:
+                raise TypeError(
+                    f"{self.label} optional numeric value must be None, not text"
+                )
+            if self.required:
+                raise ValueError(f"{self.label} is required")
             return value
 
         if self.kind in {"text", "path"}:

@@ -12,21 +12,21 @@ from __future__ import annotations
 import pathlib
 import subprocess
 import sys
-from types import SimpleNamespace
 
+from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
 from zlc_neutral_atom.logic_nodes.pulse_scan import ScanArtifactRef
-from zlc_workbench.task_console.run_bridge import ConsoleRunNode
+from zlc_neutral_atom.runtime.hosted_run import HostedRun
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 
-def test_the_run_bridge_does_not_import_the_notebook_facade():
-    """Layering: the console package takes prepare/start closures, not authority."""
+def test_hosted_run_does_not_import_the_application_or_gui_layer():
+    """Layering: the hosted Run takes prepare/start closures, not authority."""
 
     import ast
 
-    tree = ast.parse((REPO / "zlc_workbench" / "task_console" / "run_bridge.py")
+    tree = ast.parse((REPO / "zlc_neutral_atom" / "runtime" / "hosted_run.py")
                      .read_text(encoding="utf-8"))
     roots = set()
     for node in ast.walk(tree):
@@ -61,19 +61,13 @@ def test_successful_run_result_is_the_only_final_artifact_authority() -> None:
         def cancel(self, _reason=""):
             raise AssertionError("a successful Run must not be cancelled")
 
-    spec = SimpleNamespace(
-        key=SimpleNamespace(stable_definition_id="final-result"),
-        name="Pulse scan",
-        artifact_outputs=(),
-        build_request=lambda values: values,
-        outputs_for=lambda request: (),
-    )
-    node = ConsoleRunNode(
-        spec,
-        {},
+    node = HostedRun(
+        definition_key=DefinitionKey("test", "final-result"),
+        request={},
         instance_id="final-result-instance",
-        instance_label="Pulse scan",
+        dataset_output_declarations=(),
         prepare=lambda request: request,
+        qualify_output=lambda name: f"@logic/final-result-instance/{name}",
         request_owner_wake=lambda: None,
     )
     node._handle = Handle()
@@ -83,3 +77,119 @@ def test_successful_run_result_is_the_only_final_artifact_authority() -> None:
         assert node.final_result == reference
     finally:
         node.shutdown()
+
+
+def test_run_attachment_calls_the_capability_live_output_starter() -> None:
+    """The generic host must not shadow the injected domain start adapter."""
+
+    import time
+
+    from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
+    from zlc_neutral_atom.catalog import MeasurementDefinition
+    from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
+    from zlc_neutral_atom.logic_node_declaration import (
+        LogicNodeDeclaration,
+        OutputPresentation,
+    )
+    from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
+    from zlc_neutral_atom.runtime.live_output_host import LiveDatasetHost
+    from zlc_workbench.task_console.attachment_builders import run_attachment
+    from zlc_workbench.task_console.capability import ConsoleNodeHost
+    from zlc_workbench.task_console.declaration_projection import (
+        project_declaration_spec,
+    )
+    from zlc_workbench.task_console.presentation_index import (
+        ConsolePresentationIndex,
+    )
+
+    key = DefinitionKey("tests", "live-output-start")
+    declaration = LogicNodeDeclaration(
+        definition=MeasurementDefinition(
+            key,
+            "Live output",
+            "tests.LiveOutputRequest",
+            "tests.LiveOutputBinding",
+        ),
+        description="test live start seam",
+        authoring_schema=AuthoringSchema(
+            (AuthoringField("enabled", "bool", "Enabled", default=True),)
+        ),
+        input_specs=(),
+        outputs=(
+            OutputPresentation(
+                DatasetOutputDeclaration("value", "tests.live-output"),
+                "value",
+                "Value",
+            ),
+        ),
+        build_request=lambda values: bool(values["enabled"]),
+        bind_request=lambda request, _inputs: request,
+    )
+    spec = project_declaration_spec(declaration)
+    plane = SignalDataPlane()
+    host = ConsoleNodeHost(
+        data_plane=plane,
+        presentation_index=ConsolePresentationIndex(),
+        resolve_inputs=lambda _spec, _values: {},
+        request_owner_wake=lambda: None,
+    )
+    observed: list[tuple[object, object]] = []
+    terminal = RunSnapshot(
+        RunId("live-output-start-run"),
+        RunState.SUCCEEDED,
+        "complete",
+        True,
+        None,
+        None,
+        (),
+        None,
+    )
+
+    class Handle:
+        run_id = terminal.run_id
+
+        @staticmethod
+        def snapshot():
+            return terminal
+
+        @staticmethod
+        def result(*, timeout=None):
+            assert timeout == 0.0
+            return None
+
+        @staticmethod
+        def cancel(_reason=""):
+            raise AssertionError("completed handle must not be cancelled")
+
+    def capability_start(command, live_host):
+        observed.append((command, live_host))
+        return Handle()
+
+    attachment = run_attachment(
+        spec,
+        bind_request=lambda request, _inputs: request,
+        prepare=lambda request: ("prepared", request),
+        start_with_live_output=capability_start,
+    )
+    node = attachment.create_node(
+        host,
+        spec,
+        {"enabled": True},
+        "live-output-instance",
+    )
+    try:
+        node.start()
+        deadline = time.monotonic() + 2.0
+        while (
+            (not observed or not node.final_result_resolved)
+            and time.monotonic() < deadline
+        ):
+            node.poll()
+            time.sleep(0.005)
+        assert observed and observed[0][0] == ("prepared", True)
+        assert isinstance(observed[0][1], LiveDatasetHost)
+        assert node.final_result_resolved
+    finally:
+        node.poll()
+        node.shutdown()
+        plane.close()

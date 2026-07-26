@@ -394,7 +394,7 @@ class FigureViewer(QtWidgets.QWidget):
 
         if not isinstance(handle, LoadedFigureArchive):
             # FigureViewer only injects local archive persistence.  A durable
-            # Capture/Scan artifact belongs to the notebook composition root.
+            # Capture/Scan artifact belongs to the application composition root.
             self.info_pane.status.show_message(
                 "Fit save returned no Figure archive",
                 severity="error",

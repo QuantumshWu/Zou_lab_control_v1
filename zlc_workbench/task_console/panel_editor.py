@@ -29,6 +29,9 @@ from zlc_frontend.qt_widgets import (
     FluentSectionLabel,
     FluentSettingRow,
     FluentSwitch,
+    FigureSurfaceContext,
+    FigureSurfaceHost,
+    ViewSpecEditor,
     GREY,
     scaled_px,
     signals_blocked as _signals_blocked,
@@ -96,6 +99,7 @@ class PanelEditor(QtWidgets.QWidget):
         self._board = None
         self.render_surface_id = f"{card.panel_id}::edit::{id(self):x}"
         self._snapshot_value = None
+        self._snapshot_source_component = None
         self._snapshot_figure = None
         self._snapshot_display = None
         self._snapshot_contract = None
@@ -186,6 +190,12 @@ class PanelEditor(QtWidgets.QWidget):
             form_widgets=self.ed_params,
             parent=page,
         )
+        self.view_spec_editor = ViewSpecEditor(
+            label_width=label_w,
+            parent=page,
+        )
+        self.view_spec_editor.viewChanged.connect(self._edit_view_spec)
+        col.addWidget(self.view_spec_editor)
         self.repeat_mode_row, self.repeat_mode_combo = card._make_repeat_mode_row(
             self._edit_repeat_mode,
             label_w,
@@ -343,8 +353,6 @@ class PanelEditor(QtWidgets.QWidget):
         the card-owned display state.
         """
 
-        from zlc_frontend.qt_widgets import FacetedPanelHost
-
         card = self.card
         source_host = None if card is None else card.board
         front = None if source_host is None else source_host.front_frame
@@ -374,10 +382,35 @@ class PanelEditor(QtWidgets.QWidget):
         logical_size = tuple(
             int(value) for value in panel_display_size(size_name)
         )
-        if isinstance(board, FacetedPanelHost) and overview_artifact is not None:
-            board.present_overview(overview_artifact)
+        if board.faceted and overview_artifact is not None:
+            board.present_overview(
+                overview_artifact,
+                context=FigureSurfaceContext.for_figure(
+                    figure,
+                    display=display,
+                    contract=contract,
+                ),
+            )
         elif front is not None:
-            board.present_frame(front, logical_size=logical_size)
+            selector_figure = figure
+            live_context = None if source_host is None else source_host.context
+            if live_context is not None:
+                selector_figure = live_context.selector_figure
+            board.present_frame(
+                front,
+                context=FigureSurfaceContext.for_frame(
+                    front,
+                    figure=figure,
+                    display=display,
+                    contract=contract,
+                    selector_figure=(
+                        selector_figure
+                        if selector_figure is not figure
+                        else None
+                    ),
+                ),
+                logical_size=logical_size,
+            )
         else:
             self.status.setText("the panel has no complete focused frame")
             return
@@ -389,12 +422,22 @@ class PanelEditor(QtWidgets.QWidget):
         self._presented_render_request_revision = self._render_request_revision
         self._pending_render_result = None
         self._snapshot_value = value
+        try:
+            self._snapshot_source_component = (
+                self.console._data.capture_source_component(value)
+            )
+        except (RuntimeError, TypeError, ValueError):
+            # A standalone/static Figure surface has no TaskConsole causal
+            # graph.  It may still render and fit, but cannot publish a routed
+            # signal until a real producer is attached.
+            self._snapshot_source_component = None
         self._snapshot_figure = figure
         self._snapshot_display = display
         self._snapshot_contract = contract
         self._refresh_unit_readout()
         if self._fit_pane is not None:
             card.refresh_fit_authoring_pane(self._fit_pane)
+        card._refresh_view_spec_control_surface(self)
         self.refresh_limit_hints()
         self.status.setText("")
 
@@ -406,6 +449,7 @@ class PanelEditor(QtWidgets.QWidget):
         return (
             self._snapshot_value,
             self._snapshot_figure,
+            self._snapshot_source_component,
         )
 
     def freeze_current_view_request(self, *, axis_labels=None, short_labels=None):
@@ -507,17 +551,49 @@ class PanelEditor(QtWidgets.QWidget):
         logical_size = tuple(
             int(value) for value in panel_display_size(request.contract.size_name)
         )
+        selector_figure = None
         if faceted is not None:
-            if faceted.overview is not None:
-                board.present_overview(faceted.overview)
-            else:
-                board.present_frame(
-                    faceted.frame,
-                    logical_size=logical_size,
+            if faceted.focus is not None:
+                intent = request.contract.intent
+                if figure is None or intent is None:
+                    raise RuntimeError(
+                        "focused Edit front lost its typed Figure context"
+                    )
+                selector_figure = figure.focused_typed_panel(
+                    faceted.focus.panel_index,
+                    expected_selection=faceted.focus.selection,
+                    expected_intent=intent,
                 )
-            figure = faceted.figure
+            board.present_faceted(
+                faceted,
+                context=(
+                    FigureSurfaceContext.for_figure(
+                        figure,
+                        display=request.display,
+                        contract=request.contract,
+                    )
+                    if faceted.overview is not None
+                    else FigureSurfaceContext.for_frame(
+                        faceted.frame,
+                        figure=figure,
+                        display=request.display,
+                        contract=request.contract,
+                        selector_figure=selector_figure,
+                    )
+                ),
+                logical_size=logical_size,
+            )
         else:
-            board.present_frame(frame, logical_size=logical_size)
+            board.present_frame(
+                frame,
+                context=FigureSurfaceContext.for_frame(
+                    frame,
+                    figure=figure,
+                    display=request.display,
+                    contract=request.contract,
+                ),
+                logical_size=logical_size,
+            )
         self._snapshot_figure = figure
         self._snapshot_display = request.display
         self._snapshot_contract = request.contract
@@ -535,24 +611,21 @@ class PanelEditor(QtWidgets.QWidget):
     def _ensure_snapshot_surface(self):
         """Construct the one host type this panel needs, at most once."""
 
-        from zlc_frontend.qt_widgets import FacetedPanelHost, SinglePanelHost
-
-        wanted = FacetedPanelHost if self.card.config.kind == "grid" else SinglePanelHost
+        wanted_faceted = self.card.config.kind == "grid"
         board = self._board
-        if isinstance(board, wanted):
+        if isinstance(board, FigureSurfaceHost) and board.faceted == wanted_faceted:
             return board
         self._retire_snapshot_surface(board)
-        board = wanted(
+        board = FigureSurfaceHost(
             self.card.panel_id,
+            faceted=wanted_faceted,
             empty_text="no snapshot yet",
+            output_authority=self.card._figure_output_authority,
             parent=self,
         )
-        if isinstance(board, FacetedPanelHost):
+        if wanted_faceted:
             board.focusRequested.connect(self._forward_grid_focus)
             board.overviewRequested.connect(self._forward_grid_overview)
-        board.rangeSelected.connect(self._forward_range)
-        board.rectangleSelected.connect(self._forward_rectangle)
-        board.crossSelected.connect(self._forward_cross)
         board.viewCommitted.connect(self._forward_view_commit)
         board.colorLimitsCommitted.connect(self._forward_color_limits)
         board.thresholdsCommitted.connect(self._forward_thresholds)
@@ -585,15 +658,6 @@ class PanelEditor(QtWidgets.QWidget):
                 surface=self._board,
             )
 
-    def _forward_range(self, gesture) -> None:
-        self.card.accept_range_from(self._board, gesture)
-
-    def _forward_rectangle(self, gesture) -> None:
-        self.card.accept_rectangle_from(self._board, gesture)
-
-    def _forward_cross(self, gesture) -> None:
-        self.card.accept_cross_from(self._board, gesture)
-
     def _forward_view_commit(self, commit) -> None:
         self.card.accept_view_commit_from(self._board, commit)
 
@@ -619,6 +683,7 @@ class PanelEditor(QtWidgets.QWidget):
         if self.card is not None and self._fit_pane is not None:
             self.card.release_fit_authoring_pane(self._fit_pane)
         self._fit_pane = None
+        self._snapshot_source_component = None
         if self.card is not None:
             try:
                 self.card.fit_presentation_changed.disconnect(
@@ -659,6 +724,7 @@ class PanelEditor(QtWidgets.QWidget):
         if self.card is None:
             return
         if self.card._commit_repeat_mode(mode):
+            self.card._refresh_view_spec_control_surface(self)
             self._request_snapshot_render()
 
     def _edit_grid_facet(self, intent, axis_id) -> bool:
@@ -667,8 +733,16 @@ class PanelEditor(QtWidgets.QWidget):
         changed = self.card._commit_grid_facet(intent, axis_id)
         if changed:
             self.card._refresh_grid_control_surface(self)
+            self.card._refresh_view_spec_control_surface(self)
             self._request_snapshot_render()
         return changed
+
+    def _edit_view_spec(self, view) -> None:
+        if self.card is None:
+            return
+        if self.card._commit_view_spec(view):
+            self.card._refresh_view_spec_control_surface(self)
+            self._request_snapshot_render()
 
     def _sync_fixed_lim_enabled(self, relim: str) -> None:
         """The Edit tab's fixed lo/hi row is ALWAYS in the layout -- only its INPUTS enable when
@@ -734,6 +808,7 @@ class PanelEditor(QtWidgets.QWidget):
                 self.repeat_mode_combo,
                 self.repeat_mode_row,
             )
+            card._refresh_view_spec_control_surface(self)
         self._seed_limit_boxes()        # re-seed the pin from config.params (may have changed in Setting)
         self.refresh_limit_hints()
 

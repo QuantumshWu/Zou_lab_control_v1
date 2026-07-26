@@ -45,6 +45,36 @@ from zlc_neutral_atom.devices.camera.contract import (
 )
 
 
+_NON_BLOCKING_FRAME_APPLICABILITY_FIELDS = frozenset(
+    {
+        "exposure_seconds",
+        "opaque_frame_settings_fingerprint",
+    }
+)
+
+
+def _frame_applicability_mismatches(
+    expected: "FrameContract",
+    observed: "FrameContract",
+) -> tuple[str, ...]:
+    """Return only differences that presently invalidate a readout model.
+
+    Raw camera exposure is not the atom illumination/integration window: that
+    window also depends on the pulse probe/readout schedule.  The opaque camera
+    settings digest includes raw exposure on both real and virtual adapters, so
+    it cannot be a hard applicability witness either.  Both facts remain in the
+    immutable contracts and therefore in provenance, but neither may reject a
+    model until a typed effective-window contract exists.
+    """
+
+    return tuple(
+        item.name
+        for item in fields(FrameContract)
+        if item.name not in _NON_BLOCKING_FRAME_APPLICABILITY_FIELDS
+        and getattr(observed, item.name) != getattr(expected, item.name)
+    )
+
+
 def _minimum_coordinate_separation(coordinates_xy: np.ndarray) -> float:
     """Return the nearest 2D coordinate separation with only O(site) scratch."""
 
@@ -205,7 +235,7 @@ class CalibrationCaptureLayout:
 
 @dataclass(frozen=True)
 class FrameContract:
-    """Single-frame facts determining calibration-model applicability."""
+    """Single-frame provenance and explicit calibration-applicability facts."""
 
     binding: ReadoutBindingKey
     camera_identity: str
@@ -315,20 +345,16 @@ class FrameContract:
         physical_facts: CameraPhysicalFacts,
         frame_schema: ValueSchema,
     ) -> None:
-        """Reject a live source unless every calibration-relevant fact agrees."""
+        """Reject a live source when an explicit model-validity fact differs."""
 
         observed = type(self).from_camera_working_point(
             binding,
             physical_facts,
             frame_schema,
         )
-        if observed == self:
+        mismatches = _frame_applicability_mismatches(self, observed)
+        if not mismatches:
             return
-        mismatches = tuple(
-            item.name
-            for item in fields(FrameContract)
-            if getattr(observed, item.name) != getattr(self, item.name)
-        )
         raise ValueError("readout frame contract mismatch: " + ", ".join(mismatches))
 
     @classmethod
@@ -425,13 +451,9 @@ class FrameContract:
             readout_event_index=readout_event_index,
             require_physical_event_witness=True,
         )
-        if observed == self:
+        mismatches = _frame_applicability_mismatches(self, observed)
+        if not mismatches:
             return
-        mismatches = tuple(
-            item.name
-            for item in fields(FrameContract)
-            if getattr(observed, item.name) != getattr(self, item.name)
-        )
         raise ValueError("readout frame contract mismatch: " + ", ".join(mismatches))
 
 

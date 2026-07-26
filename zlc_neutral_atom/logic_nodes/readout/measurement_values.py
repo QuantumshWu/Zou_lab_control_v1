@@ -6,7 +6,7 @@ from decimal import Decimal, localcontext
 from math import isfinite
 from numbers import Integral, Real
 
-from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import ReadoutModelKind
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_pulse import PulseDocument
 from zlc_storage import canonical_text, finite_real
 

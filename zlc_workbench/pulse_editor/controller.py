@@ -23,7 +23,7 @@ from zlc_neutral_atom.devices.sequencer.application import (
     PulseRunRequest,
     PulseTargetDescriptor,
 )
-from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot
+from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot, RunState
 from zlc_neutral_atom.devices.sequencer.port import PulseScanProgress
 from zlc_pulse import (
     FIELD_DAC,
@@ -49,6 +49,7 @@ from zlc_pulse import (
     move_period,
     new_period,
     nominal_scan_reference,
+    parameter_value_in_unit,
     rename_port_label,
     reconcile_scan_schema,
     remove_period,
@@ -196,21 +197,6 @@ def _cancel_and_wait_detached_run(handle: RunHandle) -> RunSnapshot:
     return handle.wait()
 
 
-def _applied_authoring_document(snapshot: AppliedPulseSnapshot) -> PulseDocument:
-    """Show exact applied API values while retaining their authored bindings."""
-
-    document = snapshot.source_document
-    values = dict(snapshot.api_values)
-    for parameter in document.api_parameters:
-        document = replace_pulse_field(
-            document,
-            parameter.field,
-            values[parameter.parameter_id],
-            unit=parameter.unit,
-        )
-    return document
-
-
 def parse_remote_endpoint(value: str) -> tuple[str, int]:
     """Parse ``host[:port]`` and bracketed IPv6 without guessing a blank host."""
 
@@ -264,8 +250,6 @@ class PulseRuntimeUpdate:
     connection_endpoint: str
     target_descriptor: PulseTargetDescriptor | None
     run_snapshot: RunSnapshot | None
-    run_generation: int | None
-    run_revision: int | None
     applied_snapshot: AppliedPulseSnapshot | None
     scan_progress: PulseScanProgress | None
     held_scan_point: tuple[
@@ -278,6 +262,18 @@ class PulseRuntimeUpdate:
     run_busy: bool
     close_requested: bool
     close_complete: bool
+
+    def is_document_applied(self, document: PulseDocument) -> bool:
+        """Derive On-Pulse truth from the Run and applied intent only."""
+
+        if not isinstance(document, PulseDocument):
+            raise TypeError("document must be PulseDocument")
+        return bool(
+            self.run_snapshot is not None
+            and self.run_snapshot.state is RunState.RUNNING
+            and self.applied_snapshot is not None
+            and self.applied_snapshot.matches_authoring_document(document)
+        )
 
 
 @dataclass(frozen=True)
@@ -470,16 +466,10 @@ class PulseEditorController:
             PulseExecutionForm,
             tuple[tuple[str, int | float], ...],
             int,
-            int | None,
-            int | None,
         ] | None = None
         self._handle: RunHandle | None = None
         self._run_snapshot: RunSnapshot | None = None
         self._applied_snapshot: AppliedPulseSnapshot | None = None
-        self._applied_authoring_cache_source: AppliedPulseSnapshot | None = None
-        self._applied_authoring_cache_fingerprint: str | None = None
-        self._run_generation: int | None = None
-        self._run_revision: int | None = None
         self._owner_reaped = True
         self._reap_inflight = False
         self._owned_close_inflight = False
@@ -627,8 +617,6 @@ class PulseEditorController:
             connection_endpoint=self._connection_endpoint,
             target_descriptor=self._descriptor,
             run_snapshot=self._run_snapshot,
-            run_generation=self._run_generation,
-            run_revision=self._run_revision,
             applied_snapshot=self._applied_snapshot,
             scan_progress=self._scan_progress,
             held_scan_point=self._held_scan_snapshot(),
@@ -1565,27 +1553,7 @@ class PulseEditorController:
         self._descriptor = None
         self._run_snapshot = None
         self._applied_snapshot = None
-        self._applied_authoring_cache_source = None
-        self._applied_authoring_cache_fingerprint = None
-        self._run_generation = None
-        self._run_revision = None
         self._scan_progress = None
-
-    def _applied_authoring_fingerprint(
-        self,
-        snapshot: AppliedPulseSnapshot,
-    ) -> str:
-        """Resolve execution-time API values once for one applied identity."""
-
-        if snapshot is not self._applied_authoring_cache_source:
-            self._applied_authoring_cache_source = snapshot
-            self._applied_authoring_cache_fingerprint = (
-                _applied_authoring_document(snapshot).fingerprint
-            )
-        fingerprint = self._applied_authoring_cache_fingerprint
-        if fingerprint is None:
-            raise RuntimeError("applied Pulse authoring fingerprint was not cached")
-        return fingerprint
 
     def start(
         self,
@@ -1624,7 +1592,7 @@ class PulseEditorController:
             document = nominal_scan_reference(document)
         supplied = (
             {
-                parameter.parameter_id: document.field_value(parameter.field)[0]
+                parameter.parameter_id: parameter_value_in_unit(document, parameter)
                 for parameter in document.api_parameters
             }
             if api_values is None
@@ -1647,8 +1615,6 @@ class PulseEditorController:
             form,
             ordered_values,
             scan_sweep_count,
-            self._editor_generation,
-            self._editor.revision,
         )
         self._held_scan_source = None
         self._held_scan_index = None
@@ -1662,8 +1628,6 @@ class PulseEditorController:
             PulseExecutionForm,
             tuple[tuple[str, int | float], ...],
             int,
-            int | None,
-            int | None,
         ],
     ) -> None:
         pulse = self._pulse
@@ -1695,11 +1659,9 @@ class PulseEditorController:
             PulseExecutionForm,
             tuple[tuple[str, int | float], ...],
             int,
-            int | None,
-            int | None,
         ],
     ) -> None:
-        document, form, api_values, sweep_count, editor_generation, revision = pending
+        document, form, api_values, sweep_count = pending
         pulse = self._pulse
         if pulse is None:
             raise RuntimeError("Pulse editor is offline")
@@ -1711,10 +1673,6 @@ class PulseEditorController:
         self._handle = None
         self._run_snapshot = None
         self._applied_snapshot = None
-        self._applied_authoring_cache_source = None
-        self._applied_authoring_cache_fingerprint = None
-        self._run_generation = editor_generation
-        self._run_revision = revision
 
         def start_run() -> RunHandle:
             return pulse.start(
@@ -1726,7 +1684,7 @@ class PulseEditorController:
                 )
             )
 
-        self._submit("start", (generation, revision), start_run)
+        self._submit("start", generation, start_run)
 
     def request_scan_progress(self) -> None:
         """Schedule one read-only observation; never perform transport I/O on Qt."""
@@ -1774,7 +1732,7 @@ class PulseEditorController:
         applied = active.applied
         if applied is None:
             raise RuntimeError("The running scan has not reached hardware prepare.")
-        source = _applied_authoring_document(applied)
+        source = applied.authoring_document
         table = source.scan_table
         if table is None or not table.rows:
             raise RuntimeError("No scan table is applied on the sequencer.")
@@ -1792,7 +1750,7 @@ class PulseEditorController:
         api_values = tuple(
             (
                 parameter.parameter_id,
-                frozen.field_value(parameter.field)[0],
+                parameter_value_in_unit(frozen, parameter),
             )
             for parameter in frozen.api_parameters
         )
@@ -1803,8 +1761,6 @@ class PulseEditorController:
                 PulseExecutionForm.CONTINUOUS_MONITOR,
                 api_values,
                 1,
-                None,
-                None,
             )
         )
 
@@ -1852,11 +1808,9 @@ class PulseEditorController:
             raise RuntimeError(
                 "The sequencer has no applied pulse yet (nothing was prepared)."
             )
-        document = _applied_authoring_document(applied)
+        document = applied.authoring_document
         revision = self.replace_document(document)
         self._applied_snapshot = applied
-        self._run_generation = self._editor_generation
-        self._run_revision = revision
         self._diagnostic = "Synced from device."
         return revision
 
@@ -1997,10 +1951,6 @@ class PulseEditorController:
         if self._handle is None:
             self._run_snapshot = None
             self._applied_snapshot = None
-            self._applied_authoring_cache_source = None
-            self._applied_authoring_cache_fingerprint = None
-            self._run_generation = None
-        self._run_revision = None
         self._connection_state = "closing"
         return _OwnerChanges(editor=True, runtime=True, scan_progress=True)
 
@@ -2390,7 +2340,7 @@ class PulseEditorController:
                 continue
             if kind == "start":
                 changes.runtime = True
-                generation, revision = token
+                generation = token
                 self._run_starting = False
                 try:
                     handle = future.result()
@@ -2399,8 +2349,6 @@ class PulseEditorController:
                         self._owner_reaped = True
                         self._handle = None
                         self._pending_hold = None
-                        self._run_generation = None
-                        self._run_revision = None
                         self._diagnostic = (
                             f"Pulse start failed: {type(error).__name__}: {error}"
                         )
@@ -2659,8 +2607,6 @@ class PulseEditorController:
         runtime_before = (
             self._run_snapshot,
             self._applied_snapshot,
-            self._run_generation,
-            self._run_revision,
             self._run_starting,
             self._pending_start is not None,
             id(self._handle),
@@ -2693,21 +2639,7 @@ class PulseEditorController:
                 self._scan_progress = None
             self._run_snapshot = observation.run
             self._applied_snapshot = observation.applied
-            if observation.applied is None:
-                self._applied_authoring_cache_source = None
-                self._applied_authoring_cache_fingerprint = None
-                self._run_generation = None
-                self._run_revision = None
-            else:
-                if (
-                    self._applied_authoring_fingerprint(observation.applied)
-                    == self._editor.document.fingerprint
-                ):
-                    self._run_generation = self._editor_generation
-                    self._run_revision = self._editor.revision
-                else:
-                    self._run_generation = None
-                    self._run_revision = None
+            if observation.applied is not None:
                 pending_hold = self._pending_hold
                 if (
                     pending_hold is not None
@@ -2755,8 +2687,6 @@ class PulseEditorController:
                 != (
                     self._run_snapshot,
                     self._applied_snapshot,
-                    self._run_generation,
-                    self._run_revision,
                     self._run_starting,
                     self._pending_start is not None,
                     id(self._handle),

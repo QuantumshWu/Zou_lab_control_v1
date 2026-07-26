@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 import time
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 
 from zlc_neutral_atom.logic_nodes.camera_measurement import (
     CameraMonitorViewSpec,
@@ -47,11 +47,11 @@ class _LiveView:
 
 
 def _start_one_live_frame(exp, *, exposure):
-    request = exp.readout.camera_measurement_request(
+    request = exp.nodes.camera_measurement.camera_measurement_request(
         camera_role="mot_camera",
         exposure=exposure,
     )
-    prepared = exp.readout.prepare_camera_measurement(request)
+    prepared = exp.nodes.camera_measurement.prepare_camera_measurement(request)
     assert isinstance(prepared, PreparedLiveCameraMeasurement)
     views: list[_LiveView] = []
 
@@ -65,7 +65,13 @@ def _start_one_live_frame(exp, *, exposure):
     assert view.updated_event.wait(5.0), handle.snapshot()
     assert view.failure is None
     assert view.dataset is not None
-    assert view.dataset.freeze_current().coverage.written_cells >= 1
+    frozen = view.dataset.freeze_current()
+    assert frozen.coverage.written_cells >= 1
+    outputs = prepared.live_dataset_outputs(frozen)
+    frame = outputs["frame_0"].snapshot
+    assert frame.block.schema.physical_shape[:2] == (1, 1)
+    assert frame.block.schema.cell_schema == frozen.snapshot.block.schema.cell_schema
+    assert frame.block.values.dtype == frozen.snapshot.block.values.dtype
     handle.cancel("exposure test complete")
     terminal = handle.wait(5.0)
     assert terminal.state.terminal, terminal
@@ -81,13 +87,13 @@ def test_live_camera_applies_and_restores_requested_exposure(tmp_path) -> None:
 
 
 def _run_finite_camera(exp, *, exposure, pulse_request):
-    request = exp.readout.camera_measurement_request(
+    request = exp.nodes.camera_measurement.camera_measurement_request(
         camera_role="camera",
         repeat=1,
         frames_per_cycle=3,
         exposure=exposure,
     )
-    prepared = exp.readout.prepare_camera_measurement(request)
+    prepared = exp.nodes.camera_measurement.prepare_camera_measurement(request)
     assert isinstance(prepared, PreparedFiniteCameraMeasurement)
     handle = prepared.start()
     deadline = time.monotonic() + 2.0

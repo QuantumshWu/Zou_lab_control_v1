@@ -1,0 +1,81 @@
+"""Pulse Scan's complete built-in capability package."""
+
+from __future__ import annotations
+
+from zlc_neutral_atom.artifact_dispatch import ArtifactCapability
+from zlc_neutral_atom.logic_node_package import LogicNodePackage
+
+from .api import PulseScanApi
+from .application import prepare_exact_scan
+from .declaration import PULSE_SCAN_LOGIC_NODE
+from .reference import (
+    SCAN_ARTIFACT_REF_SCHEMA,
+    ScanArtifactRef,
+    scan_artifact_ref_from_tree,
+    scan_artifact_ref_to_tree,
+)
+from .repository import ScanRepository
+
+
+def _bind_api(host: object, _dependencies: tuple[object, ...]) -> PulseScanApi:
+    operations = host._logic_node_operations()
+    repository = ScanRepository(operations.repository_root / "scans")
+    pulse_port = operations.pulse_port
+    start_run = operations.start_run
+    resolve_sequencer_ref = host.resolve_readout_sequencer_ref
+
+    def prepare(request, source, sequencer_role):
+        sequencer_ref = resolve_sequencer_ref(sequencer_role)
+        return prepare_exact_scan(
+            request,
+            source,
+            pulse_port=pulse_port(sequencer_ref),
+            repository=repository,
+            start_run=start_run,
+        )
+
+    return PulseScanApi(repository, prepare=prepare)
+
+
+def _close_api(api: PulseScanApi) -> tuple[Exception, ...]:
+    return api.close()
+
+
+def _bind_task_console(api: PulseScanApi, _catalog: object, _projection):
+    from zlc_pulse import describe_pulse_template
+
+    from .ui.task_console import pulse_scan_task_console_adapter
+
+    return pulse_scan_task_console_adapter(
+        prepare=api.prepare_scan_source,
+        read_pulse_template=describe_pulse_template,
+    )
+
+
+def _bind_artifact_capabilities(
+    api: PulseScanApi,
+) -> tuple[ArtifactCapability, ...]:
+    return (
+        ArtifactCapability(
+            format_id=SCAN_ARTIFACT_REF_SCHEMA,
+            source_label="scan",
+            reference_type=ScanArtifactRef,
+            project_dataset=api._project_dataset_source,
+            reference_to_tree=scan_artifact_ref_to_tree,
+            reference_from_tree=scan_artifact_ref_from_tree,
+            admit_dataset_content=True,
+        ),
+    )
+
+
+LOGIC_NODE_PACKAGE = LogicNodePackage(
+    api_name="pulse_scan",
+    declaration=PULSE_SCAN_LOGIC_NODE,
+    bind_api=_bind_api,
+    bind_task_console=_bind_task_console,
+    task_console_order=80,
+    close_api=_close_api,
+    bind_artifact_capabilities=_bind_artifact_capabilities,
+)
+
+__all__ = ["LOGIC_NODE_PACKAGE"]

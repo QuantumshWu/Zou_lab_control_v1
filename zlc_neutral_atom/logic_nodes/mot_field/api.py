@@ -1,11 +1,10 @@
-"""Notebook surface owned by MOT-field optimization."""
+"""Public Experiment API owned by MOT-field optimization."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
 
-from zlc_neutral_atom.installation import DeviceRef
 from zlc_pulse import PulseDocument
 
 from .application import PreparedMotFieldAcquisition
@@ -20,40 +19,43 @@ from .mot_field import (
 )
 from .mot_field_task import (
     DEFAULT_MOT_FIELD_PULSE_PATH,
-    MotFieldTaskDependencies,
     MotFieldTaskIntent,
     PreparedMotFieldTask,
 )
 
 
-class MotFieldNotebookHost(Protocol):
-    def load_mot_field_pulse(
+class MotFieldApi:
+    __slots__ = (
+        "_load_pulse",
+        "_prepare_acquisition",
+        "_prepare_task",
+        "_resolve_camera_ref",
+        "_resolve_sequencer_ref",
+    )
+
+    def __init__(
         self,
-        value: PulseDocument | str | Path,
-    ) -> PulseDocument: ...
-
-    def resolve_mot_camera_ref(self, requested: str | None) -> DeviceRef: ...
-
-    def resolve_mot_sequencer_ref(self, requested: str | None) -> DeviceRef: ...
-
-    def bind_mot_field_acquisition(
-        self,
-        request: MotFieldRequest,
-    ) -> PreparedMotFieldAcquisition: ...
-
-    def bind_mot_field_task(
-        self,
-        intent: MotFieldTaskIntent,
-        dependencies: MotFieldTaskDependencies,
-    ) -> PreparedMotFieldTask: ...
-
-
-class MotFieldNotebookAdapter:
-    __slots__ = ()
-
-    @property
-    def _mot_field_notebook_host(self) -> MotFieldNotebookHost:
-        raise NotImplementedError
+        *,
+        load_pulse: Callable[[PulseDocument | str | Path], PulseDocument],
+        resolve_camera_ref: Callable[[str | None], object],
+        resolve_sequencer_ref: Callable[[str | None], object],
+        prepare_acquisition: Callable[[MotFieldRequest], PreparedMotFieldAcquisition],
+        prepare_task: Callable[[MotFieldTaskIntent, object], PreparedMotFieldTask],
+    ) -> None:
+        operations = (
+            load_pulse,
+            resolve_camera_ref,
+            resolve_sequencer_ref,
+            prepare_acquisition,
+            prepare_task,
+        )
+        if any(not callable(operation) for operation in operations):
+            raise TypeError("MOT-field API operations must be callable")
+        self._load_pulse = load_pulse
+        self._resolve_camera_ref = resolve_camera_ref
+        self._resolve_sequencer_ref = resolve_sequencer_ref
+        self._prepare_acquisition = prepare_acquisition
+        self._prepare_task = prepare_task
 
     def mot_field_request(
         self,
@@ -71,21 +73,20 @@ class MotFieldNotebookAdapter:
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
     ) -> MotFieldRequest:
-        host = self._mot_field_notebook_host
         selected_camera = (
             DEFAULT_MOT_FIELD_CAMERA_ROLE if camera_role is None else camera_role
         )
         return MotFieldRequest(
             program=build_mot_scan_program(
-                host.load_mot_field_pulse(pulse),
+                self._load_pulse(pulse),
                 center_x=center_x,
                 center_y=center_y,
                 center_z=center_z,
                 span=span,
                 points=points,
             ),
-            camera_ref=host.resolve_mot_camera_ref(selected_camera),
-            sequencer_ref=host.resolve_mot_sequencer_ref(sequencer_role),
+            camera_ref=self._resolve_camera_ref(selected_camera),
+            sequencer_ref=self._resolve_sequencer_ref(sequencer_role),
             roi_cx=roi_cx,
             roi_cy=roi_cy,
             roi_radius=roi_radius,
@@ -98,13 +99,13 @@ class MotFieldNotebookAdapter:
     ) -> PreparedMotFieldAcquisition:
         if not isinstance(request, MotFieldRequest):
             raise TypeError("request must be MotFieldRequest")
-        return self._mot_field_notebook_host.bind_mot_field_acquisition(request)
+        return self._prepare_acquisition(request)
 
     def prepare_mot_field_task(
         self,
         intent: MotFieldTaskIntent,
     ) -> PreparedMotFieldTask:
-        return self._mot_field_notebook_host.bind_mot_field_task(intent, self)
+        return self._prepare_task(intent, self)
 
 
-__all__ = ["MotFieldNotebookAdapter", "MotFieldNotebookHost"]
+__all__ = ["MotFieldApi"]

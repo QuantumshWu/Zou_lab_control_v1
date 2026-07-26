@@ -2,29 +2,18 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 import threading
 import time
 
-from zlc_workbench.task_console.run_bridge import ConsoleRunNode
+from zlc_neutral_atom.catalog import DefinitionKey
+from zlc_neutral_atom.runtime.hosted_run import HostedRun
 
 
 def test_stop_during_prepare_never_calls_the_hardware_starter() -> None:
     entered = threading.Event()
     release = threading.Event()
     starter_calls: list[object] = []
-    build_calls: list[dict[str, object]] = []
     frozen = object()
-
-    spec = SimpleNamespace(
-        key=SimpleNamespace(stable_definition_id="prepare-stop"),
-        name="Pulse scan",
-        title="Pulse scan",
-        kind="measurement",
-        artifact_outputs=(),
-        build_request=lambda values: build_calls.append(dict(values)),
-        outputs_for=lambda request: (),
-    )
 
     def prepare(request):
         assert request is frozen
@@ -32,14 +21,14 @@ def test_stop_during_prepare_never_calls_the_hardware_starter() -> None:
         assert release.wait(2.0)
         return object()
 
-    node = ConsoleRunNode(
-        spec,
-        {},
+    node = HostedRun(
+        definition_key=DefinitionKey("test", "prepare-stop"),
+        request=frozen,
         instance_id="prepare-stop-instance",
-        instance_label="Pulse scan",
+        dataset_output_declarations=(),
         prepare=prepare,
+        qualify_output=lambda name: f"@logic/prepare-stop-instance/{name}",
         request_owner_wake=lambda: None,
-        frozen_request=frozen,
     )
     node.bind_starter(lambda command: starter_calls.append(command))
     try:
@@ -57,7 +46,6 @@ def test_stop_during_prepare_never_calls_the_hardware_starter() -> None:
         assert node.last_error is None
         assert not node.running
         assert not starter_calls
-        assert not build_calls
         assert node.worker_idle
     finally:
         release.set()

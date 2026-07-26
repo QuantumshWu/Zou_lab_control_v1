@@ -9,7 +9,12 @@ import threading
 
 import numpy as np
 
-from zlc_frontend import render_plot_report
+from zlc_frontend import (
+    PlotPanelComposeRequest,
+    PlotPanelSession,
+    render_plot_report,
+)
+from zlc_frontend.encoded_raster import encode_raster_buffer_png
 from zlc_data import (
     SITE,
     SPATIAL_X,
@@ -212,6 +217,27 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         capture_repository_root=tmp_path / "workspace" / "captures",
         render_report=_render_current_report,
     )
+
+    # Calibration supplies only the typed SiteMap page.  Its saved overview
+    # must be the exact raster produced when an ordinary Plot Panel consumes
+    # the same frontend contract, source, display state, and provenance.
+    document = project_calibration_plot_report(view)
+    overview = next(page for page in document.pages if page.key == "overview")
+    session = PlotPanelSession(overview.contract)
+    try:
+        direct = session.compose(
+            PlotPanelComposeRequest(
+                overview.source,
+                overview.display,
+                overview.provenance,
+            )
+        )
+        assert direct.frame is not None
+        assert len(direct.frame.panels) == 1
+        direct_png = encode_raster_buffer_png(direct.frame.panels[0].raster)
+    finally:
+        session.close()
+    assert (destination / "overview.png").read_bytes() == direct_png
 
     assert {path.name for path in destination.iterdir()} == {
         "README.txt",

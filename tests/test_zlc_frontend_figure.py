@@ -27,7 +27,6 @@ from zlc_data import (
     AxisSpec,
     BlockId,
     CellValidity,
-    ComponentValidity,
     CoordinateFrameId,
     DataBlock,
     DatasetComponentValidity,
@@ -70,12 +69,12 @@ from zlc_frontend.figure import (
     ViewPreferences,
     ViewSpec,
     decode_figure_document,
-    decode_view_spec,
     encode_figure_document,
-    encode_view_spec,
     figure_document_to_tree,
+    resolve_grid_view,
     suggest_view,
     validate_view_spec,
+    view_spec_from_tree,
     view_spec_to_tree,
 )
 from zlc_storage.canonical import encode
@@ -179,7 +178,7 @@ def test_pulse_is_document_fed_and_cannot_enter_the_dataset_figure_path():
     illegal_tree = view_spec_to_tree(ordinary)
     illegal_tree["intent"] = ViewIntent.PULSE.value
     with pytest.raises(ValueError, match="document-fed"):
-        decode_view_spec(encode(illegal_tree))
+        view_spec_from_tree(illegal_tree)
 
     # Even a corrupted/in-memory object that bypasses the dataclass constructor
     # cannot fall through FigureEvaluator's closed dispatch and become METER.
@@ -257,7 +256,7 @@ def test_monitor_history_is_display_only_curve_x_or_newest_image_slider():
         )
 
 
-def test_ambiguous_axis_and_stale_selection_fail_without_tuple_order_guessing():
+def test_same_role_axes_use_explicit_schema_order_default_and_stale_selection_fails():
     repeat = axis("repeat", REPEAT, 1)
     first = axis("a", SCAN_POINT, 2)
     second = axis("b", SCAN_POINT, 3)
@@ -268,7 +267,12 @@ def test_ambiguous_axis_and_stale_selection_fail_without_tuple_order_guessing():
         point_layout=PointLayout.rect_c((2, 3)),
     ).schema
     suggestion = suggest_view(schema, ViewIntent.CURVE)
-    assert suggestion.status is SuggestionStatus.NEEDS_INPUT
+    assert suggestion.status is SuggestionStatus.RESOLVED
+    assert suggestion.spec.binding(first.axis_id).role is AxisViewRole.X
+    second_binding = suggestion.spec.binding(second.axis_id)
+    assert second_binding.role is AxisViewRole.SLIDER
+    assert second_binding.selector == FixedIndex(0)
+    assert any(reason.code == "DISPLAY_AXIS_DEFAULT" for reason in suggestion.reasons)
     assert {item.axis_id for item in suggestion.alternatives} == {
         first.axis_id,
         second.axis_id,
@@ -280,6 +284,104 @@ def test_ambiguous_axis_and_stale_selection_fail_without_tuple_order_guessing():
     )
     assert stale.status is SuggestionStatus.NEEDS_INPUT
     assert stale.reasons[0].code == "STALE_SELECTION_AXIS"
+
+
+def test_declared_multidimensional_signal_auto_projects_explicitly_for_every_plot_kind():
+    frame = CoordinateFrameId("camera")
+    repeat = axis("auto-repeat", REPEAT, 1)
+    y = axis("auto-y", SPATIAL_Y, 3, frame=frame)
+    x = axis("auto-x", SPATIAL_X, 4, frame=frame)
+    values = np.arange(12, dtype=np.uint16).reshape(1, 1, 3, 4)
+    block = make_block(
+        values,
+        repeat_axis=repeat,
+        point_axes=(),
+        point_layout=PointLayout.rect_c(()),
+        data_axes=(y, x),
+    )
+    roi = Selection.rectangle(
+        x.axis_id,
+        y.axis_id,
+        1,
+        3,
+        1,
+        2,
+        coordinate_frame=frame,
+    )
+
+    curve = suggest_view(block.schema, ViewIntent.CURVE, roi)
+    assert curve.status is SuggestionStatus.RESOLVED
+    assert curve.spec.binding(x.axis_id).role is AxisViewRole.X
+    y_binding = curve.spec.binding(y.axis_id)
+    assert y_binding.role is AxisViewRole.SLIDER
+    assert y_binding.selector == FixedIndex(1)
+    assert not any(
+        binding.role in (AxisViewRole.FACET, AxisViewRole.REDUCED)
+        and binding.axis_id in (x.axis_id, y.axis_id)
+        for binding in curve.spec.axis_bindings
+    )
+    curve_data = only_series(evaluated_data(block, curve.spec)).data
+    assert isinstance(curve_data, EvaluatedCurve)
+    np.testing.assert_array_equal(curve_data.values, values[0, 0, 1, 1:4])
+
+    histogram = suggest_view(block.schema, ViewIntent.HISTOGRAM, roi)
+    assert histogram.status is SuggestionStatus.RESOLVED
+    assert {
+        histogram.spec.binding(axis_id).role for axis_id in (x.axis_id, y.axis_id)
+    } == {AxisViewRole.SAMPLE}
+    histogram_data = only_series(evaluated_data(block, histogram.spec)).data
+    assert isinstance(histogram_data, EvaluatedHistogram)
+    np.testing.assert_array_equal(
+        histogram_data.samples,
+        values[0, 0, 1:3, 1:4].reshape(-1),
+    )
+    assert {item.axis_id for item in histogram_data.sample_coordinates} >= {
+        x.axis_id,
+        y.axis_id,
+    }
+
+    meter = suggest_view(block.schema, ViewIntent.METER, roi)
+    assert meter.status is SuggestionStatus.RESOLVED
+    assert all(
+        meter.spec.binding(axis_id).role is AxisViewRole.SLIDER
+        for axis_id in (x.axis_id, y.axis_id)
+    )
+    meter_data = only_series(evaluated_data(block, meter.spec)).data
+    assert isinstance(meter_data, EvaluatedMeter)
+    assert meter_data.value == values[0, 0, 1, 1]
+
+    spatial_grid = resolve_grid_view(
+        block.schema,
+        ViewIntent.CURVE,
+        y.axis_id,
+    )
+    assert spatial_grid.status is SuggestionStatus.RESOLVED
+    assert spatial_grid.spec.binding(y.axis_id).role is AxisViewRole.FACET
+    assert spatial_grid.spec.binding(x.axis_id).role is AxisViewRole.X
+    spatial_cells = evaluated_data(block, spatial_grid.spec).layers[0].cells
+    assert len(spatial_cells) == y.size
+    for index, cell in enumerate(spatial_cells):
+        np.testing.assert_array_equal(
+            cell.series[0].data.values,
+            values[0, 0, index],
+        )
+
+    scan_a = axis("auto-scan-a", SCAN_POINT, 2)
+    scan_b = axis("auto-scan-b", SCAN_POINT, 3)
+    scan_schema = make_block(
+        np.arange(6, dtype=float).reshape(1, 6),
+        repeat_axis=repeat,
+        point_axes=(scan_a, scan_b),
+        point_layout=PointLayout.rect_c((2, 3)),
+    ).schema
+    scan_grid = resolve_grid_view(
+        scan_schema,
+        ViewIntent.CURVE,
+        scan_a.axis_id,
+    )
+    assert scan_grid.status is SuggestionStatus.RESOLVED
+    assert scan_grid.spec.binding(scan_a.axis_id).role is AxisViewRole.FACET
+    assert scan_grid.spec.binding(scan_b.axis_id).role is AxisViewRole.X
 
 
 def test_scalar_selection_resolves_display_axis_ambiguity():
@@ -421,8 +523,12 @@ def test_slider_bindings_preserve_contract_order_and_repeat_latest():
         binding = image_suggestion.spec.binding(axis_id)
         assert binding.role is AxisViewRole.SLIDER
         assert binding.selector == FixedIndex(expected_index)
-    assert image_suggestion.spec.binding(site.axis_id).role is AxisViewRole.FACET
-    assert image_suggestion.spec.binding(component.axis_id).role is AxisViewRole.FACET
+    site_binding = image_suggestion.spec.binding(site.axis_id)
+    assert site_binding.role is AxisViewRole.SLIDER
+    assert site_binding.selector == FixedIndex(5)
+    component_binding = image_suggestion.spec.binding(component.axis_id)
+    assert component_binding.role is AxisViewRole.SLIDER
+    assert component_binding.selector == FixedIndex(0)
 
     rolling_point = axis("rolling-meter-point", SCAN_POINT, 40)
     meter_schema = DatasetSchema(
@@ -587,7 +693,7 @@ def test_view_and_document_codec_are_strict_canonical_and_owner_delegating(
         "display_selections": [owner_selection_tree],
     }
     assert view_spec_to_tree(view) == expected_view_tree
-    assert decode_view_spec(encode_view_spec(view)) == view
+    assert view_spec_from_tree(view_spec_to_tree(view)) == view
 
     dataset_a = DatasetId("dataset-a")
     dataset_z = DatasetId("dataset-z")
@@ -657,19 +763,15 @@ def test_view_and_document_codec_are_strict_canonical_and_owner_delegating(
     extra = deepcopy(expected_view_tree)
     extra["authority_seed"] = "forbidden"
     with pytest.raises(ValueError, match="exactly"):
-        decode_view_spec(encode(extra))
+        view_spec_from_tree(extra)
     unknown_view_schema = deepcopy(expected_view_tree)
     unknown_view_schema["schema"] = "zlc_frontend.UnknownView"
     with pytest.raises(ValueError, match="expected schema"):
-        decode_view_spec(encode(unknown_view_schema))
+        view_spec_from_tree(unknown_view_schema)
     malformed_selector = deepcopy(expected_view_tree)
     malformed_selector["axis_bindings"][3]["selector"]["extra"] = True
     with pytest.raises(ValueError, match="display selector"):
-        decode_view_spec(encode(malformed_selector))
-    noncanonical_view = deepcopy(expected_view_tree)
-    noncanonical_view["axis_bindings"].reverse()
-    with pytest.raises(ValueError, match="non-canonical typed representation"):
-        decode_view_spec(encode(noncanonical_view))
+        view_spec_from_tree(malformed_selector)
     noncanonical_document = deepcopy(expected_document_tree)
     noncanonical_document["datasets"].reverse()
     with pytest.raises(ValueError, match="non-canonical typed representation"):
@@ -880,8 +982,10 @@ def test_roi_selection_does_not_invent_a_reducer_but_explicit_reduction_evaluate
         coordinate_frame=frame,
     )
     suggestion = suggest_view(block.schema, ViewIntent.CURVE, roi)
-    assert suggestion.status is SuggestionStatus.NEEDS_INPUT
-    assert suggestion.reasons[0].code == "UNRESOLVED_INFORMATION_AXIS"
+    assert suggestion.status is SuggestionStatus.RESOLVED
+    assert suggestion.spec.binding(point.axis_id).role is AxisViewRole.X
+    assert suggestion.spec.binding(x.axis_id).role is AxisViewRole.SLIDER
+    assert suggestion.spec.binding(y.axis_id).role is AxisViewRole.SLIDER
     explicit_view = ViewSpec(
         block.schema.fingerprint,
         ViewIntent.CURVE,
@@ -1055,8 +1159,12 @@ def test_validate_rejects_mixed_joint_reducers_and_outside_fixed_selection():
         roi,
         ViewPreferences(repeat_mode=RepeatViewMode.SUM),
     )
-    assert mixed_suggestion.status is SuggestionStatus.NEEDS_INPUT
-    assert mixed_suggestion.reasons[0].code == "UNRESOLVED_INFORMATION_AXIS"
+    assert mixed_suggestion.status is SuggestionStatus.RESOLVED
+    assert mixed_suggestion.spec.binding(repeat.axis_id).reduction == DisplayReduction(
+        DisplayReductionMethod.SUM
+    )
+    assert mixed_suggestion.spec.binding(x.axis_id).role is AxisViewRole.SLIDER
+    assert mixed_suggestion.spec.binding(y.axis_id).role is AxisViewRole.SLIDER
 
     mean_spec = ViewSpec(
         block.schema.fingerprint,
@@ -1316,7 +1424,7 @@ def test_sparse_coordinate_image_selects_narrowest_axis_before_large_gather():
     assert image.values.shape == (512, 2)
 
 
-def test_single_repeat_image_keeps_component_axes_and_invalid_components():
+def test_single_repeat_image_selects_component_and_grid_facets_all_components():
     repeat = axis("component-repeat", REPEAT, 1)
     point = axis("component-point", SCAN_POINT, 1)
     component = axis("component", COMPONENT, 2)
@@ -1339,7 +1447,23 @@ def test_single_repeat_image_keeps_component_axes_and_invalid_components():
     )
     suggestion = suggest_view(block.schema, ViewIntent.IMAGE)
     assert suggestion.status is SuggestionStatus.RESOLVED
-    evaluated = evaluated_data(block, suggestion.spec)
+    component_binding = suggestion.spec.binding(component.axis_id)
+    assert component_binding.role is AxisViewRole.SLIDER
+    assert component_binding.selector == FixedIndex(0)
+    ordinary = evaluated_data(block, suggestion.spec)
+    assert len(ordinary.layers[0].cells) == 1
+    ordinary_image = ordinary.layers[0].cells[0].series[0].data
+    np.testing.assert_array_equal(ordinary_image.values, values[0, 0, 0])
+    np.testing.assert_array_equal(ordinary_image.validity, valid[0, 0, 0])
+    assert np.shares_memory(ordinary_image.values, block.values)
+
+    grid = resolve_grid_view(
+        block.schema,
+        ViewIntent.IMAGE,
+        component.axis_id,
+    )
+    assert grid.status is SuggestionStatus.RESOLVED
+    evaluated = evaluated_data(block, grid.spec)
     assert len(evaluated.layers[0].cells) == 2
     for component_index, cell in enumerate(evaluated.layers[0].cells):
         assert cell.facet_address[0].axis_id == component.axis_id
@@ -1478,8 +1602,10 @@ def test_ragged_explicit_reduction_never_pads_to_groups_times_max(monkeypatch):
     )
     selection = Selection.index_range(reduced.axis_id, 0, reduced.size)
     suggestion = suggest_view(block.schema, ViewIntent.CURVE, selection)
-    assert suggestion.status is SuggestionStatus.NEEDS_INPUT
-    assert suggestion.reasons[0].code == "UNRESOLVED_INFORMATION_AXIS"
+    assert suggestion.status is SuggestionStatus.RESOLVED
+    reduced_binding = suggestion.spec.binding(reduced.axis_id)
+    assert reduced_binding.role is AxisViewRole.SLIDER
+    assert reduced_binding.selector == FixedIndex(0)
     explicit_view = ViewSpec(
         block.schema.fingerprint,
         ViewIntent.CURVE,

@@ -21,7 +21,8 @@ def open_task_console(
 
     from .capability import ConsoleNodeHost
     from .catalog_bridge import ConsoleCatalogView
-    from .data_plane import ConsoleDataPlane
+    from .presentation_index import ConsolePresentationIndex
+    from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
     from .window import show_task_console
 
     catalog_view = ConsoleCatalogView(
@@ -37,7 +38,8 @@ def open_task_console(
             raise RuntimeError("TaskConsole owner is not composed")
         console[0].request_owner_wake()
 
-    data_plane = ConsoleDataPlane()
+    data_plane = SignalDataPlane()
+    presentation_index = ConsolePresentationIndex()
 
     def resolve_inputs(spec, values):
         if not console:
@@ -48,6 +50,7 @@ def open_task_console(
 
     host = ConsoleNodeHost(
         data_plane=data_plane,
+        presentation_index=presentation_index,
         resolve_inputs=resolve_inputs,
         request_owner_wake=request_owner_wake,
     )
@@ -57,7 +60,6 @@ def open_task_console(
         values,
         *,
         instance_id: str,
-        instance_label: str,
     ):
         attachment = ports.attachment_for(spec.key)
         if attachment is None or attachment.spec is not spec:
@@ -69,7 +71,6 @@ def open_task_console(
             spec,
             values,
             instance_id,
-            instance_label,
         )
 
     body = show_task_console(
@@ -78,6 +79,7 @@ def open_task_console(
         catalog_view=catalog_view,
         run_factory=run_factory,
         data_plane=data_plane,
+        presentation_index=presentation_index,
         **kwargs,
     )
     console.append(body)

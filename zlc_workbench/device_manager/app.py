@@ -43,7 +43,14 @@ def _initial_document(
             )
         document = loaded
     elif document is None:
-        document = InstallationConfigDocument.virtual()
+        from zlc_neutral_atom.installation_package import (
+            default_installation_package,
+        )
+
+        document = InstallationConfigDocument.from_parameters(
+            default_installation_package().backend,
+            {},
+        )
     if not isinstance(document, InstallationConfigDocument):
         raise TypeError("document must be InstallationConfigDocument")
     return document, state

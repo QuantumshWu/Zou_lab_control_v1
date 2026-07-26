@@ -14,6 +14,8 @@ import threading
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+import numpy as np
+
 from zlc_neutral_atom.devices.camera.contract import (
     CameraSample,
     CameraSampleContract,
@@ -41,8 +43,8 @@ from zlc_neutral_atom.runtime.streams import AcquisitionStream
 from zlc_storage import canonical_digest, canonical_text, encode, sha256_text
 
 
-_VIRTUAL_CAMERA_ASSOCIATION_SCHEMA = (
-    "zlc_neutral_atom.camera-measurement.virtual-pulse-association"
+_CAMERA_PULSE_ASSOCIATION_SCHEMA = (
+    "zlc_neutral_atom.camera-measurement.pulse-association"
 )
 
 
@@ -51,8 +53,11 @@ class CameraSignalAssociationAuthority(Protocol):
     """Optional target-owned physical association seam.
 
     This is intentionally separate from ``CameraAdapter``.  A composition may
-    provide it only when its concrete producer can observe FIRE and camera
-    ordinals at their shared physical boundary.
+    provide it only when its concrete producer can reconcile the admitted pulse
+    terminal with one exact, contiguous camera-ordinal interval.  A simulator
+    may observe both sides in-process; a real installation instead combines its
+    active E0 qualification, camera-produced ordinals, and hardware terminal
+    readback.  The cursor is shared by both paths.
     """
 
     def arm_signal_event_association(
@@ -71,6 +76,7 @@ class CameraSignalAssociationAuthority(Protocol):
         artifact_digest: str,
         trigger_counts: tuple[tuple[str, int], ...],
         terminal_evidence_digest: str,
+        terminal_evidence_kind: str,
     ) -> tuple[str, int, int]: ...
 
     def finish_signal_event_association(
@@ -89,6 +95,7 @@ class _CameraAssociationToken:
     physical_end_ordinal: int | None = None
     trigger_channel: str | None = None
     terminal_evidence_digest: str | None = None
+    terminal_evidence_kind: PulseTerminalEvidenceKind | None = None
     delivered_count: int = 0
     bound: bool = False
 
@@ -203,10 +210,6 @@ class _CameraAssociatedSignalEventCursor:
         current = self._require_token(token)
         if not isinstance(terminal_evidence, PulseTerminalAck):
             raise TypeError("camera association requires PulseTerminalAck")
-        if terminal_evidence.evidence_kind is not PulseTerminalEvidenceKind.SIMULATED:
-            raise ValueError(
-                "this association owner proves only the virtual in-process trigger wire"
-            )
         if terminal_evidence.session_id != current.request.cause_id:
             raise ValueError("pulse terminal belongs to another association cause")
         if terminal_evidence.artifact_digest != current.request.cause_digest:
@@ -221,6 +224,7 @@ class _CameraAssociatedSignalEventCursor:
                 terminal_evidence.expected_trigger_counts_from_completed_schedule
             ),
             terminal_evidence_digest=terminal_digest,
+            terminal_evidence_kind=terminal_evidence.evidence_kind.value,
         )
         if canonical_text(channel, "associated trigger channel") != self._trigger_channel:
             raise RuntimeError("association authority returned another trigger channel")
@@ -235,6 +239,7 @@ class _CameraAssociatedSignalEventCursor:
         current.physical_end_ordinal = end
         current.trigger_channel = channel
         current.terminal_evidence_digest = terminal_digest
+        current.terminal_evidence_kind = terminal_evidence.evidence_kind
         current.bound = True
 
     def next_associated_signal(
@@ -296,9 +301,12 @@ class _CameraAssociatedSignalEventCursor:
                 "camera association finish differs from its bound physical interval"
             )
         request = current.request
+        evidence_kind = current.terminal_evidence_kind
+        if evidence_kind is None:
+            raise RuntimeError("camera association lost its terminal evidence kind")
         canonical_evidence = encode(
             {
-                "schema": _VIRTUAL_CAMERA_ASSOCIATION_SCHEMA,
+                "schema": _CAMERA_PULSE_ASSOCIATION_SCHEMA,
                 "association_id": request.association_id,
                 "cause_id": request.cause_id,
                 "cause_digest": request.cause_digest,
@@ -315,13 +323,13 @@ class _CameraAssociatedSignalEventCursor:
                 "physical_trigger_count": end - start,
                 "frames_per_cycle": self._frames_per_cycle,
                 "selected_phase": self._phase,
-                "evidence_kind": "SIMULATED_IN_PROCESS_TRIGGER_WIRE",
+                "terminal_evidence_kind": evidence_kind.value,
             }
         )
         evidence = SignalAssociationEvidence(
             request,
             terminal_digest,
-            _VIRTUAL_CAMERA_ASSOCIATION_SCHEMA,
+            _CAMERA_PULSE_ASSOCIATION_SCHEMA,
             canonical_evidence,
         )
         self._token = None

@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from zlc_neutral_atom.node_input import BoundNodeInputs
+from zlc_neutral_atom.processing.signal_plane import SignalDataPlane, SignalValue
 from zlc_neutral_atom.runtime.signal_source import SignalEventSource
 from .input_binding import (
     ResolvedArtifactInput,
@@ -27,7 +28,7 @@ from .input_binding import (
 )
 
 from .catalog_bridge import ConsoleNodeSpec
-from .data_plane import ConsoleDataPlane, ConsoleSignalValue
+from .presentation_index import ConsolePresentationIndex
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,13 +78,16 @@ class ConsoleNodeInputs:
 class ConsoleNodeHost:
     """Generic services available while a concrete attachment creates a node."""
 
-    data_plane: ConsoleDataPlane
+    data_plane: SignalDataPlane
+    presentation_index: ConsolePresentationIndex
     resolve_inputs: Callable[[ConsoleNodeSpec, Mapping[str, object]], Mapping[str, ResolvedNodeInput]]
     request_owner_wake: Callable[[], None]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.data_plane, ConsoleDataPlane):
-            raise TypeError("data_plane must be ConsoleDataPlane")
+        if not isinstance(self.data_plane, SignalDataPlane):
+            raise TypeError("data_plane must be SignalDataPlane")
+        if not isinstance(self.presentation_index, ConsolePresentationIndex):
+            raise TypeError("presentation_index must be ConsolePresentationIndex")
         for name in (
             "resolve_inputs",
             "request_owner_wake",
@@ -108,13 +112,13 @@ class ConsoleNodeHost:
         )
         return ConsoleNodeInputs(resolved, bound)
 
-    def current_value(self, binding: ResolvedDatasetInput) -> ConsoleSignalValue:
+    def current_value(self, binding: ResolvedDatasetInput) -> SignalValue:
         """Return the currently admitted immutable value of one selected input."""
 
         if not isinstance(binding, ResolvedDatasetInput):
             raise TypeError("binding must be ResolvedDatasetInput")
         value = self.data_plane.freeze().value(binding.selection.signal_key)
-        if not isinstance(value, ConsoleSignalValue):
+        if not isinstance(value, SignalValue):
             raise RuntimeError(
                 "the selected running Dataset producer has not published a value"
             )
@@ -140,7 +144,6 @@ ConsoleNodeFactory = Callable[
         ConsoleNodeHost,
         ConsoleNodeSpec,
         Mapping[str, object],
-        str,
         str,
     ],
     object,

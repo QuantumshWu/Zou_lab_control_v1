@@ -14,6 +14,7 @@ from zlc_frontend.form import FormSpec
 from zlc_neutral_atom.installation_config import (
     InstallationConfigDocument,
     default_installation_authoring_schema,
+    installation_authoring_schema,
 )
 from zlc_storage import sha256_text
 from zlc_workbench.form_projection import project_authoring_form
@@ -25,7 +26,7 @@ def form_spec(
     """Project one current config topology to the shared headless form contract."""
 
     if isinstance(document_or_backend, InstallationConfigDocument):
-        schema = document_or_backend.config.authoring_schema()
+        schema = installation_authoring_schema(document_or_backend)
     elif isinstance(document_or_backend, str):
         schema = default_installation_authoring_schema(document_or_backend)
     else:
@@ -223,7 +224,7 @@ class DeviceConfigEditorSession:
 def _document_state(
     document: InstallationConfigDocument,
 ) -> tuple[str, dict[str, object]]:
-    return document.backend, document.config.to_parameters()
+    return document.backend, document.parameters
 
 
 def _require_document(value: object, field: str) -> None:

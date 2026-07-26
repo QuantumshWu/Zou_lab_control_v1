@@ -3,7 +3,7 @@
 The detector must never infer its own authority.  This module therefore joins
 one independently configured grid in camera output-pixel coordinates with one
 frozen three-event pulse recipe.  The installation gives the same grid value to
-the apparatus model and to this profile; notebook convenience code only copies
+the apparatus model and to this profile; application convenience code only copies
 the already-validated intent into ordinary Capture and Calibration requests.
 """
 

@@ -22,10 +22,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_render_lane_releases_session_after_active_compose_on_its_worker() -> None:
-    from zlc_frontend.qt_widgets import ensure_qt_app
-    from zlc_workbench.task_console.render_lane import (
-        ConsoleRenderCompletion,
-        ConsoleRenderLane,
+    from zlc_frontend.qt_widgets import (
+        FigureSurfaceCompletion,
+        FigureSurfaceLane,
+        ensure_qt_app,
     )
 
     application = ensure_qt_app()
@@ -40,7 +40,7 @@ def test_render_lane_releases_session_after_active_compose_on_its_worker() -> No
             worker_threads.append(threading.get_ident())
             released.set()
 
-    lane = ConsoleRenderLane(
+    lane = FigureSurfaceLane(
         application,
         accept_completion=lambda _completion: set(),
         request_shutdown_wake=lambda: shutdown_wakes.append(True),
@@ -52,7 +52,7 @@ def test_render_lane_releases_session_after_active_compose_on_its_worker() -> No
         entered.set()
         if not unblock.wait(5.0):
             raise RuntimeError("test compose was not released")
-        return ConsoleRenderCompletion((), ())
+        return FigureSurfaceCompletion((), ())
 
     lane._compose = blocking_compose
     lane._start((), (), ())
@@ -75,15 +75,14 @@ def test_render_lane_releases_session_after_active_compose_on_its_worker() -> No
 def test_fit_lane_waits_for_cancelled_active_solver_before_close_ack() -> None:
     from types import SimpleNamespace
 
-    from zlc_frontend.qt_widgets import ensure_qt_app
-    from zlc_workbench.task_console.panel_fit import PanelFitLane
+    from zlc_frontend.qt_widgets import FigureFitLane, ensure_qt_app
 
     application = ensure_qt_app()
     entered = threading.Event()
     returned = threading.Event()
     shutdown_wakes: list[bool] = []
     request = SimpleNamespace(cancelled=threading.Event())
-    lane = PanelFitLane(
+    lane = FigureFitLane(
         application,
         accept_completion=lambda _completion: None,
         request_shutdown_wake=lambda: shutdown_wakes.append(True),
@@ -282,7 +281,7 @@ def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
     )
     from zlc_frontend.panel_render import PanelComposer
     from zlc_frontend.qt_widgets import ensure_qt_app
-    from zlc_workbench.task_console.data_plane import ConsoleSignalValue
+    from zlc_neutral_atom.processing.signal_plane import SignalValue
     from zlc_workbench.task_console.window import TaskConsole
 
     repeat = AxisSpec(
@@ -318,9 +317,9 @@ def test_repeat_choice_commits_one_typed_view_spec_from_real_qt_input() -> None:
         block.ref(StreamGenerationId("task-console-repeat-generation")),
         block,
     )
-    value = ConsoleSignalValue(
+    value = SignalValue(
         name="typed-repeat",
-        source="test",
+        source_instance_id="test",
         snapshot=snapshot,
         coverage=None,
         run_id="run",
@@ -398,7 +397,7 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
     from zlc_workbench.task_console.console_state import TaskConsoleState
     from zlc_frontend.figure import AxisViewRole, view_spec_from_tree
     from zlc_frontend.qt_widgets import ensure_qt_app
-    from zlc_workbench.task_console.data_plane import ConsoleSignalValue
+    from zlc_neutral_atom.processing.signal_plane import SignalValue
     from zlc_workbench.task_console.window import TaskConsole
 
     repeat = AxisSpec(
@@ -434,9 +433,9 @@ def test_grid_repeat_facet_focus_and_overview_follow_real_qt_input() -> None:
         block.ref(StreamGenerationId("task-console-grid-generation")),
         block,
     )
-    value = ConsoleSignalValue(
+    value = SignalValue(
         name="scan",
-        source="virtual scan",
+        source_instance_id="virtual-scan",
         snapshot=snapshot,
         coverage=None,
         run_id="run",

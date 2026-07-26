@@ -28,9 +28,16 @@ from zlc_neutral_atom.artifacts import (
     FitResultArtifactRef,
     FitResultRepository,
 )
+from zlc_neutral_atom.artifact_dispatch import ArtifactCapability, ArtifactDispatch
 from zlc_neutral_atom.capture.artifact import (
     CaptureRepository,
     compile_capture_artifact_pipeline,
+)
+from zlc_neutral_atom.capture.reference import (
+    CAPTURE_ARTIFACT_REF_SCHEMA,
+    CaptureArtifactRef,
+    capture_artifact_ref_from_tree,
+    capture_artifact_ref_to_tree,
 )
 from zlc_neutral_atom.capture.frames import CaptureFrameSource
 from zlc_neutral_atom.devices.camera.endpoint import CameraCaptureEndpoint
@@ -275,6 +282,19 @@ def capture_case(tmp_path):
         case.close()
 
 
+def _artifact_dispatch(case) -> ArtifactDispatch:
+    return ArtifactDispatch((
+        ArtifactCapability(
+            CAPTURE_ARTIFACT_REF_SCHEMA,
+            "capture",
+            CaptureArtifactRef,
+            project_dataset=case.capture_repository.project_dataset_source,
+            reference_to_tree=capture_artifact_ref_to_tree,
+            reference_from_tree=capture_artifact_ref_from_tree,
+        ),
+    ))
+
+
 def _execution(repository, case):
     artifact = case.capture_repository.load(case.capture_reference)
     spec = fit_spec_for(
@@ -282,8 +302,8 @@ def _execution(repository, case):
         "exponential_decay",
         fit_axis_ids=(AxisId("camera.x"),),
     )
-    return repository.execute_capture(
-        case.capture_repository,
+    return repository.execute(
+        _artifact_dispatch(case),
         case.capture_reference,
         spec,
     )
@@ -342,7 +362,7 @@ def test_execution_save_load_is_idempotent_and_has_no_mirror_truths(
         )
         loaded = repository.load(
             first,
-            capture_repository=capture_case.capture_repository,
+            artifacts=_artifact_dispatch(capture_case),
         )
         assert isinstance(loaded, AdmittedFitResult)
         assert loaded.source_artifact_ref == capture_case.capture_reference
@@ -372,6 +392,7 @@ def test_raw_fit_result_cannot_be_promoted_without_execution_authority(
                 object(),
                 repository=repository,
                 source_artifact_ref=capture_case.capture_reference,
+                source_reference_payload=b"untrusted",
                 result=execution.result,
             )
         reference = execution.save()
@@ -428,7 +449,7 @@ def test_load_fails_closed_on_content_corruption(
         with pytest.raises(ContentCorruptionError):
             repository.load(
                 reference,
-                capture_repository=capture_case.capture_repository,
+                artifacts=_artifact_dispatch(capture_case),
             )
     finally:
         repository.close()
@@ -445,7 +466,7 @@ def test_foreign_fit_repository_rejects_reference(tmp_path, capture_case) -> Non
         with pytest.raises(ValueError, match="another repository"):
             second.load(
                 reference,
-                capture_repository=capture_case.capture_repository,
+                artifacts=_artifact_dispatch(capture_case),
             )
     finally:
         second.close()

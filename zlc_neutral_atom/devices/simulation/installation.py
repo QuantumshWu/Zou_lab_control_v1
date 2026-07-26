@@ -17,10 +17,11 @@ from zlc_neutral_atom.installation_runtime import (
     _identity_for,
 )
 from zlc_neutral_atom.devices.camera.endpoint import CameraCaptureEndpoint, CameraMonitorEndpoint
+from zlc_neutral_atom.devices.camera.binding import bind_camera_endpoint
 from zlc_neutral_atom.devices.simulation.apparatus import VirtualAtomArray, VirtualCamera, VirtualMotFrameSource, VirtualRfSource, VirtualSequencer
 from zlc_neutral_atom.devices.simulation.rf_endpoint import VirtualRfTableEndpoint
 from zlc_neutral_atom.devices.simulation.sequencer_endpoint import VirtualSequencerExecutionEndpoint
-from zlc_neutral_atom.installation_plan import installation_device_plan
+from zlc_neutral_atom.installation_plan import InstallationDevicePlan
 from zlc_neutral_atom.installation import ReadoutApparatusFacts
 from zlc_neutral_atom.devices.rf import BoundRfTablePort
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
@@ -154,7 +155,7 @@ def _bind_camera(
             else CameraAcquisitionMode.EXTERNAL_TRIGGERED
         ),
     )
-    attestation = _bind_camera_endpoint(
+    attestation = bind_camera_endpoint(
         broker,
         asset,
         asset_map_revision,
@@ -164,40 +165,6 @@ def _bind_camera(
         BoundCapturePort(attestation),
         BoundCameraMonitorPort(attestation),
     )
-
-
-def _bind_camera_endpoint(
-    broker: DeviceBroker,
-    asset: InstallationAsset,
-    asset_map_revision: str,
-    endpoint: CameraCaptureEndpoint | CameraMonitorEndpoint,
-):
-    """Bind the one shared camera command/cleanup/safe-state surface."""
-
-    binding: BoundDevice | None = None
-
-    def current_binding() -> BoundDevice:
-        if binding is None:
-            raise RuntimeError("camera endpoint binding is not installed")
-        return binding
-
-    identity = _identity_for(asset, asset_map_revision)
-    proof = broker.verify_identity(lambda: identity)
-    binding = broker.bind(
-        key=asset.resource_key,
-        identity=proof,
-        execute_command=lambda command: endpoint.execute_command(
-            current_binding(),
-            command,
-        ),
-        capability_probe=lambda: endpoint.capability_probe(current_binding()),
-        close_session=lambda command: endpoint.close_session(
-            current_binding(),
-            command,
-        ),
-        interrupt_operations={SafetyOperation.DISARM: endpoint.interrupt},
-    )
-    return broker.verify_capability(binding)
 
 
 def _bind_sequencer(
@@ -288,6 +255,7 @@ def _bind_rf(
 def create_virtual_installation(
     *,
     seed: int | None = 7,
+    device_plan: tuple[InstallationDevicePlan, ...] | None = None,
 ) -> _InstallationComposition:
     """Build and publish one immutable virtual graph or fail without a partial runtime."""
 
@@ -296,6 +264,10 @@ def create_virtual_installation(
             raise TypeError("virtual installation seed must be an integer or None")
         if seed < 0:
             raise ValueError("virtual installation seed must be non-negative")
+    if device_plan is None:
+        from .package import INSTALLATION_PACKAGE
+
+        device_plan = INSTALLATION_PACKAGE.device_plan
     trap: VirtualAtomArray | None = None
     sequencer: VirtualSequencer | None = None
     rf: VirtualRfSource | None = None
@@ -404,7 +376,7 @@ def create_virtual_installation(
             runtime_instance_id,
             assets,
             devices,
-            installation_device_plan("virtual"),
+            device_plan,
         )
         resources = ResourceArbiter()
         controller = RunController(resources)

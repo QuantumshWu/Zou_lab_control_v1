@@ -86,8 +86,7 @@ class MotFieldTaskIntent:
     """Complete MOT-field application intent before hardware binding.
 
     ``None`` means frame-centred ROI.  Numeric zero is an ordinary explicit
-    pixel coordinate; UI sentinel interpretation must already have disappeared
-    before this typed value is constructed.
+    pixel coordinate.
     """
 
     pulse: str
@@ -284,9 +283,6 @@ def build_mot_field_intent_from_authoring(
             "MOT field requires the installation's external-trigger-capable "
             "mot_camera role"
         )
-    for key in ("roi_cx", "roi_cy"):
-        if authored[key] == "":
-            authored[key] = None
     return MotFieldTaskIntent(**authored)  # type: ignore[arg-type]
 
 

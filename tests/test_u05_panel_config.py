@@ -9,8 +9,26 @@ from __future__ import annotations
 import ast
 import pathlib
 
+import numpy as np
 import pytest
 
+from zlc_data import (
+    MONITOR_HISTORY,
+    REPEAT,
+    AxisId,
+    AxisSpec,
+    BlockId,
+    DataBlock,
+    DatasetRevision,
+    DatasetSchema,
+    OwnedSnapshot,
+    PointLayout,
+    StreamGenerationId,
+    VALID,
+    ValueSchema,
+)
+from zlc_frontend.figure import ViewIntent
+from zlc_frontend.plot_panel import plot_panel_input, plot_panel_intent
 from zlc_workbench.task_console.console_records import (
     DEFAULT_UPDATE_MS,
     PANEL_KINDS,
@@ -19,7 +37,7 @@ from zlc_workbench.task_console.console_records import (
 )
 
 
-KINDS = ("2d", "sites", "1d", "monitor", "hist", "grid")
+KINDS = ("2d", "sites", "1d", "meter", "monitor", "hist", "grid")
 DEFAULT = {
     "panel_id": "panel-test",
     "title": "",
@@ -29,6 +47,33 @@ DEFAULT = {
     "signal": "",
     "params": {},
 }
+
+
+def _scalar_snapshot(*, rolling: bool) -> OwnedSnapshot:
+    repeat = AxisSpec(AxisId("test.repeat"), "repeat", REPEAT, 1, (0,))
+    history = (
+        AxisSpec(
+            AxisId("test.monitor-history"),
+            "history",
+            MONITOR_HISTORY,
+            2,
+            (0, 1),
+        ),
+    ) if rolling else ()
+    schema = DatasetSchema(
+        repeat,
+        history,
+        PointLayout.rect_c(tuple(axis.size for axis in history)),
+        ValueSchema.scalar(np.dtype("<f8")),
+    )
+    block = DataBlock(
+        BlockId("test-rolling" if rolling else "test-scalar"),
+        DatasetRevision(0),
+        np.zeros(schema.physical_shape, dtype="<f8"),
+        VALID,
+        schema,
+    )
+    return OwnedSnapshot(block.ref(StreamGenerationId("test-generation")), block)
 
 
 def test_a_fresh_panel_is_unbound_for_every_kind() -> None:
@@ -98,6 +143,18 @@ def test_only_end_to_end_live_renderers_are_addable() -> None:
     for kind in ("pulse",):
         with pytest.raises(ValueError):
             PanelConfig(kind=kind)
+
+
+def test_meter_and_monitor_are_distinct_frontend_contracts() -> None:
+    scalar = _scalar_snapshot(rolling=False)
+    history = _scalar_snapshot(rolling=True)
+
+    assert plot_panel_intent("meter") is ViewIntent.METER
+    assert plot_panel_intent("monitor") is ViewIntent.CURVE
+    assert plot_panel_input("meter", scalar).snapshot is scalar
+    assert plot_panel_input("monitor", history).snapshot is history
+    with pytest.raises(ValueError, match="use Meter for a scalar dataset"):
+        plot_panel_input("monitor", scalar)
 
 
 def test_the_record_module_reaches_for_no_toolkit_and_no_renderer() -> None:

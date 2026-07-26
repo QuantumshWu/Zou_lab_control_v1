@@ -47,6 +47,7 @@ from zlc_frontend.qt_widgets import (
 from zlc_neutral_atom.runtime.run import RunState
 from zlc_pulse import (
     DestructivePulseTargetEditError,
+    PulseDocument,
     PulseExecutionForm,
     scan_column_specs,
 )
@@ -415,8 +416,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             path=previous_editor.path,
             file_state=previous_editor.file_state,
             dirty=self._controller.dirty,
-            document_generation=generation,
-            editor_revision=revision,
+            document=after,
             runtime=runtime,
         )
         visible = self._controller.current_display_visible_ports
@@ -1094,8 +1094,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             path=update.path,
             file_state=update.file_state,
             dirty=update.dirty,
-            document_generation=update.document_generation,
-            editor_revision=update.editor_revision,
+            document=editor.document,
             runtime=runtime,
         )
         self._last_editor_projection = dataclass_replace(
@@ -1138,18 +1137,32 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             lowered = update.diagnostic.lower()
             if "failed" in lowered or "error" in lowered:
                 self._message(update.diagnostic)
+        applied_key = (
+            None
+            if update.applied_snapshot is None
+            else (
+                update.applied_snapshot.run_id,
+                update.applied_snapshot.authoring_document_digest,
+            )
+        )
+        previous_applied_key = (
+            None
+            if previous is None or previous.applied_snapshot is None
+            else (
+                previous.applied_snapshot.run_id,
+                previous.applied_snapshot.authoring_document_digest,
+            )
+        )
         file_run_key = (
             update.run_snapshot,
-            update.run_generation,
-            update.run_revision,
+            applied_key,
             update.file_busy,
             update.run_busy,
             update.connection_state,
         )
         previous_file_run_key = None if previous is None else (
             previous.run_snapshot,
-            previous.run_generation,
-            previous.run_revision,
+            previous_applied_key,
             previous.file_busy,
             previous.run_busy,
             previous.connection_state,
@@ -1348,8 +1361,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             path=editor.path,
             file_state=editor.file_state,
             dirty=editor.dirty,
-            document_generation=editor.document_generation,
-            editor_revision=editor.editor_revision,
+            document=editor.document,
             runtime=runtime,
         )
 
@@ -1360,8 +1372,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         path: Path | None,
         file_state: str,
         dirty: bool,
-        document_generation: int,
-        editor_revision: int,
+        document: PulseDocument,
         runtime: PulseRuntimeUpdate,
     ) -> None:
         local = path.name if path is not None else ""
@@ -1384,12 +1395,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             self._window.setWindowTitle(title)
 
         run = runtime.run_snapshot
-        synchronized = (
-            run is not None
-            and run.state is RunState.RUNNING
-            and runtime.run_generation == document_generation
-            and runtime.run_revision == editor_revision
-        )
+        synchronized = runtime.is_document_applied(document)
         if runtime.run_busy and run is None:
             color = YELLOW
         elif run is not None and run.state is RunState.RUNNING:
@@ -1622,7 +1628,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         return self._permanently_closed
 
     def restore_window(self) -> None:
-        """Restore the same notebook-owned editor after an X-to-hide action."""
+        """Restore the same application-owned editor after an X-to-hide action."""
 
         if self._owner_retiring or self._permanently_closed:
             raise RuntimeError("Pulse editor is closing with its application")

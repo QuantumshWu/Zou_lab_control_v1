@@ -45,10 +45,10 @@ from zlc_frontend.qt_widgets import (
     FluentRevisionedFormEditor,
     FluentScrollArea,
     FluentSwitch,
+    FigureSurfaceHost,
     GREY,
     ORANGE,
     FrozenRasterView,
-    QtRasterBoard,
     RasterPixelRatioObserver,
     runtime_range_placeholders,
     FluentSettingsPopupAnchor,
@@ -124,10 +124,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             tuple[float, float] | None,
             RelimMode | None,
         ] | None = None
-        self._area_candidates: dict[
-            str,
-            tuple[float, float, float, float],
-        ] = {}
         self._bound_panel_ids: set[str] = set()
         self._export_commit_lock = threading.Lock()
         super().__init__(
@@ -156,14 +152,15 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._live_page = QtWidgets.QWidget(self._tabs)
         live_layout = QtWidgets.QVBoxLayout(self._live_page)
         live_layout.setContentsMargins(0, 0, 0, 0)
-        self._board_widget = QtRasterBoard(
-            ("saved-fit-loading",),
-            self._live_page,
+        self._surface_host = FigureSurfaceHost(
+            "saved-fit-grid",
+            panel_ids=("saved-fit-loading",),
             columns=1,
             empty_text="Resolving exact saved fit…",
+            parent=self._live_page,
         )
-        self._board_widget.setObjectName("savedFitGridBoard")
-        self._board_widget.setMinimumSize(480, 320)
+        self._surface_host.board.setObjectName("savedFitGridBoard")
+        self._surface_host.setMinimumSize(480, 320)
         self._typed_scroll = FluentScrollArea(self._live_page)
         self._typed_scroll.setObjectName("savedFitGridTypedScroll")
         self._typed_scroll.setWidgetResizable(False)
@@ -174,7 +171,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             QtCore.Qt.ScrollBarAsNeeded
         )
         self._typed_scroll.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-        self._typed_scroll.setWidget(self._board_widget)
+        self._typed_scroll.setWidget(self._surface_host)
         live_layout.addWidget(self._typed_scroll, 1)
         self._encoded_board = FrozenRasterView(
             "saved-fit-generic",
@@ -286,8 +283,17 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._selector_switch.toggled.connect(self._set_selector_enabled)
         self._setting_button.clicked.connect(self._open_display_settings)
         self._fit_button.clicked.connect(self._open_refit)
-        self._board_widget.imagePanelLeftDoubleClicked.connect(
+        self._surface_host.panelDoubleClicked.connect(
             self._focus_panel_id
+        )
+        self._surface_host.rectangleSelected.connect(
+            self._accept_rectangle_gesture
+        )
+        self._surface_host.viewCommitted.connect(
+            self._accept_image_interaction
+        )
+        self._surface_host.colorLimitsCommitted.connect(
+            self._accept_image_interaction
         )
         self._encoded_board.normalizedDoubleClicked.connect(self._focus_at)
         self._edit_image_display.applyRequested.connect(
@@ -328,11 +334,11 @@ class SavedFitGridWindow(FrozenRasterWindow):
         return (
             self._view_family == "typed-image"
             and self._current_front is not None
-            and self._board_widget.has_front
-            and self._board_widget.front_frame is self._current_front.frame
+            and self._surface_host.has_front
+            and self._surface_host.front_frame is self._current_front.frame
             and (
-                self._board_widget.width(),
-                self._board_widget.height(),
+                self._surface_host.width(),
+                self._surface_host.height(),
             ) == self._current_front.logical_size
         )
 
@@ -372,11 +378,11 @@ class SavedFitGridWindow(FrozenRasterWindow):
             return False
         frame = candidate.frame
         if candidate is self._current_front and (
-            not self._board_widget.has_front
-            or self._board_widget.front_frame is not frame
+            not self._surface_host.has_front
+            or self._surface_host.front_frame is not frame
             or (
-                self._board_widget.width(),
-                self._board_widget.height(),
+                self._surface_host.width(),
+                self._surface_host.height(),
             ) != candidate.logical_size
         ):
             return False
@@ -489,14 +495,14 @@ class SavedFitGridWindow(FrozenRasterWindow):
             isinstance(origin, PanelInteractionOrigin)
             and self._front_matches_display_revision()
             and origin.panel_id in self._bound_panel_ids
-            and self._board_widget.visible_image_origin(origin.panel_id) == origin
+            and self._surface_host.visible_image_origin(origin.panel_id) == origin
             and origin.presentation.panel_revision == self._display.revision
         )
 
     def _accept_rectangle_gesture(self, gesture: RectangleGesture) -> None:
         if not isinstance(gesture, RectangleGesture):
             raise TypeError("saved-fit area callback requires RectangleGesture")
-        origin = self._board_widget.visible_image_origin(gesture.panel_id)
+        origin = self._surface_host.visible_image_origin(gesture.panel_id)
         if origin is None or not self._visible_origin_is_current(origin):
             raise RuntimeError("saved-fit area origin is stale")
         if (
@@ -513,14 +519,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._display.revision,
         ):
             raise RuntimeError("saved-fit area differs from its painted origin")
-        if gesture.normalized_bounds is None:
-            self._area_candidates.pop(gesture.panel_id, None)
-        else:
-            self._area_candidates[gesture.panel_id] = gesture.normalized_bounds
-        self._board_widget.set_image_rectangle_candidate(
-            gesture.normalized_bounds,
-            panel_id=gesture.panel_id,
-        )
         if gesture.normalized_bounds is None:
             self._diagnostic.setText(
                 f"{gesture.panel_id}: DISPLAY ONLY area cleared"
@@ -628,34 +626,10 @@ class SavedFitGridWindow(FrozenRasterWindow):
             )
         origin = self._pending_image_interaction_origin
         if origin is not None:
-            self._board_widget.discard_pending_image_interaction(origin)
+            self._surface_host.discard_pending_interaction(origin)
         self._pending_image_interaction_origin = None
         self._display_rollback = None
         self._sync_image_display_editors()
-
-    def _sync_panel_bindings(self, frame: BoardFrame) -> None:
-        intent = self._selector_switch.isChecked()
-        for panel_id in tuple(self._bound_panel_ids):
-            self._board_widget.unbind_rectangle_selector(panel_id)
-        self._bound_panel_ids.clear()
-        for panel in frame.panels:
-            payload = panel.display_payload
-            if not isinstance(payload, ImagePanelPayload):
-                raise TypeError("saved-fit board admitted a non-IMAGE panel")
-            self._board_widget.bind_rectangle_selector(
-                panel.panel_id,
-                payload.viewport,
-                self._accept_rectangle_gesture,
-                enabled=intent,
-                interaction_callback=self._accept_image_interaction,
-            )
-            self._bound_panel_ids.add(panel.panel_id)
-            bounds = self._area_candidates.get(panel.panel_id)
-            if bounds is not None:
-                self._board_widget.set_image_rectangle_candidate(
-                    bounds,
-                    panel_id=panel.panel_id,
-                )
 
     def _present_typed_front(
         self,
@@ -672,40 +646,20 @@ class SavedFitGridWindow(FrozenRasterWindow):
         panel_ids = tuple(panel.panel_id for panel in frame.panels)
         if panel_ids != tuple(fit_grid_panel_id(panel) for panel in panels):
             raise ValueError("saved-fit frame order differs from projected panels")
-        painted = self._board_widget.front_frame
-        needs_stage = (
-            not self._board_widget.has_front
-            or tuple(self._board_widget.panel_ids) != panel_ids
-            or (
-                painted is not None
-                and (painted.board_id, painted.layout_generation)
-                != (frame.board_id, frame.layout_generation)
-            )
+        self._surface_host.present_image_grid(
+            frame,
+            columns=front.columns,
+            logical_size=front.logical_size,
         )
-        self._board_widget.setUpdatesEnabled(False)
-        try:
-            if needs_stage:
-                self._board_widget.stage_layout(
-                    panel_ids,
-                    board_id=frame.board_id,
-                    layout_generation=frame.layout_generation,
-                    columns=front.columns,
-                )
-            self._board_widget.present(frame)
-            self._board_widget.setFixedSize(*front.logical_size)
-        finally:
-            self._board_widget.setUpdatesEnabled(True)
-        self._board_widget.updateGeometry()
-        self._board_widget.update()
         self._view_family = "typed-image"
         self._encoded_scroll.hide()
         self._typed_scroll.show()
-        self._board_widget.show()
+        self._surface_host.show()
         self._current_panels = tuple(panels)
         self._current_front = front
         self._current_color_limits = front.color_limits
         self._layout_generation = frame.layout_generation
-        self._sync_panel_bindings(frame)
+        self._bound_panel_ids = set(panel_ids)
         self._pending_image_interaction_origin = None
         self._sync_image_display_editors()
 
@@ -731,12 +685,12 @@ class SavedFitGridWindow(FrozenRasterWindow):
         try:
             if enabled and not self._front_matches_display_revision():
                 raise RuntimeError("selector has no current exact IMAGE front")
-            self._board_widget.set_selectors_enabled(bool(enabled))
+            self._surface_host.set_selectors_enabled(bool(enabled))
         except BaseException as error:
             blocker = QtCore.QSignalBlocker(self._selector_switch)
             self._selector_switch.setChecked(False)
             del blocker
-            self._board_widget.set_selectors_enabled(False)
+            self._surface_host.set_selectors_enabled(False)
             self._diagnostic.setText(
                 f"Selector rejected: {error_summary(error)}"
             )
@@ -773,8 +727,8 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._export_button.setEnabled(
                 enabled and self._current_encoded_bundle is not None
             )
-            if self._board_widget.selectors_enabled:
-                self._board_widget.set_selectors_enabled(False)
+            if self._surface_host.selectors_enabled:
+                self._surface_host.set_selectors_enabled(False)
             return
         self._overview_button.setEnabled(
             enabled
@@ -786,14 +740,14 @@ class SavedFitGridWindow(FrozenRasterWindow):
         for panel_id in self._bound_panel_ids:
             ready = (
                 front_ready
-                and self._board_widget.image_selector_fault(panel_id) is None
+                and self._surface_host.image_selector_fault(panel_id) is None
             )
-            self._board_widget.set_image_interaction_readiness(panel_id, ready)
+            self._surface_host.set_image_panel_ready(panel_id, ready)
             healthy = healthy or ready
         self._selector_switch.setEnabled(healthy)
         intended = self._selector_switch.isChecked() and healthy
-        if self._board_widget.selectors_enabled != intended:
-            self._board_widget.set_selectors_enabled(intended)
+        if self._surface_host.selectors_enabled != intended:
+            self._surface_host.set_selectors_enabled(intended)
         self._setting_button.setEnabled(front_ready)
         self._edit_image_display.setEnabled(front_ready)
         self._setting_image_display.setEnabled(front_ready)
@@ -920,7 +874,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
         else:
             self._surface_render_pending = True
         if self._view_family == "typed-image":
-            self._board_widget.clear()
+            self._surface_host.clear()
             self._page_front = None
             self._current_front = None
             self._set_controls_enabled(False)
@@ -1642,15 +1596,13 @@ class SavedFitGridWindow(FrozenRasterWindow):
     def _clear_bundle(self) -> None:
         self._bundle = None
         self._boards = ()
-        board = getattr(self, "_board_widget", None)
-        if board is not None:
+        surface = getattr(self, "_surface_host", None)
+        if surface is not None:
             origin = self._pending_image_interaction_origin
             if origin is not None:
-                board.discard_pending_image_interaction(origin)
-            for panel_id in tuple(self._bound_panel_ids):
-                board.unbind_rectangle_selector(panel_id)
+                surface.discard_pending_interaction(origin)
             self._bound_panel_ids.clear()
-            board.clear()
+            surface.clear()
         encoded_board = getattr(self, "_encoded_board", None)
         if encoded_board is not None:
             encoded_board.clear()
@@ -1660,7 +1612,6 @@ class SavedFitGridWindow(FrozenRasterWindow):
         self._showing_page = True
         self._pending_image_interaction_origin = None
         self._display_rollback = None
-        self._area_candidates.clear()
 
     def _finish_close_if_ready(self) -> None:
         if self._closing and self._future is None and not self._closed:

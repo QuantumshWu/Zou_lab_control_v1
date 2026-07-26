@@ -37,7 +37,6 @@ from zlc_frontend.figure_outputs import (
     area_data_output_presentation,
     figure_derived_signal,
     figure_output_revision_ref,
-    materialize_area_range_output,
 )
 from zlc_frontend.figure_source import FigureSource
 from zlc_frontend.image_view import ImageViewportTransform
@@ -135,28 +134,10 @@ def _site_map_area_outputs(
             "selection": selection_tree,
         }
     )
-    outputs: dict[str, FigureDerivedSignal] = {}
-    for axis, term in ((x_axis, x_term), (y_axis, y_term)):
-        key, value = materialize_area_range_output(
-            source,
-            snapshot.ref,
-            axis,
-            (float(term.lower), float(term.upper)),
-            ("lower", "upper"),
-            {
-                "inputs": lineage,
-                "selection": selection_tree,
-                "axis_id": axis.axis_id.value,
-            },
-            unit=axis.unit,
-            derivation_digest=derivation_digest,
-        )
-        outputs[key] = value
-
-    # An empty box still publishes its physical bounds.  Inventing a sentinel
-    # site would turn a valid empty selection into false data.
+    # There is no selected data for an empty box.  Geometry is provenance, not
+    # a second public signal, and inventing a sentinel site would be false data.
     if not selected.size:
-        return outputs
+        return {}
 
     selected_indices = tuple(int(index) for index in selected)
     source_site_axis = view.site_axis
@@ -214,17 +195,18 @@ def _site_map_area_outputs(
             "quantity": quantity,
         },
     )
-    outputs[AREA_DATA_OUTPUT] = figure_derived_signal(
-        AREA_DATA_OUTPUT,
-        result,
-        source,
-        preserve_source_coverage=False,
-        presentation=area_data_output_presentation(
-            source.source_contract_id,
-        ),
-        derivation_digest=derivation_digest,
-    )
-    return outputs
+    return {
+        AREA_DATA_OUTPUT: figure_derived_signal(
+            AREA_DATA_OUTPUT,
+            result,
+            source,
+            preserve_source_coverage=False,
+            presentation=area_data_output_presentation(
+                source.source_contract_id,
+            ),
+            derivation_digest=derivation_digest,
+        )
+    }
 
 def _evaluated_image_cell(
     values: np.ndarray,

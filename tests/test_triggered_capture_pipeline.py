@@ -317,7 +317,7 @@ def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation
         from pathlib import Path
         import sys
 
-        from Zou_lab_control.notebook import connect
+        from Zou_lab_control.api import connect
         from zlc_pulse import load_pulse_document
 
         workspace = Path(sys.argv[1])
@@ -380,7 +380,7 @@ def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation
 def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest(
     tmp_path,
 ):
-    from Zou_lab_control.notebook import connect
+    from Zou_lab_control.api import connect
 
     class RecordingPreview:
         def __init__(self, spec) -> None:
@@ -424,7 +424,7 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
     )
     ports = []
     try:
-        sequence = experiment.readout.sitemap_request(frames=2)
+        sequence = experiment.nodes.calibration.sitemap_request(frames=2)
         grouping = sequence.capture_request.within_point_grouping
         assert grouping is not None
         reference_event = sequence.analysis.layout.reference_event_indices[0]

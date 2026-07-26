@@ -1,99 +1,110 @@
-"""RUN seam: one console node's Run lifecycle, off the GUI thread.
+"""Headless hosted Run lifecycle, off the caller thread.
 
-Run seam of the composition root (``app.py``).  A console node
-is a frozen typed request plus a Run: the CATALOG seam freezes the request
-(:mod:`.catalog_bridge`), this module owns what happens next -- prepare, start,
-cancel, and the snapshot the board polls each tick.
+A hosted run is a frozen typed request plus a Run.  The caller freezes the
+request; this module owns what happens next -- prepare, start, cancel, and the
+latest observable snapshot.
 
-The GUI thread never blocks on the domain.  Every prepare/start/cancel round
-trip is submitted to :class:`~zlc_workbench.run_owner.QtRunOwnerMailbox`, the
-same worker mailbox the Workbench's own monitor window uses, and the console
-reads results by draining completions on its tick.  A node that is stopping
-therefore keeps the board interactive; a node that dies reports its failure
-instead of leaving a button stuck.
+The caller never blocks on domain preparation or start. Every round trip is
+submitted to :class:`RunOwnerMailbox`; an owner loop drains completions.
 
-Layering: this module does NOT import the notebook facade.  It takes a
-``prepare`` callable the composition root supplies (the same shape the Workbench
-windows take), so the console package stays free of domain authority.
+Layering: this module does NOT import an application facade or UI toolkit.  It
+takes a ``prepare`` callable from the composition root, so this lifecycle stays
+free of domain and presentation authority.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import Future
 import threading
-from typing import Callable, Mapping
+from typing import Callable
 
-from .console_records import console_signal_key
-from zlc_workbench.run_owner import QtRunOwnerMailbox
+from zlc_neutral_atom.artifact_output import ArtifactOutputDeclaration
+from zlc_neutral_atom.catalog import DefinitionKey
+from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
+from .owner_mailbox import RunOwnerMailbox
 from zlc_neutral_atom.runtime.signal_source import SignalEventSource
 
-__all__ = ["ConsoleRunNode"]
+__all__ = ["HostedRun"]
 
 
 _UNRESOLVED_FINAL = object()
-_BUILD_REQUEST = object()
 
 
 class _StartSuppressed(Exception):
     """The user stopped this node before its starter received hardware authority."""
 
 
-class ConsoleRunNode:
-    """The Run lifecycle of ONE console node (a logic row / camera panel).
+class HostedRun:
+    """The lifecycle of one hosted run.
 
     ``prepare`` receives the node's frozen request and returns the domain's
-    prepared command.  ``view_factory``, when the node's prepared command wants
-    a live view, is handed straight to ``start_with_view`` -- the MONITOR seam
-    owns what that factory builds, this seam only sequences the call.
+    prepared command.  The composition root binds the command's concrete start
+    operation once; this owner sequences it without interpreting devices,
+    outputs, or presentation.
     """
 
     def __init__(
         self,
-        spec,
-        values,
         *,
+        definition_key: DefinitionKey,
+        request: object,
         instance_id: str,
-        instance_label: str,
+        dataset_output_declarations: tuple[DatasetOutputDeclaration, ...],
+        artifact_output_declarations: tuple[ArtifactOutputDeclaration, ...] = (),
         prepare: Callable[[object], object],
+        qualify_output: Callable[[str], str],
         request_owner_wake: Callable[[], None],
-        frozen_request: object = _BUILD_REQUEST,
-        materialize_final_presentations: Callable[[object, object, object], object]
-        | None = None,
     ) -> None:
+        if not isinstance(definition_key, DefinitionKey):
+            raise TypeError("definition_key must be DefinitionKey")
         if not callable(prepare):
             raise TypeError("prepare must be callable")
+        if not callable(qualify_output):
+            raise TypeError("qualify_output must be callable")
         identity = str(instance_id).strip()
-        label = str(instance_label).strip()
-        if not identity or not label:
-            raise ValueError("console instance id and label must be non-empty")
-        self._spec = spec
+        if not identity:
+            raise ValueError("hosted instance id must be non-empty")
+        dataset_outputs = tuple(dataset_output_declarations)
+        if any(
+            not isinstance(value, DatasetOutputDeclaration)
+            for value in dataset_outputs
+        ):
+            raise TypeError(
+                "dataset_output_declarations must contain "
+                "DatasetOutputDeclaration values"
+            )
+        artifact_outputs = tuple(artifact_output_declarations)
+        if any(
+            not isinstance(value, ArtifactOutputDeclaration)
+            for value in artifact_outputs
+        ):
+            raise TypeError(
+                "artifact_output_declarations must contain "
+                "ArtifactOutputDeclaration values"
+            )
+        dataset_names = tuple(value.name for value in dataset_outputs)
+        artifact_names = tuple(value.name for value in artifact_outputs)
+        if len(set(dataset_names)) != len(dataset_names):
+            raise ValueError("Dataset output names must be unique")
+        if len(set(artifact_names)) != len(artifact_names):
+            raise ValueError("Artifact output names must be unique")
+        if set(dataset_names).intersection(artifact_names):
+            raise ValueError("Dataset and Artifact output names must not overlap")
+        self._definition_key = definition_key
         self.instance_id = identity
-        self.instance_label = label
-        self._values = dict(values)
         self._prepare = prepare
+        self._qualify_output = qualify_output
         # One worker thread per node: a node's prepare/start/cancel jobs must not
         # interleave with each other, and thread affinity is what lets a domain
         # port that is not thread-safe be driven from here at all.
-        self._owner = QtRunOwnerMailbox(
+        self._owner = RunOwnerMailbox(
             request_owner_wake,
-            thread_name_prefix=f"console-{spec.key.stable_definition_id}",
+            thread_name_prefix=f"hosted-{definition_key.stable_definition_id}",
             max_workers=1,
         )
-        self._request = (
-            spec.build_request(self._values)
-            if frozen_request is _BUILD_REQUEST
-            else frozen_request
-        )
-        # Freeze the visible vocabulary from the same typed request.  Camera
-        # cardinality is application-owned request state, never re-derived from
-        # form values or a later Dataset revision.
-        self._output_declarations = tuple(spec.outputs_for(self._request))
-        self._artifact_declarations = tuple(spec.artifact_outputs)
-        if materialize_final_presentations is not None and not callable(
-            materialize_final_presentations
-        ):
-            raise TypeError("materialize_final_presentations must be callable")
-        self._materialize_final_presentations = materialize_final_presentations
+        self._request = request
+        self._dataset_output_declarations = dataset_outputs
+        self._artifact_output_declarations = artifact_outputs
         self._prepared_command = None
         self._handle = None
         self._start_future: Future | None = None
@@ -107,78 +118,56 @@ class ConsoleRunNode:
         self._final_result = _UNRESOLVED_FINAL
         self._final_outputs_submitted = False
         self._materialized_final_outputs = None
-        self._materialized_final_presentations = None
         self._completion_summary: str | None = None
         self._final_output_error: str | None = None
         self._error: str | None = None
         self._start_exception: BaseException | None = None
         self._stop_requested = False
-        self._stop_reason = "Console user requested stop"
+        self._stop_reason = "Host requested stop"
         self._starter = None
 
     # ----------------------------------------------------------------- facts
     @property
-    def spec(self):
-        return self._spec
-
-    @property
-    def name(self) -> str:
-        return self._spec.name
-
-    @property
-    def display_label(self) -> str:
-        """The saved row label shown wherever the console names this producer."""
-
-        return self.instance_label
-
-    @property
-    def layer(self) -> str:
-        """Measurement / processor / task is a Definition fact, not runtime state."""
-
-        return self._spec.kind
-
-    @property
-    def prefix(self) -> str:
-        """Signal qualification is owned by the persisted instance identity."""
-
-        return ""
+    def definition_key(self) -> DefinitionKey:
+        return self._definition_key
 
     def signal_key(self, output_name: str) -> str:
-        """Exact panel-binding key for one definition-owned output."""
+        """Exact host route for one definition-owned output."""
 
-        return console_signal_key(self.instance_id, output_name)
+        return self._qualify_output(output_name)
 
     def published_signals(self) -> tuple[str, ...]:
         """Return the exact producer-instance outputs published by this node.
 
-        The short names remain owned by the domain applications.  The catalog
-        supplies only their Workbench labels.  Qualifying them with the
-        saved immutable row id prevents two valid producers of ``frame`` or
-        ``counts`` from overwriting one another in the board data plane.
+        The short names remain owned by the domain applications.  The injected
+        qualifier supplies their stable host routes, preventing two valid
+        producers of ``frame`` or ``counts`` from overwriting one another.
         """
 
         return tuple(
-            self.signal_key(item.name) for item in self._output_declarations
+            self.signal_key(item.name)
+            for item in self._dataset_output_declarations
         )
 
     def published_artifacts(self) -> tuple[str, ...]:
         """Return exact keys for FINAL artifact outputs, never Dataset signals."""
 
         return tuple(
-            self.signal_key(item.name) for item in self._artifact_declarations
+            self.signal_key(item.name)
+            for item in self._artifact_output_declarations
         )
 
     @property
-    def output_declarations(self) -> tuple:
-        """The exact output vocabulary frozen with this node's request."""
-
-        return self._output_declarations
+    def dataset_output_declarations(
+        self,
+    ) -> tuple[DatasetOutputDeclaration, ...]:
+        return self._dataset_output_declarations
 
     @property
-    def artifact_declarations(self) -> tuple:
-        """The exact non-Dataset output vocabulary frozen with this run."""
-
-        return self._artifact_declarations
+    def artifact_output_declarations(
+        self,
+    ) -> tuple[ArtifactOutputDeclaration, ...]:
+        return self._artifact_output_declarations
 
     @property
     def request(self):
@@ -239,7 +228,7 @@ class ConsoleRunNode:
     def start_exception(self) -> BaseException | None:
         """Structured exception from the most recent start submission.
 
-        Normal presentation uses :attr:`last_error`; typed resource admission
+        Normal host status uses :attr:`last_error`; typed resource admission
         is normalized separately by :attr:`resource_conflict`.
         """
 
@@ -251,7 +240,7 @@ class ConsoleRunNode:
 
         ``RunStartRejected`` belongs to the synchronous controller start API.
         A composite handle instead carries the same ``ResourceBusy`` outcome
-        on its immutable snapshot.  Normalizing both here keeps the Qt shell
+        on its immutable snapshot.  Normalizing both here keeps every host
         independent of exception timing and forbids RunId parsing from text.
         """
 
@@ -278,11 +267,17 @@ class ConsoleRunNode:
         The property never waits.  :meth:`poll` admits the result only after
         the matching handle reports ``SUCCEEDED`` and its owner thread has
         finished.  Starting another generation clears it before submission,
-        so a panel can never keep offering an earlier artifact while a rerun
+        so a consumer can never keep offering an earlier artifact while a rerun
         is in flight.
         """
 
         return None if self._final_result is _UNRESOLVED_FINAL else self._final_result
+
+    @property
+    def prepared_command(self) -> object | None:
+        """Return the command admitted for this generation, without ownership."""
+
+        return self._prepared_command
 
     @property
     def final_result_resolved(self) -> bool:
@@ -290,7 +285,7 @@ class ConsoleRunNode:
 
         ``None`` may itself be a legitimate successful result, so callers must
         not use :attr:`final_result` as a completion flag.  This property is the
-        narrow distinction needed by the GUI owner: keep polling a terminal
+        narrow distinction needed by the host owner: keep polling a terminal
         Run until its owner thread has exited, then detach it.
         """
 
@@ -301,9 +296,8 @@ class ConsoleRunNode:
         """Whether the optional FINAL output materialization has finished.
 
         A committed artifact remains a successful result even when its named
-        output materialization or optional frontend presentation fails.  That
-        boundary error is shown by the Workbench without rewriting Run terminal
-        truth.
+        output materialization fails. That boundary error does not rewrite Run
+        terminal truth.
         """
 
         return (
@@ -328,12 +322,6 @@ class ConsoleRunNode:
         return dict(self._materialized_final_outputs)
 
     @property
-    def materialized_final_presentations(self):
-        if self._materialized_final_presentations is None:
-            return None
-        return dict(self._materialized_final_presentations)
-
-    @property
     def final_output_error(self) -> str | None:
         return self._final_output_error
 
@@ -349,7 +337,7 @@ class ConsoleRunNode:
         # the owner-thread completion installs its RunHandle.  Live view ports
         # may publish their first immutable revision in that narrow interval;
         # treating the producer as stopped makes a real same-node publication
-        # impossible to bind reactively until an unrelated GUI poll occurs.
+        # impossible to bind reactively until an unrelated host poll occurs.
         if self._start_pending:
             return True
         snapshot = self._snapshot
@@ -364,7 +352,7 @@ class ConsoleRunNode:
         This is deliberately distinct from a dataset stream generation.  It
         lets a downstream reactive node pin the source Run even while its first
         frame has arrived just before the corresponding RunHandle completion is
-        drained on the Qt owner thread.
+        drained by the owner loop.
         """
 
         return self._owner.generation
@@ -421,7 +409,7 @@ class ConsoleRunNode:
         self._stop_requested = False
         self._cancelled_before_start = False
         self._stop_event.clear()
-        self._stop_reason = "Console user requested stop"
+        self._stop_reason = "Host requested stop"
         generation = self._owner.begin_generation()
         self._handle = None
         self._prepared_command = None
@@ -429,7 +417,6 @@ class ConsoleRunNode:
         self._final_result = _UNRESOLVED_FINAL
         self._final_outputs_submitted = False
         self._materialized_final_outputs = None
-        self._materialized_final_presentations = None
         self._completion_summary = None
         self._final_output_error = None
         request = self._request
@@ -449,7 +436,7 @@ class ConsoleRunNode:
         self._start_future = future
         self._start_pending = True
 
-    def cancel(self, reason: str = "Console user requested stop") -> None:
+    def cancel(self, reason: str = "Host requested stop") -> None:
         """Ask the Run to stop.  Never waits for the worker to reap it."""
 
         handle = self._handle
@@ -464,9 +451,9 @@ class ConsoleRunNode:
         """Drain worker completions and refresh the snapshot.  Call per tick.
 
         Returns the current ``RunSnapshot`` (or None before the first start).
-        The board reads state from the RETURNED snapshot rather than from a
-        flag this object also keeps, so the button state and the displayed
-        diagnostics can never disagree about the same run.
+        Consumers read state from the returned snapshot rather than from a
+        second flag, so lifecycle decisions and diagnostics cannot disagree
+        about the same run.
         """
 
         for completion in self._owner.drain_completions():
@@ -475,19 +462,12 @@ class ConsoleRunNode:
             if completion.kind == "materialize-final-outputs":
                 error = completion.future.exception()
                 if error is None:
-                    projected, presentations = completion.future.result()
+                    projected = completion.future.result()
                     if not isinstance(projected, dict):
                         self._final_output_error = (
                             "TypeError: final output owner must return a dict"
                         )
                         self._materialized_final_outputs = {}
-                        self._materialized_final_presentations = {}
-                    elif not isinstance(presentations, dict):
-                        self._final_output_error = (
-                            "TypeError: final presentation owner must return a dict"
-                        )
-                        self._materialized_final_outputs = {}
-                        self._materialized_final_presentations = {}
                     else:
                         actual = set(map(str, projected))
                         if not actual:
@@ -495,25 +475,13 @@ class ConsoleRunNode:
                                 "ValueError: final outputs factory returned no outputs"
                             )
                             self._materialized_final_outputs = {}
-                            self._materialized_final_presentations = {}
-                        elif not set(map(str, presentations)).issubset(actual):
-                            self._final_output_error = (
-                                "ValueError: FINAL presentation has no matching "
-                                "domain output"
-                            )
-                            self._materialized_final_outputs = {}
-                            self._materialized_final_presentations = {}
                         else:
                             self._materialized_final_outputs = dict(projected)
-                            self._materialized_final_presentations = dict(
-                                presentations
-                            )
                 else:
                     self._final_output_error = (
                         f"{type(error).__name__}: {error}"
                     )
                     self._materialized_final_outputs = {}
-                    self._materialized_final_presentations = {}
                 continue
             error = completion.future.exception()
             if error is not None:
@@ -549,8 +517,8 @@ class ConsoleRunNode:
                 ):
                     try:
                         # A Run publishes terminal state just before its owner
-                        # thread exits.  timeout=0 keeps the Qt polling path
-                        # non-blocking; the next tick retries that narrow join.
+                        # thread exits.  timeout=0 keeps observation
+                        # non-blocking; the next poll retries that narrow join.
                         self._final_result = handle.result(timeout=0.0)
                     except TimeoutError:
                         pass
@@ -585,22 +553,8 @@ class ConsoleRunNode:
                             and not self._final_outputs_submitted
                         ):
                             result = self._final_result
-                            materialize_presentations = (
-                                self._materialize_final_presentations
-                            )
-
                             def materialize_final_outputs():
-                                outputs = outputs_factory(result)
-                                presentations = (
-                                    {}
-                                    if materialize_presentations is None
-                                    else materialize_presentations(
-                                        command,
-                                        result,
-                                        outputs,
-                                    )
-                                )
-                                return outputs, presentations
+                                return outputs_factory(result)
 
                             self._final_outputs_submitted = True
                             self._owner.submit(
@@ -614,5 +568,5 @@ class ConsoleRunNode:
         return self._snapshot
 
     def shutdown(self) -> None:
-        self.cancel("Console is closing")
+        self.cancel("Host is closing")
         self._owner.shutdown()

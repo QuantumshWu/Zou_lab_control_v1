@@ -59,7 +59,7 @@ def test_composition_root_prepares_the_workspace_before_children():
 
     import inspect
 
-    from Zou_lab_control.notebook import connect
+    from Zou_lab_control.api import connect
 
     source = inspect.getsource(connect)
     prepare = source.index("durable_makedirs(repository_root)")

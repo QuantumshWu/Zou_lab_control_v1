@@ -1,8 +1,8 @@
-"""Raw live-dataset attachment owned by one TaskConsole consumer.
+"""Raw live-dataset attachment owned by one host consumer.
 
-The slot carries acquisition revisions across the worker/UI ownership boundary.
-It deliberately has no selector, ROI, reduction, Fit, or render policy: those
-are Figure-owned branches over an accepted immutable front.
+The slot carries acquisition revisions across the producer/consumer ownership boundary.
+It deliberately has no projection, analysis, or render policy: those are
+downstream branches over an accepted immutable front.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 import threading
 from typing import Callable, Mapping
 
-from zlc_frontend.figure import DatasetId
 from zlc_neutral_atom.dataset_output import (
     LiveDatasetOutput,
     LiveDatasetOutputOwner,
@@ -21,21 +20,18 @@ from zlc_neutral_atom.runtime.preview import LiveDatasetViewSpec
 from zlc_storage import canonical_text
 
 
-class LiveDatasetSlot:
+class LiveDatasetPort:
     """One materializer lifetime plus coalesced revision notifications."""
 
     def __init__(
         self,
         spec: LiveDatasetViewSpec,
         *,
-        dataset_id: DatasetId,
         retain_on_terminal: bool = True,
         output_owner: LiveDatasetOutputOwner | None = None,
     ) -> None:
         if not isinstance(spec, LiveDatasetViewSpec):
             raise TypeError("spec must implement LiveDatasetViewSpec")
-        if not isinstance(dataset_id, DatasetId):
-            raise TypeError("dataset_id must be DatasetId")
         if not isinstance(retain_on_terminal, bool):
             raise TypeError("retain_on_terminal must be bool")
         if output_owner is not None and not callable(
@@ -45,7 +41,6 @@ class LiveDatasetSlot:
                 "output_owner must implement the neutral live output contract"
             )
         self.spec = spec
-        self.dataset_id = dataset_id
         self._retain_on_terminal = retain_on_terminal
         self._output_owner = output_owner
         self._lock = threading.Lock()
@@ -236,4 +231,4 @@ class LiveDatasetSlot:
             return dataset, listener
 
 
-__all__ = ["LiveDatasetSlot"]
+__all__ = ["LiveDatasetPort"]

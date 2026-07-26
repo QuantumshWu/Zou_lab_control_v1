@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtCore, QtTest, QtWidgets
 
-from Zou_lab_control.notebook import device_manager
+from Zou_lab_control.api import device_manager
 from tests.gui_user_flow import (
     capture_offscreen_window,
     configure_offscreen_fast_path,
@@ -180,7 +180,7 @@ def test_saved_config_opens_as_the_exact_editing_baseline(tmp_path):
     configure_offscreen_fast_path()
     application = ensure_qt_app()
     path = tmp_path / "installation.json"
-    document = InstallationConfigDocument.virtual(seed=23)
+    document = InstallationConfigDocument.from_parameters("virtual", {"seed": 23})
     save_installation_config(path, document)
 
     body = device_manager(path, repository=tmp_path / "workspace")

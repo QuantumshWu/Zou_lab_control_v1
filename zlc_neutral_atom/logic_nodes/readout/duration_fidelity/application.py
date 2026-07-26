@@ -48,10 +48,10 @@ from zlc_neutral_atom.dataset_output import (
 )
 from zlc_neutral_atom.logic_nodes.readout.bimodal import fit_bimodal
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
-    ReadoutModelKind,
     ResolvedCalibration,
     extract_readout_features,
 )
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
 from zlc_neutral_atom.logic_nodes.readout.duration_fidelity.measurement import (
     BoundReadoutDurationFidelity,

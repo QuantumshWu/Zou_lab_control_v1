@@ -1,4 +1,4 @@
-"""Human lifecycle contract for the notebook-owned formal Pulse GUI."""
+"""Human lifecycle contract for the Experiment-owned formal Pulse GUI."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PyQt5 import QtCore, QtTest
 
-from Zou_lab_control.notebook.facade import connect
+from Zou_lab_control.api import connect
 from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_pulse import load_deployed_pulse_target, new_pulse_document
 
@@ -23,7 +23,7 @@ def _until(application, predicate, *, timeout: float = 10.0) -> None:
     assert predicate()
 
 
-def test_notebook_x_hides_and_reopens_same_dirty_editor_then_owner_retires(tmp_path):
+def test_bound_x_hides_and_reopens_same_dirty_editor_then_owner_retires(tmp_path):
     application = ensure_qt_app()
     experiment = connect("virtual", repository=tmp_path)
     body = experiment.pulse_gui()

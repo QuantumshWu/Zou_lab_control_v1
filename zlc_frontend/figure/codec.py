@@ -139,17 +139,6 @@ def view_spec_from_tree(tree: Any) -> ViewSpec:
     )
 
 
-def encode_view_spec(spec: ViewSpec) -> bytes:
-    return encode(view_spec_to_tree(spec))
-
-
-def decode_view_spec(payload: bytes) -> ViewSpec:
-    spec = view_spec_from_tree(decode(payload))
-    if bytes(payload) != encode_view_spec(spec):
-        raise ValueError("ViewSpec payload uses a non-canonical typed representation")
-    return spec
-
-
 def figure_document_to_tree(document: FigureDocument) -> dict[str, Any]:
     if not isinstance(document, FigureDocument):
         raise TypeError("document must be FigureDocument")
@@ -266,9 +255,7 @@ __all__ = [
     "FIGURE_DOCUMENT_SCHEMA",
     "VIEW_SPEC_SCHEMA",
     "decode_figure_document",
-    "decode_view_spec",
     "encode_figure_document",
-    "encode_view_spec",
     "figure_document_from_tree",
     "figure_document_to_tree",
     "view_spec_from_tree",

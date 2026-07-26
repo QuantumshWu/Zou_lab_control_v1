@@ -19,6 +19,7 @@ from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentFrame,
     FluentLabel,
+    PublishedSignalsLegend,
     FluentStatusDot,
     scaled_px,
 )
@@ -99,19 +100,7 @@ class LogicNodeRow(FluentFrame):
         # --- published-signals legend: one signal per line (name | shape | meaning) ---
         # Monospace so the name/shape columns ALIGN down the rows (a readable table, not a
         # run-on line).
-        self.publishes_label = FluentLabel("")
-        # WRAP, never extend the row horizontally: a logic-node card lives in a vertical list with NO
-        # horizontal scroll.  The publishes legend is name + shape only (short, fits) -- the longer
-        # per-signal meaning lives in the tooltip, so nothing forces the card wider than the column.
-        self.publishes_label.setWordWrap(True)
-        self.publishes_label.setMinimumWidth(0)
-        self.publishes_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Ignored,
-            QtWidgets.QSizePolicy.Preferred,
-        )
-        self.publishes_label.setStyleSheet(
-            f"color: {GREY}; background: transparent; border: none; "
-            "font-family: Consolas, 'DejaVu Sans Mono', monospace;")
+        self.publishes_label = PublishedSignalsLegend()
         outer.addWidget(self.publishes_label)
 
     def set_state(self, state: str, *, status: str = "") -> None:
@@ -143,15 +132,4 @@ class LogicNodeRow(FluentFrame):
         grows wider than its column and the Logic list needs no horizontal scroll.  ``rows`` is
         ``[(name, shape, description)]`` (dimensions AUTO-EXTRACTED from the authoritative signal schema; meanings
         from the node's ``output_specs``); a pending shape (``—``) just means no value yet."""
-        rows = list(rows)
-        if rows:
-            name_w = max(len(str(n)) for n, _, _ in rows)
-            shape_w = max(len(str(s)) for _, s, _ in rows)
-            lines = [f"  {str(n):<{name_w}}  {str(s):<{shape_w}}".rstrip() for n, s, _ in rows]
-            text = "publishes:\n" + "\n".join(lines)
-            tip = "\n".join(f"{n} {s} — {d}" for n, s, d in rows if d)   # meanings on hover, off the card
-        else:
-            text, tip = "publishes: (no declared outputs)", ""
-        if text != self.publishes_label.text():       # skip churn: shapes refresh each tick
-            self.publishes_label.setText(text)
-            self.publishes_label.setToolTip(tip)
+        self.publishes_label.set_rows(rows)

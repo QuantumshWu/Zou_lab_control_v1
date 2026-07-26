@@ -11,12 +11,12 @@ from zlc_neutral_atom.capture.artifact import (
 )
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
-    ReadoutModelKind,
     ResolvedCalibration,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
 )
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.runtime.run import RunPlan
 

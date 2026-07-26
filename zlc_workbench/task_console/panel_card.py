@@ -32,6 +32,13 @@ from zlc_frontend.qt_widgets import (
     FluentSettingsPopupAnchor,
     FluentSettingRow,
     FluentTreeComboBox,
+    FigureFitRequest,
+    FigureOutputAuthority,
+    FigureSurfaceContext,
+    FigureSurfaceHost,
+    FigureSurfaceOutputRequest as _PanelFigureOutputRequest,
+    FigureSurfaceRenderRequest as _PanelRenderRequest,
+    ViewSpecEditor,
     GREEN,
     GREY,
     ORANGE,
@@ -73,10 +80,6 @@ from zlc_frontend.panel_size import PANEL_SIZES
 from zlc_frontend.plot_kind import PLOT_KIND_SPEC_BY_KEY
 
 from .panel_board import card_size as _card_size
-from .render_lane import (
-    PanelFigureOutputRequest as _PanelFigureOutputRequest,
-    PanelRenderRequest as _PanelRenderRequest,
-)
 
 
 _FIT_SPEC_PARAM = "figure_fit_spec"
@@ -147,7 +150,8 @@ class PanelCard(FluentGroupBox):
 
     def __init__(self, config: PanelConfig, parent=None, *,
                  signal_groups_provider=None,
-                 render_request=None):
+                 render_request=None,
+                 presentation_provider=None):
         fit_spec = self.validate_config(config)
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
@@ -167,21 +171,24 @@ class PanelCard(FluentGroupBox):
         if not callable(render_request):
             raise TypeError("render_request must be callable")
         self._render_request = render_request
+        if not callable(presentation_provider):
+            raise TypeError("presentation_provider must be callable")
+        self._presentation_provider = presentation_provider
         # Figure-owned derived signals.  Area is an authoritative named-axis
         # Selection promoted from a completed gesture; Cross is a completed
         # right-click coordinate.  Neither is a Measurement parameter and
         # neither opens another window.
-        self._area_commit = None
-        self._cross_commit = None
+        self._figure_output_authority = FigureOutputAuthority(self)
         self._figure_output_owner_token = object()
         self._figure_output_request_revision = 0
+        self._figure_output_request_signature = object()
         # Figure Fit is one card-owned committed command/result with two
         # editable surfaces (Setting and Edit).  Neither surface owns a solver.
         # The command retains the exact source of the surface that submitted
         # it; renderers show its result only on a matching source revision.
         self._fit_panes: list[FitAuthoringPane] = []
         # ``None`` means the live card context.  Edit supplies a callable that
-        # returns its exact frozen (value, DataFigure).  The pane is
+        # returns its exact frozen (value, DataFigure, causal ancestry).  The pane is
         # still only an editor; the single committed command/result below owns
         # execution authority.
         self._fit_context_providers: dict[FitAuthoringPane, object | None] = {}
@@ -192,6 +199,7 @@ class PanelCard(FluentGroupBox):
         self._fit_draft_context = None
         self._fit_active_spec = fit_spec
         self._fit_active_source = None
+        self._fit_active_source_component = None
         self._fit_result = None
         self._fit_result_identity = None
         self._fit_request_revision = 0
@@ -361,7 +369,7 @@ class PanelCard(FluentGroupBox):
         """Build an editor for this card's one committed Figure Fit state.
 
         The default pane acts on the live card.  An Edit surface supplies one
-        provider returning its exact frozen ``(ConsoleSignalValue, DataFigure)``.
+        provider returning its exact frozen ``(SignalValue, DataFigure)``.
         This explicit source edge is what prevents a Fit click
         on an old Edit snapshot from silently fitting a newer monitor frame.
         """
@@ -451,15 +459,18 @@ class PanelCard(FluentGroupBox):
         if provider is None:
             value = self._presented_value
             figure = self._presented_figure
+            source_component = None
         else:
             context = provider()
             if context is None:
                 return None
-            if not isinstance(context, tuple) or len(context) != 2:
+            if not isinstance(context, tuple) or len(context) not in (2, 3):
                 raise TypeError(
-                    "Fit context provider must return (value, figure)"
+                    "Fit context provider must return "
+                    "(value, figure[, causal ancestry])"
                 )
-            value, figure = context
+            value, figure = context[:2]
+            source_component = context[2] if len(context) == 3 else None
         snapshot = getattr(value, "snapshot", None)
         if snapshot is None or figure is None:
             return None
@@ -470,7 +481,7 @@ class PanelCard(FluentGroupBox):
         entries = tuple(figure.datasets.entries)
         if len(entries) != 1 or entries[0].snapshot.ref != snapshot.ref:
             raise ValueError("Fit context Figure belongs to another source revision")
-        return value, figure
+        return value, figure, source_component
 
     def refresh_fit_authoring_pane(self, pane: FitAuthoringPane) -> bool:
         """Reconcile one visible pane against its own exact Figure source."""
@@ -479,7 +490,7 @@ class PanelCard(FluentGroupBox):
         if context is None:
             pane.set_busy("prepare", draft_ready=False)
             return False
-        value, figure = context
+        value, figure, _source_component = context
         selection = self._fit_selection_for_value(value)
         seed = self._fit_active_spec
         if (
@@ -541,7 +552,7 @@ class PanelCard(FluentGroupBox):
 
         from zlc_data import Selection
 
-        commit = self._area_commit
+        commit = self._figure_output_authority.area_commit
         if (
             commit is not None
             and isinstance(commit.selection, Selection)
@@ -727,7 +738,7 @@ class PanelCard(FluentGroupBox):
         if context is None:
             self.set_status("Fit source is not currently available", error=True)
             return
-        source, figure = context
+        source, figure, source_component = context
         selection = self._fit_selection_for_value(source)
         from zlc_frontend import (
             fit_spec_from_arguments,
@@ -758,6 +769,7 @@ class PanelCard(FluentGroupBox):
         self._fit_draft = draft
         self._fit_active_spec = exact_spec
         self._fit_active_source = source
+        self._fit_active_source_component = source_component
         self._commit_persisted_params(
             {_FIT_SPEC_PARAM: fit_spec_to_tree(exact_spec)}
         )
@@ -792,14 +804,13 @@ class PanelCard(FluentGroupBox):
             return None
         if spec.input_schema_fingerprint != snapshot.ref.schema_fingerprint:
             return None
-        from .panel_fit import PanelFitRequest
-
         self._fit_request_revision += 1
-        request = PanelFitRequest(
+        request = FigureFitRequest(
             self.panel_id,
             self._fit_request_revision,
             source,
             spec,
+            self._fit_active_source_component,
         )
         self._fit_pending_source_ref = snapshot.ref
         return request
@@ -807,9 +818,7 @@ class PanelCard(FluentGroupBox):
     def accept_fit_completion(self, request, result, error: str | None) -> bool:
         """Admit a result only for the still-current committed command."""
 
-        from .panel_fit import PanelFitRequest
-
-        if not isinstance(request, PanelFitRequest):
+        if not isinstance(request, FigureFitRequest):
             return False
         source = self._fit_active_source
         snapshot = None if source is None else getattr(source, "snapshot", None)
@@ -835,6 +844,7 @@ class PanelCard(FluentGroupBox):
             self.set_status("Fit worker returned another source revision", error=True)
             return True
         self._fit_result = result
+        self._fit_active_source_component = request.source_component
         self._fit_result_identity = "draft-fit:" + sha256(
             encode_fit_result_batch(result)
         ).hexdigest()
@@ -859,6 +869,7 @@ class PanelCard(FluentGroupBox):
         self.fit_cancel_requested.emit()
         self._fit_active_spec = None
         self._fit_active_source = None
+        self._fit_active_source_component = None
         self._commit_persisted_params(remove=(_FIT_SPEC_PARAM,))
         self._clear_fit_result(notify=True)
         for pane in tuple(self._fit_panes):
@@ -1009,45 +1020,36 @@ class PanelCard(FluentGroupBox):
         """Give this card its raster surface.
 
         A panel shows PIXELS the worker produced -- an already-coherent
-        BoardFrame handed to :class:`~zlc_frontend.qt_widgets.SinglePanelHost`,
-        which paints from immutable bytes and owns no figure.  The card
+        BoardFrame handed to the frontend-owned ``FigureSurfaceHost``, which
+        paints from immutable bytes and owns the exact Figure context.  The card
         therefore holds no Matplotlib object at all: rendering happens off the
         GUI thread and arrives here already rasterised.  The host is the ONE
-        selector owner (design rule: an interactive window uses the
-        QtRasterBoard chain; FrozenRasterView stays a frozen-report presenter), so
-        the console card's selector switch and completed gestures go through
-        the same binding as every other one-panel window.
+        selector owner; ``FrozenRasterView`` stays a frozen-report presenter.
+        The console card's selector switch and completed gestures therefore go
+        through the same binding as every other interactive Figure window.
         """
-
-        from zlc_frontend.qt_widgets import FacetedPanelHost, SinglePanelHost
 
         if self.board is not None:
             return
+        self.board = FigureSurfaceHost(
+            self.panel_id,
+            faceted=self.config.kind == "grid",
+            empty_text=(
+                "choose a facet axis in Setting"
+                if self.config.kind == "grid"
+                else "waiting for data"
+            ),
+            output_authority=self._figure_output_authority,
+        )
         if self.config.kind == "grid":
-            self.board = FacetedPanelHost(
-                self.panel_id,
-                empty_text="choose a facet axis in Setting",
-            )
             self.board.focusRequested.connect(self._focus_grid_cell)
             self.board.overviewRequested.connect(self._return_to_grid_overview)
-            self.board.rangeSelected.connect(self._accept_area_range)
-            self.board.rectangleSelected.connect(
-                self._accept_area_rectangle
-            )
-            self.board.crossSelected.connect(self._accept_cross)
-        else:
-            self.board = SinglePanelHost(
-                self.panel_id, empty_text="waiting for data")
-            # A panel card exposes the frontend owner's complete typed gesture
-            # without deciding what that rectangle means.  ROI/control-domain
-            # routing belongs to the TaskConsole composition layer; keeping
-            # that meaning out of this view is what lets every image-like
-            # consumer share the same selector.
-            self.board.rangeSelected.connect(self._accept_area_range)
-            self.board.rectangleSelected.connect(
-                self._accept_area_rectangle
-            )
-            self.board.crossSelected.connect(self._accept_cross)
+        self.board.figureOutputsChanged.connect(
+            self._figure_surface_outputs_changed
+        )
+        self.board.interactionRejected.connect(
+            lambda detail: self.set_status(detail, error=True)
+        )
         self._apply_fixed_size()
         # The pulse-preview answer protocol, verbatim: a wheel-zoom / pan /
         # double-middle commit is answered by re-composing THIS card at the
@@ -1065,133 +1067,16 @@ class PanelCard(FluentGroupBox):
         self._apply_selectors_state()
         self.canvas_holder.addWidget(self.board)
 
-    def selection_for_rectangle_gesture(self, gesture):
-        """Promote this card's exact held rectangle through its selector owner."""
+    def _figure_surface_outputs_changed(self) -> None:
+        """Publish the one frontend-owned Area/Cross command state."""
 
-        from zlc_frontend.selector import RectangleGesture
-
-        if not isinstance(gesture, RectangleGesture):
-            raise TypeError("gesture must be RectangleGesture")
-        if gesture.panel_id != self.panel_id:
-            raise ValueError("rectangle gesture belongs to another panel card")
-        if self.board is None:
-            raise RuntimeError(
-                "rectangle selection requires this card's panel host"
-            )
-        return self.board.selection_for_rectangle_gesture(gesture)
-
-    def _set_area_commit(self, commit) -> None:
-        from zlc_frontend.figure_outputs import FigureAreaCommit
-
-        if commit is not None and not isinstance(commit, FigureAreaCommit):
-            raise TypeError("Area output requires FigureAreaCommit or None")
-        changed = commit != self._area_commit
-        self._area_commit = commit
-        if changed:
-            self.figure_outputs_changed.emit()
-            self._fit_selection_changed()
+        self.figure_outputs_changed.emit()
+        self._fit_selection_changed()
 
     def _clear_figure_outputs(self, *, notify: bool) -> None:
-        changed = self._area_commit is not None or self._cross_commit is not None
-        self._area_commit = None
-        self._cross_commit = None
-        if changed and notify:
-            self.figure_outputs_changed.emit()
-        if changed:
+        self._figure_output_authority.clear(notify=notify)
+        if not notify:
             self._fit_selection_changed()
-
-    def _accept_area_range(self, gesture, *, host=None) -> None:
-        """Promote a completed curve span into the Figure's Area output."""
-
-        from zlc_frontend.selector import (
-            CurveRangeGesture,
-            HistogramRangeGesture,
-        )
-
-        if not isinstance(
-            gesture,
-            (CurveRangeGesture, HistogramRangeGesture),
-        ):
-            return
-        if gesture.x_span is None:
-            self._set_area_commit(None)
-            return
-        board = self.board if host is None else host
-        if board is None:
-            return
-        try:
-            commit = board.area_commit_for_range_gesture(gesture)
-        except RuntimeError:
-            self._set_area_commit(None)
-            return
-        self._set_area_commit(commit)
-
-    def _accept_area_rectangle(self, gesture, *, host=None) -> None:
-        """Promote a completed image rectangle into the Figure's Area output."""
-
-        from zlc_frontend.selector import RectangleGesture
-
-        if not isinstance(gesture, RectangleGesture):
-            return
-        if gesture.normalized_bounds is None:
-            self._set_area_commit(None)
-            return
-        board = self.board if host is None else host
-        if board is None:
-            return
-        try:
-            commit = board.area_commit_for_rectangle_gesture(gesture)
-        except RuntimeError:
-            # A stale origin is ineligible.  SiteMap rectangles resolve through
-            # the painted background's named spatial axes here, then the Figure
-            # output owner selects site centres from that exact joined view.
-            # They never become a Measurement ROI.
-            self._set_area_commit(None)
-            return
-        self._set_area_commit(commit)
-
-    def _accept_cross(self, gesture, *, host=None) -> None:
-        """Accept one completed Cross click; pointer motion never reaches here."""
-
-        from zlc_frontend.figure_outputs import FigureCrossCommit
-        from zlc_frontend.selector import CrossGesture
-
-        if not isinstance(gesture, CrossGesture):
-            return
-        board = self.board if host is None else host
-        if board is None or board.visible_interaction_origin() != gesture.origin:
-            return
-        if gesture.point is None:
-            changed = self._cross_commit is not None
-            self._cross_commit = None
-            if changed:
-                self.figure_outputs_changed.emit()
-            return
-        try:
-            commit = board.cross_commit_for_gesture(gesture)
-        except (RuntimeError, TypeError, ValueError):
-            return
-        if not isinstance(commit, FigureCrossCommit):
-            raise TypeError("panel host returned another Cross contract")
-        changed = commit != self._cross_commit
-        self._cross_commit = commit
-        if changed:
-            self.figure_outputs_changed.emit()
-
-    def accept_range_from(self, host, gesture) -> None:
-        """Accept one selector gesture from another view of this exact front."""
-
-        self._accept_area_range(gesture, host=host)
-
-    def accept_rectangle_from(self, host, gesture) -> None:
-        """Accept one rectangle from another host without duplicating mapping."""
-
-        self._accept_area_rectangle(gesture, host=host)
-
-    def accept_cross_from(self, host, gesture) -> None:
-        """Accept a Cross click from another host of this exact front."""
-
-        self._accept_cross(gesture, host=host)
 
     @staticmethod
     def _figure_commit_matches_value(commit, value) -> bool:
@@ -1213,14 +1098,15 @@ class PanelCard(FluentGroupBox):
         """
 
         value = self._presented_value
+        authority = self._figure_output_authority
         area_commit = (
-            self._area_commit
-            if self._figure_commit_matches_value(self._area_commit, value)
+            authority.area_commit
+            if self._figure_commit_matches_value(authority.area_commit, value)
             else None
         )
         cross_commit = (
-            self._cross_commit
-            if self._figure_commit_matches_value(self._cross_commit, value)
+            authority.cross_commit
+            if self._figure_commit_matches_value(authority.cross_commit, value)
             else None
         )
         fit_result = self._fit_result
@@ -1252,14 +1138,15 @@ class PanelCard(FluentGroupBox):
             or result.source_ref
             != getattr(getattr(source, "snapshot", None), "ref", None)
         ):
-            return None, None
-        return source, result
+            return None, None, None
+        return source, result, self._fit_active_source_component
 
     def freeze_figure_output_request(
         self,
         *,
         source_contract_id: str | None,
-    ) -> _PanelFigureOutputRequest:
+        live_source_override=None,
+    ) -> _PanelFigureOutputRequest | None:
         """Freeze Figure intent only; derived arrays stay off the Qt owner."""
 
         from zlc_frontend.figure_outputs import (
@@ -1271,7 +1158,26 @@ class PanelCard(FluentGroupBox):
         live_source, area_commit, cross_commit, _live_fit_result = (
             self.frozen_figure_output_state()
         )
-        fit_source, fit_result = self.frozen_fit_output_state()
+        if live_source_override is not None:
+            live_source = live_source_override
+            authority = self._figure_output_authority
+            area_commit = (
+                authority.area_commit
+                if self._figure_commit_matches_value(
+                    authority.area_commit,
+                    live_source,
+                )
+                else None
+            )
+            cross_commit = (
+                authority.cross_commit
+                if self._figure_commit_matches_value(
+                    authority.cross_commit,
+                    live_source,
+                )
+                else None
+            )
+        fit_source, fit_result, fit_source_component = self.frozen_fit_output_state()
         source = fit_source if fit_result is not None else live_source
         if (
             source is not None
@@ -1284,9 +1190,10 @@ class PanelCard(FluentGroupBox):
         request = None
         source_value = None
         if source is not None:
+            presentation = self._presentation_provider(source)
             site_map = (
-                source.presentation
-                if isinstance(source.presentation, SiteMapPresentation)
+                presentation
+                if isinstance(presentation, SiteMapPresentation)
                 else None
             )
             request = FigureOutputRequest(
@@ -1304,6 +1211,16 @@ class PanelCard(FluentGroupBox):
             )
             source_value = source
 
+        signature = (
+            None if source is None else source.snapshot.ref,
+            source_contract_id,
+            area_commit,
+            cross_commit,
+            self._fit_result_identity if fit_result is not None else None,
+        )
+        if signature == self._figure_output_request_signature:
+            return None
+        self._figure_output_request_signature = signature
         self._figure_output_request_revision += 1
         return _PanelFigureOutputRequest(
             self.panel_id,
@@ -1311,6 +1228,9 @@ class PanelCard(FluentGroupBox):
             self._figure_output_request_revision,
             source_value,
             request,
+            source_component=(
+                fit_source_component if fit_result is not None else None
+            ),
         )
 
     def accepts_figure_output_completion(
@@ -1328,6 +1248,15 @@ class PanelCard(FluentGroupBox):
 
     def invalidate_figure_output_requests(self) -> None:
         self._figure_output_request_revision += 1
+        self._figure_output_request_signature = object()
+
+    def has_live_selector_outputs(self) -> bool:
+        """Whether a generation-scoped selector must follow source revisions."""
+
+        return (
+            self._figure_output_authority.area_commit is not None
+            or self._figure_output_authority.cross_commit is not None
+        )
 
     def _focus_grid_cell(self, panel_index: int, selection) -> None:
         """Show one exact cell from the currently painted coherent overview."""
@@ -1417,7 +1346,7 @@ class PanelCard(FluentGroupBox):
         """Freeze a pure view edit against the already accepted data front.
 
         A selector/display/title/size commit is not a data-acquisition boundary.
-        It must not advance ``ConsoleDataPlane`` merely because the operator
+        It must not advance ``SignalDataPlane`` merely because the operator
         moved a control.  A source rebind whose selected name differs from the
         accepted value waits for the next base tick or explicit Refresh.
         """
@@ -1474,7 +1403,7 @@ class PanelCard(FluentGroupBox):
             source = plot_panel_input(
                 self.config.kind,
                 value.snapshot,
-                getattr(value, "presentation", None),
+                self._presentation_provider(value),
             )
         except (TypeError, ValueError) as error:
             self.set_status(str(error), error=True)
@@ -1491,24 +1420,12 @@ class PanelCard(FluentGroupBox):
             self._pending_render_request_revision = None
             self._refresh_grid_view_controls()
             self._refresh_repeat_mode_control()
+            self._refresh_view_spec_controls()
         self._candidate_value = value
-        view = (
-            None
-            if self.config.kind == "sites"
-            else self._saved_view_spec(schema)
-        )
-        if self.config.kind == "grid" and view is None:
-            from zlc_frontend.plot_panel import plot_panel_view_for_schema
-
-            view = plot_panel_view_for_schema(
-                "grid",
-                self.config.params,
-                schema,
-                default_grid=True,
-            )
-        if self.config.kind == "grid" and view is None:
+        view = self._effective_view_spec(schema)
+        if self.config.kind != "sites" and view is None:
             self.set_status(
-                "choose a named facet axis in Setting",
+                "the declared axes cannot form a complete typed view",
                 error=False,
             )
             return None
@@ -1584,23 +1501,11 @@ class PanelCard(FluentGroupBox):
         source = plot_panel_input(
             self.config.kind,
             snapshot,
-            getattr(value, "presentation", None),
+            self._presentation_provider(value),
         )
-        if self.config.kind == "sites":
-            view = None
-        else:
-            view = self._saved_view_spec(schema)
-            if self.config.kind == "grid" and view is None:
-                from zlc_frontend.plot_panel import plot_panel_view_for_schema
-
-                view = plot_panel_view_for_schema(
-                    "grid",
-                    self.config.params,
-                    schema,
-                    default_grid=True,
-                )
-            if self.config.kind == "grid" and view is None:
-                raise ValueError("grid surface needs a named facet axis")
+        view = self._effective_view_spec(schema)
+        if self.config.kind != "sites" and view is None:
+            raise ValueError("dataset surface needs a complete typed view")
         fit_result = self._fit_result
         fit_result_identity = self._fit_result_identity
         if fit_result is None or fit_result.source_ref != snapshot.ref:
@@ -1648,7 +1553,6 @@ class PanelCard(FluentGroupBox):
         from zlc_frontend import PanelProvenance
         source_key = (
             str(value.name),
-            str(value.source),
             contract.session_identity,
             source.session_identity,
         )
@@ -1843,6 +1747,7 @@ class PanelCard(FluentGroupBox):
         self._candidate_schema = request.value.snapshot.block.schema
         self._refresh_grid_view_controls()
         self._refresh_repeat_mode_control()
+        self._refresh_view_spec_controls()
         self.set_status("ok", error=False)
         return True
 
@@ -1996,8 +1901,8 @@ class PanelCard(FluentGroupBox):
 
         This is a projection of the already-owned immutable monitor revision,
         not another acquisition and not a GUI snapshot.  The same
-        :class:`PanelComposer` supplies the document used to draw the card, so
-        saving cannot re-guess axes or plot kind from an array shape.
+        frontend Figure session supplies the document used to draw the card,
+        so saving cannot re-guess axes or plot kind from an array shape.
         """
 
         if self.config.kind == "sites":
@@ -2113,16 +2018,51 @@ class PanelCard(FluentGroupBox):
         try:
             self._build_plot()
             logical_size = pending_contract.logical_size
-            if faceted is not None:
-                if faceted.overview is not None:
-                    self.board.present_overview(faceted.overview)
-                else:
-                    self.board.present_frame(
-                        faceted.frame,
-                        logical_size=logical_size,
+            selector_figure = None
+            if faceted is not None and faceted.focus is not None:
+                intent = pending_contract.intent
+                if pending_figure is None or intent is None:
+                    raise RuntimeError(
+                        "focused grid front lost its typed Figure context"
                     )
+                selector_figure = pending_figure.focused_typed_panel(
+                    faceted.focus.panel_index,
+                    expected_selection=faceted.focus.selection,
+                    expected_intent=intent,
+                )
+            if faceted is not None:
+                context = (
+                    FigureSurfaceContext.for_figure(
+                        pending_figure,
+                        display=pending_display,
+                        contract=pending_contract,
+                    )
+                    if faceted.overview is not None
+                    else FigureSurfaceContext.for_frame(
+                        faceted.frame,
+                        figure=pending_figure,
+                        display=pending_display,
+                        contract=pending_contract,
+                        selector_figure=selector_figure,
+                    )
+                )
+                self.board.present_faceted(
+                    faceted,
+                    context=context,
+                    logical_size=logical_size,
+                )
             else:
-                self.board.present_frame(frame, logical_size=logical_size)
+                context = FigureSurfaceContext.for_frame(
+                    frame,
+                    figure=pending_figure,
+                    display=pending_display,
+                    contract=pending_contract,
+                )
+                self.board.present_frame(
+                    frame,
+                    context=context,
+                    logical_size=logical_size,
+                )
             self._presented_figure = pending_figure
             self._presented_display = pending_display
             self._presented_contract = pending_contract
@@ -2160,8 +2100,8 @@ class PanelCard(FluentGroupBox):
         )
         self.front_presented.emit()
         if (
-            self._area_commit is not None
-            or self._cross_commit is not None
+            self._figure_output_authority.area_commit is not None
+            or self._figure_output_authority.cross_commit is not None
             or self._fit_result is not None
         ):
             self.figure_outputs_changed.emit()
@@ -2308,6 +2248,12 @@ class PanelCard(FluentGroupBox):
             form_widgets=self.form_widgets,
             parent=content,
         )
+        self.view_spec_editor = ViewSpecEditor(
+            label_width=label_w,
+            parent=content,
+        )
+        self.view_spec_editor.viewChanged.connect(self._commit_view_spec)
+        display.addWidget(self.view_spec_editor)
         self.repeat_mode_row, self.repeat_mode_combo = self._make_repeat_mode_row(
             self._commit_repeat_mode,
             label_w,
@@ -2382,6 +2328,7 @@ class PanelCard(FluentGroupBox):
         self._settings_col.addStretch(1)
 
         self._refresh_signal_combo()
+        self._refresh_view_spec_controls()
 
     def _remove_from_settings(self) -> None:
         self.settings_popup.hide()
@@ -2402,6 +2349,7 @@ class PanelCard(FluentGroupBox):
         self.refresh_on_show()
         self._refresh_signal_combo()
         self._refresh_grid_view_controls()
+        self._refresh_view_spec_controls()
         if self._fit_options_identity is None:
             self._sync_fit_authoring_from_presented(prepare_authoring=True)
 
@@ -2843,6 +2791,7 @@ class PanelCard(FluentGroupBox):
         )
         self._refresh_grid_view_controls()
         self._refresh_repeat_mode_control()
+        self._refresh_view_spec_controls()
         return changed
 
     def _saved_view_spec(self, schema):
@@ -2857,6 +2806,59 @@ class PanelCard(FluentGroupBox):
             self.config.params,
             schema,
         )
+
+    def _effective_view_spec(self, schema):
+        """Resolve the exact auto-or-authored frontend view used for display."""
+
+        if self.config.kind == "sites":
+            return None
+        saved = self._saved_view_spec(schema)
+        if saved is not None:
+            return saved
+        if self.config.kind == "grid":
+            from zlc_frontend.figure import suggest_default_grid_view
+
+            return suggest_default_grid_view(schema).spec
+        from zlc_frontend.figure import suggest_view
+
+        return suggest_view(schema, self.view_intent()).spec
+
+    def _refresh_view_spec_control_surface(self, owner) -> None:
+        editor = getattr(owner, "view_spec_editor", None)
+        if editor is None:
+            return
+        schema = self._current_schema()
+        editor.reconcile(
+            schema,
+            None if schema is None else self._effective_view_spec(schema),
+        )
+
+    def _refresh_view_spec_controls(self) -> None:
+        self._refresh_view_spec_control_surface(self)
+
+    def _commit_view_spec(self, candidate) -> bool:
+        """Persist one frontend-authored display view without changing data."""
+
+        from zlc_frontend.figure import ViewSpec, validate_view_spec, view_spec_to_tree
+
+        schema = self._current_schema()
+        if schema is None:
+            return False
+        if not isinstance(candidate, ViewSpec):
+            raise TypeError("view editor must emit ViewSpec")
+        if candidate.schema_fingerprint != schema.fingerprint:
+            raise ValueError("view editor emitted another schema generation")
+        validate_view_spec(schema, candidate)
+        self._view_pin = None
+        if self.config.kind == "grid":
+            self._grid_focus = None
+        changed = self._set_params(
+            {_VIEW_SPEC_PARAM: view_spec_to_tree(candidate)}
+        )
+        self._refresh_grid_view_controls()
+        self._refresh_repeat_mode_control()
+        self._refresh_view_spec_controls()
+        return changed
 
     def _reconcile_persisted_view_for_schema(self, schema) -> None:
         """Retire prior-generation view state at the schema commit boundary."""
@@ -3016,6 +3018,7 @@ class PanelCard(FluentGroupBox):
         )
         if changed:
             self._refresh_grid_view_controls()
+            self._refresh_view_spec_controls()
         return changed
 
     def _on_signal_pick(self, _index: int) -> None:
@@ -3040,6 +3043,7 @@ class PanelCard(FluentGroupBox):
         self._grid_focus = None
         self._pending_faceted_result = None
         self._refresh_repeat_mode_control()
+        self._refresh_view_spec_controls()
         self._invalidate_render_binding()
         self._render_version = -1
         self._request_display_render()
@@ -3064,7 +3068,7 @@ class PanelCard(FluentGroupBox):
     def accept_view_commit_from(self, host, commit) -> None:
         """CAS and answer one exact-front zoom/pan commit.
 
-        ``SinglePanelHost`` deliberately forwards the whole typed commit.  A
+        ``FigureSurfaceHost`` deliberately forwards the whole typed commit.  A
         delayed gesture from an older front therefore cannot rewrite this
         card's current view, and a failed compose releases only that pending
         origin instead of leaving the selector permanently wedged.
@@ -3675,6 +3679,7 @@ class PanelCard(FluentGroupBox):
         self._fit_draft_context = None
         self._fit_active_spec = None
         self._fit_active_source = None
+        self._fit_active_source_component = None
         self._fit_result = None
         self._fit_result_identity = None
         self._teardown_plot()

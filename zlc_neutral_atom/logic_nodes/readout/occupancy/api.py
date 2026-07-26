@@ -1,26 +1,32 @@
-"""Notebook surface owned by the Occupancy Processor and detection artifact."""
+"""Public Experiment API owned by Occupancy and its detection artifact."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
 
 from zlc_data import Selection
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
+from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.logic_nodes.camera_measurement.output_binding import (
     CameraFrameOutputBinding,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
-    ReadoutModelKind,
     ResolvedCalibration,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
 )
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.runtime.run import RunHandle
 
-from .application import DetectionRequest
-from .cell import OccupancyCellDomain
+from .application import (
+    DetectionRequest,
+    build_detection_request,
+)
+from .cell import (
+    OccupancyCellDomain,
+)
 from .processor import ResolvedOccupancy
 from .processor_application import (
     OccupancyProcessorRequest,
@@ -28,65 +34,79 @@ from .processor_application import (
     prepare_occupancy_processor,
 )
 from .reference import OccupancyArtifactRef
+from .repository import OccupancyRepository
 
 
-class OccupancyNotebookHost(Protocol):
-    def resolve_occupancy_calibration(
+class OccupancyApi:
+    __slots__ = (
+        "_admit_capture",
+        "_calibration",
+        "_inspect_cell",
+        "_load_cell",
+        "_load_occupancy_operation",
+        "_repository",
+        "_repository_path",
+        "_require_binding_operation",
+        "_start_detection_operation",
+        "_wait_run",
+    )
+
+    def __init__(
         self,
-        reference: CalibrationArtifactRef,
-    ) -> ResolvedCalibration: ...
-
-    def load_saved_occupancy_calibration(
-        self,
-        calibration_ref_file: str | Path,
-    ) -> ResolvedCalibration: ...
-
-    def build_occupancy_detection_request(
-        self,
-        source: CaptureArtifactRef,
-        calibration: CalibrationArtifactRef,
+        calibration,
         *,
-        model_kind: ReadoutModelKind | None,
-    ) -> DetectionRequest: ...
+        repository_path: Path,
+        require_binding: Callable,
+        wait_run: Callable,
+        admit_capture: Callable,
+        start_detection: Callable,
+        load_occupancy: Callable,
+        inspect_cell: Callable,
+        load_cell: Callable,
+    ) -> None:
+        if not isinstance(repository_path, Path):
+            raise TypeError("repository_path must be Path")
+        operations = (
+            require_binding,
+            wait_run,
+            admit_capture,
+            start_detection,
+            load_occupancy,
+            inspect_cell,
+            load_cell,
+        )
+        if any(not callable(operation) for operation in operations):
+            raise TypeError("Occupancy API operations must be callable")
+        self._calibration = calibration
+        self._repository_path = repository_path
+        self._require_binding_operation = require_binding
+        self._wait_run = wait_run
+        self._admit_capture = admit_capture
+        self._start_detection_operation = start_detection
+        self._load_occupancy_operation = load_occupancy
+        self._inspect_cell = inspect_cell
+        self._load_cell = load_cell
+        self._repository: OccupancyRepository | None = None
 
-    def start_occupancy_detection(self, request: DetectionRequest) -> RunHandle: ...
+    def _occupancy_repository(self) -> OccupancyRepository:
+        repository = self._repository
+        if repository is None:
+            repository = OccupancyRepository(self._repository_path)
+            self._repository = repository
+        return repository
 
-    def run_occupancy_detection(
-        self,
-        request: DetectionRequest,
-    ) -> OccupancyArtifactRef: ...
+    def close(self) -> tuple[Exception, ...]:
+        repository = self._repository
+        if repository is None:
+            return ()
+        try:
+            repository.close()
+        except Exception as error:
+            return (error,)
+        return ()
 
-    def admit_occupancy_artifact(
-        self,
-        reference: OccupancyArtifactRef,
-    ) -> ResolvedOccupancy: ...
-
-    def inspect_occupancy_navigation(
-        self,
-        reference: OccupancyArtifactRef,
-    ) -> OccupancyCellDomain: ...
-
-    def compose_occupancy_cell_source(
-        self,
-        reference: OccupancyArtifactRef,
-        selection: Selection | None,
-        *,
-        expected_navigation: OccupancyCellDomain | None,
-    ): ...
-
-    def open_occupancy_cell_gui(
-        self,
-        reference: OccupancyArtifactRef,
-        selection: Selection | None,
-    ): ...
-
-
-class OccupancyNotebookAdapter:
-    __slots__ = ()
-
-    @property
-    def _occupancy_notebook_host(self) -> OccupancyNotebookHost:
-        raise NotImplementedError
+    def _require_binding(self, binding: ReadoutBindingKey) -> None:
+        self._require_binding_operation(binding)
 
     def prepare_occupancy_processor_request(
         self,
@@ -94,9 +114,7 @@ class OccupancyNotebookAdapter:
     ) -> PreparedOccupancyProcessor:
         if not isinstance(request, OccupancyProcessorRequest):
             raise TypeError("request must be OccupancyProcessorRequest")
-        resolved = self._occupancy_notebook_host.resolve_occupancy_calibration(
-            request.calibration_ref
-        )
+        resolved = self._calibration.load_calibration(request.calibration_ref)
         self._require_binding(resolved.artifact.frame_contract.binding)
         return prepare_occupancy_processor(request, resolved)
 
@@ -122,9 +140,7 @@ class OccupancyNotebookAdapter:
         calibration_ref_file: str | Path,
         model_kind: ReadoutModelKind | None = None,
     ) -> PreparedOccupancyProcessor:
-        resolved = self._occupancy_notebook_host.load_saved_occupancy_calibration(
-            calibration_ref_file
-        )
+        resolved = self._calibration.load_saved_calibration(calibration_ref_file)
         return self.prepare_occupancy_processor_request(
             OccupancyProcessorRequest(
                 camera_output_binding,
@@ -133,6 +149,11 @@ class OccupancyNotebookAdapter:
             )
         )
 
+    def load_saved_calibration(self, path: str | Path) -> ResolvedCalibration:
+        """Admit one saved Calibration pointer for Occupancy authoring."""
+
+        return self._calibration.load_saved_calibration(path)
+
     def detection_request(
         self,
         source: CaptureArtifactRef,
@@ -140,9 +161,9 @@ class OccupancyNotebookAdapter:
         *,
         model_kind: ReadoutModelKind | None = None,
     ) -> DetectionRequest:
-        request = self._occupancy_notebook_host.build_occupancy_detection_request(
-            source,
-            calibration,
+        request = build_detection_request(
+            self._admit_capture(source),
+            self._calibration.load_calibration(calibration),
             model_kind=model_kind,
         )
         self._require_binding(request.readout_binding)
@@ -152,21 +173,44 @@ class OccupancyNotebookAdapter:
         if not isinstance(request, DetectionRequest):
             raise TypeError("request must be DetectionRequest")
         self._require_binding(request.readout_binding)
-        return self._occupancy_notebook_host.start_occupancy_detection(request)
+        return self._start_detection_operation(
+            request,
+            self._occupancy_repository(),
+        )
 
     def detect(self, request: DetectionRequest) -> OccupancyArtifactRef:
         if not isinstance(request, DetectionRequest):
             raise TypeError("request must be DetectionRequest")
         self._require_binding(request.readout_binding)
-        return self._occupancy_notebook_host.run_occupancy_detection(request)
+        return self._wait_run(self.start_detection(request))
 
     def load_occupancy(
         self,
         reference: OccupancyArtifactRef,
     ) -> ResolvedOccupancy:
-        resolved = self._occupancy_notebook_host.admit_occupancy_artifact(reference)
+        resolved = self._load_occupancy_operation(
+            reference,
+            self._occupancy_repository(),
+        )
         self._require_binding(resolved.readout_binding)
         return resolved
+
+    def _project_figure(
+        self,
+        reference: OccupancyArtifactRef,
+        *,
+        output: str | None,
+        materialize: bool,
+    ):
+        """Project an Occupancy artifact through its capability-owned UI leaf."""
+
+        from .ui.view_projection import project_occupancy_figure
+
+        return project_occupancy_figure(
+            self.load_occupancy(reference),
+            output=output,
+            materialize=materialize,
+        )
 
     def _inspect_occupancy_cell_navigation(
         self,
@@ -174,7 +218,7 @@ class OccupancyNotebookAdapter:
     ) -> OccupancyCellDomain:
         if not isinstance(reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
-        domain = self._occupancy_notebook_host.inspect_occupancy_navigation(reference)
+        domain = self._inspect_cell(reference, self._occupancy_repository())
         self._require_binding(domain.readout_binding)
         return domain
 
@@ -194,11 +238,20 @@ class OccupancyNotebookAdapter:
             OccupancyCellDomain,
         ):
             raise TypeError("expected_navigation must be OccupancyCellDomain or None")
-        return self._occupancy_notebook_host.compose_occupancy_cell_source(
+        source = self._load_cell(
             reference,
+            self._occupancy_repository(),
             selection,
-            expected_navigation=expected_navigation,
+            expected_domain_identity=(
+                None
+                if expected_navigation is None
+                else expected_navigation.identity
+            ),
         )
+        self._require_binding(source.domain.readout_binding)
+        from .ui.view_projection import build_exact_occupancy_cell_view
+
+        return build_exact_occupancy_cell_view(source)
 
     def occupancy_cell_view(
         self,
@@ -218,13 +271,16 @@ class OccupancyNotebookAdapter:
             raise TypeError("reference must be OccupancyArtifactRef")
         if selection is not None and not isinstance(selection, Selection):
             raise TypeError("selection must be Selection or None")
-        return self._occupancy_notebook_host.open_occupancy_cell_gui(
+        from .ui.workbench import open_occupancy_cell_workbench
+
+        return open_occupancy_cell_workbench(
+            self._inspect_occupancy_cell_navigation,
+            self._load_occupancy_cell_source,
             reference,
-            selection,
+            selection=selection,
         )
 
 
 __all__ = [
-    "OccupancyNotebookAdapter",
-    "OccupancyNotebookHost",
+    "OccupancyApi",
 ]

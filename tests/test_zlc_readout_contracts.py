@@ -374,7 +374,7 @@ def test_multievent_calibration_contract_matches_same_single_event_occupancy() -
     assert calibrated.readout_mode == "low-noise"
 
 
-def test_live_camera_working_point_requires_the_complete_frame_contract() -> None:
+def test_live_camera_working_point_requires_explicit_applicability_facts() -> None:
     calibrated = _contract()
     live_facts = replace(
         _physical_facts(),
@@ -393,10 +393,8 @@ def test_live_camera_working_point_requires_the_complete_frame_contract() -> Non
     for change in (
         {"optical_path": "alternate-imaging-v1"},
         {"roi_origin_yx": (11, 20)},
-        {"exposure_seconds": 0.0021},
         {"gain": 2.1},
         {"readout_mode": "alternate-mode"},
-        {"opaque_frame_settings_fingerprint": "9" * 64},
     ):
         with pytest.raises(ValueError, match="readout frame contract mismatch"):
             calibrated.assert_compatible_working_point(
@@ -404,6 +402,19 @@ def test_live_camera_working_point_requires_the_complete_frame_contract() -> Non
                 replace(live_facts, **change),
                 frame_schema,
             )
+
+    # Raw camera exposure is not the pulse-defined atom illumination window,
+    # and the opaque digest includes that raw exposure.  They remain recorded
+    # in provenance but cannot independently invalidate the calibration.
+    for change in (
+        {"exposure_seconds": 0.0021},
+        {"opaque_frame_settings_fingerprint": "9" * 64},
+    ):
+        calibrated.assert_compatible_working_point(
+            BINDING,
+            replace(live_facts, **change),
+            frame_schema,
+        )
 
 
 def test_reference_schedule_and_capture_fingerprint_do_not_leak_into_frame_applicability() -> None:
@@ -435,19 +446,17 @@ def test_reference_schedule_and_capture_fingerprint_do_not_leak_into_frame_appli
 
 
 @pytest.mark.parametrize(
-    ("exposure", "gain", "mode"),
+    ("gain", "mode"),
     [
-        (0.0021, 2.0, "low-noise"),
-        (0.002, 2.1, "low-noise"),
-        (0.002, 2.0, "alternate-mode"),
+        (2.1, "low-noise"),
+        (2.0, "alternate-mode"),
     ],
 )
-def test_selected_exposure_gain_and_mode_changes_are_rejected(
-    exposure: float,
+def test_selected_gain_and_mode_changes_are_rejected(
     gain: float,
     mode: str,
 ) -> None:
-    descriptor = _single_event_descriptor(exposure=exposure, gain=gain, mode=mode)
+    descriptor = _single_event_descriptor(exposure=0.002, gain=gain, mode=mode)
     with pytest.raises(ValueError, match="frame contract mismatch"):
         _contract().assert_compatible(
             BINDING,
@@ -457,18 +466,27 @@ def test_selected_exposure_gain_and_mode_changes_are_rejected(
         )
 
 
+def test_selected_raw_exposure_is_provenance_not_an_applicability_blocker() -> None:
+    descriptor = _single_event_descriptor(exposure=0.0021)
+    _contract().assert_compatible(
+        BINDING,
+        descriptor,
+        _single_event_schema(descriptor),
+        readout_event_index=0,
+    )
+
+
 @pytest.mark.parametrize("frame_fingerprint", ["9" * 64, None])
-def test_selected_opaque_frame_settings_evidence_is_fail_closed(
+def test_selected_opaque_frame_settings_evidence_is_provenance_only(
     frame_fingerprint: str | None,
 ) -> None:
     descriptor = _single_event_descriptor(frame_fingerprint=frame_fingerprint)
-    with pytest.raises(ValueError, match="opaque_frame_settings_fingerprint"):
-        _contract().assert_compatible(
-            BINDING,
-            descriptor,
-            _single_event_schema(descriptor),
-            readout_event_index=0,
-        )
+    _contract().assert_compatible(
+        BINDING,
+        descriptor,
+        _single_event_schema(descriptor),
+        readout_event_index=0,
+    )
 
 
 @pytest.mark.parametrize(

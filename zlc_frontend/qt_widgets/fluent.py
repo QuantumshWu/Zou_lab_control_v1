@@ -3223,8 +3223,16 @@ class ElidedLabel(QtWidgets.QLabel):
         self.setAlignment(align)
         self.setStyleSheet(f'QLabel {{ color: {TEXT}; font: {fluent_font_size()}pt "{FONT}"; background: transparent; }}')
         self.setMinimumWidth(scaled_px(8))
+        # Elision makes the *painted* QLabel text fit the assigned geometry, so
+        # the normal Preferred policy remains width-neutral once layout has
+        # assigned that geometry.  QSizePolicy.Ignored is not equivalent: Qt
+        # then omits even an explicit minimumWidth from the layout allocation
+        # while QWidget still enforces that minimum on itself.  The result is
+        # overlapping siblings (and right-edge overflow) whenever a caller
+        # reserves a real identity/status column.  Keep the label shrinkable,
+        # but let the layout honour its declared minimum.
         self.setSizePolicy(
-            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
             QtWidgets.QSizePolicy.Preferred,
         )
         self.setText(str(text))

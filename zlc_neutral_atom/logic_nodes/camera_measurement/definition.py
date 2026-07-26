@@ -361,52 +361,77 @@ def project_camera_monitor_outputs(
     source: MonitorDatasetSnapshot,
     request: "CameraMeasurementRequest",
 ) -> dict[str, LiveDatasetOutput]:
-    """Project an atomic monitor cycle without misreporting frame coverage.
+    """Publish the newest atomic monitor cycle as declared ``frame_i`` values.
 
-    Event references are selected with the same declared READOUT_EVENT index as
-    the Dataset.  Consequently each ``frame_i`` reports coverage in its own
-    reduced point geometry and carries provenance for that frame rather than
-    reusing the most recent event of the whole cycle.
+    ``MONITOR_HISTORY`` is private rolling-storage geometry, not a physical
+    point axis of a public Camera signal.  The frozen monitor orders that axis
+    newest-first, so every output selects history index zero together with its
+    declared ``READOUT_EVENT`` index.  The resulting public signal therefore
+    retains the universal ``(R=1, P=1, *data_shape)`` contract regardless of
+    the configured history capacity.
     """
 
     if not isinstance(source, MonitorDatasetSnapshot):
         raise TypeError("source must be MonitorDatasetSnapshot")
-    frames = project_camera_measurement_outputs(source.snapshot, request)
     source_schema = source.snapshot.block.schema
-    event_positions = tuple(
-        index
-        for index, axis in enumerate(source_schema.point_axes)
-        if axis.role == READOUT_EVENT
+    history_axes = tuple(
+        axis for axis in source_schema.point_axes if axis.role == MONITOR_HISTORY
     )
-    if len(event_positions) != 1:
+    event_axes = tuple(
+        axis for axis in source_schema.point_axes if axis.role == READOUT_EVENT
+    )
+    if len(history_axes) != 1:
+        raise ValueError("Camera monitor must contain one MONITOR_HISTORY axis")
+    if len(event_axes) != 1:
         raise ValueError("Camera monitor must contain one READOUT_EVENT axis")
-    event_position = event_positions[0]
-    projected: dict[str, LiveDatasetOutput] = {}
-    for declaration, snapshot in zip(
-        request.output_declarations,
-        frames.values(),
-        strict=True,
+    if any(
+        axis.role not in {MONITOR_HISTORY, READOUT_EVENT}
+        for axis in source_schema.point_axes
     ):
+        raise ValueError("Camera monitor contains an unsupported public point axis")
+    history_axis = history_axes[0]
+    event_axis = event_axes[0]
+    if event_axis.size != request.frames_per_cycle:
+        raise ValueError(
+            "Camera monitor READOUT_EVENT size differs from frames_per_cycle"
+        )
+
+    projected: dict[str, LiveDatasetOutput] = {}
+    for declaration in request.output_declarations:
         output_name = declaration.name
         event_index = camera_frame_output_index(output_name)
+        snapshot = materialize_dataset_selection(
+            source.snapshot,
+            Selection(
+                (
+                    IndexSelection(history_axis.axis_id, 0),
+                    IndexSelection(event_axis.axis_id, event_index),
+                )
+            ),
+            reference_for=lambda output_schema, index=event_index: _camera_frame_ref(
+                source.snapshot,
+                event_axis.axis_id.value,
+                index,
+                output_schema,
+            ),
+        )
         output_schema = snapshot.block.schema
-        selected_refs = []
-        for repeat_index in range(output_schema.repeat_axis.size):
-            for output_storage_index in range(
-                output_schema.point_layout.storage_size
-            ):
-                output_logical = list(
-                    output_schema.point_layout.multi_index(output_storage_index)
-                )
-                output_logical.insert(event_position, event_index)
-                source_storage_index = source_schema.point_layout.storage_index(
-                    tuple(output_logical)
-                )
-                linear_index = (
-                    repeat_index * source_schema.point_layout.storage_size
-                    + source_storage_index
-                )
-                selected_refs.append(source.event_refs[linear_index])
+        if output_schema.point_axes:
+            raise RuntimeError("Camera monitor storage axes leaked into a public frame")
+        source_logical_point = tuple(
+            0 if axis.role == MONITOR_HISTORY else event_index
+            for axis in source_schema.point_axes
+        )
+        source_storage_index = source_schema.point_layout.storage_index(
+            source_logical_point
+        )
+        selected_refs = tuple(
+            source.event_refs[
+                repeat_index * source_schema.point_layout.storage_size
+                + source_storage_index
+            ]
+            for repeat_index in range(output_schema.repeat_axis.size)
+        )
         total = (
             output_schema.repeat_axis.size
             * output_schema.point_layout.storage_size
@@ -437,65 +462,6 @@ def project_camera_monitor_outputs(
             join_digest,
         )
     return projected
-
-
-def current_camera_monitor_selection(
-    schema: DatasetSchema,
-    coverage: MonitorCoverage,
-) -> tuple[int, tuple[int, ...], Selection]:
-    """Resolve the exact current Camera cell from monitor storage semantics.
-
-    ``MonitorDataset`` presents the newest history slot at logical index zero;
-    Camera's default live view presents ``frame_0`` of that cycle.  Keeping
-    this rule beside Camera Measurement prevents a GUI from rediscovering the
-    cell from array rank or storage order.
-    """
-
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    if not isinstance(coverage, MonitorCoverage):
-        raise TypeError("coverage must be MonitorCoverage")
-    if coverage.written_cells == 0:
-        raise ValueError("the current Camera monitor has no committed cell")
-    if schema.repeat_axis.size != 1:
-        raise ValueError("the current Camera monitor requires one storage repeat")
-    history_axes = tuple(
-        axis for axis in schema.point_axes if axis.role == MONITOR_HISTORY
-    )
-    if len(history_axes) != 1:
-        raise ValueError(
-            "the current Camera monitor requires one MONITOR_HISTORY axis"
-        )
-    event_axes = tuple(
-        axis for axis in schema.point_axes if axis.role == READOUT_EVENT
-    )
-    if len(event_axes) > 1:
-        raise ValueError("a Camera monitor has multiple READOUT_EVENT axes")
-    if any(
-        axis.role not in {MONITOR_HISTORY, READOUT_EVENT}
-        for axis in schema.point_axes
-    ):
-        raise ValueError("a Camera monitor contains an unsupported point axis")
-
-    logical_point = tuple(0 for _axis in schema.point_axes)
-    selection = Selection(
-        (
-            IndexSelection(schema.repeat_axis.axis_id, 0),
-            *(
-                IndexSelection(axis.axis_id, index)
-                for axis, index in zip(
-                    schema.point_axes,
-                    logical_point,
-                    strict=True,
-                )
-            ),
-        )
-    )
-    return (
-        schema.point_layout.storage_index(logical_point),
-        logical_point,
-        selection,
-    )
 
 
 @dataclass(frozen=True)
@@ -629,7 +595,6 @@ __all__ = [
     "camera_measurement_roles",
     "camera_frame_output_index",
     "camera_frame_output_declarations",
-    "current_camera_monitor_selection",
     "project_camera_measurement_outputs",
     "camera_measurement_final_outputs",
     "project_camera_monitor_outputs",

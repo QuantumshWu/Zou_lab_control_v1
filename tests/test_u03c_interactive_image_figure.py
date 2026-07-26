@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import gc
+from io import BytesIO
 import os
 from pathlib import Path
 import threading
@@ -12,6 +13,7 @@ import weakref
 
 import numpy as np
 import pytest
+from PIL import Image
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -344,7 +346,11 @@ def test_image_front_preserves_exact_axes_validity_and_all_display_interactions(
         application,
         lambda: window._future is None and destination.exists(),
     )
-    assert destination.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    with Image.open(BytesIO(destination.read_bytes())) as exported:
+        exported_rgba = exported.convert("RGBA")
+        raster = _frame.panels[0].raster
+        assert exported_rgba.size == (raster.width, raster.height)
+        assert exported_rgba.tobytes() == raster.pixels
     assert window._status.text() == "READY"
 
     _close(application, window)
@@ -457,9 +463,6 @@ def test_initial_image_front_cannot_self_attest_a_conflicting_viewport() -> None
     front = figure_module.render_data_figure_front(
         figure,
         ImageDisplayState(),
-        current_value_limits=None,
-        previous_relim_mode=None,
-        previous_count_scale=None,
         sequence=0,
         check_cancelled=lambda: None,
     )

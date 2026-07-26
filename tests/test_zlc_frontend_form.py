@@ -200,10 +200,13 @@ def test_closed_registry_has_one_complete_atomic_handler_per_kind() -> None:
         FORM_WIDGET_HANDLERS["new"] = object()
 
 
-def test_form_projects_numeric_fields_to_fluent_spinboxes() -> None:
+def test_form_keeps_spins_numeric_and_projects_optional_numbers_as_typed_blanks() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtGui
+
     from zlc_frontend.qt_widgets import (
         FluentDoubleSpinBox,
+        FluentLineEdit,
         FluentParameterForm,
         FluentSpinBox,
         ensure_qt_app,
@@ -215,8 +218,17 @@ def test_form_projects_numeric_fields_to_fluent_spinboxes() -> None:
     assert isinstance(form.widget_for("count"), FluentSpinBox)
     assert isinstance(form.widget_for("timeout"), FluentDoubleSpinBox)
     assert isinstance(form.widget_for("gain"), FluentDoubleSpinBox)
-    assert isinstance(form.widget_for("site"), FluentSpinBox)
-    assert isinstance(form.widget_for("exposure"), FluentDoubleSpinBox)
+    site = form.widget_for("site")
+    exposure = form.widget_for("exposure")
+    assert isinstance(site, FluentLineEdit)
+    assert isinstance(exposure, FluentLineEdit)
+    assert form.widget_for("iterations").specialValueText() == ""
+    assert form.widget_for("timeout").specialValueText() == ""
+    for optional in (site, exposure):
+        validator = optional.validator()
+        assert validator is not None
+        assert validator.validate("", 0)[0] == QtGui.QValidator.Intermediate
+        assert validator.validate("Auto", 4)[0] == QtGui.QValidator.Invalid
 
     values = form.read_all()
     assert values["iterations"] == 40

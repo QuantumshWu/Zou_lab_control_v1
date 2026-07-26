@@ -89,7 +89,7 @@ class _StandaloneTaskConsoleFlow:
         self.failure: BaseException | None = None
 
     def open(self):
-        from Zou_lab_control.notebook import device_manager
+        from Zou_lab_control.api import device_manager
 
         kwargs = {
             "repository": self.args.repository,

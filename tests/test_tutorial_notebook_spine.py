@@ -31,6 +31,12 @@ _REQUIRED_MARKDOWN = (
 )
 
 _REQUIRED_CURRENT_CODE = (
+    "Zou_lab_control.api",
+    "exp.nodes.calibration",
+    "exp.nodes.occupancy",
+    "exp.nodes.camera_measurement",
+    "exp.nodes.pulse_scan",
+    "exp.nodes.temperature",
     "resolve_api_parameters",
     "FrozenScanTable",
     "temperature_release_recapture_request",
@@ -40,6 +46,17 @@ _REQUIRED_CURRENT_CODE = (
 )
 
 _FORBIDDEN_OLD_OR_RAW_CODE = (
+    "Zou_lab_control.notebook",
+    "exp.readout.sitemap",
+    "exp.readout.load_calibration",
+    "exp.readout.detection_request",
+    "exp.readout.detect",
+    "exp.readout.load_occupancy",
+    "exp.readout.camera_measurement_request",
+    "exp.readout.prepare_camera_measurement",
+    "exp.readout.prepare_scan_source",
+    "exp.readout.materialize_scan",
+    "exp.readout.temperature_release_recapture",
     "Zou_lab_control.frontend",
     "Zou_lab_control.neutral_atom",
     "load_sitemap_pulse",

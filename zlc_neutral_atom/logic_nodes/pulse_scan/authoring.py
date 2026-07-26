@@ -45,9 +45,12 @@ PULSE_SCAN_SOURCE_INPUT_SPEC = DatasetInputSpec(
     None,
     description=(
         "Any live Dataset signal published by another running Measurement, "
-        "Processor, selector, or Fit output. PulseScan samples the next fresh "
-        "ordered value and never owns the producer or its device."
+        "Processor, or association-preserving Area/Cross selector. Fit "
+        "parameters and other snapshot-only values remain ordinary signals but "
+        "are not offered here. PulseScan samples the next producer-associated "
+        "value and never owns the producer or its device."
     ),
+    requires_event_association=True,
 )
 _PULSE_SCAN_INPUT_SPECS = (PULSE_SCAN_SOURCE_INPUT_SPEC,)
 

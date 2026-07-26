@@ -34,9 +34,8 @@ def _source_files(roots=SOURCE_ROOTS):
 
     ``Path.rglob`` on a missing directory yields nothing and raises nothing, so a
     guard that names a root keeps PASSING while silently auditing less the moment
-    that root is renamed or deleted.  During a migration that renames roots for a
-    living, a guard going quietly vacuous is worse than no guard: it reads as
-    evidence.  Proving the roots exist converts that into a red test.
+    that root is renamed or deleted. Proving the roots exist converts that into a
+    red test.
     """
 
     missing = [root for root in roots if not (ROOT / root).is_dir()]
@@ -57,9 +56,8 @@ def _sole_definition(name, node_type=ast.ClassDef):
     ``Zou_lab_control/frontend/data_figure.py`` for a forbidden version field, and
     when the salvage turned that path into a forwarding shim the check kept
     passing against a file which by construction could no longer contain what it
-    was looking for.  Searching for the definition follows the code across the
-    migration, and requiring EXACTLY ONE site proves in passing that nobody forked
-    it into a second copy.
+    was looking for. Searching for the definition follows the owner, and requiring
+    EXACTLY ONE site proves in passing that nobody forked it into a second copy.
     """
 
     sites = []
@@ -207,8 +205,7 @@ def _imports(path: Path) -> set[str]:
 @pytest.mark.parametrize("package,forbidden", FORBIDDEN.items())
 def test_target_package_has_no_reverse_imports(package, forbidden):
     root = ROOT / package
-    if not root.exists():
-        pytest.skip(f"{package} has not entered its migration slice")
+    assert root.is_dir(), f"declared source package is missing: {package}"
     violations = []
     for path in root.rglob("*.py"):
         if package == "zlc_neutral_atom" and _is_logic_node_product_leaf(path):
@@ -266,8 +263,7 @@ def test_task_console_does_not_reconstruct_figure_output_presentation():
         "FitParameterMetadata",
         "figure_output_contract_id",
         "AREA_DATA_OUTPUT",
-        "CROSS_X_OUTPUT",
-        "CROSS_Y_OUTPUT",
+        "CROSS_DATA_OUTPUT",
         "FIT_OUTPUT_PREFIX",
         "area.range.",
     )
@@ -725,8 +721,7 @@ def test_domain_packages_may_not_import_a_gui_toolkit(package):
     """
 
     root = ROOT / package
-    if not root.exists():
-        pytest.skip(f"{package} has not entered its migration slice")
+    assert root.is_dir(), f"declared headless package is missing: {package}"
     violations = []
     for path in sorted(root.rglob("*.py")):
         if package == "zlc_neutral_atom" and _is_logic_node_product_leaf(path):
@@ -741,8 +736,25 @@ def test_domain_packages_may_not_import_a_gui_toolkit(package):
     )
 
 
+def _logic_node_capability_roots() -> tuple[Path, ...]:
+    logic_nodes = ROOT / "zlc_neutral_atom" / "logic_nodes"
+    roots: set[Path] = set()
+    package_files = sorted(logic_nodes.rglob("package.py"))
+    assert package_files, "Logic-node package discovery guard is scanning nothing"
+    for package_file in package_files:
+        current = package_file.parent
+        while current != logic_nodes:
+            package_root = current / "__init__.py"
+            assert package_root.is_file(), (
+                f"Logic-node package path lacks __init__.py: {current.relative_to(ROOT)}"
+            )
+            roots.add(package_root)
+            current = current.parent
+    return tuple(sorted(roots))
+
+
 def test_logic_node_package_roots_do_not_eagerly_import_optional_ui():
-    roots = sorted((ROOT / "zlc_neutral_atom/logic_nodes").glob("*/__init__.py"))
+    roots = _logic_node_capability_roots()
     assert roots, "logic-node package-root guard is scanning nothing"
     violations = []
     for path in roots:
@@ -756,7 +768,9 @@ def test_logic_node_package_roots_do_not_eagerly_import_optional_ui():
 
 
 def test_logic_node_ui_package_roots_are_inert():
-    roots = sorted((ROOT / "zlc_neutral_atom/logic_nodes").glob("*/ui/__init__.py"))
+    roots = sorted(
+        (ROOT / "zlc_neutral_atom" / "logic_nodes").rglob("ui/__init__.py")
+    )
     assert roots, "logic-node UI package-root guard is scanning nothing"
     violations = []
     for path in roots:
@@ -800,8 +814,8 @@ def test_no_task_console_attachment_residue_exists():
 
 def test_optional_logic_node_adapter_leaves_are_headless_importable():
     logic_nodes = ROOT / "zlc_neutral_atom/logic_nodes"
-    paths = sorted(logic_nodes.glob("*/workbench_adapter.py"))
-    paths += sorted(logic_nodes.glob("*/ui/task_console.py"))
+    paths = sorted(logic_nodes.rglob("workbench_adapter.py"))
+    paths += sorted(logic_nodes.rglob("ui/task_console.py"))
     assert paths, "optional adapter import guard is scanning nothing"
     modules = [
         ".".join(path.relative_to(ROOT).with_suffix("").parts)
@@ -826,14 +840,11 @@ def test_optional_logic_node_adapter_leaves_are_headless_importable():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_notebook_facade_has_no_implicit_current_calibration_state():
-    source = (ROOT / "Zou_lab_control/notebook/facade.py").read_text(
-        encoding="utf-8"
-    )
-    assert "current_calibration" not in source, (
-        "calibration-dependent notebook requests must receive an explicit typed ref; "
-        "do not restore a session current/revision map"
-    )
+def test_public_api_has_no_implicit_current_calibration_state():
+    from Zou_lab_control.api import ReadoutFacade
+
+    assert not hasattr(ReadoutFacade, "current_calibration")
+    assert not hasattr(ReadoutFacade, "current_calibration_ref")
 
 
 def test_readout_family_root_does_not_eagerly_aggregate_leaf_owners():
@@ -851,9 +862,9 @@ def test_readout_family_root_does_not_eagerly_aggregate_leaf_owners():
     )
 
 
-def test_headless_notebook_import_does_not_load_frontend_renderer():
+def test_headless_api_import_does_not_load_frontend_renderer():
     code = (
-        "import sys; import Zou_lab_control.notebook; "
+        "import sys; import Zou_lab_control.api; "
         "assert 'zlc_frontend.render' not in sys.modules; "
         "assert not any(name == 'matplotlib' or name.startswith('matplotlib.') "
         "or name == 'PyQt5' or name.startswith('PyQt5.') "
@@ -1052,14 +1063,6 @@ def test_current_format_names_do_not_encode_edit_counters():
         Path("zlc_storage/canonical.py"): ("ZLC-CANONICAL-1",),
         Path("tests/test_zlc_storage_canonical.py"): ("ZLC-CANONICAL-1",),
         Path("docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md"): (
-            "zlc_pulse.PulseTargetABI/v1",
-            "ZLC-CANONICAL-1",
-        ),
-        # The progress ledger moved OUT of the design doc (section 22 -> its own file), and the
-        # two APPROVED hardware-protocol identities travelled with the historical rows that
-        # discuss them.  The allowlist follows the text to its new home; the pattern is not
-        # weakened.
-        Path("docs/MIGRATION_LEDGER_zh.md"): (
             "zlc_pulse.PulseTargetABI/v1",
             "ZLC-CANONICAL-1",
         ),

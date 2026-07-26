@@ -37,10 +37,10 @@ from zlc_neutral_atom.capture.artifact import (
 from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
-    ReadoutModelKind,
     SiteMap,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.repository import CalibrationRepository
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from .processor import OccupancyArtifact
 from .reference import OccupancyArtifactRef

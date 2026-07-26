@@ -13,40 +13,29 @@ from zlc_data import (
     SITE,
     SPATIAL_X,
     SPATIAL_Y,
-    SPECTRAL,
     AxisId,
     AxisLayout,
     AxisSpec,
     BlockId,
     CoordinateFrameId,
     DataBlock,
-    DataTransformSpec,
     DatasetRevision,
     DatasetSchema,
     FitBatchStatus,
     FitNumericPolicy,
     FitResultBatch,
-    IndexRangeSelection,
-    MissingPolicy,
     OwnedSnapshot,
     PointLayout,
     Selection,
     StreamGenerationId,
     VALID,
     ValidityContract,
-    ValidityPolicy,
     ValueSchema,
-    ReductionMethod,
-    ReductionSpec,
-    bind_fit,
-    commit_transform,
-    fit_spec_for,
     suggest_fit_draft,
 )
 from zlc_frontend.figure import (
     AxisViewRole,
     SuggestionStatus,
-    selection_fit_view_projection,
     suggest_fit_view,
 )
 
@@ -223,164 +212,6 @@ def test_authority_draft_preserves_every_nonfit_axis_and_never_accepts_display_s
             fit_axis_ids=(scan.axis_id,),
             view_spec=object(),
         )
-
-
-@pytest.mark.parametrize("fit_role", (SCAN_POINT, SPECTRAL))
-@pytest.mark.parametrize("layout_kind", ("rect_c", "rect_f", "sparse"))
-def test_point_fit_range_projection_reconstructs_resolved_layout_exactly(
-    fit_role,
-    layout_kind,
-):
-    repeat = _axis("repeat", REPEAT, 2)
-    site = _axis("site", SITE, 2, coordinates=("left", "right"))
-    fit_axis = _axis(
-        "frequency",
-        fit_role,
-        7,
-        coordinates=(-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0),
-        unit="MHz",
-    )
-    shape = (site.size, fit_axis.size)
-    if layout_kind == "rect_c":
-        point_layout = PointLayout.rect_c(shape)
-    elif layout_kind == "rect_f":
-        point_layout = PointLayout.rect_f(shape)
-    else:
-        point_layout = PointLayout.explicit(
-            shape,
-            tuple((0, index) for index in range(7))
-            + tuple((1, index) for index in (0, 2, 3, 5, 6)),
-        )
-    schema = DatasetSchema(
-        repeat,
-        (site, fit_axis),
-        point_layout,
-        ValueSchema.scalar(np.dtype("<f8")),
-    )
-    roi = Selection.index_range(fit_axis.axis_id, 1, 6)
-
-    bound = suggest_fit_draft(
-        schema,
-        "gaussian_offset",
-        fit_axis_ids=(fit_axis.axis_id,),
-        selection=roi,
-    )
-    projected_schema, projected_roi = selection_fit_view_projection(bound)
-
-    assert projected_roi == roi
-    assert projected_schema.repeat_axis == bound.effective_schema.cell_axes[0]
-    assert projected_schema.point_axes == bound.effective_schema.cell_axes[1:]
-    assert projected_schema.cell_schema.data_axes == bound.effective_schema.data_axes
-    assert projected_schema.cell_layout == bound.effective_schema.cell_layout
-    assert projected_schema.point_axes[1].coordinates == (-2.0, -1.0, 0.0, 1.0, 2.0)
-    assert projected_schema.point_axes[1].index_origin == 0
-    assert bound.spec.batch_axis_ids == (repeat.axis_id, site.axis_id)
-
-
-def test_spatial_box_draft_keeps_both_physical_fit_axes_and_all_batches():
-    repeat = _axis("repeat", REPEAT, 3)
-    scan = _axis("scan", SCAN_POINT, 2, coordinates=(10.0, 20.0))
-    site = _axis("site", SITE, 2, coordinates=("left", "right"))
-    frame = "camera"
-    y_axis = _axis(
-        "camera.y", SPATIAL_Y, 8, coordinates=range(8), unit="pixel", frame=frame
-    )
-    x_axis = _axis(
-        "camera.x", SPATIAL_X, 10, coordinates=range(10), unit="pixel", frame=frame
-    )
-    schema = DatasetSchema(
-        repeat,
-        (scan,),
-        PointLayout.rect_c((scan.size,)),
-        ValueSchema(
-            (site, y_axis, x_axis),
-            ValidityContract.value(),
-            np.dtype("<f8"),
-        ),
-    )
-    roi = Selection.rectangle(
-        x_axis.axis_id,
-        y_axis.axis_id,
-        2,
-        7,
-        1,
-        5,
-        coordinate_frame=CoordinateFrameId(frame),
-    )
-
-    bound = suggest_fit_draft(
-        schema,
-        "radial_gaussian_center",
-        fit_axis_ids=(x_axis.axis_id, y_axis.axis_id),
-        selection=roi,
-    )
-    projected_schema, projected_roi = selection_fit_view_projection(bound)
-
-    assert projected_roi == roi
-    assert bound.spec.fit_axis_ids == (x_axis.axis_id, y_axis.axis_id)
-    assert bound.spec.batch_axis_ids == (
-        repeat.axis_id,
-        scan.axis_id,
-        site.axis_id,
-    )
-    assert tuple(axis.size for axis in projected_schema.cell_schema.data_axes) == (2, 5, 6)
-    assert projected_schema.cell_layout == bound.effective_schema.cell_layout
-
-
-def test_projection_rejects_reduction_index_drop_and_batch_axis_range():
-    repeat = _axis("repeat", REPEAT, 1)
-    scan = _axis("scan", SCAN_POINT, 9, coordinates=range(9))
-    site = _axis("site", SITE, 3, coordinates=("a", "b", "c"))
-    schema = DatasetSchema(
-        repeat,
-        (scan,),
-        PointLayout.rect_c((scan.size,)),
-        ValueSchema((site,), ValidityContract.value(), np.dtype("<f8")),
-    )
-
-    reduced = commit_transform(
-        schema,
-        DataTransformSpec(
-            (
-                Selection.index_range(scan.axis_id, 1, 8),
-                ReductionSpec(
-                    (site.axis_id,),
-                    ReductionMethod.MEAN,
-                    MissingPolicy.REQUIRE_ALL,
-                    ValidityPolicy.REQUIRE_ALL,
-                ),
-            )
-        ),
-    )
-    reduced_bound = bind_fit(
-        fit_spec_for(
-            schema,
-            "gaussian_offset",
-            committed_transform=reduced,
-            fit_axis_ids=(scan.axis_id,),
-        ),
-        schema,
-    )
-    with pytest.raises(ValueError, match="exactly one range Selection"):
-        selection_fit_view_projection(reduced_bound)
-
-    for forbidden in (
-        Selection.index(site.axis_id, 0),
-        Selection.index_range(site.axis_id, 0, 2),
-    ):
-        committed = commit_transform(schema, DataTransformSpec((forbidden,)))
-        bound = bind_fit(
-            fit_spec_for(
-                schema,
-                "gaussian_offset",
-                committed_transform=committed,
-                fit_axis_ids=(scan.axis_id,),
-            ),
-            schema,
-        )
-        expected = "range-preserving" if forbidden.terms[0].__class__.__name__ == "IndexSelection" else "explicit fit axis"
-        with pytest.raises(ValueError, match=expected):
-            selection_fit_view_projection(bound)
 
 
 @pytest.mark.parametrize(

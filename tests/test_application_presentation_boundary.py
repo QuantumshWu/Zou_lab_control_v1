@@ -91,9 +91,9 @@ def test_artifact_dataset_source_binds_metadata_and_owned_snapshot() -> None:
     assert materialized.require_owned_snapshot() is source.snapshot
 
 
-def test_notebook_facade_does_not_reimplement_frontend_figure_policy() -> None:
-    path = ROOT / "Zou_lab_control/notebook/facade.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+def test_public_api_does_not_reimplement_frontend_figure_policy() -> None:
+    paths = sorted((ROOT / "Zou_lab_control" / "api").glob("*.py"))
+    assert paths
     forbidden_calls = {
         "DataFigure",
         "DatasetDescriptor",
@@ -106,17 +106,21 @@ def test_notebook_facade_does_not_reimplement_frontend_figure_policy() -> None:
         "suggest_view",
     }
     violations = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        if isinstance(node.func, ast.Name):
-            name = node.func.id
-        elif isinstance(node.func, ast.Attribute):
-            name = node.func.attr
-        else:
-            continue
-        if name in forbidden_calls:
-            violations.append(f"{path.relative_to(ROOT)}:{node.lineno} calls {name}")
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name):
+                name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+            else:
+                continue
+            if name in forbidden_calls:
+                violations.append(
+                    f"{path.relative_to(ROOT)}:{node.lineno} calls {name}"
+                )
     assert not violations, (
         "application composition resolves artifacts; zlc_frontend owns Figure "
         "suggestion/document/evaluation:\n" + "\n".join(violations)
@@ -127,7 +131,7 @@ def test_application_boundary_does_not_construct_domain_or_view_owners() -> None
     """Composition may connect owner exports, never recreate their values."""
 
     paths = (
-        ROOT / "Zou_lab_control/notebook/facade.py",
+        *sorted((ROOT / "Zou_lab_control" / "api").glob("*.py")),
         ROOT / "Zou_lab_control/workbench/_composition.py",
     )
     forbidden_calls = {
@@ -184,8 +188,7 @@ def test_application_tree_delegates_artifact_dataset_interpretation() -> None:
         "output_dataset_ref",
     }
     allowed_materialize_hosts = {
-        ("notebook/_readout_composition.py", "materialize_capture_artifact"),
-        ("notebook/_readout_composition.py", "materialize_pulse_scan"),
+        ("api/_readout_core.py", "materialize_capture"),
     }
     violations = []
     for path in sorted(application_root.rglob("*.py")):

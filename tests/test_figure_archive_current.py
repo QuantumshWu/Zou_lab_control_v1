@@ -493,7 +493,7 @@ def test_notebook_no_argument_entry_opens_the_same_session_independent_viewer(
     application,
     tmp_path,
 ):
-    import Zou_lab_control.notebook as zlc
+    import Zou_lab_control.api as zlc
 
     experiment = zlc.connect("virtual", repository=tmp_path / "repository")
     viewer = None

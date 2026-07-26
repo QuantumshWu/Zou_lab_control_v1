@@ -30,7 +30,7 @@ from .view_projection import (
     calibration_authority_summary,
 )
 from zlc_workbench.form_projection import project_authoring_form
-from zlc_workbench.run_owner import QtRunOwnerMailbox
+from zlc_neutral_atom.runtime.owner_mailbox import RunOwnerMailbox
 
 from zlc_workbench.window_runtime import error_summary
 
@@ -91,7 +91,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
             object_prefix="calibrationEditor",
             subject="calibration",
         )
-        self._run_owner = QtRunOwnerMailbox(
+        self._run_owner = RunOwnerMailbox(
             self._wake.request_owner_wake,
             thread_name_prefix="zlc-calibration-workbench",
             max_workers=2,

@@ -15,8 +15,9 @@ from zlc_neutral_atom.logic_node_declaration import (
     OutputPresentation,
     PathPresentationHint,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import ReadoutModelKind, ResolvedCalibration
+from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import ResolvedCalibration
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSegmentTable,
     ApiSlotSegmentedProgram,
@@ -181,7 +182,7 @@ def build_readout_duration_intent_from_authoring(
         pulse=authored["pulse"],  # type: ignore[arg-type]
         duration_microseconds=authored["duration"],
         shots=authored["shots"],
-        site=None if site == "" else site,
+        site=site,
     )
 
 

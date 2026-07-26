@@ -19,13 +19,13 @@ from zlc_neutral_atom.logic_nodes.camera_measurement.output_binding import (
 from zlc_neutral_atom.dataset_output import LiveDatasetOutput
 from zlc_neutral_atom.node_input import BoundNodeInputs
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
-    ReadoutModelKind,
     ResolvedCalibration,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
     calibration_artifact_input_ref,
 )
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
     OCCUPANCY_CALIBRATION_INPUT_SPEC,
     OCCUPANCY_CAMERA_INPUT_SPEC,

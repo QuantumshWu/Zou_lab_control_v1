@@ -1,4 +1,4 @@
-"""Composition-only worker mailbox and Run ownership for Qt surfaces."""
+"""Worker mailbox and Run ownership for one headless owner."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import threading
 from typing import Callable, NamedTuple
 
-from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot
+from zlc_neutral_atom.runtime.run import RunHandle
 
 
 class OwnerCompletion(NamedTuple):
@@ -15,8 +15,8 @@ class OwnerCompletion(NamedTuple):
     future: Future
 
 
-class QtRunOwnerMailbox:
-    """Own mechanics shared by Run windows, never their product policy."""
+class RunOwnerMailbox:
+    """Own asynchronous Run mechanics, never application product policy."""
 
     def __init__(
         self,
@@ -34,8 +34,6 @@ class QtRunOwnerMailbox:
         self._lock = threading.Lock()
         self._tracked: set[Future] = set()
         self._completions: list[OwnerCompletion] = []
-        self._attachments: list[tuple[int, object]] = []
-        self._pending_snapshot: tuple[int, RunSnapshot] | None = None
         self._generation = 0
         self._handle: RunHandle | None = None
         self._owner_reaped = True
@@ -67,15 +65,13 @@ class QtRunOwnerMailbox:
     @property
     def has_pending_owner_work(self) -> bool:
         with self._lock:
-            return bool(self._tracked or self._completions or self._attachments)
+            return bool(self._tracked or self._completions)
 
     def begin_generation(self) -> int:
         self._generation += 1
         self._handle = None
         self._owner_reaped = False
         self._terminal_job_inflight = False
-        with self._lock:
-            self._pending_snapshot = None
         return self._generation
 
     def set_handle(self, handle: RunHandle) -> None:
@@ -107,52 +103,10 @@ class QtRunOwnerMailbox:
         future.add_done_callback(done)
         return future
 
-    def submit_render(self, work: Callable[[], object]) -> Future:
-        return self.submit("render", work)
-
     def drain_completions(self) -> tuple[OwnerCompletion, ...]:
         with self._lock:
             pending = tuple(self._completions)
             self._completions.clear()
-        return pending
-
-    def post_attachment(self, payload: object, *, generation: int) -> None:
-        with self._lock:
-            self._attachments.append((generation, payload))
-        self._wake()
-
-    def drain_attachments(self) -> tuple[tuple[int, object], ...]:
-        with self._lock:
-            pending = tuple(self._attachments)
-            self._attachments.clear()
-        return pending
-
-    def enqueue_snapshot(
-        self,
-        snapshot: RunSnapshot,
-        *,
-        generation: int | None = None,
-        last_snapshot: RunSnapshot | None = None,
-    ) -> bool:
-        generation = self._generation if generation is None else generation
-        with self._lock:
-            pending = self._pending_snapshot
-            if snapshot == last_snapshot or (
-                pending is not None and pending[1] == snapshot
-            ):
-                return False
-            self._pending_snapshot = (generation, snapshot)
-        return True
-
-    def poll_snapshot(self, last_snapshot: RunSnapshot | None) -> bool:
-        handle = self._handle
-        return handle is not None and self.enqueue_snapshot(
-            handle.snapshot(), last_snapshot=last_snapshot
-        )
-
-    def take_pending_snapshot(self) -> tuple[int, RunSnapshot] | None:
-        with self._lock:
-            pending, self._pending_snapshot = self._pending_snapshot, None
         return pending
 
     def begin_terminal_job(
@@ -187,4 +141,4 @@ class QtRunOwnerMailbox:
         self._pool.shutdown(wait=False)
 
 
-__all__ = ["OwnerCompletion", "QtRunOwnerMailbox"]
+__all__ = ["OwnerCompletion", "RunOwnerMailbox"]

@@ -1420,7 +1420,7 @@ class RunController:
         *,
         cancel_join_timeout: float = 5.0,
     ) -> FinalT:
-        """Wait for one admitted Run while owning notebook interrupt semantics."""
+        """Wait for one admitted Run while owning caller interrupt semantics."""
 
         if not isinstance(handle, RunHandle):
             raise TypeError("handle must be RunHandle")
@@ -1428,7 +1428,7 @@ class RunController:
         try:
             return handle.result()
         except KeyboardInterrupt:
-            handle.cancel("notebook KeyboardInterrupt")
+            handle.cancel("caller KeyboardInterrupt")
             try:
                 snapshot = handle.wait(timeout)
             except TimeoutError as error:

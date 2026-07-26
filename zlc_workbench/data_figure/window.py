@@ -12,12 +12,10 @@ from PyQt5 import QtCore, QtWidgets
 
 from zlc_data import (
     AxisId,
-    CoordinateRangeSelection,
     FitCancelled,
     FitDeadlineExceeded,
     FitResultBatch,
     FitSpec,
-    IndexRangeSelection,
     Selection,
 )
 from zlc_frontend import (
@@ -64,10 +62,11 @@ from zlc_frontend.qt_widgets import (
     FluentPopup,
     FluentRevisionedFormEditor,
     FluentSwitch,
+    FigureSurfaceContext,
+    FigureSurfaceHost,
     GREY,
     GREEN,
     ORANGE,
-    QtRasterBoard,
     RasterPixelRatioObserver,
     FrozenRasterView,
     runtime_range_placeholders,
@@ -261,15 +260,35 @@ class DataFigureWindow(FrozenRasterWindow):
         self._typed_page.hide()
         page_layout = QtWidgets.QVBoxLayout(self._typed_page)
         page_layout.setContentsMargins(0, 0, 0, 0)
-        self._board_widget = QtRasterBoard(
-            (DATA_FIGURE_PANEL_ID,),
-            self._typed_page,
-            columns=1,
+        self._surface_host = FigureSurfaceHost(
+            DATA_FIGURE_PANEL_ID,
             empty_text="Resolving exact typed figure…",
+            parent=self._typed_page,
         )
-        self._board_widget.setObjectName("figureViewerTypedBoard")
-        self._board_widget.setFixedSize(*initial_surface.logical_size)
-        page_layout.addWidget(self._board_widget, 1)
+        # Retain the named low-level event target for Qt input tooling.  The
+        # window does not bind or present through it; FigureSurfaceHost is the
+        # sole interaction/presentation owner.
+        self._surface_host.board.setObjectName("figureViewerTypedBoard")
+        self._surface_host.set_logical_size(initial_surface.logical_size)
+        page_layout.addWidget(self._surface_host, 1)
+        self._surface_host.rectangleSelected.connect(
+            self._accept_image_rectangle
+        )
+        self._surface_host.rangeSelected.connect(
+            self._accept_numeric_interaction
+        )
+        self._surface_host.viewCommitted.connect(
+            self._accept_surface_view_commit
+        )
+        self._surface_host.colorLimitsCommitted.connect(
+            self._accept_image_interaction
+        )
+        self._surface_host.thresholdsCommitted.connect(
+            self._accept_numeric_interaction
+        )
+        self._surface_host.interactionRejected.connect(
+            self._diagnostic.setText
+        )
 
         self._settings_popup = FluentPopup(self)
         self._settings_popup.setObjectName("figureViewerTypedSettingsPopup")
@@ -368,7 +387,7 @@ class DataFigureWindow(FrozenRasterWindow):
             self._surface_size_name,
             pixel_ratio=pixel_ratio,
         )
-        self._board_widget.setFixedSize(*geometry.logical_size)
+        self._surface_host.set_logical_size(geometry.logical_size)
         if geometry == self._surface_geometry:
             return
         self._surface_geometry = geometry
@@ -378,7 +397,7 @@ class DataFigureWindow(FrozenRasterWindow):
         # scroll host.  They are not interactive named panel surfaces.
         if self._view_family == "encoded":
             return
-        self._board_widget.clear()
+        self._surface_host.clear()
         for board in self._boards:
             board.clear()
         if self._initial_outcome is not None:
@@ -423,11 +442,6 @@ class DataFigureWindow(FrozenRasterWindow):
         display = self._display
         if display is None:
             raise RuntimeError("typed surface refresh lost its display state")
-        previous_scale = (
-            display.count_scale
-            if isinstance(display, HistogramDisplayState)
-            else None
-        )
         overlay = self._fit_overlay_desired
         self._pending_state = display
         self._fit_overlay_inflight = overlay
@@ -439,9 +453,6 @@ class DataFigureWindow(FrozenRasterWindow):
             None if overlay is None else overlay.result,
             None if overlay is None else overlay.result_identity,
             display,
-            self._visible_value_limits(),
-            display.relim_mode,
-            previous_scale,
             self._request_revision,
             self._cancelled,
         ):
@@ -559,9 +570,6 @@ class DataFigureWindow(FrozenRasterWindow):
             None,
             None,
             request,
-            None,
-            None,
-            None,
             self._request_revision,
             self._cancelled,
         ):
@@ -582,7 +590,7 @@ class DataFigureWindow(FrozenRasterWindow):
             return
         if len(self._boards) != 1 or not self._boards[0].has_front:
             raise RuntimeError("cached typed grid overview front is unavailable")
-        self._board_widget.clear()
+        self._surface_host.clear()
         self._display = None
         self._typed_contract = None
         self._visible_fit_result_identity = None
@@ -631,7 +639,7 @@ class DataFigureWindow(FrozenRasterWindow):
             )
             return bool(
                 display is not None
-                and self._board_widget.front_frame is not None
+                and self._surface_host.front_frame is not None
                 and self._pending_state is None
                 and payload is not None
                 and visible_revision == display.revision
@@ -666,22 +674,7 @@ class DataFigureWindow(FrozenRasterWindow):
         return tuple(self._fit_options)
 
     def _visible_typed_payload(self) -> DataFigurePanelPayload | None:
-        if self._view_family == "image":
-            payload = self._board_widget.visible_image_payload(DATA_FIGURE_PANEL_ID)
-        elif self._view_family == "curve":
-            payload = self._board_widget.visible_curve_payload(DATA_FIGURE_PANEL_ID)
-        elif self._view_family == "histogram":
-            payload = self._board_widget.visible_histogram_payload(DATA_FIGURE_PANEL_ID)
-        elif self._view_family == "meter":
-            payload = self._board_widget.visible_meter_payload(DATA_FIGURE_PANEL_ID)
-        else:
-            return None
-        if payload is not None:
-            return payload
-        # A valid front is admitted before optional interaction controls.  If
-        # their construction fails there is deliberately no binding, but the
-        # exact current raster/payload remains visible and ready.
-        frame = self._board_widget.front_frame
+        frame = self._surface_host.front_frame
         if frame is None or len(frame.panels) != 1:
             return None
         candidate = frame.panels[0].display_payload
@@ -699,13 +692,7 @@ class DataFigureWindow(FrozenRasterWindow):
         return candidate if isinstance(candidate, expected_type) else None
 
     def _visible_typed_origin(self) -> PanelInteractionOrigin | None:
-        if self._view_family == "image":
-            return self._board_widget.visible_image_origin(DATA_FIGURE_PANEL_ID)
-        if self._view_family == "curve":
-            return self._board_widget.visible_curve_origin(DATA_FIGURE_PANEL_ID)
-        if self._view_family == "histogram":
-            return self._board_widget.visible_histogram_origin(DATA_FIGURE_PANEL_ID)
-        return None
+        return self._surface_host.visible_interaction_origin()
 
     def _visible_value_limits(self) -> tuple[float, float] | None:
         payload = self._visible_typed_payload()
@@ -763,15 +750,12 @@ class DataFigureWindow(FrozenRasterWindow):
                 "color_max",
             )
             subject = "image display"
-            bind = None
         elif isinstance(state, CurveDisplayState):
             runtime_fields = ("y_min", "y_max")
             subject = "curve display"
-            bind = self._board_widget.bind_curve_interaction
         else:
             runtime_fields = ("count_min", "count_max")
             subject = "histogram display"
-            bind = self._board_widget.bind_histogram_interaction
         spec = data_figure_display_form_spec(state)
         edit = None
         setting = None
@@ -808,24 +792,6 @@ class DataFigureWindow(FrozenRasterWindow):
             edit.cancelRequested.connect(lambda: self._reload_editor(edit))
             setting.cancelRequested.connect(lambda: self._reload_editor(setting))
             self._settings_popup_layout.addWidget(setting)
-            if isinstance(state, ImageDisplayState):
-                payload = self._visible_typed_payload()
-                if not isinstance(payload, ImagePanelPayload):
-                    raise RuntimeError("IMAGE controls require one exact payload")
-                self._board_widget.bind_rectangle_selector(
-                    DATA_FIGURE_PANEL_ID,
-                    payload.viewport,
-                    self._accept_image_rectangle,
-                    enabled=self._interaction_switch.isChecked(),
-                    interaction_callback=self._accept_image_interaction,
-                )
-            else:
-                assert bind is not None
-                bind(
-                    DATA_FIGURE_PANEL_ID,
-                    self._accept_numeric_interaction,
-                    enabled=self._interaction_switch.isChecked(),
-                )
         except BaseException:
             if setting is not None:
                 self._settings_popup_layout.removeWidget(setting)
@@ -837,6 +803,9 @@ class DataFigureWindow(FrozenRasterWindow):
             raise
         self._edit_display = edit
         self._setting_display = setting
+        self._surface_host.set_selectors_enabled(
+            self._interaction_switch.isChecked()
+        )
 
     def _editors(self) -> tuple[FluentRevisionedFormEditor, FluentRevisionedFormEditor]:
         if self._edit_display is None or self._setting_display is None:
@@ -916,11 +885,7 @@ class DataFigureWindow(FrozenRasterWindow):
         )
         if self._view_family == overview_family:
             ready = bool(enabled and not self._typed_ui_faulted)
-            self._board_widget.set_interaction_readiness(
-                image=False,
-                curve=False,
-                histogram=False,
-            )
+            self._surface_host.set_interaction_ready(False)
             self._settings_button.setEnabled(False)
             self._fit_button.setEnabled(False)
             self._interaction_switch.setEnabled(False)
@@ -934,11 +899,7 @@ class DataFigureWindow(FrozenRasterWindow):
             return
         if self._view_family == "meter":
             ready = bool(enabled and not self._typed_ui_faulted)
-            self._board_widget.set_interaction_readiness(
-                image=False,
-                curve=False,
-                histogram=False,
-            )
+            self._surface_host.set_interaction_ready(False)
             self._settings_button.setEnabled(False)
             self._fit_button.setEnabled(False)
             self._interaction_switch.setEnabled(False)
@@ -946,7 +907,7 @@ class DataFigureWindow(FrozenRasterWindow):
                 ready and overview is not None and self._future is None
             )
             self._export_button.setEnabled(
-                ready and self._board_widget.front_frame is not None
+                ready and self._surface_host.front_frame is not None
             )
             return
         active = bool(
@@ -954,14 +915,10 @@ class DataFigureWindow(FrozenRasterWindow):
             and not self._typed_ui_faulted
             and self._view_family in ("image", "curve", "histogram")
         )
-        self._board_widget.set_interaction_readiness(
-            image=active and self._view_family == "image",
-            curve=active and self._view_family == "curve",
-            histogram=active and self._view_family == "histogram",
-        )
+        self._surface_host.set_interaction_ready(active)
         self._settings_button.setEnabled(active)
         self._export_button.setEnabled(
-            active and self._board_widget.front_frame is not None
+            active and self._surface_host.front_frame is not None
         )
         self._fit_button.setEnabled(
             active
@@ -984,7 +941,7 @@ class DataFigureWindow(FrozenRasterWindow):
         if self._view_family not in ("image", "curve", "histogram"):
             return
         try:
-            self._board_widget.set_selectors_enabled(bool(enabled))
+            self._surface_host.set_selectors_enabled(bool(enabled))
         except BaseException as error:
             self._diagnostic.setText(error_summary(error))
 
@@ -1329,20 +1286,12 @@ class DataFigureWindow(FrozenRasterWindow):
         self._fit_overlay_pending = None
         self._status.setText("RENDERING FIT OVERLAY")
         self._set_typed_controls_enabled(False)
-        previous_scale = (
-            display.count_scale
-            if isinstance(display, HistogramDisplayState)
-            else None
-        )
         if not self._submit_surface_future(
             "fit_overlay",
             renderer,
             request.result,
             request.result_identity,
             candidate,
-            self._visible_value_limits(),
-            display.relim_mode,
-            previous_scale,
             self._request_revision,
             self._cancelled,
         ):
@@ -1353,45 +1302,14 @@ class DataFigureWindow(FrozenRasterWindow):
         else:
             self._sync_fit_authoring_busy()
 
-    @staticmethod
-    def _curve_span_for_selection(
-        selection: Selection,
-        payload: CurvePanelPayload,
-    ) -> tuple[float, float]:
-        axis = payload.viewport.x_axis
-        matches = tuple(term for term in selection.terms if term.axis_id == axis.axis_id)
-        if len(matches) != 1:
-            raise ValueError("curve Fit selection does not name the displayed x axis")
-        term = matches[0]
-        if isinstance(term, CoordinateRangeSelection):
-            return float(term.lower), float(term.upper)
-        if isinstance(term, IndexRangeSelection):
-            coordinates = axis.coordinates
-            if term.stop > len(coordinates):
-                raise IndexError("curve Fit index range exceeds displayed coordinates")
-            low = float(coordinates[term.start])
-            high = float(coordinates[term.stop - 1])
-            return (min(low, high), max(low, high))
-        raise ValueError("curve Fit selection must preserve a non-empty range")
-
     def _reapply_fit_candidate(self) -> None:
         selection = self._fit_selection_candidate
         if selection is None:
             return
         origin = self._visible_typed_origin()
-        payload = self._visible_typed_payload()
-        if origin is None or payload is None:
+        if origin is None or self._visible_typed_payload() is None:
             return
-        if isinstance(payload, CurvePanelPayload):
-            self._board_widget.set_curve_range_candidate(
-                self._curve_span_for_selection(selection, payload),
-                panel_id=DATA_FIGURE_PANEL_ID,
-            )
-        elif isinstance(payload, ImagePanelPayload):
-            self._board_widget.set_selector_applied_selection(
-                selection,
-                panel_id=DATA_FIGURE_PANEL_ID,
-            )
+        self._surface_host.set_area_selection_candidate(selection)
 
     def _accept_fit_selection_candidate(
         self,
@@ -1481,14 +1399,10 @@ class DataFigureWindow(FrozenRasterWindow):
             gesture.normalized_bounds is not None
             and self._fit_available_for_intent(ViewIntent.IMAGE)
         ):
-            # Resolve authority while QtRasterBoard still holds the exact front
-            # on which this gesture was completed.  Painting the candidate first
-            # would release that proof and make a later conversion racy.
-            selection = self._board_widget.selection_for_rectangle_gesture(gesture)
-        self._board_widget.set_image_rectangle_candidate(
-            gesture.normalized_bounds,
-            panel_id=DATA_FIGURE_PANEL_ID,
-        )
+            commit = self._surface_host.area_commit
+            if commit is not None and isinstance(commit.selection, Selection):
+                selection = commit.selection
+        self._surface_host.set_rectangle_candidate(gesture.normalized_bounds)
         if gesture.normalized_bounds is None:
             if self._fit_available_for_intent(ViewIntent.IMAGE):
                 self._accept_fit_selection_candidate(None)
@@ -1528,6 +1442,14 @@ class DataFigureWindow(FrozenRasterWindow):
             )
         self._start_typed_render(candidate, origin=origin)
 
+    def _accept_surface_view_commit(self, command) -> None:
+        """Route the unified host's typed viewport commit by its contract."""
+
+        if isinstance(command, ImageViewportCommit):
+            self._accept_image_interaction(command)
+            return
+        self._accept_numeric_interaction(command)
+
     def _accept_numeric_interaction(
         self,
         command: CurveInteractionIntent | HistogramInteractionIntent,
@@ -1564,17 +1486,10 @@ class DataFigureWindow(FrozenRasterWindow):
                 and self._fit_available_for_intent(ViewIntent.CURVE)
                 and command.x_span is not None
             ):
-                # As with IMAGE, the exact held origin must be consumed before
-                # set_curve_range_candidate finalizes the display-only gesture.
-                selection = self._board_widget.selection_for_curve_range_gesture(
-                    command
-                )
-            setter = (
-                self._board_widget.set_curve_range_candidate
-                if is_curve
-                else self._board_widget.set_histogram_range_candidate
-            )
-            setter(command.x_span, panel_id=DATA_FIGURE_PANEL_ID)
+                commit = self._surface_host.area_commit
+                if commit is not None and isinstance(commit.selection, Selection):
+                    selection = commit.selection
+            self._surface_host.set_range_candidate(command.x_span)
             if is_curve and self._fit_available_for_intent(ViewIntent.CURVE):
                 self._accept_fit_selection_candidate(selection)
                 return
@@ -1648,11 +1563,6 @@ class DataFigureWindow(FrozenRasterWindow):
         self._status.setText(f"RENDERING {self._view_family.upper()}")
         self._diagnostic.setText("")
         self._set_typed_controls_enabled(False)
-        previous_scale = (
-            display.count_scale
-            if isinstance(display, HistogramDisplayState)
-            else None
-        )
         overlay = self._fit_overlay_desired
         overlay_result = None if overlay is None else overlay.result
         overlay_identity = None if overlay is None else overlay.result_identity
@@ -1663,9 +1573,6 @@ class DataFigureWindow(FrozenRasterWindow):
             overlay_result,
             overlay_identity,
             candidate,
-            self._visible_value_limits(),
-            display.relim_mode,
-            previous_scale,
             self._request_revision,
             self._cancelled,
         )
@@ -1687,16 +1594,9 @@ class DataFigureWindow(FrozenRasterWindow):
         cleanup_errors = []
         if origin is not None:
             try:
-                discard = {
-                    "image": self._board_widget.discard_pending_image_interaction,
-                    "curve": self._board_widget.discard_pending_curve_interaction,
-                    "histogram": (
-                        self._board_widget.discard_pending_histogram_interaction
-                    ),
-                }.get(family)
-                if discard is None:
+                if family not in ("image", "curve", "histogram"):
                     raise RuntimeError("pending interaction has no typed family")
-                discard(origin)
+                self._surface_host.discard_pending_interaction(origin)
             except BaseException as error:
                 cleanup_errors.append(error_summary(error))
         if family in ("image", "curve", "histogram"):
@@ -1772,7 +1672,16 @@ class DataFigureWindow(FrozenRasterWindow):
             if not same_exact_data_owners(exact_data, expected_data):
                 raise ValueError("typed worker changed frozen evaluated data")
 
-        self._board_widget.present(front.frame)
+        self._surface_host.present_frame(
+            front.frame,
+            context=FigureSurfaceContext.for_frame(
+                front.frame,
+                figure=front.figure,
+                display=expected_state,
+                contract=front.surface_contract,
+            ),
+            logical_size=front.surface_contract.logical_size,
+        )
         # The admitted board front is the transaction boundary.  Commit the
         # exact Figure/authored state/contract before cache release or any
         # optional Qt chrome work.
@@ -1826,6 +1735,7 @@ class DataFigureWindow(FrozenRasterWindow):
             self._diagnostic.setText("")
         except BaseException as error:
             self._typed_ui_faulted = True
+            self._surface_host.unbind_interaction()
             self._set_typed_controls_enabled(False)
             self._status.setText("TYPED CONTROLS FAILED")
             self._diagnostic.setText(error_summary(error))
@@ -1884,6 +1794,7 @@ class DataFigureWindow(FrozenRasterWindow):
                     )
         except BaseException as error:
             self._typed_ui_faulted = True
+            self._surface_host.unbind_interaction()
             self._set_typed_controls_enabled(False)
             self._status.setText("TYPED CONTROLS FAILED")
             self._diagnostic.setText(error_summary(error))
@@ -2448,7 +2359,7 @@ class DataFigureWindow(FrozenRasterWindow):
             and len(self._boards) == 1
             and self._boards[0].has_front
         )
-        typed_ready = self._board_widget.front_frame is not None
+        typed_ready = self._surface_host.front_frame is not None
         if (
             self._future is not None
             or self._closing
@@ -2475,7 +2386,7 @@ class DataFigureWindow(FrozenRasterWindow):
             self._start_export(destination)
 
     def _start_export(self, destination: Path) -> None:
-        frame = self._board_widget.front_frame
+        frame = self._surface_host.front_frame
         overview = self._grid_overview
         overview_family = (
             None
@@ -2534,7 +2445,7 @@ class DataFigureWindow(FrozenRasterWindow):
 
     def _clear_bundle(self) -> None:
         super()._clear_bundle()
-        self._board_widget.clear()
+        self._surface_host.clear()
         self._grid_overview = None
         self._visible_figure = None
         self._grid_focus_pending = None

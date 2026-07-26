@@ -56,7 +56,6 @@ from zlc_storage import (
 )
 
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
-    ReadoutModelKind,
     ResolvedCalibration,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
@@ -65,6 +64,7 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     calibration_artifact_ref_to_tree,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.repository import CalibrationRepository
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from .processor import (
     OCCUPANCY_COUNTS_BLOCK_ID,

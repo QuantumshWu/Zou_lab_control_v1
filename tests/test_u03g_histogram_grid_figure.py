@@ -17,7 +17,7 @@ from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 from zlc_data import (
     REPEAT,
     SCAN_POINT,
@@ -526,7 +526,7 @@ def test_public_occupancy_counts_entry_opens_the_histogram_grid(
     owner_thread = threading.get_ident()
     calls = []
     with zlc.connect("virtual", repository=tmp_path / "public-entry") as experiment:
-        calibration_reference = experiment.readout.sitemap(frames=12)
+        calibration_reference = experiment.nodes.calibration.sitemap(frames=12)
         document = load_sitemap_pulse()
         trigger_index = document.target.raw_lanes.index("ch11")
         trigger_run = 0
@@ -552,13 +552,13 @@ def test_public_occupancy_counts_entry_opens_the_histogram_grid(
             trigger_channel="ch11",
             readout_events_per_repeat=1,
         )
-        reference = experiment.readout.detect(
-            experiment.readout.detection_request(
+        reference = experiment.nodes.occupancy.detect(
+            experiment.nodes.occupancy.detection_request(
                 capture_reference,
                 calibration_reference,
             )
         )
-        expected_figure = experiment.figure(reference, occupancy_output="counts")
+        expected_figure = experiment.figure(reference, output="counts")
         expected_cells = expected_figure.evaluated.layers[0].cells
         assert len(expected_cells) > 1
         original = type(experiment).figure
@@ -570,7 +570,7 @@ def test_public_occupancy_counts_entry_opens_the_histogram_grid(
         monkeypatch.setattr(type(experiment), "figure", traced)
         window = experiment.figure_gui(
             reference,
-            occupancy_output="counts",
+            output="counts",
         )
         try:
             _until(application, lambda: window.worker_idle and window.raster_ready)
@@ -582,7 +582,7 @@ def test_public_occupancy_counts_entry_opens_the_histogram_grid(
             thread_id, source, args, options = calls[0]
             assert thread_id != owner_thread
             assert source == reference and args == ()
-            assert options["occupancy_output"] == "counts"
+            assert options["output"] == "counts"
             assert options["selection"] is None
             assert options["intent"] is None
             window._focus_grid_region(*_center(overview.regions[1]))

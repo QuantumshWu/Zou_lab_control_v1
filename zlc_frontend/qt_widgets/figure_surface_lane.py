@@ -1,4 +1,4 @@
-"""The TaskConsole's single worker-owned raster lane.
+"""Reusable Figure-surface worker lane for raster and derived outputs.
 
 Qt freezes immutable requests and accepts completed fronts.  This owner keeps
 every ``PanelComposer`` and Agg object on one worker thread, coalesces requests
@@ -24,11 +24,19 @@ from zlc_frontend import (
     PlotPanelSession,
 )
 from zlc_frontend.panel_render import FacetedPanelFocus
-from zlc_frontend.qt_widgets import QtOwnerWake
+from .owner_wake import QtOwnerWake
+
+
+__all__ = [
+    "FigureSurfaceCompletion",
+    "FigureSurfaceLane",
+    "FigureSurfaceOutputRequest",
+    "FigureSurfaceRenderRequest",
+]
 
 
 @dataclass(frozen=True, slots=True)
-class PanelRenderRequest:
+class FigureSurfaceRenderRequest:
     panel_id: str
     request_revision: int
     signature: object
@@ -55,7 +63,7 @@ class PanelRenderRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class PanelFigureOutputRequest:
+class FigureSurfaceOutputRequest:
     """One Figure's immutable derived-output intent and publication source."""
 
     panel_id: str
@@ -63,6 +71,10 @@ class PanelFigureOutputRequest:
     request_revision: int
     source_value: object | None
     request: FigureOutputRequest | None
+    # Opaque Workbench causal ancestry captured when this request was frozen.
+    # The render worker never reads it; the data-plane owner validates it when
+    # admitting the completed derived transaction.
+    source_component: object | None = None
 
     def __post_init__(self) -> None:
         identity = str(self.panel_id).strip()
@@ -73,6 +85,8 @@ class PanelFigureOutputRequest:
         if self.request is None:
             if self.source_value is not None:
                 raise ValueError("empty Figure output request cannot carry a source")
+            if self.source_component is not None:
+                raise ValueError("empty Figure output request cannot carry ancestry")
         elif not isinstance(self.request, FigureOutputRequest):
             raise TypeError("Figure output work requires FigureOutputRequest")
         object.__setattr__(self, "panel_id", identity)
@@ -80,14 +94,14 @@ class PanelFigureOutputRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class ConsoleRenderCompletion:
+class FigureSurfaceCompletion:
     renders: tuple[tuple[object, object, object, object, str | None], ...]
     figure_outputs: tuple[
-        tuple[PanelFigureOutputRequest, FigureOutputFront | None, str | None], ...
+        tuple[FigureSurfaceOutputRequest, FigureOutputFront | None, str | None], ...
     ]
 
 
-class ConsoleRenderLane:
+class FigureSurfaceLane:
     """Serialize panel composition and return completions on the Qt owner."""
 
     def __init__(
@@ -110,8 +124,8 @@ class ConsoleRenderLane:
         self._lock = threading.Lock()
         self._future: Future | None = None
         self._completion = None
-        self._pending: dict[str, PanelRenderRequest] = {}
-        self._pending_outputs: dict[str, PanelFigureOutputRequest] = {}
+        self._pending: dict[str, FigureSurfaceRenderRequest] = {}
+        self._pending_outputs: dict[str, FigureSurfaceOutputRequest] = {}
         self._reset_pending: set[str] = set()
         self._worker_composers: dict[str, tuple[object, object]] = {}
         self._worker_output_sessions: dict[str, FigureOutputSession] = {}
@@ -148,7 +162,7 @@ class ConsoleRenderLane:
                 and not self._pending_outputs
             )
 
-    def enqueue(self, requests: tuple[PanelRenderRequest, ...]) -> None:
+    def enqueue(self, requests: tuple[FigureSurfaceRenderRequest, ...]) -> None:
         if not requests or self._closing:
             return
         with self._lock:
@@ -164,7 +178,7 @@ class ConsoleRenderLane:
 
     def enqueue_outputs(
         self,
-        requests: tuple[PanelFigureOutputRequest, ...],
+        requests: tuple[FigureSurfaceOutputRequest, ...],
     ) -> None:
         """Evaluate Figure-derived datasets on this lane's worker owner."""
 
@@ -201,8 +215,8 @@ class ConsoleRenderLane:
 
     def _start(
         self,
-        requests: tuple[PanelRenderRequest, ...],
-        output_requests: tuple[PanelFigureOutputRequest, ...],
+        requests: tuple[FigureSurfaceRenderRequest, ...],
+        output_requests: tuple[FigureSurfaceOutputRequest, ...],
         reset_panel_ids: tuple[str, ...],
     ) -> None:
         if self._closing:
@@ -215,14 +229,14 @@ class ConsoleRenderLane:
         )
         with self._lock:
             if self._future is not None:
-                raise RuntimeError("TaskConsole render lane admitted overlapping batches")
+                raise RuntimeError("Figure surface lane admitted overlapping batches")
             self._future = future
         future.add_done_callback(self._finished)
 
     def _compose(
         self,
-        requests: tuple[PanelRenderRequest, ...],
-        output_requests: tuple[PanelFigureOutputRequest, ...],
+        requests: tuple[FigureSurfaceRenderRequest, ...],
+        output_requests: tuple[FigureSurfaceOutputRequest, ...],
         reset_panel_ids: tuple[str, ...],
     ):
         from zlc_frontend.panel_render import PanelRenderError
@@ -295,7 +309,7 @@ class ConsoleRenderLane:
                 )
             else:
                 output_results.append((request, front, None))
-        return ConsoleRenderCompletion(tuple(results), tuple(output_results))
+        return FigureSurfaceCompletion(tuple(results), tuple(output_results))
 
     def _finished(self, future: Future) -> None:
         try:
@@ -304,7 +318,7 @@ class ConsoleRenderLane:
             completion = f"{type(error).__name__}: {error}"
         with self._lock:
             if self._future is not future:
-                raise RuntimeError("TaskConsole render future identity changed")
+                raise RuntimeError("Figure surface render future identity changed")
             self._future = None
             if self._closing:
                 return
@@ -379,7 +393,7 @@ class ConsoleRenderLane:
             failures = (f"{type(error).__name__}: {error}",)
         with self._lock:
             if self._shutdown_future is not future:
-                raise RuntimeError("TaskConsole render shutdown future identity changed")
+                raise RuntimeError("Figure surface shutdown future identity changed")
             self._shutdown_future = None
             self._shutdown_failures = tuple(failures)
             self._shutdown_complete = True

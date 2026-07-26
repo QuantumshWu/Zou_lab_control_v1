@@ -37,12 +37,15 @@ class DatasetInputSpec:
     label: str
     accepted_output_contract_ids: tuple[str, ...] | None
     description: str = ""
+    requires_event_association: bool = False
 
     def __post_init__(self) -> None:
         canonical_text(self.key, "Dataset input key")
         canonical_text(self.label, "Dataset input label")
         if not isinstance(self.description, str):
             raise TypeError("Dataset input description must be str")
+        if type(self.requires_event_association) is not bool:
+            raise TypeError("requires_event_association must be bool")
         accepted = self.accepted_output_contract_ids
         if accepted is not None:
             object.__setattr__(

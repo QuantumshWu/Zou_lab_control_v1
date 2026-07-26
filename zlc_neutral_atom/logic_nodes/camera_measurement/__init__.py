@@ -23,7 +23,6 @@ from .definition import (
     camera_measurement_default_role,
     camera_measurement_final_outputs,
     camera_measurement_roles,
-    current_camera_monitor_selection,
     project_camera_measurement_outputs,
     project_camera_monitor_outputs,
 )
@@ -71,7 +70,6 @@ __all__ = [
     "camera_measurement_default_role",
     "camera_measurement_final_outputs",
     "camera_measurement_roles",
-    "current_camera_monitor_selection",
     "prepare_finite_camera_measurement",
     "prepare_live_camera_measurement",
     "project_camera_measurement_outputs",

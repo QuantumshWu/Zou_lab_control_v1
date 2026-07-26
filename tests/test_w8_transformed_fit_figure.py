@@ -15,7 +15,7 @@ from PyQt5 import QtCore, QtWidgets
 
 from zlc_frontend.qt_widgets import ensure_qt_app
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 from zlc_data import (
     REPEAT,
     SCAN_POINT,
@@ -450,7 +450,7 @@ def test_public_execution_and_saved_ref_reopen_the_same_selection_transform(
 
         monkeypatch.setattr(
             FitResultRepository,
-            "execute_capture",
+            "execute",
             forbidden_execute,
         )
         window = experiment.figure_gui(saved_ref)

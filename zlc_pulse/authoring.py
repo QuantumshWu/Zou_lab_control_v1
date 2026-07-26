@@ -738,7 +738,7 @@ def _convert_binding_value(
     source_unit: str,
     target_unit: str,
 ) -> int | float:
-    if field_kind != FIELD_DURATION or source_unit == target_unit:
+    if field_kind not in (FIELD_DURATION, FIELD_DELAY) or source_unit == target_unit:
         return value
     converted = (
         Fraction(str(value))
@@ -950,6 +950,46 @@ def resolve_api_parameters(
             if parameter.parameter_id not in requested
         ),
     )
+
+
+def apply_api_values_to_authoring_document(
+    document: PulseDocument,
+    values: Mapping[str, int | float],
+) -> PulseDocument:
+    """Apply exact API values while retaining the source authoring form.
+
+    API values use each parameter's declared unit.  A source field may use a
+    different equivalent time unit, so convert back before replacing it.  The
+    result is the exact applied authoring intent with API declarations intact;
+    execution lowering remains :func:`resolve_api_parameters`' responsibility.
+    """
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    requested = dict(values)
+    expected = set(document.api_parameter_by_id)
+    if set(requested) != expected:
+        raise ValueError(
+            "applied API values must exactly cover declared parameters; "
+            f"missing={tuple(sorted(expected - set(requested)))}, "
+            f"unknown={tuple(sorted(set(requested) - expected))}"
+        )
+    applied = document
+    for parameter in document.api_parameters:
+        _nominal, authored_unit = document.field_value(parameter.field)
+        value = _convert_binding_value(
+            requested[parameter.parameter_id],
+            parameter.field.kind,
+            parameter.unit,
+            authored_unit,
+        )
+        applied = replace_pulse_field(
+            applied,
+            parameter.field,
+            value,
+            unit=authored_unit,
+        )
+    return applied
 
 
 def resolve_api_segment_document(
@@ -1329,6 +1369,7 @@ __all__ = [
     "PulseEditResult",
     "ScanParameterNormalization",
     "ScanNormalizationReport",
+    "apply_api_values_to_authoring_document",
     "attach_scan_recipe",
     "allocate_field_parameter_id",
     "clear_port",

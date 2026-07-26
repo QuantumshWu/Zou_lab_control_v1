@@ -18,14 +18,11 @@ from zlc_frontend.data_figure_presentation import (
     DataFigureFront,
     DataFigureGridDisplayState,
     DataFigureGridFocusRequest,
-    DataFigurePanelPayload,
     classify_faceted_data_figure,
     classify_single_data_figure,
-    data_figure_initial_payload_context,
     default_data_figure_display_state,
     display_state_intent,
     grid_display_state_intent,
-    data_figure_payload_intent,
 )
 from zlc_frontend.data_figure_render import (
     DataFigureRenderSession,
@@ -55,14 +52,11 @@ def _figure_window_factory(
     size_name: str = DEFAULT_DATA_FIGURE_SIZE_NAME,
     presentation_title: str | None = None,
     presentation_value_label: str | None = None,
-    initial_payload: DataFigurePanelPayload | None = None,
 ):
     if initial_display is not None:
         display_state_intent(initial_display)
     if initial_grid_display is not None:
         grid_display_state_intent(initial_grid_display)
-    if initial_payload is not None:
-        data_figure_payload_intent(initial_payload)
     if not isinstance(embedded, bool):
         raise TypeError("embedded must be bool")
     for name, value in (
@@ -133,22 +127,9 @@ def _figure_window_factory(
                 raise ValueError(
                     "saved display state does not match the figure view intent"
                 )
-            (
-                current_value_limits,
-                previous_relim_mode,
-                previous_count_scale,
-            ) = data_figure_initial_payload_context(
-                figure,
-                display,
-                initial_payload,
-                initial_fit_result_identity,
-            )
             front = render_session.render_front(
                 figure,
                 display,
-                current_value_limits=current_value_limits,
-                previous_relim_mode=previous_relim_mode,
-                previous_count_scale=previous_count_scale,
                 sequence=sequence,
                 check_cancelled=lambda: _require_not_cancelled(cancelled),
                 fit_result_identity=initial_fit_result_identity,
@@ -158,19 +139,15 @@ def _figure_window_factory(
                 presentation_title=presentation_title,
                 presentation_value_label=presentation_value_label,
             )
-            cached_typed = figure
+            cached_typed = front.figure
             cached_base = (
-                figure.with_fit_results(None)
-                if figure.has_fit_overlays
-                else figure
+                front.figure.with_fit_results(None)
+                if front.figure.has_fit_overlays
+                else front.figure
             )
             return front
         grid_intent, grid_panel_count, grid_reason = classify_faceted_data_figure(figure)
         if grid_intent is not None and grid_panel_count is not None:
-            if initial_payload is not None:
-                raise ValueError(
-                    "a grid overview does not accept one focused panel payload"
-                )
             if initial_display is not None:
                 raise ValueError(
                     "a multi-panel figure does not accept one single-panel display state"
@@ -195,21 +172,18 @@ def _figure_window_factory(
                 display_state=initial_grid_display,
                 presentation_title=presentation_title,
                 presentation_value_label=presentation_value_label,
+                fit_result_identity=initial_fit_result_identity,
                 check_cancelled=lambda: _require_not_cancelled(cancelled),
             )
             cached_typed_grid = (
                 grid_intent,
-                figure,
+                overview.figure,
                 initial_fit_result_identity,
             )
             return overview
         if initial_grid_display is not None:
             raise ValueError(
                 "a grid display state requires a supported typed grid figure"
-            )
-        if initial_payload is not None:
-            raise ValueError(
-                "an initial panel payload requires a supported single-panel figure"
             )
         return render_encoded_data_figure(
             figure,
@@ -221,9 +195,6 @@ def _figure_window_factory(
         fit_result: FitResultBatch | None,
         fit_result_identity: str | None,
         state: DataFigureDisplayState | DataFigureGridFocusRequest,
-        current_value_limits,
-        previous_relim_mode,
-        previous_count_scale,
         sequence: int,
         cancelled: threading.Event,
         geometry: PanelSurfaceGeometry,
@@ -255,9 +226,6 @@ def _figure_window_factory(
             front = render_session.render_front(
                 focused,
                 display,
-                current_value_limits=None,
-                previous_relim_mode=None,
-                previous_count_scale=None,
                 sequence=sequence,
                 check_cancelled=lambda: _require_not_cancelled(cancelled),
                 fit_result_identity=grid_fit_result_identity,
@@ -300,9 +268,6 @@ def _figure_window_factory(
         return render_session.render_front(
             render_figure,
             state,
-            current_value_limits=current_value_limits,
-            previous_relim_mode=previous_relim_mode,
-            previous_count_scale=previous_count_scale,
             sequence=sequence,
             check_cancelled=lambda: _require_not_cancelled(cancelled),
             fit_result=fit_result,
@@ -353,7 +318,6 @@ def create_data_figure_pane(
     size_name: str = DEFAULT_DATA_FIGURE_SIZE_NAME,
     presentation_title: str | None = None,
     presentation_value_label: str | None = None,
-    initial_payload: DataFigurePanelPayload | None = None,
 ) -> DataFigureWindow:
     """Build the one DataFigure interaction owner for embedding or launch.
 
@@ -407,7 +371,6 @@ def create_data_figure_pane(
         size_name=size_name,
         presentation_title=presentation_title,
         presentation_value_label=presentation_value_label,
-        initial_payload=initial_payload,
     )()
 
 def open_figure_workbench(

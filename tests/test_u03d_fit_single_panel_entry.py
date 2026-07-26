@@ -15,7 +15,7 @@ from PyQt5 import QtCore, QtWidgets
 from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 from zlc_data import (
     READOUT_EVENT,
     REPEAT,
@@ -526,7 +526,7 @@ def test_direct_scan_fit_entry_is_typed_and_repeat_remains_authoritative_batch(
     source = _synthetic_image_source(
         program.repeat_count * program.point_table.point_layout.storage_size
     )
-    reference = experiment.readout.prepare_scan_source(
+    reference = experiment.nodes.pulse_scan.prepare_scan_source(
         request,
         source,
     ).start().result(20.0)
@@ -550,7 +550,7 @@ def test_direct_scan_fit_entry_is_typed_and_repeat_remains_authoritative_batch(
             for axis_id, _role in window._fit_axis_roles
             if axis_id not in bound.spec.fit_axis_ids
         }
-        repeat_axis = experiment.readout.load_scan(
+        repeat_axis = experiment.nodes.pulse_scan.load_scan(
             reference
         ).output_schema.repeat_axis
         assert repeat_axis.role == REPEAT

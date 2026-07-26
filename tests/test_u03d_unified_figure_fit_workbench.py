@@ -15,7 +15,7 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 import pytest
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 from Zou_lab_control.workbench import open_figure_workbench
 from zlc_workbench.data_figure.window import DataFigureWindow
 from zlc_data import (
@@ -249,7 +249,7 @@ def test_public_fit_surfaces_remain_headless_until_a_window_is_opened() -> None:
             sys.executable,
             "-c",
             (
-                "import sys; import Zou_lab_control.notebook; "
+                "import sys; import Zou_lab_control.api; "
                 "import Zou_lab_control.workbench; import zlc_frontend; "
                 "assert not any(n == 'PyQt5' or n.startswith('PyQt5.') "
                 "for n in sys.modules)"
@@ -272,13 +272,13 @@ def test_figure_fit_is_one_step_save_reopen_refit_and_export(
     experiment, reference, _workspace = capture_product
     owner_thread = threading.get_ident()
     execute_threads: list[int] = []
-    original_execute = FitResultRepository.execute_capture
+    original_execute = FitResultRepository.execute
 
     def observed_execute(self, *args, **kwargs):
         execute_threads.append(threading.get_ident())
         return original_execute(self, *args, **kwargs)
 
-    monkeypatch.setattr(FitResultRepository, "execute_capture", observed_execute)
+    monkeypatch.setattr(FitResultRepository, "execute", observed_execute)
     window = _open_image_fit(application, experiment, reference)
     try:
         pane = window._fit_pane
@@ -455,7 +455,7 @@ def test_fit_solver_does_not_block_image_navigation_and_new_roi_revokes_it(
     experiment, reference, _workspace = capture_product
     entered = threading.Event()
     release = threading.Event()
-    original_execute = FitResultRepository.execute_capture
+    original_execute = FitResultRepository.execute
 
     def blocked_execute(self, *args, **kwargs):
         entered.set()
@@ -463,7 +463,7 @@ def test_fit_solver_does_not_block_image_navigation_and_new_roi_revokes_it(
             raise TimeoutError("test did not release Fit execution")
         return original_execute(self, *args, **kwargs)
 
-    monkeypatch.setattr(FitResultRepository, "execute_capture", blocked_execute)
+    monkeypatch.setattr(FitResultRepository, "execute", blocked_execute)
     window = _open_image_fit(application, experiment, reference)
     try:
         pane = window._fit_pane

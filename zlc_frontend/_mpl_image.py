@@ -6,20 +6,14 @@ import gc
 from io import BytesIO
 import math
 import threading
-from numbers import Integral, Number
+from numbers import Number
 import matplotlib
 import numpy as np
 from zlc_data import FitBatchStatus, FitResultBatch
 from zlc_storage import positive_integer
 from .figure import (
-    EvaluatedAxis,
-    EvaluatedCurve,
-    EvaluatedFigureData,
-    EvaluatedHistogram,
     EvaluatedImage,
-    EvaluatedMeter,
     EvaluatedProjectionIdentity,
-    FigureDocument,
 )
 from .fit_image_projection import (
     RadialGaussianImageFitPanel,
@@ -44,51 +38,32 @@ from .display_range import (
     validated_display_range,
 )
 from .render import (
-    CurveFitOverlay,
-    CurvePanelPayload,
-    HistogramPanelPayload,
-    ImagePanelPayload,
     ImagePanelRasterGeometry,
-    MeterPanelPayload,
-    PulsePanelPayload,
     RadialGaussianImageFitOverlay,
     RasterBuffer,
     _validated_curve_fit_overlays,
 )
 from .axis_display import axis_label as _axis_label
 from .plot_layout import (
-    grid_shape_for,
-    grid_shape_for_aspect,
     image_panel_layout,
     image_panel_layout_for_raster,
     LIVE_PANEL_DPI,
-    optimal_grid_size,
-    panel_data_box,
-    panel_data_box_for_raster,
     panel_figure_size_inches,
-    rolling_panel_layout,
-    rolling_panel_layout_for_raster,
-    site_grid_geometry,
 )
 from .render_style import (
     ANNOTATION_FONT_SIZE,
-    CURVE_LINESTYLE,
-    CURVE_MARKER,
     FIT_CONTOUR_COLOR,
     FIT_CONTOUR_LINEWIDTH,
     FIT_FAILURE_COLOR,
-    FIT_LINESTYLE,
-    HIST_FILL_ALPHA,
-    LINE_CYCLE,
+    FIT_RADIAL_CENTER_SIZE,
+    FIT_RADIAL_COLOR,
+    FIT_RADIAL_RING_ALPHA,
+    FIT_RADIAL_RING_LINEWIDTH,
     PALETTE,
     SITE_OCCUPANCY_STYLE,
     apply_title,
-    axis_label_fontsize,
-    bimodal_fit_line_specs,
     render_style_context,
     small_fontsize,
-    threshold_line_kwargs,
-    tick_fontsize,
 )
 from .site_map import (
     SITE_INVALID_ALPHA,
@@ -232,15 +207,20 @@ def _draw_projected_image(
         from matplotlib.patches import Circle
 
         assert radius is not None and diagnostic is None
-        axis.scatter(*center, color=PALETTE["fit_right"], s=8, clip_on=True)
+        axis.scatter(
+            *center,
+            color=FIT_RADIAL_COLOR,
+            s=FIT_RADIAL_CENTER_SIZE,
+            clip_on=True,
+        )
         axis.add_patch(
             Circle(
                 center,
                 radius=radius,
-                edgecolor=PALETTE["fit_right"],
+                edgecolor=FIT_RADIAL_COLOR,
                 facecolor="none",
-                linewidth=1.8,
-                alpha=0.9,
+                linewidth=FIT_RADIAL_RING_LINEWIDTH,
+                alpha=FIT_RADIAL_RING_ALPHA,
                 clip_on=True,
             )
         )
@@ -432,152 +412,6 @@ def _validated_radial_grid_columns(columns: int, panel_count: int) -> int:
     if columns > panel_count:
         raise ValueError("columns cannot exceed the radial panel count")
     return columns
-
-def _validated_image_panel_export(
-    payload: ImagePanelPayload,
-    display: ImageDisplayState,
-) -> None:
-    if not isinstance(payload, ImagePanelPayload):
-        raise TypeError("payload must be ImagePanelPayload")
-    if not isinstance(display, ImageDisplayState):
-        raise TypeError("display must be ImageDisplayState")
-    home_viewport = image_viewport_for_evaluated_image(payload.image)
-    expected_viewport = image_viewport_for_display_state(display, home_viewport)
-    if expected_viewport != payload.viewport:
-        raise ValueError("image display state differs from the exact payload viewport")
-    if payload.colormap is not display.colormap:
-        raise ValueError("image display colormap differs from the exact payload")
-    if (
-        display.relim_mode is RelimMode.FIXED
-        and display.fixed_color_limits != payload.color_limits
-    ):
-        raise ValueError("fixed image display limits differ from the exact payload front")
-
-def _image_panel_fit_annotation(
-    payload: ImagePanelPayload,
-) -> tuple[
-    tuple[float, float] | None,
-    float | None,
-    str | None,
-    str | None,
-]:
-    """Project one immutable radial-fit DTO through the exact payload view.
-
-    The Qt front and this headless export share the same authority boundary:
-    fit geometry is expressed in the declared coordinate frame and is mapped
-    by :class:`ImageViewportTransform`.  Mapping the resulting visible point
-    and span back through the imshow extent keeps descending axes, cropped
-    viewports, and half-cell edges exact without letting Matplotlib infer a
-    pixel convention from array shape.
-
-    The returned tuple is ``(center, radius, diagnostic, title)``.  Failed and
-    sparse cells intentionally return no geometry, so a diagnostic can never
-    inherit a successful centre/ring.
-    """
-
-    overlay = payload.fit_overlay
-    if overlay is None:
-        return None, None, None, None
-    status_label = (
-        "NOT_PRESENT" if overlay.status is None else overlay.status.value
-    )
-    title = f"{overlay.caption} $\\cdot$ {status_label}"
-    if overlay.status is not FitBatchStatus.CONVERGED:
-        return None, None, overlay.diagnostic or status_label, title
-
-    center = overlay.center_xy
-    radius = overlay.one_over_e_radius
-    if center is None or radius is None:
-        raise RuntimeError("converged radial fit overlay lost its geometry")
-    viewport = payload.viewport
-    visible_center = viewport.unbounded_visible_point_for_coordinate(
-        center,
-        coordinate_frame=overlay.coordinate_frame,
-    )
-    visible_diameter = viewport.visible_span_for_coordinate_span(
-        (2.0 * radius, 2.0 * radius),
-        coordinate_frame=overlay.coordinate_frame,
-    )
-
-    x_edges, _x_centers, _x_labels = _image_axis(payload.image.x_axis)
-    y_edges, _y_centers, _y_labels = _image_axis(payload.image.y_axis)
-    left, top, right, bottom = viewport.visible_bounds
-    x_full_start, x_full_stop = float(x_edges[0]), float(x_edges[-1])
-    y_full_start, y_full_stop = float(y_edges[0]), float(y_edges[-1])
-    x_view_start = x_full_start + left * (x_full_stop - x_full_start)
-    x_view_stop = x_full_start + right * (x_full_stop - x_full_start)
-    y_view_top = y_full_start + top * (y_full_stop - y_full_start)
-    y_view_bottom = y_full_start + bottom * (y_full_stop - y_full_start)
-    projected_center = (
-        x_view_start + visible_center[0] * (x_view_stop - x_view_start),
-        y_view_top + visible_center[1] * (y_view_bottom - y_view_top),
-    )
-    projected_diameters = (
-        visible_diameter[0] * abs(x_view_stop - x_view_start),
-        visible_diameter[1] * abs(y_view_bottom - y_view_top),
-    )
-    tolerance = 16.0 * math.ulp(
-        max(1.0, abs(projected_diameters[0]), abs(projected_diameters[1]))
-    )
-    if not math.isclose(
-        projected_diameters[0],
-        projected_diameters[1],
-        rel_tol=1e-12,
-        abs_tol=tolerance,
-    ):
-        raise ValueError("radial fit viewport mapping produced anisotropic geometry")
-    return projected_center, projected_diameters[0] / 2.0, None, title
-
-def encode_image_panel_png(
-    payload: ImagePanelPayload,
-    display: ImageDisplayState,
-    *,
-    dpi: float = 100.0,
-) -> bytes:
-    """Encode one exact current IMAGE front without re-evaluation or fit authority.
-
-    The committed viewport, colormap, effective colour limits, and value unit
-    all come from the exact payload/display pair.  An attached immutable radial
-    fit DTO is exported as its centre/radius and status only; no fitted image or
-    contour is synthesized.  Pointer-drag rectangles remain absent because
-    they are transient Qt overlays, not committed display state.
-    """
-
-    _validated_image_panel_export(payload, display)
-    center, radius, diagnostic, title = _image_panel_fit_annotation(payload)
-    dpi = _render_dpi(dpi)
-
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from matplotlib.figure import Figure
-
-    figure = None
-    output = BytesIO()
-    try:
-        with render_style_context():
-            figure = Figure(figsize=(5.0, 4.0), dpi=dpi, constrained_layout=True)
-            FigureCanvasAgg(figure)
-            axis = figure.subplots()
-            _draw_projected_image(
-                axis,
-                figure,
-                payload.image,
-                colormap=display.colormap.value,
-                color_limits=payload.color_limits,
-                visible_bounds=payload.viewport.visible_bounds,
-                regular_axis_contract=True,
-                center=center,
-                radius=radius,
-                diagnostic=diagnostic,
-            )
-            if title is not None:
-                axis.set_title(title)
-            figure.savefig(output, format="png", dpi=dpi)
-    finally:
-        if figure is not None:
-            release_agg_figure(figure)
-        figure = None
-        gc.collect()
-    return output.getvalue()
 
 def render_radial_gaussian_image_fit_panels(
     panels: tuple[RadialGaussianImageFitPanel, ...],
@@ -918,7 +752,6 @@ class ImagePanelAggRenderer:
     __slots__ = (
         "_axis",
         "_axes_blit_cache",
-        "_bin_count",
         "_blit_cache",
         "_colorbar",
         "_colorbar_state",
@@ -940,7 +773,6 @@ class ImagePanelAggRenderer:
         "_prepared_image_key",
         "_prepared_image_value",
         "_owner_thread",
-        "_render_count",
         "_site_map",
         "_site_artist",
         "_size",
@@ -1074,8 +906,8 @@ class ImagePanelAggRenderer:
             fit_center_artist = axis.scatter(
                 (),
                 (),
-                color=PALETTE["fit_right"],
-                s=8,
+                color=FIT_RADIAL_COLOR,
+                s=FIT_RADIAL_CENTER_SIZE,
                 clip_on=True,
                 zorder=6,
             )
@@ -1083,10 +915,10 @@ class ImagePanelAggRenderer:
             fit_ring_artist = Circle(
                 (0.0, 0.0),
                 radius=1.0,
-                edgecolor=PALETTE["fit_right"],
+                edgecolor=FIT_RADIAL_COLOR,
                 facecolor="none",
-                linewidth=1.8,
-                alpha=0.9,
+                linewidth=FIT_RADIAL_RING_LINEWIDTH,
+                alpha=FIT_RADIAL_RING_ALPHA,
                 clip_on=True,
                 zorder=6,
             )
@@ -1130,8 +962,6 @@ class ImagePanelAggRenderer:
         self._size = (width, height)
         self._size_name = None if size_name is None else str(size_name)
         self._count_ceiling = 0.0
-        self._bin_count = 0
-        self._render_count = 0
 
     def render(
         self,
@@ -1332,9 +1162,13 @@ class ImagePanelAggRenderer:
             # mapping actually changes.  Calling ``update_normal`` regardless
             # rebuilt its QuadMesh on every camera frame and defeated the
             # otherwise steady Agg path.
-            endpoints_enabled = colorbar_endpoints is True or (
-                colorbar_endpoints is None and self._render_count > 0
-            )
+            # Endpoint labels are chrome, so their presence must be stable for
+            # the lifetime of this renderer.  Deferring them until the second
+            # frame made the first live update change the chrome key and pay
+            # another complete Agg draw before the steady blit path could be
+            # entered.  ``None`` is the ordinary PlotPanel policy (enabled);
+            # specialised surfaces such as SiteMap opt out explicitly.
+            endpoints_enabled = colorbar_endpoints is not False
             colorbar_state = (
                 colormap_name,
                 tuple(float(value) for value in color_limits),
@@ -1441,8 +1275,6 @@ class ImagePanelAggRenderer:
                     actual_height,
                 ),
             )
-            self._bin_count = bin_count
-            self._render_count += 1
             return raster, geometry
 
     def _update_site_overlay(
@@ -1596,7 +1428,6 @@ class ImagePanelAggRenderer:
             raise RuntimeError("image-panel Agg renderer is closed")
 
 __all__ = [
-    "encode_image_panel_png",
     "encode_radial_gaussian_image_fit_panels",
     "render_radial_gaussian_image_fit_panels",
     "ImagePanelAggRenderer",

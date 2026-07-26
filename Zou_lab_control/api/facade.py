@@ -1,4 +1,4 @@
-"""Notebook-first composition facade with no public raw hardware graph."""
+"""Experiment composition API with no public raw hardware graph."""
 
 from __future__ import annotations
 
@@ -54,8 +54,6 @@ from zlc_neutral_atom.devices.sequencer.application import (
     PulseTargetDescriptor,
     prepare_pulse_execution,
 )
-from zlc_neutral_atom.logic_nodes.readout.occupancy.reference import OccupancyArtifactRef
-from zlc_neutral_atom.logic_nodes.pulse_scan.reference import ScanArtifactRef
 from zlc_neutral_atom.devices.sequencer.port import PulseScanProgress
 from zlc_neutral_atom.runtime.run import CancelOutcome, RunHandle
 from zlc_pulse import (
@@ -66,7 +64,7 @@ from zlc_storage import canonical_text as _text
 from zlc_storage import durable_makedirs
 from zlc_storage import positive_real as _positive_real
 
-from ._readout_composition import ReadoutFacade, compose_readout_resources
+from ._readout_core import ReadoutFacade
 from ._application_services import (
     ExperimentCloseAttempt as _ExperimentCloseAttempt,
     ExperimentServices as _ExperimentServices,
@@ -78,11 +76,12 @@ from ._application_services import (
 )
 from ._figure_projection import (
     data_figure_for_services as _data_figure_for_services,
-    project_notebook_figure as _project_notebook_figure,
+    project_figure as _project_figure,
 )
 from ._dataset_sources import (
     project_final_dataset_source as _project_final_dataset_source,
 )
+from ._logic_node_api import compose_logic_node_apis
 
 if TYPE_CHECKING:
     from zlc_frontend import DataFigure
@@ -244,15 +243,17 @@ class PulseFacade:
 
 
 class Experiment:
-    """Public notebook root containing values, requests, and narrow facades only."""
+    """Public experiment root containing values, requests, and narrow APIs only."""
 
     __slots__ = (
+        "_artifact_operations",
         "_services",
         "name",
         "device_catalog",
         "installation_config",
         "pulse",
         "readout",
+        "nodes",
     )
 
     def __init__(
@@ -276,6 +277,11 @@ class Experiment:
         self.device_catalog = device_catalog
         self.installation_config = installation_config
         self.readout = ReadoutFacade(services)
+        self.nodes = compose_logic_node_apis(
+            self.readout,
+            self.readout._artifact_capabilities(),
+        )
+        self._artifact_operations = self.nodes._artifact_operations
         self.pulse = PulseFacade(services)
 
     def pulse_gui(
@@ -294,7 +300,7 @@ class Experiment:
         """Lazily open the task console bound to this experiment.
 
         One composition root owns the window (``zlc_workbench.task_console.app``),
-        so a notebook and the double-clickable launcher open the SAME console.
+        so scripted and double-clickable launchers open the same console.
         """
 
         from Zou_lab_control.workbench import open_task_console
@@ -328,7 +334,7 @@ class Experiment:
             existing = services.gui_handles.get(name)
             if existing is not None:
                 if existing.permanently_closed:
-                    # A committed teardown can race a later notebook reopen by
+                    # A committed teardown can race a later API reopen by
                     # one owner turn.  Retire the exact dead handle instead of
                     # leaving an un-restorable registry tombstone forever.
                     services.gui_handles.pop(name)
@@ -380,7 +386,7 @@ class Experiment:
 
     def fit(
         self,
-        source: CaptureArtifactRef | ScanArtifactRef,
+        source: object,
         spec: FitSpec | None = None,
         *,
         model: str | None = None,
@@ -389,10 +395,10 @@ class Experiment:
         constraints: tuple[FitParameterConstraint, ...] = (),
         numeric_policy: FitNumericPolicy | None = None,
     ) -> FitExecution:
-        """Fit one committed capture or FINAL scan without hidden reduction."""
+        """Fit one owner-admitted FINAL Dataset artifact without hidden reduction."""
 
-        if not isinstance(source, (CaptureArtifactRef, ScanArtifactRef)):
-            raise TypeError("source must be CaptureArtifactRef or ScanArtifactRef")
+        if not self._artifact_operations.can_project_dataset(source):
+            raise TypeError("source must be a composed FINAL Dataset artifact")
         if (spec is None) == (model is None):
             raise ValueError("provide exactly one of spec or model")
         with _fit_service_guard(self._services) as services:
@@ -403,7 +409,7 @@ class Experiment:
             if spec is None:
                 assert model is not None
                 schema = _project_final_dataset_source(
-                    services,
+                    self._artifact_operations,
                     source,
                     materialize=False,
                 ).schema
@@ -431,15 +437,8 @@ class Experiment:
                 raise ValueError(
                     "spec cannot be combined with model convenience arguments"
                 )
-            if isinstance(source, CaptureArtifactRef):
-                return services.fit_repository.execute_capture(
-                    services.capture_repository,
-                    source,
-                    spec,
-                    cancel_check=closing_cancel_check,
-                )
-            return services.fit_repository.execute_scan(
-                services.readout_resources.scan_repository,
+            return services.fit_repository.execute(
+                self._artifact_operations,
                 source,
                 spec,
                 cancel_check=closing_cancel_check,
@@ -452,19 +451,18 @@ class Experiment:
         with _service_guard(self._services) as services:
             return services.fit_repository.load(
                 reference,
-                capture_repository=services.capture_repository,
-                scan_repository=services.readout_resources.scan_repository,
+                artifacts=self._artifact_operations,
             )
 
     def _open_fit_capable_figure_gui(
         self,
         display_source,
-        fit_source: CaptureArtifactRef | ScanArtifactRef,
+        fit_source: object,
         *,
         intent,
         selection: Selection | None,
         preferences,
-        occupancy_output: str | None,
+        artifact_output: str | None,
         selected_model: str | None = None,
         initial_fit_spec: FitSpec | None = None,
         initial_selection: Selection | None = None,
@@ -475,8 +473,8 @@ class Experiment:
     ):
         """Compose the one Figure-owned Fit host without exposing repositories."""
 
-        if not isinstance(fit_source, (CaptureArtifactRef, ScanArtifactRef)):
-            raise TypeError("fit_source must be CaptureArtifactRef or ScanArtifactRef")
+        if not self._artifact_operations.can_project_dataset(fit_source):
+            raise TypeError("fit_source must be a composed FINAL Dataset artifact")
         timeout = _positive_real(timeout_seconds, "timeout_seconds")
         chosen_model = (
             None if selected_model is None else _text(selected_model, "model")
@@ -494,7 +492,7 @@ class Experiment:
 
         def source_schema(services):
             return _project_final_dataset_source(
-                services,
+                self._artifact_operations,
                 fit_source,
                 materialize=False,
             ).schema
@@ -583,16 +581,8 @@ class Experiment:
                         closing = services.state != "OPEN"
                     return closing or bool(cancel_check())
 
-                if isinstance(fit_source, CaptureArtifactRef):
-                    return services.fit_repository.execute_capture(
-                        services.capture_repository,
-                        fit_source,
-                        spec,
-                        cancel_check=combined_cancel_check,
-                        deadline_monotonic=deadline_monotonic,
-                    )
-                return services.fit_repository.execute_scan(
-                    services.readout_resources.scan_repository,
+                return services.fit_repository.execute(
+                    self._artifact_operations,
                     fit_source,
                     spec,
                     cancel_check=combined_cancel_check,
@@ -615,8 +605,7 @@ class Experiment:
             with _service_guard(self._services) as services:
                 admitted = services.fit_repository.load(
                     reference,
-                    capture_repository=services.capture_repository,
-                    scan_repository=services.readout_resources.scan_repository,
+                    artifacts=self._artifact_operations,
                 )
             if admitted.source_artifact_ref != fit_source:
                 raise ValueError("saved Fit reopened against another source artifact")
@@ -628,7 +617,7 @@ class Experiment:
                 intent=intent,
                 selection=selection,
                 preferences=preferences,
-                occupancy_output=occupancy_output,
+                output=artifact_output,
             )
 
         if direct_fit_single_panel:
@@ -650,19 +639,20 @@ class Experiment:
                     raise ValueError("direct Fit Figure loader received another source")
                 with _service_guard(self._services) as services:
                     source_projection = _project_final_dataset_source(
-                        services,
+                        self._artifact_operations,
                         fit_source,
                         materialize=False,
                     )
                     schema = source_projection.schema
                     seed_document, _datasets, _fit_result = (
-                        _project_notebook_figure(
+                        _project_figure(
                             services,
+                            self._artifact_operations,
                             source,
                             intent=intent,
                             selection=selection,
                             preferences=preferences,
-                            occupancy_output=None,
+                            artifact_output=None,
                             materialize=False,
                             preprojected_source=source_projection,
                         )
@@ -681,11 +671,12 @@ class Experiment:
                     del schema, source_projection, seed_document
                     return _data_figure_for_services(
                         services,
+                        self._artifact_operations,
                         source,
                         intent=intent,
                         selection=display_selection,
                         preferences=display_preferences,
-                        occupancy_output=None,
+                        artifact_output=None,
                     )
 
         from Zou_lab_control.workbench import open_figure_workbench
@@ -709,7 +700,7 @@ class Experiment:
 
     def fit_gui(
         self,
-        source: CaptureArtifactRef | ScanArtifactRef,
+        source: object,
         *,
         model: str | None = None,
         committed_transform: CommittedTransform | None = None,
@@ -717,8 +708,8 @@ class Experiment:
     ):
         """Open the same DataFigure host with its Fit tab selected."""
 
-        if not isinstance(source, (CaptureArtifactRef, ScanArtifactRef)):
-            raise TypeError("source must be CaptureArtifactRef or ScanArtifactRef")
+        if not self._artifact_operations.can_project_dataset(source):
+            raise TypeError("source must be a composed FINAL Dataset artifact")
         initial_selection = None
         if committed_transform is not None:
             if not isinstance(committed_transform, CommittedTransform):
@@ -737,7 +728,7 @@ class Experiment:
             intent=None,
             selection=None,
             preferences=None,
-            occupancy_output=None,
+            artifact_output=None,
             selected_model=model,
             initial_selection=initial_selection,
             open_fit=True,
@@ -747,84 +738,62 @@ class Experiment:
 
     def figure_document(
         self,
-        source: (
-            ScanArtifactRef
-            | OccupancyArtifactRef
-            | CaptureArtifactRef
-            | FitExecution
-            | FitResultArtifactRef
-            | AdmittedFitResult
-        ),
+        source: object,
         *,
         intent: "ViewIntent | None" = None,
         selection: Selection | None = None,
         preferences: "ViewPreferences | None" = None,
-        occupancy_output: str | None = None,
+        output: str | None = None,
     ) -> "FigureDocument":
         """Project one committed source into a renderer-free document.
 
-        Occupancy defaults to its classified ``occupied`` block; ``counts`` is
-        an explicit presentation alternative.
+        A multi-output artifact may expose an owner-defined ``output`` name;
+        ordinary Dataset artifacts and Fit results reject that argument.
         """
 
         with _service_guard(self._services) as services:
-            document, _datasets, _fit = _project_notebook_figure(
+            document, _datasets, _fit = _project_figure(
                 services,
+                self._artifact_operations,
                 source,
                 intent=intent,
                 selection=selection,
                 preferences=preferences,
-                occupancy_output=occupancy_output,
+                artifact_output=output,
                 materialize=False,
             )
         return document
 
     def figure(
         self,
-        source: (
-            ScanArtifactRef
-            | OccupancyArtifactRef
-            | CaptureArtifactRef
-            | FitExecution
-            | FitResultArtifactRef
-            | AdmittedFitResult
-        ),
+        source: object,
         *,
         intent: "ViewIntent | None" = None,
         selection: Selection | None = None,
         preferences: "ViewPreferences | None" = None,
-        occupancy_output: str | None = None,
+        output: str | None = None,
     ) -> "DataFigure":
         """Resolve one frozen source and return its optional-render DataFigure."""
 
         with _service_guard(self._services) as services:
             return _data_figure_for_services(
                 services,
+                self._artifact_operations,
                 source,
                 intent=intent,
                 selection=selection,
                 preferences=preferences,
-                occupancy_output=occupancy_output,
+                artifact_output=output,
             )
 
     def figure_gui(
         self,
-        source: (
-            ScanArtifactRef
-            | OccupancyArtifactRef
-            | CaptureArtifactRef
-            | FitExecution
-            | FitResultArtifactRef
-            | AdmittedFitResult
-            | str
-            | Path
-            | None
-        ) = None,
+        source: object | str | Path | None = None,
         *,
         intent: "ViewIntent | None" = None,
         selection: Selection | None = None,
         preferences: "ViewPreferences | None" = None,
-        occupancy_output: str | None = None,
+        output: str | None = None,
     ):
         """Open the saved-figure browser or show one typed frozen source.
 
@@ -840,7 +809,7 @@ class Experiment:
                     ("intent", intent),
                     ("selection", selection),
                     ("preferences", preferences),
-                    ("occupancy_output", occupancy_output),
+                    ("output", output),
                 )
                 if value is not None
             )
@@ -858,7 +827,7 @@ class Experiment:
             and intent is None
             and selection is None
             and preferences is None
-            and occupancy_output is None
+            and output is None
         ):
             experiment_services = self._services
             session_thread_id = None
@@ -891,17 +860,14 @@ class Experiment:
                     if session_admitted is None:
                         admitted = services.fit_repository.load(
                             reference,
-                            capture_repository=services.capture_repository,
-                            scan_repository=(
-                                services.readout_resources.scan_repository
-                            ),
+                            artifacts=self._artifact_operations,
                         )
                         model = FitGridModel.from_result(
                             reference.target_ref,
                             admitted.result,
                         )
                         source_projection = _project_final_dataset_source(
-                            services,
+                            self._artifact_operations,
                             admitted.source_artifact_ref,
                             materialize=True,
                         )
@@ -933,11 +899,12 @@ class Experiment:
                         )
                     figure = _data_figure_for_services(
                         services,
+                        self._artifact_operations,
                         admitted,
                         intent=None,
                         selection=resolved_selection,
                         preferences=resolved_preferences,
-                        occupancy_output=None,
+                        artifact_output=None,
                         preprojected_source=source_projection,
                     )
                 return figure, model, page, cell_summary
@@ -971,7 +938,7 @@ class Experiment:
                     # The focused batch cell chooses only the displayed source panel.
                     selection=cell_selection,
                     preferences=model.focus_preferences(),
-                    occupancy_output=None,
+                    artifact_output=None,
                     selected_model=result.spec.model_id,
                     initial_fit_spec=result.spec,
                     initial_selection=authority_selection,
@@ -986,14 +953,14 @@ class Experiment:
                 source,
             )
 
-        if isinstance(source, (CaptureArtifactRef, ScanArtifactRef)):
+        if self._artifact_operations.can_project_dataset(source):
             return self._open_fit_capable_figure_gui(
                 source,
                 source,
                 intent=intent,
                 selection=selection,
                 preferences=preferences,
-                occupancy_output=occupancy_output,
+                artifact_output=output,
             )
 
         if isinstance(source, (FitExecution, AdmittedFitResult)):
@@ -1025,7 +992,7 @@ class Experiment:
                 intent=intent,
                 selection=selection,
                 preferences=preferences,
-                occupancy_output=occupancy_output,
+                artifact_output=output,
                 selected_model=result.spec.model_id,
                 initial_fit_spec=result.spec,
                 initial_selection=initial_authority_selection,
@@ -1046,7 +1013,7 @@ class Experiment:
                 intent=intent,
                 selection=selection,
                 preferences=preferences,
-                occupancy_output=occupancy_output,
+                output=output,
             )
 
         return open_figure_workbench(
@@ -1171,7 +1138,7 @@ class Experiment:
 
             failures = (
                 _cleanup_failures(services.fit_repository.close)
-                + list(services.readout_resources.close())
+                + list(self.nodes.close())
                 + _cleanup_failures(services.capture_repository.close)
             )
             if failures:
@@ -1254,12 +1221,14 @@ def _resolve_installation_document(
             "InstallationConfigDocument"
         )
     if config == "virtual":
-        resolved_seed = 7 if seed is _CONNECT_SEED_UNSET else seed
-        return InstallationConfigDocument.virtual(seed=resolved_seed)
+        return InstallationConfigDocument.from_parameters(
+            "virtual",
+            {} if seed is _CONNECT_SEED_UNSET else {"seed": seed},
+        )
     if config == "remote_pulse":
         raise ValueError(
-            "remote_pulse requires InstallationConfigDocument.remote_pulse(...) "
-            "or a saved installation config"
+            "remote_pulse requires a saved installation config or "
+            "InstallationConfigDocument.from_parameters('remote_pulse', ...)"
         )
     if seed is not _CONNECT_SEED_UNSET:
         raise ValueError("seed cannot override a saved installation config")
@@ -1274,7 +1243,7 @@ def connect(
     seed: int | None | object = _CONNECT_SEED_UNSET,
     required_pulse_document: PulseDocument | None = None,
 ) -> Experiment:
-    """Compose one notebook Experiment; raw devices remain authority-private."""
+    """Compose one Experiment; raw devices remain authority-private."""
 
     installation_document = _resolve_installation_document(config, seed)
     if required_pulse_document is not None and not isinstance(
@@ -1291,7 +1260,6 @@ def connect(
     durable_makedirs(repository_root)
     capture_repository = None
     fit_repository = None
-    readout_resources = None
     runtime = None
     try:
         capture_repository = CaptureRepository(repository_root / "captures")
@@ -1304,20 +1272,15 @@ def connect(
         )
         runtime = installation.runtime
         catalog = runtime.device_catalog
-        readout_resources = compose_readout_resources(
-            repository_root,
-            installation,
-            catalog=catalog,
-            runtime=runtime,
-        )
         fit_operations_drained = threading.Event()
         fit_operations_drained.set()
         services = _ExperimentServices(
+            repository_root=repository_root,
+            installation=installation,
             runtime=runtime,
             capture_repository=capture_repository,
             fit_repository=fit_repository,
             catalog=catalog,
-            readout_resources=readout_resources,
             installation_config=installation_document,
             pulse_application=PulseApplicationOwner(),
             operation_lock=threading.RLock(),
@@ -1344,7 +1307,6 @@ def connect(
             + _cleanup_failures(
                 None if fit_repository is None else fit_repository.close,
             )
-            + ([] if readout_resources is None else list(readout_resources.close()))
             + _cleanup_failures(
                 None if capture_repository is None else capture_repository.close,
             )

@@ -1225,9 +1225,14 @@ class VirtualCamera:
         artifact_digest: str,
         trigger_counts: tuple[tuple[str, int], ...],
         terminal_evidence_digest: str,
+        terminal_evidence_kind: str,
     ) -> tuple[str, int, int]:
         """Bind the observed virtual FIRE group to its exact terminal receipt."""
 
+        if terminal_evidence_kind != "SIMULATED":
+            raise ValueError(
+                "virtual camera association requires a simulated pulse terminal"
+            )
         artifact = sha256_text(artifact_digest, "artifact_digest")
         terminal_digest = sha256_text(
             terminal_evidence_digest,
@@ -2100,6 +2105,16 @@ class VirtualCamera:
     def capture_state(self) -> tuple[bool, int]:
         with self._condition:
             return self._armed, len(self._pending)
+
+    def observed_produced_count(self) -> int:
+        """Return the exact virtual sensor production ordinal without draining."""
+
+        with self._condition:
+            if not self._armed:
+                raise RuntimeError(
+                    "virtual camera produced count requires an armed capture"
+                )
+            return self._produced
 
     def close(self) -> None:
         try:

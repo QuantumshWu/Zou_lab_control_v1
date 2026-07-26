@@ -170,9 +170,11 @@ def view_for_schema(
 ):
     """The ViewSpec this schema admits for ``intent``.
 
-    Raises rather than guessing: a schema that needs an explicit axis choice is
-    a question for the operator, and silently picking an axis would put a
-    plausible-looking wrong picture on the board.
+    The metadata-only suggester derives a complete display default from named
+    axis roles and schema declaration order.  The returned ``ViewSpec`` records
+    every chosen display, sample, slider, batch, and reduction role explicitly;
+    ndarray shape, values, and AxisId spelling never participate.  A schema with
+    an unknown role still fails instead of receiving a guessed projection.
     """
 
     if view is not None:
@@ -356,6 +358,8 @@ class PanelComposer:
         provenance: PanelProvenance,
         fit_result=None,
         fit_result_identity: str | None = None,
+        histogram_projection_value_range: tuple[float, float] | None = None,
+        check_cancelled=None,
     ) -> tuple[object, DataFigure]:
         """Rasterize once and return the exact already-evaluated figure too."""
 
@@ -389,6 +393,8 @@ class PanelComposer:
             ref,
             fit_result=fit_result,
             fit_result_identity=fit_result_identity,
+            histogram_projection_value_range=histogram_projection_value_range,
+            check_cancelled=check_cancelled,
         )
         return (
             self._frame_for(
@@ -411,6 +417,7 @@ class PanelComposer:
         focus: FacetedPanelFocus | None = None,
         fit_result=None,
         fit_result_identity: str | None = None,
+        check_cancelled=None,
     ) -> FacetedPanelResult:
         """Compose one complete typed grid or one exact focused cell.
 
@@ -451,6 +458,8 @@ class PanelComposer:
                 "a grid requires one multi-cell CURVE, HISTOGRAM, IMAGE, or METER view"
             )
         if focus is None:
+            if check_cancelled is not None:
+                check_cancelled()
             rendered_figure = source_figure
             if fit_result is not None:
                 rendered_figure = source_figure.with_fit_results(
@@ -469,6 +478,8 @@ class PanelComposer:
                     self._faceted_overview_renderer = None
                     renderer.close()
                 raise
+            if check_cancelled is not None:
+                check_cancelled()
             if len(regions) != len(layers[0].cells):
                 raise PanelRenderError(
                     "grid hit regions do not cover every evaluated cell"
@@ -501,6 +512,7 @@ class PanelComposer:
             focused_display,
             fit_result=fit_result,
             fit_result_identity=fit_result_identity,
+            check_cancelled=check_cancelled,
         )
         frame = self._frame_for(
             focused.document,
@@ -515,6 +527,212 @@ class PanelComposer:
             frame=frame,
             focus=focus,
         )
+
+    def compose_data_figure(
+        self,
+        figure: DataFigure,
+        *,
+        display,
+        provenance: PanelProvenance,
+        fit_result=None,
+        fit_result_identity: str | None = None,
+        histogram_projection_value_range: tuple[float, float] | None = None,
+        check_cancelled=None,
+    ) -> tuple[object, DataFigure]:
+        """Render one already-evaluated Figure through this panel surface.
+
+        Saved-figure and live-panel hosts differ in where their immutable
+        ``DataFigure`` comes from, not in how it is painted.  This seam keeps
+        the archive's exact evaluated arrays (no second evaluation/copy) while
+        reusing this composer's sole Agg/style/continuity owner.
+        """
+
+        document, _evaluated, _layer, evaluated_input = self._bind_data_figure(
+            figure,
+            faceted=False,
+        )
+
+        overlay_result = fit_result
+        base = figure
+        if figure.has_fit_overlays:
+            if fit_result is not None or fit_result_identity is None:
+                raise PanelRenderError(
+                    "saved Figure Fit replay requires its exact result identity"
+                )
+            results = tuple(figure.fit_results.values())
+            if len(results) != 1:
+                raise PanelRenderError("single panel Figure requires one Fit result")
+            overlay_result = results[0]
+            base = figure.with_fit_results(None)
+        else:
+            overlay_result = self._validated_transient_fit(
+                base,
+                fit_result,
+                fit_result_identity,
+            )
+        series = base.evaluated.layers[0].cells[0].series
+        if not series:
+            raise PanelRenderError("existing panel Figure evaluated no series")
+        raster, payload = self._rasterize(
+            base,
+            series,
+            display,
+            evaluated_input.ref,
+            fit_result=overlay_result,
+            fit_result_identity=fit_result_identity,
+            histogram_projection_value_range=histogram_projection_value_range,
+            check_cancelled=check_cancelled,
+        )
+        return (
+            self._frame_for(
+                document,
+                evaluated_input.ref,
+                raster,
+                payload,
+                display,
+                provenance,
+            ),
+            base,
+        )
+
+    def compose_data_figure_faceted(
+        self,
+        figure: DataFigure,
+        *,
+        display,
+        fit_result=None,
+        fit_result_identity: str | None = None,
+        check_cancelled=None,
+    ) -> FacetedPanelResult:
+        """Render an already-evaluated multi-cell Figure as one grid overview.
+
+        Archive replay must preserve the exact arrays and facet addresses that
+        were loaded.  Re-resolving the source snapshot would produce an
+        equivalent-looking but second ``EvaluatedFigureData`` authority.  This
+        method is the grid counterpart of :meth:`compose_data_figure`: it feeds
+        that existing evaluation into the same persistent Plot Panel renderer.
+        """
+
+        document, evaluated, layer, _evaluated_input = self._bind_data_figure(
+            figure,
+            faceted=True,
+        )
+        overlay_result = fit_result
+        base = figure
+        if figure.has_fit_overlays:
+            if fit_result is not None or fit_result_identity is None:
+                raise PanelRenderError(
+                    "saved Figure Fit replay requires its exact result identity"
+                )
+            results = tuple(figure.fit_results.values())
+            if len(results) != 1:
+                raise PanelRenderError("faceted Figure requires one Fit result")
+            overlay_result = results[0]
+            base = figure.with_fit_results(None)
+        else:
+            overlay_result = self._validated_transient_fit(
+                base,
+                fit_result,
+                fit_result_identity,
+            )
+        visible = (
+            base
+            if overlay_result is None
+            else base.with_fit_results({layer.layer_id: overlay_result})
+        )
+        renderer = self._faceted_overview_agg()
+        try:
+            if check_cancelled is not None:
+                check_cancelled()
+            raster, regions = renderer.render(
+                document,
+                evaluated,
+                dict(visible.fit_results),
+                display_state=display,
+            )
+        except BaseException:
+            if self._faceted_overview_renderer is renderer:
+                self._faceted_overview_renderer = None
+                renderer.close()
+            raise
+        if check_cancelled is not None:
+            check_cancelled()
+        if len(regions) != len(evaluated.layers[0].cells):
+            raise PanelRenderError(
+                "grid hit regions do not cover every evaluated cell"
+            )
+        overview = FacetedOverviewArtifact(
+            visible,
+            raster,
+            regions,
+            self._surface_geometry.logical_size,
+            PanelPresentationIdentity(
+                self._panel_id,
+                document.document_id,
+                document.revision,
+                0,
+                getattr(display, "revision", 0) or 0,
+            ),
+        )
+        return FacetedPanelResult(visible, overview=overview)
+
+    def _bind_data_figure(
+        self,
+        figure: DataFigure,
+        *,
+        faceted: bool,
+    ):
+        """Validate and bind one existing Figure without evaluating it again."""
+
+        if not isinstance(figure, DataFigure):
+            raise TypeError("figure must be DataFigure")
+        document = figure.document
+        evaluated = figure.evaluated
+        cells = () if len(evaluated.layers) != 1 else evaluated.layers[0].cells
+        expected_cells = len(cells) > 1 if faceted else len(cells) == 1
+        if (
+            len(document.layers) != 1
+            or len(document.datasets) != 1
+            or len(evaluated.layers) != 1
+            or not expected_cells
+            or len(evaluated.inputs) != 1
+        ):
+            shape = "multiple cells" if faceted else "one cell"
+            raise PanelRenderError(
+                f"an existing panel Figure requires one layer, input, and {shape}"
+            )
+        layer = document.layers[0]
+        if layer.view.intent is not self._intent:
+            raise PanelRenderError("Figure intent differs from this panel surface")
+        if self._view is not None and layer.view != self._view:
+            raise PanelRenderError("Figure view differs from this panel contract")
+        evaluated_input = evaluated.inputs[0]
+        if evaluated_input.dataset_id != layer.dataset_id:
+            raise PanelRenderError("Figure layer and evaluated input disagree")
+
+        document_changed = (
+            self._document != document or self._dataset_id != evaluated_input.dataset_id
+        )
+        if document_changed:
+            renderer, self._renderer = self._renderer, None
+            if renderer is not None:
+                renderer.close()
+            self._discard_faceted_overview()
+            self._discard_faceted_focus()
+            self._document = document
+            self._document_fingerprint = document.datasets[0].schema_fingerprint
+            self._dataset_id = evaluated_input.dataset_id
+            self._color_limits = None
+            self._image_relim_mode = None
+            self._curve_y_limits = (0.0, 1.0)
+            self._curve_relim_mode = None
+            self._histogram_count_limits = None
+            self._histogram_relim_mode = None
+            self._histogram_count_scale = None
+            self._image_home_viewport = None
+            self._image_color_cache_key = None
+            self._image_color_cache_value = None
+        return document, evaluated, layer, evaluated_input
 
     def _source_figure_for(self, document, snapshot) -> DataFigure:
         """Resolve and evaluate exactly one immutable source revision once."""
@@ -661,6 +879,8 @@ class PanelComposer:
         *,
         fit_result=None,
         fit_result_identity: str | None,
+        histogram_projection_value_range: tuple[float, float] | None = None,
+        check_cancelled=None,
     ):
         evaluated = figure.evaluated
         data = series[0].data
@@ -673,6 +893,7 @@ class PanelComposer:
                 else figure.transient_single_panel_radial_fit_overlay(
                     fit_result,
                     result_identity=fit_result_identity,
+                    check_cancelled=check_cancelled,
                 )
             )
             return self._image_front(
@@ -700,13 +921,18 @@ class PanelComposer:
                     figure.transient_single_panel_curve_fit_overlay_plan(
                         fit_result,
                         result_identity=fit_result_identity,
-                    )
+                    ),
+                    check_cancelled=check_cancelled,
                 )
             return self._curve_front(evaluated, display, fit_overlays=overlays)
         if self._intent is ViewIntent.HISTOGRAM:
             if not isinstance(data, EvaluatedHistogram):
                 raise PanelRenderError("this signal does not evaluate to a histogram")
-            return self._histogram_front(evaluated, display)
+            return self._histogram_front(
+                evaluated,
+                display,
+                projection_value_range=histogram_projection_value_range,
+            )
         if self._intent is ViewIntent.METER:
             if not isinstance(data, EvaluatedMeter):
                 raise PanelRenderError("this signal does not evaluate to a meter")
@@ -723,6 +949,7 @@ class PanelComposer:
         *,
         fit_result=None,
         fit_result_identity: str | None = None,
+        check_cancelled=None,
     ):
         """Use the existing single-panel renderer for one typed grid cell."""
 
@@ -743,6 +970,7 @@ class PanelComposer:
                 fit_overlay = figure.transient_single_panel_radial_fit_overlay(
                     fit_result,
                     result_identity=fit_result_identity,
+                    check_cancelled=check_cancelled,
                 )
             return self._image_front(
                 series[0].data,
@@ -770,7 +998,8 @@ class PanelComposer:
                         figure.transient_single_panel_curve_fit_overlay_plan(
                             fit_result,
                             result_identity=fit_result_identity,
-                        )
+                        ),
+                        check_cancelled=check_cancelled,
                     )
                 raster, payload = renderer.render_interactive_curve(
                     figure.evaluated,
@@ -963,7 +1192,7 @@ class PanelComposer:
         )
         payload = ImagePanelPayload(
             image=data,
-            evaluated_input=EvaluatedInput(self._dataset_id, ref),
+            evaluated_input=projection_identity.evaluated_input,
             # The viewport revision tracks the display revision because a
             # viewport is a property OF a display state; a pair that drifted
             # would let a pan land on a colour window that no longer exists.
@@ -1018,13 +1247,28 @@ class PanelComposer:
         self._curve_relim_mode = display.relim_mode
         return raster, payload
 
-    def _histogram_front(self, evaluated, display: HistogramDisplayState):
+    def _histogram_front(
+        self,
+        evaluated,
+        display: HistogramDisplayState,
+        *,
+        projection_value_range: tuple[float, float] | None = None,
+    ):
+        options = {}
+        if projection_value_range is not None:
+            from .display_range import validated_display_range
+
+            options["projection_value_range"] = validated_display_range(
+                projection_value_range,
+                "histogram projection value range",
+            )
         raster, payload = self._agg().render_interactive_histogram(
             evaluated,
             display,
             current_count_limits=self._histogram_count_limits,
             previous_relim_mode=self._histogram_relim_mode,
             previous_count_scale=self._histogram_count_scale,
+            **options,
         )
         self._histogram_count_limits = payload.viewport.count_limits
         self._histogram_relim_mode = display.relim_mode

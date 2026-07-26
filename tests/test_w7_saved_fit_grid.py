@@ -16,7 +16,7 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 import pytest
 
-import Zou_lab_control.notebook as zlc
+import Zou_lab_control.api as zlc
 from zlc_data import (
     REPEAT,
     SCAN_POINT,
@@ -307,7 +307,7 @@ def test_saved_fit_grid_public_imports_stay_headless_and_ref_has_exact_identity(
             sys.executable,
             "-c",
             (
-                "import sys; import zlc_frontend; import Zou_lab_control.notebook; "
+                "import sys; import zlc_frontend; import Zou_lab_control.api; "
                 "import Zou_lab_control.workbench; "
                 "from zlc_neutral_atom.artifacts.fit_reference import "
                 "FitResultArtifactRef; "
@@ -754,7 +754,7 @@ def test_saved_ref_uses_one_typed_board_cached_focus_display_and_exact_export(
         return original_materialize(self, *args, **kwargs)
 
     monkeypatch.setattr(FitResultRepository, "load", observed_load)
-    monkeypatch.setattr(FitResultRepository, "execute_capture", forbidden_execute)
+    monkeypatch.setattr(FitResultRepository, "execute", forbidden_execute)
     monkeypatch.setattr(AdmittedCapture, "materialize_snapshot", observed_materialize)
     manifests_before = _manifest_count(workspace)
     window = experiment.figure_gui(reference)
@@ -967,7 +967,7 @@ def test_every_saved_1d_catalog_model_reopens_focuses_and_exports_without_refit(
         return original_materialize(self, *args, **kwargs)
 
     monkeypatch.setattr(FitResultRepository, "load", observed_load)
-    monkeypatch.setattr(FitResultRepository, "execute_capture", forbidden_execute)
+    monkeypatch.setattr(FitResultRepository, "execute", forbidden_execute)
     monkeypatch.setattr(AdmittedCapture, "materialize_snapshot", observed_materialize)
     immutable_store_before = _fit_store_state(workspace)
     manifests_before = _manifest_count(workspace)

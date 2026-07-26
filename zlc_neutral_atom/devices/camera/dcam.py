@@ -10,13 +10,10 @@ qualification intentionally remain installation responsibilities.
 from __future__ import annotations
 
 import math
-import queue
 import threading
 import time
 from collections import deque
-from concurrent.futures import Future
 from dataclasses import dataclass, replace
-from typing import Callable, TypeVar
 
 import numpy as np
 
@@ -30,6 +27,7 @@ from zlc_storage import (
 )
 
 from ._dcam_driver import DcamProperty, DcamSdkDriver, DcamValue
+from ._owner_lane import CameraSdkOwnerLane
 from .contract import (
     CameraCaptureTerminalRecord,
     CameraFrameRecord,
@@ -37,7 +35,6 @@ from .contract import (
 )
 
 
-_T = TypeVar("_T")
 _CAPTURE_STATUS_BUSY = 1
 _WAIT_SLICE_SECONDS = 0.05
 
@@ -117,52 +114,6 @@ class DcamCameraConfig:
             object.__setattr__(self, "roi_xywh", tuple(normalized))
 
 
-class _OwnerLane:
-    """Serialize every SDK call on one stable, non-daemon owner thread."""
-
-    _STOP = object()
-
-    def __init__(self, name: str) -> None:
-        self._commands: queue.Queue[object] = queue.Queue()
-        self._owner_ident: int | None = None
-        self._thread = threading.Thread(target=self._run, name=name, daemon=False)
-        self._thread.start()
-
-    @property
-    def owner_ident(self) -> int | None:
-        return self._owner_ident
-
-    def _run(self) -> None:
-        self._owner_ident = threading.get_ident()
-        while True:
-            item = self._commands.get()
-            if item is self._STOP:
-                return
-            function, future = item
-            if not future.set_running_or_notify_cancel():
-                continue
-            try:
-                future.set_result(function())
-            except BaseException as error:
-                future.set_exception(error)
-
-    def call(self, function: Callable[[], _T]) -> _T:
-        if threading.get_ident() == self._owner_ident:
-            return function()
-        if not self._thread.is_alive():
-            raise RuntimeError("DCAM SDK owner lane is closed")
-        future: Future[_T] = Future()
-        self._commands.put((function, future))
-        return future.result()
-
-    def close(self) -> None:
-        if threading.get_ident() == self._owner_ident:
-            raise RuntimeError("DCAM SDK owner lane cannot join itself")
-        if self._thread.is_alive():
-            self._commands.put(self._STOP)
-            self._thread.join()
-
-
 class DcamCameraAdapter:
     """External-trigger qCMOS implementation of the CameraAdapter protocol."""
 
@@ -181,7 +132,7 @@ class DcamCameraAdapter:
         self._driver = (
             DcamSdkDriver(library_path=library_path) if driver is None else driver
         )
-        self._lane = _OwnerLane("zlc-dcam-camera-owner")
+        self._lane = CameraSdkOwnerLane("zlc-dcam-camera-owner")
         self._state_lock = threading.RLock()
         self._finish_requested = threading.Event()
         self._device: object | None = None
@@ -796,6 +747,17 @@ class DcamCameraAdapter:
     def capture_state(self) -> tuple[bool, int]:
         with self._state_lock:
             return self._armed, len(self._pending)
+
+    def observed_produced_count(self) -> int:
+        """Read the DCAM transfer counter without consuming a frame."""
+
+        def observe() -> int:
+            if not self._armed:
+                raise RuntimeError("qCMOS produced count requires an armed capture")
+            count, _newest = self._observe_transfer_on_owner()
+            return count
+
+        return self._lane.call(observe)
 
     def _close_on_owner(self) -> None:
         device = self._device
