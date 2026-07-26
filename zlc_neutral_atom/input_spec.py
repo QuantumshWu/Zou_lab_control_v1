@@ -24,11 +24,18 @@ def _contract_ids(values: tuple[str, ...]) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class DatasetInputSpec:
-    """One exact Dataset producer selection."""
+    """One Dataset producer selection.
+
+    ``accepted_output_contract_ids=None`` is an intentional source-neutral
+    input: every declared Dataset output is admissible.  This is not shape or
+    rank guessing; the consumer is explicitly declaring that its semantics do
+    not depend on the producer's domain contract.  Concrete consumers keep a
+    closed tuple and therefore remain exactly typed.
+    """
 
     key: str
     label: str
-    accepted_output_contract_ids: tuple[str, ...]
+    accepted_output_contract_ids: tuple[str, ...] | None
     description: str = ""
 
     def __post_init__(self) -> None:
@@ -36,11 +43,20 @@ class DatasetInputSpec:
         canonical_text(self.label, "Dataset input label")
         if not isinstance(self.description, str):
             raise TypeError("Dataset input description must be str")
-        object.__setattr__(
-            self,
-            "accepted_output_contract_ids",
-            _contract_ids(self.accepted_output_contract_ids),
-        )
+        accepted = self.accepted_output_contract_ids
+        if accepted is not None:
+            object.__setattr__(
+                self,
+                "accepted_output_contract_ids",
+                _contract_ids(accepted),
+            )
+
+    def accepts(self, contract_id: str) -> bool:
+        """Return whether one owner-declared Dataset contract is admissible."""
+
+        canonical = canonical_text(contract_id, "output contract id")
+        accepted = self.accepted_output_contract_ids
+        return accepted is None or canonical in accepted
 
     @property
     def field_keys(self) -> tuple[str, ...]:

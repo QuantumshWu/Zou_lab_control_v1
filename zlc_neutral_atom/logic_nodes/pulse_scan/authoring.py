@@ -5,19 +5,10 @@ from __future__ import annotations
 from typing import Mapping
 
 from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
-from zlc_neutral_atom.logic_nodes.camera_measurement import (
-    CAMERA_FRAME_OUTPUT_CONTRACT_ID,
-)
-from zlc_data import (
-    AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID,
-    projected_dataset_output_contract_id,
-)
 from zlc_neutral_atom.input_spec import (
     DatasetInputSpec,
 )
-from zlc_neutral_atom.logic_nodes.occupancy.processor import (
-    OCCUPANCY_EXACT_SCAN_OUTPUT_DECLARATIONS,
-)
+from zlc_neutral_atom.pulse_catalog import PROBE_PULSE_PATH
 from zlc_pulse import (
     commit_scan_table,
     evaluate_numeric_scan_program,
@@ -25,6 +16,7 @@ from zlc_pulse import (
     load_pulse_document,
 )
 from zlc_pulse.scan_template import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
+from zlc_storage.paths import resolve_under_project
 
 from .contracts import (
     ApiSegmentTable,
@@ -33,16 +25,13 @@ from .contracts import (
 )
 
 
-DEFAULT_PROBE_PULSE_PATH = "pulses/probe_template.json"
-
-
 _PULSE_SCAN_AUTHORING_SCHEMA = AuthoringSchema(
     (
         AuthoringField(
             "pulse",
             "path",
             "Pulse template",
-            default=DEFAULT_PROBE_PULSE_PATH,
+            default=PROBE_PULSE_PATH,
             required=True,
             description=(
                 "Current PulseDocument whose declared scan/API slots are edited below"
@@ -51,31 +40,17 @@ _PULSE_SCAN_AUTHORING_SCHEMA = AuthoringSchema(
     )
 )
 
-_EXACT_SOURCE_CONTRACTS = (
-    CAMERA_FRAME_OUTPUT_CONTRACT_ID,
-    *(
-        declaration.contract_id
-        for declaration in OCCUPANCY_EXACT_SCAN_OUTPUT_DECLARATIONS
+PULSE_SCAN_SOURCE_INPUT_SPEC = DatasetInputSpec(
+    "y_signal",
+    "Signal (y)",
+    None,
+    description=(
+        "Any live Dataset signal published by another running Measurement, "
+        "Processor, selector, or Fit output. PulseScan samples the next fresh "
+        "ordered value and never owns the producer or its device."
     ),
 )
-_PULSE_SCAN_INPUT_SPECS = (
-    DatasetInputSpec(
-        "y_signal",
-        "Exact source (y)",
-        _EXACT_SOURCE_CONTRACTS
-        + tuple(
-            projected_dataset_output_contract_id(
-                contract_id,
-                AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID,
-            )
-            for contract_id in _EXACT_SOURCE_CONTRACTS
-        ),
-        description=(
-            "Exact Camera frame or Occupancy counts/occupied Dataset, optionally "
-            "through one explicit authoritative Figure Area selection"
-        ),
-    ),
-)
+_PULSE_SCAN_INPUT_SPECS = (PULSE_SCAN_SOURCE_INPUT_SPEC,)
 
 
 def pulse_scan_authoring_schema() -> AuthoringSchema:
@@ -101,7 +76,7 @@ def build_pulse_scan_program(
     authored = pulse_scan_authoring_schema().freeze(
         {"pulse": values["pulse"]} if "pulse" in values else {}
     )
-    document = load_pulse_document(authored["pulse"])
+    document = load_pulse_document(resolve_under_project(authored["pulse"]))
     slots = dict(values.get("pulse_slots") or {})
     sweep_kind = str(slots.get("sweep_kind") or "")
     source = str(slots.get("program") or "")
@@ -151,7 +126,7 @@ def build_pulse_scan_program(
 
 
 __all__ = [
-    "DEFAULT_PROBE_PULSE_PATH",
+    "PULSE_SCAN_SOURCE_INPUT_SPEC",
     "build_pulse_scan_program",
     "pulse_scan_authoring_schema",
     "pulse_scan_input_specs",

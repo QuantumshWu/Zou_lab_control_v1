@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -13,7 +13,7 @@ from .capability import ConsoleCapabilityAttachment
 
 @dataclass(frozen=True, slots=True)
 class TaskConsoleApplicationPorts:
-    """One immutable explicit attachment tuple plus artifact admission.
+    """One immutable explicit attachment tuple.
 
     Concrete preparers and presenters are closed inside the attachments by the
     outer composition root.  The shell therefore cannot locate an Experiment,
@@ -21,7 +21,6 @@ class TaskConsoleApplicationPorts:
     """
 
     attachments: tuple[ConsoleCapabilityAttachment, ...]
-    resolve_artifact_reference: Callable[[object], object]
     _by_key: Mapping[DefinitionKey, ConsoleCapabilityAttachment] = field(
         init=False,
         repr=False,
@@ -46,8 +45,6 @@ class TaskConsoleApplicationPorts:
                     f"duplicate TaskConsole attachment {attachment.key}"
                 )
             by_key[attachment.key] = attachment
-        if not callable(self.resolve_artifact_reference):
-            raise TypeError("resolve_artifact_reference must be callable")
         object.__setattr__(self, "attachments", attachments)
         object.__setattr__(self, "_by_key", MappingProxyType(by_key))
 

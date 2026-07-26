@@ -26,15 +26,15 @@ from zlc_data import (
     Value,
     ValueSchema,
 )
-from zlc_neutral_atom.logic_nodes.camera_capture.reference import CaptureArtifactRef
-from zlc_neutral_atom.logic_nodes.calibration.analysis import (
+from zlc_neutral_atom.capture.reference import CaptureArtifactRef
+from zlc_neutral_atom.logic_nodes.readout.calibration.analysis import (
     CalibrationAnalysisRequest,
     CalibrationComputation,
     _calibrate_readout_frames,
     _validate_site_center_admission,
     find_site_centers,
 )
-from zlc_neutral_atom.logic_nodes.calibration.calibration import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     BackgroundMode,
     BoxFeature,
     BoxReducer,
@@ -46,12 +46,12 @@ from zlc_neutral_atom.logic_nodes.calibration.calibration import (
     apply_calibration,
     extract_readout_features,
 )
-from zlc_neutral_atom.logic_nodes.readout_common.contracts import (
+from zlc_neutral_atom.logic_nodes.readout.contracts import (
     CalibrationCaptureLayout,
     FrameContract,
 )
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
-from zlc_neutral_atom.logic_nodes.readout_common.physical_context import ReadoutPhysicalContext
+from zlc_neutral_atom.logic_nodes.readout.physical_context import ReadoutPhysicalContext
 
 
 _FIXTURES = Path(__file__).with_name("fixtures")

@@ -73,6 +73,7 @@ from zlc_frontend.selector import (
 from zlc_neutral_atom.artifacts import FitResultArtifactRef
 from zlc_workbench.fit import FitDraftAuthority, FitDraftResult
 from zlc_storage import nonnegative_integer
+from zlc_storage.paths import user_output_path
 from zlc_workbench.frozen_raster import FrozenRasterWindow
 from zlc_workbench.window_runtime import cancel_export_commits, error_summary
 
@@ -1111,10 +1112,12 @@ class DataFigureWindow(FrozenRasterWindow):
         if bindings.save_requires_path:
             destination = self._fit_save_path
             if destination is None:
+                output_dir = user_output_path("figures", "data-figure")
+                output_dir.mkdir(parents=True, exist_ok=True)
                 selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
                     self,
                     "Save fitted DataFigure archive",
-                    "",
+                    str(output_dir / "fitted_figure.npz"),
                     "DataFigure archive (*.npz)",
                 )
                 if not selected:
@@ -2264,10 +2267,12 @@ class DataFigureWindow(FrozenRasterWindow):
         ):
             return
         family = self._view_family
+        output_dir = user_output_path("figures", "data-figure")
+        output_dir.mkdir(parents=True, exist_ok=True)
         path, _selected = QtWidgets.QFileDialog.getSaveFileName(
             self,
             f"Export current {family} view",
-            f"{family}.png",
+            str(output_dir / f"{family}.png"),
             "PNG image (*.png)",
         )
         if path:

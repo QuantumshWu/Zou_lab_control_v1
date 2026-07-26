@@ -126,7 +126,7 @@ lane/name/bus projection as a whole.
 `streamer_config.json` (search order: `ZLC_PS_CONFIG` env → cwd → this file):
 
 - `fpga/pulse_streamer/host/image.py` (`load_streamer_config`, capacity estimate CLI)
-- `zlc_pulse.server_app` and `zlc_neutral_atom.bootstrap._installation`
+- `zlc_pulse.server_app` and `zlc_neutral_atom.installation_dispatch`
   (frozen deployment geometry/clock validation)
 - `zlc_neutral_atom.timing.clock` (20 ns authoring grid projection)
 - `estimate_resources.bat` (repo root, double-click capacity check)

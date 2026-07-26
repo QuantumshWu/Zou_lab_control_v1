@@ -28,7 +28,7 @@ from zlc_pulse import (
     PulseTarget,
     sample_compiled_bus_codes,
 )
-from zlc_storage import canonical_digest
+from zlc_storage import canonical_digest, canonical_text, sha256_text
 from zlc_storage.canonical import positive_integer as _positive_int
 
 
@@ -1049,6 +1049,21 @@ class VirtualMotFrameSource:
             )
 
 
+@dataclass
+class _VirtualCameraSignalAssociation:
+    """One pre-FIRE reservation owned by the virtual trigger wire."""
+
+    association_id: str
+    cause_digest: str
+    expected_trigger_count: int
+    trigger_group_size: int
+    expected_group_count: int
+    physical_start_ordinal: int
+    physical_end_ordinal: int | None = None
+    terminal_evidence_digest: str | None = None
+    error: BaseException | None = None
+
+
 class VirtualCamera:
     """One installed camera supporting live and finite acquisition.
 
@@ -1100,6 +1115,7 @@ class VirtualCamera:
         self._active_fire_end_ordinal = 0
         self._worker_error: BaseException | None = None
         self._terminal: CameraCaptureTerminalRecord | None = None
+        self._signal_association: _VirtualCameraSignalAssociation | None = None
         self._open = True
         sequencer.add_fire_listener(self._on_fire)
 
@@ -1123,6 +1139,200 @@ class VirtualCamera:
         if not self._open:
             raise RuntimeError("virtual camera is closed")
         return self
+
+    def arm_signal_event_association(
+        self,
+        association_id: str,
+        cause_digest: str,
+        expected_trigger_count: int,
+        trigger_group_size: int,
+        expected_group_count: int,
+    ) -> tuple[object, int]:
+        """Reserve the next exact finite FIRE on this camera's trigger wire.
+
+        This is deliberately a virtual-apparatus seam, not part of the generic
+        CameraAdapter contract.  Only this object observes the in-process FIRE
+        callback and the physical frame ordinal counter under the same lock.
+        """
+
+        identity = canonical_text(association_id, "association_id")
+        digest = sha256_text(cause_digest, "cause_digest")
+        trigger_count = _positive_int(
+            expected_trigger_count,
+            "expected_trigger_count",
+        )
+        group_size = _positive_int(trigger_group_size, "trigger_group_size")
+        group_count = _positive_int(
+            expected_group_count,
+            "expected_group_count",
+        )
+        if trigger_count != group_size * group_count:
+            raise ValueError(
+                "virtual signal association trigger groups do not cover its count"
+            )
+        deadline = time.monotonic() + self.timeout
+        with self._condition:
+            if self.free_running_live:
+                raise ValueError(
+                    "a free-running virtual camera has no pulse association"
+                )
+            if self._signal_association is not None:
+                raise RuntimeError(
+                    "virtual camera already owns a signal association"
+                )
+            while (
+                (self._worker is not None and self._worker.is_alive())
+                or self._pending
+            ):
+                if self._worker_error is not None:
+                    raise RuntimeError(
+                        "virtual camera source failed before association arm"
+                    ) from self._worker_error
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError(
+                        "virtual camera did not reach a drained pre-FIRE boundary"
+                    )
+                self._condition.wait(min(0.05, remaining))
+            if not self._armed or self._expected is not None or not self._accepting:
+                raise RuntimeError(
+                    "virtual camera association requires a running external-trigger monitor"
+                )
+            if self._worker_error is not None:
+                raise RuntimeError(
+                    "virtual camera source failed before association arm"
+                ) from self._worker_error
+            start = self._produced
+            if start % group_size:
+                raise RuntimeError(
+                    "virtual camera monitor is not at a complete readout-cycle boundary"
+                )
+            association = _VirtualCameraSignalAssociation(
+                identity,
+                digest,
+                trigger_count,
+                group_size,
+                group_count,
+                start,
+            )
+            self._signal_association = association
+            return association, start
+
+    def bind_signal_event_association(
+        self,
+        token: object,
+        *,
+        artifact_digest: str,
+        trigger_counts: tuple[tuple[str, int], ...],
+        terminal_evidence_digest: str,
+    ) -> tuple[str, int, int]:
+        """Bind the observed virtual FIRE group to its exact terminal receipt."""
+
+        artifact = sha256_text(artifact_digest, "artifact_digest")
+        terminal_digest = sha256_text(
+            terminal_evidence_digest,
+            "terminal_evidence_digest",
+        )
+        counts = tuple(trigger_counts)
+        with self._condition:
+            association = self._require_signal_association(token)
+            if association.error is not None:
+                raise RuntimeError(
+                    "virtual camera signal association failed during FIRE"
+                ) from association.error
+            if association.physical_end_ordinal is None:
+                raise RuntimeError(
+                    "virtual camera did not observe the associated FIRE"
+                )
+            if artifact != association.cause_digest:
+                raise ValueError(
+                    "virtual camera terminal belongs to another pulse artifact"
+                )
+            channel = self.capture_trigger_channels[0]
+            matching = tuple(count for name, count in counts if name == channel)
+            if matching != (association.expected_trigger_count,):
+                raise RuntimeError(
+                    "virtual pulse terminal trigger count differs from camera association"
+                )
+            association.terminal_evidence_digest = terminal_digest
+            return (
+                channel,
+                association.physical_start_ordinal,
+                association.physical_end_ordinal,
+            )
+
+    def finish_signal_event_association(
+        self,
+        token: object,
+    ) -> tuple[str, int, int, str]:
+        """Prove the bound ordinal interval was produced completely and exactly."""
+
+        deadline = time.monotonic() + self.timeout
+        with self._condition:
+            association = self._require_signal_association(token)
+            while True:
+                if association.error is not None:
+                    self._signal_association = None
+                    self._condition.notify_all()
+                    raise RuntimeError(
+                        "virtual camera signal association failed"
+                    ) from association.error
+                end = association.physical_end_ordinal
+                worker_running = (
+                    self._worker is not None and self._worker.is_alive()
+                )
+                if end is not None and self._produced >= end and not worker_running:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError(
+                        "virtual camera association did not finish its frame interval"
+                    )
+                self._condition.wait(min(0.05, remaining))
+            assert association.physical_end_ordinal is not None
+            if self._produced != association.physical_end_ordinal:
+                raise RuntimeError(
+                    "virtual camera produced frames outside the associated FIRE interval"
+                )
+            terminal_digest = association.terminal_evidence_digest
+            if terminal_digest is None:
+                raise RuntimeError(
+                    "virtual camera association has no bound pulse terminal"
+                )
+            result = (
+                self.capture_trigger_channels[0],
+                association.physical_start_ordinal,
+                association.physical_end_ordinal,
+                terminal_digest,
+            )
+            self._signal_association = None
+            self._condition.notify_all()
+            return result
+
+    def cancel_signal_event_association(self, token: object) -> None:
+        """Release an uncommitted association without changing camera ownership."""
+
+        with self._condition:
+            association = self._signal_association
+            if association is None:
+                return
+            if association is not token:
+                raise RuntimeError(
+                    "virtual camera association token belongs to another request"
+                )
+            self._signal_association = None
+            self._condition.notify_all()
+
+    def _require_signal_association(
+        self,
+        token: object,
+    ) -> _VirtualCameraSignalAssociation:
+        association = self._signal_association
+        if association is None or association is not token:
+            raise RuntimeError(
+                "virtual camera association token is not current"
+            )
+        return association
 
     def snapshot(self) -> dict[str, object]:
         source_snapshot = getattr(self.frame_source, "snapshot", None)
@@ -1238,6 +1448,10 @@ class VirtualCamera:
         with self._condition:
             if self._armed:
                 raise RuntimeError("virtual camera already owns an armed capture")
+            if self._signal_association is not None:
+                raise RuntimeError(
+                    "virtual camera retained an unfinished signal association"
+                )
             if self._worker is not None and self._worker.is_alive():
                 raise RuntimeError("previous virtual camera producer is still running")
             self._pending.clear()
@@ -1333,6 +1547,17 @@ class VirtualCamera:
 
     def _on_fire(self, playback: PulsePlayback) -> None:
         if playback.repeat_forever:
+            with self._condition:
+                association = self._signal_association
+                if association is not None:
+                    error = RuntimeError(
+                        "a finite signal association observed a continuous virtual FIRE"
+                    )
+                    association.error = error
+                    self._worker_error = error
+                    self._accepting = False
+                    self._condition.notify_all()
+                    raise error
             self._start_continuous_triggered_live(playback)
             return
         with self._condition:
@@ -1368,6 +1593,46 @@ class VirtualCamera:
                 self.capture_trigger_channels,
             )
             trigger_count = len(trigger_offsets)
+            association = self._signal_association
+            if association is not None:
+                try:
+                    artifact = self.sequencer.output_artifact
+                    if artifact is None:
+                        raise RuntimeError(
+                            "virtual camera observed FIRE without a compiled artifact"
+                        )
+                    if artifact.fingerprint != association.cause_digest:
+                        raise RuntimeError(
+                            "virtual camera observed another artifact after association arm"
+                        )
+                    if trigger_count != association.expected_trigger_count:
+                        raise RuntimeError(
+                            "virtual FIRE trigger count differs from the associated group"
+                        )
+                    expected_groups = (
+                        (association.trigger_group_size,)
+                        * association.expected_group_count
+                    )
+                    observed_groups = playback.trigger_group_sizes(
+                        self.capture_trigger_channels
+                    )
+                    if observed_groups != expected_groups:
+                        raise RuntimeError(
+                            "virtual FIRE trigger grouping differs from the associated cycles"
+                        )
+                    if self._produced != association.physical_start_ordinal:
+                        raise RuntimeError(
+                            "virtual camera advanced after association arm but before FIRE"
+                        )
+                    association.physical_end_ordinal = (
+                        association.physical_start_ordinal + trigger_count
+                    )
+                except BaseException as error:
+                    association.error = error
+                    self._worker_error = error
+                    self._accepting = False
+                    self._condition.notify_all()
+                    raise
             remaining = (
                 None
                 if self._expected is None
@@ -1798,6 +2063,12 @@ class VirtualCamera:
         with self._condition:
             if self._terminal is not None:
                 return self._terminal
+            association = self._signal_association
+            if association is not None:
+                association.error = RuntimeError(
+                    "virtual camera was disarmed during signal association"
+                )
+                self._signal_association = None
             worker = self._worker
             stop = self._worker_stop
             self._accepting = False

@@ -37,7 +37,7 @@ import pathlib
 
 import pytest
 
-from zlc_storage.paths import PROJECT_ROOT, project_path
+from zlc_storage.paths import PROJECT_ROOT, project_path, user_output_path
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -139,6 +139,16 @@ def test_the_seam_is_the_only_definition_of_the_project_root():
     assert not offenders, (
         "these re-derive a project-anchored path from their own file depth instead of "
         "asking zlc_storage.paths:\n" + "\n".join(offenders))
+
+
+def test_generated_user_files_have_one_non_input_output_root():
+    assert user_output_path("figures", "pulses") == project_path(
+        "_output",
+        "figures",
+        "pulses",
+    )
+    with pytest.raises(ValueError, match="plain path components"):
+        user_output_path("../pulses")
 
 
 

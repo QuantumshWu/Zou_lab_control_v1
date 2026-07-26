@@ -19,15 +19,15 @@ from zlc_data import (
     Value,
     ValueSchema,
 )
-from zlc_neutral_atom.logic_nodes.camera_capture.reference import CaptureArtifactRef
-from zlc_neutral_atom.logic_nodes.calibration.analysis import (
+from zlc_neutral_atom.capture.reference import CaptureArtifactRef
+from zlc_neutral_atom.logic_nodes.readout.calibration.analysis import (
     CalibrationAnalysisResult,
     CalibrationAnalysisRequest,
     CalibrationComputation,
     _calibrate_readout_frames,
     reference_labels,
 )
-from zlc_neutral_atom.logic_nodes.calibration.calibration import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     BackgroundMode,
     BoxFeature,
     BoxReducer,
@@ -43,12 +43,12 @@ from zlc_neutral_atom.logic_nodes.calibration.calibration import (
     classify_occupancy,
     extract_readout_features,
 )
-from zlc_neutral_atom.logic_nodes.readout_common.contracts import (
+from zlc_neutral_atom.logic_nodes.readout.contracts import (
     CalibrationCaptureLayout,
     FrameContract,
 )
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
-from zlc_neutral_atom.logic_nodes.readout_common.physical_context import ReadoutPhysicalContext
+from zlc_neutral_atom.logic_nodes.readout.physical_context import ReadoutPhysicalContext
 
 
 def _physical_context(contract: FrameContract) -> ReadoutPhysicalContext:
@@ -280,7 +280,7 @@ def test_psf_missing_required_pixel_invalidates_without_renormalizing() -> None:
 
 
 def test_reversed_short_polarity_is_diagnostic_only_and_bad_component_survives() -> None:
-    import zlc_neutral_atom.logic_nodes.calibration.analysis as analysis
+    import zlc_neutral_atom.logic_nodes.readout.calibration.analysis as analysis
 
     source, contract = _contracts((9, 9))
     groups = 24

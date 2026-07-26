@@ -1,755 +1,498 @@
-"""Exact pulse-execution lineage for the two supported scan programs."""
+"""Source-neutral signal and sequencer lineage for PulseScan artifacts."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeAlias
+import hashlib
 
 from zlc_data import (
-    READOUT_EVENT,
-    DatasetSchema,
-    ValueSchema,
-    value_schema_from_tree,
-    value_schema_to_tree,
+    StreamGenerationId,
+    data_transform_spec_from_tree,
+    data_transform_spec_to_tree,
 )
-from zlc_neutral_atom.devices.camera.contract import (
-    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
-    CameraAcquisitionMode,
-    CameraFrameMetadataContract,
-    CameraSampleContract,
-    decode_camera_capture_spec,
-    freeze_camera_capture_spec,
+from zlc_neutral_atom.catalog import (
+    definition_key_from_tree,
+    definition_key_to_tree,
 )
-from zlc_neutral_atom.logic_nodes.camera_capture.session import (
-    CameraCaptureProvenance,
-    camera_capture_provenance_from_tree,
-    camera_capture_provenance_to_tree,
+from zlc_neutral_atom.devices.sequencer.port import (
+    PulseTerminalAck,
+    pulse_terminal_ack_from_tree,
+    pulse_terminal_ack_to_tree,
+    validate_pulse_terminal_for_artifact,
 )
-from zlc_neutral_atom.devices.camera.capture_port import (
-    CaptureTerminalAck,
-    capture_terminal_ack_from_tree,
-    capture_terminal_ack_to_tree,
-)
-from zlc_neutral_atom.devices.camera.contract import (
-    CameraCapabilityEvidence,
-    FrozenCaptureSpec,
-    camera_capability_evidence_from_tree,
-    camera_capability_evidence_to_tree,
-    frozen_capture_spec_from_tree,
-    frozen_capture_spec_to_tree,
-)
-from zlc_neutral_atom.runtime.dataset import (
-    DatasetCellAddress,
-    DatasetCellSchedule,
-    DatasetSealProvenance,
-)
-from zlc_neutral_atom.logic_nodes.camera_capture.pipeline import PipelineResult
 from zlc_neutral_atom.runtime.streams import (
-    EventSpanRef,
+    ArtifactInputRef,
+    EventId,
+    EventRef,
+    ProcessorStageProvenance,
     StreamId,
-    event_span_ref_from_tree,
-    event_span_ref_to_tree,
+    event_ref_to_tree,
+    processor_stage_provenance_from_tree,
+    processor_stage_provenance_to_tree,
 )
-from zlc_neutral_atom.timing.lineage import (
-    PulseCaptureBinding,
-    PulseCaptureEvidence,
-    pulse_capture_evidence_from_tree,
-    pulse_capture_evidence_to_tree,
+from zlc_neutral_atom.runtime.signal_source import (
+    SignalAssociationEvidence,
+    SignalProjectionAuthority,
+    signal_association_evidence_from_tree,
+    signal_association_evidence_to_tree,
+    signal_projection_authority_from_tree,
+    signal_projection_authority_to_tree,
 )
-from zlc_neutral_atom.timing.capture_plan import (
-    capture_cell_join_contract_to_tree,
+from zlc_pulse import CompiledPulseArtifact, PulseExecutionForm
+from zlc_storage import (
+    canonical_text,
+    encode,
+    exact_mapping,
+    nonnegative_integer,
+    positive_integer,
+    sha256_text,
 )
-from zlc_pulse import (
-    CompiledPulseArtifact,
-    PulseDocument,
-    PulseExecutionForm,
-    expand_autonomous_scan_repeats,
-)
-from zlc_storage import canonical_text, exact_mapping, nonnegative_integer, sha256_text
 
 from .contracts import (
     ApiSlotSegmentedProgram,
     AutonomousScanSlotProgram,
     PulseScanProgram,
 )
+from .source_binding import ScanSignalBinding
 
 
-SCAN_EXECUTION_SCHEMA = "zlc_neutral_atom.PulseScanExecution"
-CAMERA_RUN_EVIDENCE_SCHEMA = "zlc_neutral_atom.CameraRunEvidence"
+SCAN_EXECUTION_SCHEMA = "zlc_neutral_atom.logic_nodes.pulse_scan.execution"
+SIGNAL_EVENT_SEQUENCE_SCHEMA = (
+    "zlc_neutral_atom.logic_nodes.pulse_scan.causal-signal-event-sequence"
+)
 _AUTONOMOUS_KIND = "AUTONOMOUS_SCAN_SLOT"
 _API_SEGMENTED_KIND = "API_SLOT_SEGMENTED_EXISTING"
-_API_STATIC_SHAPE_SCHEMA = "zlc_neutral_atom.ApiSegmentedMetadataStaticShape"
-
-
-def api_segmented_metadata_static_shape_to_tree(
-    program: ApiSlotSegmentedProgram,
-    point_bindings: tuple[PulseCaptureBinding | PulseCaptureEvidence, ...],
-    *,
-    camera_source_stream_id: StreamId,
-    result_stream_id: StreamId,
-    result_source_id: str,
-    derivation_root_stream_id: StreamId | None,
-    camera_provenance: CameraCaptureProvenance,
-    camera_capability: CameraCapabilityEvidence,
-    camera_arm_spec: FrozenCaptureSpec,
-    camera_source_value_schema: ValueSchema,
-    camera_source_schema_fingerprint: str,
-) -> dict[str, object]:
-    """Project pre-FIRE execution and stream-topology metadata facts."""
-
-    if not isinstance(program, ApiSlotSegmentedProgram):
-        raise TypeError("program must be ApiSlotSegmentedProgram")
-    bindings = tuple(point_bindings)
-    if len(bindings) != program.point_count or any(
-        not isinstance(item, (PulseCaptureBinding, PulseCaptureEvidence))
-        for item in bindings
-    ):
-        raise TypeError("point_bindings must contain one pulse binding per point")
-    if any(
-        item.compiled_artifact.source_document_digest != document.fingerprint
-        for item, document in zip(bindings, program.resolved_point_documents)
-    ):
-        raise ValueError("API execution shape bindings differ from resolved points")
-    if not isinstance(camera_source_stream_id, StreamId):
-        raise TypeError("camera_source_stream_id must be StreamId")
-    if not isinstance(result_stream_id, StreamId):
-        raise TypeError("result_stream_id must be StreamId")
-    canonical_text(result_source_id, "result_source_id")
-    if derivation_root_stream_id is not None and not isinstance(
-        derivation_root_stream_id,
-        StreamId,
-    ):
-        raise TypeError("derivation_root_stream_id must be StreamId or None")
-    if not isinstance(camera_provenance, CameraCaptureProvenance):
-        raise TypeError("camera_provenance must be CameraCaptureProvenance")
-    if not isinstance(camera_capability, CameraCapabilityEvidence):
-        raise TypeError("camera_capability must be CameraCapabilityEvidence")
-    if not isinstance(camera_arm_spec, FrozenCaptureSpec):
-        raise TypeError("camera_arm_spec must be FrozenCaptureSpec")
-    if not isinstance(camera_source_value_schema, ValueSchema):
-        raise TypeError("camera_source_value_schema must be ValueSchema")
-    sha256_text(
-        camera_source_schema_fingerprint,
-        "camera_source_schema_fingerprint",
-    )
-    return {
-        "schema": _API_STATIC_SHAPE_SCHEMA,
-        "program_fingerprint": program.fingerprint,
-        "stream_topology": {
-            "camera_source_stream_id": camera_source_stream_id.value,
-            "result_stream_id": result_stream_id.value,
-            "result_source_id": result_source_id,
-            "derivation_root_stream_id": (
-                None
-                if derivation_root_stream_id is None
-                else derivation_root_stream_id.value
-            ),
-        },
-        "camera": {
-            "provenance": camera_capture_provenance_to_tree(camera_provenance),
-            "capability": camera_capability_evidence_to_tree(camera_capability),
-            "arm_spec": frozen_capture_spec_to_tree(camera_arm_spec),
-            "source_value_schema": value_schema_to_tree(camera_source_value_schema),
-            "source_schema_fingerprint": camera_source_schema_fingerprint,
-        },
-        "points": [
-            {
-                "artifact_fingerprint": item.compiled_artifact.fingerprint,
-                "trigger_channel": item.trigger_channel,
-                "join_contract": capture_cell_join_contract_to_tree(
-                    item.join_contract
-                    if isinstance(item, PulseCaptureEvidence)
-                    else item.cell_plan.join_contract
-                ),
-            }
-            for item in bindings
-        ],
-    }
 
 
 @dataclass(frozen=True, slots=True)
-class CameraRunEvidence:
-    """Compact durable proof for the one exact camera arm behind a scan.
+class SignalEventSequence:
+    """Expandable proof of the ordered external events consumed as scan ``y``.
 
-    Frames remain owned by the dataset artifact.  This value retains only the
-    terminal receipt, owner-minted camera facts, canonical arm request, camera
-    cell schema plus full-schema fingerprint, source event span, and the digest
-    of the actual ordinal-to-cell schedule.  Point coordinates stay single-owned
-    by the surrounding scan artifact and are composed back in during reload.
+    Selected outputs may be a filtered phase of a wider producer stream, so
+    source sequence numbers need only increase; they are intentionally not
+    required to be contiguous.  Exact selected refs and their aligned direct
+    input refs are retained without retaining a second copy of payloads.
+    ``ordered_event_digest`` remains a compact integrity value, but is always
+    recomputed from the stored refs and therefore is not opaque lineage.
     """
 
-    terminal: CaptureTerminalAck
-    camera_provenance: CameraCaptureProvenance
-    capability: CameraCapabilityEvidence
-    arm_spec: FrozenCaptureSpec
-    source_value_schema: ValueSchema
-    source_schema_fingerprint: str
-    source_schedule_digest: str
-    source_event_span: EventSpanRef
+    binding: ScanSignalBinding
+    projection_authority: SignalProjectionAuthority
+    stream_id: StreamId
+    generation: StreamGenerationId
+    first_sequence: int
+    last_sequence: int
+    count: int
+    ordered_event_digest: str
+    source_run_id: str
+    source_id: str
+    event_refs: tuple[EventRef, ...]
+    direct_input_event_refs: tuple[tuple[EventRef, ...], ...]
+    processor_stages: tuple[ProcessorStageProvenance, ...]
+    associations: tuple[SignalAssociationEvidence, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.terminal, CaptureTerminalAck):
-            raise TypeError("terminal must be CaptureTerminalAck")
-        if not isinstance(self.camera_provenance, CameraCaptureProvenance):
-            raise TypeError("camera_provenance must be CameraCaptureProvenance")
-        if not isinstance(self.capability, CameraCapabilityEvidence):
-            raise TypeError("capability must be CameraCapabilityEvidence")
-        if not isinstance(self.arm_spec, FrozenCaptureSpec):
-            raise TypeError("arm_spec must be FrozenCaptureSpec")
-        if not isinstance(self.source_value_schema, ValueSchema):
-            raise TypeError("source_value_schema must be ValueSchema")
-        sha256_text(self.source_schema_fingerprint, "source_schema_fingerprint")
-        sha256_text(self.source_schedule_digest, "source_schedule_digest")
-        if not isinstance(self.source_event_span, EventSpanRef):
-            raise TypeError("source_event_span must be EventSpanRef")
-
-        provenance = self.camera_provenance
-        capability = self.capability
-        terminal = self.terminal
-        capability.physical_facts.validate_descriptor(provenance.descriptor)
-        expected_payload = CameraSampleContract(self.source_value_schema)
-        if capability.payload_contract_fingerprint != expected_payload.fingerprint:
-            raise ValueError(
-                "camera payload contract differs from the source camera schema"
+        if not isinstance(self.binding, ScanSignalBinding):
+            raise TypeError("binding must be ScanSignalBinding")
+        if not isinstance(self.projection_authority, SignalProjectionAuthority):
+            raise TypeError(
+                "projection_authority must be SignalProjectionAuthority"
             )
-        if self.arm_spec.owner_fingerprint != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT:
-            raise ValueError("camera arm spec belongs to an unknown owner")
-        decoded_arm = decode_camera_capture_spec(self.arm_spec)
-        if freeze_camera_capture_spec(decoded_arm) != self.arm_spec:
-            raise ValueError("camera arm spec is not the canonical owner encoding")
-        if decoded_arm.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
-            raise ValueError("exact scan camera must be externally triggered")
-        if capability.exact_external_trigger_qualification_digest is None:
+        committed = self.projection_authority.committed_transform
+        committed_spec = None if committed is None else committed.spec
+        if self.binding.transform != committed_spec:
             raise ValueError(
-                "exact scan camera lacks qualified one-frame-per-trigger evidence"
+                "signal binding authoring transform differs from committed authority"
             )
-
-        event_count = self.source_event_span.count
-        if decoded_arm.expected_frames != event_count:
-            raise ValueError("camera expected frame count differs from source event span")
-        if (
-            terminal.produced_count != event_count
-            or terminal.drained_count != event_count
-            or not terminal.source_stopped
-            or not terminal.no_more_frames
-            or not terminal.joined
+        if not isinstance(self.stream_id, StreamId):
+            raise TypeError("stream_id must be StreamId")
+        if not isinstance(self.generation, StreamGenerationId):
+            raise TypeError("generation must be StreamGenerationId")
+        first = nonnegative_integer(self.first_sequence, "first_sequence")
+        last = nonnegative_integer(self.last_sequence, "last_sequence")
+        count = positive_integer(self.count, "count")
+        if last < first or count > last - first + 1:
+            raise ValueError("signal event sequence bounds cannot contain its count")
+        sha256_text(self.ordered_event_digest, "ordered_event_digest")
+        canonical_text(self.source_run_id, "source_run_id")
+        canonical_text(self.source_id, "source_id")
+        references = tuple(self.event_refs)
+        if len(references) != count or any(
+            not isinstance(reference, EventRef) for reference in references
         ):
-            raise ValueError("camera terminal does not prove exact stop, drain, and join")
-        if len(
-            {
-                capability.fingerprint,
-                provenance.capability_fingerprint,
-                terminal.capability_fingerprint,
-            }
-        ) != 1:
-            raise ValueError("camera capability lineage is inconsistent")
-        if len(
-            {
-                self.arm_spec.digest,
-                provenance.camera_arm_spec_fingerprint,
-                terminal.capture_spec_fingerprint,
-            }
-        ) != 1:
-            raise ValueError("camera arm-spec lineage is inconsistent")
-        if len(
-            {
-                decoded_arm.settings_fingerprint,
-                capability.settings_fingerprint,
-                provenance.active_settings_fingerprint,
-                terminal.settings_fingerprint,
-            }
-        ) != 1:
-            raise ValueError("camera settings lineage is inconsistent")
-        if (
-            capability.capture_spec_owner_fingerprint
-            != self.arm_spec.owner_fingerprint
+            raise ValueError("event_refs must contain exactly count EventRef values")
+        if any(
+            reference.stream_id != self.stream_id
+            or reference.generation != self.generation
+            for reference in references
         ):
-            raise ValueError("camera capability and arm-spec owners differ")
-        if (
-            provenance.binding_stamp.binding_instance_id
-            != terminal.binding_instance_id
+            raise ValueError("event_refs differ from the selected stream generation")
+        if references[0].sequence != first or references[-1].sequence != last:
+            raise ValueError("event_refs differ from the declared sequence bounds")
+        if any(
+            right.sequence <= left.sequence
+            for left, right in zip(references, references[1:])
         ):
-            raise ValueError("camera binding lineage is inconsistent")
-        if provenance.binding.value != capability.source_id:
-            raise ValueError("camera source lineage is inconsistent")
+            raise ValueError("event_refs must be strictly ordered")
+        if _ordered_event_digest(references) != self.ordered_event_digest:
+            raise ValueError("ordered_event_digest differs from event_refs")
+        direct_rows = tuple(tuple(row) for row in self.direct_input_event_refs)
+        if len(direct_rows) != count or any(
+            any(not isinstance(reference, EventRef) for reference in row)
+            for row in direct_rows
+        ):
+            raise ValueError(
+                "direct_input_event_refs must align EventRef rows to scan cells"
+            )
+        stages = tuple(self.processor_stages)
+        if any(not isinstance(stage, ProcessorStageProvenance) for stage in stages):
+            raise TypeError(
+                "processor_stages must contain ProcessorStageProvenance values"
+            )
+        associations = tuple(self.associations)
+        if not associations or any(
+            not isinstance(item, SignalAssociationEvidence)
+            for item in associations
+        ):
+            raise ValueError(
+                "associations must contain producer-owned SignalAssociationEvidence"
+            )
+        if sum(
+            item.request.expected_event_count for item in associations
+        ) != count:
+            raise ValueError(
+                "association event groups must cover exactly the selected events"
+            )
+        association_ids = tuple(
+            item.request.association_id for item in associations
+        )
+        cause_ids = tuple(item.request.cause_id for item in associations)
+        if len(set(association_ids)) != len(association_ids):
+            raise ValueError("association ids must be unique within one scan")
+        if len(set(cause_ids)) != len(cause_ids):
+            raise ValueError("association cause ids must be unique within one scan")
+        object.__setattr__(self, "first_sequence", first)
+        object.__setattr__(self, "last_sequence", last)
+        object.__setattr__(self, "count", count)
+        object.__setattr__(self, "event_refs", references)
+        object.__setattr__(self, "direct_input_event_refs", direct_rows)
+        object.__setattr__(
+            self,
+            "processor_stages",
+            tuple(
+                ProcessorStageProvenance(
+                    stage.processor_binding_digest,
+                    stage.direct_artifact_inputs,
+                )
+                for stage in stages
+            ),
+        )
+        object.__setattr__(self, "associations", associations)
 
     @property
-    def event_count(self) -> int:
-        return self.source_event_span.count
+    def artifact_inputs(self) -> tuple[ArtifactInputRef, ...]:
+        """Unique direct artifact inputs in processor-chain order."""
 
-    def require_event_count(self, expected_count: int) -> None:
-        expected = nonnegative_integer(expected_count, "expected_count")
-        if expected != self.event_count:
-            raise ValueError("camera event count differs from pulse execution")
-
-    def validate_source_schema(self, domain_schema: DatasetSchema) -> DatasetSchema:
-        """Rebuild the camera schema from the persisted scan sampling domain."""
-
-        if not isinstance(domain_schema, DatasetSchema):
-            raise TypeError("domain_schema must be DatasetSchema")
-        schema = DatasetSchema(
-            domain_schema.repeat_axis,
-            domain_schema.point_axes,
-            domain_schema.point_layout,
-            self.source_value_schema,
-        )
-        if schema.fingerprint != self.source_schema_fingerprint:
-            raise ValueError("camera source schema differs from the scan sampling domain")
-        self.camera_provenance.validate_schema(schema)
-        return schema
-
-    def require_schedule(
-        self,
-        schedule: DatasetCellSchedule,
-        source_schema: DatasetSchema,
-    ) -> None:
-        if not isinstance(schedule, DatasetCellSchedule):
-            raise TypeError("schedule must be DatasetCellSchedule")
-        if not isinstance(source_schema, DatasetSchema):
-            raise TypeError("source_schema must be DatasetSchema")
-        if source_schema.fingerprint != self.source_schema_fingerprint:
-            raise ValueError("camera schedule uses another source schema")
-        if len(schedule) != self.event_count:
-            raise ValueError("camera event count differs from pulse execution")
-        if schedule.digest_for_schema(source_schema) != self.source_schedule_digest:
-            raise ValueError("camera source schedule differs from pulse execution")
-
-    def validate_dataset_provenance(
-        self,
-        provenance: DatasetSealProvenance,
-    ) -> None:
-        """Rebind camera aggregate facts to the persisted source dataset."""
-
-        if not isinstance(provenance, DatasetSealProvenance):
-            raise TypeError("provenance must be DatasetSealProvenance")
-        if provenance.end_sequence - provenance.start_sequence != self.event_count:
-            raise ValueError("dataset interval differs from camera terminal count")
-        derivation = provenance.derivation
-        if derivation is None:
-            span = self.source_event_span
-            if (
-                provenance.trace_binding.source_id != self.capability.source_id
-                or provenance.stream_id != span.stream_id
-                or provenance.generation != span.generation
-                or provenance.start_sequence != span.start_sequence
-                or provenance.end_sequence != span.end_sequence
-                or provenance.join_plan_digest != self.source_schedule_digest
-                or provenance.metadata_contract_fingerprint
-                != CameraFrameMetadataContract().fingerprint
-                or provenance.ordered_metadata_digest
-                != self.terminal.ordered_metadata_digest
-            ):
-                raise ValueError(
-                    "raw dataset provenance differs from camera aggregate evidence"
-                )
-        elif derivation.root_input_span != self.source_event_span:
-            raise ValueError(
-                "processed dataset derivation differs from camera source event span"
-            )
+        ordered: list[ArtifactInputRef] = []
+        seen: set[str] = set()
+        for stage in self.processor_stages:
+            for reference in stage.direct_artifact_inputs:
+                if reference.fingerprint not in seen:
+                    seen.add(reference.fingerprint)
+                    ordered.append(reference)
+        return tuple(ordered)
 
 
-def camera_run_evidence_from_pipeline(value: PipelineResult) -> CameraRunEvidence:
-    """Snapshot only immutable camera facts from one validated pipeline result."""
-
-    if not isinstance(value, PipelineResult):
-        raise TypeError("value must be PipelineResult")
-    schema = value.source_dataset_schema
-    schedule = value.source_cell_schedule
-    evidence = CameraRunEvidence(
-        value.capture_terminal,
-        value.camera_provenance,
-        value.camera_capability_evidence,
-        value.camera_arm_spec,
-        schema.cell_schema,
-        schema.fingerprint,
-        schedule.digest_for_schema(schema),
-        value.source_event_span,
-    )
-    evidence.validate_source_schema(schema)
-    return evidence
+def _ordered_event_digest(references: tuple[EventRef, ...]) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(b"zlc_neutral_atom.PulseScanSignalEventRefs\x00")
+    for reference in references:
+        encoded = encode(event_ref_to_tree(reference))
+        hasher.update(len(encoded).to_bytes(8, "big"))
+        hasher.update(encoded)
+    return hasher.hexdigest()
 
 
-def camera_run_evidence_to_tree(value: CameraRunEvidence) -> dict[str, object]:
-    if not isinstance(value, CameraRunEvidence):
-        raise TypeError("value must be CameraRunEvidence")
-    return {
-        "schema": CAMERA_RUN_EVIDENCE_SCHEMA,
-        "terminal": capture_terminal_ack_to_tree(value.terminal),
-        "camera_provenance": camera_capture_provenance_to_tree(
-            value.camera_provenance
-        ),
-        "capability": camera_capability_evidence_to_tree(value.capability),
-        "arm_spec": frozen_capture_spec_to_tree(value.arm_spec),
-        "source_value_schema": value_schema_to_tree(value.source_value_schema),
-        "source_schema_fingerprint": value.source_schema_fingerprint,
-        "source_schedule_digest": value.source_schedule_digest,
-        "source_event_span": event_span_ref_to_tree(value.source_event_span),
-    }
-
-
-def camera_run_evidence_from_tree(tree: object) -> CameraRunEvidence:
+def _event_ref_from_tree(tree: object) -> EventRef:
     data = exact_mapping(
         tree,
-        {
-            "schema",
-            "terminal",
-            "camera_provenance",
-            "capability",
-            "arm_spec",
-            "source_value_schema",
-            "source_schema_fingerprint",
-            "source_schedule_digest",
-            "source_event_span",
-        },
-        CAMERA_RUN_EVIDENCE_SCHEMA,
+        {"stream_id", "generation", "sequence", "event_id", "payload_digest"},
+        "PulseScan EventRef",
+        discriminator=None,
     )
-    value = CameraRunEvidence(
-        capture_terminal_ack_from_tree(data["terminal"]),
-        camera_capture_provenance_from_tree(data["camera_provenance"]),
-        camera_capability_evidence_from_tree(data["capability"]),
-        frozen_capture_spec_from_tree(data["arm_spec"]),
-        value_schema_from_tree(data["source_value_schema"]),
-        data["source_schema_fingerprint"],
-        data["source_schedule_digest"],
-        event_span_ref_from_tree(data["source_event_span"]),
+    value = EventRef(
+        StreamId(data["stream_id"]),
+        StreamGenerationId(data["generation"]),
+        data["sequence"],
+        EventId(data["event_id"]),
+        data["payload_digest"],
     )
-    if camera_run_evidence_to_tree(value) != tree:
-        raise ValueError("CameraRunEvidence tree is typed but non-canonical")
+    if event_ref_to_tree(value) != tree:
+        raise ValueError("PulseScan EventRef tree is non-canonical")
     return value
-
-
-def _require_autonomous_evidence(
-    program: AutonomousScanSlotProgram,
-    evidence: PulseCaptureEvidence,
-) -> None:
-    if not isinstance(evidence, PulseCaptureEvidence):
-        raise TypeError("evidence must be PulseCaptureEvidence")
-    artifact = evidence.compiled_artifact
-    if artifact.execution_form is not PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
-        raise ValueError("autonomous scan evidence requires AUTONOMOUS_SCAN_ONCE")
-    expanded = expand_autonomous_scan_repeats(program.execution_document)
-    if artifact.source_document_digest != expanded.fingerprint:
-        raise ValueError("autonomous evidence differs from the execution document")
-    schedule = evidence.trigger_schedule
-    point_count = program.repeat_count * program.point_table.point_layout.storage_size
-    if (
-        schedule.point_count != point_count
-        or schedule.loop_count != 1
-        or not schedule.full_point_loop
-        or schedule.total != point_count
-    ):
-        raise ValueError("autonomous evidence is not one complete repeat-major scan")
-    if evidence.join_contract.scan_point_layout != program.point_table.point_layout:
-        raise ValueError("autonomous evidence differs from the scan point layout")
-
-
-def _require_api_segment_evidence(
-    document: PulseDocument,
-    evidence: PulseCaptureEvidence,
-) -> None:
-    if not isinstance(evidence, PulseCaptureEvidence):
-        raise TypeError("evidence must be PulseCaptureEvidence")
-    artifact = evidence.compiled_artifact
-    if artifact.execution_form is not PulseExecutionForm.STATIC_ONCE:
-        raise ValueError("API segment evidence requires STATIC_ONCE")
-    if artifact.source_document_digest != document.fingerprint:
-        raise ValueError("API segment artifact belongs to another resolved document")
-    schedule = evidence.trigger_schedule
-    if (
-        schedule.point_count != 1
-        or schedule.loop_count != 1
-        or not schedule.full_point_loop
-        or schedule.total != 1
-    ):
-        raise ValueError("each API segment must contain exactly one readout trigger")
-    if (
-        evidence.join_contract.scan_point_layout.storage_size != 1
-        or evidence.join_contract.within_point_grouping != ((0, 0),)
-    ):
-        raise ValueError("API segment evidence must describe one local dataset cell")
 
 
 @dataclass(frozen=True, slots=True)
 class AutonomousScanExecution:
-    """One autonomous scan program and its single completed pulse receipt."""
-
     program: AutonomousScanSlotProgram
-    evidence: PulseCaptureEvidence
-    camera: CameraRunEvidence
+    artifact: CompiledPulseArtifact
+    terminal: PulseTerminalAck
+    source: SignalEventSequence
 
     def __post_init__(self) -> None:
         if not isinstance(self.program, AutonomousScanSlotProgram):
             raise TypeError("program must be AutonomousScanSlotProgram")
-        _require_autonomous_evidence(self.program, self.evidence)
-        if not isinstance(self.camera, CameraRunEvidence):
-            raise TypeError("camera must be CameraRunEvidence")
-        self.camera.require_event_count(self.evidence.expected_trigger_count)
-        self.camera.capability.physical_facts.require_single_capture_trigger_channel(
-            self.evidence.trigger_channel
-        )
-        required_interval = (
-            self.camera.capability.physical_facts.required_external_trigger_interval_seconds
-        )
-        minimum_interval_ticks = self.evidence.trigger_schedule.minimum_interval_ticks
-        if required_interval is None:
-            raise ValueError("camera evidence omits the qualified trigger interval")
-        if (
-            minimum_interval_ticks is not None
-            and minimum_interval_ticks
-            / self.evidence.compiled_artifact.target_ir.clock_hz
-            < required_interval
-        ):
-            raise ValueError("autonomous camera trigger interval is not qualified")
+        if not isinstance(self.artifact, CompiledPulseArtifact):
+            raise TypeError("artifact must be CompiledPulseArtifact")
+        if self.artifact.execution_form is not PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
+            raise ValueError("autonomous scan lineage requires AUTONOMOUS_SCAN_ONCE")
+        if not isinstance(self.terminal, PulseTerminalAck):
+            raise TypeError("terminal must be PulseTerminalAck")
+        validate_pulse_terminal_for_artifact(self.terminal, self.artifact)
+        if not isinstance(self.source, SignalEventSequence):
+            raise TypeError("source must be SignalEventSequence")
+        expected = self.program.repeat_count * self.program.point_table.point_layout.storage_size
+        if self.source.count != expected:
+            raise ValueError("source event count differs from autonomous R by P")
 
 
 @dataclass(frozen=True, slots=True)
 class ApiSegmentEvidence:
-    """One completed finite API segment at an exact repeat/point address."""
-
     repeat_index: int
     point_storage_index: int
-    evidence: PulseCaptureEvidence
+    artifact: CompiledPulseArtifact
+    terminal: PulseTerminalAck
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "repeat_index",
-            nonnegative_integer(self.repeat_index, "repeat_index"),
-        )
-        object.__setattr__(
-            self,
-            "point_storage_index",
-            nonnegative_integer(self.point_storage_index, "point_storage_index"),
-        )
-        if not isinstance(self.evidence, PulseCaptureEvidence):
-            raise TypeError("evidence must be PulseCaptureEvidence")
+        repeat = nonnegative_integer(self.repeat_index, "repeat_index")
+        point = nonnegative_integer(self.point_storage_index, "point_storage_index")
+        if not isinstance(self.artifact, CompiledPulseArtifact):
+            raise TypeError("artifact must be CompiledPulseArtifact")
+        if self.artifact.execution_form is not PulseExecutionForm.STATIC_ONCE:
+            raise ValueError("API segment lineage requires STATIC_ONCE")
+        if not isinstance(self.terminal, PulseTerminalAck):
+            raise TypeError("terminal must be PulseTerminalAck")
+        validate_pulse_terminal_for_artifact(self.terminal, self.artifact)
+        object.__setattr__(self, "repeat_index", repeat)
+        object.__setattr__(self, "point_storage_index", point)
 
 
 @dataclass(frozen=True, slots=True)
 class ApiSegmentedScanExecution:
-    """All API segments, in exact repeat-major/point-fast completion order."""
-
     program: ApiSlotSegmentedProgram
     segments: tuple[ApiSegmentEvidence, ...]
-    camera: CameraRunEvidence
+    source: SignalEventSequence
 
     def __post_init__(self) -> None:
         if not isinstance(self.program, ApiSlotSegmentedProgram):
             raise TypeError("program must be ApiSlotSegmentedProgram")
-        if not isinstance(self.camera, CameraRunEvidence):
-            raise TypeError("camera must be CameraRunEvidence")
         segments = tuple(self.segments)
-        if any(not isinstance(item, ApiSegmentEvidence) for item in segments):
-            raise TypeError("segments must contain ApiSegmentEvidence values")
-        point_count = self.program.point_table.point_layout.storage_size
-        resolved_points = self.program.resolved_point_documents
-        expected_count = self.program.repeat_count * point_count
-        if len(segments) != expected_count or any(
-            (item.repeat_index, item.point_storage_index)
-            != divmod(segment_index, point_count)
-            for segment_index, item in enumerate(segments)
+        if len(segments) != self.program.segment_count or any(
+            not isinstance(item, ApiSegmentEvidence) for item in segments
         ):
-            raise ValueError("API segment evidence must be complete R-major/P-fast order")
-        channels: set[str] = set()
-        binding_instances: set[str] = set()
-        evidence_kinds: set[object] = set()
-        terminal_session_ids: set[str] = set()
-        artifact_by_point: list[CompiledPulseArtifact | None] = [None] * point_count
-        for item in segments:
-            _require_api_segment_evidence(
-                resolved_points[item.point_storage_index],
-                item.evidence,
-            )
-            channels.add(item.evidence.trigger_channel)
-            binding_instances.add(item.evidence.terminal.binding_instance_id)
-            evidence_kinds.add(item.evidence.terminal.evidence_kind)
-            terminal_session_ids.add(item.evidence.terminal.session_id)
-            artifact = item.evidence.compiled_artifact
-            previous = artifact_by_point[item.point_storage_index]
-            if previous is None:
-                artifact_by_point[item.point_storage_index] = artifact
-            elif previous.fingerprint != artifact.fingerprint:
-                raise ValueError("one API point changed compiled artifact across repeats")
-        if len(channels) != 1:
-            raise ValueError("all API segments must use the same trigger channel")
-        if len(binding_instances) != 1:
-            raise ValueError("API segments changed sequencer binding instance")
-        if len(evidence_kinds) != 1:
-            raise ValueError("API segments mixed hardware and simulated evidence")
-        if len(terminal_session_ids) != len(segments):
-            raise ValueError("API segments reused a pulse terminal receipt")
-        artifacts = tuple(item for item in artifact_by_point if item is not None)
-        if len(artifacts) != point_count:
-            raise ValueError("API execution omits a point artifact")
-        self.camera.require_event_count(expected_count)
-        self.camera.capability.physical_facts.require_single_capture_trigger_channel(
-            next(iter(channels))
+            raise ValueError("API segments must cover the complete R by P run")
+        expected_cells = tuple(
+            (repeat, point)
+            for repeat in range(self.program.repeat_count)
+            for point in range(self.program.point_count)
         )
+        if tuple(
+            (item.repeat_index, item.point_storage_index) for item in segments
+        ) != expected_cells:
+            raise ValueError("API segment order must be repeat-major and point-fast")
+        if not isinstance(self.source, SignalEventSequence):
+            raise TypeError("source must be SignalEventSequence")
+        if self.source.count != self.program.segment_count:
+            raise ValueError("source event count differs from API R by P")
         object.__setattr__(self, "segments", segments)
 
 
-def api_segmented_metadata_static_shape_from_execution(
-    value: ApiSegmentedScanExecution,
-    provenance: DatasetSealProvenance,
-) -> dict[str, object]:
-    """Rebuild the pre-FIRE projection from completed execution and provenance."""
-
-    if not isinstance(value, ApiSegmentedScanExecution):
-        raise TypeError("value must be ApiSegmentedScanExecution")
-    if not isinstance(provenance, DatasetSealProvenance):
-        raise TypeError("provenance must be DatasetSealProvenance")
-    point_count = value.program.point_count
-    first_repeat = value.segments[:point_count]
-    camera = value.camera
-    derivation = provenance.derivation
-    return api_segmented_metadata_static_shape_to_tree(
-        value.program,
-        tuple(item.evidence for item in first_repeat),
-        camera_source_stream_id=camera.source_event_span.stream_id,
-        result_stream_id=provenance.stream_id,
-        result_source_id=provenance.trace_binding.source_id,
-        derivation_root_stream_id=(
-            None if derivation is None else derivation.root_input_span.stream_id
-        ),
-        camera_provenance=camera.camera_provenance,
-        camera_capability=camera.capability,
-        camera_arm_spec=camera.arm_spec,
-        camera_source_value_schema=camera.source_value_schema,
-        camera_source_schema_fingerprint=camera.source_schema_fingerprint,
-    )
-
-
-PulseScanExecution: TypeAlias = AutonomousScanExecution | ApiSegmentedScanExecution
-
-
-def api_segmented_cell_schedule(
-    program: ApiSlotSegmentedProgram,
-    schema: DatasetSchema,
-) -> DatasetCellSchedule:
-    """Derive the accepted API exception's global R-major/P-fast schedule."""
-
-    if not isinstance(program, ApiSlotSegmentedProgram):
-        raise TypeError("program must be ApiSlotSegmentedProgram")
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    if schema.repeat_axis.size != program.repeat_count:
-        raise ValueError("camera repeat axis differs from API scan repeats")
-    event_positions = tuple(
-        position
-        for position, axis in enumerate(schema.point_axes)
-        if axis.role == READOUT_EVENT
-    )
-    if len(event_positions) != 1:
-        raise ValueError("API camera schema requires one READOUT_EVENT axis")
-    event_position = event_positions[0]
-    if schema.point_axes[event_position].size != 1:
-        raise ValueError("API camera READOUT_EVENT axis must be singleton")
-    scan_axes = tuple(
-        axis
-        for position, axis in enumerate(schema.point_axes)
-        if position != event_position
-    )
-    if scan_axes != program.point_table.point_axes:
-        raise ValueError("API camera scan axes differ from the point table")
-    scan_positions = {
-        axis.axis_id: position for position, axis in enumerate(scan_axes)
-    }
-
-    def cells():
-        for repeat_index in range(program.repeat_count):
-            for point_index in range(program.point_table.point_layout.storage_size):
-                scan_multi = program.point_table.point_layout.multi_index(point_index)
-                full_multi = tuple(
-                    0
-                    if position == event_position
-                    else scan_multi[scan_positions[axis.axis_id]]
-                    for position, axis in enumerate(schema.point_axes)
-                )
-                yield DatasetCellAddress(
-                    repeat_index,
-                    schema.point_layout.storage_index(full_multi),
-                )
-
-    return DatasetCellSchedule.from_cells(schema, cells())
+PulseScanExecution = AutonomousScanExecution | ApiSegmentedScanExecution
 
 
 def execution_compiled_artifacts(
-    value: PulseScanExecution,
+    execution: PulseScanExecution,
 ) -> tuple[CompiledPulseArtifact, ...]:
-    """Return the exact point-indexed compiled artifact tuple for persistence."""
+    if isinstance(execution, AutonomousScanExecution):
+        return (execution.artifact,)
+    if not isinstance(execution, ApiSegmentedScanExecution):
+        raise TypeError("execution must be PulseScanExecution")
+    by_point: list[CompiledPulseArtifact | None] = [None] * execution.program.point_count
+    for item in execution.segments:
+        existing = by_point[item.point_storage_index]
+        if existing is None:
+            by_point[item.point_storage_index] = item.artifact
+        elif existing != item.artifact:
+            raise ValueError("one API point used different artifacts across repeats")
+    if any(item is None for item in by_point):
+        raise ValueError("API execution omitted a point artifact")
+    return tuple(item for item in by_point if item is not None)
 
-    if isinstance(value, AutonomousScanExecution):
-        return (value.evidence.compiled_artifact,)
-    if isinstance(value, ApiSegmentedScanExecution):
-        point_count = value.program.point_table.point_layout.storage_size
-        first_repeat = value.segments[:point_count]
-        return tuple(item.evidence.compiled_artifact for item in first_repeat)
-    raise TypeError("value must be a PulseScanExecution")
 
-
-def _evidence_reference_to_tree(
-    evidence: PulseCaptureEvidence,
-    artifact_index: int,
-) -> dict[str, object]:
-    tree = pulse_capture_evidence_to_tree(evidence)
-    if tree is None:
-        raise RuntimeError("scan evidence unexpectedly encoded as None")
+def _binding_to_tree(value: ScanSignalBinding) -> dict[str, object]:
     return {
-        "artifact_index": nonnegative_integer(artifact_index, "artifact_index"),
-        "evidence": tree,
+        "producer_definition": definition_key_to_tree(value.producer_definition),
+        "output": {
+            "name": value.output.name,
+            "contract_id": value.output.contract_id,
+        },
+        "transform": (
+            None
+            if value.transform is None
+            else data_transform_spec_to_tree(value.transform)
+        ),
     }
 
 
-def _evidence_reference_from_tree(
-    tree: object,
-    artifacts: tuple[CompiledPulseArtifact, ...],
-) -> PulseCaptureEvidence:
+def _binding_from_tree(tree: object) -> ScanSignalBinding:
     data = exact_mapping(
         tree,
-        {"artifact_index", "evidence"},
-        "scan pulse evidence reference",
+        {"producer_definition", "output", "transform"},
+        "PulseScan signal binding",
         discriminator=None,
     )
-    artifact_index = nonnegative_integer(data["artifact_index"], "artifact_index")
-    try:
-        artifact = artifacts[artifact_index]
-    except IndexError as exc:
-        raise ValueError("scan evidence references an absent compiled artifact") from exc
-    evidence = pulse_capture_evidence_from_tree(data["evidence"], artifact)
-    if evidence is None:
-        raise ValueError("scan pulse evidence cannot be None")
-    return evidence
+    output = exact_mapping(
+        data["output"],
+        {"name", "contract_id"},
+        "PulseScan signal output",
+        discriminator=None,
+    )
+    from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
+
+    return ScanSignalBinding(
+        definition_key_from_tree(data["producer_definition"]),
+        DatasetOutputDeclaration(output["name"], output["contract_id"]),
+        (
+            None
+            if data["transform"] is None
+            else data_transform_spec_from_tree(data["transform"])
+        ),
+    )
+
+
+def signal_event_sequence_to_tree(value: SignalEventSequence) -> dict[str, object]:
+    if not isinstance(value, SignalEventSequence):
+        raise TypeError("value must be SignalEventSequence")
+    return {
+        "schema": SIGNAL_EVENT_SEQUENCE_SCHEMA,
+        "binding": _binding_to_tree(value.binding),
+        "projection_authority": signal_projection_authority_to_tree(
+            value.projection_authority
+        ),
+        "stream_id": value.stream_id.value,
+        "generation": value.generation.value,
+        "first_sequence": value.first_sequence,
+        "last_sequence": value.last_sequence,
+        "count": value.count,
+        "ordered_event_digest": value.ordered_event_digest,
+        "source_run_id": value.source_run_id,
+        "source_id": value.source_id,
+        "event_refs": [event_ref_to_tree(item) for item in value.event_refs],
+        "direct_input_event_refs": [
+            [event_ref_to_tree(item) for item in row]
+            for row in value.direct_input_event_refs
+        ],
+        "processor_stages": [
+            processor_stage_provenance_to_tree(stage)
+            for stage in value.processor_stages
+        ],
+        "associations": [
+            signal_association_evidence_to_tree(item)
+            for item in value.associations
+        ],
+    }
+
+
+def signal_event_sequence_from_tree(tree: object) -> SignalEventSequence:
+    data = exact_mapping(
+        tree,
+        {
+            "schema",
+            "binding",
+            "projection_authority",
+            "stream_id",
+            "generation",
+            "first_sequence",
+            "last_sequence",
+            "count",
+            "ordered_event_digest",
+            "source_run_id",
+            "source_id",
+            "event_refs",
+            "direct_input_event_refs",
+            "processor_stages",
+            "associations",
+        },
+        SIGNAL_EVENT_SEQUENCE_SCHEMA,
+    )
+    event_refs = data["event_refs"]
+    direct_rows = data["direct_input_event_refs"]
+    stages = data["processor_stages"]
+    associations = data["associations"]
+    if not isinstance(event_refs, list):
+        raise TypeError("SignalEventSequence event_refs must be a list")
+    if not isinstance(direct_rows, list) or any(
+        not isinstance(row, list) for row in direct_rows
+    ):
+        raise TypeError(
+            "SignalEventSequence direct_input_event_refs must be nested lists"
+        )
+    if not isinstance(stages, list):
+        raise TypeError("SignalEventSequence processor_stages must be a list")
+    if not isinstance(associations, list):
+        raise TypeError("SignalEventSequence associations must be a list")
+    value = SignalEventSequence(
+        _binding_from_tree(data["binding"]),
+        signal_projection_authority_from_tree(data["projection_authority"]),
+        StreamId(data["stream_id"]),
+        StreamGenerationId(data["generation"]),
+        data["first_sequence"],
+        data["last_sequence"],
+        data["count"],
+        data["ordered_event_digest"],
+        data["source_run_id"],
+        data["source_id"],
+        tuple(_event_ref_from_tree(item) for item in event_refs),
+        tuple(
+            tuple(_event_ref_from_tree(item) for item in row)
+            for row in direct_rows
+        ),
+        tuple(processor_stage_provenance_from_tree(item) for item in stages),
+        tuple(signal_association_evidence_from_tree(item) for item in associations),
+    )
+    if signal_event_sequence_to_tree(value) != tree:
+        raise ValueError("SignalEventSequence tree is non-canonical")
+    return value
 
 
 def pulse_scan_execution_to_tree(value: PulseScanExecution) -> dict[str, object]:
-    artifacts = execution_compiled_artifacts(value)
     if isinstance(value, AutonomousScanExecution):
         return {
             "schema": SCAN_EXECUTION_SCHEMA,
             "kind": _AUTONOMOUS_KIND,
             "program_fingerprint": value.program.fingerprint,
-            "evidence": _evidence_reference_to_tree(value.evidence, 0),
-            "camera": camera_run_evidence_to_tree(value.camera),
+            "terminal": pulse_terminal_ack_to_tree(value.terminal),
+            "source": signal_event_sequence_to_tree(value.source),
         }
     if isinstance(value, ApiSegmentedScanExecution):
+        artifacts = execution_compiled_artifacts(value)
+        artifact_index = {item.fingerprint: index for index, item in enumerate(artifacts)}
         return {
             "schema": SCAN_EXECUTION_SCHEMA,
             "kind": _API_SEGMENTED_KIND,
             "program_fingerprint": value.program.fingerprint,
-            "camera": camera_run_evidence_to_tree(value.camera),
             "segments": [
                 {
                     "repeat_index": item.repeat_index,
                     "point_storage_index": item.point_storage_index,
-                    "pulse": _evidence_reference_to_tree(
-                        item.evidence,
-                        item.point_storage_index,
-                    ),
+                    "artifact_index": artifact_index[item.artifact.fingerprint],
+                    "terminal": pulse_terminal_ack_to_tree(item.terminal),
                 }
                 for item in value.segments
             ],
+            "source": signal_event_sequence_to_tree(value.source),
         }
-    raise TypeError("value must be a PulseScanExecution")
+    raise TypeError("value must be PulseScanExecution")
 
 
 def pulse_scan_execution_from_tree(
@@ -757,71 +500,68 @@ def pulse_scan_execution_from_tree(
     program: PulseScanProgram,
     compiled_artifacts: tuple[CompiledPulseArtifact, ...],
 ) -> PulseScanExecution:
+    if not isinstance(tree, dict):
+        raise TypeError("PulseScan execution tree must be a mapping")
     artifacts = tuple(compiled_artifacts)
     if any(not isinstance(item, CompiledPulseArtifact) for item in artifacts):
-        raise TypeError("compiled_artifacts must contain CompiledPulseArtifact values")
-    if not isinstance(tree, dict):
-        raise TypeError("pulse scan execution tree must be a mapping")
+        raise TypeError("compiled_artifacts must contain CompiledPulseArtifact")
     kind = tree.get("kind")
     if kind == _AUTONOMOUS_KIND:
         data = exact_mapping(
             tree,
-            {"schema", "kind", "program_fingerprint", "evidence", "camera"},
+            {"schema", "kind", "program_fingerprint", "terminal", "source"},
             SCAN_EXECUTION_SCHEMA,
         )
-        if not isinstance(program, AutonomousScanSlotProgram):
-            raise ValueError("autonomous execution tree has another program kind")
-        if len(artifacts) != 1:
-            raise ValueError("autonomous execution requires one compiled artifact")
-        sha256_text(data["program_fingerprint"], "program_fingerprint")
-        if data["program_fingerprint"] != program.fingerprint:
-            raise ValueError("execution metadata belongs to another scan program")
+        if not isinstance(program, AutonomousScanSlotProgram) or len(artifacts) != 1:
+            raise ValueError("autonomous execution has another program/artifact set")
         value: PulseScanExecution = AutonomousScanExecution(
             program,
-            _evidence_reference_from_tree(data["evidence"], artifacts),
-            camera_run_evidence_from_tree(data["camera"]),
+            artifacts[0],
+            pulse_terminal_ack_from_tree(data["terminal"]),
+            signal_event_sequence_from_tree(data["source"]),
         )
     elif kind == _API_SEGMENTED_KIND:
         data = exact_mapping(
             tree,
-            {"schema", "kind", "program_fingerprint", "segments", "camera"},
+            {"schema", "kind", "program_fingerprint", "segments", "source"},
             SCAN_EXECUTION_SCHEMA,
         )
         if not isinstance(program, ApiSlotSegmentedProgram):
-            raise ValueError("API execution tree has another program kind")
-        point_count = program.point_table.point_layout.storage_size
-        if len(artifacts) != point_count:
-            raise ValueError("API execution requires one compiled artifact per point")
-        sha256_text(data["program_fingerprint"], "program_fingerprint")
-        if data["program_fingerprint"] != program.fingerprint:
-            raise ValueError("execution metadata belongs to another scan program")
-        segment_trees = data["segments"]
-        if not isinstance(segment_trees, list):
-            raise TypeError("segments must be a list")
-        segments: list[ApiSegmentEvidence] = []
-        for item in segment_trees:
-            segment = exact_mapping(
-                item,
-                {"repeat_index", "point_storage_index", "pulse"},
+            raise ValueError("API execution has another program kind")
+        rows = data["segments"]
+        if not isinstance(rows, list):
+            raise TypeError("API execution segments must be a list")
+        segments = []
+        for row in rows:
+            item = exact_mapping(
+                row,
+                {"repeat_index", "point_storage_index", "artifact_index", "terminal"},
                 "API segment evidence",
                 discriminator=None,
             )
+            index = nonnegative_integer(item["artifact_index"], "artifact_index")
+            if index >= len(artifacts):
+                raise ValueError("API segment artifact_index is out of range")
             segments.append(
                 ApiSegmentEvidence(
-                    segment["repeat_index"],
-                    segment["point_storage_index"],
-                    _evidence_reference_from_tree(segment["pulse"], artifacts),
+                    item["repeat_index"],
+                    item["point_storage_index"],
+                    artifacts[index],
+                    pulse_terminal_ack_from_tree(item["terminal"]),
                 )
             )
         value = ApiSegmentedScanExecution(
             program,
             tuple(segments),
-            camera_run_evidence_from_tree(data["camera"]),
+            signal_event_sequence_from_tree(data["source"]),
         )
     else:
-        raise ValueError("pulse scan execution kind is unknown")
+        raise ValueError("PulseScan execution kind is unknown")
+    sha256_text(tree["program_fingerprint"], "program_fingerprint")
+    if tree["program_fingerprint"] != program.fingerprint:
+        raise ValueError("execution belongs to another PulseScan program")
     if pulse_scan_execution_to_tree(value) != tree:
-        raise ValueError("PulseScanExecution tree is typed but non-canonical")
+        raise ValueError("PulseScan execution tree is non-canonical")
     return value
 
 
@@ -829,17 +569,13 @@ __all__ = [
     "ApiSegmentEvidence",
     "ApiSegmentedScanExecution",
     "AutonomousScanExecution",
-    "CAMERA_RUN_EVIDENCE_SCHEMA",
-    "CameraRunEvidence",
     "PulseScanExecution",
     "SCAN_EXECUTION_SCHEMA",
-    "api_segmented_metadata_static_shape_from_execution",
-    "api_segmented_metadata_static_shape_to_tree",
-    "camera_run_evidence_from_pipeline",
-    "camera_run_evidence_from_tree",
-    "camera_run_evidence_to_tree",
-    "api_segmented_cell_schedule",
+    "SIGNAL_EVENT_SEQUENCE_SCHEMA",
+    "SignalEventSequence",
     "execution_compiled_artifacts",
     "pulse_scan_execution_from_tree",
     "pulse_scan_execution_to_tree",
+    "signal_event_sequence_from_tree",
+    "signal_event_sequence_to_tree",
 ]

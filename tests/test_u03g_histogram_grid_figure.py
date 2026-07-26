@@ -512,13 +512,13 @@ def test_public_occupancy_counts_entry_opens_the_histogram_grid(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    from zlc_neutral_atom.logic_nodes.calibration.sitemap import load_packaged_sitemap_pulse
+    from zlc_neutral_atom.logic_nodes.readout.calibration.sitemap import load_sitemap_pulse
 
     owner_thread = threading.get_ident()
     calls = []
     with zlc.connect("virtual", repository=tmp_path / "public-entry") as experiment:
         calibration_reference = experiment.readout.sitemap(frames=12)
-        document = load_packaged_sitemap_pulse()
+        document = load_sitemap_pulse()
         trigger_index = document.target.raw_lanes.index("ch11")
         trigger_run = 0
         previous = False

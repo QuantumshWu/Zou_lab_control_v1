@@ -201,7 +201,6 @@ class SequencerCapabilitySnapshot:
     manifest: PulseTargetManifest
     clock_hz: float
     geometry_fingerprint: int
-    resident_scan_point_capacity: int
     max_blocking_call_seconds: float
     terminal_evidence_kind: "PulseTerminalEvidenceKind"
     server_connection_generation: str | None
@@ -219,14 +218,6 @@ class SequencerCapabilitySnapshot:
             or not 0 <= self.geometry_fingerprint <= 0xFFFFFFFF
         ):
             raise ValueError("geometry_fingerprint must be an unsigned 32-bit integer")
-        if (
-            isinstance(self.resident_scan_point_capacity, bool)
-            or not isinstance(self.resident_scan_point_capacity, int)
-            or self.resident_scan_point_capacity < 1
-        ):
-            raise ValueError(
-                "resident_scan_point_capacity must be a positive integer"
-            )
         object.__setattr__(
             self,
             "max_blocking_call_seconds",

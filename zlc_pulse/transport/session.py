@@ -39,6 +39,7 @@ from ..evidence import (
     hardware_terminal_evidence_to_tree,
     validate_terminal_for_artifact,
 )
+from ..fpga import scan_chunk_wire_words
 from ..target import PulseTarget
 from .lease import DeviceLease
 
@@ -140,6 +141,13 @@ class DeployedStreamerSession:
         self._artifact: CompiledPulseArtifact | None = None
         self._artifact_digest: str | None = None
         self._total_points = 0
+        self._total_chunks = 0
+        self._scan_chunk_rows: tuple[
+            tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]], ...
+        ] = ()
+        self._next_monotonic_chunk = 2
+        self._bank_ready = 0b11
+        self._scan_sweep = 0
         self._last_cursor = 0
         self._tail_seconds = 0.0
         self._drain_until = 0.0
@@ -329,6 +337,18 @@ class DeployedStreamerSession:
         artifact_digest = artifact.fingerprint
         ir = artifact.target_ir
         total_points = len(ir.scan_points)
+        total_chunks = (
+            (total_points + self.params.bank_size - 1) // self.params.bank_size
+            if total_points
+            else 0
+        )
+        scan_chunk_rows = tuple(
+            (
+                scan_chunk_wire_words(ir, self.params, chunk, target_bank=0),
+                scan_chunk_wire_words(ir, self.params, chunk, target_bank=1),
+            )
+            for chunk in range(total_chunks)
+        )
         with self._lock:
             if (
                 operation_epoch != self._operation_epoch
@@ -362,6 +382,11 @@ class DeployedStreamerSession:
             self._artifact = None
             self._artifact_digest = None
             self._total_points = total_points
+            self._total_chunks = total_chunks
+            self._scan_chunk_rows = scan_chunk_rows
+            self._next_monotonic_chunk = 2
+            self._bank_ready = 0b11
+            self._scan_sweep = 0
             self._last_cursor = 0
             self._tail_seconds = artifact.max_configured_output_delay_ticks / ir.clock_hz
             self._drain_until = 0.0
@@ -647,6 +672,9 @@ class DeployedStreamerSession:
                 "state": self._state,
                 "prepared_artifact_digest": self._artifact_digest,
                 "scan_points": self._total_points,
+                "scan_chunks": self._total_chunks,
+                "next_monotonic_scan_chunk": self._next_monotonic_chunk,
+                "scan_sweep": self._scan_sweep,
                 "last_confirmed_cursor": self._last_cursor,
                 "cursor_sample_count": self._cursor_sample_count,
                 "underflow_observed": self._underflow_observed,
@@ -831,24 +859,19 @@ class DeployedStreamerSession:
             return
         artifact = self._artifact
         continuous = bool(artifact is not None and artifact.target_ir.repeat_forever)
+        streamed = self._total_chunks > 2
         poll_interval = (
             max(
                 self.terminal_poll_interval,
                 _CONTINUOUS_OBSERVER_INTERVAL_SECONDS,
             )
-            if continuous
+            if continuous and not streamed
             else self.terminal_poll_interval
         )
+        previous_cursor = 0
         try:
             while not stop.is_set():
-                sampled_cursor: int | None = None
-                if continuous and self._total_points:
-                    status, sampled_cursor = self._read_words(
-                        (CtrlWords.STATUS, CtrlWords.CURSOR),
-                        stop=stop,
-                    )
-                else:
-                    status = self.transport.read_word(CtrlWords.STATUS, stop=stop)
+                status = self.transport.read_word(CtrlWords.STATUS, stop=stop)
                 self._status_sample_count += 1
                 if status & STATUS_ERROR:
                     raise RuntimeError("pulse streamer reported STATUS_ERROR")
@@ -880,26 +903,29 @@ class DeployedStreamerSession:
                     return
 
                 if self._total_points:
-                    cursor = (
-                        sampled_cursor
-                        if sampled_cursor is not None
-                        else self.transport.read_word(CtrlWords.CURSOR, stop=stop)
-                    )
+                    cursor = self.transport.read_word(CtrlWords.CURSOR, stop=stop)
                     if not 0 <= cursor < self._total_points:
                         raise RuntimeError(
                             "pulse streamer cursor is outside the active scan table"
                         )
+                    if continuous and cursor < previous_cursor:
+                        self._scan_sweep += 1
+                    previous_cursor = cursor
                     with self._lock:
                         if operation_epoch != self._operation_epoch or stop.is_set():
                             return
                         self._last_cursor = cursor
                         self._cursor_sample_count += 1
-                # Continuous Pulse is observed for diagnostics/progress only; FPGA
-                # timing is autonomous.  Polling JTAG at a 1 ms target saturated the
-                # transport (real hardware managed only ~9 reads/s) and delayed the
-                # next SAFE/upload.  A cancellable ~3 Hz hardware sample is ample
-                # for progress UI and detects fail-closed underflow without owning
-                # the autonomous timing path.
+                    if streamed:
+                        self._refill_freed_scan_banks(
+                            artifact,
+                            cursor,
+                            continuous=continuous,
+                            stop=stop,
+                        )
+                # A resident continuous pulse needs only low-rate progress sampling.
+                # A streamed scan instead polls at the configured transport cadence:
+                # this one worker is the sole post-FIRE status/cursor/refill owner.
                 if stop.wait(poll_interval):
                     return
         except TransportAborted:
@@ -920,6 +946,100 @@ class DeployedStreamerSession:
                 )
             self.transport.record_diagnostic("stream_failure", repr(error))
             self._terminal_event.set()
+
+    def _refill_freed_scan_banks(
+        self,
+        artifact: CompiledPulseArtifact | None,
+        cursor: int,
+        *,
+        continuous: bool,
+        stop: threading.Event,
+    ) -> None:
+        """Keep the frozen RTL's ping-pong banks one chunk ahead of playback."""
+
+        if artifact is None:
+            raise RuntimeError("scan refill lost its compiled artifact")
+        total_chunks = self._total_chunks
+        if total_chunks <= 2:
+            return
+        engine_chunk = self._scan_sweep * total_chunks + (
+            min(cursor, self._total_points - 1) // self.params.bank_size
+        )
+        while (
+            (continuous or self._next_monotonic_chunk < total_chunks)
+            and engine_chunk >= self._next_monotonic_chunk - 1
+        ):
+            monotonic_chunk = self._next_monotonic_chunk
+            data_chunk = (
+                monotonic_chunk % total_chunks
+                if continuous
+                else monotonic_chunk
+            )
+            bank = monotonic_chunk % 2
+            unarmed = self._bank_ready & ~(1 << bank)
+            words = self._scan_chunk_rows[data_chunk][bank]
+            marker = (
+                CtrlWords.BANK0_CHUNK
+                if bank == 0
+                else CtrlWords.BANK1_CHUNK
+            )
+            rearmed = unarmed | (1 << bank)
+            deadline = time.monotonic() + self.action_timeout
+            rewrite = getattr(self.transport, "rewrite_scan_bank", None)
+            if callable(rewrite):
+                rewrite(
+                    unarmed_bank_ready=unarmed,
+                    bank_words=words,
+                    chunk_word=marker,
+                    chunk_index=data_chunk,
+                    rearmed_bank_ready=rearmed,
+                    stop=stop,
+                    deadline=deadline,
+                )
+            else:
+                # Injectable model transports use the same ordered row contract.
+                # Production transports provide rewrite_scan_bank() so their
+                # acknowledgement granularity cannot re-arm a partial bank.
+                self.transport.write_words(
+                    (
+                        (CtrlWords.BANK_READY, unarmed),
+                        *words,
+                        (marker, data_chunk),
+                        (CtrlWords.BANK_READY, rearmed),
+                    ),
+                    stop=stop,
+                    deadline=deadline,
+                )
+            committed_status, committed_cursor = self._read_words(
+                (CtrlWords.STATUS, CtrlWords.CURSOR),
+                stop=stop,
+                deadline=deadline,
+            )
+            if committed_status & STATUS_ERROR:
+                raise RuntimeError(
+                    "pulse streamer reported STATUS_ERROR during scan-bank refill"
+                )
+            if committed_status & STATUS_UNDERFLOW:
+                self._underflow_observed = True
+                raise RuntimeError(
+                    "pulse streamer underflowed during scan-bank refill; "
+                    "seamless scan timing is invalid"
+                )
+            if not 0 <= committed_cursor < self._total_points:
+                raise RuntimeError(
+                    "pulse streamer cursor is outside the active scan table "
+                    "after scan-bank refill"
+                )
+            if (
+                committed_cursor // self.params.bank_size
+                != cursor // self.params.bank_size
+            ):
+                raise RuntimeError(
+                    "pulse streamer crossed a scan-bank boundary while its next "
+                    "bank refill was in flight; seamless timing cannot be proven"
+                )
+            self._bank_ready = rearmed
+            self._next_monotonic_chunk += 1
 
     def _read_terminal_evidence(
         self,

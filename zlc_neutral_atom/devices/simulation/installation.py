@@ -259,10 +259,8 @@ def _bind_rf(
     asset: InstallationAsset,
     asset_map_revision: str,
     source: VirtualRfSource,
-    *,
-    maximum_points: int,
 ) -> BoundRfTablePort:
-    endpoint = VirtualRfTableEndpoint(source, maximum_points)
+    endpoint = VirtualRfTableEndpoint(source)
     binding: BoundDevice | None = None
 
     def current_binding() -> BoundDevice:
@@ -392,7 +390,6 @@ def create_virtual_installation(
             assets.require("rf", rf),
             assets.revision,
             rf,
-            maximum_points=pulse_port.capability.resident_scan_point_capacity,
         )
         readout_apparatus_facts = ReadoutApparatusFacts(
             camera_role="camera",
@@ -440,6 +437,7 @@ def create_virtual_installation(
         return _InstallationComposition(
             runtime=runtime,
             readout_apparatus_facts=(readout_apparatus_facts,),
+            camera_signal_association_authorities=(("camera", camera),),
         )
     except BaseException as primary:
         cleanup_errors: list[BaseException] = []

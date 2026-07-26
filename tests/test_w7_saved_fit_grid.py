@@ -69,7 +69,7 @@ from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: F401
 from zlc_frontend.qt_widgets import AxisLayoutNavigator, FrozenRasterView, QtRasterBoard
 from zlc_neutral_atom.artifacts import FitResultRepository
 from zlc_neutral_atom.artifacts.fit_reference import FitResultArtifactRef
-from zlc_neutral_atom.logic_nodes.camera_capture.artifact import AdmittedCapture
+from zlc_neutral_atom.capture.artifact import AdmittedCapture
 
 from zlc_workbench.fit_grid.render_lane import (
     _build_image_grid_frame,
@@ -79,7 +79,7 @@ from zlc_workbench.fit_grid.render_lane import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+PULSE = ROOT / "pulses" / "imaging_template.json"
 CURVE_PULSE = ROOT / "pulses" / "probe_template.json"
 ONE_DIMENSIONAL_MODELS = tuple(
     model.model_id for model in fit_model_catalog() if model.independent_arity == 1

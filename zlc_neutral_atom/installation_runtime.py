@@ -317,6 +317,7 @@ class _InstallationComposition:
 
     runtime: _InstallationRuntime
     readout_apparatus_facts: tuple[ReadoutApparatusFacts, ...] = ()
+    camera_signal_association_authorities: tuple[tuple[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.runtime, _InstallationRuntime):
@@ -338,6 +339,38 @@ class _InstallationComposition:
                     "readout apparatus sequencer role is not a sequencer"
                 )
         object.__setattr__(self, "readout_apparatus_facts", facts)
+        authorities = tuple(self.camera_signal_association_authorities)
+        roles: list[str] = []
+        required_methods = (
+            "arm_signal_event_association",
+            "bind_signal_event_association",
+            "finish_signal_event_association",
+            "cancel_signal_event_association",
+        )
+        for item in authorities:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise TypeError(
+                    "camera signal association entries must be (role, authority) tuples"
+                )
+            role, authority = item
+            if not isinstance(role, str) or not role or role.strip() != role:
+                raise ValueError("camera signal association role must be canonical text")
+            if catalog.require(role).domain != "camera":
+                raise ValueError(
+                    "camera signal association role is not a camera"
+                )
+            if any(not callable(getattr(authority, name, None)) for name in required_methods):
+                raise TypeError(
+                    "camera signal association authority has an incomplete contract"
+                )
+            roles.append(role)
+        if len(roles) != len(set(roles)):
+            raise ValueError("camera signal association roles must be unique")
+        object.__setattr__(
+            self,
+            "camera_signal_association_authorities",
+            authorities,
+        )
 
 
 def _catalog(

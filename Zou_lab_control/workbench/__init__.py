@@ -9,7 +9,7 @@ def open_calibration_report_workbench(
 ):
     """Open one committed calibration report without eager Qt imports."""
 
-    from zlc_workbench.calibration_workbench.app import (
+    from zlc_neutral_atom.logic_nodes.readout.calibration.ui.workbench import (
         open_calibration_report_workbench as _open,
     )
 
@@ -25,7 +25,7 @@ def open_calibration_workbench(
 ):
     """Open formal calibration creation/editing without eager Qt imports."""
 
-    from zlc_workbench.calibration_workbench.app import (
+    from zlc_neutral_atom.logic_nodes.readout.calibration.ui.workbench import (
         open_calibration_workbench as _open,
     )
 
@@ -46,7 +46,7 @@ def open_occupancy_cell_workbench(
 ):
     """Open one exact same-shot occupancy map without eager Qt imports."""
 
-    from zlc_workbench.occupancy_viewer.app import (
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.ui.workbench import (
         open_occupancy_cell_workbench as _open,
     )
 
@@ -65,7 +65,6 @@ def open_figure_workbench(
     intent=None,
     selection=None,
     preferences=None,
-    occupancy_output=None,
     fit_preparer=None,
     fit_executor=None,
     fit_saver=None,
@@ -85,8 +84,6 @@ def open_figure_workbench(
         "selection": selection,
         "preferences": preferences,
     }
-    if occupancy_output is not None:
-        options["occupancy_output"] = occupancy_output
     for name, value in (
         ("fit_preparer", fit_preparer),
         ("fit_executor", fit_executor),
@@ -117,44 +114,6 @@ def open_saved_fit_grid_workbench(
     )
 
     return _open(view_loader, refit_opener, reference)
-
-
-def open_scan_workbench(experiment, request):
-    """Open the current typed autonomous scan panel lazily."""
-
-    from zlc_frontend.figure import ViewIntent
-    from zlc_frontend.scan_preview import describe_scan_figure
-    from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import (
-        OccupancyScanRequest,
-        ScanRequest,
-    )
-    from zlc_workbench.scan import FinalScanPresentation
-    from zlc_workbench.scan_workbench.application import ScanWorkbenchActions
-    from zlc_workbench.scan_workbench.app import open_scan_workbench as _open
-
-    def prepare(frozen_request):
-        if isinstance(frozen_request, ScanRequest):
-            return experiment.readout.prepare_scan(frozen_request)
-        if isinstance(frozen_request, OccupancyScanRequest):
-            return experiment.readout.prepare_occupancy_scan(frozen_request)
-        raise TypeError("request must be a current scan request")
-
-    def project_final(reference, selection, preferences):
-        options = {}
-        if preferences is not None:
-            options.update(
-                intent=ViewIntent.CURVE,
-                selection=selection,
-                preferences=preferences,
-            )
-        figure = experiment.figure(reference, **options)
-        return FinalScanPresentation(
-            reference,
-            figure.to_png_bytes(),
-            describe_scan_figure(figure.document),
-        )
-
-    return _open(ScanWorkbenchActions(prepare, project_final), request)
 
 
 def open_pulse_editor(
@@ -306,6 +265,5 @@ __all__ = [
     "open_device_manager",
     "open_pulse_editor",
     "open_saved_fit_grid_workbench",
-    "open_scan_workbench",
     "open_task_console",
 ]

@@ -57,9 +57,8 @@ PLOT_KIND_SPECS: tuple[PlotKindSpec, ...] = (
     PlotKindSpec(
         key="sites", label="Site map", panel=True,
         input_format=(
-            "value must carry a typed calibration site map, or an exact "
-            "single-cell occupancy view with its same-shot frame and "
-            "admitted calibration geometry"),
+            "value must carry a typed SiteMapPresentation whose site state, "
+            "background, geometry and revision are already joined"),
     ),
     PlotKindSpec(
         key="1d", label="1D vector",

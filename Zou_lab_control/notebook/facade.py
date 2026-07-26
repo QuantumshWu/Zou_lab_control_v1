@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Iterator, Mapping, TYPE_CHECKING
-from uuid import uuid4
 
 from zlc_neutral_atom.installation import (
     DeviceCatalogView,
@@ -18,11 +17,6 @@ from zlc_neutral_atom.installation_config import (
     load_installation_config,
 )
 from zlc_data import (
-    MONITOR_HISTORY,
-    SCAN_POINT,
-    SPATIAL_X,
-    SPATIAL_Y,
-    SPECTRAL,
     AxisId,
     CommittedTransform,
     DataTransformSpec,
@@ -37,7 +31,6 @@ from zlc_data import (
     fit_model_catalog,
     fit_spec_for,
     suggest_fit_draft,
-    validate_fit_result_source_binding,
 )
 from zlc_neutral_atom.artifacts import (
     AdmittedFitResult,
@@ -45,12 +38,12 @@ from zlc_neutral_atom.artifacts import (
     FitResultArtifactRef,
     FitResultRepository,
 )
-from zlc_neutral_atom.logic_nodes.camera_capture.artifact import (
+from zlc_neutral_atom.capture.artifact import (
     CaptureArtifact,
     CaptureRepository,
 )
-from zlc_neutral_atom.logic_nodes.camera_capture.reference import CaptureArtifactRef
-from zlc_neutral_atom.logic_nodes.camera_capture.application import (
+from zlc_neutral_atom.capture.reference import CaptureArtifactRef
+from zlc_neutral_atom.capture.application import (
     CaptureRequest,
     PlanDescriptor,
     PreparedFiniteCapture,
@@ -77,7 +70,9 @@ from zlc_neutral_atom.logic_nodes.mot_field import (
     DEFAULT_MOT_FIELD_SPAN_CODE,
     MotFieldRequest,
     MotFieldResult,
+    PreparedMotFieldAcquisition,
     build_mot_scan_program,
+    prepare_mot_field_acquisition,
 )
 from zlc_neutral_atom.logic_nodes.mot_field import (
     MotFieldTaskIntent,
@@ -95,7 +90,7 @@ from zlc_neutral_atom.devices.sequencer.application import (
     PulseTargetDescriptor,
     prepare_pulse_execution,
 )
-from zlc_neutral_atom.logic_nodes.calibration.calibration import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     BackgroundMode,
     BoxReducer,
     CalibrationAnalysisRequest,
@@ -104,15 +99,15 @@ from zlc_neutral_atom.logic_nodes.calibration.calibration import (
     ResolvedCalibration,
     ThresholdMethod,
 )
-from zlc_neutral_atom.logic_nodes.calibration.application import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.application import (
     CalibrationArtifactRequest,
     build_calibration_artifact_request,
     prepare_calibration_artifact_plan,
 )
-from zlc_neutral_atom.logic_nodes.calibration.reference import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
 )
-from zlc_neutral_atom.logic_nodes.calibration.task import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.task import (
     CalibrationTaskIntent,
     PreparedCalibrationTask,
     admit_calibration_capture_export,
@@ -120,7 +115,7 @@ from zlc_neutral_atom.logic_nodes.calibration.task import (
     prepare_calibration_task as prepare_calibration_task_application,
     write_calibration_task_outputs as write_calibration_application_outputs,
 )
-from zlc_neutral_atom.logic_nodes.grey_molasses_detuning import (
+from zlc_neutral_atom.logic_nodes.release_recapture.grey_molasses_detuning import (
     AutonomousMeasurementUnavailable,
     GREY_MOLASSES_CAPABILITY_GAP,
     GreyMolassesDetuningApplicationCommand,
@@ -129,7 +124,7 @@ from zlc_neutral_atom.logic_nodes.grey_molasses_detuning import (
     prepare_grey_molasses_detuning,
     prepare_grey_molasses_detuning_application,
 )
-from zlc_neutral_atom.logic_nodes.readout_duration_fidelity import (
+from zlc_neutral_atom.logic_nodes.readout.duration_fidelity import (
     PreparedReadoutDurationFidelity,
     ReadoutDurationFidelityApplicationCommand,
     ReadoutDurationFidelityIntent,
@@ -137,65 +132,58 @@ from zlc_neutral_atom.logic_nodes.readout_duration_fidelity import (
     prepare_readout_duration_fidelity,
     prepare_readout_duration_fidelity_application,
 )
-from zlc_neutral_atom.logic_nodes.release_recapture_common.application import (
+from zlc_neutral_atom.logic_nodes.release_recapture.application import (
     PreparedReleaseRecapture,
 )
-from zlc_neutral_atom.logic_nodes.temperature_release_recapture import (
+from zlc_neutral_atom.logic_nodes.release_recapture.temperature import (
     TemperatureReleaseRecaptureApplicationCommand,
     TemperatureReleaseRecaptureIntent,
     TemperatureReleaseRecaptureRequest,
     prepare_temperature_release_recapture,
     prepare_temperature_release_recapture_application,
 )
-from zlc_neutral_atom.logic_nodes.occupancy.reference import OccupancyArtifactRef
-from zlc_neutral_atom.logic_nodes.occupancy.cell import (
-    ExactOccupancyCellSource,
+from zlc_neutral_atom.logic_nodes.readout.occupancy.reference import OccupancyArtifactRef
+from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import (
     OccupancyCellDomain,
     inspect_occupancy_cell_domain,
     load_exact_occupancy_cell_source,
 )
-from zlc_neutral_atom.logic_nodes.readout_common.contracts import CalibrationCaptureLayout
+from zlc_neutral_atom.logic_nodes.readout.contracts import CalibrationCaptureLayout
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
-from zlc_neutral_atom.logic_nodes.calibration.sitemap import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.sitemap import (
     SitemapAcquisitionProfile,
     SitemapCalibrationRequest,
     build_sitemap_analysis_request,
     build_sitemap_calibration_request,
 )
-from zlc_neutral_atom.logic_nodes.calibration.installation import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.installation import (
     build_sitemap_acquisition_profile,
 )
 from zlc_neutral_atom.logic_nodes.pulse_scan import (
-    ApiSegmentTable,
-    ApiSlotSegmentedProgram,
-    AutonomousScanSlotProgram,
     MaterializedScanData,
-    PulseScanProgram,
     ScanPointTable,
 )
 from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import (
-    OccupancyScanRequest,
-    ScanRequest,
-    ScanSourceBinding,
-    build_scan_request,
+    PulseScanBoundRequest,
 )
 from zlc_neutral_atom.logic_nodes.pulse_scan.reference import ScanArtifactRef
 from zlc_neutral_atom.logic_nodes.pulse_scan.application import (
     PreparedExactScan,
     prepare_exact_scan,
 )
-from zlc_neutral_atom.logic_nodes.occupancy.application import (
+from zlc_neutral_atom.logic_nodes.readout.occupancy.application import (
     DetectionRequest,
     build_detection_request,
     prepare_detection_plan,
 )
-from zlc_neutral_atom.logic_nodes.occupancy.processor_application import (
+from zlc_neutral_atom.logic_nodes.readout.occupancy.processor_application import (
     PreparedOccupancyProcessor,
     OccupancyProcessorRequest,
     prepare_occupancy_processor,
 )
 from zlc_neutral_atom.devices.sequencer.port import PulseScanProgress
 from zlc_neutral_atom.runtime.run import CancelOutcome, RunHandle
+from zlc_neutral_atom.runtime.signal_source import SignalEventSource
 from zlc_pulse import (
     PulseDocument,
     PulseExecutionForm,
@@ -204,19 +192,20 @@ from zlc_pulse import (
 from zlc_storage import canonical_text as _text
 from zlc_storage import durable_makedirs
 from zlc_storage import positive_real as _positive_real
+from zlc_storage.paths import resolve_under_project
 
 if TYPE_CHECKING:
     from zlc_frontend import DataFigure
     from zlc_frontend.figure import FigureDocument, ViewIntent, ViewPreferences
-    from zlc_neutral_atom.logic_nodes.calibration.analysis import (
+    from zlc_neutral_atom.logic_nodes.readout.calibration.analysis import (
         CalibrationComputation,
         CalibrationReport,
     )
-    from zlc_neutral_atom.logic_nodes.calibration.repository import (
+    from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
         CalibrationRepository,
     )
-    from zlc_neutral_atom.logic_nodes.occupancy.processor import ResolvedOccupancy
-    from zlc_neutral_atom.logic_nodes.occupancy.repository import OccupancyRepository
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import ResolvedOccupancy
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.repository import OccupancyRepository
     from zlc_neutral_atom.logic_nodes.pulse_scan.repository import (
         ScanArtifact,
         ScanRepository,
@@ -224,6 +213,14 @@ if TYPE_CHECKING:
 
 
 _DEFAULT_FIT_GUI_TIMEOUT_SECONDS = 30.0
+
+
+def _load_project_pulse(value: PulseDocument | str | Path) -> PulseDocument:
+    """Resolve one operator-authored pulse against the project catalog."""
+
+    if isinstance(value, PulseDocument):
+        return value
+    return load_pulse_document(resolve_under_project(value))
 
 
 class _ResourceCleanupError(RuntimeError):
@@ -306,6 +303,7 @@ class _ExperimentServices:
     fit_repository: FitResultRepository
     catalog: DeviceCatalogView
     sitemap_profiles: Mapping[str, SitemapAcquisitionProfile]
+    camera_signal_association_authorities: Mapping[str, object]
     installation_config: InstallationConfigDocument
     pulse_application: PulseApplicationOwner
     operation_lock: threading.RLock
@@ -375,7 +373,7 @@ def _calibration_repository(
 ) -> "CalibrationRepository":
     repository = services.calibration_repository
     if repository is None:
-        from zlc_neutral_atom.logic_nodes.calibration.repository import (
+        from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
             CalibrationRepository,
         )
 
@@ -384,61 +382,28 @@ def _calibration_repository(
     return repository
 
 
+def _render_calibration_report(view):
+    """Composition seam from Calibration's physical projection to frontend pixels."""
+
+    from zlc_neutral_atom.logic_nodes.readout.calibration.ui.report_render import (
+        render_calibration_report,
+    )
+
+    return render_calibration_report(view)
+
+
 def _occupancy_repository(
     services: _ExperimentServices,
 ) -> "OccupancyRepository":
     repository = services.occupancy_repository
     if repository is None:
-        from zlc_neutral_atom.logic_nodes.occupancy.repository import (
+        from zlc_neutral_atom.logic_nodes.readout.occupancy.repository import (
             OccupancyRepository,
         )
 
         repository = OccupancyRepository(services.occupancy_repository_path)
         services.occupancy_repository = repository
     return repository
-
-
-def _exact_occupancy_cell_view(source: ExactOccupancyCellSource):
-    """Compose neutral-admitted physical facts into one frontend SiteMap value."""
-
-    from zlc_frontend.site_map_render import build_occupancy_cell_view
-
-    if not isinstance(source, ExactOccupancyCellSource):
-        raise TypeError("source must be ExactOccupancyCellSource")
-    domain = source.domain
-    site_map = domain.site_map
-    metadata = source.frame_metadata
-    address = source.address
-    summary = (
-        f"{domain.artifact_identity} | "
-        f"source={domain.source_capture_identity} | "
-        f"calibration={domain.calibration_identity}\n"
-        f"model={domain.model_kind.value} | "
-        f"revision={domain.occupancy_ref.revision.value} | "
-        f"generation={domain.generation.value} | "
-        f"address=({address.repeat_index}, {address.point_storage_index}) | "
-        f"logical_point={source.logical_point}\n"
-        f"frame ordinal={metadata.source_ordinal} | "
-        f"frame_stamp={metadata.frame_stamp} | "
-        f"camera_stamp={metadata.camera_stamp} | "
-        f"captured_at={metadata.captured_at:.9f}s | "
-        f"correlation={metadata.correlation_id}"
-    )
-    return build_occupancy_cell_view(
-        source.image,
-        domain.source_ref,
-        source.occupied,
-        domain.occupancy_ref,
-        source.selection,
-        site_axis=site_map.site_axis,
-        coordinate_frame=site_map.coordinate_frame,
-        centers_xy=site_map.coordinates_xy,
-        calibration_site_validity=site_map.validity.mask,
-        calibration_identity=domain.calibration_identity,
-        run_id=domain.run_id,
-        provenance_epoch_id=domain.provenance_epoch_id,
-        summary=summary,
-    )
 
 
 class PulseFacade:
@@ -466,7 +431,6 @@ class PulseFacade:
                 capability.manifest,
                 capability.clock_hz,
                 capability.geometry_fingerprint,
-                capability.resident_scan_point_capacity,
             )
 
     def request(
@@ -619,6 +583,7 @@ class ReadoutFacade:
         repeat: int = DEFAULT_CAMERA_MEASUREMENT_REPEAT,
         history_cycles: int = DEFAULT_CAMERA_MONITOR_HISTORY_CYCLES,
         frames_per_cycle: int = DEFAULT_CAMERA_FRAMES_PER_CYCLE,
+        exposure: float | None = None,
     ) -> CameraMeasurementRequest:
         """Freeze Main's one Camera semantic: 0=live, K=finite."""
 
@@ -630,6 +595,7 @@ class ReadoutFacade:
                 repeat=repeat,
                 history_cycles=history_cycles,
                 frames_per_cycle=frames_per_cycle,
+                exposure_seconds=exposure,
             )
 
     def prepare_camera_measurement(
@@ -668,11 +634,7 @@ class ReadoutFacade:
         within_point_grouping: tuple[tuple[int, int], ...] | None = None,
     ) -> CaptureRequest:
         with _service_guard(self._services) as services:
-            document = (
-                pulse
-                if isinstance(pulse, PulseDocument)
-                else load_pulse_document(pulse)
-            )
+            document = _load_project_pulse(pulse)
             camera_role = self._resolve_camera_role(services, camera_role)
             return CaptureRequest(
                 document,
@@ -720,11 +682,7 @@ class ReadoutFacade:
         """Freeze the autonomous two-readout temperature Measurement."""
 
         with _service_guard(self._services) as services:
-            document = (
-                pulse
-                if isinstance(pulse, PulseDocument)
-                else load_pulse_document(pulse)
-            )
+            document = _load_project_pulse(pulse)
             camera = self._resolve_camera_role(services, camera_role)
             sequencer = _resolve_role(
                 services.catalog,
@@ -795,11 +753,7 @@ class ReadoutFacade:
         """Freeze one camera-rearmed API-slot duration sweep."""
 
         with _service_guard(self._services) as services:
-            document = (
-                pulse
-                if isinstance(pulse, PulseDocument)
-                else load_pulse_document(pulse)
-            )
+            document = _load_project_pulse(pulse)
             camera = self._resolve_camera_role(services, camera_role)
             sequencer = _resolve_role(
                 services.catalog,
@@ -872,11 +826,7 @@ class ReadoutFacade:
         """Freeze grey-molasses intent without inventing a missing RF Port."""
 
         with _service_guard(self._services) as services:
-            document = (
-                pulse
-                if isinstance(pulse, PulseDocument)
-                else load_pulse_document(pulse)
-            )
+            document = _load_project_pulse(pulse)
             camera = self._resolve_camera_role(services, camera_role)
             sequencer = _resolve_role(
                 services.catalog,
@@ -940,265 +890,19 @@ class ReadoutFacade:
         with _service_guard(self._services) as services:
             return services.capture_repository.materialize_final(reference)
 
-    def scan_request(
-        self,
-        pulse: PulseDocument | str | Path,
-        *,
-        camera_role: str | None = None,
-        sequencer_role: str | None = None,
-        trigger_channel: str | None = None,
-        api_values: Mapping[str, int | float] | None = None,
-        output_transform_spec: DataTransformSpec | None = None,
-    ) -> ScanRequest:
-        """Build one direct-camera autonomous SCAN_SLOT request.
-
-        The PulseDocument's frozen table is the only slot-value truth.
-        API-slot scans use :meth:`api_scan_request`; direct SCAN_SLOT execution
-        stays on the autonomous streamed scan path.
-        """
-
-        with _service_guard(self._services) as services:
-            document = (
-                pulse
-                if isinstance(pulse, PulseDocument)
-                else load_pulse_document(pulse)
-            )
-            program = AutonomousScanSlotProgram.from_api_values(
-                document,
-                api_values,
-            )
-            camera_role = self._resolve_camera_role(services, camera_role)
-            return ScanRequest(
-                program=program,
-                camera_ref=services.catalog.require(camera_role).ref,
-                sequencer_ref=services.catalog.require(
-                    _resolve_role(
-                        services.catalog,
-                        sequencer_role,
-                        "sequencer",
-                        ("sequencer",),
-                    )
-                ).ref,
-                trigger_channel=trigger_channel,
-                output_transform_spec=output_transform_spec,
-            )
-
-    def scan(self, pulse: PulseDocument | str | Path, **kwargs) -> ScanArtifactRef:
-        return _run_scan(self._services, self.scan_request(pulse, **kwargs))
-
-    def start_scan(self, pulse: PulseDocument | str | Path, **kwargs) -> RunHandle:
-        return _start_scan(self._services, self.scan_request(pulse, **kwargs))
-
-    def api_scan_request(
-        self,
-        pulse: PulseDocument | str | Path,
-        *,
-        api_table: ApiSegmentTable,
-        segmentation_rationale: str,
-        camera_role: str | None = None,
-        sequencer_role: str | None = None,
-        trigger_channel: str | None = None,
-        output_transform_spec: DataTransformSpec | None = None,
-    ) -> ScanRequest:
-        """Build the accepted finite API_SLOT segmented exception explicitly."""
-
-        with _service_guard(self._services) as services:
-            document = (
-                pulse
-                if isinstance(pulse, PulseDocument)
-                else load_pulse_document(pulse)
-            )
-            program = ApiSlotSegmentedProgram(
-                document,
-                api_table,
-                segmentation_rationale,
-            )
-            camera_role = self._resolve_camera_role(services, camera_role)
-            sequencer_role = _resolve_role(
-                services.catalog,
-                sequencer_role,
-                "sequencer",
-                ("sequencer",),
-            )
-            return ScanRequest(
-                program=program,
-                camera_ref=services.catalog.require(camera_role).ref,
-                sequencer_ref=services.catalog.require(sequencer_role).ref,
-                trigger_channel=trigger_channel,
-                output_transform_spec=output_transform_spec,
-            )
-
-    def api_scan(self, pulse: PulseDocument | str | Path, **kwargs) -> ScanArtifactRef:
-        return _run_scan(self._services, self.api_scan_request(pulse, **kwargs))
-
-    def start_api_scan(
-        self,
-        pulse: PulseDocument | str | Path,
-        **kwargs,
-    ) -> RunHandle:
-        return _start_scan(self._services, self.api_scan_request(pulse, **kwargs))
-
-    def occupancy_scan_request(
-        self,
-        pulse: PulseDocument | str | Path,
-        *,
-        calibration_ref: CalibrationArtifactRef,
-        model_kind: ReadoutModelKind | None = None,
-        output_name: str = "counts",
-        camera_role: str | None = None,
-        sequencer_role: str | None = None,
-        trigger_channel: str | None = None,
-        api_values: Mapping[str, int | float] | None = None,
-        output_transform_spec: DataTransformSpec | None = None,
-    ) -> OccupancyScanRequest:
-        """Build the first external Measurement→Processor SCAN_SLOT request."""
-
-        with _service_guard(self._services) as services:
-            document = (
-                pulse
-                if isinstance(pulse, PulseDocument)
-                else load_pulse_document(pulse)
-            )
-            program = AutonomousScanSlotProgram.from_api_values(
-                document,
-                api_values,
-            )
-            camera_role = self._resolve_camera_role(services, camera_role)
-            sequencer_role = _resolve_role(
-                services.catalog,
-                sequencer_role,
-                "sequencer",
-                ("sequencer",),
-            )
-            return OccupancyScanRequest(
-                program=program,
-                camera_ref=services.catalog.require(camera_role).ref,
-                sequencer_ref=services.catalog.require(sequencer_role).ref,
-                calibration_ref=calibration_ref,
-                model_kind=model_kind,
-                output_name=output_name,
-                trigger_channel=trigger_channel,
-                output_transform_spec=output_transform_spec,
-            )
-
-    def occupancy_scan(
-        self,
-        pulse: PulseDocument | str | Path,
-        **kwargs,
-    ) -> ScanArtifactRef:
-        return _run_scan(
-            self._services,
-            self.occupancy_scan_request(pulse, **kwargs),
-        )
-
-    def start_occupancy_scan(
-        self,
-        pulse: PulseDocument | str | Path,
-        **kwargs,
-    ) -> RunHandle:
-        return _start_scan(
-            self._services,
-            self.occupancy_scan_request(pulse, **kwargs),
-        )
-
-    def api_occupancy_scan_request(
-        self,
-        pulse: PulseDocument | str | Path,
-        *,
-        api_table: ApiSegmentTable,
-        segmentation_rationale: str,
-        calibration_ref: CalibrationArtifactRef,
-        model_kind: ReadoutModelKind | None = None,
-        output_name: str = "counts",
-        camera_role: str | None = None,
-        sequencer_role: str | None = None,
-        trigger_channel: str | None = None,
-        output_transform_spec: DataTransformSpec | None = None,
-    ) -> OccupancyScanRequest:
-        with _service_guard(self._services) as services:
-            document = (
-                pulse
-                if isinstance(pulse, PulseDocument)
-                else load_pulse_document(pulse)
-            )
-            program = ApiSlotSegmentedProgram(
-                document,
-                api_table,
-                segmentation_rationale,
-            )
-            camera_role = self._resolve_camera_role(services, camera_role)
-            sequencer_role = _resolve_role(
-                services.catalog,
-                sequencer_role,
-                "sequencer",
-                ("sequencer",),
-            )
-            return OccupancyScanRequest(
-                program=program,
-                camera_ref=services.catalog.require(camera_role).ref,
-                sequencer_ref=services.catalog.require(sequencer_role).ref,
-                calibration_ref=calibration_ref,
-                model_kind=model_kind,
-                output_name=output_name,
-                trigger_channel=trigger_channel,
-                output_transform_spec=output_transform_spec,
-            )
-
-    def api_occupancy_scan(
-        self,
-        pulse: PulseDocument | str | Path,
-        **kwargs,
-    ) -> ScanArtifactRef:
-        return _run_scan(
-            self._services,
-            self.api_occupancy_scan_request(pulse, **kwargs),
-        )
-
-    def start_api_occupancy_scan(
-        self,
-        pulse: PulseDocument | str | Path,
-        **kwargs,
-    ) -> RunHandle:
-        return _start_scan(
-            self._services,
-            self.api_occupancy_scan_request(pulse, **kwargs),
-        )
-
-    def prepare_scan(self, request: ScanRequest) -> PreparedExactScan:
-        """Bind one frozen direct Camera scan to its closed application command."""
-
-        if not isinstance(request, ScanRequest):
-            raise TypeError("request must be ScanRequest")
-        with _service_guard(self._services) as services:
-            return _prepare_scan_for_services(services, request)
-
-    def prepare_occupancy_scan(
-        self,
-        request: OccupancyScanRequest,
-    ) -> PreparedExactScan:
-        """Bind a frozen Occupancy scan to its progressive application port."""
-
-        if not isinstance(request, OccupancyScanRequest):
-            raise TypeError("request must be OccupancyScanRequest")
-        with _service_guard(self._services) as services:
-            return _prepare_scan_for_services(services, request)
-
     def prepare_scan_source(
         self,
-        program: PulseScanProgram,
-        source: ScanSourceBinding,
+        request: PulseScanBoundRequest,
+        source: SignalEventSource,
         *,
         sequencer_role: str | None = None,
-        trigger_channel: str | None = None,
     ) -> PreparedExactScan:
-        """Bind one canonical scan program to one typed physical y source.
+        """Contribute only the installed sequencer to source-neutral PulseScan."""
 
-        The caller resolves only which producer/output the operator selected.
-        Camera cardinality, Occupancy calibration/model semantics and
-        authoritative transforms are already owned by ``ScanSourceBinding``;
-        this installation boundary contributes only the sequencer identity.
-        """
-
+        if not isinstance(request, PulseScanBoundRequest):
+            raise TypeError("request must be PulseScanBoundRequest")
+        if not isinstance(source, SignalEventSource):
+            raise TypeError("source must implement SignalEventSource")
         with _service_guard(self._services) as services:
             sequencer = _resolve_role(
                 services.catalog,
@@ -1207,18 +911,13 @@ class ReadoutFacade:
                 ("sequencer",),
             )
             sequencer_ref = services.catalog.require(sequencer).ref
-        request = build_scan_request(
-            program,
-            source,
-            sequencer_ref=sequencer_ref,
-            trigger_channel=trigger_channel,
-        )
-        self._require_binding(ReadoutBindingKey(request.camera_ref.role))
-        if isinstance(request, ScanRequest):
-            return self.prepare_scan(request)
-        if isinstance(request, OccupancyScanRequest):
-            return self.prepare_occupancy_scan(request)
-        raise RuntimeError("scan source owner returned an unknown request type")
+            return prepare_exact_scan(
+                request,
+                source,
+                pulse_port=services.runtime.pulse_port(sequencer_ref),
+                repository=services.scan_repository,
+                start_run=services.runtime.start,
+            )
 
     def load_scan(self, reference: ScanArtifactRef) -> "ScanArtifact":
         with _service_guard(self._services) as services:
@@ -1251,11 +950,7 @@ class ReadoutFacade:
     ) -> MotFieldRequest:
         """Freeze one three-axis autonomous MOT scan and its ROI analysis."""
 
-        document = (
-            pulse
-            if isinstance(pulse, PulseDocument)
-            else load_pulse_document(pulse)
-        )
+        document = _load_project_pulse(pulse)
         program = build_mot_scan_program(
             document,
             center_x=center_x,
@@ -1298,18 +993,20 @@ class ReadoutFacade:
                 trigger_channel=trigger_channel,
             )
 
-    def prepare_mot_field_scan(
+    def prepare_mot_field_acquisition(
         self,
         request: MotFieldRequest,
-    ) -> PreparedExactScan:
-        """Bind one MOT request to the exact-scan preview/start application port."""
+    ) -> PreparedMotFieldAcquisition:
+        """Bind the MOT-owned coupled Camera + autonomous pulse acquisition."""
 
         if not isinstance(request, MotFieldRequest):
             raise TypeError("request must be MotFieldRequest")
         with _service_guard(self._services) as services:
-            return _prepare_scan_for_services(
-                services,
-                request.as_scan_request(),
+            return prepare_mot_field_acquisition(
+                request,
+                pulse_port=services.runtime.pulse_port(request.sequencer_ref),
+                camera_port=services.runtime.camera_port(request.camera_ref),
+                start_run=services.runtime.start,
             )
 
     def prepare_mot_field_task(
@@ -1400,13 +1097,7 @@ class ReadoutFacade:
 
         selected_camera, profile = self._sitemap_profile(camera_role)
 
-        selected_pulse = (
-            None
-            if pulse is None
-            else pulse
-            if isinstance(pulse, PulseDocument)
-            else load_pulse_document(Path(pulse).expanduser())
-        )
+        selected_pulse = None if pulse is None else _load_project_pulse(pulse)
         with _service_guard(self._services) as services:
             camera_ref = services.catalog.require(selected_camera).ref
             sequencer_role = _resolve_role(
@@ -1485,7 +1176,7 @@ class ReadoutFacade:
         calibration: CalibrationArtifactRef,
         *,
         folder: str | Path,
-        save_frames: bool,
+        frame_export_policy: str,
         expected_camera_role: str | None = None,
     ) -> None:
         """Persist application-owned task outputs via the bound repositories."""
@@ -1508,12 +1199,13 @@ class ReadoutFacade:
                 source,
                 calibration,
                 folder=folder,
-                save_frames=save_frames,
+                frame_export_policy=frame_export_policy,
                 capture_repository=services.capture_repository,
                 calibration_repository=_calibration_repository(services),
                 expected_camera_role=(
                     None if binding is None else binding.value
                 ),
+                render_report=_render_calibration_report,
             )
 
     def calibration_request(
@@ -1824,7 +1516,11 @@ class ReadoutFacade:
                 ),
             )
             self._require_binding(source.domain.readout_binding)
-            return _exact_occupancy_cell_view(source)
+            from zlc_neutral_atom.logic_nodes.readout.occupancy.ui.view_projection import (
+                build_exact_occupancy_cell_view,
+            )
+
+            return build_exact_occupancy_cell_view(source)
 
     def occupancy_cell_view(
         self,
@@ -1872,35 +1568,15 @@ def _project_notebook_figure(
     preinspected_schema=None,
     preinspected_dataset_ref=None,
 ):
-    """Composition-only ref dispatch; frontend never sees a neutral repository."""
+    """Resolve application artifacts, then delegate all Figure policy."""
 
-    from zlc_frontend.figure import (
-        DatasetDescriptor,
-        DatasetId,
-        FigureDocument,
-        FigureLayer,
-        ResolvedDataset,
-        ResolvedDatasetMap,
-        RepeatViewMode,
-        SuggestionStatus,
-        ViewIntent,
-        ViewPreferences,
-        suggest_fit_view,
-        suggest_view,
+    from zlc_frontend import (
+        FrozenFigureSource,
+        build_frozen_data_figure,
+        build_frozen_figure_document,
     )
 
-    if selection is not None and not isinstance(selection, Selection):
-        raise TypeError("selection must be Selection or None")
-    if intent is not None and not isinstance(intent, ViewIntent):
-        raise TypeError("intent must be ViewIntent or None")
-    if preferences is not None and not isinstance(preferences, ViewPreferences):
-        raise TypeError("preferences must be ViewPreferences or None")
     is_occupancy = isinstance(source, OccupancyArtifactRef)
-    if occupancy_output is not None and occupancy_output not in (
-        "occupied",
-        "counts",
-    ):
-        raise ValueError("occupancy_output must be 'occupied', 'counts', or None")
     if not is_occupancy and occupancy_output is not None:
         raise ValueError("occupancy_output is valid only for OccupancyArtifactRef")
 
@@ -1940,8 +1616,9 @@ def _project_notebook_figure(
     fit_result = draft_fit_result
     snapshot = preloaded_snapshot
     source_final = None
-    selected_occupancy_output = None
+    occupancy_projection = None
     source_label = "capture"
+    source_dataset_ref = None
     if draft_fit_result is not None:
         if not isinstance(source, (CaptureArtifactRef, ScanArtifactRef)):
             raise TypeError(
@@ -1952,32 +1629,31 @@ def _project_notebook_figure(
         source_label = "scan"
         source_ref = source
     elif is_occupancy:
-        selected_occupancy_output = (
-            "occupied" if occupancy_output is None else occupancy_output
+        from zlc_neutral_atom.logic_nodes.readout.occupancy.ui.view_projection import (
+            project_occupancy_figure,
         )
-        repository = _occupancy_repository(services)
-        resolved = repository.admit(
+
+        resolved_occupancy = _occupancy_repository(services).admit(
             source,
             services.capture_repository,
             _calibration_repository(services),
         )
-        artifact = resolved.artifact
-        selected_block = (
-            artifact.occupied
-            if selected_occupancy_output == "occupied"
-            else artifact.counts
+        occupancy_projection = project_occupancy_figure(
+            resolved_occupancy,
+            output=occupancy_output,
+            materialize=materialize,
         )
-        schema = selected_block.schema
-        model_kind = artifact.model_kind
-        if materialize:
-            snapshot = (
-                artifact.occupied_snapshot
-                if selected_occupancy_output == "occupied"
-                else artifact.counts_snapshot
-            )
-        del selected_block, artifact, resolved
-        source_label = (
-            f"occupancy {selected_occupancy_output} | {model_kind.value}"
+        schema = occupancy_projection.schema
+        snapshot = occupancy_projection.snapshot
+        source_label = occupancy_projection.label
+        selected_output = "occupied" if occupancy_output is None else occupancy_output
+        selected_block = (
+            resolved_occupancy.artifact.occupied
+            if selected_output == "occupied"
+            else resolved_occupancy.artifact.counts
+        )
+        source_dataset_ref = selected_block.ref(
+            resolved_occupancy.artifact.generation
         )
         source_ref = None
     elif isinstance(source, CaptureArtifactRef):
@@ -2034,93 +1710,54 @@ def _project_notebook_figure(
                 source_dataset_ref = snapshot.ref
         else:
             raise TypeError("fit source artifact kind is not current")
-    if fit_result is not None:
-        validate_fit_result_source_binding(
-            fit_result,
-            source_dataset_ref,
-            schema,
-        )
-    if fit_result is None:
-        if intent is None:
-            roles = {
-                axis.role
-                for axis in (
-                    schema.repeat_axis,
-                    *schema.point_axes,
-                    *schema.cell_schema.data_axes,
-                )
-            }
-            if selected_occupancy_output == "occupied":
-                if roles.intersection((SCAN_POINT, SPECTRAL, MONITOR_HISTORY)):
-                    resolved_intent = ViewIntent.CURVE
-                else:
-                    resolved_intent = ViewIntent.METER
-            elif SPATIAL_X in roles and SPATIAL_Y in roles:
-                resolved_intent = ViewIntent.IMAGE
-            elif roles.intersection((SCAN_POINT, SPECTRAL, MONITOR_HISTORY)):
-                resolved_intent = ViewIntent.CURVE
-            else:
-                resolved_intent = ViewIntent.HISTOGRAM
-        else:
-            resolved_intent = intent
-        resolved_preferences = preferences
-        if (
-            selected_occupancy_output == "occupied"
-            and resolved_intent is ViewIntent.METER
-            and (preferences is None or preferences.repeat_mode is None)
-        ):
-            resolved_preferences = replace(
-                ViewPreferences() if preferences is None else preferences,
-                repeat_mode=RepeatViewMode.MEAN,
-            )
-        suggestion = suggest_view(
-            schema,
+    if snapshot is None and source_ref is not None:
+        if materialize:
+            if source_final is None:
+                raise RuntimeError("figure FINAL source is unavailable")
+            if isinstance(source_ref, CaptureArtifactRef):
+                snapshot = source_final.materialize_snapshot()
+            elif isinstance(source_ref, ScanArtifactRef):
+                snapshot = services.scan_repository.materialize(source_ref).snapshot
+            else:  # pragma: no cover - source kind is closed above
+                raise TypeError("fit source artifact kind is not current")
+    if source_dataset_ref is None:
+        raise RuntimeError("figure source Dataset identity is unavailable")
+
+    resolved_intent = intent
+    resolved_preferences = preferences
+    if fit_result is None and occupancy_projection is not None:
+        if resolved_intent is None:
+            resolved_intent = occupancy_projection.default_intent
+        resolved_preferences = occupancy_projection.resolve_preferences(
             resolved_intent,
-            selection,
             resolved_preferences,
         )
-        label = source_label
-    else:
-        suggestion = suggest_fit_view(
-            schema,
-            fit_result,
-            selection,
-            preferences,
-        )
-        if suggestion.spec is not None and intent not in (None, suggestion.spec.intent):
-            raise ValueError("requested figure intent is incompatible with the fitted axes")
-        label = f"fit: {fit_result.spec.model_id}"
-    if suggestion.status is SuggestionStatus.NEEDS_INPUT:
-        details = "; ".join(reason.message for reason in suggestion.reasons)
-        raise ValueError(f"figure view needs explicit input: {details}")
-    assert suggestion.spec is not None
-
-    dataset_id = DatasetId("source")
-    document = FigureDocument(
-        document_id=f"notebook-{uuid4().hex}",
-        revision=0,
-        datasets=(DatasetDescriptor(dataset_id, label, schema.fingerprint),),
-        layers=(FigureLayer("data", dataset_id, suggestion.spec),),
+    frontend_source = FrozenFigureSource(
+        label=(
+            source_label
+            if fit_result is None
+            else f"fit: {fit_result.spec.model_id}"
+        ),
+        schema=schema,
+        ref=source_dataset_ref,
+        snapshot=snapshot,
+        fit_result=fit_result,
     )
     if not materialize:
+        document = build_frozen_figure_document(
+            frontend_source,
+            intent=resolved_intent,
+            selection=selection,
+            preferences=resolved_preferences,
+        )
         return document, None, fit_result
-    if snapshot is None and source_ref is not None:
-        if source_final is None:
-            raise RuntimeError("figure FINAL source is unavailable")
-        del schema, suggestion
-        if isinstance(source_ref, CaptureArtifactRef):
-            snapshot = source_final.materialize_snapshot()
-        elif isinstance(source_ref, ScanArtifactRef):
-            snapshot = services.scan_repository.materialize(source_ref).snapshot
-        else:  # pragma: no cover - source kind is closed above
-            raise TypeError("fit source artifact kind is not current")
-    if snapshot is None:
-        raise RuntimeError("figure source was not materialized")
-    return (
-        document,
-        ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
-        fit_result,
+    figure = build_frozen_data_figure(
+        frontend_source,
+        intent=resolved_intent,
+        selection=selection,
+        preferences=resolved_preferences,
     )
+    return figure.document, figure, fit_result
 
 
 def _data_figure_for_services(
@@ -2136,7 +1773,7 @@ def _data_figure_for_services(
 ) -> "DataFigure":
     """Build one frozen DataFigure while repository authority stays private."""
 
-    document, datasets, fit_result = _project_notebook_figure(
+    _document, figure, _fit_result = _project_notebook_figure(
         services,
         source,
         intent=intent,
@@ -2147,14 +1784,9 @@ def _data_figure_for_services(
         draft_fit_result=draft_fit_result,
         preloaded_snapshot=preloaded_snapshot,
     )
-    assert datasets is not None
-    from zlc_frontend import DataFigure
-
-    return DataFigure(
-        document,
-        datasets,
-        fit_results=({"data": fit_result} if fit_result is not None else None),
-    )
+    if figure is None:
+        raise RuntimeError("frozen Figure source was not materialized")
+    return figure
 
 
 class Experiment:
@@ -2203,13 +1835,6 @@ class Experiment:
         from Zou_lab_control.workbench import open_pulse_editor
 
         return open_pulse_editor(self, document=document, path=path)
-
-    def scan_gui(self, request: ScanRequest | OccupancyScanRequest):
-        """Open the current typed SCAN_SLOT panel for a frozen request."""
-
-        from Zou_lab_control.workbench import open_scan_workbench
-
-        return open_scan_workbench(self, request)
 
     def task_console(self, *, task=None, state=None, **kwargs):
         """Lazily open the task console bound to this experiment.
@@ -2290,22 +1915,6 @@ class Experiment:
     def inspect(self, request: CaptureRequest) -> PlanDescriptor:
         with _service_guard(self._services) as services:
             return _prepare_capture_for_services(services, request).descriptor
-
-    def start_scan(
-        self,
-        request: ScanRequest | OccupancyScanRequest,
-    ) -> RunHandle:
-        return _start_scan(self._services, request)
-
-    def scan(
-        self,
-        request: ScanRequest | OccupancyScanRequest,
-    ) -> ScanArtifactRef:
-        return _run_scan(self._services, request)
-
-    def inspect_scan(self, request: ScanRequest) -> PlanDescriptor:
-        with _service_guard(self._services) as services:
-            return _prepare_scan_for_services(services, request).descriptor
 
     def fit(
         self,
@@ -2556,7 +2165,15 @@ class Experiment:
                 raise ValueError("saved Fit reopened against another source artifact")
             return admitted.result
 
-        figure_factory = self.figure
+        def figure_factory(source, *, intent, selection, preferences):
+            return self.figure(
+                source,
+                intent=intent,
+                selection=selection,
+                preferences=preferences,
+                occupancy_output=occupancy_output,
+            )
+
         if direct_fit_single_panel:
             if display_source != fit_source:
                 raise ValueError(
@@ -2569,7 +2186,6 @@ class Experiment:
                 intent,
                 selection,
                 preferences,
-                occupancy_output=None,
             ):
                 """Resolve the labelled display cell on the Figure worker."""
 
@@ -2593,7 +2209,7 @@ class Experiment:
                             intent=intent,
                             selection=selection,
                             preferences=preferences,
-                            occupancy_output=occupancy_output,
+                            occupancy_output=None,
                             materialize=False,
                             preinspected_schema=schema,
                             preinspected_dataset_ref=dataset_ref,
@@ -2617,7 +2233,7 @@ class Experiment:
                         intent=intent,
                         selection=display_selection,
                         preferences=display_preferences,
-                        occupancy_output=occupancy_output,
+                        occupancy_output=None,
                     )
 
         from Zou_lab_control.workbench import open_figure_workbench
@@ -2628,7 +2244,6 @@ class Experiment:
             intent=intent,
             selection=selection,
             preferences=preferences,
-            occupancy_output=occupancy_output,
             fit_preparer=prepare_fit,
             fit_executor=execute_fit,
             fit_saver=save_fit_execution,
@@ -2976,13 +2591,22 @@ class Experiment:
             if isinstance(source, FitResultArtifactRef)
             else None
         )
+
+        def figure_factory(current_source, *, intent, selection, preferences):
+            return self.figure(
+                current_source,
+                intent=intent,
+                selection=selection,
+                preferences=preferences,
+                occupancy_output=occupancy_output,
+            )
+
         return open_figure_workbench(
-            self.figure,
+            figure_factory,
             source,
             intent=intent,
             selection=selection,
             preferences=preferences,
-            occupancy_output=occupancy_output,
             initial_fit_result_identity=initial_identity,
         )
 
@@ -3094,30 +2718,6 @@ def _prepare_capture_for_services(
     )
 
 
-def _prepare_scan_for_services(
-    services: _ExperimentServices,
-    request: ScanRequest | OccupancyScanRequest,
-) -> PreparedExactScan:
-    """Resolve installation dependencies and invoke the scan application owner."""
-
-    if not isinstance(request, (ScanRequest, OccupancyScanRequest)):
-        raise TypeError("request must be a current scan request")
-    calibration = None
-    if isinstance(request, OccupancyScanRequest):
-        calibration = _calibration_repository(services).admit(
-            request.calibration_ref,
-            services.capture_repository,
-        )
-    return prepare_exact_scan(
-        request,
-        pulse_port=services.runtime.pulse_port(request.sequencer_ref),
-        camera_port=services.runtime.camera_port(request.camera_ref),
-        repository=services.scan_repository,
-        start_run=services.runtime.start,
-        calibration=calibration,
-    )
-
-
 def _prepare_temperature_release_recapture_for_services(
     services: _ExperimentServices,
     request: TemperatureReleaseRecaptureRequest,
@@ -3194,6 +2794,11 @@ def _prepare_camera_measurement_for_services(
             request,
             monitor_port=services.runtime.camera_monitor_port(request.camera_ref),
             start_run=services.runtime.start,
+            association_authority=(
+                services.camera_signal_association_authorities.get(
+                    request.camera_ref.role
+                )
+            ),
         )
     return prepare_finite_camera_measurement(
         request,
@@ -3242,27 +2847,6 @@ def _run(services: _ExperimentServices, request: CaptureRequest) -> CaptureArtif
         handle = _prepare_capture_for_services(guarded, request).start()
         runtime = guarded.runtime
     return runtime.wait(handle)
-
-
-def _start_scan(
-    services: _ExperimentServices,
-    request: ScanRequest | OccupancyScanRequest,
-) -> RunHandle:
-    with _service_guard(services) as guarded:
-        return _prepare_scan_for_services(guarded, request).start()
-
-
-def _run_scan(
-    services: _ExperimentServices,
-    request: ScanRequest | OccupancyScanRequest,
-) -> ScanArtifactRef:
-    with _service_guard(services) as guarded:
-        handle = _prepare_scan_for_services(guarded, request).start()
-        runtime = guarded.runtime
-    result = runtime.wait(handle)
-    if not isinstance(result, ScanArtifactRef):
-        raise TypeError("scan Run returned a non-scan artifact ref")
-    return result
 
 
 def _prepare_calibration_for_services(
@@ -3393,7 +2977,7 @@ def connect(
 
         scan_repository = ScanRepository(repository_root / "scans")
         fit_repository = FitResultRepository(repository_root / "fits")
-        from zlc_neutral_atom.bootstrap._installation import create_installation
+        from zlc_neutral_atom.installation_dispatch import create_installation
 
         installation = create_installation(
             installation_document,
@@ -3428,6 +3012,9 @@ def connect(
             fit_repository=fit_repository,
             catalog=catalog,
             sitemap_profiles=MappingProxyType(sitemap_profiles),
+            camera_signal_association_authorities=MappingProxyType(
+                dict(installation.camera_signal_association_authorities)
+            ),
             installation_config=installation_document,
             pulse_application=PulseApplicationOwner(),
             operation_lock=threading.RLock(),
@@ -3512,7 +3099,6 @@ __all__ = [
     "MaterializedScanData",
     "MotFieldRequest",
     "MotFieldResult",
-    "OccupancyScanRequest",
     "OccupancyArtifactRef",
     "PlanDescriptor",
     "PreparedPulseExecution",
@@ -3527,7 +3113,6 @@ __all__ = [
     "ReadoutModelKind",
     "ScanArtifactRef",
     "ScanPointTable",
-    "ScanRequest",
     "SitemapCalibrationRequest",
     "SitemapCalibrationFailed",
     "SitemapCalibrationInterrupted",

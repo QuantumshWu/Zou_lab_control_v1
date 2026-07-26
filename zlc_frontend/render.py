@@ -3,7 +3,7 @@
 The renderer may use Matplotlib, Qt, or neither, but the worker/GUI boundary is
 always an immutable :class:`BoardFrame`.  No live Figure, Artist, mutable or
 aliased ndarray view, or QImage storage crosses this module's boundary.  The
-exact image, curve, and calibrated site-map interaction payloads are allowed
+exact image, curve, and typed site-map interaction payloads are allowed
 because their evaluated arrays are intrinsically backed by owned immutable
 bytes.
 """
@@ -901,7 +901,7 @@ class MeterPanelPayload:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class SiteMapPanelPayload:
-    """One IMAGE background plus calibrated sites and optional occupancy state.
+    """One IMAGE background plus declared sites and optional boolean state.
 
     Site coordinates carry an explicit frame and are never inferred from array
     shape.  Site state and background remain distinct evaluated inputs so a
@@ -913,10 +913,11 @@ class SiteMapPanelPayload:
     site_axis: AxisSpec
     coordinate_frame: CoordinateFrameId
     centers_xy: np.ndarray
-    occupied: np.ndarray | None
+    site_state: np.ndarray | None
     site_validity: np.ndarray
-    calibration_identity: str
+    site_geometry_identity: str
     view_identity: str
+    coherence_identity: str
     _geometry_identity: str = field(init=False, repr=False)
     _join_key_digest: str = field(init=False, repr=False)
 
@@ -942,12 +943,12 @@ class SiteMapPanelPayload:
             )
 
         site_count = self.site_axis.size
-        occupancy_present = self.occupied is not None
-        centers, occupied, validity = immutable_site_state(
+        state_present = self.site_state is not None
+        centers, site_state, validity = immutable_site_state(
             self.centers_xy,
             (
-                self.occupied
-                if occupancy_present
+                self.site_state
+                if state_present
                 else np.zeros(site_count, dtype=np.bool_)
             ),
             self.site_validity,
@@ -966,22 +967,31 @@ class SiteMapPanelPayload:
         object.__setattr__(self, "centers_xy", centers)
         object.__setattr__(
             self,
-            "occupied",
-            occupied if occupancy_present else None,
+            "site_state",
+            site_state if state_present else None,
         )
         object.__setattr__(self, "site_validity", validity)
-        calibration_identity = _text(
-            self.calibration_identity,
-            "site-map calibration_identity",
+        geometry_source_identity = _text(
+            self.site_geometry_identity,
+            "site-map site_geometry_identity",
         )
         view_identity = _text(self.view_identity, "site-map view_identity")
-        object.__setattr__(self, "calibration_identity", calibration_identity)
+        coherence_identity = _text(
+            self.coherence_identity,
+            "site-map coherence_identity",
+        )
+        object.__setattr__(
+            self,
+            "site_geometry_identity",
+            geometry_source_identity,
+        )
         object.__setattr__(self, "view_identity", view_identity)
+        object.__setattr__(self, "coherence_identity", coherence_identity)
         axis = self.site_axis
         geometry_identity = canonical_digest(
             {
                 "schema": "zlc_frontend.SiteMapGeometry",
-                "calibration_identity": calibration_identity,
+                "geometry_source_identity": geometry_source_identity,
                 "coordinate_frame": self.coordinate_frame.value,
                 "site_axis": axis_to_tree(axis),
                 "centers_sha256": sha256_digest(memoryview(centers).cast("B")),
@@ -1008,6 +1018,7 @@ class SiteMapPanelPayload:
                 {
                     "schema": "zlc_frontend.SiteMapJoin",
                     "view_identity": view_identity,
+                    "coherence_identity": coherence_identity,
                     "site_state": input_trees["site_state"],
                     "background": input_trees["background"],
                     "geometry_identity": geometry_identity,
@@ -1017,7 +1028,7 @@ class SiteMapPanelPayload:
 
     @property
     def geometry_identity(self) -> str:
-        """Digest calibration-owned geometry used for hold/topology checks."""
+        """Digest presentation-owned geometry used for hold/topology checks."""
 
         return self._geometry_identity
 
@@ -1169,7 +1180,7 @@ class PanelFrame:
                 if self.coherence_stamp.join_key_digest != payload.join_key_digest:
                     raise ValueError(
                         "site-map coherence digest omits or changes its typed view, "
-                        "inputs, or calibration geometry"
+                        "inputs, or site geometry"
                     )
             if presentations[0].panel_revision != payload_revision:
                 raise ValueError(

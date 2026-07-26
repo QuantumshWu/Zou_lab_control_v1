@@ -19,7 +19,7 @@ from zlc_data import (
     ValidityContract,
     ValueSchema,
 )
-from zlc_neutral_atom.logic_nodes.readout_common.physical_context import (
+from zlc_neutral_atom.logic_nodes.readout.physical_context import (
     BusReadoutTrace,
     DigitalReadoutTrace,
     derive_readout_physical_context,
@@ -43,7 +43,7 @@ from zlc_pulse import (
 
 ROOT = Path(__file__).parents[1]
 CLOCK_HZ = 50e6
-IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+IMAGING_TEMPLATE = ROOT / "pulses" / "imaging_template.json"
 
 
 def _axis(name: str, role: str, size: int) -> AxisSpec:

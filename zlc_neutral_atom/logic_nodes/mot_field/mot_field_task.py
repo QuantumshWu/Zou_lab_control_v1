@@ -20,7 +20,17 @@ from typing import Mapping, Protocol
 import numpy as np
 
 from zlc_neutral_atom.dataset_output import FinalDatasetOutput
+from zlc_neutral_atom.logic_node_declaration import (
+    DefaultOutputView,
+    DynamicChoicePresentation,
+    LogicNodeDeclaration,
+    OutputPresentation,
+    PathPresentationHint,
+)
+from zlc_neutral_atom.pulse_catalog import MOT_FIELD_PULSE_PATH
+from zlc_neutral_atom.node_input import bind_no_node_inputs
 from zlc_neutral_atom.authoring import (
+    AuthoringChoice,
     AuthoringField,
     AuthoringSchema,
     MINIMUM_POSITIVE_FLOAT,
@@ -32,27 +42,31 @@ from .mot_field import (
     DEFAULT_MOT_FIELD_ROI_RADIUS_PX,
     DEFAULT_MOT_FIELD_SPAN_CODE,
     MINIMUM_MOT_FIELD_POINTS,
+    MOT_FIELD_FINAL_OUTPUT_DECLARATIONS,
+    MOT_FIELD_TASK_DEFINITION,
+    MotFieldAcquisitionResult,
     MotFieldRequest,
     MotFieldResult,
     analyze_mot_scan,
     mot_field_final_outputs,
 )
+from .mot_field_live import MOT_FIELD_LIVE_OUTPUT_DECLARATIONS
 from .mot_field_task_live import MotFieldTaskLiveOutput
+from .application import (
+    MotFieldAcquisitionHandle,
+    PreparedMotFieldAcquisition,
+)
 from zlc_neutral_atom.runtime._failure import safe_error_summary
 from zlc_neutral_atom.runtime.run import (
     CancelOutcome,
     RunCancelled,
     RunFailed,
-    RunHandle,
     RunId,
     RunStartRejected,
     RunSnapshot,
     RunState,
 )
 from zlc_neutral_atom.runtime.resources import ResourceBusy
-from zlc_neutral_atom.logic_nodes.pulse_scan import ScanArtifactRef
-from zlc_neutral_atom.logic_nodes.pulse_scan.application import PreparedExactScan
-from zlc_neutral_atom.logic_nodes.pulse_scan.repository import MaterializedScanData
 from zlc_storage import (
     canonical_text,
     finite_real,
@@ -63,8 +77,8 @@ from zlc_storage import (
 from zlc_storage.paths import resolve_under_project
 
 
-DEFAULT_MOT_FIELD_REPORT_FOLDER = "mot_field"
-DEFAULT_MOT_FIELD_PULSE_PATH = "pulses/mot_field_template.json"
+DEFAULT_MOT_FIELD_REPORT_FOLDER = "_output/mot_field"
+DEFAULT_MOT_FIELD_PULSE_PATH = MOT_FIELD_PULSE_PATH
 
 
 @dataclass(frozen=True)
@@ -276,13 +290,77 @@ def build_mot_field_intent_from_authoring(
     return MotFieldTaskIntent(**authored)  # type: ignore[arg-type]
 
 
+def _mot_camera_choices(context: object) -> tuple[DynamicChoicePresentation, ...]:
+    if not isinstance(context, tuple):
+        raise TypeError("MOT dynamic choice context must be a role tuple")
+    roles = mot_field_camera_roles(context)
+    return (
+        DynamicChoicePresentation(
+            "camera_role",
+            tuple(AuthoringChoice(role, role) for role in roles),
+            roles[0] if roles else None,
+            "MOT field requires the installed mot_camera role" if not roles else "",
+        ),
+    )
+
+
+MOT_FIELD_LOGIC_NODE = LogicNodeDeclaration(
+    definition=MOT_FIELD_TASK_DEFINITION,
+    description=(
+        "Sweep da_x/da_y/da_z in one autonomous hardware scan, measure "
+        "MOT fluorescence, and report the refined optimum"
+    ),
+    authoring_schema=_MOT_FIELD_AUTHORING_SCHEMA,
+    input_specs=(),
+    outputs=(
+        OutputPresentation(
+            MOT_FIELD_LIVE_OUTPUT_DECLARATIONS[0],
+            "MOT intensity grid",
+            "Counts",
+            "provisional Bx/By/Bz intensity while the scan runs",
+        ),
+        OutputPresentation(
+            MOT_FIELD_FINAL_OUTPUT_DECLARATIONS[0],
+            "MOT field",
+            "Counts",
+            "FINAL optimum and complete three-dimensional intensity grid",
+        ),
+        OutputPresentation(
+            MOT_FIELD_FINAL_OUTPUT_DECLARATIONS[1],
+            "scan",
+            "Signal",
+            "exact raw Camera source scan",
+        ),
+    ),
+    build_request=build_mot_field_intent_from_authoring,
+    bind_request=bind_no_node_inputs,
+    default_views=(
+        DefaultOutputView("grid", "grid"),
+        DefaultOutputView("mot_field", "grid"),
+    ),
+    path_presentations=(
+        PathPresentationHint(
+            "pulse",
+            file_filter="Pulse program (*.json);;All files (*)",
+            base_dir="pulses",
+        ),
+        PathPresentationHint(
+            "folder",
+            mode="dir",
+            base_dir=DEFAULT_MOT_FIELD_REPORT_FOLDER,
+        ),
+    ),
+    resolve_dynamic_choices=_mot_camera_choices,
+)
+
+
 def write_mot_field_report(
     result: MotFieldResult,
     folder: str | Path,
 ) -> Path:
     """Atomically write the authoritative MOT analysis report.
 
-    The exact scan repository remains the owner of camera frames and run
+    The exact acquisition result remains the source of Camera values and run
     lineage.  This derived report preserves the analyzed 3-D intensity block,
     all three physical DAC coordinate axes, and the refined optimum.
     """
@@ -321,30 +399,21 @@ def write_mot_field_report(
     return target
 
 
-class _ScanEnded(Exception):
+class _AcquisitionEnded(Exception):
     def __init__(self, snapshot: RunSnapshot) -> None:
         self.snapshot = snapshot
 
 
-class _CancelledAfterScan(Exception):
+class _CancelledAfterAcquisition(Exception):
     pass
 
 
-class MotFieldScanMaterializer(Protocol):
-    """Typed canonical scan-admission port retained by a prepared MOT task."""
-
-    def materialize_scan(
-        self,
-        reference: ScanArtifactRef,
-    ) -> MaterializedScanData: ...
-
-
-class MotFieldTaskDependencies(MotFieldScanMaterializer, Protocol):
+class MotFieldTaskDependencies(Protocol):
     """Installation-bound semantic port required by the MOT application.
 
     This is deliberately not a bag of callbacks.  One composition service
-    binds the neutral intent to devices, prepares the exact scan command, and
-    admits the resulting canonical scan artifact.
+    binds the neutral intent to devices and prepares the coupled exact
+    Camera + Sequencer command.
     """
 
     def mot_field_request(
@@ -362,16 +431,15 @@ class MotFieldTaskDependencies(MotFieldScanMaterializer, Protocol):
         camera_role: str,
     ) -> MotFieldRequest: ...
 
-    def prepare_mot_field_scan(
+    def prepare_mot_field_acquisition(
         self,
         request: MotFieldRequest,
-    ) -> PreparedExactScan: ...
+    ) -> PreparedMotFieldAcquisition: ...
 
 def _require_dependencies(dependencies) -> MotFieldTaskDependencies:
     for name in (
         "mot_field_request",
-        "prepare_mot_field_scan",
-        "materialize_scan",
+        "prepare_mot_field_acquisition",
     ):
         if not callable(getattr(dependencies, name, None)):
             raise TypeError(
@@ -381,30 +449,21 @@ def _require_dependencies(dependencies) -> MotFieldTaskDependencies:
     return dependencies
 
 
-def _require_materializer(materializer) -> MotFieldScanMaterializer:
-    if not callable(getattr(materializer, "materialize_scan", None)):
-        raise TypeError(
-            "MOT scan materializer must expose materialize_scan()"
-        )
-    return materializer
-
-
 class PreparedMotFieldTask:
     """One-shot, fully bound MOT-field application command.
 
-    Preparation freezes the physical request, exact-scan contract and live
+    Preparation freezes the physical request, exact acquisition and live
     projection before any Run starts.  A frontend may attach ``live_output``
     and then call :meth:`start`; it never assembles scan or analysis stages.
     """
 
     __slots__ = (
+        "_acquisition",
         "_handle",
         "_intent",
         "_live_output",
         "_lock",
-        "_materializer",
         "_request",
-        "_scan",
         "_started",
     )
 
@@ -412,23 +471,21 @@ class PreparedMotFieldTask:
         self,
         intent: MotFieldTaskIntent,
         request: MotFieldRequest,
-        scan: PreparedExactScan,
+        acquisition: PreparedMotFieldAcquisition,
         live_output: MotFieldTaskLiveOutput,
-        materializer: MotFieldScanMaterializer,
     ) -> None:
         if not isinstance(intent, MotFieldTaskIntent):
             raise TypeError("intent must be MotFieldTaskIntent")
         if not isinstance(request, MotFieldRequest):
             raise TypeError("request must be MotFieldRequest")
-        if not isinstance(scan, PreparedExactScan):
-            raise TypeError("scan must be PreparedExactScan")
+        if not isinstance(acquisition, PreparedMotFieldAcquisition):
+            raise TypeError("acquisition must be PreparedMotFieldAcquisition")
         if not isinstance(live_output, MotFieldTaskLiveOutput):
             raise TypeError("live_output must be MotFieldTaskLiveOutput")
         self._intent = intent
         self._request = request
-        self._scan = scan
+        self._acquisition = acquisition
         self._live_output = live_output
-        self._materializer = _require_materializer(materializer)
         self._lock = threading.Lock()
         self._started = False
         self._handle: MotFieldTaskHandle | None = None
@@ -454,9 +511,8 @@ class PreparedMotFieldTask:
                 handle = MotFieldTaskHandle(
                     self._request,
                     report_folder=self._intent.folder,
-                    prepared_scan=self._scan,
+                    prepared_acquisition=self._acquisition,
                     live_output=self._live_output,
-                    materializer=self._materializer,
                 )
             except BaseException as error:
                 self._live_output.fail(f"{type(error).__name__}: {error}")
@@ -475,6 +531,17 @@ class PreparedMotFieldTask:
         if handle is None:
             raise RuntimeError("MOT task has not started")
         return handle.final_dataset_outputs(result)
+
+    def completion_summary(self, result: MotFieldResult) -> str:
+        """Expose the exact report path committed by this successful task."""
+
+        if not isinstance(result, MotFieldResult):
+            raise TypeError("MOT completion result must be MotFieldResult")
+        with self._lock:
+            handle = self._handle
+        if handle is None or handle.report_path is None:
+            raise RuntimeError("MOT task has no committed report path")
+        return f"done; report: {handle.report_path}"
 
 
 def prepare_mot_field_task(
@@ -500,21 +567,19 @@ def prepare_mot_field_task(
     )
     if not isinstance(request, MotFieldRequest):
         raise TypeError("MOT dependency returned a non-MotFieldRequest")
-    scan = dependencies.prepare_mot_field_scan(request)
-    if not isinstance(scan, PreparedExactScan):
-        raise TypeError("MOT dependency returned a non-PreparedExactScan")
+    acquisition = dependencies.prepare_mot_field_acquisition(request)
+    if not isinstance(acquisition, PreparedMotFieldAcquisition):
+        raise TypeError("MOT dependency returned another acquisition type")
     live_output = MotFieldTaskLiveOutput(
         request,
-        scan.source_schema,
-        scan.output_contract,
+        acquisition.source_schema,
     )
     try:
         return PreparedMotFieldTask(
             intent,
             request,
-            scan,
+            acquisition,
             live_output,
-            dependencies,
         )
     except BaseException:
         live_output.close()
@@ -522,37 +587,34 @@ def prepare_mot_field_task(
 
 
 class MotFieldTaskHandle:
-    """Run-like owner of one exact scan followed by MOT analysis/reporting."""
+    """Run-like owner of one exact acquisition and MOT analysis/reporting."""
 
     def __init__(
         self,
         request: MotFieldRequest,
         *,
         report_folder: str | Path,
-        prepared_scan: PreparedExactScan,
+        prepared_acquisition: PreparedMotFieldAcquisition,
         live_output: MotFieldTaskLiveOutput,
-        materializer: MotFieldScanMaterializer,
     ) -> None:
         if not isinstance(request, MotFieldRequest):
             raise TypeError("request must be MotFieldRequest")
-        if not isinstance(prepared_scan, PreparedExactScan):
-            raise TypeError("prepared_scan must be PreparedExactScan")
+        if not isinstance(prepared_acquisition, PreparedMotFieldAcquisition):
+            raise TypeError("prepared_acquisition must be PreparedMotFieldAcquisition")
         if not isinstance(live_output, MotFieldTaskLiveOutput):
             raise TypeError("live_output must be MotFieldTaskLiveOutput")
         self.run_id = RunId(f"mot-field-task-{uuid.uuid4().hex}")
         self._request = request
         self._report_folder = resolve_under_project(report_folder)
-        self._prepared_scan = prepared_scan
+        self._prepared_acquisition = prepared_acquisition
         self._live_output = live_output
-        self._materializer = _require_materializer(materializer)
         self._condition = threading.Condition(threading.RLock())
-        self._active: RunHandle | None = None
-        self._phase = "scan-starting"
+        self._active: MotFieldAcquisitionHandle | None = None
+        self._phase = "acquisition-starting"
         self._cancel_requested = False
         self._cancel_reason = "user requested stop"
         self._terminal: RunSnapshot | None = None
-        self._scan_ref: ScanArtifactRef | None = None
-        self._materialized_scan: MaterializedScanData | None = None
+        self._acquisition_result: MotFieldAcquisitionResult | None = None
         self._result: MotFieldResult | None = None
         self._report_path: Path | None = None
         self._thread = threading.Thread(
@@ -563,9 +625,10 @@ class MotFieldTaskHandle:
         self._thread.start()
 
     @property
-    def source_scan_ref(self) -> ScanArtifactRef | None:
+    def source_identity(self) -> str | None:
         with self._condition:
-            return self._scan_ref
+            source = self._acquisition_result
+            return None if source is None else source.source_identity
 
     @property
     def report_path(self) -> Path | None:
@@ -577,7 +640,7 @@ class MotFieldTaskHandle:
     def _checkpoint(self) -> None:
         with self._condition:
             if self._cancel_requested:
-                raise _CancelledAfterScan
+                raise _CancelledAfterAcquisition
 
     def _finish(
         self,
@@ -610,14 +673,14 @@ class MotFieldTaskHandle:
             self._condition.notify_all()
 
     def _coordinate(self) -> None:
-        child: RunHandle | None = None
+        child: MotFieldAcquisitionHandle | None = None
         try:
-            child = self._prepared_scan.start(self._live_output.preview_port)
-            if not isinstance(child, RunHandle):
-                raise TypeError("MOT scan starter returned a non-RunHandle")
+            child = self._prepared_acquisition.start(self._live_output.preview_port)
+            if not isinstance(child, MotFieldAcquisitionHandle):
+                raise TypeError("MOT acquisition starter returned another handle type")
             with self._condition:
                 self._active = child
-                self._phase = "scan-running"
+                self._phase = "acquisition-running"
                 cancelled = self._cancel_requested
                 reason = self._cancel_reason
                 self._condition.notify_all()
@@ -626,24 +689,18 @@ class MotFieldTaskHandle:
             try:
                 source = child.result()
             except (RunCancelled, RunFailed) as error:
-                raise _ScanEnded(error.snapshot) from None
+                raise _AcquisitionEnded(error.snapshot) from None
             finally:
                 with self._condition:
                     if self._active is child:
                         self._active = None
-            if not isinstance(source, ScanArtifactRef):
-                raise TypeError("MOT scan Run returned a non-ScanArtifactRef")
+            if not isinstance(source, MotFieldAcquisitionResult):
+                raise TypeError("MOT acquisition Run returned another result type")
             with self._condition:
-                self._scan_ref = source
-                self._phase = "analyzing-final-scan"
+                self._acquisition_result = source
+                self._phase = "analyzing-final-acquisition"
             self._checkpoint()
-            materialized = self._materializer.materialize_scan(source)
-            if not isinstance(materialized, MaterializedScanData):
-                raise TypeError("MOT materializer returned a non-MaterializedScanData")
-            with self._condition:
-                self._materialized_scan = materialized
-            self._checkpoint()
-            result = analyze_mot_scan(self._request, materialized)
+            result = analyze_mot_scan(self._request, source)
             self._checkpoint()
             with self._condition:
                 self._phase = "writing-report"
@@ -659,9 +716,9 @@ class MotFieldTaskHandle:
                 "mot-field-complete",
                 child=child.snapshot(),
             )
-        except _CancelledAfterScan:
+        except _CancelledAfterAcquisition:
             self._finish(RunState.CANCELLED, "cancelled")
-        except _ScanEnded as ended:
+        except _AcquisitionEnded as ended:
             self._finish(
                 ended.snapshot.state,
                 "cancelled"
@@ -695,7 +752,7 @@ class MotFieldTaskHandle:
             cancelling = self._cancel_requested
         child_snapshot = None if child is None else child.snapshot()
         if child_snapshot is not None:
-            phase = f"scan/{child_snapshot.phase}"
+            phase = f"acquisition/{child_snapshot.phase}"
         return RunSnapshot(
             self.run_id,
             RunState.CANCELLING if cancelling else RunState.RUNNING,
@@ -767,7 +824,7 @@ class MotFieldTaskHandle:
         self,
         result: MotFieldResult,
     ) -> dict[str, FinalDatasetOutput]:
-        """Publish FINAL result/source datasets from the already admitted scan."""
+        """Publish FINAL result/source datasets from the completed acquisition."""
 
         if not isinstance(result, MotFieldResult):
             raise TypeError("result must be MotFieldResult")
@@ -776,16 +833,16 @@ class MotFieldTaskHandle:
                 raise RuntimeError("MOT final outputs require successful task terminal")
             if result is not self._result:
                 raise ValueError("MOT result belongs to another task")
-            materialized = self._materialized_scan
-        if materialized is None:
-            raise RuntimeError("MOT task lost its admitted source scan")
-        return mot_field_final_outputs(result, materialized)
+            acquisition = self._acquisition_result
+        if acquisition is None:
+            raise RuntimeError("MOT task lost its exact source acquisition")
+        return mot_field_final_outputs(result, acquisition)
 
 
 __all__ = [
     "DEFAULT_MOT_FIELD_PULSE_PATH",
     "DEFAULT_MOT_FIELD_REPORT_FOLDER",
-    "MotFieldScanMaterializer",
+    "MOT_FIELD_LOGIC_NODE",
     "MotFieldTaskDependencies",
     "MotFieldTaskHandle",
     "MotFieldTaskIntent",

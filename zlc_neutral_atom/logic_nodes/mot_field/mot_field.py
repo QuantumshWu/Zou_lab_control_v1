@@ -1,15 +1,15 @@
-"""MOT coil-field optimization over one autonomous SCAN_SLOT camera scan.
+"""MOT coil-field optimization over one autonomous SCAN_SLOT camera acquisition.
 
-The exact scan remains the sole hardware and persistence owner.  This module
-adds only the neutral-atom physics that consumes its FINAL artifact:
+This capability owns the coupled Camera + Sequencer experiment:
 
 * freeze the three semantic coil DAC axes into one autonomous pulse table;
 * reduce each camera frame with the experiment's circular ROI-minus-annulus
   fluorescence rule; and
 * refine the grid argmax by a local centre of mass.
 
-Autonomous SCAN_SLOT execution is the normal path; this module contains only
-the concrete MOT scan physics and result materialization.
+Autonomous SCAN_SLOT execution is the only path.  Generic capture/pulse owners
+provide exact transport and hardware commands; generic PulseScan is not part of
+this task's application or result model.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
 from itertools import product
 import math
 from numbers import Integral, Real
-from typing import TYPE_CHECKING, Sequence
+from typing import Sequence
 
 import numpy as np
 
@@ -34,6 +34,8 @@ from zlc_data import (
     DatasetSchema,
     OwnedSnapshot,
     PointLayout,
+    READOUT_EVENT,
+    SCAN_POINT,
     StreamGenerationId,
     VALID,
     ValidityContract,
@@ -48,21 +50,10 @@ from zlc_neutral_atom.dataset_output import (
     final_dataset_join_digest,
 )
 from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.logic_nodes.pulse_scan import (
-    AutonomousScanSlotProgram,
-    ScanArtifactRef,
-)
-from zlc_neutral_atom.logic_nodes.pulse_scan.reference import (
-    scan_artifact_ref_to_tree,
-)
-from zlc_neutral_atom.logic_nodes.pulse_scan.repository import MaterializedScanData
+from zlc_neutral_atom.runtime.dataset import DatasetSealProvenance
 from zlc_pulse import FrozenScanTable, PulseDocument, freeze_scan_table
 from zlc_pulse.document import FIELD_DAC
 from zlc_storage import canonical_digest, canonical_text, finite_real, positive_real
-
-if TYPE_CHECKING:
-    from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import ScanRequest
-
 
 MOT_SCAN_PARAMETER_IDS = ("da_x", "da_y", "da_z")
 MOT_FIELD_FINAL_OUTPUT_DECLARATIONS = (
@@ -117,7 +108,7 @@ def build_mot_scan_program(
     center_z: float,
     span: float,
     points: int,
-) -> AutonomousScanSlotProgram:
+) -> "MotFieldProgram":
     """Freeze the complete x/y/z grid into the current pulse document.
 
     The semantic parameter ids are the experiment API.  Their target DAC ports
@@ -158,14 +149,94 @@ def build_mot_scan_program(
     if not isinstance(frozen, FrozenScanTable):
         raise TypeError("pulse owner returned a non-FrozenScanTable")
     committed = replace(document, scan_table=frozen, scan_recipe=None)
-    return AutonomousScanSlotProgram(committed)
+    point_axes = tuple(
+        AxisSpec(
+            AxisId(f"mot-field.{parameter_id}"),
+            parameters[parameter_id].label or parameter_id,
+            SCAN_POINT,
+            len(axis),
+            axis,
+            parameters[parameter_id].unit,
+        )
+        for parameter_id, axis in zip(MOT_SCAN_PARAMETER_IDS, axes, strict=True)
+    )
+    return MotFieldProgram(
+        committed,
+        point_axes,
+        PointLayout.rect_c(tuple(len(axis) for axis in axes)),
+    )
+
+
+@dataclass(frozen=True)
+class MotFieldProgram:
+    """The complete three-axis pulse table owned by the MOT task."""
+
+    document: PulseDocument
+    point_axes: tuple[AxisSpec, AxisSpec, AxisSpec]
+    point_layout: PointLayout
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.document, PulseDocument):
+            raise TypeError("document must be PulseDocument")
+        axes = tuple(self.point_axes)
+        if len(axes) != 3 or any(
+            not isinstance(axis, AxisSpec) or axis.role != SCAN_POINT
+            for axis in axes
+        ):
+            raise ValueError("MOT program requires three SCAN_POINT axes")
+        if tuple(axis.axis_id.value for axis in axes) != tuple(
+            f"mot-field.{parameter_id}" for parameter_id in MOT_SCAN_PARAMETER_IDS
+        ):
+            raise ValueError("MOT program axis identities differ from da_x/da_y/da_z")
+        if not isinstance(self.point_layout, PointLayout):
+            raise TypeError("point_layout must be PointLayout")
+        if self.point_layout.logical_shape != tuple(axis.size for axis in axes):
+            raise ValueError("MOT point layout differs from its three axes")
+        table = self.document.scan_table
+        if table is None or table.columns != MOT_SCAN_PARAMETER_IDS:
+            raise ValueError("MOT program must freeze da_x, da_y, da_z")
+        reconstructed = tuple(
+            tuple(
+                axis.coordinate_at(index)
+                for axis, index in zip(
+                    axes,
+                    self.point_layout.multi_index(storage_index),
+                    strict=True,
+                )
+            )
+            for storage_index in range(self.point_layout.storage_size)
+        )
+        if reconstructed != table.rows:
+            raise ValueError("MOT axes/layout do not reproduce the frozen pulse table")
+        object.__setattr__(self, "point_axes", axes)
+
+    @property
+    def fingerprint(self) -> str:
+        return canonical_digest(
+            {
+                "owner": "zlc_neutral_atom.mot-field-program",
+                "pulse_document": self.document.fingerprint,
+                "axes": tuple(
+                    {
+                        "axis_id": axis.axis_id.value,
+                        "coordinates": axis.coordinates,
+                        "unit": axis.unit,
+                    }
+                    for axis in self.point_axes
+                ),
+                "layout": tuple(
+                    self.point_layout.multi_index(index)
+                    for index in range(self.point_layout.storage_size)
+                ),
+            }
+        )
 
 
 @dataclass(frozen=True)
 class MotFieldRequest:
     """One immutable MOT optimization intent over an autonomous scan."""
 
-    program: AutonomousScanSlotProgram
+    program: MotFieldProgram
     camera_ref: DeviceRef
     sequencer_ref: DeviceRef
     roi_cx: float | None = None
@@ -174,8 +245,8 @@ class MotFieldRequest:
     trigger_channel: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.program, AutonomousScanSlotProgram):
-            raise TypeError("program must be AutonomousScanSlotProgram")
+        if not isinstance(self.program, MotFieldProgram):
+            raise TypeError("program must be MotFieldProgram")
         columns = self.program.document.scan_table
         if columns is None or columns.columns != MOT_SCAN_PARAMETER_IDS:
             raise ValueError("MOT program must freeze da_x, da_y, da_z")
@@ -199,30 +270,72 @@ class MotFieldRequest:
                 canonical_text(self.trigger_channel, "trigger_channel"),
             )
 
-    def as_scan_request(self) -> "ScanRequest":
-        """Expose the exact Camera scan owned by this MOT request.
 
-        The notebook supplies installation identities when constructing this
-        request; the MOT domain, not that facade, owns how its physics intent
-        maps onto the generic scan application.
-        """
 
-        from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import ScanRequest
+def mot_field_source_identity(
+    snapshot: OwnedSnapshot,
+    provenance: DatasetSealProvenance,
+) -> str:
+    """Digest the exact source facts used by one MOT result."""
 
-        return ScanRequest(
-            program=self.program,
-            camera_ref=self.camera_ref,
-            sequencer_ref=self.sequencer_ref,
-            trigger_channel=self.trigger_channel,
-            output_transform_spec=None,
-        )
+    if not isinstance(snapshot, OwnedSnapshot):
+        raise TypeError("snapshot must be OwnedSnapshot")
+    if not isinstance(provenance, DatasetSealProvenance):
+        raise TypeError("provenance must be DatasetSealProvenance")
+    ref = snapshot.ref
+    trace = provenance.trace_binding
+    return canonical_digest(
+        {
+            "owner": "zlc_neutral_atom.mot-field-acquisition",
+            "block_id": ref.block_id.value,
+            "generation": ref.stream_generation.value,
+            "schema": ref.schema_fingerprint,
+            "revision": ref.revision.value,
+            "stream_id": provenance.stream_id.value,
+            "start_sequence": provenance.start_sequence,
+            "end_sequence": provenance.end_sequence,
+            "join_plan": provenance.join_plan_digest,
+            "ordered_metadata": provenance.ordered_metadata_digest,
+            "metadata_contract": provenance.metadata_contract_fingerprint,
+            "run_id": trace.run_id,
+            "source_id": trace.source_id,
+        }
+    )
+
+
+@dataclass(frozen=True)
+class MotFieldAcquisitionResult:
+    """Exact raw Camera dataset from one autonomous MOT hardware run."""
+
+    snapshot: OwnedSnapshot
+    provenance: DatasetSealProvenance
+    source_identity: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.snapshot, OwnedSnapshot):
+            raise TypeError("snapshot must be OwnedSnapshot")
+        if not isinstance(self.provenance, DatasetSealProvenance):
+            raise TypeError("provenance must be DatasetSealProvenance")
+        if self.snapshot.ref.stream_generation != self.provenance.generation:
+            raise ValueError("MOT source snapshot and provenance generations differ")
+        schema = self.snapshot.block.schema
+        expected = schema.repeat_axis.size * schema.point_layout.storage_size
+        if self.provenance.end_sequence - self.provenance.start_sequence != expected:
+            raise ValueError("MOT source provenance does not cover every dataset cell")
+        if self.snapshot.ref.revision.value != expected:
+            raise ValueError("MOT source snapshot is not the complete exact revision")
+        if self.source_identity != mot_field_source_identity(
+            self.snapshot,
+            self.provenance,
+        ):
+            raise ValueError("MOT source identity differs from its exact dataset")
 
 
 @dataclass(frozen=True, eq=False)
 class MotFieldResult:
     """Computed MOT optimum retaining the exact source scan and full 3-D block."""
 
-    scan_ref: ScanArtifactRef
+    source_identity: str
     point_axes: tuple[AxisSpec, AxisSpec, AxisSpec]
     intensity: np.ndarray
     best_field: tuple[float, float, float]
@@ -230,8 +343,7 @@ class MotFieldResult:
     __hash__ = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.scan_ref, ScanArtifactRef):
-            raise TypeError("scan_ref must be ScanArtifactRef")
+        canonical_text(self.source_identity, "source_identity")
         axes = tuple(self.point_axes)
         if len(axes) != 3 or any(not isinstance(axis, AxisSpec) for axis in axes):
             raise ValueError("point_axes must contain the three MOT AxisSpec values")
@@ -416,8 +528,8 @@ def mot_intensity_schema(
     _validate_mot_source_schema(request, source_schema)
     return DatasetSchema(
         source_schema.repeat_axis,
-        source_schema.point_axes,
-        source_schema.point_layout,
+        request.program.point_axes,
+        request.program.point_layout,
         ValueSchema.scalar(
             np.dtype("<f8"),
             source_schema.cell_schema.value_unit,
@@ -433,11 +545,27 @@ def _validate_mot_source_schema(
         raise TypeError("request must be MotFieldRequest")
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
-    table = request.program.point_table
-    if schema.point_axes != table.point_axes:
+    program = request.program
+    if schema.point_axes[:3] != program.point_axes:
         raise ValueError("MOT scan axes differ from the frozen MOT program")
-    if schema.point_layout != table.point_layout:
-        raise ValueError("MOT point layout differs from the frozen MOT program")
+    trailing = schema.point_axes[3:]
+    if (
+        len(trailing) != 1
+        or trailing[0].role != READOUT_EVENT
+        or trailing[0].size != 1
+    ):
+        raise ValueError("MOT camera acquisition requires one singleton readout event")
+    if schema.point_layout.logical_shape != (*program.point_layout.logical_shape, 1):
+        raise ValueError("MOT source point layout differs from the frozen grid")
+    expected_mapping = tuple(
+        (*program.point_layout.multi_index(index), 0)
+        for index in range(program.point_layout.storage_size)
+    )
+    if tuple(
+        schema.point_layout.multi_index(index)
+        for index in range(schema.point_layout.storage_size)
+    ) != expected_mapping:
+        raise ValueError("MOT source storage order differs from the frozen grid")
     if schema.repeat_axis.size != 1:
         raise ValueError(
             "MOT optimization requires exactly one repeat; it never auto-reduces repeat"
@@ -445,7 +573,7 @@ def _validate_mot_source_schema(
     data_axes = schema.cell_schema.data_axes
     if tuple(axis.role for axis in data_axes) != (SPATIAL_Y, SPATIAL_X):
         raise ValueError("MOT scan output must preserve one spatial-y/x camera frame")
-    if schema.point_layout.storage_size != math.prod(schema.point_layout.logical_shape):
+    if program.point_layout.storage_size != math.prod(program.point_layout.logical_shape):
         raise ValueError("MOT scan requires the complete Cartesian coil grid")
 
 
@@ -518,39 +646,40 @@ def refine_mot_optimum(
 
 def analyze_mot_scan(
     request: MotFieldRequest,
-    materialized: MaterializedScanData,
+    acquisition: MotFieldAcquisitionResult,
 ) -> MotFieldResult:
     """Analyze the exact FINAL scan without flattening or implicit reduction."""
 
     if not isinstance(request, MotFieldRequest):
         raise TypeError("request must be MotFieldRequest")
-    if not isinstance(materialized, MaterializedScanData):
-        raise TypeError("materialized must be MaterializedScanData")
-    schema = materialized.schema
-    table = request.program.point_table
+    if not isinstance(acquisition, MotFieldAcquisitionResult):
+        raise TypeError("acquisition must be MotFieldAcquisitionResult")
+    source = acquisition.snapshot.block
+    schema = source.schema
+    program = request.program
     storage_values, present = _mot_storage_intensities(
         request,
-        materialized.values,
-        materialized.validity,
+        source.values,
+        source.validity,
         schema,
         written_cells=schema.point_layout.storage_size,
     )
     if not present.all():
         raise RuntimeError("FINAL MOT scan is missing intensity cells")
-    logical = np.empty(schema.point_layout.logical_shape, dtype=np.float64)
-    for storage_index in range(schema.point_layout.storage_size):
-        logical[schema.point_layout.multi_index(storage_index)] = storage_values[
+    logical = np.empty(program.point_layout.logical_shape, dtype=np.float64)
+    for storage_index in range(program.point_layout.storage_size):
+        logical[program.point_layout.multi_index(storage_index)] = storage_values[
             storage_index
         ]
 
     axes = tuple(
         tuple(axis.coordinates or tuple(range(axis.size)))
-        for axis in table.point_axes
+        for axis in program.point_axes
     )
     best, peak = refine_mot_optimum(logical, axes)
     return MotFieldResult(
-        materialized.artifact_ref,
-        table.point_axes,
+        acquisition.source_identity,
+        program.point_axes,
         logical,
         best,
         peak,
@@ -572,8 +701,7 @@ def materialize_mot_field_snapshot(result: MotFieldResult) -> OwnedSnapshot:
     identity = canonical_digest(
         {
             "owner": "zlc_neutral_atom.mot-field-result",
-            "repository_id": result.scan_ref.repository_id,
-            "scan_manifest": result.scan_ref.manifest_digest,
+            "source_identity": result.source_identity,
             "axes": tuple(
                 tuple(axis.coordinate_at(index) for index in range(axis.size))
                 for axis in result.point_axes
@@ -608,17 +736,17 @@ def materialize_mot_field_snapshot(result: MotFieldResult) -> OwnedSnapshot:
 
 def mot_field_final_outputs(
     result: MotFieldResult,
-    source_scan: MaterializedScanData,
+    source_scan: MotFieldAcquisitionResult,
 ) -> dict[str, FinalDatasetOutput]:
     """Publish the analyzed MOT grid and its exact source scan together."""
 
     if not isinstance(result, MotFieldResult):
         raise TypeError("result must be MotFieldResult")
-    if not isinstance(source_scan, MaterializedScanData):
-        raise TypeError("source_scan must be MaterializedScanData")
-    if source_scan.artifact_ref != result.scan_ref:
+    if not isinstance(source_scan, MotFieldAcquisitionResult):
+        raise TypeError("source_scan must be MotFieldAcquisitionResult")
+    if source_scan.source_identity != result.source_identity:
         raise ValueError("MOT result and materialized source name different scans")
-    source_identity = scan_artifact_ref_to_tree(result.scan_ref)
+    source_identity = {"mot_field_source_identity": result.source_identity}
     snapshots = (
         materialize_mot_field_snapshot(result),
         source_scan.snapshot,
@@ -656,6 +784,8 @@ __all__ = [
     "MOT_SCAN_PARAMETER_IDS",
     "MINIMUM_MOT_FIELD_POINTS",
     "MotFieldRequest",
+    "MotFieldProgram",
+    "MotFieldAcquisitionResult",
     "MotFieldResult",
     "MotRoiProjector",
     "analyze_mot_scan",
@@ -664,6 +794,7 @@ __all__ = [
     "mot_intensity_schema",
     "materialize_mot_field_snapshot",
     "mot_field_final_outputs",
+    "mot_field_source_identity",
     "mot_roi_intensity",
     "refine_mot_optimum",
 ]

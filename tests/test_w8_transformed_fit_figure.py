@@ -66,7 +66,7 @@ from zlc_workbench.data_figure.window import DataFigureWindow
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+PULSE = ROOT / "pulses" / "imaging_template.json"
 
 
 @pytest.fixture(scope="module")

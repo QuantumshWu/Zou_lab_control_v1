@@ -2,9 +2,10 @@
 # zlc_edge_streamer): BRAM edge/scan tables + 1-tick FIFO prefetch + 2-bank
 # streaming scan, JTAG-to-AXI control.  ONE clean build (no variants).
 #
-# Frozen 35T geometry: 4096 edges + bank_size 2048 (4096 fully resident scan
-# points).  The RTL contains a refill mailbox, but the current qualified host
-# deliberately admits only the resident window.
+# Frozen 35T geometry: 4096 edges + two bank_size=2048 scan banks (4096
+# bank-local slots at one time).  The host preloads the first two chunks and its
+# sole observer refills each released bank through the frozen mailbox; total N
+# is not limited by the two-bank window, and the FPGA remains the timing owner.
 #
 # *** The engine + control FSM have cycle-accurate Python models
 # (engine_model.rtl_mirror_play == reference at read latency 1/2/3 incl. 1-tick;

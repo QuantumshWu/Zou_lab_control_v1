@@ -13,7 +13,7 @@ by independent hardware timing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from zlc_neutral_atom.devices.camera.contract import (
     CameraAcquisitionMode,
@@ -26,7 +26,11 @@ from zlc_storage import (
     sha256_text,
 )
 
-from .capture_port import CaptureCapabilitySnapshot
+from .capture_port import (
+    CameraExposureConfiguredAck,
+    CaptureCapabilitySnapshot,
+    _admit_exposure_leased_capability,
+)
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.ports import (
     BoundDevice,
@@ -169,12 +173,38 @@ class BoundCameraMonitorPort:
     """Drive authority restricted to one continuous display-only monitor."""
 
     capability_attestation: VerifiedDeviceCapability
+    _leased_capability: CameraMonitorCapabilitySnapshot | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+    )
+    _exposure_session_id: str | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+    )
 
     def __post_init__(self) -> None:
         admit_bound_capability(
             self.capability_attestation,
             CameraMonitorCapabilitySnapshot,
         )
+        leased = self._leased_capability
+        if leased is None:
+            if self._exposure_session_id is not None:
+                raise ValueError("exposure session requires a leased capability")
+        else:
+            if not isinstance(leased, CameraMonitorCapabilitySnapshot):
+                raise TypeError(
+                    "camera monitor lease requires CameraMonitorCapabilitySnapshot"
+                )
+            _admit_exposure_leased_capability(
+                self.capability_attestation.snapshot,
+                leased,
+                self._exposure_session_id,
+            )
         if not self.device.session_cleanup_capable:
             raise ValueError("camera monitor requires session-specific cleanup")
         if not any(
@@ -189,9 +219,34 @@ class BoundCameraMonitorPort:
 
     @property
     def capability(self) -> CameraMonitorCapabilitySnapshot:
-        snapshot = self.capability_attestation.snapshot
+        snapshot = self._leased_capability
+        if snapshot is None:
+            snapshot = self.capability_attestation.snapshot
         assert isinstance(snapshot, CameraMonitorCapabilitySnapshot)
         return snapshot
+
+    def with_configured_exposure(
+        self,
+        acknowledgement: CameraExposureConfiguredAck,
+    ) -> "BoundCameraMonitorPort":
+        """Bind the endpoint-read monitor working point to this active Run."""
+
+        if not isinstance(acknowledgement, CameraExposureConfiguredAck):
+            raise TypeError(
+                "acknowledgement must be CameraExposureConfiguredAck"
+            )
+        capability = acknowledgement.capability
+        if not isinstance(capability, CameraMonitorCapabilitySnapshot):
+            raise TypeError(
+                "camera monitor exposure acknowledgement lost its monitor mode"
+            )
+        if acknowledgement.binding_instance_id != self.device.binding_instance_id:
+            raise ValueError("exposure acknowledgement belongs to another device")
+        return type(self)(
+            self.capability_attestation,
+            _leased_capability=capability,
+            _exposure_session_id=acknowledgement.session_id,
+        )
 
     @property
     def resource_claim(self) -> ResourceClaim:

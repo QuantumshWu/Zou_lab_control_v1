@@ -40,6 +40,22 @@ def _spec():
                 minimum=-1.0,
                 maximum=1.0,
             ),
+            FormFieldProps(
+                "site",
+                "int",
+                "Site",
+                default=None,
+                minimum=0,
+                allow_blank=True,
+            ),
+            FormFieldProps(
+                "exposure",
+                "float",
+                "Exposure",
+                default=None,
+                minimum=float.fromhex("0x0.0000000000001p-1022"),
+                allow_blank=True,
+            ),
             FormFieldProps("authored", "number", "Authored number", default=1),
             FormFieldProps(
                 "mode",
@@ -100,6 +116,8 @@ def test_headless_form_contract_is_immutable_exact_and_does_not_load_qt() -> Non
         "count",
         "timeout",
         "gain",
+        "site",
+        "exposure",
         "authored",
         "mode",
         "enabled",
@@ -182,11 +200,10 @@ def test_closed_registry_has_one_complete_atomic_handler_per_kind() -> None:
         FORM_WIDGET_HANDLERS["new"] = object()
 
 
-def test_form_preserves_unbounded_numbers_lossless_float_and_typed_choices() -> None:
+def test_form_projects_numeric_fields_to_fluent_spinboxes() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from zlc_frontend.qt_widgets import (
         FluentDoubleSpinBox,
-        FluentLineEdit,
         FluentParameterForm,
         FluentSpinBox,
         ensure_qt_app,
@@ -194,28 +211,41 @@ def test_form_preserves_unbounded_numbers_lossless_float_and_typed_choices() -> 
 
     ensure_qt_app()
     form = FluentParameterForm(_spec())
-    assert isinstance(form.widget_for("iterations"), FluentLineEdit)
+    assert isinstance(form.widget_for("iterations"), FluentSpinBox)
     assert isinstance(form.widget_for("count"), FluentSpinBox)
-    assert isinstance(form.widget_for("timeout"), FluentLineEdit)
+    assert isinstance(form.widget_for("timeout"), FluentDoubleSpinBox)
     assert isinstance(form.widget_for("gain"), FluentDoubleSpinBox)
+    assert isinstance(form.widget_for("site"), FluentSpinBox)
+    assert isinstance(form.widget_for("exposure"), FluentDoubleSpinBox)
 
     values = form.read_all()
     assert values["iterations"] == 40
     assert values["gain"] == 0.12345678901234566
+    assert values["site"] is None
+    assert values["exposure"] is None
     assert type(values["authored"]) is int
     assert type(values["mode"]) is int
 
-    huge = 2**80 + 123
-    values["iterations"] = huge
+    values["iterations"] = 100_000
     values["timeout"] = 1.2345678901234567e100
+    values["site"] = 7
+    values["exposure"] = 0.013
     values["authored"] = 1.0
     values["mode"] = "1"
     form.write_all(values)
     written = form.read_all()
-    assert written["iterations"] == huge
+    assert written["iterations"] == 100_000
     assert written["timeout"] == 1.2345678901234567e100
+    assert written["site"] == 7
+    assert written["exposure"] == 0.013
     assert type(written["authored"]) is float
     assert type(written["mode"]) is str
+
+    values["site"] = None
+    values["exposure"] = None
+    form.write_all(values)
+    assert form.read_all()["site"] is None
+    assert form.read_all()["exposure"] is None
 
 
 def test_full_state_populate_is_exact_prevalidated_and_signal_blocked() -> None:
@@ -240,7 +270,7 @@ def test_full_state_populate_is_exact_prevalidated_and_signal_blocked() -> None:
     assert form.read_all() == initial
 
     updated = dict(initial)
-    updated.update(text="new", iterations=2**70, enabled=False)
+    updated.update(text="new", iterations=2**20, enabled=False)
     form.widget_for("iterations").setDisabled(True)
     form.widget_for("enabled").hide()
     form.populate(updated)
@@ -261,7 +291,7 @@ def test_text_is_never_evaluated_and_invalid_numeric_text_fails_closed() -> None
     form.widget_for("text").setText(literal)
     assert form.read_all()["text"] == literal
 
-    form.widget_for("iterations").setText("2**63")
+    form.widget_for("iterations").lineEdit().setText("2**63")
     with pytest.raises(ValueError, match="base-10 integer"):
         form.read_all()
 

@@ -32,7 +32,7 @@ ROOT = Path(__file__).parents[1]
 
 def _service_manifest():
     target = load_pulse_document(
-        ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+        ROOT / "pulses" / "imaging_template.json"
     ).target
     return pulse_target_manifest_from_lanes(target)
 
@@ -71,7 +71,7 @@ class RecordingBackend:
 
 
 def _artifact(params=None, execution_form=PulseExecutionForm.STATIC_ONCE):
-    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     return compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -103,7 +103,18 @@ def test_server_executes_one_exact_current_artifact_and_returns_schedule_receipt
         "fire",
         "await_completion",
     ]
-    assert service.snapshot()["state"] == "DONE"
+    snapshot = service.snapshot()
+    assert set(snapshot) == {
+        "schema",
+        "connection_generation",
+        "manifest",
+        "clock_hz",
+        "geometry_fingerprint",
+        "state",
+        "prepared_ref",
+        "backend",
+    }
+    assert snapshot["state"] == "DONE"
 
 
 def test_server_messages_are_current_canonical_owner_codecs():

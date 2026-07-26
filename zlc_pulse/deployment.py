@@ -27,53 +27,6 @@ APPROVED_DEPLOYED_TARGET_ABI = (
 )
 
 
-# THE single statement of why a scan larger than the resident window is refused.
-# The frozen bitstream already contains ping-pong refill hardware, so the missing
-# thing is evidence, not silicon - and saying so precisely is what keeps the
-# refusal from reading as "the hardware cannot do this".  Publishing
-# AUTONOMOUS_REFILLED means satisfying every clause below and flipping this one
-# constant, not scattering a second opinion through the call sites.
-AUTONOMOUS_REFILLED_UNAVAILABLE_REASON = (
-    "AUTONOMOUS_REFILLED is not published for this deployment: the frozen "
-    "bitstream does implement ping-pong bank refill, but the capability gate "
-    "still lacks (1) a single FiniteScanStreamer I/O owner for status, cursor, "
-    "refill, progress, cancel and completion, (2) a conservative hard upper "
-    "bound on one refill transaction rather than a measured worst case, and "
-    "(3) hardware time observation with enough resolution at EVERY potential "
-    "bank seam plus a full-schedule residual attestation - the current RTL "
-    "clears UNDERFLOW once a bank recovers instead of latching it, so neither "
-    "a final DONE nor partial camera timestamps prove that no stall occurred. "
-    "See docs/REAL_HARDWARE_BRINGUP_zh.md for the qualification runbook."
-)
-
-
-class FormalScanCapacityExceeded(ValueError):
-    """A scan table larger than the resident window, refused before FIRE.
-
-    Typed rather than a bare ``ValueError`` so a caller (preflight, GUI, or
-    notebook) can report the three facts an operator actually needs - how many
-    points were asked for, how many fit resident, and what would have to be
-    published to lift the limit - without scraping a message.  It stays a
-    ``ValueError`` subclass because refusing an over-capacity table is a bad
-    argument, and existing callers already treat it as one.
-    """
-
-    def __init__(
-        self,
-        requested_points: int,
-        resident_limit: int,
-        capability_unavailable_reason: str,
-    ) -> None:
-        self.requested_points = int(requested_points)
-        self.resident_limit = int(resident_limit)
-        self.capability_unavailable_reason = str(capability_unavailable_reason)
-        super().__init__(
-            "formal autonomous scan exceeds the frozen bitstream's fully "
-            f"resident capacity: {self.requested_points} points > "
-            f"{self.resident_limit}. {self.capability_unavailable_reason}"
-        )
-
-
 def _autonomous_scan_repeat_domain(
     document: PulseDocument,
 ) -> tuple[FrozenScanTable, int, int]:
@@ -94,37 +47,14 @@ def _autonomous_scan_repeat_domain(
     return table, repeat_count, repeat_count * len(table.rows)
 
 
-def require_autonomous_scan_resident_capacity(
-    document: PulseDocument,
-    resident_scan_point_capacity: int,
-) -> None:
-    """Check logical R*P against the bound sequencer before row expansion."""
-
-    if (
-        isinstance(resident_scan_point_capacity, bool)
-        or not isinstance(resident_scan_point_capacity, int)
-        or resident_scan_point_capacity < 1
-    ):
-        raise ValueError("resident_scan_point_capacity must be a positive integer")
-    _, _, total_points = _autonomous_scan_repeat_domain(document)
-    if total_points > resident_scan_point_capacity:
-        # Same refusal as the post-expansion deployment check, raised earlier on
-        # the logical R*P domain so an over-capacity request never gets expanded
-        # into millions of rows first.  One error type, one reason.
-        raise FormalScanCapacityExceeded(
-            total_points,
-            resident_scan_point_capacity,
-            AUTONOMOUS_REFILLED_UNAVAILABLE_REASON,
-        )
-
-
 def expand_autonomous_scan_repeats(document: PulseDocument) -> PulseDocument:
     """Freeze a whole-document logical repeat into a repeat-major scan table.
 
     A partial-period RepeatRegion cannot represent a dataset repeat axis: its
     triggers need not occur once per loop.  Exact scan therefore removes the
     hardware loop and duplicates the frozen SCAN_SLOT rows in ``repeat, point``
-    order.  Deployment capacity is checked separately against the bound port.
+    order.  The transport streams the resulting immutable table through the
+    frozen RTL's ping-pong banks.
     """
 
     table, repeat_count, _ = _autonomous_scan_repeat_domain(document)
@@ -226,7 +156,6 @@ def _validate_artifact_against_bound_deployment(
         raise TypeError("artifact must be CompiledPulseArtifact")
     if artifact.target_ir.clock_hz != float(clock_hz):
         raise ValueError("compiled artifact clock differs from deployed hardware clock")
-    validate_resident_scan_capacity(artifact, params)
     validate_target_ir_for_target(artifact.target_ir, target)
     expected = pack_target_ir(artifact.target_ir, params)
     if artifact.wire_image != expected:
@@ -235,41 +164,10 @@ def _validate_artifact_against_bound_deployment(
         )
 
 
-def validate_resident_scan_capacity(
-    artifact: CompiledPulseArtifact,
-    params: StreamerParams,
-) -> None:
-    """Reject scans whose timing would depend on unqualified host refill."""
-
-    if not isinstance(params, StreamerParams):
-        raise TypeError("params must be StreamerParams")
-    total_points = len(artifact.target_ir.scan_points)
-    resident_capacity = resident_scan_point_capacity(params)
-    if total_points > resident_capacity:
-        raise FormalScanCapacityExceeded(
-            total_points,
-            resident_capacity,
-            AUTONOMOUS_REFILLED_UNAVAILABLE_REASON,
-        )
-
-
-def resident_scan_point_capacity(params: StreamerParams) -> int:
-    """Return the frozen streamer's two-bank resident scan capacity."""
-
-    if not isinstance(params, StreamerParams):
-        raise TypeError("params must be StreamerParams")
-    return 2 * params.bank_size
-
-
 __all__ = [
     "APPROVED_DEPLOYED_TARGET_ABI",
-    "AUTONOMOUS_REFILLED_UNAVAILABLE_REASON",
-    "FormalScanCapacityExceeded",
     "expand_autonomous_scan_repeats",
-    "resident_scan_point_capacity",
-    "require_autonomous_scan_resident_capacity",
     "require_approved_target_abi",
     "validate_artifact_for_deployment",
     "validate_deployed_target",
-    "validate_resident_scan_capacity",
 ]

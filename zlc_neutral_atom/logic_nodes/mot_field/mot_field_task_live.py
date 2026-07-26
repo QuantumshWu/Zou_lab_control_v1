@@ -1,6 +1,6 @@
 """Run-scoped provisional output for one prepared MOT-field task.
 
-The object in this module is both the exact scan's typed preview port and the
+The object in this module is both the exact acquisition's typed preview port and the
 application-owned live-output source consumed by a frontend.  It never owns an
 artifact or a GUI object: the exact DatasetBuilder remains authoritative while
 the MOT projection publishes immutable scalar-grid revisions.
@@ -23,14 +23,13 @@ from zlc_neutral_atom.runtime.preview import (
     ExactDatasetPreviewPort,
     ExactDatasetPreviewSpec,
 )
-from zlc_neutral_atom.logic_nodes.pulse_scan import ScanOutputContract
 from zlc_storage import canonical_text
 
 
 class MotFieldTaskLiveOutput:
     """Project exact camera deltas into the task's one named live grid.
 
-    ``PreparedExactScan`` sees this object only as an
+    ``PreparedMotFieldAcquisition`` sees this object only as an
     :class:`ExactDatasetPreviewPort`.  Workbench sees only
     ``set_change_listener``/``freeze_live_outputs``/``close``.  Neither side
     assembles or understands the projection pipeline.
@@ -40,12 +39,10 @@ class MotFieldTaskLiveOutput:
         self,
         request: MotFieldRequest,
         source_schema: DatasetSchema,
-        output_contract: ScanOutputContract,
     ) -> None:
         self._projection = MotFieldLiveProjection(
             request,
             source_schema,
-            output_contract,
         )
         self._spec = ExactDatasetPreviewSpec(source_schema.fingerprint)
         self._condition = threading.Condition(threading.Lock())

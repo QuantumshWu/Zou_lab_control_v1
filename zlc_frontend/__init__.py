@@ -5,6 +5,11 @@ from .data_figure import (
     DataFigure,
     FigurePanelRegion,
 )
+from .frozen_figure import (
+    FrozenFigureSource,
+    build_frozen_data_figure,
+    build_frozen_figure_document,
+)
 from .figure_archive import (
     FIGURE_ARCHIVE_SCHEMA,
     FigureArchive,
@@ -189,6 +194,8 @@ from .panel_size import PANEL_SIZES, panel_size_cells
 from .plot_kind import PLOT_KIND_SPECS, PLOT_KIND_SPEC_BY_KEY, PlotKindSpec
 from .shape_text import describe_dataset_shape, indexed_unique_name
 from .panel_policy import (
+    FIXED_HI_PARAM,
+    FIXED_LO_PARAM,
     HISTOGRAM_CELL_THRESHOLDS_PARAM,
     HISTOGRAM_THRESHOLDS_PARAM,
     RELIM_MODES,
@@ -243,6 +250,8 @@ __all__ = [
     "FigureCrossCommit",
     "FigureDerivedSignal",
     "FigureOutputSource",
+    "FIXED_HI_PARAM",
+    "FIXED_LO_PARAM",
     "FigureEvaluationCancelled",
     "FigureEvaluationDeadlineExceeded",
     "FigureEvaluationError",
@@ -259,6 +268,7 @@ __all__ = [
     "FormFieldKind",
     "FormFieldProps",
     "FormSpec",
+    "FrozenFigureSource",
     "FitGridCellSummary",
     "FitGridModel",
     "FitGridPage",
@@ -321,6 +331,8 @@ __all__ = [
     "ViewSuggestion",
     "VIEW_SPEC_PARAM",
     "automatic_panel_kind",
+    "build_frozen_data_figure",
+    "build_frozen_figure_document",
     "contract_for",
     "area_range_output_name",
     "describe_authoritative_transform",

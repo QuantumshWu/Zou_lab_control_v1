@@ -21,6 +21,30 @@ def project_path(*parts: str) -> Path:
     return PROJECT_ROOT.joinpath(*(str(part) for part in parts)).resolve()
 
 
+def user_output_path(*parts: str) -> Path:
+    """Resolve one operator-created output below the single ``_output`` root.
+
+    Each argument is exactly one path component.  Callers name their semantic
+    owner instead of depositing generated files beside editable inputs; for
+    example ``user_output_path("figures", "pulses")``.  This function only
+    resolves placement and deliberately performs no I/O.
+    """
+
+    components: list[str] = []
+    for value in parts:
+        component = str(value)
+        parsed = Path(component)
+        if (
+            not component
+            or parsed.is_absolute()
+            or len(parsed.parts) != 1
+            or component in {".", ".."}
+        ):
+            raise ValueError("user output parts must be plain path components")
+        components.append(component)
+    return project_path("_output", *components)
+
+
 def resolve_under_project(path) -> Path:
     """Resolve ``path`` to an absolute path: an absolute (or ``~``) path is taken as-is;
     a RELATIVE path is anchored to the PROJECT ROOT (never the process CWD), so a bare
@@ -41,4 +65,10 @@ def display_path(path) -> str:
     return str(resolve_under_project(path))
 
 
-__all__ = ["PROJECT_ROOT", "project_path", "resolve_under_project", "display_path"]
+__all__ = [
+    "PROJECT_ROOT",
+    "display_path",
+    "project_path",
+    "resolve_under_project",
+    "user_output_path",
+]

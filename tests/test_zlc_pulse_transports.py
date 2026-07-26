@@ -143,18 +143,68 @@ def _session(document, params, transport):
     ).start()
 
 
-def test_nonresident_scan_is_rejected_before_any_hardware_io():
+def test_finite_scan_refills_freed_ping_pong_bank_in_the_fire_owned_worker():
     params = replace(StreamerParams(), bank_size=2)
     document, artifact = _scan_artifact(params, count=5)
     transport = TraceRegisterTransport(params)
     session = _session(document, params, transport)
 
-    with pytest.raises(ValueError, match="fully resident capacity"):
-        session.prepare(artifact)
-    assert transport.write_batches == []
+    session.prepare(artifact)
+    session.fire(artifact)
+    transport.cursor = 2
+    deadline = time.monotonic() + 1.0
+    refill = None
+    while time.monotonic() < deadline:
+        refill = next(
+            (
+                batch
+                for batch in transport.write_batches
+                if (CtrlWords.BANK0_CHUNK, 2) in batch
+            ),
+            None,
+        )
+        if refill is not None:
+            break
+        time.sleep(0.001)
+    assert refill is not None
+    assert refill[0] == (CtrlWords.BANK_READY, 0b10)
+    assert refill[-2:] == (
+        (CtrlWords.BANK0_CHUNK, 2),
+        (CtrlWords.BANK_READY, 0b11),
+    )
+
+    transport.cursor = 4
+    transport.status = STATUS_DONE
+    assert session.await_completion(artifact, timeout=1.0) is not None
+    assert session.snapshot()["next_monotonic_scan_chunk"] == 3
 
 
-def test_public_service_rejects_nonresident_scan_before_backend_io():
+def test_scan_refill_rejects_a_boundary_crossing_hidden_by_rearm():
+    class CrossingDuringRewriteTransport(TraceRegisterTransport):
+        def write_words(self, rows, *, stop=None, deadline=None):
+            rows = tuple(rows)
+            super().write_words(rows, stop=stop, deadline=deadline)
+            if (CtrlWords.BANK0_CHUNK, 2) in rows:
+                # Model the exact non-sticky RTL race: playback reached the bank
+                # boundary while the host write was in flight, then advanced as
+                # soon as the final READY write cleared the transient stall.
+                self.cursor = 4
+
+    params = replace(StreamerParams(), bank_size=2)
+    document, artifact = _scan_artifact(params, count=5)
+    transport = CrossingDuringRewriteTransport(params)
+    session = _session(document, params, transport)
+
+    session.prepare(artifact)
+    session.fire(artifact)
+    transport.cursor = 2
+
+    with pytest.raises(RuntimeError, match="boundary while its next bank refill"):
+        session.await_completion(artifact, timeout=1.0)
+    assert session.snapshot()["state"] == "FAILED"
+
+
+def test_public_service_accepts_scan_larger_than_the_two_resident_banks():
     params = replace(StreamerParams(), bank_size=2)
     document, artifact = _scan_artifact(params, count=5)
     transport = TraceRegisterTransport(params)
@@ -166,10 +216,11 @@ def test_public_service_rejects_nonresident_scan_before_backend_io():
         params=params,
     )
 
-    with pytest.raises(ValueError, match="fully resident capacity"):
-        service.prepare(artifact)
-    assert transport.write_batches == []
-    assert service.snapshot()["state"] == "IDLE"
+    reference = service.prepare(artifact)
+
+    assert reference.artifact_digest == artifact.fingerprint
+    assert service.snapshot()["state"] == "PREPARED"
+    service.safe_state()
 
 
 def test_resident_finite_terminal_owner_starts_at_fire_before_await():
@@ -232,7 +283,7 @@ def test_continuous_scan_observer_publishes_only_sampled_hardware_cursor():
 
 def test_static_terminal_evidence_never_reads_semantically_empty_cursor():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -368,7 +419,7 @@ def test_safe_after_fire_command_commit_cannot_be_overwritten_by_late_fire():
 
 def test_safe_interrupts_tail_wait_without_republishing_a_drain_deadline():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     delayed = replace(document, delays=(OutputDelay("ch11", 200, "ms"),))
     artifact = compile_pulse_artifact(
         delayed,
@@ -438,7 +489,7 @@ def test_terminal_cursor_mismatch_is_rejected_even_when_done_is_set():
 
 def test_short_wait_does_not_allow_next_prepare_to_cut_off_delay_tail():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     delayed = replace(document, delays=(OutputDelay("ch11", 20, "ms"),))
     artifact = compile_pulse_artifact(
         delayed,
@@ -527,7 +578,7 @@ def test_axi_absolute_deadline_includes_waiting_for_the_io_owner(tmp_path):
 
 def test_safe_absolute_deadline_includes_waiting_for_an_older_safe():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     transport = TraceRegisterTransport(params)
     session = DeployedStreamerSession(
         transport,
@@ -564,7 +615,7 @@ def test_safe_absolute_deadline_includes_waiting_for_an_older_safe():
 
 def test_clear_host_config_rechecks_layout_before_its_first_write():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     transport = TraceRegisterTransport(params)
     transport.words[CtrlWords.LAYOUT_ID] ^= 1
     session = _session(document, params, transport)
@@ -576,7 +627,7 @@ def test_clear_host_config_rechecks_layout_before_its_first_write():
 
 def test_layout_mismatch_close_revokes_without_geometry_dependent_writes():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     transport = TraceRegisterTransport(params)
     transport.words[CtrlWords.LAYOUT_ID] ^= 1
     lease = MemoryDeviceLease()
@@ -598,7 +649,7 @@ def test_layout_mismatch_close_revokes_without_geometry_dependent_writes():
 
 def test_bringup_enters_acknowledged_safe_before_clearing_live_configuration():
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     transport = TraceRegisterTransport(params)
     session = _session(document, params, transport)
 
@@ -623,7 +674,7 @@ def test_safe_requires_a_bounded_stable_status_acknowledgement():
             self.write_batches.append(rows)
 
     params = StreamerParams()
-    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     transport = StuckSafeTransport(params)
     session = DeployedStreamerSession(
         transport,
@@ -768,6 +819,54 @@ class WrongSequenceUartLink:
             framing.encode_reply((request[3] + 1) & 0xFF, framing.ST_OK)
             for request in requests
         ]
+
+
+class RecordingUartLink:
+    def __init__(self):
+        self.batches = []
+
+    def open(self):
+        pass
+
+    def close(self):
+        pass
+
+    @staticmethod
+    def exchange(request, *, deadline, stop=None):
+        return framing.encode_reply(request[3], framing.ST_OK, (0,))
+
+    def write_batch(self, requests, *, deadline, stop=None):
+        requests = tuple(requests)
+        self.batches.append(requests)
+        return [
+            framing.encode_reply(request[3], framing.ST_OK)
+            for request in requests
+        ]
+
+
+def test_uart_scan_bank_rearm_is_a_separate_acknowledged_phase(tmp_path):
+    link = RecordingUartLink()
+    transport = UartRegisterTransport(state_dir=tmp_path, link=link)
+
+    transport.rewrite_scan_bank(
+        unarmed_bank_ready=0b10,
+        bank_words=((100, 7), (101, 8)),
+        chunk_word=CtrlWords.BANK0_CHUNK,
+        chunk_index=2,
+        rearmed_bank_ready=0b11,
+    )
+
+    assert len(link.batches) == 4
+    addresses = [
+        int.from_bytes(batch[0][4:8], "little")
+        for batch in link.batches
+    ]
+    assert addresses == [
+        CtrlWords.BANK_READY,
+        100,
+        CtrlWords.BANK0_CHUNK,
+        CtrlWords.BANK_READY,
+    ]
 
 
 def test_uart_transport_rejects_stale_or_reordered_sequence_replies(tmp_path):

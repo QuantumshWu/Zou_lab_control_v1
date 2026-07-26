@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import math
 from numbers import Integral
+from typing import TYPE_CHECKING, Mapping, Protocol, runtime_checkable
 
 import numpy as np
 
 from zlc_data import immutable_array
+
+if TYPE_CHECKING:
+    from zlc_data import AxisSpec, CoordinateFrameId, Selection
+    from .figure import EvaluatedImage, EvaluatedInput
+    from .figure_outputs import FigureDerivedSignal, FigureOutputSource
+    from .image_view import ImageViewportTransform
 
 
 _SITE_RADIUS_BLOCK = 128
@@ -23,6 +30,48 @@ SITE_OCCUPIED_LINEWIDTH = 0.9
 SITE_INVALID_COLOR = "#CD7380"
 SITE_INVALID_ALPHA = 0.95
 SITE_INVALID_LINEWIDTH = SITE_OCCUPIED_LINEWIDTH
+
+
+@runtime_checkable
+class SiteMapPresentation(Protocol):
+    """Generic Figure-ready site layer owned by the frontend."""
+
+    background: "EvaluatedImage"
+    background_input: "EvaluatedInput"
+    home_viewport: "ImageViewportTransform"
+    site_axis: "AxisSpec"
+    coordinate_frame: "CoordinateFrameId"
+    centers_xy: np.ndarray
+    site_radius: float
+    site_validity: np.ndarray
+    run_id: str
+    provenance_epoch_id: str
+    coherence_identity: str
+    summary: str
+
+    @property
+    def site_state_input(self) -> "EvaluatedInput": ...
+
+    @property
+    def cell_selection(self) -> "Selection": ...
+
+    @property
+    def site_geometry_identity(self) -> str: ...
+
+    @property
+    def view_identity(self) -> str: ...
+
+    @property
+    def site_state(self) -> np.ndarray | None: ...
+
+    @property
+    def presentation_kind(self) -> str: ...
+
+    def materialize_area_outputs(
+        self,
+        source: "FigureOutputSource",
+        selection: "Selection",
+    ) -> Mapping[str, "FigureDerivedSignal"]: ...
 
 
 def site_ring_radius(centers_xy: np.ndarray) -> float:
@@ -75,9 +124,9 @@ def immutable_site_state(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Structurally freeze one already-admitted SiteMap projection.
 
-    Calibration/occupancy owners decide whether a site state is physically
-    admissible.  The frontend checks only the shape, dtype and finite drawing
-    coordinates required by its render payload.
+    The upstream neutral publication decides whether a site state is
+    physically admissible.  The frontend checks only the shape, dtype and
+    finite drawing coordinates required by its render payload.
     """
 
     if isinstance(site_count, bool) or not isinstance(site_count, Integral):
@@ -125,6 +174,7 @@ __all__ = [
     "SITE_OCCUPIED_ALPHA",
     "SITE_OCCUPIED_COLOR",
     "SITE_OCCUPIED_LINEWIDTH",
+    "SiteMapPresentation",
     "immutable_site_state",
     "site_ring_radius",
 ]

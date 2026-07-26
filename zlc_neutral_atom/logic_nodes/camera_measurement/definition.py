@@ -19,7 +19,12 @@ from zlc_data import (
 )
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
-from zlc_neutral_atom.logic_nodes.camera_capture.reference import (
+from zlc_neutral_atom.logic_node_declaration import (
+    DynamicChoicePresentation,
+    LogicNodeDeclaration,
+)
+from zlc_neutral_atom.node_input import bind_no_node_inputs
+from zlc_neutral_atom.capture.reference import (
     CaptureArtifactRef,
     capture_artifact_ref_to_tree,
 )
@@ -35,10 +40,13 @@ from zlc_neutral_atom.runtime.dataset import (
 )
 from zlc_neutral_atom.runtime.streams import event_ref_to_tree
 from zlc_storage import canonical_digest, canonical_text, positive_integer
+from zlc_storage import positive_real
 
-from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
-from zlc_neutral_atom.devices.camera.contract import (
-    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+from zlc_neutral_atom.authoring import (
+    MINIMUM_POSITIVE_FLOAT,
+    AuthoringChoice,
+    AuthoringField,
+    AuthoringSchema,
 )
 
 
@@ -61,7 +69,6 @@ CAMERA_MEASUREMENT_DEFINITION = MeasurementDefinition(
     "Camera",
     "zlc.camera-measurement-request",
     "zlc.camera-measurement-binding",
-    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
 )
 
 
@@ -85,6 +92,20 @@ _CAMERA_MEASUREMENT_AUTHORING_SCHEMA = AuthoringSchema(
             allow_blank=False,
             description=(
                 "Ordered camera frames retained on an explicit READOUT_EVENT axis"
+            ),
+        ),
+        AuthoringField(
+            "exposure",
+            "float",
+            "Exposure",
+            default=None,
+            required=False,
+            unit="s",
+            minimum=MINIMUM_POSITIVE_FLOAT,
+            allow_blank=True,
+            description=(
+                "Exposure applied and read back for this Camera run; blank keeps "
+                "the selected camera's installed working point"
             ),
         ),
         AuthoringField(
@@ -135,24 +156,50 @@ def camera_measurement_default_role(available_roles) -> str | None:
     return roles[0] if roles else None
 
 
-def build_camera_measurement_request_from_authoring(
-    builder,
-    values: Mapping[str, object],
-) -> "CameraMeasurementRequest":
-    """Freeze Camera leaves through their owner before resolving the device."""
+@dataclass(frozen=True, slots=True)
+class CameraMeasurementIntent:
+    """Device-independent Camera authoring frozen before installation binding."""
 
-    if not callable(builder):
-        raise TypeError("Camera Measurement request builder must be callable")
+    camera_role: str
+    frames_per_cycle: int = DEFAULT_CAMERA_FRAMES_PER_CYCLE
+    exposure_seconds: float | None = None
+    repeat: int = DEFAULT_CAMERA_MEASUREMENT_REPEAT
+
+    def __post_init__(self) -> None:
+        canonical_text(self.camera_role, "camera_role")
+        object.__setattr__(
+            self,
+            "frames_per_cycle",
+            positive_integer(self.frames_per_cycle, "frames_per_cycle"),
+        )
+        if isinstance(self.repeat, bool) or not isinstance(self.repeat, int):
+            raise TypeError("repeat must be an integer")
+        if self.repeat < MINIMUM_CAMERA_MEASUREMENT_REPEAT:
+            raise ValueError("repeat must be non-negative")
+        if self.exposure_seconds is not None:
+            object.__setattr__(
+                self,
+                "exposure_seconds",
+                positive_real(self.exposure_seconds, "exposure_seconds"),
+            )
+
+    @property
+    def output_declarations(self) -> tuple[DatasetOutputDeclaration, ...]:
+        return camera_frame_output_declarations(self.frames_per_cycle)
+
+
+def build_camera_measurement_intent_from_authoring(
+    values: Mapping[str, object],
+) -> CameraMeasurementIntent:
+    """Freeze Camera leaves without resolving an installed DeviceRef."""
+
     authored = camera_measurement_authoring_schema().freeze(values)
-    selected = {
-        key: value
-        for key, value in authored.items()
-        if value not in (None, "")
-    }
-    request = builder(**selected)
-    if not isinstance(request, CameraMeasurementRequest):
-        raise TypeError("Camera Measurement request builder returned another value")
-    return request
+    return CameraMeasurementIntent(
+        camera_role=authored["camera_role"],
+        frames_per_cycle=authored["frames_per_cycle"],
+        exposure_seconds=authored["exposure"],
+        repeat=authored["repeat"],
+    )
 
 
 def camera_frame_output_index(output_name: str) -> int:
@@ -463,6 +510,7 @@ class CameraMeasurementRequest:
     repeat: int = DEFAULT_CAMERA_MEASUREMENT_REPEAT
     history_cycles: int = DEFAULT_CAMERA_MONITOR_HISTORY_CYCLES
     frames_per_cycle: int = DEFAULT_CAMERA_FRAMES_PER_CYCLE
+    exposure_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.camera_ref, DeviceRef):
@@ -481,6 +529,13 @@ class CameraMeasurementRequest:
             "frames_per_cycle",
             positive_integer(self.frames_per_cycle, "frames_per_cycle"),
         )
+        exposure = self.exposure_seconds
+        if exposure is not None:
+            object.__setattr__(
+                self,
+                "exposure_seconds",
+                positive_real(exposure, "exposure_seconds"),
+            )
 
     @property
     def output_names(self) -> tuple[str, ...]:
@@ -508,11 +563,53 @@ class CameraMeasurementDescriptor:
         canonical_text(self.resource_claim, "resource_claim")
 
 
+def _camera_request_outputs(
+    request: object,
+) -> tuple[DatasetOutputDeclaration, ...]:
+    if not isinstance(request, (CameraMeasurementIntent, CameraMeasurementRequest)):
+        raise TypeError("Camera output owner requires an authored or bound request")
+    return request.output_declarations
+
+
+def _camera_role_choices(context: object) -> tuple[DynamicChoicePresentation, ...]:
+    if not isinstance(context, tuple):
+        raise TypeError("Camera dynamic choice context must be a role tuple")
+    roles = camera_measurement_roles(context)
+    return (
+        DynamicChoicePresentation(
+            "camera_role",
+            tuple(AuthoringChoice(role, role) for role in roles),
+            camera_measurement_default_role(roles),
+            "Camera Measurement requires an installed camera role" if not roles else "",
+        ),
+    )
+
+
+CAMERA_MEASUREMENT_LOGIC_NODE = LogicNodeDeclaration(
+    definition=CAMERA_MEASUREMENT_DEFINITION,
+    description="Acquire camera frames as a live or finite Measurement",
+    authoring_schema=_CAMERA_MEASUREMENT_AUTHORING_SCHEMA,
+    input_specs=(),
+    outputs=(),
+    build_request=build_camera_measurement_intent_from_authoring,
+    bind_request=bind_no_node_inputs,
+    request_output_declarations=_camera_request_outputs,
+    request_output_axis_label="Counts",
+    request_output_description=(
+        "ordered camera readout event; repeat, point, and trailing data axes "
+        "are preserved"
+    ),
+    resolve_dynamic_choices=_camera_role_choices,
+)
+
+
 __all__ = [
     "CAMERA_MEASUREMENT_ROLE_ORDER",
     "CAMERA_MEASUREMENT_DEFINITION",
     "CAMERA_MEASUREMENT_KEY",
+    "CAMERA_MEASUREMENT_LOGIC_NODE",
     "CameraMeasurementDescriptor",
+    "CameraMeasurementIntent",
     "CameraMeasurementRequest",
     "CAMERA_FRAME_OUTPUT_CONTRACT_ID",
     "DEFAULT_CAMERA_FRAMES_PER_CYCLE",
@@ -522,7 +619,7 @@ __all__ = [
     "MINIMUM_CAMERA_FRAMES_PER_CYCLE",
     "MINIMUM_CAMERA_MEASUREMENT_REPEAT",
     "camera_measurement_authoring_schema",
-    "build_camera_measurement_request_from_authoring",
+    "build_camera_measurement_intent_from_authoring",
     "camera_measurement_default_role",
     "camera_measurement_roles",
     "camera_frame_output_index",

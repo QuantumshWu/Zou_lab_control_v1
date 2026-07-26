@@ -454,7 +454,6 @@ def open_figure_workbench(
     intent=None,
     selection=None,
     preferences=None,
-    occupancy_output=None,
     fit_preparer=None,
     fit_executor=None,
     fit_saver=None,
@@ -513,8 +512,6 @@ def open_figure_workbench(
         "selection": selection,
         "preferences": preferences,
     }
-    if occupancy_output is not None:
-        options["occupancy_output"] = occupancy_output
     return open_workbench_window(
         _figure_window_factory(
             lambda: figure_factory(source, **options),

@@ -9,9 +9,15 @@ from types import MappingProxyType
 from typing import Callable
 import uuid
 
+from zlc_data import ValueSchema
 from zlc_neutral_atom.dataset_output import LiveDatasetOutput
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
+from zlc_neutral_atom.runtime.signal_source import (
+    SignalAssociationScheduleRequirement,
+    SignalEventAssociationSource,
+    SignalEventSource,
+)
 from zlc_workbench.input_binding import ResolvedDatasetInput
 
 from .console_records import console_signal_key
@@ -76,6 +82,7 @@ class ConsoleProcessorNode:
         request: object,
         source_input: ResolvedDatasetInput,
         initial_source: ConsoleSignalValue,
+        source_event_source: SignalEventSource | None = None,
         prepare_application: Callable[[], object],
         materialize_publication: Callable[
             [object, ConsoleSignalValue], ConsoleProcessorPublication
@@ -98,6 +105,13 @@ class ConsoleProcessorNode:
         if not isinstance(initial_source.coverage, MonitorCoverage):
             raise ValueError(
                 "latest-only Processor input requires typed monitor coverage"
+            )
+        if source_event_source is not None and not isinstance(
+            source_event_source,
+            SignalEventSource,
+        ):
+            raise TypeError(
+                "source_event_source must implement SignalEventSource or be None"
             )
         source_generation = getattr(source_node, "lifecycle_generation", None)
         if (
@@ -131,7 +145,13 @@ class ConsoleProcessorNode:
         self._source_input = source_input
         self._source_signal = source_signal
         self._output_declarations = tuple(spec.outputs_for(request))
+        self._output_names = tuple(
+            declaration.name for declaration in self._output_declarations
+        )
         self._source_node = source_node
+        self._source_event_source = source_event_source
+        self._signal_event_source: SignalEventSource | None = None
+        self._signal_events_closed = False
         self._source_lifecycle_generation = source_generation
         self._initial_source: ConsoleSignalValue | None = initial_source
         self._source_run_id = initial_source.run_id
@@ -183,6 +203,12 @@ class ConsoleProcessorNode:
         return self._output_declarations
 
     @property
+    def output_names(self) -> tuple[str, ...]:
+        """Exact owner-declared names available through the event seam."""
+
+        return self._output_names
+
+    @property
     def running(self) -> bool:
         return self._state is RunState.RUNNING
 
@@ -229,6 +255,29 @@ class ConsoleProcessorNode:
             for output in self._output_declarations
         )
 
+    def value_schema(self, output_name: str) -> ValueSchema:
+        """Return one running Processor output's owner-defined event schema."""
+
+        name = self._require_output_name(output_name)
+        source = self._running_signal_source()
+        schema = source.value_schema(name)
+        if not isinstance(schema, ValueSchema):
+            raise TypeError("Processor signal source returned another schema type")
+        return schema
+
+    def open_signal_cursor(self, output_name: str):
+        """Open a future-only cursor over one running Processor output."""
+
+        name = self._require_output_name(output_name)
+        return self._running_signal_source().open_signal_cursor(name)
+
+    @property
+    def worker_idle(self) -> bool:
+        """Whether the optional derived-event worker has fully stopped."""
+
+        source = self._signal_event_source
+        return source is None or bool(getattr(source, "worker_idle", False))
+
     def start(self) -> None:
         if self.running:
             return
@@ -254,6 +303,7 @@ class ConsoleProcessorNode:
             return
         self._cancel_requested = True
         self._phase = "stopping after current Processor evaluation"
+        self._close_signal_events()
         if self._data_plane.cancel_latest_only_processor(self):
             self._accept_processor_cancelled()
 
@@ -261,6 +311,15 @@ class ConsoleProcessorNode:
         if self._state is None:
             return None
         if self._state.terminal:
+            return self._snapshot()
+        signal_source = self._signal_event_source
+        signal_error = (
+            None if signal_source is None else getattr(signal_source, "error", None)
+        )
+        if signal_error is not None:
+            if not isinstance(signal_error, Exception):
+                signal_error = RuntimeError(str(signal_error))
+            self._fail(signal_error)
             return self._snapshot()
         if (
             getattr(self._source_node, "lifecycle_generation", None)
@@ -285,7 +344,10 @@ class ConsoleProcessorNode:
         return self._snapshot()
 
     def shutdown(self) -> None:
-        self.cancel("TaskConsole is closing")
+        try:
+            self.cancel("TaskConsole is closing")
+        finally:
+            self._close_signal_events()
 
     def _prepare_processor_application(self) -> object:
         return self._prepare_application()
@@ -314,8 +376,31 @@ class ConsoleProcessorNode:
     def _processor_application_ready(self, application: object) -> None:
         if not callable(getattr(application, "evaluate", None)):
             raise TypeError("Processor prepare returned no evaluable application")
-        if self._state is RunState.RUNNING and not self._cancel_requested:
-            self._phase = "waiting for a new source revision"
+        if self._state is not RunState.RUNNING or self._cancel_requested:
+            return
+        start_signal_events = getattr(application, "start_signal_events", None)
+        if start_signal_events is not None:
+            if not callable(start_signal_events):
+                raise TypeError(
+                    "Processor application start_signal_events must be callable"
+                )
+            upstream = self._source_event_source
+            if upstream is None:
+                raise TypeError(
+                    "Processor live events require a SignalEventSource input"
+                )
+            derived = start_signal_events(upstream)
+            try:
+                self._validate_signal_event_source(derived)
+            except BaseException:
+                close = getattr(derived, "close", None)
+                if callable(close):
+                    close()
+                raise
+            self._signal_event_source = derived
+            self._signal_events_closed = False
+            self._refresh_signal_association_capability(derived)
+        self._phase = "waiting for a new source revision"
 
     def _processor_work_started(self, source: ConsoleSignalValue) -> None:
         self._validate_processor_source(source)
@@ -339,8 +424,7 @@ class ConsoleProcessorNode:
         self._data_plane.publish_processor(
             self,
             publication.outputs,
-            run_id=source.run_id,
-            epoch_id=source.epoch_id,
+            source=source,
             presentations=publication.presentations,
         )
         self._phase = "waiting for a new source revision"
@@ -348,12 +432,16 @@ class ConsoleProcessorNode:
     def _accept_processor_failure(self, error: Exception) -> None:
         if self._state is None or self._state.terminal:
             return
+        self._close_signal_events()
+        self._data_plane.withdraw_processor(self)
         self._error = f"{type(error).__name__}: {error}"
         self._state = RunState.FAILED
         self._phase = "failed"
 
     def _accept_processor_cancelled(self) -> None:
         if self._state is RunState.RUNNING:
+            self._close_signal_events()
+            self._data_plane.withdraw_processor(self)
             self._state = RunState.CANCELLED
             self._phase = "cancelled"
 
@@ -363,6 +451,90 @@ class ConsoleProcessorNode:
     def _fail(self, error: Exception) -> None:
         self._accept_processor_failure(error)
         self._data_plane.cancel_latest_only_processor(self)
+
+    def _require_output_name(self, output_name: str) -> str:
+        if (
+            not isinstance(output_name, str)
+            or not output_name
+            or output_name.strip() != output_name
+        ):
+            raise ValueError("Processor output name must be canonical text")
+        if output_name not in self._output_names:
+            raise KeyError(f"Processor has no output {output_name!r}")
+        return output_name
+
+    def _running_signal_source(self) -> SignalEventSource:
+        if self._state is not RunState.RUNNING or self._cancel_requested:
+            raise RuntimeError("Processor signal events are not running")
+        source = self._signal_event_source
+        if source is None:
+            raise TypeError("this Processor does not expose live signal events")
+        return source
+
+    def _validate_signal_event_source(self, source: object) -> None:
+        if not isinstance(source, SignalEventSource):
+            raise TypeError(
+                "Processor start_signal_events returned no SignalEventSource"
+            )
+        close = getattr(source, "close", None)
+        if not callable(close):
+            raise TypeError("Processor signal source must expose close()")
+        if type(getattr(source, "worker_idle", None)) is not bool:
+            raise TypeError(
+                "Processor signal source must expose boolean worker_idle"
+            )
+        output_names = getattr(source, "output_names", None)
+        if output_names is not None and tuple(output_names) != self._output_names:
+            raise ValueError(
+                "Processor signal source differs from the declared output vocabulary"
+            )
+        for name in self._output_names:
+            if not isinstance(source.value_schema(name), ValueSchema):
+                raise TypeError(
+                    "Processor signal source value_schema() must return ValueSchema"
+                )
+
+    def _close_signal_events(self) -> None:
+        self._clear_signal_association_capability()
+        source = self._signal_event_source
+        if source is None or self._signal_events_closed:
+            return
+        close = getattr(source, "close", None)
+        if not callable(close):
+            raise TypeError("Processor signal source lost its close() seam")
+        close()
+        self._signal_events_closed = True
+
+    def _refresh_signal_association_capability(self, source: object) -> None:
+        self._clear_signal_association_capability()
+        if isinstance(source, SignalEventAssociationSource):
+            self.__dict__.update(
+                open_associated_signal_cursor=self._open_associated_signal_cursor,
+                signal_association_schedule_requirement=(
+                    self._signal_association_schedule_requirement
+                ),
+            )
+
+    def _clear_signal_association_capability(self) -> None:
+        self.__dict__.pop("open_associated_signal_cursor", None)
+        self.__dict__.pop("signal_association_schedule_requirement", None)
+
+    def _open_associated_signal_cursor(self, output_name: str):
+        name = self._require_output_name(output_name)
+        source = self._running_signal_source()
+        if not isinstance(source, SignalEventAssociationSource):
+            raise RuntimeError("Processor lost signal association capability")
+        return source.open_associated_signal_cursor(name)
+
+    def _signal_association_schedule_requirement(
+        self,
+        output_name: str,
+    ) -> SignalAssociationScheduleRequirement:
+        name = self._require_output_name(output_name)
+        source = self._running_signal_source()
+        if not isinstance(source, SignalEventAssociationSource):
+            raise RuntimeError("Processor lost signal association capability")
+        return source.signal_association_schedule_requirement(name)
 
     def _snapshot(self) -> RunSnapshot:
         state = self._state

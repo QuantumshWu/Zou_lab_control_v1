@@ -7,43 +7,38 @@ import pathlib
 
 import pytest
 
-from Zou_lab_control.workbench.task_console_attachments.camera_measurement import (
-    camera_measurement_attachment,
+from zlc_neutral_atom.logic_nodes.camera_measurement import (
+    CAMERA_MEASUREMENT_LOGIC_NODE,
 )
-from Zou_lab_control.workbench.task_console_attachments.occupancy import (
-    occupancy_attachment,
+from zlc_neutral_atom.logic_nodes.readout.occupancy.declaration import (
+    OCCUPANCY_LOGIC_NODE,
 )
 from zlc_neutral_atom.catalog import definition_key_to_tree
-from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.logic_nodes.camera_measurement import CameraMeasurementRequest
 from zlc_workbench.task_console.application_ports import TaskConsoleApplicationPorts
 from zlc_workbench.task_console.catalog_bridge import ConsoleCatalogView
+from zlc_workbench.task_console.declaration_projection import (
+    project_processor_declaration,
+    project_run_declaration,
+)
 
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 
-def _camera_request_builder(*, camera_role="camera", repeat=0, frames_per_cycle=1):
-    return CameraMeasurementRequest(
-        DeviceRef("test-installation", "test-runtime", str(camera_role)),
-        repeat=int(repeat),
-        frames_per_cycle=int(frames_per_cycle),
-    )
-
-
 def _ports_and_view() -> tuple[TaskConsoleApplicationPorts, ConsoleCatalogView]:
     attachments = (
-        camera_measurement_attachment(
-            installed_camera_roles=("camera", "mot_camera"),
-            request_builder=_camera_request_builder,
-            prepare=lambda request: request,
+        project_run_declaration(
+            CAMERA_MEASUREMENT_LOGIC_NODE,
+            prepare=lambda intent: intent,
+            dynamic_choice_context=("camera", "mot_camera"),
         ),
-        occupancy_attachment(prepare=lambda request: request),
+        project_processor_declaration(
+            OCCUPANCY_LOGIC_NODE,
+            prepare=lambda request: request,
+            resolve_artifact_reference=lambda binding: binding,
+        ),
     )
-    ports = TaskConsoleApplicationPorts(
-        attachments=attachments,
-        resolve_artifact_reference=lambda reference: reference,
-    )
+    ports = TaskConsoleApplicationPorts(attachments=attachments)
     return ports, ConsoleCatalogView(
         tuple(attachment.spec for attachment in ports.attachments)
     )
@@ -65,16 +60,13 @@ def test_every_supplied_attachment_projects_once_with_definition_owned_kind() ->
 
 
 def test_application_ports_reject_duplicate_definition_keys() -> None:
-    attachment = camera_measurement_attachment(
-        installed_camera_roles=("camera",),
-        request_builder=_camera_request_builder,
-        prepare=lambda request: request,
+    attachment = project_run_declaration(
+        CAMERA_MEASUREMENT_LOGIC_NODE,
+        prepare=lambda intent: intent,
+        dynamic_choice_context=("camera",),
     )
     with pytest.raises(ValueError, match="duplicate TaskConsole attachment"):
-        TaskConsoleApplicationPorts(
-            attachments=(attachment, attachment),
-            resolve_artifact_reference=lambda reference: reference,
-        )
+        TaskConsoleApplicationPorts(attachments=(attachment, attachment))
 
 
 def test_camera_is_a_measurement_and_request_owns_frame_vocabulary() -> None:
@@ -85,12 +77,25 @@ def test_camera_is_a_measurement_and_request_owns_frame_vocabulary() -> None:
     request = camera.build_request(
         {"camera_role": "mot_camera", "frames_per_cycle": 3, "repeat": 0}
     )
-    assert request.output_names == ("frame_0", "frame_1", "frame_2")
+    assert tuple(output.name for output in request.output_declarations) == (
+        "frame_0",
+        "frame_1",
+        "frame_2",
+    )
     assert tuple(output.name for output in camera.outputs_for(request)) == (
         "frame_0",
         "frame_1",
         "frame_2",
     )
+    configured = camera.build_request(
+        {
+            "camera_role": "camera",
+            "frames_per_cycle": 1,
+            "exposure": 0.013,
+            "repeat": 0,
+        }
+    )
+    assert configured.exposure_seconds == 0.013
 
 
 def test_the_generic_bridge_is_qt_free_and_has_no_concrete_node_dispatch() -> None:

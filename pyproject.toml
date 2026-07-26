@@ -52,7 +52,6 @@ include = ["Zou_lab_control*", "zlc_data*", "zlc_storage*", "zlc_pulse*", "zlc_n
 
 [tool.setuptools.package-data]
 "zlc_pulse" = ["assets/*.json"]
-"zlc_neutral_atom" = ["assets/*.json"]
 "zlc_frontend" = ["assets/*.ttf"]
 "fpga" = ["board_config/*.json"]
 

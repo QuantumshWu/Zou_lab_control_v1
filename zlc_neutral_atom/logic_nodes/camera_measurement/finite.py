@@ -2,22 +2,36 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
+import uuid
 
 from zlc_data import AxisId, AxisSpec, BlockId, DatasetSchema, PointLayout, READOUT_EVENT, REPEAT
-from zlc_neutral_atom.logic_nodes.camera_capture.artifact import CaptureRepository
-from zlc_neutral_atom.logic_nodes.camera_capture.reference import CaptureArtifactRef
+from zlc_neutral_atom.capture.artifact import (
+    CaptureRepository,
+    compile_capture_artifact_pipeline,
+)
+from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.dataset_output import LiveDatasetOutput, single_live_dataset_output
 from zlc_neutral_atom.devices.camera.contract import CameraAcquisitionMode
-from zlc_neutral_atom.logic_nodes.camera_capture.prepared import PreparedExactCapture
-from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
+from zlc_neutral_atom.capture.prepared import PreparedExactCapture
+from zlc_neutral_atom.devices.camera.capture_port import (
+    BoundCapturePort,
+    configure_camera_exposure,
+)
 from zlc_neutral_atom.runtime.dataset import (
     DatasetCellAddress,
     DatasetCellSchedule,
     DatasetPreviewSnapshot,
     MonitorDatasetSnapshot,
 )
-from zlc_neutral_atom.logic_nodes.camera_capture.pipeline import MinimalPipelineSpec
+from zlc_neutral_atom.capture.pipeline import (
+    CapturePreviewPort,
+    CapturePreviewSpec,
+    MinimalPipelineSpec,
+)
+from zlc_neutral_atom.runtime.cleanup import CleanupReport, run_cleanup_steps
+from zlc_neutral_atom.runtime.preview import notify_preview_failure
 from zlc_neutral_atom.runtime.run import RunHandle, RunPlan
 from zlc_storage import positive_integer
 
@@ -100,6 +114,161 @@ class PreparedFiniteCameraMeasurement(PreparedExactCapture):
             source,
             self._request,
         )
+
+    def start(self) -> RunHandle:
+        if self._request.exposure_seconds is None:
+            return super().start()
+        self._claim_start()
+        return self._start_run(
+            _compile_exposure_configured_camera_artifact(
+                self._request,
+                self._pipeline.measurement.capture_port,
+                self._repository,
+            )
+        )
+
+    def start_with_preview(
+        self,
+        *,
+        factory: Callable[[CapturePreviewSpec], CapturePreviewPort],
+        source_ordinals: tuple[int, ...] | None = None,
+    ) -> RunHandle:
+        if self._request.exposure_seconds is None:
+            return super().start_with_preview(
+                factory=factory,
+                source_ordinals=source_ordinals,
+            )
+        if not callable(factory):
+            raise TypeError("factory must be callable")
+        self.preview_schema
+        self._claim_start()
+        preview_spec = CapturePreviewSpec(
+            self._preview_block_id,
+            self._preview_edge,
+            source_ordinals,
+        )
+        preview = factory(preview_spec)
+        plan = _compile_exposure_configured_camera_artifact(
+            self._request,
+            self._pipeline.measurement.capture_port,
+            self._repository,
+            preview=preview,
+        )
+        try:
+            return self._start_run(plan)
+        except BaseException as error:
+            notify_preview_failure(preview, error)
+            raise
+
+
+@dataclass
+class _ConfiguredFiniteCapture:
+    exposure_session_id: str
+    exposure_attempted: bool = False
+    inner_plan: RunPlan | None = None
+    inner_prepared: object | None = None
+
+
+def _compile_exposure_configured_camera_artifact(
+    request: CameraMeasurementRequest,
+    port: BoundCapturePort,
+    repository: CaptureRepository,
+    *,
+    preview: CapturePreviewPort | None = None,
+) -> RunPlan:
+    """Configure, capture, and restore one Camera request in a flat Run."""
+
+    exposure = request.exposure_seconds
+    if exposure is None:
+        pipeline, _descriptor = bind_finite_camera_measurement(
+            request,
+            camera_port=port,
+        )
+        return compile_capture_artifact_pipeline(
+            pipeline,
+            repository,
+            preview=preview,
+        )
+    state = _ConfiguredFiniteCapture(uuid.uuid4().hex)
+
+    def preflight(context):
+        state.exposure_attempted = True
+        leased_port = configure_camera_exposure(
+            context,
+            port,
+            state.exposure_session_id,
+            exposure,
+        )
+        pipeline, _descriptor = bind_finite_camera_measurement(
+            request,
+            camera_port=leased_port,
+        )
+        inner = compile_capture_artifact_pipeline(
+            pipeline,
+            repository,
+            preview=preview,
+        )
+        if (
+            inner.resource_claims != (port.resource_claim,)
+            or inner.bound_devices != (port.device,)
+            or inner.interrupt_operations != port.interrupt_operations
+            or not inner.requires_final_commit
+        ):
+            raise RuntimeError(
+                "configured Camera inner plan changed its admitted authority"
+            )
+        state.inner_plan = inner
+        prepared = inner.preflight(context)
+        state.inner_prepared = prepared
+        return state
+
+    def execute(context, prepared: _ConfiguredFiniteCapture):
+        if prepared is not state or state.inner_plan is None:
+            raise RuntimeError("configured Camera preflight authority differs")
+        return state.inner_plan.execute(context, state.inner_prepared)
+
+    def cleanup(
+        context,
+        prepared: _ConfiguredFiniteCapture | None,
+        primary: BaseException | None,
+    ) -> CleanupReport:
+        def cleanup_capture() -> CleanupReport:
+            inner = state.inner_plan
+            if inner is None:
+                return port.verify_idle(context)
+            return inner.cleanup(context, state.inner_prepared, primary)
+
+        steps = [cleanup_capture]
+        if state.exposure_attempted:
+            steps.append(
+                lambda: port.cleanup(context, state.exposure_session_id)
+            )
+        return run_cleanup_steps(*steps)
+
+    def finalize(context, result):
+        inner = state.inner_plan
+        if inner is None:
+            raise RuntimeError("configured Camera lost its finalization owner")
+        return inner.finalize(context, result)
+
+    def dispose_unfinalized(result) -> None:
+        inner = state.inner_plan
+        if inner is None or inner.dispose_unfinalized is None:
+            return
+        inner.dispose_unfinalized(result)
+
+    return RunPlan(
+        name=f"Camera {request.camera_ref.role}",
+        resource_claims=(port.resource_claim,),
+        bound_devices=(port.device,),
+        preflight=preflight,
+        execute=execute,
+        cleanup=cleanup,
+        finalize=finalize,
+        interrupt_operations=port.interrupt_operations,
+        requires_final_commit=True,
+        dispose_unfinalized=dispose_unfinalized,
+    )
 
 
 def bind_finite_camera_measurement(

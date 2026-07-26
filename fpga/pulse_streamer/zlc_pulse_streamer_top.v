@@ -9,8 +9,9 @@
 //
 // One clean design (no variants).  JTAG-to-AXI control; edge + scan tables in
 // BLOCK RAM, bus tables in LUTRAM inside the engine.  Reaches 4096 edges + 4096
-// resident scan points in the currently qualified runtime.  The frozen mailbox
-// contains refill fields, but host-refilled operation is not a published mode.
+// bank-local scan slots at one time.  The host preloads two chunks and its sole
+// observer refills released banks through the frozen mailbox while this FPGA
+// remains the owner of every scan-point transition.
 //
 // Control path (all behind ONE proven axi_bram_ctrl, so AXI handshakes are the
 // vendor IP -- only a SIMPLE combinational write decoder is custom):
@@ -26,9 +27,10 @@
 //     R_BUS   bus-image BRAM; the mini-loader copies it into the engine bus LUTRAM
 //
 // SCAN BANKS: the engine plays scan point 0..N-1 through two banks and exposes
-// scan_cursor plus BANK_READY/BANK*_CHUNK.  The current host loads both banks
-// before FIRE and admits N<=2*BANK_SIZE.  Refill fields remain frozen RTL facts,
-// not evidence that host-refilled timing has been qualified.
+// scan_cursor plus BANK_READY/BANK*_CHUNK.  Prepare loads the first two chunks;
+// the sole host observer refills each released bank without driving per-point
+// timing.  A late or missing chunk holds the engine and raises UNDERFLOW, which
+// invalidates the run.
 //
 // 1-TICK: the build tcl forces the 3 edge BRAMs to READ_LATENCY_B = 2 so the
 // engine's RD_LAT=2 prefetch pipeline is deterministic and back-to-back 20 ns
@@ -50,7 +52,7 @@ module zlc_pulse_streamer_top #(
     parameter integer EDGE_ADDR_WIDTH = `ZLC_EDGE_ADDR_WIDTH,
     parameter integer BANK_SIZE = `ZLC_BANK_SIZE,           // power of two; scan ping-pong bank
     parameter integer SCAN_ADDR_WIDTH = `ZLC_SCAN_ADDR_WIDTH, // = clog2(2*BANK_SIZE), image.scan_addr_width
-    parameter integer SCAN_COUNT_WIDTH = 32,                // encoded total N; current host admits resident capacity
+    parameter integer SCAN_COUNT_WIDTH = 32,                // encoded total scan-point count N; independent of bank depth
     parameter integer TICK_WIDTH = `ZLC_TICK_WIDTH,
     parameter integer NUM_SLOTS = `ZLC_NUM_SLOTS,
     parameter integer COEFF_WIDTH = `ZLC_COEFF_WIDTH,

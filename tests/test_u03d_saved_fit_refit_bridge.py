@@ -31,7 +31,7 @@ from zlc_neutral_atom.artifacts import FitResultRepository
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+PULSE = ROOT / "pulses" / "imaging_template.json"
 PANEL_ID = "generic-typed"
 
 

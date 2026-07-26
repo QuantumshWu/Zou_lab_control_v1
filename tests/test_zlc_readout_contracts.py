@@ -22,7 +22,7 @@ from zlc_data import (
     ValueSchema,
     value_schema_to_tree,
 )
-from zlc_neutral_atom.logic_nodes.readout_common.contracts import (
+from zlc_neutral_atom.logic_nodes.readout.contracts import (
     CalibrationCaptureLayout,
     FrameContract,
 )
@@ -31,7 +31,7 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraEventReadoutSetting,
     ReadoutBindingKey,
 )
-from zlc_neutral_atom.logic_nodes.readout_common.codec import (
+from zlc_neutral_atom.logic_nodes.readout.codec import (
     calibration_capture_layout_from_tree,
     calibration_capture_layout_to_tree,
     frame_contract_from_tree,

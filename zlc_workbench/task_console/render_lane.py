@@ -38,6 +38,16 @@ class PanelRenderRequest:
     fit_result: object | None = None
     fit_result_identity: str | None = None
     rolling_distribution: bool = False
+    # One Figure may be presented by the live card and by an Edit tab frozen
+    # at an older accepted input.  They share this lane and the same renderer
+    # implementation, but each surface needs its own persistent Agg state.
+    # ``panel_id`` remains the Figure's semantic identity; ``surface_id`` is
+    # only the composition/presentation route.
+    surface_id: str | None = None
+
+    @property
+    def render_surface_id(self) -> str:
+        return self.panel_id if self.surface_id is None else self.surface_id
 
 
 class ConsoleRenderLane:
@@ -83,22 +93,22 @@ class ConsoleRenderLane:
         with self._lock:
             if self._future is not None or self._completion is not None:
                 for request in requests:
-                    self._pending[request.panel_id] = request
+                    self._pending[request.render_surface_id] = request
                 return
         self._start(requests, ())
 
-    def forget(self, panel_id: str) -> None:
-        """Dispose worker state for one removed/rebound panel in lane order."""
+    def forget(self, surface_id: str) -> None:
+        """Dispose worker state for one retired presentation surface."""
 
         start_reset = False
         with self._lock:
-            self._pending.pop(panel_id, None)
+            self._pending.pop(surface_id, None)
             if self._future is None and self._completion is None:
                 start_reset = True
             else:
-                self._reset_pending.add(panel_id)
+                self._reset_pending.add(surface_id)
         if start_reset:
-            self._start((), (panel_id,))
+            self._start((), (surface_id,))
 
     def _start(
         self,
@@ -119,17 +129,19 @@ class ConsoleRenderLane:
         requests: tuple[PanelRenderRequest, ...],
         reset_panel_ids: tuple[str, ...],
     ):
-        from zlc_frontend.site_map_render import SiteMapComposer, SiteMapView
+        from zlc_frontend.site_map import SiteMapPresentation
+        from zlc_frontend.site_map_render import SiteMapComposer
         from zlc_frontend.panel_render import PanelComposer, PanelRenderError
 
-        for panel_id in reset_panel_ids:
-            owned = self._worker_composers.pop(panel_id, None)
+        for surface_id in reset_panel_ids:
+            owned = self._worker_composers.pop(surface_id, None)
             if owned is not None:
                 owned[1].close()
 
         results = []
         for request in requests:
-            owned = self._worker_composers.get(request.panel_id)
+            surface_id = request.render_surface_id
+            owned = self._worker_composers.get(surface_id)
             if owned is None or owned[0] != request.source_key:
                 if owned is not None:
                     owned[1].close()
@@ -155,7 +167,7 @@ class ConsoleRenderLane:
                         rolling_trace=request.kind == "monitor",
                         rolling_distribution=request.rolling_distribution,
                     )
-                self._worker_composers[request.panel_id] = (
+                self._worker_composers[surface_id] = (
                     request.source_key,
                     composer,
                 )
@@ -164,7 +176,7 @@ class ConsoleRenderLane:
             try:
                 if request.kind == "sites":
                     presentation = getattr(request.value, "presentation", None)
-                    if not isinstance(presentation, SiteMapView.__args__):
+                    if not isinstance(presentation, SiteMapPresentation):
                         raise PanelRenderError(
                             "Site map requires one typed physical SiteMap view"
                         )
@@ -245,7 +257,9 @@ class ConsoleRenderLane:
         # Closing the composer merely because a fast wheel gesture overtook one
         # raster answer made every zoom burst pay first-frame construction and
         # permanently prevented the steady blit path from warming up.
-        reset.difference_update(request.panel_id for request in pending)
+        reset.difference_update(
+            request.render_surface_id for request in pending
+        )
         if pending or reset:
             self._start(pending, tuple(sorted(reset)))
 

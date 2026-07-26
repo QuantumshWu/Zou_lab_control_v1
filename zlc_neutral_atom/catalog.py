@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from zlc_storage import (
     canonical_text as _canonical_text,
     exact_mapping,
-    sha256_text,
 )
 
 
@@ -79,17 +78,12 @@ class MeasurementDefinition:
     title: str
     request_schema_id: str
     binding_schema_id: str
-    capture_spec_owner_fingerprint: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, DefinitionKey):
             raise TypeError("key must be DefinitionKey")
         for field in ("title", "request_schema_id", "binding_schema_id"):
             _canonical_text(getattr(self, field), field)
-        sha256_text(
-            self.capture_spec_owner_fingerprint,
-            "capture_spec_owner_fingerprint",
-        )
 
 
 @dataclass(frozen=True)

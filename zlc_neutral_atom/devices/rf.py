@@ -45,18 +45,12 @@ def _table(values: object) -> tuple[float, ...]:
 @dataclass(frozen=True, slots=True)
 class RfTableCapabilitySnapshot:
     binding_stamp: DeviceBindingStamp
-    maximum_points: int
     max_blocking_call_seconds: float
     capability_fingerprint: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.binding_stamp, DeviceBindingStamp):
             raise TypeError("binding_stamp must be DeviceBindingStamp")
-        object.__setattr__(
-            self,
-            "maximum_points",
-            positive_integer(self.maximum_points, "RF maximum_points"),
-        )
         object.__setattr__(
             self,
             "max_blocking_call_seconds",
@@ -182,8 +176,6 @@ class BoundRfTablePort:
     ) -> None:
         if not isinstance(table, RfDetuningTable):
             raise TypeError("table must be RfDetuningTable")
-        if len(table.detuning_gamma) > self.capability.maximum_points:
-            raise ValueError("RF detuning table exceeds the bound Port capacity")
         if (
             self.device.validate_capability(self.capability_attestation)
             is not self.capability

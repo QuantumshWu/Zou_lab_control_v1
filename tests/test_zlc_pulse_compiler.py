@@ -25,7 +25,7 @@ from zlc_pulse import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+IMAGING_TEMPLATE = ROOT / "pulses" / "imaging_template.json"
 _SECONDS_PER_TIME_UNIT = {
     "ns": Fraction(1, 1_000_000_000),
     "us": Fraction(1, 1_000_000),

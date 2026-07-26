@@ -19,11 +19,11 @@ from zlc_frontend.qt_widgets import ensure_qt_app
 import pytest
 
 import Zou_lab_control.notebook as zlc
-from zlc_neutral_atom.logic_nodes.calibration.calibration import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     build_calibration_analysis_request_from_authoring,
     calibration_analysis_authoring_schema,
 )
-from zlc_neutral_atom.logic_nodes.calibration.reference import CalibrationArtifactRef
+from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
 from zlc_workbench.form_projection import project_authoring_form
 
@@ -75,8 +75,9 @@ def test_calibration_owner_presenter_and_public_imports_remain_headless() -> Non
             "-c",
             (
                 "import sys\n"
-                "import zlc_neutral_atom.logic_nodes.calibration.calibration\n"
-                "import zlc_workbench.logic_node_presentations.calibration\n"
+                "import zlc_neutral_atom.logic_nodes.readout.calibration.calibration\n"
+                "import zlc_neutral_atom.logic_nodes.readout.calibration.declaration\n"
+                "import zlc_neutral_atom.logic_nodes.readout.calibration.workbench_adapter\n"
                 "import zlc_workbench.form_projection\n"
                 "for prefix in ('PyQt5', 'matplotlib', 'scipy'):\n"
                 "    assert not any(\n"
@@ -374,7 +375,7 @@ def test_stop_before_finalize_publishes_no_calibration(
         replace(computation.report.request, split_seed=19),
     )
     before = _manifest_count(workspace)
-    import zlc_neutral_atom.logic_nodes.calibration.analysis as analysis_module
+    import zlc_neutral_atom.logic_nodes.readout.calibration.analysis as analysis_module
 
     original_analyze = analysis_module._analyze_calibration_resolved
     analyzed = threading.Event()

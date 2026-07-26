@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 import math
 from typing import Any, Mapping
@@ -32,9 +32,6 @@ from zlc_pulse import (
     resolve_api_segment_document,
 )
 from zlc_storage import canonical_digest, canonical_text, exact_mapping
-from zlc_neutral_atom.devices.camera.contract import (
-    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
-)
 from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
 
 
@@ -49,7 +46,6 @@ PULSE_SCAN_MEASUREMENT_DEFINITION = MeasurementDefinition(
     "Pulse scan",
     PULSE_SCAN_PROGRAM_SCHEMA,
     "zlc.pulse-scan-binding",
-    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
 )
 
 _AUTONOMOUS_SCAN_SLOT_KIND = "AUTONOMOUS_SCAN_SLOT"
@@ -391,7 +387,7 @@ class ApiSlotSegmentedProgram:
         )
         # Resolve every row while the intent/request is still being built.  A
         # sub-tick duration or out-of-range DAC is an authoring error, not a Run
-        # failure after camera/sequencer resources have already been admitted.
+        # failure after the sequencer has already been admitted.
         for row in self.table.rows:
             resolve_api_segment_document(
                 self.document,
@@ -423,12 +419,22 @@ class ApiSlotSegmentedProgram:
 
     @cached_property
     def resolved_point_documents(self) -> tuple[PulseDocument, ...]:
-        """The P finite point documents, resolved once and retained in row order."""
+        """The P single-fire point documents, resolved once in row order.
+
+        The authored whole-document RepeatRegion defines the outer Dataset R
+        axis.  API segmentation therefore fires each resolved point once for
+        every repeat; leaving that RepeatRegion inside each point document
+        would multiply R twice and would make one software segment emit more
+        than one physical point.
+        """
 
         documents = tuple(
-            resolve_api_segment_document(
-                self.document,
-                dict(zip(self.table.columns, row)),
+            replace(
+                resolve_api_segment_document(
+                    self.document,
+                    dict(zip(self.table.columns, row)),
+                ),
+                repeat=None,
             )
             for row in self.table.rows
         )
@@ -453,12 +459,15 @@ class ScanOutputContract:
     are intentionally not modelled until a second real policy is consumed.
     """
 
-    committed_transform: CommittedTransform
+    committed_transform: CommittedTransform | None
     output_dataset_schema: DatasetSchema
 
     def __post_init__(self) -> None:
-        if not isinstance(self.committed_transform, CommittedTransform):
-            raise TypeError("committed_transform must be CommittedTransform")
+        if self.committed_transform is not None and not isinstance(
+            self.committed_transform,
+            CommittedTransform,
+        ):
+            raise TypeError("committed_transform must be CommittedTransform or None")
         if not isinstance(self.output_dataset_schema, DatasetSchema):
             raise TypeError("output_dataset_schema must be DatasetSchema")
         schema = self.output_dataset_schema
@@ -471,7 +480,8 @@ class ScanOutputContract:
             schema.cell_schema.value_unit,
         )
         if (
-            transformed_schema.fingerprint
+            self.committed_transform is not None
+            and transformed_schema.fingerprint
             != self.committed_transform.output_schema_fingerprint
         ):
             raise ValueError(
@@ -490,7 +500,7 @@ class ScanOutputContract:
 def bind_scan_output_contract(
     input_schema: DatasetSchema,
     scan_points: ScanPointTable,
-    committed_transform: CommittedTransform,
+    committed_transform: CommittedTransform | None = None,
 ) -> ScanOutputContract:
     """Bind one axis-total output while preserving repeat and physical scan rows."""
 
@@ -506,9 +516,19 @@ def bind_scan_output_contract(
     if any(axis.role == SCAN_POINT for axis in input_schema.cell_schema.data_axes):
         raise ValueError("SCAN_POINT axes must be DatasetSchema point axes")
 
-    if not isinstance(committed_transform, CommittedTransform):
-        raise TypeError("committed_transform must be CommittedTransform")
-    resolved = resolve_transformed_schema(input_schema, committed_transform)
+    if committed_transform is None:
+        resolved = TransformedSchema(
+            (input_schema.repeat_axis, *input_schema.point_axes),
+            input_schema.cell_layout,
+            input_schema.cell_schema.data_axes,
+            input_schema.cell_schema.validity_contract.component_axis_ids,
+            input_schema.cell_schema.dtype,
+            input_schema.cell_schema.value_unit,
+        )
+    elif isinstance(committed_transform, CommittedTransform):
+        resolved = resolve_transformed_schema(input_schema, committed_transform)
+    else:
+        raise TypeError("committed_transform must be CommittedTransform or None")
     output_cell_axes = resolved.cell_axes
     output_cell_layout = resolved.cell_layout
     output_data_axes = resolved.data_axes
@@ -665,8 +685,10 @@ def scan_output_contract_to_tree(value: ScanOutputContract) -> dict[str, Any]:
         raise TypeError("value must be ScanOutputContract")
     return {
         "schema": SCAN_OUTPUT_CONTRACT_SCHEMA,
-        "committed_transform": committed_transform_to_tree(
-            value.committed_transform
+        "committed_transform": (
+            None
+            if value.committed_transform is None
+            else committed_transform_to_tree(value.committed_transform)
         ),
         "output_dataset_schema": dataset_schema_to_tree(
             value.output_dataset_schema
@@ -687,7 +709,11 @@ def scan_output_contract_from_tree(
         SCAN_OUTPUT_CONTRACT_SCHEMA,
     )
     value = ScanOutputContract(
-        committed_transform_from_tree(data["committed_transform"]),
+        (
+            None
+            if data["committed_transform"] is None
+            else committed_transform_from_tree(data["committed_transform"])
+        ),
         dataset_schema_from_tree(data["output_dataset_schema"]),
     )
     if scan_output_contract_to_tree(value) != tree:

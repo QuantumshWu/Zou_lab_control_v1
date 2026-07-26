@@ -158,9 +158,8 @@ def _signal_leaf_keys(combo) -> set[str]:
 def _replace_spin_value(spin, text: str) -> None:
     """Edit the visible numeric control exactly as an operator would.
 
-    Bounded owner declarations project to Fluent spin boxes; deliberately
-    unbounded integers project to the shared Fluent line editor so Qt's native
-    32-bit spin range cannot become a hidden domain limit.
+    Numeric owner declarations project to shared Fluent spin controls; an
+    optional value uses the control's explicit ``Auto`` state for ``None``.
     """
 
     edit = spin.lineEdit() if hasattr(spin, "lineEdit") else spin
@@ -710,6 +709,7 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         role_combo = widgets["camera_role"]
         _choose_combo_data(role_combo, "mot_camera", application)
         _replace_spin_value(widgets["frames_per_cycle"], "3")
+        _replace_spin_value(widgets["exposure"], "0.013")
         QtTest.QTest.mouseClick(editor.form.start_button, QtCore.Qt.LeftButton)
         frame_signals = tuple(
             console_signal_key(row.node.node_id, f"frame_{index}")
@@ -1665,7 +1665,7 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
     configure_offscreen_fast_path()
     application = ensure_qt_app()
     from task_console import _StandaloneTaskConsoleFlow, _build_parser
-    from zlc_neutral_atom.logic_nodes.release_recapture_common.timing import (
+    from zlc_neutral_atom.logic_nodes.release_recapture.timing import (
         TriggeredReleaseRecaptureResult,
     )
 
@@ -1815,10 +1815,10 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
 
-def test_pulse_scan_exposes_its_table_and_runs_from_one_camera_definition(
+def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
     tmp_path,
 ) -> None:
-    """The formal Pulse-scan row owns the Main table editor and exact source."""
+    """PulseScan consumes a running Camera signal without owning its Run."""
 
     configure_offscreen_fast_path()
     application = ensure_qt_app()
@@ -1853,12 +1853,32 @@ def test_pulse_scan_exposes_its_table_and_runs_from_one_camera_definition(
             if button.text() == "Add Panel"
         )
 
-        # There is one Camera definition.  Pulse scan resolves its declared
-        # frame output into a dedicated exact acquisition; a second hidden
-        # CameraCapture/CameraMonitor definition is neither needed nor offered.
+        # There is one Camera definition.  It is started first and remains the
+        # sole owner of its live stream; PulseScan consumes frame_0 through the
+        # producer-owned association capability and owns only the sequencer.
         _choose_combo_text(console.kind_combo, "Measurement: Camera", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         camera_row = console.logic_nodes[-1]
+        camera_editor = console._logic_editors[id(camera_row)]
+        camera_widgets = _visible_form_widgets(camera_editor)
+        _choose_combo_data(camera_widgets["camera_role"], "camera", application)
+        _replace_spin_value(camera_widgets["repeat"], "0")
+        QtTest.QTest.mouseClick(
+            camera_editor.form.start_button,
+            QtCore.Qt.LeftButton,
+        )
+        until(
+            application,
+            lambda: (
+                (node := console._logic_nodes.get(id(camera_row))) is not None
+                and node.handle is not None
+                and node.running
+            ),
+            timeout=15.0,
+        )
+        camera_node = console._logic_nodes[id(camera_row)]
+        camera_handle = camera_node.handle
+        camera_run_id = camera_handle.run_id
         camera_signal = console_signal_key(camera_row.node.node_id, "frame_0")
 
         _choose_combo_text(console.kind_combo, "Measurement: Pulse scan", application)
@@ -1882,7 +1902,7 @@ def test_pulse_scan_exposes_its_table_and_runs_from_one_camera_definition(
             parameter for parameter in scan_spec.input_fields
             if parameter.key == "y_signal"
         )
-        assert y_parameter.label == "Exact source (y)"
+        assert y_parameter.label == "Signal (y)"
         assert _signal_leaf_keys(widgets["y_signal"]) == {camera_signal}
         _choose_signal_leaf(widgets["y_signal"], camera_signal, application)
 
@@ -1901,6 +1921,16 @@ def test_pulse_scan_exposes_its_table_and_runs_from_one_camera_definition(
         value = console._data.freeze().value(scan_signal)
         if value is None:
             raise AssertionError(scan_row.status_label.text())
+        current_camera = console._logic_nodes.get(id(camera_row))
+        assert current_camera is camera_node
+        assert current_camera.handle is camera_handle
+        assert current_camera.handle.run_id == camera_run_id
+        assert current_camera.running
+        assert camera_row.status_label.text() == "running"
+        assert camera_row.stop_button.isEnabled()
+        camera_value = console._data.freeze().value(camera_signal)
+        assert camera_value is not None
+        assert camera_value.run_id == camera_run_id.value
         assert not any(card.config.signal == scan_signal for card in console.cards)
         data_roles = {
             axis.role for axis in value.snapshot.block.schema.cell_schema.data_axes

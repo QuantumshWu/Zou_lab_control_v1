@@ -52,12 +52,12 @@ from zlc_frontend.figure import (
     fit_single_panel_presentation,
     suggest_view,
 )
-from zlc_neutral_atom.logic_nodes.calibration.sitemap import load_packaged_sitemap_pulse
+from zlc_neutral_atom.logic_nodes.readout.calibration.sitemap import load_sitemap_pulse
 from zlc_pulse import FrozenScanTable, RepeatRegion, ScanParameter
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+PULSE = ROOT / "pulses" / "imaging_template.json"
 
 
 def _axis(identity: str, role, size: int) -> AxisSpec:
@@ -206,7 +206,7 @@ def _until(application, predicate, *, timeout: float = 45.0) -> None:
 
 
 def _two_point_image_scan_document():
-    document = load_packaged_sitemap_pulse()
+    document = load_sitemap_pulse()
     camera_port = next(
         port for port in document.target.ports if port.label == "emCCD"
     )

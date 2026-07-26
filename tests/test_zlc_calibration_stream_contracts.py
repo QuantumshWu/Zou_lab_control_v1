@@ -25,11 +25,11 @@ from zlc_data import (
     ValidityContract,
     ValueSchema,
 )
-from zlc_neutral_atom.logic_nodes.calibration.calibration import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     CalibrationAnalysisRequest,
     ReadoutModelKind,
 )
-from zlc_neutral_atom.logic_nodes.readout_common.contracts import CalibrationCaptureLayout
+from zlc_neutral_atom.logic_nodes.readout.contracts import CalibrationCaptureLayout
 
 
 ROOT = Path(__file__).parents[1]

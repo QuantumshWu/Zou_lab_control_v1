@@ -55,14 +55,45 @@ tutorials/         the single executable user tutorial
 The public notebook entry is:
 
 ```python
-from pathlib import Path
 import Zou_lab_control.notebook as zlc
+from zlc_storage.paths import user_output_path
 
-exp = zlc.connect("virtual", repository=Path("results") / "experiment")
+exp = zlc.connect(
+    "virtual",
+    repository=user_output_path("notebooks", "experiment"),
+)
 ```
 
 Ordinary notebook and GUI code receives typed facades and immutable artifacts,
 not raw camera, sequencer, registry, or SDK objects.
+
+## Outputs and saved files
+
+All automatic operator-facing exports live below the project-root `_output/`
+directory.  Relative paths are always resolved from the project root, never
+from the process working directory; an explicitly selected absolute path is
+used as-is.
+
+| Product or action | Default location |
+|---|---|
+| Calibration task result bundle | `_output/calibrations/` |
+| MOT-field task report | `_output/mot_field/` |
+| TaskConsole figure export | `_output/figures/task-console/` |
+| DataFigure / FigureViewer export | `_output/figures/data-figure/` |
+| Fit-grid export | `_output/figures/fit-grid/` |
+| Pulse preview export | `_output/figures/pulses/` |
+
+The Calibration folder contains the discoverable `calibration_ref.json`, a
+human-readable `report/` with summaries, tables and PNG pages, and optional
+raw `frames/`.  The canonical machine authority remains in the experiment
+repository selected by `connect(..., repository=...)`; the pointer file names
+that exact committed artifact.  MOT similarly writes a report while publishing
+its typed FINAL outputs.
+
+Measurements and processors publish typed live/FINAL signals to the Logic
+tree; they do not silently create arbitrary files.  Save/Export is an explicit
+Figure action.  Editable pulse inputs belong in `pulses/`, while generated
+preview images belong under `_output/` as listed above.
 
 ## Design and operations
 

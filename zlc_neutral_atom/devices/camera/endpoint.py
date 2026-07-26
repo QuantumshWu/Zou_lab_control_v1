@@ -370,6 +370,13 @@ class CameraCaptureEndpoint:
                 raise RuntimeError(
                     "camera exposure change altered the frame payload contract"
                 )
+            # Exposure does not change the frame schema.  Retain the exact
+            # broker-attested payload owner so a run-scoped exposure lease can
+            # be consumed by the already-admitted Dataset/Figure topology.
+            observed = replace(
+                observed,
+                payload_contract=baseline.payload_contract,
+            )
             expected_facts = replace(
                 baseline.physical_facts,
                 exposure_seconds=observed.physical_facts.exposure_seconds,
@@ -415,6 +422,7 @@ class CameraCaptureEndpoint:
                 required_interval,
                 observed.settings_fingerprint,
                 capability.capability_fingerprint,
+                capability,
             )
         finally:
             self._end_command_operation(token)

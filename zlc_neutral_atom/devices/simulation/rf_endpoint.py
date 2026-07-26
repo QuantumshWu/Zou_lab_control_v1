@@ -21,13 +21,10 @@ from .apparatus import VirtualRfSource
 
 
 class VirtualRfTableEndpoint:
-    def __init__(self, source: VirtualRfSource, maximum_points: int) -> None:
+    def __init__(self, source: VirtualRfSource) -> None:
         if not isinstance(source, VirtualRfSource):
             raise TypeError("source must be VirtualRfSource")
         self._source = source
-        self._maximum_points = int(maximum_points)
-        if self._maximum_points < 1:
-            raise ValueError("maximum_points must be positive")
 
     def capability_probe(self, binding: BoundDevice) -> RfTableCapabilitySnapshot:
         fingerprint = canonical_digest(
@@ -37,12 +34,10 @@ class VirtualRfTableEndpoint:
                 "control_key": RF_DETUNING_CONTROL_KEY,
                 "unit": "Gamma",
                 "clock_source": "sequencer-scan-point",
-                "maximum_points": self._maximum_points,
             }
         )
         return RfTableCapabilitySnapshot(
             binding.binding_stamp,
-            self._maximum_points,
             1.0,
             fingerprint,
         )
@@ -52,8 +47,6 @@ class VirtualRfTableEndpoint:
             capability = self.capability_probe(binding)
             if command.capability_fingerprint != capability.capability_fingerprint:
                 raise RuntimeError("RF prepare uses another capability generation")
-            if len(command.table.detuning_gamma) > capability.maximum_points:
-                raise ValueError("RF detuning table exceeds endpoint capacity")
             self._source.prepare_table(
                 command.session_id,
                 command.table.pulse_artifact_digest,

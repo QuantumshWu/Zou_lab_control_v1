@@ -8,7 +8,7 @@
 //
 // Global edge-table playback with:
 //   * edge + scan tables in BLOCK RAM (thousands of edges + a two-bank scan
-//     protocol; the qualified host uses the resident window); bus segment
+//     protocol; the host streams bank-local chunks); bus segment
 //     tables in LUTRAM (the bus/ramp engine reads them
 //     combinationally every tick, so they MUST stay async-read).
 //   * a depth-FIFO_DEPTH continuous PREFETCH of the next edges (one BRAM read per
@@ -17,10 +17,10 @@
 //     (start / loop-rewind / scan-advance / repeat) reseed instantly and
 //     back-to-back **1-tick (20 ns) edges** play one per cycle.
 //   * a 2-bank PING-PONG scan window: the engine plays scan point 0..N-1,
-//     addressing bank (idx/BANK_SIZE)%2.  The current host preloads both banks;
-//     refill handshakes remain available for later qualification.  A not-ready
-//     bank STALLS the engine and flags STATUS underflow rather than emitting a
-//     wrong point.
+//     addressing bank (idx/BANK_SIZE)%2.  The host preloads the first two chunks,
+//     then its sole observer refills each released bank.  A not-ready bank
+//     STALLS the engine and flags STATUS underflow rather than emitting a wrong
+//     point; the host never drives point timing.
 //
 // PROVEN PRE-HARDWARE: this module's exact register transfers are mirrored
 // cycle-for-cycle by engine_model.rtl_mirror_play for the deployed RD_LAT=2
@@ -59,7 +59,7 @@ module zlc_edge_streamer #(
     parameter integer CHANNEL_COUNT = `ZLC_CHANNEL_COUNT,
     parameter integer EDGE_ADDR_WIDTH = `ZLC_EDGE_ADDR_WIDTH,
     parameter integer SCAN_ADDR_WIDTH = `ZLC_SCAN_ADDR_WIDTH,   // = clog2(2*BANK_SIZE)
-    parameter integer SCAN_COUNT_WIDTH = 32,    // encoded total N; current host admits resident capacity
+    parameter integer SCAN_COUNT_WIDTH = 32,    // encoded total scan-point count N; independent of bank depth
     parameter integer BANK_SIZE = `ZLC_BANK_SIZE,               // power of two; points per ping-pong bank
     parameter integer TICK_WIDTH = `ZLC_TICK_WIDTH,
     parameter integer NUM_SLOTS = `ZLC_NUM_SLOTS,

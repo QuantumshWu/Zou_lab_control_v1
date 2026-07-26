@@ -55,6 +55,7 @@ from zlc_frontend.selector import (
     RectangleGesture,
 )
 from zlc_neutral_atom.artifacts.fit_reference import FitResultArtifactRef
+from zlc_storage.paths import user_output_path
 from zlc_workbench.frozen_raster import FrozenRasterWindow
 from zlc_workbench.window_runtime import cancel_export_commits, error_summary
 
@@ -1132,10 +1133,12 @@ class SavedFitGridWindow(FrozenRasterWindow):
             )
         ):
             return
+        output_dir = user_output_path("figures", "fit-grid")
+        output_dir.mkdir(parents=True, exist_ok=True)
         path, _selected = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Export saved fit view",
-            "saved_fit_grid.png",
+            str(output_dir / "saved_fit_grid.png"),
             "Images (*.png *.pdf *.svg *.jpg *.jpeg)",
         )
         if path:

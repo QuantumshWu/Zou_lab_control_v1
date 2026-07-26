@@ -34,7 +34,7 @@ from zlc_storage import (
     exact_mapping,
 )
 
-from zlc_neutral_atom.logic_nodes.camera_capture.reference import (
+from zlc_neutral_atom.capture.reference import (
     CaptureArtifactRef,
     capture_artifact_ref_from_tree,
     capture_artifact_ref_to_tree,
@@ -333,7 +333,7 @@ class FitResultRepository:
     ) -> FitExecution:
         """Fit one exact FINAL capture."""
 
-        from zlc_neutral_atom.logic_nodes.camera_capture.artifact import CaptureRepository
+        from zlc_neutral_atom.capture.artifact import CaptureRepository
 
         if type(capture_repository) is not CaptureRepository:
             raise TypeError("capture_repository must be CaptureRepository")
@@ -455,7 +455,7 @@ class FitResultRepository:
             source_ref = _source_ref_from_tree(manifest["source"])
             result_ref = content_ref_from_tree(manifest["result_blob"])
             if isinstance(source_ref, CaptureArtifactRef):
-                from zlc_neutral_atom.logic_nodes.camera_capture.artifact import CaptureRepository
+                from zlc_neutral_atom.capture.artifact import CaptureRepository
 
                 if type(capture_repository) is not CaptureRepository:
                     raise TypeError(

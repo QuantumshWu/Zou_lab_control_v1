@@ -24,6 +24,7 @@ from zlc_frontend.qt_widgets import (
     FluentLabel,
     FluentLineEdit,
     FluentScrollArea,
+    FluentSectionLabel,
     FluentStatusDot,
     FluentStatusStrip,
     FluentSwitch,
@@ -58,6 +59,7 @@ from .console_records import (
     panel_signal_key,
 )
 from zlc_frontend.shape_text import describe_dataset_shape, indexed_unique_name
+from zlc_storage.paths import user_output_path
 from .panel_board import (
     GAP,
     PanelBoard,
@@ -171,7 +173,8 @@ class TaskConsole(QtWidgets.QWidget):
         # The folder the LAST panel "Save Fig" wrote into -- so a panel's Edit-tab save
         # picker reopens at the same place across panels and across reopens (remembered
         # for the life of the process / Jupyter kernel, like the pulse GUI's save dir).
-        # None until the first save -> the picker defaults to the tasks/ folder.
+        # None until the first save -> the picker defaults to the unified
+        # operator-output tree, never the reloadable tasks/ layout folder.
         self._last_save_dir: str | None = None
         # Per-panel editors: one PanelEditor per opened PLOT panel, hosted as a
         # closable tab (keyed by id(card)).
@@ -414,6 +417,8 @@ class TaskConsole(QtWidgets.QWidget):
             self.logic_scroll = None
             self.logic_layout = None
             self.logic_hint = None
+            self.figure_signals_section = None
+            self.figure_signals_label = None
         else:
             logic_tab = QtWidgets.QWidget()
             logic_tab.setStyleSheet("background: transparent;")
@@ -432,6 +437,22 @@ class TaskConsole(QtWidgets.QWidget):
             self.logic_hint.setWordWrap(True)
             self.logic_hint.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
             self.logic_layout.addWidget(self.logic_hint)
+            self.figure_signals_section = FluentSectionLabel("Figure signals")
+            self.figure_signals_label = FluentLabel("")
+            self.figure_signals_label.setWordWrap(True)
+            self.figure_signals_label.setMinimumWidth(0)
+            self.figure_signals_label.setSizePolicy(
+                QtWidgets.QSizePolicy.Ignored,
+                QtWidgets.QSizePolicy.Preferred,
+            )
+            self.figure_signals_label.setStyleSheet(
+                f"color: {GREY}; background: transparent; border: none; "
+                "font-family: Consolas, 'DejaVu Sans Mono', monospace;"
+            )
+            self.figure_signals_section.hide()
+            self.figure_signals_label.hide()
+            self.logic_layout.addWidget(self.figure_signals_section)
+            self.logic_layout.addWidget(self.figure_signals_label)
             self.logic_layout.addStretch(1)
             self.logic_scroll.set_width_bounded_widget(logic_body)
             logic_outer.addWidget(self.logic_scroll, 1)
@@ -586,7 +607,13 @@ class TaskConsole(QtWidgets.QWidget):
         self._recompute_tick_interval()        # a new panel's rate may change the timer base
 
     def _publish_figure_outputs(self, card: PanelCard) -> None:
-        """Materialize Area/Cross outputs from the exact visible panel front."""
+        """Materialize one source-coherent Figure output transaction.
+
+        Area/Cross normally use the live visible source.  A committed Fit may
+        instead belong to an older Edit snapshot; while it is current, that
+        exact command source owns publication and incompatible live selector
+        commits are excluded rather than mixed into one false-provenance set.
+        """
 
         if card not in self.cards:
             return
@@ -596,10 +623,19 @@ class TaskConsole(QtWidgets.QWidget):
             materialize_cross_outputs,
             materialize_fit_outputs,
         )
-        from zlc_frontend.site_map_render import SiteMapView
-        source, area_commit, cross_commit, fit_result = (
+        from zlc_frontend.site_map import SiteMapPresentation
+        live_source, area_commit, cross_commit, _live_fit_result = (
             card.frozen_figure_output_state()
         )
+        fit_source, fit_result = card.frozen_fit_output_state()
+        source = fit_source if fit_result is not None else live_source
+        if (
+            source is not None
+            and live_source is not None
+            and source.snapshot.ref != live_source.snapshot.ref
+        ):
+            area_commit = None
+            cross_commit = None
         outputs = {}
         failures = []
         figure_source = None
@@ -609,7 +645,7 @@ class TaskConsole(QtWidgets.QWidget):
             # validates that exact value when FigureOutputSource is built.
             site_map = (
                 source.presentation
-                if isinstance(source.presentation, SiteMapView.__args__)
+                if isinstance(source.presentation, SiteMapPresentation)
                 else None
             )
             figure_source = FigureOutputSource(source.snapshot, site_map)
@@ -648,6 +684,12 @@ class TaskConsole(QtWidgets.QWidget):
             self._data.publish_panel(card.panel_id, source, outputs)
         else:
             self._data.withdraw_panel(card.panel_id)
+        # Figure output materialization is a real signal-publication boundary,
+        # unlike a viewport-only edit.  Promote that completed transaction
+        # before rebuilding topology; otherwise the topology owner reads the
+        # prior tick, misses every new @panel key, and no later schema-only
+        # refresh has authority to invent the missing producer.
+        self._promote_data_front(self._data.freeze())
         names = frozenset(outputs)
         if self._card_output_names.get(card.panel_id, frozenset()) != names:
             self._card_output_names[card.panel_id] = names
@@ -985,11 +1027,12 @@ class TaskConsole(QtWidgets.QWidget):
     def _input_signal_names(self, input_spec) -> list[str]:
         """Filter every candidate solely by its stable output contract id."""
 
-        accepted = set(input_spec.accepted_output_contract_ids)
         return sorted(
             key
             for key, entry in self._signal_topology().items()
-            if getattr(entry["declaration"], "contract_id", None) in accepted
+            if input_spec.accepts(
+                getattr(entry["declaration"], "contract_id", "")
+            )
         )
 
     def _signal_formats(self) -> dict:
@@ -1331,7 +1374,7 @@ class TaskConsole(QtWidgets.QWidget):
                 f"{current!r} is not an output in this TaskConsole"
             )
         contract_id = getattr(entry["declaration"], "contract_id", None)
-        if contract_id not in selection.spec.accepted_output_contract_ids:
+        if not selection.spec.accepts(contract_id):
             raise ValueError(
                 f"{selection.spec.label} rejects output contract {contract_id!r}"
             )
@@ -1429,7 +1472,7 @@ class TaskConsole(QtWidgets.QWidget):
     def _refresh_signal_info(self) -> None:
         """Give every panel a frame-title legend naming which node and layer
         produces the panel's one bound signal -- e.g.
-        ``occupied ← occupancy [processor]``.  It does not list the producing node's whole
+        ``signal ← producer [processor]``.  It does not list the producing node's whole
         output set, so the title answers exactly "this plot's value comes from which
         measurement/processor".  A signal
         published by more than one running node is flagged ambiguous.  The
@@ -1438,7 +1481,12 @@ class TaskConsole(QtWidgets.QWidget):
         if not self._signal_info_dirty:
             return
         topology = self._signal_topology()
-        short_names = self._signal_short_names()
+        short_names = {
+            key: str(entry["declaration"].short or entry["declaration"].name)
+            for key, entry in topology.items()
+            if entry["declaration"] is not None
+        }
+        self._refresh_figure_signal_inventory(topology)
         for card in self.cards:
             reads = sorted(self._card_reads(card))
             parts: list[str] = []
@@ -1461,13 +1509,64 @@ class TaskConsole(QtWidgets.QWidget):
                     layer = str(entry["kind"])
                     tag = f"{label} [{layer}]" if layer else label
                     short = short_names.get(name, name)
-                    parts.append(f"{short} ← {tag} · {state_text}")
+                    parts.append(
+                        f"{short} ← {label} [Figure]"
+                        if layer == "figure"
+                        else f"{short} ← {tag} · {state_text}"
+                    )
             if not reads:
                 parts.append("(no signal set — pick one in Setting: value = <signal>)")
             # one read per line: "<signal> ← <node> [layer]" -- the value's origin only,
             # not the producing node's full output list.
             card.set_signal_info("\n".join(parts))
         self._signal_info_dirty = False
+
+    def _refresh_figure_signal_inventory(self, topology) -> None:
+        """Show Figure-owned selector/Fit outputs without inventing Logic nodes."""
+
+        label = self.figure_signals_label
+        section = self.figure_signals_section
+        if label is None or section is None:
+            return
+        groups = []
+        for card in self.cards:
+            rows = []
+            for key, entry in topology.items():
+                if entry["kind"] != "figure" or entry["node"] is not card:
+                    continue
+                declaration = entry["declaration"]
+                value = self._tick_data.value(key)
+                shape = (
+                    "—"
+                    if value is None
+                    else describe_dataset_shape(value.schema, value.values)
+                )
+                rows.append((str(declaration.short), shape, str(key)))
+            if rows:
+                groups.append(
+                    (
+                        str(card.config.title or PANEL_KINDS[card.config.kind]),
+                        sorted(rows),
+                    )
+                )
+        if not groups:
+            label.setText("")
+            label.setToolTip("")
+            section.hide()
+            label.hide()
+            return
+        lines = []
+        tips = []
+        for title, rows in groups:
+            lines.append(title)
+            width = max(len(name) for name, _shape, _key in rows)
+            for name, shape, key in rows:
+                lines.append(f"  {name:<{width}}  {shape}")
+                tips.append(f"{title} — {name}: {key}")
+        label.setText("\n".join(lines))
+        label.setToolTip("\n".join(tips))
+        section.show()
+        label.show()
 
     def _begin_run(self, node) -> None:
         """Start one ConsoleRunNode and register it as running.
@@ -1534,7 +1633,6 @@ class TaskConsole(QtWidgets.QWidget):
         existing = self._panel_editors.get(id(card))
         if existing is not None:
             self.tabs.setCurrentWidget(existing)
-            existing.refresh_snapshot()
             return
         editor = PanelEditor(card, self, self.tabs)
         self._panel_editors[id(card)] = editor
@@ -1553,6 +1651,7 @@ class TaskConsole(QtWidgets.QWidget):
         index = self.tabs.indexOf(editor)
         if index >= 0:
             self.tabs.removeTab(index)
+        self._render_lane.forget(editor.render_surface_id)
         editor.teardown()
         # ``removeTab`` leaves the page owned by the tab stack until deferred
         # deletion.  Keep that parent: reparenting a QWidget to ``None`` turns
@@ -1590,6 +1689,8 @@ class TaskConsole(QtWidgets.QWidget):
         index = self.tabs.indexOf(widget)
         if index >= 0:
             self.tabs.removeTab(index)
+        if isinstance(widget, PanelEditor):
+            self._render_lane.forget(widget.render_surface_id)
         for key, editor in list(self._panel_editors.items()):
             if editor is widget:
                 del self._panel_editors[key]
@@ -1970,11 +2071,12 @@ class TaskConsole(QtWidgets.QWidget):
         """Return the explicit dynamic-form capabilities for one Logic row."""
 
         field_providers = dict(signal_names_providers or {})
-        own = (
-            {str(key) for key in self._declared_signal_keys(row)}
-            if row.node.kind == "processor"
-            else set()
-        )
+        # No LogicNode may bind one of its own declared outputs as an input.
+        # This is a graph invariant, not a Processor-specific UI policy:
+        # Measurements such as PulseScan also publish outputs, and admitting
+        # those keys here creates an impossible self-cycle before the node has
+        # produced anything.
+        own = {str(key) for key in self._declared_signal_keys(row)}
 
         def names(key: str):
             provider = field_providers.get(str(key), self._signal_names)
@@ -2228,7 +2330,13 @@ class TaskConsole(QtWidgets.QWidget):
             instance_label=node.title,
         )
 
-    def _request_card_render(self, card: PanelCard, *, force: bool = False) -> bool:
+    def _request_card_render(
+        self,
+        card: PanelCard,
+        *,
+        force: bool = False,
+        surface=None,
+    ) -> bool:
         """Re-render one card from its already accepted immutable data front.
 
         This entry is used by Setting/selector view commits.  Advancing the
@@ -2238,10 +2346,27 @@ class TaskConsole(QtWidgets.QWidget):
 
         if self._render_lane.closing or card not in self.cards:
             return False
-        request = card.freeze_current_view_request(force=bool(force))
-        if request is None:
+        requests = []
+        live_request = card.freeze_current_view_request(force=bool(force))
+        if live_request is not None:
+            requests.append(live_request)
+        if surface is not None and surface is not card.board:
+            editor = next(
+                (
+                    item
+                    for item in self._panel_editors.values()
+                    if item.card is card and item._board is surface
+                ),
+                None,
+            )
+            if editor is None:
+                return False
+            edit_request = editor.freeze_current_view_request()
+            if edit_request is not None:
+                requests.append(edit_request)
+        if not requests:
             return False
-        self._render_lane.enqueue((request,))
+        self._render_lane.enqueue(tuple(requests))
         return True
 
     def _enqueue_render_batch(self, batch, snapshot, *, force: bool = False) -> None:
@@ -2257,6 +2382,7 @@ class TaskConsole(QtWidgets.QWidget):
 
         reset: set[str] = set()
         to_present = []
+        editors_to_present = []
         if isinstance(completion, str):
             self.status_strip.show_message(
                 f"Render failed: {completion}", severity="error"
@@ -2265,22 +2391,49 @@ class TaskConsole(QtWidgets.QWidget):
             by_id = {card.panel_id: card for card in self.cards}
             for request, frame, faceted_result, figure, error in completion:
                 card = by_id.get(request.panel_id)
-                if card is None or not card.accept_render_result(
-                    request,
-                    frame=frame,
-                    faceted_result=faceted_result,
-                    figure=figure,
-                    error=error,
-                ):
-                    reset.add(request.panel_id)
+                surface_id = request.render_surface_id
+                if surface_id == request.panel_id:
+                    accepted = card is not None and card.accept_render_result(
+                        request,
+                        frame=frame,
+                        faceted_result=faceted_result,
+                        figure=figure,
+                        error=error,
+                    )
+                    if accepted and error is None:
+                        to_present.append(card)
+                else:
+                    editor = next(
+                        (
+                            item
+                            for item in self._panel_editors.values()
+                            if item.render_surface_id == surface_id
+                        ),
+                        None,
+                    )
+                    accepted = (
+                        editor is not None
+                        and editor.card is card
+                        and editor.accept_render_result(
+                            request,
+                            frame=frame,
+                            faceted_result=faceted_result,
+                            figure=figure,
+                            error=error,
+                        )
+                    )
+                    if accepted and error is None:
+                        editors_to_present.append(editor)
+                if not accepted:
+                    reset.add(surface_id)
                     continue
-                if error is None:
-                    to_present.append(card)
             # Every accepted card swaps only after the whole worker batch has
             # been examined, so Qt never composes and a batch cannot be half
             # accepted because one sibling raised.
             for card in to_present:
                 card.present()
+            for editor in editors_to_present:
+                editor.present_render_result()
         return reset
 
     def _request_card_fit(self, card: PanelCard) -> None:
@@ -2316,6 +2469,9 @@ class TaskConsole(QtWidgets.QWidget):
         card._render_request_revision += 1
         card._requested_signature = None
         self._render_lane.forget(card.panel_id)
+        editor = self._panel_editors.get(id(card))
+        if editor is not None:
+            self._render_lane.forget(editor.render_surface_id)
         self._fit_lane.forget(card.panel_id)
 
     def _shutdown_render_lane(self) -> None:
@@ -2484,8 +2640,13 @@ class TaskConsole(QtWidgets.QWidget):
                         # do not wait for an unrelated display timer beat.
                         self._promote_data_front(self._data.freeze())
                         self._ensure_default_result_panels(row)
+                    completion_summary = getattr(
+                        node,
+                        "completion_summary",
+                        None,
+                    )
                     done_status = (
-                        "done"
+                        completion_summary or "done"
                         if output_error is None
                         else f"done; output unavailable: {output_error}"
                     )
@@ -2675,7 +2836,9 @@ class TaskConsole(QtWidgets.QWidget):
         """Save the WHOLE monitor board (every panel, composited in its laid-out position) to a PNG.
         Unlike a per-plot save (data png+npz), this is a raster of the board region, so it is a plain
         image.  Reuses ``_last_save_dir`` so it shares the per-panel save's remembered folder."""
-        default_dir = self._last_save_dir or str(_task_files_dir())
+        default_dir = self._last_save_dir or str(
+            user_output_path("figures", "task-console")
+        )
         default = str(Path(default_dir) / time.strftime("monitor_%Y_%m_%d_%H_%M_%S.png", time.localtime()))
         path, _sel = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save monitor image", default, "PNG image (*.png)")

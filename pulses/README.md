@@ -5,6 +5,20 @@ authoring documents. They are source data, not FPGA projects or runtime
 snapshots. A document owns one explicit `PulseTarget`, stable period and
 parameter identities, literal nominal values, and optional frozen scan rows.
 
+This directory is the single project pulse catalog. Logic-node definitions
+may declare one of these relative paths as an operator-editable default, but
+must not copy experiment pulses into a Python package `assets/` directory.
+Generated preview images, scan arrays, captures, and task reports belong under
+the runtime output workspace, never beside these source documents.
+
+| Document | Current owner/use |
+| --- | --- |
+| `imaging_template.json` | calibration/readout long-short-long acquisition |
+| `mot_field_template.json` | autonomous MOT-field scan |
+| `probe_template.json` | probe/readout-duration acquisition |
+| `release_recapture.json` | release-recapture and derived temperature scans |
+| `camera_imaging_address_switch.json` | camera-address switching reference pulse |
+
 ## Physical target
 
 `zlc_pulse/assets/deployed_target.json` is the packaged canonical target used by the server.

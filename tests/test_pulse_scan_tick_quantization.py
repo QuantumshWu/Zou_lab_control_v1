@@ -7,9 +7,7 @@ from fractions import Fraction
 import pytest
 
 from zlc_pulse.scan_template import scan_table_template
-from zlc_neutral_atom.logic_nodes.pulse_scan.authoring import (
-    DEFAULT_PROBE_PULSE_PATH,
-)
+from zlc_neutral_atom.pulse_catalog import PROBE_PULSE_PATH
 from zlc_neutral_atom.logic_nodes.pulse_scan import (
     ApiSegmentTable,
     ApiSlotSegmentedProgram,
@@ -23,7 +21,7 @@ from zlc_pulse import (
 
 
 def _default_api_program_parts():
-    document = load_pulse_document(DEFAULT_PROBE_PULSE_PATH)
+    document = load_pulse_document(PROBE_PULSE_PATH)
     specs = api_column_specs(document)
     source = scan_table_template("column_stack", specs)
     rows = evaluate_numeric_scan_program(source, width=len(specs))

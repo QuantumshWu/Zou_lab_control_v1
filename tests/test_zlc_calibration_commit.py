@@ -12,29 +12,29 @@ import textwrap
 
 import pytest
 
-import zlc_neutral_atom.logic_nodes.calibration.analysis as analysis_module
-from zlc_neutral_atom.logic_nodes.calibration.analysis import (
+import zlc_neutral_atom.logic_nodes.readout.calibration.analysis as analysis_module
+from zlc_neutral_atom.logic_nodes.readout.calibration.analysis import (
     CalibrationAnalysisResult,
     CalibrationComputation,
     compute_calibration,
 )
-from zlc_neutral_atom.logic_nodes.calibration.calibration import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     CalibrationAnalysisRequest,
     ResolvedCalibration,
 )
-from zlc_neutral_atom.logic_nodes.calibration.application import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.application import (
     CalibrationArtifactRequest,
     build_calibration_artifact_request,
     calibration_request_from_computation,
 )
-from zlc_neutral_atom.logic_nodes.calibration.repository import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
     compile_calibration_artifact_plan,
 )
-from zlc_neutral_atom.logic_nodes.calibration.sitemap import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.sitemap import (
     SitemapCalibrationRequest,
     build_sitemap_calibration_request,
 )
-from zlc_neutral_atom.logic_nodes.occupancy.application import (
+from zlc_neutral_atom.logic_nodes.readout.occupancy.application import (
     DetectionRequest,
     build_detection_request,
 )
@@ -127,7 +127,7 @@ def test_public_calibration_and_detection_requests_are_deadline_free():
 
     from Zou_lab_control.notebook.facade import ReadoutFacade
     from Zou_lab_control.workbench import open_calibration_workbench
-    from zlc_workbench.calibration_workbench.app import (
+    from zlc_neutral_atom.logic_nodes.readout.calibration.ui.workbench import (
         open_calibration_workbench as open_calibration_workbench_app,
     )
 
@@ -154,8 +154,8 @@ def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_pa
         import sys
 
         from Zou_lab_control.notebook import connect
-        from zlc_neutral_atom.logic_nodes.camera_capture.artifact import CaptureRepository
-        from zlc_neutral_atom.logic_nodes.calibration.repository import (
+        from zlc_neutral_atom.capture.artifact import CaptureRepository
+        from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
             CalibrationRepository,
         )
 
@@ -215,7 +215,7 @@ def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_pa
 
 
 def test_removed_calibration_commit_wrappers_are_not_reintroduced():
-    import zlc_neutral_atom.logic_nodes.calibration.repository as repository_module
+    import zlc_neutral_atom.logic_nodes.readout.calibration.repository as repository_module
 
     for removed in (
         "CalibrationCommit",

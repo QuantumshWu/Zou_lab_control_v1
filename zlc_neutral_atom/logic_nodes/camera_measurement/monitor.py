@@ -21,8 +21,10 @@ from zlc_data import (
     PointLayout,
     READOUT_EVENT,
     REPEAT,
+    ValueSchema,
 )
 from zlc_neutral_atom.devices.camera.contract import (
+    CameraAcquisitionMode,
     CameraDatasetEventAdapter,
     CameraSample,
 )
@@ -31,10 +33,16 @@ from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
     CameraMeasurementRequest,
     project_camera_monitor_outputs,
 )
+from zlc_neutral_atom.logic_nodes.camera_measurement.signal_source import (
+    CameraAssociatedSignalEventSource,
+    CameraSignalAssociationAuthority,
+    camera_signal_event_source,
+)
 from zlc_neutral_atom.dataset_output import LiveDatasetOutput
 from zlc_neutral_atom.runtime._failure import safe_error_summary
 from zlc_neutral_atom.runtime.cancellation import CancellationRequested
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
+from zlc_neutral_atom.runtime.cleanup import run_cleanup_steps
 from zlc_neutral_atom.runtime.dataset import (
     FrozenDatasetEdge,
     MonitorDataset,
@@ -51,7 +59,15 @@ from zlc_neutral_atom.devices.camera.monitor import (
     ReadCameraMonitorCommand,
     StartCameraMonitorCommand,
 )
+from zlc_neutral_atom.devices.camera.capture_port import (
+    configure_camera_exposure,
+)
 from zlc_neutral_atom.runtime.run import RunContext, RunHandle, RunPlan
+from zlc_neutral_atom.runtime.signal_source import (
+    SignalAssociationScheduleRequirement,
+    SignalEventAssociationCursor,
+    SignalEventCursor,
+)
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionProducer,
     AcquisitionStream,
@@ -181,6 +197,7 @@ class _CameraMonitorTransaction:
     session_id: str
     buffer_frame_count: int
     operation_deadline_seconds: float
+    association_source: CameraAssociatedSignalEventSource | None = None
     prepare_attempted: bool = False
     view_notifications_enabled: bool = True
 
@@ -221,6 +238,8 @@ class _CameraMonitorTransaction:
                 "camera monitor start returned an unexpected acknowledgement"
             )
         self._validate_ack(started.session_id, started.binding_instance_id)
+        if self.association_source is not None:
+            self.association_source.mark_association_running()
         context.set_phase("monitoring-camera")
         while True:
             context.checkpoint()
@@ -282,10 +301,14 @@ class _CameraMonitorTransaction:
         self,
         context: RunContext,
         primary: BaseException | None,
+        *,
+        restore_exposure: Callable[[], CleanupReport] | None = None,
     ) -> CleanupReport:
         software_errors: list[BaseException] = []
         cancelled = isinstance(primary, CancellationRequested)
         stream_failure = StreamError(safe_error_summary(primary)) if primary else None
+        if self.association_source is not None:
+            self.association_source.mark_association_stopped()
         try:
             if primary is None or cancelled:
                 self.producer.finish()
@@ -302,17 +325,15 @@ class _CameraMonitorTransaction:
                 self.dataset.fail(stream_failure)
         except BaseException as error:
             software_errors.append(error)
-        try:
-            report = (
-                self.port.cleanup(context, self.session_id)
-                if self.prepare_attempted
-                else self.port.verify_idle(context)
-            )
-        except BaseException as error:
-            try:
-                self.view.fail(safe_error_summary(error))
-            finally:
-                raise
+        device_cleanup = (
+            (lambda: self.port.cleanup(context, self.session_id))
+            if self.prepare_attempted
+            else (lambda: self.port.verify_idle(context))
+        )
+        steps = [device_cleanup]
+        if restore_exposure is not None:
+            steps.append(restore_exposure)
+        report = run_cleanup_steps(*steps)
         terminal_error: BaseException | None
         if report.errors:
             terminal_error = report.errors[0]
@@ -355,8 +376,11 @@ class PreparedLiveCameraMeasurement:
         "_lock",
         "_port",
         "_request",
+        "_signal_source",
         "_start_run",
         "_started",
+        "_stream",
+        "_producer",
     )
 
     def __init__(
@@ -364,6 +388,8 @@ class PreparedLiveCameraMeasurement:
         request: CameraMeasurementRequest,
         port: BoundCameraMonitorPort,
         start_run: Callable[[RunPlan], RunHandle],
+        *,
+        association_authority: CameraSignalAssociationAuthority | None = None,
     ) -> None:
         if not isinstance(request, CameraMeasurementRequest):
             raise TypeError("request must be CameraMeasurementRequest")
@@ -419,6 +445,31 @@ class PreparedLiveCameraMeasurement:
         )
         self._request = request
         self._port = port
+        self._stream, self._producer = AcquisitionStream.create(
+            StreamId(f"camera-monitor:{request.camera_ref.role}"),
+            capability.payload_contract,
+        )
+        self._signal_source = camera_signal_event_source(
+            self._stream,
+            request,
+            capability.payload_contract,
+            association_authority=association_authority,
+            trigger_channel=(
+                None
+                if association_authority is None
+                else _association_trigger_channel(capability)
+            ),
+            capability_fingerprint=(
+                None
+                if association_authority is None
+                else capability.capability_fingerprint
+            ),
+            binding_instance_id=(
+                None
+                if association_authority is None
+                else port.device.binding_instance_id
+            ),
+        )
         self._start_run = start_run
         self._lock = threading.Lock()
         self._started = False
@@ -443,6 +494,19 @@ class PreparedLiveCameraMeasurement:
 
         return project_camera_monitor_outputs(frozen, self._request)
 
+    def value_schema(self, output_name: str) -> ValueSchema:
+        """Return the declared schema without inspecting a first live frame."""
+
+        return self._signal_source.value_schema(output_name)
+
+    def open_signal_cursor(
+        self,
+        output_name: str,
+    ) -> SignalEventCursor[CameraSample]:
+        """Follow this running Camera producer without acquiring its device."""
+
+        return self._signal_source.open_signal_cursor(output_name)
+
     def start_with_view(
         self,
         *,
@@ -466,10 +530,28 @@ class PreparedLiveCameraMeasurement:
             raise ValueError(
                 "camera monitor view must retain the admitted spec by identity"
             )
-        plan = _compile_camera_monitor_plan(self._request, self._port, view)
+        plan = _compile_camera_monitor_plan(
+            self._request,
+            self._port,
+            view,
+            self._stream,
+            self._producer,
+            (
+                self._signal_source
+                if isinstance(
+                    self._signal_source,
+                    CameraAssociatedSignalEventSource,
+                )
+                else None
+            ),
+        )
         try:
             return self._start_run(plan)
         except BaseException as error:
+            try:
+                self._producer.fail(StreamError(safe_error_summary(error)))
+            except BaseException:
+                pass
             try:
                 view.fail(safe_error_summary(error))
             except BaseException:
@@ -483,25 +565,88 @@ class PreparedLiveCameraMeasurement:
             self._started = True
 
 
+class PreparedAssociatedLiveCameraMeasurement(PreparedLiveCameraMeasurement):
+    """Live Camera command with an explicitly composed pulse-association owner."""
+
+    __slots__ = ()
+
+    def signal_association_schedule_requirement(
+        self,
+        output_name: str,
+    ) -> SignalAssociationScheduleRequirement:
+        source = self._signal_source
+        if not isinstance(source, CameraAssociatedSignalEventSource):
+            raise RuntimeError(
+                "associated Camera command lost its composition authority"
+            )
+        return source.signal_association_schedule_requirement(output_name)
+
+    def open_associated_signal_cursor(
+        self,
+        output_name: str,
+    ) -> SignalEventAssociationCursor:
+        source = self._signal_source
+        if not isinstance(source, CameraAssociatedSignalEventSource):
+            raise RuntimeError(
+                "associated Camera command lost its composition authority"
+            )
+        return source.open_associated_signal_cursor(output_name)
+
+
+def _association_trigger_channel(capability) -> str:
+    """Admit only a Q0-qualified, single-wire external-trigger producer."""
+
+    if capability.acquisition_mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
+        raise ValueError("free-running Camera Measurement cannot associate pulse events")
+    evidence = capability.camera_capability_evidence
+    if evidence.exact_external_trigger_qualification_digest is None:
+        raise ValueError(
+            "Camera association requires explicit exact-trigger qualification"
+        )
+    channels = evidence.physical_facts.capture_trigger_channels
+    if len(channels) != 1:
+        raise ValueError("Camera association requires exactly one trigger channel")
+    return channels[0]
+
+
 def _compile_camera_monitor_plan(
     request: CameraMeasurementRequest,
     port: BoundCameraMonitorPort,
     view: CameraMonitorViewPort,
+    stream: AcquisitionStream[CameraSample],
+    producer: AcquisitionProducer[CameraSample],
+    association_source: CameraAssociatedSignalEventSource | None,
 ) -> RunPlan[_CameraMonitorTransaction, None, None]:
     spec = getattr(view, "spec", None)
     if not isinstance(spec, CameraMonitorViewSpec):
         raise TypeError("camera monitor view has no CameraMonitorViewSpec")
 
+    exposure_session_id = (
+        uuid.uuid4().hex if request.exposure_seconds is not None else None
+    )
+    exposure_attempted = False
+
     def preflight(context: RunContext) -> _CameraMonitorTransaction:
-        producer = None
+        nonlocal exposure_attempted
         tap = None
         raw_dataset = None
         dataset = None
         try:
-            stream, producer = AcquisitionStream.create(
-                StreamId(f"camera-monitor:{request.camera_ref.role}"),
-                port.capability.payload_contract,
-            )
+            active_port = port
+            exposure = request.exposure_seconds
+            if exposure is not None:
+                assert exposure_session_id is not None
+                exposure_attempted = True
+                active_port = configure_camera_exposure(
+                    context,
+                    port,
+                    exposure_session_id,
+                    exposure,
+                )
+            if association_source is not None:
+                association_source.bind_capability_fingerprint(
+                    active_port.capability.capability_fingerprint
+                )
             tap = stream.monitor()
             raw_dataset = MonitorDataset.append_window(
                 spec.block_id,
@@ -515,14 +660,15 @@ def _compile_camera_monitor_plan(
                 causation_domain_id=stream.generation.value,
             )
             return _CameraMonitorTransaction(
-                port,
+                active_port,
                 view,
                 dataset,
                 stream,
                 producer,
                 uuid.uuid4().hex,
                 request.history_cycles * request.frames_per_cycle,
-                port.capability.max_blocking_call_seconds,
+                active_port.capability.max_blocking_call_seconds,
+                association_source,
             )
         except BaseException as error:
             try:
@@ -544,11 +690,10 @@ def _compile_camera_monitor_plan(
                     tap.close()
                 except BaseException:
                     pass
-            if producer is not None:
-                try:
-                    producer.fail(StreamError(safe_error_summary(error)))
-                except BaseException:
-                    pass
+            try:
+                producer.fail(StreamError(safe_error_summary(error)))
+            except BaseException:
+                pass
             raise
 
     def execute(context: RunContext, prepared: _CameraMonitorTransaction) -> None:
@@ -560,15 +705,44 @@ def _compile_camera_monitor_plan(
         prepared: _CameraMonitorTransaction | None,
         primary: BaseException | None,
     ) -> CleanupReport:
+        restore_exposure = None
+        if exposure_attempted:
+            assert exposure_session_id is not None
+            restore_exposure = lambda: port.cleanup(
+                context,
+                exposure_session_id,
+            )
         if prepared is None:
-            report = port.verify_idle(context)
-            if primary is not None:
+            try:
+                producer.fail(
+                    StreamError(
+                        safe_error_summary(
+                            primary
+                            if primary is not None
+                            else RuntimeError("camera monitor ended before preflight")
+                        )
+                    )
+                )
+            except BaseException:
+                pass
+            steps = [lambda: port.verify_idle(context)]
+            if restore_exposure is not None:
+                steps.append(restore_exposure)
+            report = run_cleanup_steps(*steps)
+            failure = primary
+            if failure is None and report.errors:
+                failure = report.errors[0]
+            if failure is not None:
                 try:
-                    view.fail(safe_error_summary(primary))
+                    view.fail(safe_error_summary(failure))
                 except BaseException:
                     pass
             return report
-        return prepared.cleanup(context, primary)
+        return prepared.cleanup(
+            context,
+            primary,
+            restore_exposure=restore_exposure,
+        )
 
     return RunPlan(
         name=f"Camera monitor {request.camera_ref.role}",
@@ -588,8 +762,19 @@ def prepare_live_camera_measurement(
     *,
     monitor_port: BoundCameraMonitorPort,
     start_run: Callable[[RunPlan], RunHandle],
+    association_authority: CameraSignalAssociationAuthority | None = None,
 ) -> PreparedLiveCameraMeasurement:
-    return PreparedLiveCameraMeasurement(request, monitor_port, start_run)
+    prepared_type = (
+        PreparedAssociatedLiveCameraMeasurement
+        if association_authority is not None
+        else PreparedLiveCameraMeasurement
+    )
+    return prepared_type(
+        request,
+        monitor_port,
+        start_run,
+        association_authority=association_authority,
+    )
 
 
 __all__ = [
@@ -597,5 +782,6 @@ __all__ = [
     "CameraMonitorViewPort",
     "CameraMonitorViewSpec",
     "PreparedLiveCameraMeasurement",
+    "PreparedAssociatedLiveCameraMeasurement",
     "prepare_live_camera_measurement",
 ]

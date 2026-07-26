@@ -37,7 +37,7 @@ class BoundDatasetInput:
             raise TypeError("producer_definition must be DefinitionKey")
         if not isinstance(self.output, DatasetOutputDeclaration):
             raise TypeError("output must be DatasetOutputDeclaration")
-        if self.output.contract_id not in self.spec.accepted_output_contract_ids:
+        if not self.spec.accepts(self.output.contract_id):
             raise ValueError("Dataset output contract is not accepted by this input")
         if self.transform_spec is not None:
             if not isinstance(self.transform_spec, DataTransformSpec):
@@ -100,9 +100,20 @@ class BoundNodeInputs:
         return value
 
 
+def bind_no_node_inputs(request: object, inputs: BoundNodeInputs) -> object:
+    """Return a request only when its owner declared no cross-node inputs."""
+
+    if not isinstance(inputs, BoundNodeInputs):
+        raise TypeError("inputs must be BoundNodeInputs")
+    if inputs.values:
+        raise ValueError("this Logic node declares no cross-node inputs")
+    return request
+
+
 __all__ = [
     "BoundArtifactInput",
     "BoundDatasetInput",
     "BoundNodeInput",
     "BoundNodeInputs",
+    "bind_no_node_inputs",
 ]

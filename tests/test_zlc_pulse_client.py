@@ -13,6 +13,7 @@ from zlc_pulse import (
     RemotePulseExecutionClient,
     compile_pulse_artifact,
     load_pulse_document,
+    pulse_server_snapshot_from_tree,
     pulse_target_manifest_from_lanes,
 )
 from zlc_pulse.server import (
@@ -26,7 +27,7 @@ from zlc_storage import encode
 
 
 ROOT = Path(__file__).parents[1]
-IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+IMAGING_TEMPLATE = ROOT / "pulses" / "imaging_template.json"
 
 
 class _InProcessTimedResult:
@@ -210,6 +211,26 @@ def test_remote_client_rejects_non_current_snapshot_schema():
 
     with pytest.raises(ValueError, match="unknown field set"):
         RemotePulseExecutionClient(BadConnection(), BadConnection())
+
+
+def test_snapshot_codec_accepts_only_the_current_server_field_set():
+    _artifact, service, _connection = _fixture()
+    tree = service.snapshot()
+
+    assert set(tree) == {
+        "schema",
+        "connection_generation",
+        "manifest",
+        "clock_hz",
+        "geometry_fingerprint",
+        "state",
+        "prepared_ref",
+        "backend",
+    }
+    snapshot = pulse_server_snapshot_from_tree(tree)
+    assert snapshot.connection_generation == tree["connection_generation"]
+    assert snapshot.geometry_fingerprint == tree["geometry_fingerprint"]
+    assert snapshot.state == "IDLE"
 
 
 def test_remote_client_requires_a_physically_distinct_interrupt_connection():

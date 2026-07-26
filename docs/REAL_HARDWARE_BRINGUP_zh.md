@@ -108,67 +108,47 @@ pulse-only 路径。
 
 ---
 
-## 5. >4096 点扫描(9999 点级):`AUTONOMOUS_REFILLED` 资格化
+## 5. 当前 frozen RTL ping-pong streamed baseline
 
-本节是完整 qCMOS real installation、Q0 与 EndAttestation 闭合后的**未来资格化**，不是当前
-pulse-only 首测步骤，也不改变≤4096点 `AUTONOMOUS_RESIDENT` 的当前可用路径。
+当前已批准 bitstream 本身就实现双 bank ping-pong scan；跨越两个 bank 的表与较短表走同一
+`AUTONOMOUS_STREAMED` 路径，不需要重烧 FPGA 或另一项 capability。`prepare()` 在任何 I/O 前
+验证 clock、target、geometry/ABI 与 deterministic wire packing；这些事实成立后，完整物理
+scan table 会在 `FIRE` 前冻结，长度不改变 streamed 执行路径。
 
-### 5.1 现在会看到什么
+### 5.1 唯一 observer owner
 
-超过常驻窗口的扫描在 **fire 之前**被 typed 拒绝,不会退化成 host 逐点驱动:
+`DeployedStreamerSession` 在 `FIRE` 后只允许一个 observer 拥有该 transport 的运行期 I/O。
+它同时读取 STATUS/CURSOR、选择并补充下一个 bank、发布 progress、判定 terminal、处理 cancel，
+以及在失败时进入 SAFE；`await_completion()` 只等待该 owner 的结果，不再创建第二个读写方。
+禁止 notebook、GUI、server handler 或另一线程并行轮询状态或写 bank。
 
-```
-zlc_pulse.FormalScanCapacityExceeded:
-  formal autonomous scan exceeds the frozen bitstream's fully resident
-  capacity: 9999 points > 4096. AUTONOMOUS_REFILLED is not published ...
-```
+每个 refill 事务遵守同一个硬件握手：先将对应 `BANK_READY` 清零，再写该 bank 的全部 wire
+words 与 `BANKx_CHUNK`，最后重新置位 `BANK_READY`。finite scan 按冻结 chunk 的单调序号装入；
+cyclic scan 仍由同一序号选择 bank，并按冻结 chunk 数回绕数据。host 只供应预先冻结的 chunk，
+不选择下一个 point、不逐点 fire、不调度任何精密 edge；point/edge 时序始终由 FPGA 决定。
+每次重新置位后，同一个 observer 立即读取 `STATUS/CURSOR`；若已出现 error/underflow，或 cursor
+已跨出 refill 开始时所在的 chunk，则不能证明该 bank 在边界前完成，整 run 必须失败。这个运行时
+边界证明也覆盖“非 sticky underflow 在重新置位后迅速清零”的窗口。
 
-异常对象带三个字段,GUI/notebook 直接读,不用抠字符串:
+### 5.2 整 run 的 fail-closed 判据
 
-| 字段 | 含义 |
-|---|---|
-| `requested_points` | 本次请求的物理 scan 行数(已含 repeat 展开) |
-| `resident_limit` | `2 * bank_size`,当前 `fpga/board_config/streamer_config.json` 里 `bank_size=2048` → **4096** |
-| `capability_unavailable_reason` | 缺哪几项证据(单源常量 `AUTONOMOUS_REFILLED_UNAVAILABLE_REASON`) |
+observer 只要在任一采样中看见 `STATUS_UNDERFLOW`，即使该位随后清零或最终又出现 `DONE`，
+本次 run 也必须整体失败并进入 SAFE；不得把已取得的局部 frame、最终 cursor 或 DONE 改写成
+成功证据。错误、cursor 越界、chunk/handshake 失败、超时、取消和断连同样由这个 owner 收口。
+没有 host-stepped fallback，也不得通过拆成逐点 host 命令来掩盖 underflow。
 
-**这不是"硬件做不到"。** 冻结 bitstream 里 ping-pong bank refill 硬件本来就在,
-`zlc_edge_streamer.v` 的流式 scan 与无缝 wrap 都已验证过。缺的是**证据**,
-不是硅片,所以本节是一份资格化实验清单,不是硬件改动申请。
+### 5.3 真机 bring-up 检查
 
-### 5.2 必须先成立的三件事(§15.4 强 gate)
+这些检查验证当前 installation 与单次 run：
 
-1. **单一 I/O owner。** 一个 `FiniteScanStreamer` 同时负责 status、cursor、bank refill、
-   progress、cancel、completion。今天 `zlc_pulse/transport/session.py` 的 worker 只读
-   STATUS/CURSOR,没有 refill 写方;绝不允许再开第二个线程去写同一 transport。
-2. **refill 事务的保守硬上界。** 要的是上界,不是 measured worst / p99。
-   "measured worst refill + Windows/Python 调度余量"**不是**确定性上界,不可用来发布能力。
-3. **每个 seam 的硬件时间观测 + 全 schedule residual。**
-   当前 RTL 的 `STATUS_UNDERFLOW` 在 bank 恢复后会**自己清零**(非 sticky),
-   所以最终 `STATUS_DONE`、局部 camera timestamp、`scan_progress()` 镜像
-   **都不能**证明"从未 stall"。没有 camera edge 的区段、最后一个 trigger 之后的 seam、
-   任何不可观测的 stall,只要有一个,能力就不可发布。
+| # | 检查 | 通过判据 |
+|---|---|---|
+| S1 | 分别运行只占一个 bank、恰跨 bank、超过两个 bank 的 finite 表 | 每次只有一个 FIRE；point/camera 总数、ordered schedule、cursor terminal、producer-owned SignalAssociationEvidence 与 collector coverage 完全一致 |
+| S2 | 运行奇数与偶数 chunk 数，并以 9999 点表做 streamed 压力检查 | bank/chunk 顺序与冻结 table digest 一致；无 observed UNDERFLOW、ERROR、错序、重复或遗漏 |
+| S3 | 运行 cyclic 表并在多个 wrap 后取消 | wrap 顺序保持冻结映射；cancel 由同一 observer 收口并进入 SAFE，不遗留第二个 I/O worker |
+| S4 | 在测试环境故意把一次 refill 延迟到 bank 边界附近 | observer 必须由 UNDERFLOW 或 refill 后的 cursor 跨 chunk 证明拒绝该 run，随后 SAFE 成功；不得以稍后的 RUNNING/DONE 判成功 |
+| S5 | 正常完成后核对 server snapshot、Run diagnostics 与 producer 证据 | terminal、完整 schedule、producer association、collector coverage 和 camera drain/tail（若适用）互相一致 |
 
-### 5.3 资格化实验(按顺序;每步不过就停在这一步)
-
-| # | 实验 | 命令/配置 | 判据(全部满足才算过) |
-|---|---|---|---|
-| R1 | 常驻基线复核 | 4096 点 SCAN_SLOT,走现有 `AUTONOMOUS_RESIDENT` | 一次 fire 跑完;terminal evidence 合法;camera 帧数 == `expected_trigger_total_from_completed_schedule` |
-| R2 | refill 事务上界测量 | 单 I/O owner 下,反复写满一个 bank,记录每次事务耗时分布与**理论上界推导** | 有书面上界(transport 字节数 × 最坏 per-word 时间 + 协议开销),且实测最大值 < 上界;只有分布没有推导 = 不过 |
-| R3 | seam 时间观测分辨率 | 在每个 bank 边界安排camera trigger；使用经Q0资格化的qCMOS metadata、现有回读或外部仪器取得时间证据 | 每个潜在 seam 都落在一个可观测区间内；来源、分辨率和误差必须入证据；不得假定当前FPGA已有逐沿timestamp；**存在无edge的seam即判不过** |
-| R4 | 全 schedule residual | R3 的逐 seam 观测与 compiled schedule 做残差比对 | 残差 ≤ 由 R2 上界推出的允许值;无未解释异常点 |
-| R5 | 9999 点压力实验 | 9999 点 SCAN_SLOT,连续 ≥20 次 | 每次:无 underflow、无 late chunk、terminal 合法、帧数与 schedule 完全一致;**一次不过即整轮不过** |
-| R6 | 拒绝路径反证 | 人为把 refill 延迟到超上界 | 必须 fail closed(拒绝/INVALID),不得"看起来跑完了" |
-
-### 5.4 启用与回退
-
-- **启用**:R1–R6 全过后，新增由deployment证据签发的typed
-  `AUTONOMOUS_REFILLED` capability，并让 `validate_resident_scan_capacity` 与
-  `require_autonomous_scan_resident_capacity` 共同消费这一唯一判据；同时保存R2–R4证据digest。
-  `AUTONOMOUS_REFILLED_UNAVAILABLE_REASON` 只是拒绝诊断文本，修改它本身绝不能发布能力。
-- **回退**:任何一次实验不过、或换 transport/换机器/改 `bank_size`,立即把常量改回未发布,
-  实验退回 `AUTONOMOUS_RESIDENT`(≤4096 点)。分批扫描是合法的临时办法;
-  **host 逐点驱动不是**。
-- **不变量**:即使能力发布,host 也只**供应预先冻结的 chunk**,
-  全部精密 edge 时序仍由 FPGA 自主决定;host 不选下一个 point、不调度 edge。
-  单次 run 的 Formal 资格另由 Q0 qualification、association proof、exact 链与
-  EndAttestation 独立决定,与装载方式名称无关。
+任一检查失败时保留 snapshot、diagnostics、table/chunk digest 和仪器证据，停止该 run 并排查
+transport/installation；不要改写状态、不要切到 host stepping，也不要把重烧 bitstream 当作常规
+恢复步骤。只有证实现有 RTL 偏离已批准设计时，才另行启动 bitstream 变更流程。

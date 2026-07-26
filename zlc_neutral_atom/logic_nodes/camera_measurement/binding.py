@@ -21,12 +21,12 @@ from zlc_neutral_atom.devices.camera.contract import (
     ReadoutBindingKey,
 )
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
-from zlc_neutral_atom.logic_nodes.camera_capture.session import (
+from zlc_neutral_atom.capture.session import (
     CameraCaptureContract,
     CameraCaptureProvenance,
 )
 from zlc_neutral_atom.runtime.dataset import DatasetCellSchedule, FrozenDatasetEdge
-from zlc_neutral_atom.logic_nodes.camera_capture.pipeline import BoundMeasurement
+from zlc_neutral_atom.capture.pipeline import BoundMeasurement
 from zlc_neutral_atom.runtime.streams import StreamId
 from zlc_storage import canonical_text as _canonical_text
 from zlc_storage import sha256_text as _sha256

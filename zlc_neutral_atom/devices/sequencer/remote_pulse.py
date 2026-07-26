@@ -56,7 +56,6 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
         self._target = self._manifest.target
         self._clock_hz = snapshot.clock_hz
         self._geometry = snapshot.geometry_fingerprint
-        self._resident_scan_point_capacity = snapshot.resident_scan_point_capacity
         self._server_connection_generation = snapshot.connection_generation
         self._owner = _SequencerSessionOwner(
             self,
@@ -82,7 +81,6 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
                 "manifest_fingerprint": self._manifest.fingerprint,
                 "clock_hz": self._clock_hz,
                 "geometry_fingerprint": self._geometry,
-                "resident_scan_point_capacity": self._resident_scan_point_capacity,
                 "max_blocking_call_seconds": self._timeout,
                 "terminal_evidence_kind": (
                     PulseTerminalEvidenceKind.HARDWARE_RAW_REGISTERS.value
@@ -94,7 +92,6 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
             manifest=self._manifest,
             clock_hz=self._clock_hz,
             geometry_fingerprint=self._geometry,
-            resident_scan_point_capacity=self._resident_scan_point_capacity,
             max_blocking_call_seconds=self._timeout,
             terminal_evidence_kind=(
                 PulseTerminalEvidenceKind.HARDWARE_RAW_REGISTERS
@@ -235,8 +232,6 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
             snapshot.target != self._target
             or snapshot.clock_hz != self._clock_hz
             or snapshot.geometry_fingerprint != self._geometry
-            or snapshot.resident_scan_point_capacity
-            != self._resident_scan_point_capacity
         ):
             raise RuntimeError(
                 "remote pulse server capability changed within one connection"

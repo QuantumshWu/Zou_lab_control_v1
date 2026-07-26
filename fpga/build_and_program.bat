@@ -109,7 +109,7 @@ exit /b %ERRORLEVEL%
 :zlc_help
 echo Build/program the FINAL ZLC FPGA pulse streamer (one clean design, no variants).
 echo Control path: JTAG-to-AXI master -^> AXI BRAM controller -^> edge/scan BRAMs + bus loader.
-echo Engine: 1-tick (20 ns) FIFO prefetch + 4096-point resident autonomous scan.
+echo Engine: 1-tick (20 ns) FIFO prefetch + streamed autonomous ping-pong scan.
 echo.
 echo Usage:
 echo   fpga\build_and_program.bat              Build (only if sources changed) and program

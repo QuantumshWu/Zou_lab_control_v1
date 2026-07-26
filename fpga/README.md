@@ -57,10 +57,12 @@ and requalify the image before it may replace the frozen bitstream.
 
 Default clock is 50 MHz (20 ns tick); the minimal pulse width and resolution are
 1 tick. The qualified deployment has 4096 edge rows and two 2048-point scan
-banks, so one current autonomous run admits at most 4096 fully resident points.
-The frozen RTL contains a refill-capable mailbox, but the current runtime does
-not publish host refill; larger tables fail before FIRE rather than changing
-timing semantics. The deployed clock is fixed at 50 MHz. `ZLC_PS_XDC` and
+banks, so 4096 bank-local scan slots are resident at one time. A run may contain
+more points: preparation preloads the first two chunks, then the sole host
+observer refills each released bank through `BANK_READY` / `BANK*_CHUNK`. The
+FPGA still clocks every point autonomously; the host moves chunks, never drives
+individual point timing. Any observed `UNDERFLOW` invalidates the run. The
+deployed clock is fixed at 50 MHz. `ZLC_PS_XDC` and
 `ZLC_PS_VIVADO_BIN` select deployment/build inputs; neither changes the running
 bitstream.
 

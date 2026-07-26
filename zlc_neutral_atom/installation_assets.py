@@ -3,8 +3,8 @@
 The experiment config chooses a logical role.  It never invents a physical
 identity, resource key, or adapter matcher: those facts live in this
 machine-level document and are content-addressed as one immutable revision.
-This owner is deliberately below both bootstrap dispatch and concrete device
-attachments so device composition never depends back on bootstrap.
+This owner is deliberately below both installation dispatch and concrete
+device attachments so device composition never depends back on dispatch.
 """
 
 from __future__ import annotations

@@ -36,11 +36,12 @@ from zlc_neutral_atom.devices.camera.contract import (
     decode_camera_capture_spec,
     freeze_camera_capture_spec,
 )
-from zlc_neutral_atom.logic_nodes.camera_capture.session import (
+from zlc_neutral_atom.capture.session import (
     CameraCaptureContract,
     CameraCaptureProvenance,
 )
 from zlc_neutral_atom.devices.camera.capture_port import CaptureCapabilitySnapshot
+from zlc_neutral_atom.devices.simulation.installation import create_virtual_installation
 from zlc_neutral_atom.devices.camera.contract import (
     CameraCapabilityEvidence,
     CameraPhysicalFacts,
@@ -63,7 +64,9 @@ from zlc_neutral_atom.runtime.streams import StreamId
 from zlc_neutral_atom.logic_nodes.camera_measurement.binding import (
     CameraCaptureBindingRequest,
     _source_group_sizes,
+    bind_camera_measurement,
 )
+from zlc_neutral_atom.capture.pipeline import BoundMeasurement
 from zlc_storage import decode, encode
 
 
@@ -389,3 +392,59 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
     assert projected.values.shape == (3, 4)
     assert np.array_equal(projected.values, sample.image.values)
     assert contract.total_events == 4
+
+
+def test_camera_capture_owner_proof_belongs_to_the_bound_camera_contract():
+    composition = create_virtual_installation(seed=7)
+    runtime = composition.runtime
+    try:
+        camera_ref = runtime.device_catalog.require("camera").ref
+        port = runtime.camera_port(camera_ref)
+        repeat = _axis("binding.repeat", REPEAT, 1)
+        event = _axis("binding.event", READOUT_EVENT, 1)
+        layout = PointLayout.rect_c((1,))
+        schema = DatasetSchema(
+            repeat,
+            (event,),
+            layout,
+            port.capability.payload_contract.value_schema,
+        )
+        schedule = DatasetCellSchedule.from_cells(
+            schema,
+            (DatasetCellAddress(0, 0),),
+        )
+        measurement = bind_camera_measurement(
+            port,
+            CameraCaptureBindingRequest(
+                "camera",
+                repeat,
+                (event,),
+                layout,
+                schedule,
+                CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+                (port.capability.camera_physical_facts.event_setting(0),),
+            ),
+        )
+
+        assert not hasattr(
+            measurement.definition,
+            "capture_spec_owner_fingerprint",
+        )
+        assert measurement.capture_spec.owner_fingerprint == (
+            measurement.capture_contract.capture_spec_owner_fingerprint
+        )
+        with pytest.raises(
+            ValueError,
+            match="capture spec and camera contract owner differ",
+        ):
+            BoundMeasurement(
+                measurement.definition,
+                measurement.capture_port,
+                measurement.capture_contract,
+                replace(
+                    measurement.capture_spec,
+                    owner_fingerprint="f" * 64,
+                ),
+            )
+    finally:
+        assert runtime.shutdown(timeout=2.0)

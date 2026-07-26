@@ -1,4 +1,4 @@
-"""MONITOR seam: change-driven latest fronts from independent producers.
+"""MONITOR seam: change-driven fronts with local causal coherence.
 
 Monitor seam of the composition root (``app.py``).  A run node
 publishes into a ``LiveDatasetSlot``; this module freezes only slots that
@@ -7,9 +7,11 @@ their latest immutable fronts into one presentation cycle does *not* assert
 that independent producers observed the same physical shot.
 
 Freeze-latest, not a bus.  Each changed slot materialises its own atomic
-transaction exactly once; unchanged slots reuse their immutable fronts.  The resulting
-:class:`ConsoleDataFront` is immutable, so readers agree about every individual
-producer revision without inventing cross-producer causation.
+transaction exactly once; unchanged slots reuse their immutable fronts.  Independent
+producers still advance independently.  Within one explicit source -> Processor
+component, however, a newer source and its active descendants replace the previous
+component together.  A slow Processor therefore cannot put Camera revision N beside
+its own Occupancy revision N-1.
 
 What replaced the shot clock: a monitor tap overwrites when the display falls
 behind rather than back-pressuring acquisition, and it says so per signal
@@ -32,7 +34,7 @@ from zlc_frontend.figure_outputs import (
     FitParameterMetadata,
     SelectorAxisMetadata,
 )
-from zlc_frontend.site_map_render import SiteMapView
+from zlc_frontend.site_map import SiteMapPresentation
 from zlc_neutral_atom.dataset_output import (
     DatasetOutputDeclaration,
     FinalDatasetOutput,
@@ -67,7 +69,7 @@ class ConsoleSignalValue:
     join_digest: str                # exact immutable source/coherence digest
     transient: bool = False         # withdrawn with its live producer
     presentation: (
-        SiteMapView | SelectorAxisMetadata | FitParameterMetadata | None
+        SiteMapPresentation | SelectorAxisMetadata | FitParameterMetadata | None
     ) = None
 
     def __post_init__(self) -> None:
@@ -87,7 +89,7 @@ class ConsoleSignalValue:
             raise TypeError("signal transient flag must be bool")
         if self.presentation is not None and not isinstance(
             self.presentation,
-            (*SiteMapView.__args__, SelectorAxisMetadata, FitParameterMetadata),
+            (SiteMapPresentation, SelectorAxisMetadata, FitParameterMetadata),
         ):
             raise TypeError("Console signal presentation has an unknown type")
         object.__setattr__(self, "name", name)
@@ -158,7 +160,7 @@ class ConsoleSignalValue:
 
 @dataclass(frozen=True)
 class ConsoleDataFront:
-    """Latest immutable value of each producer; no cross-producer join claim."""
+    """Immutable front: coherent derived components, independent producers."""
 
     signals: Mapping[str, ConsoleSignalValue]
     failures: Mapping[str, str]     # producer instance_id -> freeze failure
@@ -224,6 +226,18 @@ def _node_display_label(node: object) -> str:
     return canonical_text(str(label), "console producer display label")
 
 
+def _node_declared_signal_names(node: object) -> tuple[str, ...]:
+    """Qualify one node's frozen owner declarations through its route owner."""
+
+    declared = _declared_outputs(
+        tuple(getattr(node, "output_declarations", ()) or ())
+    )
+    qualify = getattr(node, "signal_key", None)
+    if not callable(qualify):
+        raise TypeError("console producer exposes no signal_key()")
+    return tuple(str(qualify(name)) for name in declared)
+
+
 def _signal_revision_identity(value: ConsoleSignalValue) -> tuple[object, ...]:
     """Exact source identity used by the latest-only Processor lane."""
 
@@ -255,11 +269,122 @@ def _evaluate_prepared_processor_application(
         raise TypeError(
             "prepared Processor application must expose evaluate()"
         )
-    return evaluate(
+    result = evaluate(
         source.snapshot,
         coverage,
         source_event_digest=source.join_digest,
     )
+    from zlc_neutral_atom.processing import require_causal_processor_evaluation
+
+    return require_causal_processor_evaluation(
+        result,
+        source_ref=source.snapshot.ref,
+        source_event_digest=source.join_digest,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessorEdgePublication:
+    """One exact source -> complete Processor-output causal edge."""
+
+    node: object
+    source_name: str
+    source_identity: tuple[object, ...]
+    outputs: Mapping[str, ConsoleSignalValue]
+
+    def __post_init__(self) -> None:
+        source_name = canonical_text(self.source_name, "processor source name")
+        source_identity = tuple(self.source_identity)
+        outputs = dict(self.outputs)
+        if not source_identity:
+            raise ValueError("Processor edge source identity must not be empty")
+        if not outputs:
+            raise ValueError("Processor edge must publish outputs")
+        if any(not isinstance(value, ConsoleSignalValue) for value in outputs.values()):
+            raise TypeError("Processor edge outputs must be ConsoleSignalValue values")
+        object.__setattr__(self, "source_name", source_name)
+        object.__setattr__(self, "source_identity", source_identity)
+        object.__setattr__(self, "outputs", MappingProxyType(outputs))
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessorSourceComponent:
+    """One root producer transaction plus its ordered causal Processor edges."""
+
+    root_signals: Mapping[str, ConsoleSignalValue]
+    edges: tuple[_ProcessorEdgePublication, ...] = ()
+
+    def __post_init__(self) -> None:
+        root = dict(self.root_signals)
+        edges = tuple(self.edges)
+        if not root:
+            raise ValueError("Processor source component requires root signals")
+        if any(not isinstance(value, ConsoleSignalValue) for value in root.values()):
+            raise TypeError(
+                "Processor source component must contain ConsoleSignalValue values"
+            )
+        accumulated = dict(root)
+        for edge in edges:
+            if not isinstance(edge, _ProcessorEdgePublication):
+                raise TypeError("Processor source component has another edge type")
+            source = accumulated.get(edge.source_name)
+            if (
+                source is None
+                or _signal_revision_identity(source) != edge.source_identity
+            ):
+                raise ValueError(
+                    "Processor source component edge has another source revision"
+                )
+            overlap = set(accumulated).intersection(edge.outputs)
+            if overlap:
+                raise ValueError(
+                    "Processor source component edge redefines signals: "
+                    + ", ".join(sorted(overlap))
+                )
+            accumulated.update(edge.outputs)
+        object.__setattr__(self, "root_signals", MappingProxyType(root))
+        object.__setattr__(self, "edges", edges)
+
+    @property
+    def signals(self) -> Mapping[str, ConsoleSignalValue]:
+        values = dict(self.root_signals)
+        for edge in self.edges:
+            values.update(edge.outputs)
+        return MappingProxyType(values)
+
+    def extend(
+        self,
+        edge: _ProcessorEdgePublication,
+    ) -> _ProcessorSourceComponent:
+        return _ProcessorSourceComponent(self.root_signals, (*self.edges, edge))
+
+    def through_signal(self, name: str) -> _ProcessorSourceComponent:
+        selected = canonical_text(name, "processor source name")
+        if selected in self.root_signals:
+            return _ProcessorSourceComponent(self.root_signals)
+        for index, edge in enumerate(self.edges):
+            if selected in edge.outputs:
+                return _ProcessorSourceComponent(
+                    self.root_signals,
+                    self.edges[: index + 1],
+                )
+        raise KeyError(selected)
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessorPublication:
+    edge: _ProcessorEdgePublication
+    source_component: _ProcessorSourceComponent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.edge, _ProcessorEdgePublication):
+            raise TypeError("Processor publication has another edge type")
+        if not isinstance(self.source_component, _ProcessorSourceComponent):
+            raise TypeError("Processor publication has another source component type")
+        self.source_component.extend(self.edge)
+
+    def output_component(self) -> _ProcessorSourceComponent:
+        return self.source_component.extend(self.edge)
 
 
 @dataclass(slots=True)
@@ -270,7 +395,9 @@ class _LatestOnlyProcessorEntry:
     application: object | None = None
     work_future: Future | None = None
     work_source: ConsoleSignalValue | None = None
+    work_source_component: _ProcessorSourceComponent | None = None
     pending_source: ConsoleSignalValue | None = None
+    pending_source_component: _ProcessorSourceComponent | None = None
     last_source_identity: tuple[object, ...] | None = None
     cancel_requested: bool = False
 
@@ -316,6 +443,7 @@ class _LatestOnlyProcessorLane:
         node: object,
         source_name: str,
         initial_source: ConsoleSignalValue,
+        initial_source_component: _ProcessorSourceComponent,
     ) -> None:
         if self._closed:
             raise RuntimeError("latest-only Processor lane is closed")
@@ -325,6 +453,10 @@ class _LatestOnlyProcessorLane:
             raise TypeError("initial Processor source must be ConsoleSignalValue")
         if initial_source.name != name:
             raise ValueError("initial Processor source has another signal name")
+        source_component = self._require_source_component(
+            initial_source,
+            initial_source_component,
+        )
         key = id(node)
         if key in self._entries:
             raise RuntimeError("Processor node is already attached")
@@ -338,6 +470,7 @@ class _LatestOnlyProcessorLane:
             source_name=name,
             prepare_future=future,
             pending_source=initial_source,
+            pending_source_component=source_component,
             last_source_identity=_signal_revision_identity(initial_source),
         )
 
@@ -349,6 +482,7 @@ class _LatestOnlyProcessorLane:
             return True
         entry.cancel_requested = True
         entry.pending_source = None
+        entry.pending_source_component = None
         idle = entry.prepare_future.done() and (
             entry.work_future is None or entry.work_future.done()
         )
@@ -362,12 +496,20 @@ class _LatestOnlyProcessorLane:
             return
         entry.cancel_requested = True
         entry.pending_source = None
+        entry.pending_source_component = None
         if entry.prepare_future.done() and (
             entry.work_future is None or entry.work_future.done()
         ):
             self._entries.pop(id(node), None)
 
-    def route(self, signals: Mapping[str, ConsoleSignalValue]) -> None:
+    def route(
+        self,
+        signals: Mapping[str, ConsoleSignalValue],
+        source_components: Mapping[
+            str,
+            _ProcessorSourceComponent,
+        ],
+    ) -> None:
         """Offer each attached node the exact newest accepted source revision."""
 
         if self._closed:
@@ -383,12 +525,51 @@ class _LatestOnlyProcessorLane:
                 continue
             try:
                 entry.node._validate_processor_source(source)
+                source_component = source_components.get(source.name)
+                if source_component is None:
+                    raise RuntimeError(
+                        "Processor source has no retained producer transaction"
+                    )
+                source_component = self._require_source_component(
+                    source,
+                    source_component,
+                )
             except Exception as error:
                 self._retire_failed(entry, error)
                 continue
             entry.last_source_identity = identity
             entry.pending_source = source
+            entry.pending_source_component = source_component
             self._start_pending(entry)
+
+    def active_bindings(self) -> tuple[tuple[object, str], ...]:
+        """Return the currently admitted source edges on the owner thread."""
+
+        return tuple(
+            (entry.node, entry.source_name)
+            for entry in self._entries.values()
+            if not entry.cancel_requested
+        )
+
+    def source_component_for_publication(
+        self,
+        node: object,
+        source: ConsoleSignalValue,
+    ) -> _ProcessorSourceComponent:
+        """Return the exact transaction retained beside the completed work."""
+
+        entry = self._entries.get(id(node))
+        if entry is None or entry.work_source is None:
+            raise RuntimeError("Processor publication has no admitted work source")
+        if (
+            _signal_revision_identity(entry.work_source)
+            != _signal_revision_identity(source)
+        ):
+            raise RuntimeError("Processor publication source differs from its work")
+        component = entry.work_source_component
+        if component is None:
+            raise RuntimeError("Processor lane lost its source transaction")
+        return component
 
     def drain(self) -> None:
         """Admit completed worker results on the TaskConsole owner thread."""
@@ -407,9 +588,10 @@ class _LatestOnlyProcessorLane:
             work = entry.work_future
             if work is not None and work.done():
                 source = entry.work_source
-                entry.work_future = None
-                entry.work_source = None
                 if entry.cancel_requested:
+                    entry.work_future = None
+                    entry.work_source = None
+                    entry.work_source_component = None
                     self._retire_cancelled(entry)
                     continue
                 try:
@@ -420,8 +602,14 @@ class _LatestOnlyProcessorLane:
                     result = work.result()
                     entry.node._accept_processor_result(source, result)
                 except Exception as error:
+                    entry.work_future = None
+                    entry.work_source = None
+                    entry.work_source_component = None
                     self._retire_failed(entry, error)
                     continue
+                entry.work_future = None
+                entry.work_source = None
+                entry.work_source_component = None
             if entry.cancel_requested:
                 if entry.work_future is None:
                     self._retire_cancelled(entry)
@@ -438,6 +626,10 @@ class _LatestOnlyProcessorLane:
             return
         try:
             source, entry.pending_source = entry.pending_source, None
+            source_component = entry.pending_source_component
+            entry.pending_source_component = None
+            if source_component is None:
+                raise RuntimeError("Processor lane lost its pending source transaction")
             coverage = source.coverage
             if not isinstance(coverage, MonitorCoverage):
                 raise TypeError(
@@ -457,7 +649,28 @@ class _LatestOnlyProcessorLane:
             lambda _future, current=entry.node: self._wake_owner_if_open(current)
         )
         entry.work_source = source
+        entry.work_source_component = source_component
         entry.work_future = future
+
+    @staticmethod
+    def _require_source_component(
+        source: ConsoleSignalValue,
+        component: _ProcessorSourceComponent,
+    ) -> _ProcessorSourceComponent:
+        if not isinstance(component, _ProcessorSourceComponent):
+            raise TypeError(
+                "Processor source transaction has another component type"
+            )
+        selected = component.signals.get(source.name)
+        if (
+            selected is None
+            or _signal_revision_identity(selected)
+            != _signal_revision_identity(source)
+        ):
+            raise ValueError(
+                "Processor source transaction does not contain its selected revision"
+            )
+        return component.through_signal(source.name)
 
     def _retire_failed(
         self,
@@ -484,6 +697,7 @@ class _LatestOnlyProcessorLane:
         for entry in tuple(self._entries.values()):
             entry.cancel_requested = True
             entry.pending_source = None
+            entry.pending_source_component = None
         # Running evaluations consume only immutable inputs and publish only
         # when drain() admits them.  Once closed there is no consumer, so do
         # not block the Qt owner waiting for pure work that will be discarded.
@@ -509,16 +723,17 @@ class ConsoleDataPlane:
             int,
             tuple[object, dict[str, ConsoleSignalValue]],
         ] = {}
-        self._processors: dict[
-            int,
-            tuple[object, dict[str, ConsoleSignalValue]],
-        ] = {}
+        self._processors: dict[int, _ProcessorPublication] = {}
         self._panels: dict[str, dict[str, ConsoleSignalValue]] = {}
         self._failures: dict[int, str] = {}
         self._membership_changed = False
         self._closed = False
         empty = MappingProxyType({})
         self._front = ConsoleDataFront(signals=empty, failures=empty)
+        self._front_source_components: Mapping[
+            str,
+            _ProcessorSourceComponent,
+        ] = empty
 
     # ------------------------------------------------------------ membership
     def attach(self, node, slot) -> None:
@@ -568,24 +783,78 @@ class ConsoleDataPlane:
         with self._lock:
             if self._closed:
                 raise RuntimeError("console data plane is closed")
-        self._processor_lane.attach(node, source_name, initial_source)
+            initial_component = self._source_component_locked(
+                source_name,
+                initial_source,
+            )
+        self._processor_lane.attach(
+            node,
+            source_name,
+            initial_source,
+            initial_component,
+        )
+
+    def _source_component_locked(
+        self,
+        source_name: str,
+        source: ConsoleSignalValue,
+    ) -> _ProcessorSourceComponent:
+        """Resolve one accepted source to its complete retained transaction."""
+
+        expected = _signal_revision_identity(source)
+        presented = self._front_source_components.get(source_name)
+        if presented is not None:
+            selected = presented.signals.get(source_name)
+            if (
+                selected is not None
+                and _signal_revision_identity(selected) == expected
+            ):
+                return presented.through_signal(source_name)
+        for values in self._cache.values():
+            selected = values.get(source_name)
+            if (
+                selected is not None
+                and _signal_revision_identity(selected) == expected
+            ):
+                return _ProcessorSourceComponent(values).through_signal(source_name)
+        for publication in self._processors.values():
+            component = publication.output_component()
+            selected = component.signals.get(source_name)
+            if (
+                selected is not None
+                and _signal_revision_identity(selected) == expected
+            ):
+                return component.through_signal(source_name)
+        raise RuntimeError(
+            "initial Processor source has no retained producer transaction"
+        )
 
     def cancel_latest_only_processor(self, node: object) -> bool:
         """Stop routing new revisions to one processor."""
 
-        return self._processor_lane.cancel(node)
+        idle = self._processor_lane.cancel(node)
+        self.withdraw_processor(node)
+        return idle
 
     def drain_latest_only_processors(self) -> None:
         """Admit completed shared-lane work on the TaskConsole owner thread."""
 
         self._processor_lane.drain()
 
+    def withdraw_processor(self, node: object) -> None:
+        """Withdraw a stopped Processor's transient publication."""
+
+        key = id(node)
+        with self._lock:
+            if self._processors.pop(key, None) is not None:
+                self._membership_changed = True
+
     def publish_final(
         self,
         node,
         projected: Mapping[str, FinalDatasetOutput],
         *,
-        presentations: Mapping[str, SiteMapView] | None = None,
+        presentations: Mapping[str, SiteMapPresentation] | None = None,
     ) -> None:
         """Admit one successful Run's already-materialized FINAL datasets.
 
@@ -633,8 +902,10 @@ class ConsoleDataPlane:
                 + ", ".join(sorted(unknown_presentations))
             )
         for presentation in presentations.values():
-            if not isinstance(presentation, SiteMapView.__args__):
-                raise TypeError("FINAL presentations must contain SiteMapView values")
+            if not isinstance(presentation, SiteMapPresentation):
+                raise TypeError(
+                    "FINAL presentations must contain SiteMapPresentation values"
+                )
         title = _node_display_label(node)
         handle = getattr(node, "handle", None)
         run_id_value = getattr(handle, "run_id", None)
@@ -680,9 +951,8 @@ class ConsoleDataPlane:
         node,
         outputs: Mapping[str, LiveDatasetOutput],
         *,
-        run_id: str,
-        epoch_id: str,
-        presentations: Mapping[str, SiteMapView] | None = None,
+        source: ConsoleSignalValue,
+        presentations: Mapping[str, SiteMapPresentation] | None = None,
     ) -> None:
         """Namespace one Processor-owned typed output transaction.
 
@@ -693,6 +963,8 @@ class ConsoleDataPlane:
 
         if not isinstance(outputs, Mapping):
             raise TypeError("processor outputs must be a mapping")
+        if not isinstance(source, ConsoleSignalValue):
+            raise TypeError("processor source must be ConsoleSignalValue")
         _node_instance_id(node)
         presentations = {} if presentations is None else presentations
         if not isinstance(presentations, Mapping):
@@ -708,9 +980,12 @@ class ConsoleDataPlane:
         actual = set(output_names)
         if not actual:
             raise ValueError("processor output owner must return a non-empty mapping")
-        if not actual.issubset(declared):
+        expected_outputs = set(declared)
+        if actual != expected_outputs:
             raise ValueError(
-                "Processor published an output absent from the Workbench vocabulary"
+                "Processor publication must cover its complete frozen output "
+                f"vocabulary: missing={tuple(sorted(expected_outputs - actual))}, "
+                f"unknown={tuple(sorted(actual - expected_outputs))}"
             )
         presentation_names = tuple(presentations)
         if any(
@@ -736,17 +1011,30 @@ class ConsoleDataPlane:
                 source=title,
                 snapshot=output.snapshot,
                 coverage=output.coverage,
-                run_id=run_id,
-                epoch_id=epoch_id,
+                run_id=source.run_id,
+                epoch_id=source.epoch_id,
                 join_digest=output.join_digest,
                 transient=True,
                 presentation=presentation,
             )
+        source_component = self._processor_lane.source_component_for_publication(
+            node,
+            source,
+        )
         key = id(node)
+        edge = _ProcessorEdgePublication(
+            node=node,
+            source_name=source.name,
+            source_identity=_signal_revision_identity(source),
+            outputs=frozen,
+        )
         with self._lock:
             if self._closed:
                 raise RuntimeError("console data plane is closed")
-            self._processors[key] = (node, frozen)
+            self._processors[key] = _ProcessorPublication(
+                edge=edge,
+                source_component=source_component,
+            )
             self._membership_changed = True
 
     def publish_panel(
@@ -759,7 +1047,7 @@ class ConsoleDataPlane:
 
         from .console_records import panel_signal_key
         from zlc_frontend.figure_outputs import FigureDerivedSignal
-        from zlc_storage import canonical_digest
+        from zlc_neutral_atom.processing import derive_dataset_event_digest
 
         identity = str(panel_id).strip()
         if not identity:
@@ -787,12 +1075,9 @@ class ConsoleDataPlane:
                 ),
                 run_id=source.run_id,
                 epoch_id=source.epoch_id,
-                join_digest=canonical_digest(
-                    {
-                        "owner": "zlc-workbench.task-console.figure-route",
-                        "source_join_digest": source.join_digest,
-                        "derivation_digest": value.derivation_digest,
-                    }
+                join_digest=derive_dataset_event_digest(
+                    source.join_digest,
+                    value.derivation_digest,
                 ),
                 transient=False,
                 presentation=value.metadata,
@@ -921,10 +1206,29 @@ class ConsoleDataPlane:
                 key: (node, dict(value))
                 for key, (node, value) in self._finals.items()
             }
-            processors = {
-                key: (node, dict(value))
-                for key, (node, value) in self._processors.items()
-            }
+            processors = dict(self._processors)
+            active_processor_sources = tuple(
+                source_name
+                for _node, source_name in self._processor_lane.active_bindings()
+            )
+            source_transactions = []
+            for key, (node, _slot) in current.items():
+                names = list(cached.get(key, ()))
+                declared = set(_node_declared_signal_names(node))
+                names.extend(
+                    name
+                    for name in declared
+                    if name not in names
+                    and (previous := self._front.signals.get(name)) is not None
+                    and previous.transient
+                )
+                names.extend(
+                    source_name
+                    for source_name in active_processor_sources
+                    if source_name in declared and source_name not in names
+                )
+                if names:
+                    source_transactions.append(tuple(names))
             panels = {
                 panel_id: dict(value)
                 for panel_id, value in self._panels.items()
@@ -937,18 +1241,165 @@ class ConsoleDataPlane:
                 failures[_node_instance_id(node)] = failure
         for _key, (_node, values) in finals.items():
             signals.update(values)
-        for _key, (_node, values) in processors.items():
-            signals.update(values)
+        for publication in processors.values():
+            signals.update(publication.edge.outputs)
         for _panel_id, values in panels.items():
             signals.update(values)
-        self._processor_lane.route(signals)
+        # Route the newest candidate even when it is not presentable yet.  The
+        # worker must see revision N in order to produce the descendant values
+        # that make N coherent; presentation keeps the previous component until
+        # those values arrive.
+        source_components: dict[
+            str,
+            _ProcessorSourceComponent,
+        ] = {}
+        for names in source_transactions:
+            root = {
+                name: signals[name]
+                for name in names
+                if name in signals
+            }
+            if root:
+                component = _ProcessorSourceComponent(root)
+                for name in component.root_signals:
+                    source_components[name] = component
+        for publication in processors.values():
+            component = publication.output_component()
+            for name in publication.edge.outputs:
+                source_components[name] = component
+        self._processor_lane.route(signals, source_components)
+        signals, presented_source_components = self._presentable_linked_front(
+            signals,
+            source_components,
+            processors,
+            tuple(source_transactions),
+        )
         front = ConsoleDataFront(
             signals=MappingProxyType(signals),
             failures=MappingProxyType(failures),
         )
         with self._lock:
             self._front = front
+            self._front_source_components = MappingProxyType(
+                presented_source_components
+            )
         return front
+
+    def _presentable_linked_front(
+        self,
+        candidate: Mapping[str, ConsoleSignalValue],
+        candidate_source_components: Mapping[
+            str,
+            _ProcessorSourceComponent,
+        ],
+        processors: Mapping[int, _ProcessorPublication],
+        source_transactions: tuple[tuple[str, ...], ...],
+    ) -> tuple[
+        dict[str, ConsoleSignalValue],
+        dict[str, _ProcessorSourceComponent],
+    ]:
+        """Present each already-admitted linked component as one GUI front.
+
+        Physical causality has already been proved by the neutral processing
+        owner before publication.  This method owns only presentation timing:
+        if a descendant for candidate revision N has not arrived yet, the GUI
+        keeps the complete prior linked front instead of displaying a mixture
+        of N and N-1.  Two unrelated source components remain independent.
+        """
+
+        current = dict(candidate)
+        adjacency: dict[str, set[str]] = {}
+        incoherent: set[str] = set()
+        selected_edges = {
+            key: publication.edge
+            for key, publication in processors.items()
+        }
+        component_candidates = list(candidate_source_components.values())
+
+        # A completed Processor result retains the exact source transaction it
+        # evaluated.  Present that completed transaction even when acquisition
+        # has already advanced the raw latest candidate; the newer candidate is
+        # still routed to pending work above and does not need to be discarded.
+        for publication in processors.values():
+            source_component = publication.source_component
+            current.update(source_component.signals)
+            for edge in source_component.edges:
+                selected_edges[id(edge.node)] = edge
+            component_candidates.append(source_component)
+            component_candidates.append(publication.output_component())
+
+        # A live slot freezes all of its declared outputs in one producer
+        # transaction.  If a Processor consumes one member, staging must retain
+        # its siblings too; otherwise a three-frame Camera revision could be
+        # split into frame_0=N-1 and frame_1=N.
+        for names in source_transactions:
+            if not names:
+                continue
+            anchor = names[0]
+            adjacency.setdefault(anchor, set()).update(names[1:])
+            for name in names[1:]:
+                adjacency.setdefault(name, set()).add(anchor)
+
+        for node, source_name in self._processor_lane.active_bindings():
+            output_names = _node_declared_signal_names(node)
+            if not output_names:
+                raise ValueError("Processor node declares no outputs")
+            adjacency.setdefault(source_name, set()).update(output_names)
+            for output_name in output_names:
+                adjacency.setdefault(output_name, set()).add(source_name)
+
+            source = current.get(source_name)
+            edge = selected_edges.get(id(node))
+            accepted_source = None if edge is None else edge.source_identity
+            outputs_match = edge is not None and all(
+                (presented := current.get(name)) is not None
+                and _signal_revision_identity(presented)
+                == _signal_revision_identity(value)
+                for name, value in edge.outputs.items()
+            )
+            if (
+                source is None
+                or accepted_source != _signal_revision_identity(source)
+                or not outputs_match
+            ):
+                incoherent.add(source_name)
+                incoherent.update(output_names)
+
+        blocked = set(incoherent)
+        pending = list(incoherent)
+        while pending:
+            name = pending.pop()
+            for neighbour in adjacency.get(name, ()):
+                if neighbour not in blocked:
+                    blocked.add(neighbour)
+                    pending.append(neighbour)
+
+        if blocked:
+            previous = self._front.signals
+            for name in blocked:
+                old = previous.get(name)
+                if old is None:
+                    current.pop(name, None)
+                else:
+                    current[name] = old
+
+        front_components: dict[str, _ProcessorSourceComponent] = {}
+        for name in blocked:
+            previous_component = self._front_source_components.get(name)
+            if previous_component is not None and name in current:
+                front_components[name] = previous_component
+        for component in reversed(component_candidates):
+            values = component.signals
+            for name, value in values.items():
+                presented = current.get(name)
+                if (
+                    name not in front_components
+                    and presented is not None
+                    and _signal_revision_identity(presented)
+                    == _signal_revision_identity(value)
+                ):
+                    front_components[name] = component.through_signal(name)
+        return current, front_components
 
     def _freeze_one(
         self,

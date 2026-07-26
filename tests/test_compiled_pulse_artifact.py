@@ -27,7 +27,7 @@ from zlc_pulse import (
 
 
 ROOT = Path(__file__).parents[1]
-IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+IMAGING_PULSE = ROOT / "pulses" / "imaging_template.json"
 
 
 def test_static_artifact_binds_source_ir_wire_and_trigger_schedule():

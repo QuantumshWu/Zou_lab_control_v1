@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
+from fpga.pulse_streamer.host.image import CtrlWords
+
 from .session import TransportAborted
 
 
@@ -183,6 +185,32 @@ class VivadoAxiRegisterTransport:
                 deadline=absolute_deadline,
                 stop=stop,
             )
+
+    def rewrite_scan_bank(
+        self,
+        *,
+        unarmed_bank_ready: int,
+        bank_words: Sequence[tuple[int, int]],
+        chunk_word: int,
+        chunk_index: int,
+        rearmed_bank_ready: int,
+        stop: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> None:
+        """Commit one bank in a single ordered Vivado action."""
+
+        if chunk_word not in (CtrlWords.BANK0_CHUNK, CtrlWords.BANK1_CHUNK):
+            raise ValueError("scan-bank rewrite has an invalid chunk register")
+        self.write_words(
+            (
+                (CtrlWords.BANK_READY, unarmed_bank_ready),
+                *tuple(bank_words),
+                (chunk_word, chunk_index),
+                (CtrlWords.BANK_READY, rearmed_bank_ready),
+            ),
+            stop=stop,
+            deadline=deadline,
+        )
 
     def read_word(
         self,

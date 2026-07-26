@@ -861,6 +861,8 @@ class ImagePanelAggRenderer:
         "_limit_lines",
         "_last_side_key",
         "_last_viewport_key",
+        "_prepared_image_key",
+        "_prepared_image_value",
         "_owner_thread",
         "_render_count",
         "_site_map",
@@ -1043,6 +1045,8 @@ class ImagePanelAggRenderer:
         self._limit_lines = limit_lines
         self._last_side_key = None
         self._last_viewport_key = None
+        self._prepared_image_key = None
+        self._prepared_image_value = None
         self._colorbar = colorbar
         self._colorbar_state = None
         self._site_artist = site_artist
@@ -1096,15 +1100,41 @@ class ImagePanelAggRenderer:
             visible_y_limits = visible_extent[2:]
             x_limits = display_extent[:2]
             y_limits = display_extent[2:]
-            values = np.asarray(image.values)
-            validity = np.asarray(image.validity, dtype=bool)
-            finite_validity = validity & np.isfinite(values)
-            all_finite_validity = bool(np.all(finite_validity))
-            if all_finite_validity:
-                display_values = values
+            prepared_key = distribution_identity
+            if (
+                prepared_key is not None
+                and prepared_key == self._prepared_image_key
+            ):
+                (
+                    values,
+                    finite_validity,
+                    display_values,
+                ) = self._prepared_image_value
             else:
-                display_values = np.asarray(values, dtype=np.float64).copy()
-                display_values[~finite_validity] = np.nan
+                values = np.asarray(image.values)
+                validity = np.asarray(image.validity, dtype=bool)
+                # Integer/bool camera samples are finite by construction.  Do
+                # not allocate and scan a second megapixel boolean plane merely
+                # to rediscover that fact on every viewport answer.
+                finite_validity = (
+                    validity
+                    if values.dtype.kind in "biu"
+                    else validity & np.isfinite(values)
+                )
+                if bool(np.all(finite_validity)):
+                    display_values = values
+                else:
+                    display_values = np.asarray(
+                        values,
+                        dtype=np.float64,
+                    ).copy()
+                    display_values[~finite_validity] = np.nan
+                self._prepared_image_key = prepared_key
+                self._prepared_image_value = (
+                    (values, finite_validity, display_values)
+                    if prepared_key is not None
+                    else None
+                )
             colormap_name = str(display.colormap.value)
             if self._image_artist.get_cmap().name != colormap_name:
                 cmap = matplotlib.colormaps[colormap_name].copy()
@@ -1499,6 +1529,8 @@ class ImagePanelAggRenderer:
         self._blit_cache.clear()
         self._distribution_cache_key = None
         self._distribution_cache_value = None
+        self._prepared_image_key = None
+        self._prepared_image_value = None
         release_agg_figure(figure)
         gc.collect()
 

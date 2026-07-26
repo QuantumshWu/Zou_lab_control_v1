@@ -15,8 +15,8 @@ invariants live in `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` and
   block RAMs (tick 32b / coeff 64b / mask 62b, forced `READ_LATENCY_B=2`), a
   depth-`FIFO_DEPTH` (=`RD_LAT`+2=4) continuous edge prefetch that hides the BRAM
   latency so back-to-back 1-tick (20 ns) edges fire one per clock, a 2-bank
-  continuous cyclic ping-pong scan window (`BANK_SIZE`=2048, 4096 resident
-  points) for the current fully resident autonomous scans, the affine effective-tick MAC + analog-bus
+  continuous cyclic ping-pong scan window (`BANK_SIZE`=2048, 4096 bank-local
+  resident slots at one time) for autonomous streamed scans, the affine effective-tick MAC + analog-bus
   DAC engine, and the output delays -- per-channel (TTL) event-scheduler FIFOs +
   per-bus (DAC) segment-descriptor FIFOs (`out[t]=in[t-d]`, popped against a
   free-running 48-bit `g_time`).
@@ -62,18 +62,18 @@ must not be described as one.
 Scans use named slots: each edge row stores a base tick plus `NUM_SLOTS`
 fixed-point coefficients, and the FPGA computes
 `effective_tick = base + (sum_j coeff_j * slot_j) >>> COEFF_FRAC_BITS` while
-iterating the scan-point table. The scan window is a 2-bank ping-pong. The
-current qualified runtime uploads both banks before FIRE and admits at most
-4096 points; it does not refill during a run. `CURSOR`, `BANK_READY`, and
-`BANK*_CHUNK` remain the frozen hardware protocol for resident-bank identity and
-terminal observation. Analog buses upload through a separate
+iterating the scan-point table. The scan window is a 2-bank ping-pong. Prepare
+uploads the first two chunks before FIRE; during the run the sole host observer
+uses `BANK_READY` and `BANK*_CHUNK` to refill each released bank. The FPGA clocks
+scan points autonomously, while the host only transfers chunks. A late or
+missing refill produces `UNDERFLOW`, and the run is rejected. Analog buses upload through a separate
 LUTRAM segment table (`bus_id, start_tick, stop_tick, start_value, stop_value,
 mode`, plus dual `value_select` for scanned endpoints) so a ramp costs one
 segment, not hundreds of TTL edge rows.
 
 Default profile (from `host.image.StreamerParams` / `solve_capacity` on the 35T):
 `CHANNEL_COUNT=62`, `NUM_SLOTS=4`, `MAX_EDGES=4096`, `BANK_SIZE=2048` (4096
-resident points), `TICK_WIDTH=32`, `COEFF_WIDTH=16`, `COEFF_FRAC_BITS=8`,
+bank-local resident slots), `TICK_WIDTH=32`, `COEFF_WIDTH=16`, `COEFF_FRAC_BITS=8`,
 `RD_LAT=2`, `FIFO_DEPTH=4`, `EVT_FIFO_DEPTH=64`, `BUS_EVT_FIFO_DEPTH=64`,
 `CLOCK_HZ=50 MHz` (20 ns tick). Vivado `report_utilization` is the final
 resource authority; the conservative host-side estimate (`estimate_resources.bat`)
@@ -89,7 +89,7 @@ over `axi_bram_ctrl`. The mailbox words (see `host.image.CtrlWords`):
 COMMAND     host -> top   rising-edge LOAD(1) / FIRE(2) / RESET(4) / SAFE(8)
 STATUS      top -> host   LOADED(1) / RUNNING(2) / DONE(4) / ERROR(8) / UNDERFLOW(16)
 PROG_COUNT                number of edge rows
-SCAN_COUNT                TOTAL scan points N (current runtime requires N <= 4096)
+SCAN_COUNT                TOTAL scan points N (independent of bank-local window depth)
 SCAN_ENABLE / REPEAT_FOREVER
 LOOP_START / LOOP_COUNT / LOOP_END_TICK / LOOP_END_LO / LOOP_END_HI
 BUS_COUNTS                packed per-bus segment counts
@@ -106,8 +106,9 @@ Per-channel TTL delays and per-bus DA delays upload through the dedicated
 DELAY register region (one 32-bit word per channel and per bus; see
 `host.image.region_bases`).
 
-Lifecycle: `prepare` (SAFE, upload the complete resident image, arm both banks,
-LOAD) / `fire` (FIRE) / `wait_done` (poll STATUS/CURSOR) / `safe_state`.
+Lifecycle: `prepare` (SAFE, upload the static image and first two scan chunks,
+arm both banks, LOAD) / `fire` (FIRE) / `wait_done` (the sole observer polls and
+refills released banks) / `safe_state`.
 `STATUS_UNDERFLOW` is fatal evidence that seamless timing was not achieved; the
 run is rejected. The cycle-accurate behavior is locked by
 `host.engine_model` against the reference player + 200 fuzz programs.

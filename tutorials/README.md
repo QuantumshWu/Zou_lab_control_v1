@@ -13,3 +13,7 @@ Start it with `..\start_tutorials_jupyter_lab.bat`. For real-hardware setup use
 `../fpga/run_server.bat`. The published real composition is pulse-only; complete
 qCMOS + remote-sequencer readout remains unavailable and is not implied by this
 virtual tutorial.
+
+Unless `ZLC_TUTORIAL_WORKSPACE` is set explicitly, runtime artifacts go to the
+project-owned `_output/tutorials/neutral-atom/` tree; the tutorial directory
+itself remains source-only.

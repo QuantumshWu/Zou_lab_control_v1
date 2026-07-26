@@ -34,16 +34,13 @@ tutorials/_executed_check/
 **/_executed_check/
 
 # Generated local outputs.  The composition root receives an explicit runtime
-# workspace; task-owned exports may use the repository-local _output default.
-# Ignore those local products and explicit scratch export folders, never source.
+# workspace; operator-facing exports use the repository-local _output default.
+# Ignore that single local product tree, never source documents.
 /_output/
 **/_output/
-/generated_sequences/
-/results/
-**/generated_sequences/
-**/results/
 
-# Figures + data dumps are NEVER committed: panel "Save Fig" (tasks/<name>.png + .npz),
+# Figures + data dumps are NEVER committed: panel/Figure exports live below
+# _output/figures while tasks/ contains only reloadable layout JSON source,
 # calibration reports, scan exports, scratch captures.  The only binary assets admitted
 # to git are deliverable manual figures and explicitly named independent test oracles.
 # (Saved task LAYOUTS tasks/*.json are not data, so they stay committable.)
@@ -111,6 +108,7 @@ docs/**/*.sty
 # Scratch GUI verification screenshots (devtools output, not deliverables)
 /_gui_shots/
 /.gui-evidence/
+/.gui_evidence/
 
 # Pulse presets (pulses/): checked-in PulseDocument authoring JSON is committable.
 # Ignore only scratch files, unnamed timestamp saves, and local real-machine debug programs.
@@ -125,4 +123,5 @@ xsim.dir/
 *.pb
 calibrations/
 
-.claude/worktrees/
+# Claude/Codex session state belongs outside the repository.
+/.claude/

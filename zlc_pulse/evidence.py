@@ -87,7 +87,7 @@ class StaticOnceTerminalEvidence:
 
 @dataclass(frozen=True)
 class AutonomousTableTerminalEvidence:
-    """Raw stable STATUS/CURSOR samples for one resident autonomous table."""
+    """Raw stable STATUS/CURSOR samples for one autonomous scan table."""
 
     read_recipe_id: str
     transport_id: str

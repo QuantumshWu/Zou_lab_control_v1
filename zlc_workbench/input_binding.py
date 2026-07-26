@@ -108,9 +108,8 @@ class ResolvedDatasetInput:
             raise TypeError("selection must be DatasetInputSelection")
         if not isinstance(self.producer, ConsoleProducerBinding):
             raise TypeError("producer must be ConsoleProducerBinding")
-        if (
+        if not self.selection.spec.accepts(
             self.producer.output.contract_id
-            not in self.selection.spec.accepted_output_contract_ids
         ):
             raise ValueError("Dataset producer has an unaccepted output contract")
         if self.transform_spec is not None:
@@ -146,7 +145,7 @@ ResolvedNodeInput = ResolvedDatasetInput | ResolvedArtifactInput
 def bind_resolved_node_inputs(
     values: Mapping[str, ResolvedNodeInput],
     *,
-    resolve_artifact_reference: Callable[[ResolvedArtifactInput], object],
+    resolve_artifact_reference: Callable[[ResolvedArtifactInput], object] | None = None,
 ) -> BoundNodeInputs:
     """Strip Workbench routing identity before invoking a logic-node binder.
 
@@ -158,8 +157,10 @@ def bind_resolved_node_inputs(
 
     if not isinstance(values, Mapping):
         raise TypeError("values must be a mapping")
-    if not callable(resolve_artifact_reference):
-        raise TypeError("resolve_artifact_reference must be callable")
+    if resolve_artifact_reference is not None and not callable(
+        resolve_artifact_reference
+    ):
+        raise TypeError("resolve_artifact_reference must be callable or None")
     bound = {}
     for key, value in values.items():
         if isinstance(value, ResolvedDatasetInput):
@@ -174,6 +175,10 @@ def bind_resolved_node_inputs(
             continue
         if not isinstance(value, ResolvedArtifactInput):
             raise TypeError("resolved inputs contain another value type")
+        if resolve_artifact_reference is None:
+            raise RuntimeError(
+                "this attachment declares an Artifact input but owns no resolver"
+            )
         bound[key] = BoundArtifactInput(
             value.selection.spec,
             resolve_artifact_reference(value),

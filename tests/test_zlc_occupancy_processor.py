@@ -24,7 +24,7 @@ from zlc_data import (
     Value,
     ValueSchema,
 )
-from zlc_neutral_atom.logic_nodes.occupancy.processor import (
+from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
     _require_occupancy_output_schemas,
     _validate_sample_fields,
 )
@@ -134,7 +134,7 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
         try:
             calibration_ref = experiment.readout.sitemap(frames=4)
             document = load_pulse_document(
-                Path("zlc_neutral_atom/assets/imaging_template.json")
+                Path("pulses/imaging_template.json")
             )
             trigger_index = document.target.raw_lanes.index("ch11")
             periods = []
@@ -223,13 +223,165 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
 
 
 def test_normal_committed_path_has_one_repository_compiler_owner():
-    from zlc_neutral_atom.logic_nodes.occupancy.repository import (
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.repository import (
         compile_occupancy_artifact_plan,
     )
-    import zlc_neutral_atom.logic_nodes.occupancy.repository as repository_module
+    import zlc_neutral_atom.logic_nodes.readout.occupancy.repository as repository_module
 
     assert compile_occupancy_artifact_plan.__module__.endswith(
         "logic_nodes.occupancy.repository"
     )
     assert not hasattr(repository_module, "OccupancyCheckpoint")
     assert not hasattr(repository_module, "LegacyOccupancyProcessor")
+
+
+def test_live_signal_source_preserves_every_future_camera_event_and_same_shot():
+    from zlc_data import VALID, ValuePayloadContract
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.signal_source import (
+        OccupancySignalValues,
+        OccupancySignalValuesContract,
+        RunningOccupancySignalSource,
+    )
+    from zlc_neutral_atom.runtime.signal_source import (
+        SignalEventAssociationSource,
+        SignalOutputProjection,
+        StreamSignalEventSource,
+    )
+    from zlc_neutral_atom.runtime.streams import (
+        AcquisitionStream,
+        ArtifactInputRef,
+        ProcessorStageProvenance,
+        StreamId,
+        TraceContext,
+    )
+    from zlc_storage import canonical_digest, encode
+
+    frame_schema = ValueSchema.scalar(np.dtype("<f8"), "count")
+    site = _axis("live-site", SITE, 2)
+    site_validity = ValidityContract.components(site.axis_id)
+    counts_schema = ValueSchema(
+        (site,), site_validity, np.dtype("<f8"), "count"
+    )
+    occupied_schema = ValueSchema(
+        (site,), site_validity, np.dtype(bool), "occupation"
+    )
+    rate_schema = ValueSchema.scalar(np.dtype("<f8"), None)
+    contract = OccupancySignalValuesContract(
+        counts_schema,
+        occupied_schema,
+        rate_schema,
+    )
+    calibration_input = ArtifactInputRef(
+        "test.occupancy-calibration",
+        encode(
+            {
+                "schema": "test.occupancy-calibration",
+                "artifact_id": "fixture",
+            }
+        ),
+        canonical_digest({"fixture": "calibration-content"}),
+    )
+
+    def classify(frame: Value) -> OccupancySignalValues:
+        shot = float(frame.values[0])
+        validity = ComponentValidity(
+            (site.axis_id,),
+            np.asarray((True, True), dtype=bool),
+        )
+        occupied_values = np.asarray((int(shot) % 2 == 0, True), dtype=bool)
+        occupied = Value(occupied_values, validity, occupied_schema)
+        return OccupancySignalValues(
+            Value(
+                np.asarray((shot, shot + 0.25), dtype="<f8"),
+                validity,
+                counts_schema,
+            ),
+            occupied,
+            Value(
+                np.asarray(
+                    (float(np.count_nonzero(occupied_values)) / 2.0,),
+                    dtype="<f8",
+                ),
+                VALID,
+                rate_schema,
+            ),
+        )
+
+    camera_stream, camera_producer = AcquisitionStream.create(
+        StreamId("test-camera-live"),
+        ValuePayloadContract(frame_schema),
+    )
+    camera_source = StreamSignalEventSource(
+        camera_stream,
+        {
+            "frame_0": SignalOutputProjection(
+                frame_schema,
+                lambda envelope: envelope.payload,
+            )
+        },
+    )
+    camera_producer.emit(
+        Value(np.asarray((-1.0,), dtype="<f8"), VALID, frame_schema),
+        captured_at=0.5,
+        trace=TraceContext("camera-run", "camera", "before-subscription"),
+    )
+    occupancy = RunningOccupancySignalSource(
+        camera_source,
+        source_output_name="frame_0",
+        frame_schema=frame_schema,
+        contract=contract,
+        classify=classify,
+        artifact_input=calibration_input,
+        processor_stage=ProcessorStageProvenance(
+            canonical_digest({"fixture": "occupancy-processor-binding"}),
+            (calibration_input,),
+        ),
+    )
+    assert not isinstance(occupancy, SignalEventAssociationSource)
+
+    assert occupancy.value_schema("counts") is counts_schema
+    assert occupancy.value_schema("occupied") is occupied_schema
+    assert occupancy.value_schema("rate") is rate_schema
+    cursors = tuple(
+        occupancy.open_signal_cursor(name)
+        for name in ("counts", "occupied", "rate")
+    )
+    camera_events = tuple(
+        camera_producer.emit(
+            Value(np.asarray((float(shot),), dtype="<f8"), VALID, frame_schema),
+            captured_at=float(shot + 1),
+            trace=TraceContext("camera-run", "camera", f"shot-{shot}"),
+        )
+        for shot in range(32)
+    )
+
+    for shot, camera_event in enumerate(camera_events):
+        counts, occupied, rate = tuple(
+            cursor.next(timeout=1.0) for cursor in cursors
+        )
+        assert counts.event_ref is occupied.event_ref is rate.event_ref
+        assert counts.event_ref.sequence == shot
+        assert counts.trace is occupied.trace is rate.trace
+        assert counts.trace.correlation_id == f"shot-{shot}"
+        assert counts.trace.causation_refs == (
+            camera_event.event_ref,
+            calibration_input,
+        )
+        assert len(counts.processor_stages) == 1
+        assert counts.processor_stages[0].direct_artifact_inputs == (
+            calibration_input,
+        )
+        assert counts.captured_at == camera_event.captured_at
+        assert counts.value.values.tolist() == [float(shot), shot + 0.25]
+
+    occupancy.close()
+    assert occupancy.worker_idle
+    assert occupancy.error is None
+    camera_producer.emit(
+        Value(np.asarray((99.0,), dtype="<f8"), VALID, frame_schema),
+        captured_at=100.0,
+        trace=TraceContext("camera-run", "camera", "shot-99"),
+    )
+    camera_producer.finish()
+    for cursor in cursors:
+        cursor.close()

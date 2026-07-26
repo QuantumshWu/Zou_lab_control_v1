@@ -185,6 +185,7 @@ class PulsePreviewView(QtWidgets.QWidget):
             )
             self._content_widget = widget
         self.preview_placeholder.hide()
+        widget.show()
         self._wheel_target = wheel_target
         if logical_size is not None:
             width, height = (int(value) for value in logical_size)

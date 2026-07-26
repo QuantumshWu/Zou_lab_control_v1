@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import threading
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
@@ -36,97 +37,132 @@ def task_console_ports(experiment):
     from zlc_workbench.task_console.application_ports import (
         TaskConsoleApplicationPorts,
     )
-    from Zou_lab_control.workbench.task_console_attachments.calibration import (
-        calibration_attachment,
+    from zlc_neutral_atom.logic_nodes.readout.calibration.declaration import (
+        CALIBRATION_LOGIC_NODE,
     )
-    from Zou_lab_control.workbench.task_console_attachments.camera_measurement import (
-        camera_measurement_attachment,
+    from zlc_neutral_atom.logic_nodes.camera_measurement import (
+        CAMERA_MEASUREMENT_LOGIC_NODE,
+        bind_camera_measurement_intent,
     )
-    from Zou_lab_control.workbench.task_console_attachments.coupled_measurements import (
-        coupled_measurement_attachments,
+    from zlc_neutral_atom.logic_nodes.camera_measurement.workbench_adapter import (
+        start_camera_measurement_command,
     )
-    from Zou_lab_control.workbench.task_console_attachments.mot_field import (
-        mot_field_attachment,
+    from zlc_neutral_atom.logic_nodes.release_recapture.grey_molasses_detuning import (
+        GREY_MOLASSES_DETUNING_LOGIC_NODE,
+        prepare_bound_grey_molasses_detuning,
     )
-    from Zou_lab_control.workbench.task_console_attachments.occupancy import (
-        occupancy_attachment,
+    from zlc_neutral_atom.logic_nodes.mot_field import (
+        MOT_FIELD_LOGIC_NODE,
     )
-    from Zou_lab_control.workbench.task_console_attachments.pulse_scan import (
-        pulse_scan_attachment,
+    from zlc_neutral_atom.logic_nodes.mot_field.workbench_adapter import (
+        start_mot_field_task_command,
     )
-
-    def resolve_artifact_reference(binding):
-        from zlc_neutral_atom.logic_nodes.calibration.reference import (
-            CALIBRATION_ARTIFACT_REF_FORMAT,
-            CalibrationArtifactRef,
-        )
-        from zlc_workbench.input_binding import ResolvedArtifactInput
-
-        if not isinstance(binding, ResolvedArtifactInput):
-            raise TypeError("binding must be ResolvedArtifactInput")
-        if binding.selection.spec.output_contract_id != CALIBRATION_ARTIFACT_REF_FORMAT:
-            raise ValueError(
-                "TaskConsole composition has no resolver for artifact contract "
-                f"{binding.selection.spec.output_contract_id!r}"
-            )
-        producer = binding.producer
-        if producer is None:
-            path = binding.selection.reference_path
-            if path is None:
-                raise RuntimeError("saved artifact input lost its exact path")
-            reference = readout.load_saved_calibration(path).reference
-        else:
-            if producer.running:
-                raise RuntimeError("the selected artifact-producing Task is running")
-            if not producer.final_result_resolved:
-                raise RuntimeError(
-                    "the selected artifact producer has no successful current FINAL result"
-                )
-            reference = producer.final_result
-        if not isinstance(reference, CalibrationArtifactRef):
-            raise TypeError("artifact resolver returned another reference type")
-        return reference
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.declaration import (
+        OCCUPANCY_LOGIC_NODE,
+    )
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.workbench_adapter import (
+        resolve_occupancy_calibration_input,
+    )
+    from zlc_neutral_atom.logic_nodes.pulse_scan.ui.task_console import (
+        pulse_scan_task_console_adapter,
+    )
+    from zlc_neutral_atom.logic_nodes.readout.duration_fidelity import (
+        READOUT_DURATION_FIDELITY_LOGIC_NODE,
+        prepare_bound_readout_duration_fidelity,
+    )
+    from zlc_neutral_atom.logic_nodes.release_recapture.temperature import (
+        TEMPERATURE_RELEASE_RECAPTURE_LOGIC_NODE,
+        prepare_bound_temperature_release_recapture,
+    )
+    from zlc_workbench.task_console.declaration_projection import (
+        project_processor_declaration,
+        project_run_declaration,
+    )
+    from zlc_workbench.task_console.artifact_resolution import (
+        resolve_final_or_saved_artifact,
+    )
+    from zlc_neutral_atom.logic_nodes.readout.calibration.workbench_adapter import (
+        start_calibration_task_command,
+    )
+    from zlc_neutral_atom.logic_nodes.readout.calibration.ui.view_projection import (
+        project_calibration_final_views,
+    )
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.ui.view_projection import (
+        project_occupancy_views,
+    )
 
     camera_roles = catalog.roles("camera")
     rf_roles = catalog.roles("rf")
+    calibration_roles = readout.sitemap_camera_roles()
+
+    bind_camera_request = partial(
+        bind_camera_measurement_intent,
+        request_builder=readout.camera_measurement_request,
+    )
+    prepare_temperature = partial(
+        prepare_bound_temperature_release_recapture,
+        application=readout,
+    )
+    prepare_readout_duration = partial(
+        prepare_bound_readout_duration_fidelity,
+        application=readout,
+    )
+    prepare_grey_molasses = partial(
+        prepare_bound_grey_molasses_detuning,
+        application=readout,
+    )
+    resolve_occupancy_calibration = partial(
+        resolve_occupancy_calibration_input,
+        resolve_final_or_saved=resolve_final_or_saved_artifact,
+        load_saved_calibration=readout.load_saved_calibration,
+    )
+
     attachments = (
-        camera_measurement_attachment(
-            installed_camera_roles=camera_roles,
-            request_builder=readout.camera_measurement_request,
+        project_run_declaration(
+            CAMERA_MEASUREMENT_LOGIC_NODE,
+            bind_request=bind_camera_request,
             prepare=readout.prepare_camera_measurement,
+            dynamic_choice_context=camera_roles,
+            start_with_live_output=start_camera_measurement_command,
         ),
-        *coupled_measurement_attachments(
-            installed_rf_roles=rf_roles,
-            prepare_temperature=(
-                readout.prepare_temperature_release_recapture_application
-            ),
-            prepare_readout_duration=(
-                readout.prepare_readout_duration_fidelity_application
-            ),
-            prepare_grey_molasses=(
-                readout.prepare_grey_molasses_detuning_application
-            ),
+        project_run_declaration(
+            TEMPERATURE_RELEASE_RECAPTURE_LOGIC_NODE,
+            prepare=prepare_temperature,
         ),
-        occupancy_attachment(
+        project_run_declaration(
+            READOUT_DURATION_FIDELITY_LOGIC_NODE,
+            prepare=prepare_readout_duration,
+        ),
+        project_run_declaration(
+            GREY_MOLASSES_DETUNING_LOGIC_NODE,
+            prepare=prepare_grey_molasses,
+            dynamic_choice_context=rf_roles,
+        ),
+        project_processor_declaration(
+            OCCUPANCY_LOGIC_NODE,
             prepare=readout.prepare_occupancy_processor_request,
+            resolve_artifact_reference=resolve_occupancy_calibration,
+            project_presentations=project_occupancy_views,
         ),
-        calibration_attachment(
-            sitemap_camera_roles=readout.sitemap_camera_roles(),
+        project_run_declaration(
+            CALIBRATION_LOGIC_NODE,
             prepare=readout.prepare_calibration_task,
+            dynamic_choice_context=calibration_roles,
+            start_with_live_output=start_calibration_task_command,
+            materialize_final_presentations=project_calibration_final_views,
         ),
-        mot_field_attachment(
-            installed_camera_roles=camera_roles,
+        project_run_declaration(
+            MOT_FIELD_LOGIC_NODE,
             prepare=readout.prepare_mot_field_task,
+            dynamic_choice_context=camera_roles,
+            start_with_live_output=start_mot_field_task_command,
         ),
-        pulse_scan_attachment(
+        pulse_scan_task_console_adapter(
             prepare=readout.prepare_scan_source,
             read_pulse_template=describe_pulse_template,
         ),
     )
-    return TaskConsoleApplicationPorts(
-        attachments=attachments,
-        resolve_artifact_reference=resolve_artifact_reference,
-    )
+    return TaskConsoleApplicationPorts(attachments=attachments)
 
 
 def standalone_pulse_workspace(value: str | Path | None) -> Path:

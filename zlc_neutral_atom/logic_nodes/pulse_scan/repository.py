@@ -1,9 +1,8 @@
-"""Canonical FINAL dataset authority for exact pulse scans.
+"""Canonical FINAL authority for source-neutral PulseScan datasets.
 
-The repository owns one current format.  Direct-camera and processed exact
-sources are normalized by scan application adapters before this boundary; the
-persisted artifact therefore contains the canonical ``(R, P, *data_shape)``
-output itself and never delegates materialization back to a source repository.
+The repository persists the collected ``(R, P, *data_shape)`` Dataset, the
+sequencer program/terminal receipts, and compact lineage for the external
+signal events.  It has no Camera, Processor, selector, or Workbench knowledge.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ import threading
 import numpy as np
 
 from zlc_data import (
-    READOUT_EVENT,
     BlockId,
     DataBlock,
     DatasetRevisionRef,
@@ -39,7 +37,6 @@ from zlc_neutral_atom.runtime.commit import (
     publish_manifest_with_visibility_reconciliation,
 )
 from zlc_neutral_atom.runtime.dataset import (
-    DatasetCellSchedule,
     DatasetSealProvenance,
     dataset_seal_provenance_from_tree,
     dataset_seal_provenance_to_tree,
@@ -85,8 +82,6 @@ from .lineage import (
     ApiSegmentedScanExecution,
     AutonomousScanExecution,
     PulseScanExecution,
-    api_segmented_cell_schedule,
-    api_segmented_metadata_static_shape_from_execution,
     execution_compiled_artifacts,
     pulse_scan_execution_from_tree,
     pulse_scan_execution_to_tree,
@@ -419,51 +414,34 @@ def _require_scan_facts(
     repeat_count = program.repeat_count
     if source_schema.repeat_axis.size != repeat_count:
         raise ValueError("source repeat axis differs from logical scan repeats")
-    event_axes = tuple(
-        axis for axis in source_schema.point_axes if axis.role == READOUT_EVENT
-    )
-    scan_axes = tuple(
-        axis for axis in source_schema.point_axes if axis.role != READOUT_EVENT
-    )
-    if len(event_axes) != 1 or event_axes[0].size != 1:
-        raise ValueError("current exact scan source requires one singleton READOUT_EVENT")
-    if scan_axes != point_table.point_axes:
+    if source_schema.point_axes != point_table.point_axes:
         raise ValueError("source scan axes differ from the logical ScanPointTable")
-    camera_schema = execution.camera.validate_source_schema(source_schema)
-    if isinstance(execution, AutonomousScanExecution):
-        if execution.evidence.join_contract.scan_point_layout != point_table.point_layout:
-            raise ValueError("pulse join layout differs from the logical ScanPointTable")
-        expected_schedule = DatasetCellSchedule.from_cells(
-            source_schema,
-            execution.evidence.join_contract.iter_cell_schedule(
-                execution.evidence.trigger_schedule,
-                source_schema,
-            ),
-        )
-        expected_join = expected_schedule.digest_for_schema(source_schema)
-        expected_events = execution.evidence.expected_trigger_count
-    elif isinstance(execution, ApiSegmentedScanExecution):
-        expected_schedule = api_segmented_cell_schedule(
-            program,
-            source_schema,
-        )
-        expected_join = expected_schedule.digest_for_schema(source_schema)
-        expected_events = repeat_count * point_table.point_layout.storage_size
-    else:
+    if not isinstance(
+        execution,
+        (AutonomousScanExecution, ApiSegmentedScanExecution),
+    ):
         raise TypeError("execution must be a PulseScanExecution")
-    if provenance.join_plan_digest != expected_join:
-        raise ValueError("source dataset schedule differs from pulse evidence")
+    expected_events = repeat_count * point_table.point_layout.storage_size
     event_count = provenance.end_sequence - provenance.start_sequence
     if event_count != expected_events:
-        raise ValueError("source provenance count differs from pulse triggers")
+        raise ValueError("collected Dataset count differs from logical R by P")
+    if execution.source.count != expected_events:
+        raise ValueError("external signal lineage count differs from logical R by P")
+    projection = execution.source.projection_authority
+    if source_schema.cell_schema != projection.output_value_schema:
+        raise ValueError(
+            "scan source schema differs from committed signal projection output"
+        )
+    if output_contract.committed_transform is not None:
+        raise ValueError(
+            "ScanOutputContract cannot duplicate signal projection authority"
+        )
     if provenance.trace_binding.run_id != run_id:
-        raise ValueError("source provenance belongs to another Run")
-    execution.camera.require_schedule(expected_schedule, camera_schema)
-    execution.camera.validate_dataset_provenance(provenance)
+        raise ValueError("collected Dataset provenance belongs to another Run")
     resolved = bind_scan_output_contract(
         source_schema,
         point_table,
-        output_contract.committed_transform,
+        None,
     )
     if resolved != output_contract:
         raise ValueError("ScanOutputContract differs from source schema and point table")

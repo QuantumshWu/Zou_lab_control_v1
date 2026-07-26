@@ -22,7 +22,7 @@ from zlc_pulse import (
 
 
 ROOT = Path(__file__).parents[1]
-IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+IMAGING_PULSE = ROOT / "pulses" / "imaging_template.json"
 
 
 def _compact(document):

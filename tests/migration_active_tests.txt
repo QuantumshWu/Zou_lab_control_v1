@@ -1,5 +1,8 @@
 tests/test_architecture_import_dag.py
+tests/test_application_presentation_boundary.py
 tests/test_camera_capture_endpoint.py
+tests/test_camera_measurement_exposure.py
+tests/test_live_signal_events.py
 tests/test_camera_sample_contract.py
 tests/test_capture_artifact_repository.py
 tests/test_capture_checkpoint_commit.py
@@ -10,6 +13,7 @@ tests/test_compiled_pulse_artifact.py
 tests/test_console_catalog_bridge.py
 tests/test_console_data_plane.py
 tests/test_task_console_camera_user_flow.py
+tests/test_task_console_figure_current.py
 tests/test_pulse_scan_tick_quantization.py
 tests/test_task_console_start_gate_current.py
 tests/test_task_console_render_hot_path.py
@@ -32,6 +36,7 @@ tests/test_pulse_edit_alignment.py
 tests/test_pulse_preview_render.py
 tests/test_pulse_preview_projection.py
 tests/test_pulse_scan_execution_current.py
+tests/test_pulse_scan_signal_consumer.py
 tests/test_pulse_scan_workspace_current.py
 tests/test_pulse_scan_workspace_qt.py
 tests/test_pulse_timing_continuous_current.py
@@ -70,7 +75,6 @@ tests/test_u03f_meter_grid_figure.py
 tests/test_u03g_histogram_grid_figure.py
 tests/test_u03h_curve_grid_figure.py
 tests/test_u04_meter_display_owner.py
-tests/test_u04_scan_capacity_refusal.py
 tests/test_u04_settings_popup_anchor.py
 tests/test_u04_signal_picker_owner.py
 tests/test_u04_status_strip_priority.py
@@ -90,10 +94,7 @@ tests/test_pulse_gui_remote_connection.py
 tests/test_pulse_gui_notebook_lifecycle.py
 tests/test_pulse_gui_scan_runtime_qt.py
 tests/test_pulse_schedule_view_contract.py
-tests/test_w3_api_segmented_scan.py
 tests/test_w3_data_figure.py
-tests/test_w3_scan_application.py
-tests/test_w3_scan_panel_controller.py
 tests/test_w6_calibration_workbench.py
 tests/test_w7_fit_grid_overlay_geometry.py
 tests/test_w7_radial_fit_projection.py
@@ -102,8 +103,9 @@ tests/test_w8_transformed_fit_figure.py
 tests/test_workbench_endpoint_binding.py
 tests/test_z0_import_targets_resolve.py
 tests/test_zlc_calibration_commit.py
+tests/test_zlc_calibration_result_bundle.py
 tests/test_zlc_calibration_stream_contracts.py
-tests/test_zlc_camera_adapter_sdk.py
+tests/test_zlc_camera_contract.py
 tests/test_zlc_dcam_camera_adapter.py
 tests/test_zlc_curve_display.py
 tests/test_zlc_data_fit.py

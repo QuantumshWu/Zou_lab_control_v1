@@ -28,6 +28,20 @@ RELIM_PARAM = FormFieldProps(
         "  fixed  = pin the value range to the lo/hi controls"
     ),
 )
+FIXED_LO_PARAM = FormFieldProps(
+    key="fixed_lo",
+    kind="float",
+    label="lo",
+    default=0.0,
+    description="Fixed lower display limit (used only when relim is fixed)",
+)
+FIXED_HI_PARAM = FormFieldProps(
+    key="fixed_hi",
+    kind="float",
+    label="hi",
+    default=1.0,
+    description="Fixed upper display limit (used only when relim is fixed)",
+)
 
 
 def panel_view_intents():
@@ -90,6 +104,25 @@ def automatic_panel_kind(schema) -> str | None:
     return None
 
 
+def automatic_figure_intent(schema):
+    """Choose the ordinary notebook Figure intent from declared axis roles."""
+
+    from zlc_data import MONITOR_HISTORY, SCAN_POINT, SPATIAL_X, SPATIAL_Y, SPECTRAL
+    from zlc_frontend.figure import ViewIntent
+
+    axes = (
+        schema.repeat_axis,
+        *schema.point_axes,
+        *schema.cell_schema.data_axes,
+    )
+    roles = {axis.role for axis in axes}
+    if SPATIAL_X in roles and SPATIAL_Y in roles:
+        return ViewIntent.IMAGE
+    if roles.intersection((SCAN_POINT, SPECTRAL, MONITOR_HISTORY)):
+        return ViewIntent.CURVE
+    return ViewIntent.HISTOGRAM
+
+
 def repeat_mode_label(mode) -> str:
     """Return the operator-facing label for a typed repeat view mode."""
 
@@ -106,11 +139,14 @@ def repeat_mode_label(mode) -> str:
 
 
 __all__ = [
+    "FIXED_HI_PARAM",
+    "FIXED_LO_PARAM",
     "HISTOGRAM_CELL_THRESHOLDS_PARAM",
     "HISTOGRAM_THRESHOLDS_PARAM",
     "RELIM_MODES",
     "RELIM_PARAM",
     "VIEW_SPEC_PARAM",
+    "automatic_figure_intent",
     "automatic_panel_kind",
     "grid_view_intents",
     "panel_view_intents",

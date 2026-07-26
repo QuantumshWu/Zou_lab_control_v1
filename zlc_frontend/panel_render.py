@@ -10,7 +10,7 @@ Nothing here touches Qt.  The product is a :class:`~zlc_frontend.render.BoardFra
 of immutable bytes, which is what lets a megapixel frame be rasterized on a
 worker while the GUI thread stays responsive; the host presents it unchanged.
 
-Why this exists next to :class:`zlc_workbench.live.LiveBoardController`: that
+Why this exists next to the Workbench board controller: that
 controller owns ONE source's change listener and drives a fixed image+scalar
 board.  A console board is N independent cards reading ONE per-tick freeze, so
 its panels cannot each own the source.  Both, however, must rasterize a frame
@@ -847,6 +847,7 @@ class PanelComposer:
             colormap=display.colormap,
             color_limits=color_limits,
             raster_geometry=raster_geometry,
+            fit_overlay=fit_overlay,
         )
         return raster, payload
 

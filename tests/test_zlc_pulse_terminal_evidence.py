@@ -46,7 +46,7 @@ ROOT = Path(__file__).parents[1]
 
 
 def _static_artifact():
-    document = load_pulse_document(ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json")
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     return compile_pulse_artifact(
         document,
         clock_hz=50e6,

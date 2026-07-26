@@ -22,10 +22,6 @@ from .artifact import (
     encode_compiled_pulse_artifact,
 )
 from .fpga import pack_target_ir
-from .deployment import (
-    resident_scan_point_capacity,
-    validate_resident_scan_capacity,
-)
 from .evidence import (
     AutonomousTableTerminalEvidence,
     PostTerminalTailEvidence,
@@ -199,9 +195,6 @@ class PulseExecutionService:
             "manifest": pulse_target_manifest_to_tree(self._manifest),
             "clock_hz": self._clock_hz,
             "geometry_fingerprint": self._geometry_fingerprint,
-            "resident_scan_point_capacity": resident_scan_point_capacity(
-                self._params
-            ),
             "state": self._state,
             "prepared_ref": (
                 None if prepared is None else prepared_pulse_ref_to_tree(prepared)
@@ -534,7 +527,6 @@ class PulseExecutionService:
         validate_target_ir_for_target(artifact.target_ir, self._target)
         if artifact.target_ir.clock_hz != self._clock_hz:
             raise ValueError("compiled artifact clock differs from deployed clock")
-        validate_resident_scan_capacity(artifact, self._params)
         if artifact.wire_image.geometry_fingerprint != self._geometry_fingerprint:
             raise ValueError("compiled artifact geometry differs from deployed geometry")
         if artifact.wire_image != pack_target_ir(artifact.target_ir, self._params):

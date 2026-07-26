@@ -100,3 +100,8 @@ git diff --check
 GUI evidence must launch the formal product composition and allow the event loop
 to settle before capture. Generated screenshots, caches, tutorial result trees,
 and machine-local interpreter records are not source artifacts.
+
+Keep those products in the ignored `_output/`, `.gui-evidence/`/`.gui_evidence/`,
+or tool-cache trees; `.claude/` is session state and is never repository source.
+`git ls-files -ci --exclude-standard` must remain empty, so an ignore rule can
+never be used to conceal an already tracked generated artifact.

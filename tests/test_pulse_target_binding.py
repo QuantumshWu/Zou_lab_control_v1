@@ -22,7 +22,7 @@ from zlc_pulse.deployment import APPROVED_DEPLOYED_TARGET_ABI
 
 
 ROOT = Path(__file__).parents[1]
-IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+IMAGING_PULSE = ROOT / "pulses" / "imaging_template.json"
 
 
 def test_every_shipped_document_matches_the_packaged_deployment_target():

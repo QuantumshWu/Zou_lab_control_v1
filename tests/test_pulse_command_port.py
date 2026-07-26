@@ -22,7 +22,7 @@ from zlc_pulse import (
 
 
 ROOT = Path(__file__).parents[1]
-IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+IMAGING_TEMPLATE = ROOT / "pulses" / "imaging_template.json"
 
 
 def _descriptor() -> PulseTargetDescriptor:
@@ -32,7 +32,6 @@ def _descriptor() -> PulseTargetDescriptor:
         document.target,
         50e6,
         0x1234ABCD,
-        4_096,
     )
 
 
@@ -44,7 +43,6 @@ def test_pulse_target_descriptor_is_capability_free() -> None:
         "target",
         "clock_hz",
         "geometry_fingerprint",
-        "resident_scan_point_capacity",
     }
     assert descriptor.time_step_ns == 20.0
     for forbidden in (

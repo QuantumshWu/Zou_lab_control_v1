@@ -11,6 +11,7 @@ from fpga.pulse_streamer.host.image import (
     StreamerParams,
     build_fingerprint,
     pack_program,
+    region_bases,
 )
 from zlc_storage import canonical_digest, sha256_text
 
@@ -101,6 +102,49 @@ def pack_target_ir(
     )
 
 
+def scan_chunk_wire_words(
+    value: TargetIR,
+    params: StreamerParams,
+    chunk_index: int,
+    *,
+    target_bank: int,
+) -> tuple[tuple[int, int], ...]:
+    """Serialize one immutable TargetIR scan chunk for a freed hardware bank."""
+
+    if not isinstance(value, TargetIR):
+        raise TypeError("scan chunk source must be TargetIR")
+    if not isinstance(params, StreamerParams):
+        raise TypeError("params must be StreamerParams")
+    if isinstance(chunk_index, bool) or not isinstance(chunk_index, int):
+        raise TypeError("chunk_index must be an integer")
+    if chunk_index < 0:
+        raise ValueError("chunk_index must be non-negative")
+    if target_bank not in (0, 1):
+        raise ValueError("target_bank must be 0 or 1")
+    first = chunk_index * params.bank_size
+    if first >= len(value.scan_points):
+        raise ValueError("scan chunk is outside the compiled TargetIR")
+    stop = min(first + params.bank_size, len(value.scan_points))
+    base = (
+        region_bases(params)["scan"]
+        + target_bank * params.bank_size * params.scan_words
+    )
+    value_mask = (1 << params.tick_width) - 1
+    slot_count = len(value.slot_kinds)
+    return tuple(
+        (
+            base + local_index * params.scan_words + slot_index,
+            (
+                int(value.scan_points[point_index][slot_index]) & value_mask
+                if slot_index < slot_count
+                else 0
+            ),
+        )
+        for local_index, point_index in enumerate(range(first, stop))
+        for slot_index in range(params.num_slots)
+    )
+
+
 def _pulse_wire_image_payload_tree(value: PulseWireImage) -> dict[str, object]:
     if not isinstance(value, PulseWireImage):
         raise TypeError("value must be PulseWireImage")
@@ -151,4 +195,5 @@ __all__ = [
     "pack_target_ir",
     "pulse_wire_image_from_tree",
     "pulse_wire_image_to_tree",
+    "scan_chunk_wire_words",
 ]

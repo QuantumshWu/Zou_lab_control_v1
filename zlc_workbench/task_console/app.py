@@ -46,7 +46,6 @@ def open_task_console(
     host = ConsoleNodeHost(
         data_plane=data_plane,
         resolve_inputs=resolve_inputs,
-        resolve_artifact_reference=ports.resolve_artifact_reference,
         request_owner_wake=request_owner_wake,
     )
 

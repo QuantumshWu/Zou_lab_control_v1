@@ -1,10 +1,11 @@
 """The panel Edit tab: a snapshot of the card plus its full parameter surface.
 
-The editor freezes the card's accepted immutable ``DataFigure`` into the one
-shared interactive DataFigure surface.  A calibrated SiteMap, which is a
-two-input physical join rather than a DataFigure, copies its exact BoardFrame
-into the shared ``SinglePanelHost``.  The editor never evaluates data or owns a
-Matplotlib composer.
+The editor freezes the card's accepted immutable input into its stable Figure
+host.  View changes are composed by the TaskConsole's one worker lane against
+that same frozen input; only explicit Refresh replaces it.  A calibrated
+SiteMap, which is a two-input physical join rather than a DataFigure, follows
+the same surface route.  The editor never evaluates data or owns a Matplotlib
+composer.
 
 """
 
@@ -39,8 +40,7 @@ from zlc_frontend.form import choice_value_from_tree, lenient_float as _safe_flo
 from zlc_frontend.panel_params import panel_param_decls as _panel_param_decls
 from zlc_frontend import RELIM_PARAM as _RELIM_PARAM
 from zlc_frontend.render_style import panel_display_size
-from zlc_storage.paths import display_path
-from .layout_repository import task_files_dir as _task_files_dir
+from zlc_storage.paths import display_path, user_output_path
 from .logic_node_parameter_panel import LogicNodeParameterPanel
 
 
@@ -109,16 +109,22 @@ class PanelEditor(QtWidgets.QWidget):
         self.console = console
         self.setStyleSheet("background: transparent;")
         self._board = None
+        self.render_surface_id = f"{card.panel_id}::edit::{id(self):x}"
+        self._snapshot_value = None
         self._snapshot_figure = None
         self._snapshot_display = None
         self._snapshot_size_name = None
         self._snapshot_pixel_ratio = None
         self._snapshot_title = None
         self._snapshot_value_label = None
-        self._follow_next_front = False
-        card.front_presented.connect(self._on_card_front_presented)
+        self._render_request_revision = 0
+        self._pending_render_result = None
+        self._presented_render_request_revision = 0
         card.selectors_enabled_changed.connect(
             self._sync_snapshot_selectors
+        )
+        card.fit_presentation_changed.connect(
+            self._request_snapshot_render
         )
         # A plot panel's Edit never carries a measurement form or Start/Stop: a plot is a
         # pure VIEW, and the node that produces its data lives on the Logic tab.
@@ -270,6 +276,7 @@ class PanelEditor(QtWidgets.QWidget):
             self._fit_pane = card.make_fit_authoring_pane(
                 page,
                 label_width=label_w,
+                context_provider=self._fit_context,
             )
             col.addWidget(self._fit_pane)
 
@@ -316,9 +323,13 @@ class PanelEditor(QtWidgets.QWidget):
         # the DATA behind it is already owned by the run's repository, and a second copy
         # written by the GUI would be a second answer to what was measured.
         section("Save")
+        default_output_dir = user_output_path("figures", "task-console")
         self.save_dir_edit = FluentPathEdit(
-            self.console._last_save_dir or str(_task_files_dir()),
-            mode="dir", caption="Choose where to save", base_dir=str(_task_files_dir()))
+            self.console._last_save_dir or str(default_output_dir),
+            mode="dir",
+            caption="Choose where to save",
+            base_dir=str(default_output_dir),
+        )
         self.save_dir_edit.setToolTip(
             "Where to save (folder, or a full path base).  Remembered across saves this "
             "session.  With auto-name OFF this is the exact output path.")
@@ -371,10 +382,10 @@ class PanelEditor(QtWidgets.QWidget):
     def refresh_snapshot(self) -> None:
         """Copy the card's immutable front into one stable shared host.
 
-        Edit is another view of the same Figure, not a nested DataFigureWindow
-        and not another renderer.  The card's worker remains the sole composer;
-        this host receives the exact accepted frame and forwards explicit
-        gestures back to the card-owned display state.
+        Edit is another view of the same Figure, not a nested DataFigureWindow.
+        The TaskConsole render lane remains the sole composer owner; this host
+        receives an exact accepted frame and forwards explicit gestures back to
+        the card-owned display state.
         """
 
         from zlc_frontend.qt_widgets import FacetedPanelHost
@@ -391,6 +402,7 @@ class PanelEditor(QtWidgets.QWidget):
             self.status.setText("open the panel with data first")
             return
         try:
+            value = card.frozen_render_value()
             size_name, pixel_ratio = card.frozen_panel_geometry()
             title, value_label = card.frozen_panel_labels()
             if card.config.kind == "sites":
@@ -419,12 +431,154 @@ class PanelEditor(QtWidgets.QWidget):
             self.status.setText("the panel has no complete focused frame")
             return
         board.set_selectors_enabled(card.selectors_enabled)
+        # Explicit Refresh is the only data-replacement edge for Edit.  Bump
+        # the surface-local order even though this exact front was copied from
+        # the live card, so any older worker answer still in flight is stale.
+        self._render_request_revision += 1
+        self._presented_render_request_revision = self._render_request_revision
+        self._pending_render_result = None
+        self._snapshot_value = value
         self._snapshot_figure = figure
         self._snapshot_display = display
         self._snapshot_size_name = size_name
         self._snapshot_pixel_ratio = pixel_ratio
         self._snapshot_title = title
         self._snapshot_value_label = value_label
+        self._refresh_unit_readout()
+        if self._fit_pane is not None:
+            card.refresh_fit_authoring_pane(self._fit_pane)
+        self.refresh_limit_hints()
+        self.status.setText("")
+
+    def _fit_context(self):
+        """The exact frozen Figure/source this Edit surface is displaying."""
+
+        if self._snapshot_value is None or self._snapshot_figure is None:
+            return None
+        return (
+            self._snapshot_value,
+            self._snapshot_figure,
+        )
+
+    def freeze_current_view_request(self):
+        """Freeze one display answer against the explicit Refresh input."""
+
+        if self.card is None or self._snapshot_value is None:
+            return None
+        self._render_request_revision += 1
+        return self.card.freeze_surface_request(
+            self._snapshot_value,
+            surface_id=self.render_surface_id,
+            request_revision=self._render_request_revision,
+            display=self.card._display_state(),
+            frame_key=(
+                "edit-snapshot",
+                self._snapshot_value.snapshot.ref,
+            ),
+        )
+
+    def accept_render_result(
+        self,
+        request,
+        *,
+        frame=None,
+        faceted_result=None,
+        figure=None,
+        error: str | None = None,
+    ) -> bool:
+        """Admit a worker answer only for this frozen Edit input/surface."""
+
+        value = self._snapshot_value
+        if (
+            value is None
+            or request.render_surface_id != self.render_surface_id
+            or request.value.snapshot.ref != value.snapshot.ref
+        ):
+            return False
+        pending_revision = (
+            None
+            if self._pending_render_result is None
+            else int(self._pending_render_result[0].request_revision)
+        )
+        floor = max(
+            int(self._presented_render_request_revision),
+            -1 if pending_revision is None else pending_revision,
+        )
+        if int(request.request_revision) <= floor:
+            return False
+        if error is not None:
+            if int(request.request_revision) != self._render_request_revision:
+                return False
+            self.card._settle_pending_interaction_through(
+                request.display.revision,
+                failed=True,
+                answer_host=self._board,
+            )
+            self.status.setText(str(error))
+            return True
+        if request.faceted:
+            from zlc_frontend.panel_render import FacetedPanelResult
+
+            if not isinstance(faceted_result, FacetedPanelResult):
+                self.status.setText("render worker returned no faceted front")
+                return True
+            if figure is not faceted_result.figure:
+                self.status.setText("faceted render lost its exact DataFigure")
+                return True
+        elif frame is None or (
+            self.card.config.kind != "sites" and figure is None
+        ):
+            self.status.setText("render worker returned no complete front")
+            return True
+        self._pending_render_result = (
+            request,
+            frame,
+            faceted_result,
+            figure,
+        )
+        return True
+
+    def present_render_result(self) -> None:
+        """Present one accepted frozen-input answer on the Qt owner."""
+
+        pending = self._pending_render_result
+        if pending is None:
+            return
+        self._pending_render_result = None
+        request, frame, faceted, figure = pending
+        board = self._ensure_snapshot_surface()
+        logical_size = tuple(
+            int(value) for value in panel_display_size(request.size_name)
+        )
+        if faceted is not None:
+            if faceted.overview_png is not None:
+                board.present_overview(
+                    faceted.overview_png,
+                    faceted.regions,
+                    logical_size=logical_size,
+                )
+            else:
+                board.present_frame(
+                    faceted.frame,
+                    logical_size=logical_size,
+                )
+            figure = faceted.figure
+        else:
+            board.present_frame(frame, logical_size=logical_size)
+        self._snapshot_figure = figure
+        self._snapshot_display = request.display
+        self._snapshot_size_name = request.size_name
+        self._snapshot_pixel_ratio = request.pixel_ratio
+        self._snapshot_title = request.label
+        self._snapshot_value_label = request.value_label
+        self._presented_render_request_revision = int(
+            request.request_revision
+        )
+        self.card._settle_pending_interaction_through(
+            request.display.revision,
+            failed=False,
+            answer_host=board,
+        )
         self.refresh_limit_hints()
         self.status.setText("")
 
@@ -472,8 +626,14 @@ class PanelEditor(QtWidgets.QWidget):
         if self._board is not None:
             self._board.set_selectors_enabled(bool(enabled))
 
-    def _follow_card_answer(self) -> None:
-        self._follow_next_front = True
+    def _request_snapshot_render(self) -> None:
+        """Recompose presentation while retaining the explicit Refresh value."""
+
+        if self.card is not None and self._board is not None:
+            self.console._request_card_render(
+                self.card,
+                surface=self._board,
+            )
 
     def _forward_range(self, gesture) -> None:
         self.card.accept_range_from(self._board, gesture)
@@ -485,31 +645,21 @@ class PanelEditor(QtWidgets.QWidget):
         self.card.accept_cross_from(self._board, gesture)
 
     def _forward_view_commit(self, commit) -> None:
-        self._follow_card_answer()
         self.card.accept_view_commit_from(self._board, commit)
 
     def _forward_color_limits(self, commit) -> None:
-        self._follow_card_answer()
         self.card.accept_color_limits_from(self._board, commit)
 
     def _forward_thresholds(self, commit) -> None:
-        self._follow_card_answer()
         self.card.accept_thresholds_from(self._board, commit)
 
     def _forward_grid_focus(self, panel_index: int, selection) -> None:
-        self._follow_card_answer()
         self.card._focus_grid_cell(panel_index, selection)
+        self._request_snapshot_render()
 
     def _forward_grid_overview(self) -> None:
-        self._follow_card_answer()
         self.card._return_to_grid_overview()
-
-    def _on_card_front_presented(self) -> None:
-        self._refresh_unit_readout()
-        if not self._follow_next_front:
-            return
-        self._follow_next_front = False
-        self.refresh_snapshot()
+        self._request_snapshot_render()
 
     def teardown(self) -> None:
         """Release this tab's frozen Qt presentation surface."""
@@ -521,7 +671,9 @@ class PanelEditor(QtWidgets.QWidget):
         self._fit_pane = None
         if self.card is not None:
             try:
-                self.card.front_presented.disconnect(self._on_card_front_presented)
+                self.card.fit_presentation_changed.disconnect(
+                    self._request_snapshot_render
+                )
             except (TypeError, RuntimeError):
                 pass
             try:
@@ -533,9 +685,9 @@ class PanelEditor(QtWidgets.QWidget):
 
     def _edit_param(self, key: str, value) -> None:
         """Commit one authored parameter to the card's sole render request."""
+        changed = False
         if self.card is not None:
-            self._follow_next_front = True
-            self.card._set_param(key, value)
+            changed = self.card._set_param(key, value)
         if key == "relim" and getattr(self, "ed_fixed_row", None) is not None:
             self._sync_fixed_lim_enabled(str(value))   # enable lo/hi in fixed WITHOUT moving the page
             if str(value) == "fixed" and self.card is not None:
@@ -543,28 +695,29 @@ class PanelEditor(QtWidgets.QWidget):
                 # one source) into THIS tab's lo/hi inputs -- setText does not re-fire editingFinished
                 for edit, pkey in ((self.ed_fixed_lo, "fixed_lo"), (self.ed_fixed_hi, "fixed_hi")):
                     if edit is not None and pkey in self.card.config.params:
-                        edit.setText(f"{float(self.card.config.params[pkey]):g}")
+                        with _signals_blocked(edit):
+                            edit.setValue(float(self.card.config.params[pkey]))
         if key == "relim":
             # a 2D image has no Display fixed row (its clim lives in the Limits colour-range row):
             # re-seed THOSE boxes here so picking relim in the chooser fills/empties them to match the
             # pin -- runs even when ed_fixed_row is None, unlike the colour-range block above.
             self._seed_clim_boxes()
-        # ``front_presented`` copies the accepted immutable raster into this
-        # frozen view.  There is deliberately no Edit-side composer.
+        if changed:
+            self._request_snapshot_render()
 
     def _edit_repeat_mode(self, mode) -> None:
         if self.card is None:
             return
-        self._follow_next_front = True
-        self.card._commit_repeat_mode(mode)
+        if self.card._commit_repeat_mode(mode):
+            self._request_snapshot_render()
 
     def _edit_grid_facet(self, intent, axis_id) -> bool:
         if self.card is None:
             return False
-        self._follow_next_front = True
         changed = self.card._commit_grid_facet(intent, axis_id)
         if changed:
             self.card._refresh_grid_control_surface(self)
+            self._request_snapshot_render()
         return changed
 
     def _sync_fixed_lim_enabled(self, relim: str) -> None:
@@ -589,14 +742,19 @@ class PanelEditor(QtWidgets.QWidget):
         front update this tab.  It never re-reads acquisition merely because a limit changed."""
         if self.card is None:
             return
-        lo = _safe_float(self.ed_fixed_lo.text(), 0.0)
-        hi = _safe_float(self.ed_fixed_hi.text(), 1.0)
-        self._follow_next_front = True
+        lo = float(self.ed_fixed_lo.value())
+        hi = float(self.ed_fixed_hi.value())
         self.card.apply_fixed_lims(lo, hi)
+        self._request_snapshot_render()
 
     def _refresh_unit_readout(self) -> None:
-        if self.card is not None and self.ed_unit_label is not None:
-            self.ed_unit_label.setText(self.card._current_unit_text())
+        if self.ed_unit_label is None:
+            return
+        value = self._snapshot_value
+        unit = None if value is None else getattr(value, "unit", None)
+        self.ed_unit_label.setText(
+            "—" if value is None else (unit or "dimensionless")
+        )
 
     def _commit_title(self) -> None:
         """Commit the Edit tab's local title draft once."""
@@ -605,12 +763,12 @@ class PanelEditor(QtWidgets.QWidget):
         text = str(self.title_edit.text())
         if text == self.card.config.title:
             return
-        self._follow_next_front = True
         edit = getattr(self.card, "title_edit", None)
         if edit is not None:
             with _signals_blocked(edit):
                 edit.setText(text)
         self.card._commit_title()
+        self._request_snapshot_render()
         self._update_save_preview()               # default save name follows the title
 
     def _apply_source_form(self) -> None:
@@ -626,7 +784,6 @@ class PanelEditor(QtWidgets.QWidget):
         if not self.console._apply_source_params(self._source_row, values):
             self.status.setText("locked: a task is running — Stop it first")
             return
-        self._follow_next_front = True
         self.console.refresh_once()
         self.status.setText("source parameters applied")
 
@@ -640,7 +797,8 @@ class PanelEditor(QtWidgets.QWidget):
         self._refresh_display_params()
         if card is not None:
             self._refresh_unit_readout()
-            card._sync_fit_authoring_from_presented(prepare_authoring=True)
+            if self._fit_pane is not None:
+                card.refresh_fit_authoring_pane(self._fit_pane)
             card._refresh_grid_control_surface(self)
             card._seed_repeat_mode_control(
                 self.repeat_mode_combo,
@@ -793,8 +951,8 @@ class PanelEditor(QtWidgets.QWidget):
             updates[key] = (lo, hi)
             applied.append(key[5])
         if self.card is not None:
-            self._follow_next_front = True
-            self.card._set_params(updates)
+            if self.card._set_params(updates):
+                self._request_snapshot_render()
         parts = ([f"{'/'.join(applied)} range applied"] if applied else []) + \
                 ([f"{'/'.join(cleared)} range cleared"] if cleared else [])
         self.status.setText("; ".join(parts) + " (all subplots)")
@@ -813,8 +971,8 @@ class PanelEditor(QtWidgets.QWidget):
             with _signals_blocked(lo_box, hi_box):
                 lo_box.setText(""); hi_box.setText("")
         if self.card is not None:
-            self._follow_next_front = True
-            self.card._set_params(updates)
+            if self.card._set_params(updates):
+                self._request_snapshot_render()
         self.refresh_limit_hints()
         self.status.setText("view range cleared (auto)")
 
@@ -846,8 +1004,8 @@ class PanelEditor(QtWidgets.QWidget):
             self.status.setText(f"bad colour range: {exc}")
             return
         if self.card is not None:
-            self._follow_next_front = True
             self.card.apply_fixed_lims(lo, hi)
+            self._request_snapshot_render()
         self._sync_relim_combo("fixed")
         self._seed_clim_boxes()
         self.status.setText("colour range applied")
@@ -892,7 +1050,10 @@ class PanelEditor(QtWidgets.QWidget):
         title = (self.card.config.title or self.card.config.kind).strip() or "panel"
         kind = self.card.config.kind
         text = self.save_dir_edit.text().strip() if hasattr(self, "save_dir_edit") else ""
-        base = Path(text) if text else Path(self.console._last_save_dir or _task_files_dir())
+        base = Path(text) if text else Path(
+            self.console._last_save_dir
+            or user_output_path("figures", "task-console")
+        )
         # a bare folder (blank default / trailing sep / an existing dir) -> the file is
         # <folder>/<title>; otherwise the path already names the file stem.
         if not text or str(base).endswith(("/", "\\")) or (base.is_dir() and not base.suffix):

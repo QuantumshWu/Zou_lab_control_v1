@@ -26,7 +26,7 @@ from zlc_workbench.pulse import project_pulse_preview
 
 
 ROOT = Path(__file__).parents[1]
-PULSE_PATH = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+PULSE_PATH = ROOT / "pulses" / "imaging_template.json"
 
 
 def _until(application, predicate, *, timeout: float = 12.0) -> None:
@@ -147,6 +147,62 @@ def test_preview_opens_as_the_full_formal_plot_with_display_labels(preview_body)
     assert any(key != label for key, label in expected), (
         "the Preview axis regressed to raw lane keys instead of board labels"
     )
+
+
+def test_preview_keeps_the_placeholder_until_the_first_complete_front(
+    monkeypatch,
+) -> None:
+    """The deferred renderer must never expose its empty black Qt board."""
+
+    import threading
+
+    import zlc_frontend.matplotlib_render as render_module
+    from zlc_workbench.pulse_editor.app import open_pulse_editor
+
+    application = ensure_qt_app()
+    entered = threading.Event()
+    release = threading.Event()
+    render = render_module.render_pulse_timeline_panel
+
+    def blocked_render(*args, **kwargs):
+        entered.set()
+        if not release.wait(10.0):
+            raise TimeoutError("preview render was not released")
+        return render(*args, **kwargs)
+
+    monkeypatch.setattr(
+        render_module,
+        "render_pulse_timeline_panel",
+        blocked_render,
+    )
+    body = open_pulse_editor(path=PULSE_PATH)
+    try:
+        _until(
+            application,
+            lambda: body.window() is not body and body.window().isVisible(),
+        )
+        _click_tab(body, body.preview_view)
+        assert entered.wait(5.0)
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        assert body.preview_view.preview_placeholder.isVisible()
+        assert not body.preview_host.isVisible()
+
+        release.set()
+        _until(
+            application,
+            lambda: body.preview_host.front_frame is not None
+            and body.preview_host.isVisible(),
+        )
+        assert not body.preview_view.preview_placeholder.isVisible()
+    finally:
+        release.set()
+        deadline = time.monotonic() + 10.0
+        complete = False
+        while not complete and time.monotonic() < deadline:
+            complete = body.request_close(discard_unsaved=True)
+            application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+            time.sleep(0.005)
+        assert complete and body.worker_idle
 
 
 def test_show_off_rows_is_a_visible_switch_that_rebuilds_the_same_plot(preview_body) -> None:
@@ -584,7 +640,7 @@ from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_workbench.pulse_editor.app import open_pulse_editor
 
 app = ensure_qt_app()
-path = Path("zlc_neutral_atom/assets/imaging_template.json").resolve()
+path = Path("pulses/imaging_template.json").resolve()
 body = open_pulse_editor(path=path)
 index = body.tabs.indexOf(body.preview_view)
 bar = body.tabs.tabBar()

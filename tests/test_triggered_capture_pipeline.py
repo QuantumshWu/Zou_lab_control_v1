@@ -14,12 +14,12 @@ import pytest
 
 from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, REPEAT, SCAN_POINT
 from zlc_neutral_atom.devices.simulation.installation import create_virtual_installation
-from zlc_neutral_atom.logic_nodes.camera_capture.binding import (
+from zlc_neutral_atom.capture.binding import (
     TriggeredCameraLayout,
     bind_triggered_camera_acquisition,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport, run_cleanup_steps
-from zlc_neutral_atom.logic_nodes.camera_capture.coordination import (
+from zlc_neutral_atom.capture.coordination import (
     execute_autonomous_single_fire,
     validate_single_trigger_capture_binding,
 )
@@ -142,7 +142,7 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
         camera_port = runtime.camera_port(catalog.require("camera").ref)
         pulse_port = runtime.pulse_port(catalog.require("sequencer").ref)
         document = load_pulse_document(
-            ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+            ROOT / "pulses" / "imaging_template.json"
         )
         repeat_axis = _axis("capture.repeat", REPEAT, 1)
 
@@ -321,7 +321,7 @@ def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation
 
         workspace = Path(sys.argv[1])
         document = load_pulse_document(
-            Path("zlc_neutral_atom/assets/imaging_template.json")
+            Path("pulses/imaging_template.json")
         )
         experiment = connect("virtual", repository=workspace, seed=7)
         try:
@@ -487,7 +487,7 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
 
 
 def test_host_stepped_scan_is_not_reintroduced_as_a_capture_mode():
-    import zlc_neutral_atom.logic_nodes.camera_capture.triggered as capture_module
+    import zlc_neutral_atom.capture.triggered as capture_module
 
     assert not hasattr(capture_module, "HOST_STEPPED_GROUP")
     assert not hasattr(capture_module, "HostSteppedCaptureSpec")

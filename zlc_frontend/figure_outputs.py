@@ -48,7 +48,7 @@ from zlc_data import (
     materialize_numeric_dataset,
     projected_dataset_output_contract_id,
 )
-from .site_map_render import SiteMapView
+from .site_map import SiteMapPresentation
 from .render import (
     CurvePanelPayload,
     HistogramPanelPayload,
@@ -105,8 +105,12 @@ __all__ = [
     "HistogramValueRangeSelection",
     "SelectorAxisMetadata",
     "area_range_output_name",
+    "figure_derived_signal",
+    "figure_derivation_digest",
     "figure_output_contract_id",
+    "figure_output_revision_ref",
     "materialize_area_outputs",
+    "materialize_area_range_output",
     "materialize_area_snapshot",
     "materialize_cross_outputs",
     "materialize_fit_outputs",
@@ -198,16 +202,18 @@ class FigureOutputSource:
     """Exact immutable input accepted by a Figure output operation."""
 
     snapshot: OwnedSnapshot
-    site_map: SiteMapView | None = None
+    site_map: SiteMapPresentation | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, OwnedSnapshot):
             raise TypeError("Figure signal source must be OwnedSnapshot")
         if self.site_map is not None and not isinstance(
             self.site_map,
-            SiteMapView.__args__,
+            SiteMapPresentation,
         ):
-            raise TypeError("Figure output source site_map is not a SiteMapView")
+            raise TypeError(
+                "Figure output source site_map is not a SiteMapPresentation"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,7 +358,7 @@ def area_range_output_name(axis_id: AxisId) -> str:
     return f"area.range.{axis_id.value}"
 
 
-def _derived_ref(
+def figure_output_revision_ref(
     output_name: str,
     source_ref: DatasetRevisionRef,
     output_schema,
@@ -377,7 +383,7 @@ def _derived_ref(
     )
 
 
-def _derivation_digest(
+def figure_derivation_digest(
     output_name: str,
     snapshot: OwnedSnapshot,
     semantic_identity: Mapping[str, object],
@@ -403,7 +409,7 @@ def materialize_area_snapshot(
     return materialize_dataset_selection(
         source,
         selection,
-        reference_for=lambda output_schema: _derived_ref(
+        reference_for=lambda output_schema: figure_output_revision_ref(
             output_name,
             source.ref,
             output_schema,
@@ -432,7 +438,7 @@ def materialize_numeric_snapshot(
         values,
         data_axes=axes,
         unit=unit,
-        reference_for=lambda schema: _derived_ref(
+        reference_for=lambda schema: figure_output_revision_ref(
             output,
             source_ref,
             schema,
@@ -480,7 +486,7 @@ def _term_bounds(
     return (float(term.index),), ("index",), None
 
 
-def _derived_signal(
+def figure_derived_signal(
     output_name: str,
     snapshot: OwnedSnapshot,
     source: FigureOutputSource,
@@ -495,7 +501,7 @@ def _derived_signal(
         snapshot=snapshot,
         source_ref=source.snapshot.ref,
         derivation_digest=(
-            _derivation_digest(
+            figure_derivation_digest(
                 output_name,
                 snapshot,
                 {"kind": "materialized-figure-output"},
@@ -508,7 +514,7 @@ def _derived_signal(
     )
 
 
-def _area_range_output(
+def materialize_area_range_output(
     source: FigureOutputSource,
     source_ref: DatasetRevisionRef,
     axis: AxisSpec,
@@ -545,7 +551,7 @@ def _area_range_output(
         data_axes=(bound_axis,),
         semantic_identity=semantic_identity,
     )
-    return output_name, _derived_signal(
+    return output_name, figure_derived_signal(
         output_name,
         bound,
         source,
@@ -555,189 +561,6 @@ def _area_range_output(
     )
 
 
-def _site_map_input_tree(view) -> dict[str, object]:
-    """Canonical two-input lineage for one already-joined SiteMap front."""
-
-    def evaluated_input_tree(value) -> dict[str, object]:
-        return {
-            "dataset_id": value.dataset_id.value,
-            "ref": dataset_revision_ref_to_tree(value.ref),
-        }
-
-    return {
-        "background": evaluated_input_tree(view.background_input),
-        "site_state": evaluated_input_tree(view.site_state_input),
-        "calibration_identity": view.calibration_identity,
-        "view_identity": view.view_identity,
-    }
-
-
-def _site_map_data_snapshot(
-    source_ref: DatasetRevisionRef,
-    site_axis: AxisSpec,
-    values: np.ndarray,
-    validity: np.ndarray,
-    *,
-    data_axes: tuple[AxisSpec, ...],
-    unit: str | None,
-    semantic_identity: Mapping[str, object],
-) -> OwnedSnapshot:
-    """Materialise SiteMap Area data without reducing SITE validity."""
-
-    axes = tuple(data_axes)
-    if not axes or axes[0] != site_axis:
-        raise ValueError("SiteMap Area data must begin with its selected SITE axis")
-    output_name = AREA_DATA_OUTPUT
-    return materialize_component_dataset(
-        source_ref,
-        values,
-        data_axes=axes,
-        validity_axis_ids=(site_axis.axis_id,),
-        validity=validity,
-        unit=unit,
-        reference_for=lambda schema: _derived_ref(
-            output_name,
-            source_ref,
-            schema,
-            semantic_identity,
-        ),
-    )
-
-
-def _site_map_area_outputs(
-    source: FigureOutputSource,
-    selection: Selection,
-    view: SiteMapView,
-) -> dict[str, FigureDerivedSignal]:
-    """Select SiteMap state by calibrated centres, matching Main's semantics."""
-
-    snapshot = source.snapshot
-    if not isinstance(snapshot, OwnedSnapshot):
-        raise TypeError("SiteMap Area source does not own a dataset snapshot")
-    if snapshot.ref != view.site_state_input.ref:
-        raise ValueError("SiteMap Area source differs from its exact site-state input")
-    x_axis = view.home_viewport.x_axis
-    y_axis = view.home_viewport.y_axis
-    terms = {term.axis_id: term for term in selection.terms}
-    if set(terms) != {x_axis.axis_id, y_axis.axis_id}:
-        raise ValueError("SiteMap Area must select its painted x and y axes")
-    x_term = terms[x_axis.axis_id]
-    y_term = terms[y_axis.axis_id]
-    if not isinstance(x_term, CoordinateRangeSelection) or not isinstance(
-        y_term, CoordinateRangeSelection
-    ):
-        raise TypeError("SiteMap Area requires coordinate-range x and y terms")
-    if any(
-        term.coordinate_frame != view.coordinate_frame
-        for term in (x_term, y_term)
-    ):
-        raise ValueError("SiteMap Area coordinate frame differs from its sites")
-    centers = np.asarray(view.centers_xy, dtype="<f8")
-    selected = np.flatnonzero(
-        (centers[:, 0] >= float(x_term.lower))
-        & (centers[:, 0] <= float(x_term.upper))
-        & (centers[:, 1] >= float(y_term.lower))
-        & (centers[:, 1] <= float(y_term.upper))
-    )
-    lineage = _site_map_input_tree(view)
-    selection_tree = selection_to_tree(selection)
-    derivation_digest = canonical_digest(
-        {
-            "owner": "zlc_frontend.site-map-area",
-            "inputs": lineage,
-            "selection": selection_tree,
-        }
-    )
-    outputs: dict[str, FigureDerivedSignal] = {}
-
-    for axis, term in ((x_axis, x_term), (y_axis, y_term)):
-        key, value = _area_range_output(
-            source,
-            snapshot.ref,
-            axis,
-            (float(term.lower), float(term.upper)),
-            ("lower", "upper"),
-            {
-                "inputs": lineage,
-                "selection": selection_tree,
-                "axis_id": axis.axis_id.value,
-            },
-            unit=axis.unit,
-            derivation_digest=derivation_digest,
-        )
-        outputs[key] = value
-
-    # An empty box is still a meaningful completed spatial range.  Dataset axes
-    # are non-empty by contract, so it publishes only the two bounds rather than
-    # inventing a sentinel site or a false valid value.
-    if not selected.size:
-        return outputs
-
-    selected_indices = tuple(int(index) for index in selected)
-    source_site_axis = view.site_axis
-    site_axis = AxisSpec(
-        source_site_axis.axis_id,
-        source_site_axis.name,
-        source_site_axis.role,
-        len(selected_indices),
-        tuple(source_site_axis.coordinate_at(index) for index in selected_indices),
-        source_site_axis.unit,
-        source_site_axis.coordinate_frame,
-    )
-    validity = np.asarray(view.site_validity, dtype=np.bool_)[selected]
-    occupied = view.site_occupancy
-    if occupied is not None:
-        values = np.asarray(occupied, dtype=np.bool_)[selected]
-        data_axes = (site_axis,)
-        unit = None
-        quantity = "occupancy"
-    else:
-        if x_axis.unit != y_axis.unit:
-            raise ValueError(
-                "calibration SiteMap Area cannot combine x/y coordinates with "
-                "different units into one area.data signal"
-            )
-        identity = canonical_digest(
-            {
-                "owner": "zlc_frontend.site-map-area-coordinate",
-                "source_block_id": snapshot.ref.block_id.value,
-                "selection": selection_tree,
-            }
-        )
-        coordinate_axis = AxisSpec(
-            AxisId(f"figure-output-{identity[:24]}-coordinate"),
-            "coordinate",
-            COMPONENT,
-            2,
-            ("x", "y"),
-        )
-        values = np.asarray(centers[selected], dtype="<f8")
-        data_axes = (site_axis, coordinate_axis)
-        unit = x_axis.unit
-        quantity = "calibrated-centers"
-
-    result = _site_map_data_snapshot(
-        snapshot.ref,
-        site_axis,
-        values,
-        validity,
-        data_axes=data_axes,
-        unit=unit,
-        semantic_identity={
-            "inputs": lineage,
-            "selection": selection_tree,
-            "quantity": quantity,
-        },
-    )
-    outputs[AREA_DATA_OUTPUT] = _derived_signal(
-        AREA_DATA_OUTPUT,
-        result,
-        source,
-        preserve_source_coverage=False,
-        metadata=None,
-        derivation_digest=derivation_digest,
-    )
-    return outputs
 
 
 def materialize_area_outputs(
@@ -767,7 +590,7 @@ def materialize_area_outputs(
         selected = materialize_dataset_acceptance_mask(
             snapshot,
             accepted,
-            reference_for=lambda output_schema: _derived_ref(
+            reference_for=lambda output_schema: figure_output_revision_ref(
                 AREA_DATA_OUTPUT,
                 snapshot.ref,
                 output_schema,
@@ -775,7 +598,7 @@ def materialize_area_outputs(
             ),
         )
         outputs = {
-            AREA_DATA_OUTPUT: _derived_signal(
+            AREA_DATA_OUTPUT: figure_derived_signal(
                 AREA_DATA_OUTPUT,
                 selected,
                 source,
@@ -790,7 +613,7 @@ def materialize_area_outputs(
             ("value",),
             unit=schema.cell_schema.value_unit,
         )
-        range_key, range_value = _area_range_output(
+        range_key, range_value = materialize_area_range_output(
             source,
             snapshot.ref,
             value_axis,
@@ -803,17 +626,15 @@ def materialize_area_outputs(
         return outputs
     site_map = source.site_map
     if site_map is not None:
-        return _site_map_area_outputs(
-            source,
-            selection,
-            site_map,
-        )
+        if not isinstance(selection, Selection):
+            raise TypeError("SiteMap Area requires a typed Selection")
+        return dict(site_map.materialize_area_outputs(source, selection))
     snapshot = source.snapshot
     if not isinstance(snapshot, OwnedSnapshot):
         raise TypeError("Area source signal does not own a dataset snapshot")
     selected = materialize_area_snapshot(snapshot, selection)
     output: dict[str, FigureDerivedSignal] = {}
-    output[AREA_DATA_OUTPUT] = _derived_signal(
+    output[AREA_DATA_OUTPUT] = figure_derived_signal(
         AREA_DATA_OUTPUT,
         selected,
         source,
@@ -823,7 +644,7 @@ def materialize_area_outputs(
     for term in selection.terms:
         axis = _source_axis(snapshot, term.axis_id)
         values, labels, unit = _term_bounds(snapshot, term)
-        key, value = _area_range_output(
+        key, value = materialize_area_range_output(
             source,
             snapshot.ref,
             axis,
@@ -872,7 +693,11 @@ def materialize_cross_outputs(
         coordinate = materialize_numeric_snapshot(
             output_name,
             snapshot.ref,
-            np.asarray(value, dtype="<f8"),
+            # ``SCALAR_AXIS`` is still one declared component axis.  Keep the
+            # canonical physical carrier ``(R=1, P=1, data=1)`` instead of
+            # passing a zero-rank ndarray and asking the data kernel to guess
+            # whether an absent trailing dimension meant scalar data.
+            np.asarray((value,), dtype="<f8"),
             unit=axis.unit,
             semantic_identity={
                 "kind": "cross-coordinate",
@@ -880,7 +705,7 @@ def materialize_cross_outputs(
                 "value": value,
             },
         )
-        result[output_name] = _derived_signal(
+        result[output_name] = figure_derived_signal(
             output_name,
             coordinate,
             source,
@@ -917,7 +742,7 @@ def materialize_fit_outputs(
     spec_tree = fit_spec_to_tree(result.spec)
     snapshots = materialize_fit_parameter_snapshots(
         result,
-        reference_for=lambda parameter_name, schema: _derived_ref(
+        reference_for=lambda parameter_name, schema: figure_output_revision_ref(
             f"{FIT_OUTPUT_PREFIX}{parameter_name}",
             result.source_ref,
             schema,

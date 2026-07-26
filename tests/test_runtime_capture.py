@@ -25,13 +25,13 @@ from zlc_neutral_atom.devices.camera.endpoint import CameraCaptureEndpoint
 from zlc_neutral_atom.devices.simulation.sequencer_endpoint import (
     VirtualSequencerExecutionEndpoint,
 )
-from zlc_neutral_atom.logic_nodes.camera_capture.binding import (
+from zlc_neutral_atom.capture.binding import (
     TriggeredCameraLayout,
     bind_triggered_camera_acquisition,
 )
 from zlc_neutral_atom.devices.simulation.apparatus import VirtualSequencer
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
-from zlc_neutral_atom.logic_nodes.camera_capture.pipeline import MinimalPipelineSpec
+from zlc_neutral_atom.capture.pipeline import MinimalPipelineSpec
 from zlc_neutral_atom.runtime.ports import DeviceBroker, SafetyOperation
 from zlc_neutral_atom.runtime.resources import (
     DeviceIdentityEvidenceKind,
@@ -40,7 +40,7 @@ from zlc_neutral_atom.runtime.resources import (
     ResourceKey,
 )
 from zlc_neutral_atom.runtime.run import RunCancelled, RunController, RunFailed
-from zlc_neutral_atom.logic_nodes.camera_capture.triggered import (
+from zlc_neutral_atom.capture.triggered import (
     TriggeredCaptureSpec,
     compile_triggered_pipeline,
 )
@@ -245,7 +245,7 @@ class _RuntimeFixture:
             pulse_port,
             capture_port,
             pulse_document=load_pulse_document(
-                _ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+                _ROOT / "pulses" / "imaging_template.json"
             ),
             execution_form=PulseExecutionForm.STATIC_ONCE,
             trigger_channel="ch11",

@@ -33,6 +33,7 @@ _DELIVERY_TOKEN = object()
 _CURSOR_TOKEN = object()
 _RESERVATION_TOKEN = object()
 _MONITOR_TOKEN = object()
+_FOLLOW_TOKEN = object()
 _STREAM_TOKEN = object()
 _PRODUCER_TOKEN = object()
 _READINESS_TOKEN = object()
@@ -1575,6 +1576,107 @@ class MonitorTap(Generic[PayloadT]):
             self._condition.notify_all()
 
 
+class FollowTap(Generic[PayloadT]):
+    """Lossless ordered delivery of events published after subscription.
+
+    A follow tap is deliberately neither an exact consumer nor a monitor view:
+    it may join an already-running generation, never replays earlier events,
+    and has no ``latest`` operation that could silently skip a committed value.
+    Every post-subscription envelope remains owned by this tap until consumed
+    or until the subscriber explicitly closes it.
+    """
+
+    def __init__(
+        self,
+        authority: object,
+        *,
+        stream: "AcquisitionStream[PayloadT]",
+        start_sequence: int,
+    ) -> None:
+        if authority is not _FOLLOW_TOKEN:
+            raise PermissionError("FollowTap can only be minted by AcquisitionStream")
+        self._stream = stream
+        self._condition = threading.Condition(threading.Lock())
+        self._queue: deque[Envelope[PayloadT]] = deque()
+        self._start_sequence = start_sequence
+        self._next_offered_sequence = start_sequence
+        self._next_consumed_sequence = start_sequence
+        self._closed = False
+        self._source_finished = False
+        self._terminal_error: StreamError | None = None
+
+    @property
+    def start_sequence(self) -> int:
+        return self._start_sequence
+
+    @property
+    def stream_id(self) -> StreamId:
+        return self._stream.stream_id
+
+    @property
+    def stream_generation(self) -> StreamGenerationId:
+        return self._stream.generation
+
+    @property
+    def next_sequence(self) -> int:
+        with self._condition:
+            return self._next_consumed_sequence
+
+    def _offer(self, envelope: Envelope[PayloadT]) -> None:
+        with self._condition:
+            if self._closed or self._source_finished:
+                return
+            if envelope.sequence != self._next_offered_sequence:
+                raise StreamGap(
+                    self._next_offered_sequence,
+                    envelope.sequence,
+                    envelope.sequence + 1,
+                )
+            self._queue.append(envelope)
+            self._next_offered_sequence += 1
+            self._condition.notify_all()
+
+    def next(self, timeout: float | None = None) -> Envelope[PayloadT]:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            while not self._queue:
+                if self._closed:
+                    raise StreamEndedEarly("follow tap is closed")
+                if self._source_finished:
+                    if self._terminal_error is not None:
+                        raise self._terminal_error
+                    raise StreamEndedEarly("follow source reached end-of-stream")
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("timed out waiting for followed event")
+                    self._condition.wait(remaining)
+                else:
+                    self._condition.wait()
+            envelope = self._queue.popleft()
+            if envelope.sequence != self._next_consumed_sequence:
+                raise StreamGap(
+                    self._next_consumed_sequence,
+                    envelope.sequence,
+                    self._next_offered_sequence,
+                )
+            self._next_consumed_sequence += 1
+            return envelope
+
+    def _source_ended(self, error: StreamError | None) -> None:
+        with self._condition:
+            self._source_finished = True
+            self._terminal_error = error
+            self._condition.notify_all()
+
+    def close(self) -> None:
+        self._stream._remove_follower(self)
+        with self._condition:
+            self._closed = True
+            self._queue.clear()
+            self._condition.notify_all()
+
+
 class AcquisitionProducer(Generic[PayloadT]):
     """Exclusive write/terminal authority retained by the source owner lane."""
 
@@ -1655,6 +1757,7 @@ class AcquisitionStream(Generic[PayloadT]):
         self._formal_interval_start: int | None = None
         self._formal_interval_end: int | None = None
         self._monitors: set[MonitorTap[PayloadT]] = set()
+        self._followers: set[FollowTap[PayloadT]] = set()
         self._closed = False
         self._terminal_error: StreamError | None = None
         self._eos: EndOfStream | None = None
@@ -1770,6 +1873,22 @@ class AcquisitionStream(Generic[PayloadT]):
             self._monitors.add(tap)
         return tap
 
+    def follow(self) -> FollowTap[PayloadT]:
+        """Subscribe atomically to every future event of this generation."""
+
+        with self._condition:
+            if self._closed:
+                if self._terminal_error is not None:
+                    raise self._terminal_error
+                raise StreamEndedEarly("cannot follow a closed stream")
+            tap = FollowTap(
+                _FOLLOW_TOKEN,
+                stream=self,
+                start_sequence=self._next_sequence,
+            )
+            self._followers.add(tap)
+            return tap
+
     def _emit(
         self,
         payload: PayloadT,
@@ -1793,7 +1912,7 @@ class AcquisitionStream(Generic[PayloadT]):
         with self._condition:
             if self._closed:
                 if self._terminal_error is not None:
-                    if self._monitors:
+                    if self._monitors or self._followers:
                         self._close_generation_locked(self._terminal_error)
                     raise self._terminal_error
                 raise StreamEndedEarly("cannot emit after end-of-stream")
@@ -1890,6 +2009,8 @@ class AcquisitionStream(Generic[PayloadT]):
                             reservation._state = ReservationState.DRAINING
                 for monitor in tuple(self._monitors):
                     monitor._offer(envelope)
+                for follower in tuple(self._followers):
+                    follower._offer(envelope)
                 self._condition.notify_all()
             except BaseException as error:
                 if self._next_sequence == sequence:
@@ -1933,6 +2054,9 @@ class AcquisitionStream(Generic[PayloadT]):
                     except BaseException:
                         self._monitors.add(monitor)
                         raise
+            while self._followers:
+                follower = self._followers.pop()
+                follower._source_ended(error)
         finally:
             self._condition.notify_all()
 
@@ -1943,7 +2067,7 @@ class AcquisitionStream(Generic[PayloadT]):
             if self._terminal_error is not None:
                 raise self._terminal_error
             if self._eos is not None:
-                if self._monitors:
+                if self._monitors or self._followers:
                     self._close_generation_locked(None)
                 return self._eos
             if self._formal_rebind_required:
@@ -1986,7 +2110,7 @@ class AcquisitionStream(Generic[PayloadT]):
                 raise StreamEndedEarly("completed stream generation cannot be superseded")
             if isinstance(self._terminal_error, SchemaChanged):
                 if self._terminal_error.replacement == replacement:
-                    if self._monitors:
+                    if self._monitors or self._followers:
                         self._close_generation_locked(self._terminal_error)
                     return
                 raise StreamEndedEarly("stream generation was already superseded")
@@ -2009,7 +2133,7 @@ class AcquisitionStream(Generic[PayloadT]):
                 raise StreamEndedEarly("completed stream cannot fail")
             if self._terminal_error is not None:
                 if self._terminal_error is error:
-                    if self._monitors:
+                    if self._monitors or self._followers:
                         self._close_generation_locked(error)
                     return
                 raise StreamEndedEarly("stream already has a terminal failure")
@@ -2356,6 +2480,10 @@ class AcquisitionStream(Generic[PayloadT]):
         with self._condition:
             self._monitors.discard(monitor)
 
+    def _remove_follower(self, follower: FollowTap[PayloadT]) -> None:
+        with self._condition:
+            self._followers.discard(follower)
+
     def _earliest_retained_locked(self) -> int:
         return self._order[0] if self._order else self._next_sequence
 
@@ -2397,6 +2525,7 @@ __all__ = [
     "event_ref_to_tree",
     "ExactConsumerReadiness",
     "ExactReservation",
+    "FollowTap",
     "JoinKeyContract",
     "MonitorTap",
     "MonitorUpdate",

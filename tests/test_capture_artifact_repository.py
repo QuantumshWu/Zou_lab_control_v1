@@ -14,7 +14,7 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraFrameRecord,
     CameraWorkingPoint,
 )
-from zlc_neutral_atom.logic_nodes.camera_capture.artifact import (
+from zlc_neutral_atom.capture.artifact import (
     CaptureRepository,
     compile_capture_artifact_pipeline,
 )
@@ -22,12 +22,12 @@ from zlc_neutral_atom.devices.camera.endpoint import CameraCaptureEndpoint
 from zlc_neutral_atom.devices.simulation.sequencer_endpoint import (
     VirtualSequencerExecutionEndpoint,
 )
-from zlc_neutral_atom.logic_nodes.camera_capture.binding import (
+from zlc_neutral_atom.capture.binding import (
     TriggeredCameraLayout,
     bind_triggered_camera_acquisition,
 )
 from zlc_neutral_atom.devices.simulation.apparatus import VirtualSequencer
-from zlc_neutral_atom.logic_nodes.camera_capture.reference import (
+from zlc_neutral_atom.capture.reference import (
     CaptureArtifactRef,
     capture_artifact_input_ref,
     capture_artifact_ref_from_tree,
@@ -35,7 +35,7 @@ from zlc_neutral_atom.logic_nodes.camera_capture.reference import (
     encode_capture_artifact_ref,
 )
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
-from zlc_neutral_atom.logic_nodes.camera_capture.pipeline import MinimalPipelineSpec
+from zlc_neutral_atom.capture.pipeline import MinimalPipelineSpec
 from zlc_neutral_atom.runtime.ports import DeviceBroker, SafetyOperation
 from zlc_neutral_atom.runtime.resources import (
     DeviceIdentityEvidenceKind,
@@ -44,7 +44,7 @@ from zlc_neutral_atom.runtime.resources import (
     ResourceKey,
 )
 from zlc_neutral_atom.runtime.run import RunController, RunFailed
-from zlc_neutral_atom.logic_nodes.camera_capture.triggered import TriggeredCaptureSpec
+from zlc_neutral_atom.capture.triggered import TriggeredCaptureSpec
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
 from zlc_pulse import PulseExecutionForm, load_deployed_pulse_target, load_pulse_document
 from zlc_storage import (
@@ -227,7 +227,7 @@ class _CaptureCase:
             pulse_port,
             camera_port,
             pulse_document=load_pulse_document(
-                _ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+                _ROOT / "pulses" / "imaging_template.json"
             ),
             execution_form=PulseExecutionForm.STATIC_ONCE,
             trigger_channel="ch11",

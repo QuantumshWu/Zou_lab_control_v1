@@ -22,8 +22,6 @@ from zlc_neutral_atom.devices.sequencer.port import (
 from zlc_pulse import (
     PulseTargetManifest,
     build_pulse_playback,
-    resident_scan_point_capacity,
-    validate_resident_scan_capacity,
 )
 from zlc_storage import canonical_digest, positive_real as _positive_real
 
@@ -71,9 +69,6 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
                 "manifest_fingerprint": self._manifest.fingerprint,
                 "clock_hz": float(self._sequencer.clock_hz),
                 "geometry_fingerprint": self._geometry,
-                "resident_scan_point_capacity": resident_scan_point_capacity(
-                    self._params
-                ),
                 "max_blocking_call_seconds": self._timeout,
                 "terminal_evidence_kind": PulseTerminalEvidenceKind.SIMULATED.value,
             }
@@ -83,7 +78,6 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
             manifest=self._manifest,
             clock_hz=float(self._sequencer.clock_hz),
             geometry_fingerprint=self._geometry,
-            resident_scan_point_capacity=resident_scan_point_capacity(self._params),
             max_blocking_call_seconds=self._timeout,
             terminal_evidence_kind=PulseTerminalEvidenceKind.SIMULATED,
             server_connection_generation=None,
@@ -98,7 +92,6 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
             raise ValueError("compiled pulse clock differs from live sequencer")
         if artifact.wire_image.geometry_fingerprint != self._geometry:
             raise ValueError("compiled wire geometry differs from live sequencer")
-        validate_resident_scan_capacity(artifact, self._params)
 
     def _backend_prepare(self, session: _EndpointSession) -> None:
         artifact = session.request.artifact

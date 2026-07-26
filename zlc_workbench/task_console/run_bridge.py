@@ -25,6 +25,10 @@ from typing import Callable, Mapping
 
 from .console_records import console_signal_key
 from zlc_workbench.run_owner import QtRunOwnerMailbox
+from zlc_neutral_atom.runtime.signal_source import (
+    SignalAssociationScheduleRequirement,
+    SignalEventAssociationSource,
+)
 
 __all__ = ["ConsoleRunNode"]
 
@@ -93,6 +97,7 @@ class ConsoleRunNode:
             raise TypeError("materialize_final_presentations must be callable")
         self._materialize_final_presentations = materialize_final_presentations
         self._prepared_command = None
+        self._clear_signal_association_capability()
         self._handle = None
         self._start_future: Future | None = None
         self._start_pending = False
@@ -106,6 +111,7 @@ class ConsoleRunNode:
         self._final_outputs_submitted = False
         self._materialized_final_outputs = None
         self._materialized_final_presentations = None
+        self._completion_summary: str | None = None
         self._final_output_error: str | None = None
         self._error: str | None = None
         self._start_exception: BaseException | None = None
@@ -169,6 +175,28 @@ class ConsoleRunNode:
         """The frozen typed request -- the node's identity for this run."""
 
         return self._request
+
+    def value_schema(self, output_name: str):
+        """Delegate one running producer's declared live-event schema."""
+
+        command = self._prepared_command
+        if command is None:
+            raise RuntimeError("producer has not finished prepare/start submission")
+        resolve = getattr(command, "value_schema", None)
+        if not callable(resolve):
+            raise TypeError("this producer does not expose live signal events")
+        return resolve(output_name)
+
+    def open_signal_cursor(self, output_name: str):
+        """Open a future-only cursor without exposing the prepared command."""
+
+        command = self._prepared_command
+        if command is None:
+            raise RuntimeError("producer has not finished prepare/start submission")
+        open_cursor = getattr(command, "open_signal_cursor", None)
+        if not callable(open_cursor):
+            raise TypeError("this producer does not expose live signal events")
+        return open_cursor(output_name)
 
     @property
     def handle(self):
@@ -281,6 +309,12 @@ class ConsoleRunNode:
         return self._final_output_error
 
     @property
+    def completion_summary(self) -> str | None:
+        """Command-owned human result location, if this run persists one."""
+
+        return self._completion_summary
+
+    @property
     def running(self) -> bool:
         # A start is already this node's accepted lifecycle generation before
         # the owner-thread completion installs its RunHandle.  Live view ports
@@ -362,11 +396,13 @@ class ConsoleRunNode:
         generation = self._owner.begin_generation()
         self._handle = None
         self._prepared_command = None
+        self._clear_signal_association_capability()
         self._snapshot = None
         self._final_result = _UNRESOLVED_FINAL
         self._final_outputs_submitted = False
         self._materialized_final_outputs = None
         self._materialized_final_presentations = None
+        self._completion_summary = None
         self._final_output_error = None
         request = self._request
         prepare = self._prepare
@@ -472,6 +508,7 @@ class ConsoleRunNode:
                 self._start_pending = False
                 prepared, self._handle = completion.future.result()
                 self._prepared_command = prepared
+                self._refresh_signal_association_capability(prepared)
                 self._owner.set_handle(self._handle)
                 if self._stop_requested:
                     self._handle.cancel(self._stop_reason)
@@ -479,6 +516,7 @@ class ConsoleRunNode:
         if handle is not None:
             self._snapshot = handle.snapshot()
             if self._snapshot.state.terminal:
+                self._clear_signal_association_capability()
                 if (
                     self._snapshot.state.name == "SUCCEEDED"
                     and self._final_result is _UNRESOLVED_FINAL
@@ -493,6 +531,24 @@ class ConsoleRunNode:
                     else:
                         self._owner.mark_owner_reaped()
                         command = self._prepared_command
+                        summary_factory = getattr(
+                            command,
+                            "completion_summary",
+                            None,
+                        )
+                        if callable(summary_factory):
+                            try:
+                                summary = summary_factory(self._final_result)
+                                if not isinstance(summary, str) or not summary.strip():
+                                    raise TypeError(
+                                        "completion_summary() must return non-empty str"
+                                    )
+                                self._completion_summary = summary.strip()
+                            except BaseException as error:
+                                self._completion_summary = (
+                                    "result committed; location unavailable: "
+                                    f"{type(error).__name__}: {error}"
+                                )
                         outputs_factory = getattr(
                             command,
                             "final_dataset_outputs",
@@ -530,6 +586,39 @@ class ConsoleRunNode:
                     self._final_result = _UNRESOLVED_FINAL
                     self._owner.mark_owner_reaped()
         return self._snapshot
+
+    def _refresh_signal_association_capability(self, command: object) -> None:
+        self._clear_signal_association_capability()
+        if isinstance(command, SignalEventAssociationSource):
+            self.__dict__.update(
+                open_associated_signal_cursor=self._open_associated_signal_cursor,
+                signal_association_schedule_requirement=(
+                    self._signal_association_schedule_requirement
+                ),
+            )
+
+    def _clear_signal_association_capability(self) -> None:
+        self.__dict__.pop("open_associated_signal_cursor", None)
+        self.__dict__.pop("signal_association_schedule_requirement", None)
+
+    def _open_associated_signal_cursor(self, output_name: str):
+        if not self.running:
+            raise RuntimeError("producer association source is not running")
+        command = self._prepared_command
+        if not isinstance(command, SignalEventAssociationSource):
+            raise RuntimeError("producer lost signal association capability")
+        return command.open_associated_signal_cursor(output_name)
+
+    def _signal_association_schedule_requirement(
+        self,
+        output_name: str,
+    ) -> SignalAssociationScheduleRequirement:
+        if not self.running:
+            raise RuntimeError("producer association source is not running")
+        command = self._prepared_command
+        if not isinstance(command, SignalEventAssociationSource):
+            raise RuntimeError("producer lost signal association capability")
+        return command.signal_association_schedule_requirement(output_name)
 
     def wait_until_terminal(self, *, reason: str) -> None:
         """Join this node's already-submitted Run without draining Qt completions.

@@ -117,7 +117,6 @@ class PulseTargetDescriptor:
     manifest: PulseTargetManifest
     clock_hz: float
     geometry_fingerprint: int
-    resident_scan_point_capacity: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.sequencer_ref, DeviceRef):
@@ -132,12 +131,6 @@ class PulseTargetDescriptor:
             or not 0 <= self.geometry_fingerprint <= 0xFFFFFFFF
         ):
             raise ValueError("geometry_fingerprint must be an unsigned 32-bit integer")
-        if (
-            isinstance(self.resident_scan_point_capacity, bool)
-            or not isinstance(self.resident_scan_point_capacity, int)
-            or self.resident_scan_point_capacity < 1
-        ):
-            raise ValueError("resident_scan_point_capacity must be positive")
 
     @property
     def target(self) -> PulseTarget:
@@ -542,17 +535,6 @@ def prepare_pulse_execution(
     document = resolve_api_parameters(document, dict(request.api_values))
     if document.api_parameters:
         raise RuntimeError("Pulse Run retained unresolved API declarations")
-    if request.execution_form in _SCAN_FORMS:
-        table = document.scan_table
-        if table is None:
-            raise RuntimeError("autonomous scan lost its frozen scan table")
-        point_count = len(table.rows) * request.scan_sweep_count
-        capacity = pulse_port.capability.resident_scan_point_capacity
-        if point_count > capacity:
-            raise ValueError(
-                "autonomous scan exceeds the bound sequencer resident capacity: "
-                f"{point_count} points > {capacity}"
-            )
     if request.execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
         document = materialize_scan_sweeps(document, request.scan_sweep_count)
     artifact = compile_pulse_artifact(

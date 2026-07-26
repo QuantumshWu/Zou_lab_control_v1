@@ -11,14 +11,13 @@ import threading
 from typing import Callable, Mapping
 
 from zlc_frontend.figure import DatasetId
-from zlc_neutral_atom.logic_nodes.camera_measurement import CameraMonitorViewSpec
 from zlc_neutral_atom.dataset_output import (
     LiveDatasetOutput,
     LiveDatasetOutputOwner,
     LiveDatasetSnapshotSource,
 )
 from zlc_neutral_atom.runtime.dataset import MonitorDatasetSnapshot
-from zlc_neutral_atom.logic_nodes.camera_capture.pipeline import CapturePreviewSpec
+from zlc_neutral_atom.runtime.preview import LiveDatasetViewSpec
 from zlc_storage import canonical_text
 
 
@@ -27,14 +26,14 @@ class LiveDatasetSlot:
 
     def __init__(
         self,
-        spec: CapturePreviewSpec | CameraMonitorViewSpec,
+        spec: LiveDatasetViewSpec,
         *,
         dataset_id: DatasetId,
         retain_on_terminal: bool = True,
         output_owner: LiveDatasetOutputOwner | None = None,
     ) -> None:
-        if not isinstance(spec, (CapturePreviewSpec, CameraMonitorViewSpec)):
-            raise TypeError("spec must be a supported live dataset spec")
+        if not isinstance(spec, LiveDatasetViewSpec):
+            raise TypeError("spec must implement LiveDatasetViewSpec")
         if not isinstance(dataset_id, DatasetId):
             raise TypeError("dataset_id must be DatasetId")
         if not isinstance(retain_on_terminal, bool):

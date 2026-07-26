@@ -49,7 +49,7 @@ from zlc_pulse import (
     PulseExecutionForm,
     scan_column_specs,
 )
-from zlc_storage.paths import project_path
+from zlc_storage.paths import project_path, user_output_path
 
 from ._layout import px
 from .controller import (
@@ -83,6 +83,12 @@ def _pulse_files_dir() -> Path:
     )
     directory.mkdir(parents=True, exist_ok=True)
     return directory.resolve()
+
+
+def _pulse_figure_dir() -> Path:
+    directory = user_output_path("figures", "pulses")
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
 
 def _safe_file_stem(value: str) -> str:
@@ -217,11 +223,16 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             "pulse",
             group="pulse-preview",
             empty_text="Open Preview to render the pulse plot.",
+            parent=self.preview_view,
         )
-        self.preview_view.mount_content(
-            self.preview_host,
-            wheel_target=self.preview_host.board,
-        )
+        # The host already has its final QObject owner, but it is deliberately
+        # not visible until one complete raster front has been admitted.  A
+        # parented child that is neither laid out nor hidden is shown by Qt at
+        # its default geometry when the Preview page first becomes visible;
+        # QtRasterBoard then paints its empty black surface over the page until
+        # the worker finishes.  Keep the stable host parked behind the existing
+        # placeholder instead of exposing that incomplete composition.
+        self.preview_host.hide()
 
     def _wire_ui(self) -> None:
         view = self.schedule_view
@@ -853,7 +864,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 
     def _save_preview(self) -> None:
         document = self._controller.current_document
-        suggested = _pulse_files_dir() / (
+        suggested = _pulse_figure_dir() / (
             f"{_safe_file_stem(document.name)}.png"
         )
         path, _filter = QtWidgets.QFileDialog.getSaveFileName(

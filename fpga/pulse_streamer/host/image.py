@@ -14,9 +14,11 @@ Memory map (32-bit AXI words; the top decodes one axi_bram_ctrl port to regions)
   BUS    bus-segment image    (7 words/seg, copied into engine LUTRAM by the top)
 
 The edge fields are separate BRAMs read in PARALLEL (one whole edge per access,
-no width padding) so max_edges is large.  The current qualified deployment loads
-both scan banks before FIRE and rejects larger scans; host refill is not part of
-the execution contract.  Bus tables stay LUTRAM.
+no width padding) so max_edges is large.  The prepare image contains the first
+two bank-local scan chunks; the transport's sole observer refills each released
+bank through the mailbox, so total scan length may exceed this resident window.
+The FPGA owns point timing throughout; the host never steps individual points.
+Bus tables stay LUTRAM.
 
 The per-channel / per-bus OUTPUT delay is EVENT-SCHEDULED (queued toggles against a
 free-running counter, 32-bit delay bound) for BOTH the TTL channels and the DAC buses; both
@@ -109,7 +111,7 @@ class CtrlWords:
     COMMAND = 1            # host -> top: LOAD/FIRE/RESET/SAFE (rising-edge)
     STATUS = 2            # top -> host: LOADED/RUNNING/DONE/ERROR/UNDERFLOW
     PROG_COUNT = 3        # number of edges
-    SCAN_COUNT = 4        # total resident scan points N for the current deployment
+    SCAN_COUNT = 4        # total scan points N; may exceed the two-bank window
     SCAN_ENABLE = 5
     REPEAT_FOREVER = 6
     LOOP_START = 7
@@ -515,10 +517,10 @@ def scan_bank_words(program, p: StreamerParams, chunk_index: int,
 def pack_program(program, params: StreamerParams | None = None) -> dict[int, int]:
     """Pack a RuntimeSequenceProgram into the FINAL AXI write image (sparse).
 
-    Edges -> TICK/COEFF/MASK regions; the two resident scan chunks -> the two
-    banks; bus -> BUS region; scalars -> CTRL. The current deployment rejects a
-    larger table before this image reaches hardware. COMMAND/STATUS/CURSOR/
-    BANK_READY are runtime mailbox words."""
+    Edges -> TICK/COEFF/MASK regions; the initial two bank-local scan chunks -> the two
+    banks; bus -> BUS region; scalars -> CTRL. The transport streams subsequent
+    chunks into each freed bank. COMMAND/STATUS/CURSOR/BANK_READY are runtime
+    mailbox words."""
     p = params or StreamerParams()
     check_rtl_assumptions(p)   # hard gate: never pack for a geometry the shipped RTL corrupts
     bases = region_bases(p)
@@ -563,8 +565,8 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
         for k in range(p.mask_words):
             w[bases["mask"] + i * p.mask_words + k] = mw[k] if k < len(mw) else 0
 
-    # The complete currently admitted scan occupies banks 0 and 1. Record each
-    # resident chunk identity for the frozen bank handshake.
+    # Preload the first two chunks and record their identities.  The runtime
+    # transport owns every subsequent ping-pong refill.
     for chunk in (0, 1):
         w.update(scan_bank_words(program, p, chunk))
     w[CtrlWords.BANK0_CHUNK] = 0
@@ -679,7 +681,10 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
 
 def unpack_program(words: Mapping[int, int], params: StreamerParams | None = None) -> dict:
     """Reconstruct program fields from a packed image (host<->FPGA contract check).
-    Reads the two resident scan chunks used by the current deployment."""
+    Reads the static prepare image and its initial two bank-local scan chunks.
+
+    Later refill chunks are transport writes and are not present in this mapping.
+    """
     p = params or StreamerParams()
     bases = region_bases(p)
 
@@ -891,9 +896,9 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
                    target_pct: float = 90.0, bank_size: int = 2048,
                    max_edges_cap: int = 16384,
                    engine_logic_luts: int = 14639, engine_ff: int = 11502, engine_dsp: int | None = None) -> SolvedCapacity:
-    """Maximise max_edges under <=target_pct of the part's RAMB36. Scan capacity
-    is the two-bank resident window; edge fields are parallel BRAMs (no width
-    padding).
+    """Maximise max_edges under <=target_pct of the part's RAMB36. Scan storage
+    is the two-bank resident window, whose depth controls refill slack rather
+    than total scan length; edge fields are parallel BRAMs (no width padding).
 
     LUT/FF/DSP/RAMB36 estimates are CALIBRATED to a real Vivado 2019.1 place+ROUTE of the
     35T build (zlc_pulse_streamer_top, 2026-06-29 routed): 18607 slice LUTs (89%), 11502 FF
@@ -923,7 +928,7 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
         if _edge_ramb(cand, base) + fixed <= budget:
             max_edges = cand
             break
-    # Spend leftover RAMB36 on a larger fully resident autonomous scan window.
+    # Spend leftover RAMB36 on larger ping-pong banks for more refill slack.
     chosen_bank = bank_size
     for cand in (8192, 4096, 2048, 1024, bank_size):
         if cand < bank_size:

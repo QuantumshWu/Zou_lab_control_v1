@@ -7,8 +7,7 @@ composition root; it is not persisted, discovered, registered, or looked up
 through a service locator.
 
 This module deliberately knows no Camera, Calibration, Occupancy, MOT, RF or
-PulseScan type.  It only resolves owner-declared Dataset/Artifact inputs and
-retains the Workbench runtime nodes needed for lifecycle coordination.
+PulseScan type.  It only resolves owner-declared Dataset/Artifact inputs.
 """
 
 from __future__ import annotations
@@ -72,37 +71,12 @@ class ConsoleNodeInputs:
             )
         return values[0]
 
-    def runtime_nodes(self) -> tuple[object, ...]:
-        """Return the dependency-closed live producer nodes exactly once.
-
-        Runtime ownership is a Workbench fact, not a domain binding fact.  A
-        PulseScan attachment can therefore stop the selected producer chain
-        before taking exact hardware ownership without teaching TaskConsole
-        whether the chain is Camera-only or Camera->Occupancy.
-        """
-
-        ordered: dict[int, object] = {}
-
-        def add(node: object | None) -> None:
-            if node is None or id(node) in ordered:
-                return
-            ordered[id(node)] = node
-            for parent in tuple(getattr(node, "input_nodes", ()) or ()):
-                add(parent)
-
-        for value in self.resolved.values():
-            if isinstance(value, ResolvedDatasetInput):
-                add(value.producer.run_node)
-        return tuple(ordered.values())
-
-
 @dataclass(frozen=True, slots=True)
 class ConsoleNodeHost:
     """Generic services available while a concrete attachment creates a node."""
 
     data_plane: ConsoleDataPlane
     resolve_inputs: Callable[[ConsoleNodeSpec, Mapping[str, object]], Mapping[str, ResolvedNodeInput]]
-    resolve_artifact_reference: Callable[[object], object]
     request_owner_wake: Callable[[], None]
 
     def __post_init__(self) -> None:
@@ -110,7 +84,6 @@ class ConsoleNodeHost:
             raise TypeError("data_plane must be ConsoleDataPlane")
         for name in (
             "resolve_inputs",
-            "resolve_artifact_reference",
             "request_owner_wake",
         ):
             if not callable(getattr(self, name)):
@@ -120,13 +93,16 @@ class ConsoleNodeHost:
         self,
         spec: ConsoleNodeSpec,
         values: Mapping[str, object],
+        *,
+        resolve_artifact_reference: Callable[[ResolvedArtifactInput], object]
+        | None = None,
     ) -> ConsoleNodeInputs:
         """Resolve once, then strip GUI/runtime identity for the domain owner."""
 
         resolved = dict(self.resolve_inputs(spec, values))
         bound = bind_resolved_node_inputs(
             resolved,
-            resolve_artifact_reference=self.resolve_artifact_reference,
+            resolve_artifact_reference=resolve_artifact_reference,
         )
         return ConsoleNodeInputs(resolved, bound)
 

@@ -107,15 +107,10 @@ from .validation import (
 )
 from .deployment import (
     APPROVED_DEPLOYED_TARGET_ABI,
-    AUTONOMOUS_REFILLED_UNAVAILABLE_REASON,
-    FormalScanCapacityExceeded,
     expand_autonomous_scan_repeats,
-    resident_scan_point_capacity,
-    require_autonomous_scan_resident_capacity,
     require_approved_target_abi,
     validate_artifact_for_deployment,
     validate_deployed_target,
-    validate_resident_scan_capacity,
 )
 from .schedule import (
     DigitalTriggerSchedule,
@@ -244,8 +239,6 @@ from .timeline import (
 __all__ = [
     "COMPILED_PULSE_ARTIFACT_SCHEMA",
     "APPROVED_DEPLOYED_TARGET_ABI",
-    "AUTONOMOUS_REFILLED_UNAVAILABLE_REASON",
-    "FormalScanCapacityExceeded",
     "AUTONOMOUS_TABLE_READ_RECIPE",
     "COMPILER_ID",
     "CompiledPulseArtifact",
@@ -427,8 +420,6 @@ __all__ = [
     "set_output_delay",
     "require_approved_target_abi",
     "expand_autonomous_scan_repeats",
-    "resident_scan_point_capacity",
-    "require_autonomous_scan_resident_capacity",
     "serve_pulse_execution_service",
     "target_ir_from_tree",
     "target_ir_to_tree",
@@ -440,5 +431,4 @@ __all__ = [
     "validate_terminal_for_artifact",
     "validate_artifact_for_deployment",
     "validate_deployed_target",
-    "validate_resident_scan_capacity",
 ]

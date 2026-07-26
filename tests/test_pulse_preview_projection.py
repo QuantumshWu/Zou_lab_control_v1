@@ -34,7 +34,7 @@ ROOT = Path(__file__).parents[1]
 
 def test_projection_keeps_typed_row_order_and_show_off_is_only_a_view_filter():
     document = load_pulse_document(
-        ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+        ROOT / "pulses" / "imaging_template.json"
     )
     timeline = project_pulse_preview(document)
 
@@ -71,7 +71,7 @@ def test_projection_keeps_typed_row_order_and_show_off_is_only_a_view_filter():
 
 def test_all_off_projection_retains_first_digital_reference_and_active_dac_rows():
     document = load_pulse_document(
-        ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+        ROOT / "pulses" / "imaging_template.json"
     )
     digital_lanes = {
         port.lanes[0] for port in document.target.ports if port.kind == PORT_DIGITAL
@@ -111,7 +111,7 @@ def test_all_off_projection_retains_first_digital_reference_and_active_dac_rows(
 
 def test_repeat_projection_preserves_the_formal_three_state_semantics():
     base = load_pulse_document(
-        ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+        ROOT / "pulses" / "imaging_template.json"
     )
     first = base.periods[0].period_id
     second = base.periods[1].period_id

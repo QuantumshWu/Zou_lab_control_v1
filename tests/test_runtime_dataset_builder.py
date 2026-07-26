@@ -56,8 +56,6 @@ from zlc_neutral_atom.runtime.streams import (
     TraceContext,
     TraceBinding,
 )
-from zlc_neutral_atom.runtime.preview import ExactDatasetPreviewSpec
-from zlc_workbench.exact_live_slot import ExactDatasetLiveSlot
 
 
 FINGERPRINT = "3" * 64
@@ -499,53 +497,6 @@ def test_exact_preview_delta_copies_only_new_cells_in_frozen_order():
     assert reader.freeze_delta(second.ref.revision).cells == ()
 
     builder.seal(producer.finish())
-    reservation.release()
-
-
-def test_exact_live_slot_terminal_validation_does_not_materialize_frames(monkeypatch):
-    schema = dataset_schema(points=2)
-    stream, producer = source(schema)
-    reservation = stream.reserve(
-        total_events=2,
-        trace_binding=TRACE_BINDING,
-    )
-    cursor = reservation.activate()
-    builder = DatasetBuilder(
-        BlockId("delta-live-slot"),
-        reservation,
-        dataset_edge(stream, schema),
-    )
-    slot = ExactDatasetLiveSlot(ExactDatasetPreviewSpec(schema.fingerprint))
-    slot.bind(
-        builder.open_preview_reader(),
-        run_id="run",
-        causation_domain_id=stream.generation.value,
-    )
-
-    emit(producer, value(10), DatasetCellAddress(0, 0), 0)
-    builder.consume(cursor.next())
-    first = slot.wait_and_freeze_delta(DatasetRevision(0), timeout=0)
-    assert first is not None
-    assert first[2].ref.revision == DatasetRevision(1)
-
-    emit(producer, value(20), DatasetCellAddress(0, 1), 1)
-    builder.consume(cursor.next())
-    builder.seal(producer.finish())
-
-    def forbidden_materialize(*_args, **_kwargs):
-        raise AssertionError("terminal validation copied the cumulative dataset")
-
-    monkeypatch.setattr(builder, "materialize", forbidden_materialize)
-    slot.source_terminal()
-    assert slot.terminal
-    second = slot.wait_and_freeze_delta(first[2].ref.revision, timeout=None)
-    assert second is not None
-    assert tuple(cell.address for cell in second[2].cells) == (
-        DatasetCellAddress(0, 1),
-    )
-    assert slot.wait_and_freeze_delta(second[2].ref.revision, timeout=None) is None
-
-    slot.close()
     reservation.release()
 
 

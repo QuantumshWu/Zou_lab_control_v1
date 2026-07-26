@@ -18,7 +18,7 @@ import Zou_lab_control.notebook as zlc
 from zlc_data.fit_model import fit_model_catalog
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+IMAGING_PULSE = ROOT / "pulses" / "imaging_template.json"
 
 
 def test_fit_and_figure_run_on_the_virtual_installation() -> None:

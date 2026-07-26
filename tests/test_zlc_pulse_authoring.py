@@ -35,7 +35,7 @@ from zlc_pulse import (
 
 
 ROOT = Path(__file__).parents[1]
-IMAGING_TEMPLATE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+IMAGING_TEMPLATE = ROOT / "pulses" / "imaging_template.json"
 
 
 def test_freeze_scan_table_names_columns_and_reports_clock_normalization():

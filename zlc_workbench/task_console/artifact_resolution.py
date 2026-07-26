@@ -1,0 +1,51 @@
+"""Domain-neutral admission of explicitly selected FINAL artifact inputs."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from zlc_workbench.input_binding import ResolvedArtifactInput
+
+
+def resolve_producer_final_artifact(binding: ResolvedArtifactInput) -> object:
+    """Return the selected producer's completed FINAL result."""
+
+    if not isinstance(binding, ResolvedArtifactInput):
+        raise TypeError("binding must be ResolvedArtifactInput")
+    producer = binding.producer
+    if producer is None:
+        raise RuntimeError("artifact selection names no producing Logic node")
+    if producer.running:
+        raise RuntimeError("the selected artifact-producing Logic node is running")
+    if not producer.final_result_resolved:
+        raise RuntimeError(
+            "the selected artifact-producing Logic node has no successful "
+            "current FINAL result"
+        )
+    return producer.final_result
+
+
+def resolve_final_or_saved_artifact(
+    binding: ResolvedArtifactInput,
+    *,
+    load_saved: Callable[[object], object],
+    extract_reference: Callable[[object], object],
+) -> object:
+    """Resolve either the exact producer result or one explicit saved pointer."""
+
+    if not isinstance(binding, ResolvedArtifactInput):
+        raise TypeError("binding must be ResolvedArtifactInput")
+    if not callable(load_saved) or not callable(extract_reference):
+        raise TypeError("saved artifact loader/extractor must be callable")
+    if binding.producer is not None:
+        return resolve_producer_final_artifact(binding)
+    path = binding.selection.reference_path
+    if path is None:
+        raise RuntimeError("saved artifact input lost its exact path")
+    return extract_reference(load_saved(path))
+
+
+__all__ = [
+    "resolve_final_or_saved_artifact",
+    "resolve_producer_final_artifact",
+]

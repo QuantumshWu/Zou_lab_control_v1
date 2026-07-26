@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass
-from typing import Protocol, TypeVar
+from dataclasses import dataclass, field, replace
+from typing import Protocol, Self, TypeVar, runtime_checkable
 
 from zlc_storage import (
     canonical_text as _canonical_text,
@@ -125,6 +125,7 @@ class CameraExposureConfiguredAck:
     required_external_trigger_interval_seconds: float
     settings_fingerprint: str
     capability_fingerprint: str
+    capability: CaptureCapabilitySnapshot
 
     def __post_init__(self) -> None:
         for name in ("session_id", "binding_instance_id"):
@@ -151,6 +152,36 @@ class CameraExposureConfiguredAck:
         )
         _sha256(self.settings_fingerprint, "settings_fingerprint")
         _sha256(self.capability_fingerprint, "capability_fingerprint")
+        capability = self.capability
+        if not isinstance(capability, CaptureCapabilitySnapshot):
+            raise TypeError("capability must be CaptureCapabilitySnapshot")
+        if capability.binding_stamp.binding_instance_id != self.binding_instance_id:
+            raise ValueError("configured capability belongs to another binding")
+        if capability.settings_fingerprint != self.settings_fingerprint:
+            raise ValueError("configured capability settings fingerprint differs")
+        if capability.capability_fingerprint != self.capability_fingerprint:
+            raise ValueError("configured capability fingerprint differs")
+        if not math.isclose(
+            capability.camera_physical_facts.exposure_seconds,
+            self.applied_exposure_seconds,
+            rel_tol=1e-10,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("configured capability exposure differs from readback")
+
+
+@runtime_checkable
+class _CameraExposurePort(Protocol):
+    @property
+    def device(self) -> BoundDevice: ...
+
+    @property
+    def capability(self) -> CaptureCapabilitySnapshot: ...
+
+    def with_configured_exposure(
+        self,
+        acknowledgement: CameraExposureConfiguredAck,
+    ) -> Self: ...
 
 @dataclass(frozen=True)
 class PrepareCaptureCommand:
@@ -351,12 +382,34 @@ def capture_terminal_ack_from_tree(tree: object) -> CaptureTerminalAck:
 @dataclass(frozen=True)
 class BoundCapturePort:
     capability_attestation: VerifiedDeviceCapability
+    _leased_capability: CaptureCapabilitySnapshot | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+    )
+    _exposure_session_id: str | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+    )
 
     def __post_init__(self) -> None:
         admit_bound_capability(
             self.capability_attestation,
             CaptureCapabilitySnapshot,
         )
+        leased = self._leased_capability
+        if leased is None:
+            if self._exposure_session_id is not None:
+                raise ValueError("exposure session requires a leased capability")
+        else:
+            _admit_exposure_leased_capability(
+                self.capability_attestation.snapshot,
+                leased,
+                self._exposure_session_id,
+            )
         if not self.device.session_cleanup_capable:
             raise ValueError("capture port requires session-specific cleanup capability")
         if not any(
@@ -371,9 +424,44 @@ class BoundCapturePort:
 
     @property
     def capability(self) -> CaptureCapabilitySnapshot:
-        snapshot = self.capability_attestation.snapshot
+        snapshot = self._leased_capability
+        if snapshot is None:
+            snapshot = self.capability_attestation.snapshot
         assert isinstance(snapshot, CaptureCapabilitySnapshot)
         return snapshot
+
+    def with_configured_exposure(
+        self,
+        acknowledgement: CameraExposureConfiguredAck,
+    ) -> "BoundCapturePort":
+        """Bind one endpoint-read working point to the active exposure lease."""
+
+        if not isinstance(acknowledgement, CameraExposureConfiguredAck):
+            raise TypeError(
+                "acknowledgement must be CameraExposureConfiguredAck"
+            )
+        if acknowledgement.binding_instance_id != self.device.binding_instance_id:
+            raise ValueError("exposure acknowledgement belongs to another device")
+        return type(self)(
+            self.capability_attestation,
+            _leased_capability=acknowledgement.capability,
+            _exposure_session_id=acknowledgement.session_id,
+        )
+
+    def require_current_capability(self) -> CaptureCapabilitySnapshot:
+        """Validate the stable binding behind this baseline or leased view."""
+
+        baseline = self.capability_attestation.snapshot
+        if self.device.validate_capability(self.capability_attestation) is not baseline:
+            raise RuntimeError("capture capability attestation snapshot changed")
+        capability = self.capability
+        if self._leased_capability is not None:
+            _admit_exposure_leased_capability(
+                baseline,
+                capability,
+                self._exposure_session_id,
+            )
+        return capability
 
     @property
     def resource_claim(self) -> ResourceClaim:
@@ -400,6 +488,88 @@ class BoundCapturePort:
         return CleanupReport.complete()
 
 
+def _admit_exposure_leased_capability(
+    baseline: object,
+    leased: CaptureCapabilitySnapshot,
+    session_id: str | None,
+) -> None:
+    """Require a run-scoped exposure view to differ only in read-back timing."""
+
+    if not isinstance(baseline, CaptureCapabilitySnapshot):
+        raise TypeError("baseline must be CaptureCapabilitySnapshot")
+    if not isinstance(leased, CaptureCapabilitySnapshot):
+        raise TypeError("leased must be CaptureCapabilitySnapshot")
+    if session_id is None:
+        raise ValueError("leased capability requires an exposure session")
+    _canonical_text(session_id, "exposure session_id")
+    if leased.binding_stamp != baseline.binding_stamp:
+        raise ValueError("leased capability binding differs from baseline")
+    if leased.payload_contract is not baseline.payload_contract:
+        raise ValueError("exposure lease changed the camera payload owner")
+    baseline_evidence = baseline.camera_capability_evidence
+    leased_evidence = leased.camera_capability_evidence
+    if replace(
+        leased_evidence,
+        physical_facts=baseline_evidence.physical_facts,
+    ) != baseline_evidence:
+        raise ValueError("exposure lease changed non-physical capability evidence")
+    leased_facts = leased_evidence.physical_facts
+    expected_facts = replace(
+        baseline_evidence.physical_facts,
+        exposure_seconds=leased_facts.exposure_seconds,
+        required_external_trigger_interval_seconds=(
+            leased_facts.required_external_trigger_interval_seconds
+        ),
+        opaque_frame_settings_fingerprint=(
+            leased_facts.opaque_frame_settings_fingerprint
+        ),
+    )
+    if leased_facts != expected_facts:
+        raise ValueError("exposure lease changed another camera working-point fact")
+
+
+def configure_camera_exposure(
+    context: RunContext,
+    port: _CameraExposurePort,
+    session_id: str,
+    exposure_seconds: float,
+):
+    """Apply/read back one run-scoped exposure and return the leased Port view."""
+
+    if not isinstance(context, RunContext):
+        raise TypeError("context must be RunContext")
+    if not isinstance(port, _CameraExposurePort):
+        raise TypeError("port must implement the camera exposure Port contract")
+    session_id = _canonical_text(session_id, "exposure session_id")
+    exposure_seconds = _positive_finite(exposure_seconds, "exposure_seconds")
+    acknowledgement = context.device(port.device.key).execute(
+        ConfigureCameraExposureCommand(
+            session_id,
+            exposure_seconds,
+            port.capability.settings_fingerprint,
+        )
+    )
+    if not isinstance(acknowledgement, CameraExposureConfiguredAck):
+        raise TypeError(
+            "camera exposure configure returned another acknowledgement"
+        )
+    if acknowledgement.session_id != session_id:
+        raise RuntimeError("camera exposure acknowledgement session differs")
+    if acknowledgement.binding_instance_id != port.device.binding_instance_id:
+        raise RuntimeError("camera exposure acknowledgement binding differs")
+    if not math.isclose(
+        acknowledgement.applied_exposure_seconds,
+        exposure_seconds,
+        rel_tol=1e-10,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError("camera applied exposure differs from the request")
+    configured = port.with_configured_exposure(acknowledgement)
+    if not isinstance(configured, type(port)):
+        raise TypeError("camera exposure Port changed its concrete authority type")
+    return configured
+
+
 
 __all__ = [
     "BoundCapturePort",
@@ -412,6 +582,7 @@ __all__ = [
     "CapturedPayloadAck",
     "CompleteCaptureCommand",
     "ConfigureCameraExposureCommand",
+    "configure_camera_exposure",
     "PrepareCaptureCommand",
     "ReadCaptureCommand",
     "StartCaptureCommand",

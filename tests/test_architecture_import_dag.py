@@ -84,6 +84,91 @@ FORBIDDEN = {
     "zlc_neutral_atom": ("Zou_lab_control", "zlc_frontend", "zlc_workbench"),
 }
 
+
+def _is_logic_node_product_leaf(path: Path) -> bool:
+    """Whether *path* is an explicit outward product-adapter leaf."""
+
+    relative = path.relative_to(ROOT)
+    return (
+        relative.parts[:2] == ("zlc_neutral_atom", "logic_nodes")
+        and (
+            "ui" in relative.parts[3:]
+            or relative.name == "workbench_adapter.py"
+        )
+    )
+
+
+def _logic_node_declaration_sites(root: Path) -> tuple[Path, ...]:
+    sites = []
+    for source in sorted(root.rglob("*.py")):
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if (
+                isinstance(function, ast.Name)
+                and function.id == "LogicNodeDeclaration"
+            ) or (
+                isinstance(function, ast.Attribute)
+                and function.attr == "LogicNodeDeclaration"
+            ):
+                sites.append(source)
+    return tuple(sites)
+
+
+def test_logic_node_tree_contains_only_capability_leaves_or_domain_families():
+    """Keep domain-family sharing inside Logic Nodes without inventing fake nodes.
+
+    A direct child is either one standalone capability (its declaration lives in
+    that directory), or a domain family whose immediate child directories are
+    capability leaves.  Shared family modules may live at the family root.  A
+    declaration-free sibling such as the former ``camera_capture``/``*_common``
+    directories is therefore impossible, while real domain sharing does not get
+    promoted into framework/runtime merely to satisfy directory symmetry.
+    """
+
+    root = ROOT / "zlc_neutral_atom" / "logic_nodes"
+    assert root.is_dir()
+    root_modules = sorted(path.name for path in root.glob("*.py"))
+    assert root_modules == ["__init__.py"], (
+        "logic_nodes root may not accumulate shared helpers; place experiment "
+        "semantics in a named domain family and cross-family infrastructure in "
+        f"its real owner: {root_modules}"
+    )
+    violations = []
+    for child in sorted(path for path in root.iterdir() if path.is_dir()):
+        if child.name == "__pycache__":
+            continue
+        declaration_sites = _logic_node_declaration_sites(child)
+        direct = tuple(path for path in declaration_sites if path.parent == child)
+        nested = tuple(path for path in declaration_sites if path.parent != child)
+        if direct:
+            if len(direct) != 1 or nested:
+                violations.append(
+                    f"{child.relative_to(ROOT)} mixes a standalone declaration "
+                    f"with other declarations: {declaration_sites}"
+                )
+            continue
+        leaf_dirs = sorted(
+            path
+            for path in child.iterdir()
+            if path.is_dir() and path.name != "__pycache__"
+        )
+        if not leaf_dirs:
+            violations.append(
+                f"{child.relative_to(ROOT)} has no declaration and no capability leaves"
+            )
+            continue
+        for leaf in leaf_dirs:
+            sites = _logic_node_declaration_sites(leaf)
+            if len(sites) != 1:
+                violations.append(
+                    f"{leaf.relative_to(ROOT)} must own exactly one declaration, "
+                    f"found {sites}"
+                )
+    assert not violations, "\n".join(violations)
+
 CANONICAL_HELPER_NAMES = frozenset(
     {
         "_canonical_nonempty_text",
@@ -126,6 +211,8 @@ def test_target_package_has_no_reverse_imports(package, forbidden):
         pytest.skip(f"{package} has not entered its migration slice")
     violations = []
     for path in root.rglob("*.py"):
+        if package == "zlc_neutral_atom" and _is_logic_node_product_leaf(path):
+            continue
         for imported in _imports(path):
             if any(imported == prefix or imported.startswith(prefix + ".") for prefix in forbidden):
                 violations.append(f"{path.relative_to(ROOT)} imports {imported}")
@@ -144,7 +231,7 @@ def test_target_package_has_no_reverse_imports(package, forbidden):
     (
         Path("zlc_neutral_atom/runtime"),
         Path("zlc_neutral_atom/devices"),
-        Path("zlc_workbench/task_console"),
+        Path("zlc_workbench"),
     ),
 )
 def test_framework_and_device_owners_do_not_import_concrete_logic_nodes(
@@ -168,7 +255,7 @@ def test_framework_and_device_owners_do_not_import_concrete_logic_nodes(
     )
 
 
-def test_device_owners_do_not_depend_back_on_bootstrap_dispatch():
+def test_device_owners_do_not_depend_back_on_installation_dispatch():
     """Concrete attachments consume low-level installation owners, never dispatch."""
 
     root = ROOT / "zlc_neutral_atom/devices"
@@ -176,13 +263,11 @@ def test_device_owners_do_not_depend_back_on_bootstrap_dispatch():
     violations = []
     for path in sorted(root.rglob("*.py")):
         for imported in _imports(path):
-            if imported == "zlc_neutral_atom.bootstrap" or imported.startswith(
-                "zlc_neutral_atom.bootstrap."
-            ):
+            if imported == "zlc_neutral_atom.installation_dispatch":
                 violations.append(f"{path.relative_to(ROOT)} imports {imported}")
     assert not violations, (
         "device attachments are inputs to config dispatch, not consumers of the "
-        "composition-private bootstrap package:\n" + "\n".join(violations)
+        "composition-private installation dispatch:\n" + "\n".join(violations)
     )
 
 
@@ -215,13 +300,13 @@ if 'zlc_storage.canonical' not in sys.modules:
 def test_occupancy_runtime_does_not_import_calibration_analysis_or_repository():
     code = """
 import sys
-import zlc_neutral_atom.logic_nodes.occupancy.processor
+import zlc_neutral_atom.logic_nodes.readout.occupancy.processor
 
 forbidden = (
     'scipy',
-    'zlc_neutral_atom.logic_nodes.calibration.analysis',
-    'zlc_neutral_atom.logic_nodes.calibration.codec',
-    'zlc_neutral_atom.logic_nodes.calibration.repository',
+    'zlc_neutral_atom.logic_nodes.readout.calibration.analysis',
+    'zlc_neutral_atom.logic_nodes.readout.calibration.codec',
+    'zlc_neutral_atom.logic_nodes.readout.calibration.repository',
 )
 loaded = tuple(
     name for name in forbidden
@@ -515,20 +600,18 @@ def test_zlc_data_does_not_restore_unused_bulk_or_transform_history_surfaces():
     )
 
 
-READOUT_LOGIC_ROOTS = (
-    Path("zlc_neutral_atom/logic_nodes/calibration"),
-    Path("zlc_neutral_atom/logic_nodes/occupancy"),
-    Path("zlc_neutral_atom/logic_nodes/readout_common"),
+READOUT_OWNER_ROOTS = (
+    Path("zlc_neutral_atom/logic_nodes/readout"),
 )
 
 
 def _readout_logic_sources():
-    missing = [root for root in READOUT_LOGIC_ROOTS if not (ROOT / root).is_dir()]
+    missing = [root for root in READOUT_OWNER_ROOTS if not (ROOT / root).is_dir()]
     assert not missing, (
         "readout Logic-node owner roots moved; update this ratchet in the same "
         f"change instead of silently scanning nothing: {missing}"
     )
-    for root in READOUT_LOGIC_ROOTS:
+    for root in READOUT_OWNER_ROOTS:
         yield from sorted((ROOT / root).rglob("*.py"))
 
 
@@ -600,6 +683,8 @@ def test_domain_packages_may_not_import_a_gui_toolkit(package):
         pytest.skip(f"{package} has not entered its migration slice")
     violations = []
     for path in sorted(root.rglob("*.py")):
+        if package == "zlc_neutral_atom" and _is_logic_node_product_leaf(path):
+            continue
         rel = path.relative_to(ROOT).as_posix()
         for imported in _imports(path):
             if imported.split(".")[0] in GUI_TOOLKITS:
@@ -608,6 +693,91 @@ def test_domain_packages_may_not_import_a_gui_toolkit(package):
         f"{package} must stay headless-importable: "
         + "; ".join(violations)
     )
+
+
+def test_logic_node_package_roots_do_not_eagerly_import_optional_ui():
+    roots = sorted((ROOT / "zlc_neutral_atom/logic_nodes").glob("*/__init__.py"))
+    assert roots, "logic-node package-root guard is scanning nothing"
+    violations = []
+    for path in roots:
+        for imported in _imports(path):
+            if imported.endswith(".ui") or ".ui." in imported:
+                violations.append(f"{path.relative_to(ROOT)} imports {imported}")
+    assert not violations, (
+        "capability roots must remain headless; optional UI is imported only by "
+        "the top composition root:\n" + "\n".join(violations)
+    )
+
+
+def test_logic_node_ui_package_roots_are_inert():
+    roots = sorted((ROOT / "zlc_neutral_atom/logic_nodes").glob("*/ui/__init__.py"))
+    assert roots, "logic-node UI package-root guard is scanning nothing"
+    violations = []
+    for path in roots:
+        imports = _imports(path)
+        if imports:
+            violations.append(
+                f"{path.relative_to(ROOT)} imports {', '.join(sorted(imports))}"
+            )
+    assert not violations, (
+        "UI package roots must not turn an ordinary capability import into a Qt/"
+        "Workbench import:\n" + "\n".join(violations)
+    )
+
+
+def test_generic_frontend_and_workbench_do_not_import_concrete_logic_nodes():
+    violations = []
+    for package in ("zlc_frontend", "zlc_workbench"):
+        for path in _source_files((package,)):
+            for imported in _imports(path):
+                if imported == "zlc_neutral_atom.logic_nodes" or imported.startswith(
+                    "zlc_neutral_atom.logic_nodes."
+                ):
+                    violations.append(f"{path.relative_to(ROOT)} imports {imported}")
+    assert not violations, (
+        "generic frontend/workbench must receive typed values by injection, not "
+        "reach into a concrete Logic node:\n" + "\n".join(violations)
+    )
+
+
+def test_no_task_console_attachment_residue_exists():
+    paths = sorted(
+        (ROOT / "zlc_neutral_atom/logic_nodes").rglob(
+            "task_console_attachment.py"
+        )
+    )
+    assert not paths, (
+        "ordinary Logic nodes are declaration-projected; do not restore concrete "
+        f"TaskConsole attachments: {[str(path.relative_to(ROOT)) for path in paths]}"
+    )
+
+
+def test_optional_logic_node_adapter_leaves_are_headless_importable():
+    logic_nodes = ROOT / "zlc_neutral_atom/logic_nodes"
+    paths = sorted(logic_nodes.glob("*/workbench_adapter.py"))
+    paths += sorted(logic_nodes.glob("*/ui/task_console.py"))
+    assert paths, "optional adapter import guard is scanning nothing"
+    modules = [
+        ".".join(path.relative_to(ROOT).with_suffix("").parts)
+        for path in paths
+    ]
+    code = (
+        "import importlib,sys; "
+        f"mods={modules!r}; "
+        "[importlib.import_module(name) for name in mods]; "
+        "bad=[name for name in sys.modules if name == 'matplotlib' "
+        "or name.startswith('matplotlib.') or name == 'PyQt5' "
+        "or name.startswith('PyQt5.') or name == 'PySide6' "
+        "or name.startswith('PySide6.')]; "
+        "assert not bad, bad"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_notebook_facade_has_no_implicit_current_calibration_state():
@@ -620,9 +790,9 @@ def test_notebook_facade_has_no_implicit_current_calibration_state():
     )
 
 
-def test_readout_common_root_does_not_eagerly_aggregate_leaf_owners():
-    path = ROOT / "zlc_neutral_atom" / "logic_nodes" / "readout_common" / "__init__.py"
-    assert path.is_file(), "readout_common owner moved without updating this ratchet"
+def test_readout_family_root_does_not_eagerly_aggregate_leaf_owners():
+    path = ROOT / "zlc_neutral_atom" / "logic_nodes" / "readout" / "__init__.py"
+    assert path.is_file(), "readout family owner moved without updating this ratchet"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     imports = [
         node
@@ -630,7 +800,7 @@ def test_readout_common_root_does_not_eagerly_aggregate_leaf_owners():
         if isinstance(node, (ast.Import, ast.ImportFrom))
     ]
     assert not imports, (
-        "readout Logic nodes import the exact shared owner leaf; readout_common's "
+        "readout Logic nodes import the exact shared owner leaf; the family "
         "package root must not make a light contract import initialize SciPy"
     )
 
@@ -733,8 +903,8 @@ def test_content_ref_codec_and_cas_address_have_one_storage_owner():
                 )
 
     for relative in (
-        Path("zlc_neutral_atom/logic_nodes/camera_capture/artifact.py"),
-        Path("zlc_neutral_atom/logic_nodes/calibration/repository.py"),
+        Path("zlc_neutral_atom/capture/artifact.py"),
+        Path("zlc_neutral_atom/logic_nodes/readout/calibration/repository.py"),
     ):
         tree = ast.parse(
             (ROOT / relative).read_text(encoding="utf-8"),
@@ -769,8 +939,8 @@ def test_content_ref_codec_and_cas_address_have_one_storage_owner():
 def test_artifact_finalizers_do_not_replay_published_payload_digests():
     violations = []
     for relative in (
-        Path("zlc_neutral_atom/logic_nodes/camera_capture/artifact.py"),
-        Path("zlc_neutral_atom/logic_nodes/occupancy/pipeline.py"),
+        Path("zlc_neutral_atom/capture/artifact.py"),
+        Path("zlc_neutral_atom/logic_nodes/readout/occupancy/pipeline.py"),
     ):
         path = ROOT / relative
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -811,7 +981,12 @@ def test_calibration_numeric_versions_are_not_admission_authority():
     )
 
     analysis_path = (
-        ROOT / "zlc_neutral_atom" / "logic_nodes" / "calibration" / "analysis.py"
+        ROOT
+        / "zlc_neutral_atom"
+        / "logic_nodes"
+        / "readout"
+        / "calibration"
+        / "analysis.py"
     )
     assert analysis_path.is_file(), "Calibration analysis owner moved without this ratchet"
     source = analysis_path.read_text(encoding="utf-8")

@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
+from zlc_data import BlockId
 from zlc_storage import sha256_text
 
 from ._failure import safe_error_summary
-from .dataset import ExactDatasetPreviewReader
+from .dataset import ExactDatasetPreviewReader, FrozenDatasetEdge
+
+
+@runtime_checkable
+class LiveDatasetViewSpec(Protocol):
+    """Domain-neutral identity and edge required by a live UI attachment."""
+
+    block_id: BlockId
+    dataset_edge: FrozenDatasetEdge
 
 
 @dataclass(frozen=True)
@@ -72,5 +81,6 @@ __all__ = [
     "ExactDatasetPreviewPort",
     "ExactDatasetPreviewSpec",
     "FailureAwarePreviewPort",
+    "LiveDatasetViewSpec",
     "notify_preview_failure",
 ]

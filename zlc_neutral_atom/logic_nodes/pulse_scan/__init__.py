@@ -19,8 +19,8 @@ from .lineage import (
     ApiSegmentEvidence,
     ApiSegmentedScanExecution,
     AutonomousScanExecution,
-    CameraRunEvidence,
     PulseScanExecution,
+    SignalEventSequence,
 )
 from .repository import MaterializedScanData
 from .final_output import (
@@ -34,7 +34,6 @@ __all__ = [
     "ApiSlotSegmentedProgram",
     "AutonomousScanExecution",
     "AutonomousScanSlotProgram",
-    "CameraRunEvidence",
     "MaterializedScanData",
     "PULSE_SCAN_MEASUREMENT_DEFINITION",
     "PULSE_SCAN_PROGRAM_SCHEMA",
@@ -42,6 +41,7 @@ __all__ = [
     "PULSE_SCAN_FINAL_OUTPUT_DECLARATIONS",
     "PulseScanExecution",
     "PulseScanProgram",
+    "SignalEventSequence",
     "ScanOutputContract",
     "ScanPointTable",
     "ScanArtifactRef",

@@ -79,7 +79,6 @@ def test_owner_wake_without_new_fact_is_silent_and_runtime_poll_stays_narrow():
             pulse_target_manifest_from_lanes(target),
             50_000_000.0,
             0,
-            1,
         ),
         initial_connection_mode="virtual",
     )
@@ -273,7 +272,6 @@ def test_borrowed_experiment_retirement_detaches_before_runtime_timer_poll():
         pulse_target_manifest_from_lanes(target),
         50_000_000.0,
         0,
-        1,
     )
     controller = PulseEditorController(
         PulseEditorSession.new(target, time_step_ns=20),

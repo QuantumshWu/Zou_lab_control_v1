@@ -42,7 +42,7 @@ _REQUIRED_CURRENT_CODE = (
 _FORBIDDEN_OLD_OR_RAW_CODE = (
     "Zou_lab_control.frontend",
     "Zou_lab_control.neutral_atom",
-    "load_packaged_sitemap_pulse",
+    "load_sitemap_pulse",
     ".target.raw_lanes",
     'trigger_channel="ch11"',
     "exp.devices",

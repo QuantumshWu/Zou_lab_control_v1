@@ -17,11 +17,11 @@ Three models, all walking the SAME engine FSM:
   Proven == reference for latency 1 AND 2.
 
 * :func:`streaming_scan_play` -- the SCAN path: the scan-point table is a 2-bank
-  ping-pong window of ``bank_size`` points; the host refills the idle bank behind
-  the engine cursor.  This model verifies the dormant refill handshake against
-  reference and proves STALL (hold, never a wrong point) on a late refill.  The
-  current deployed host does not publish refill: its admitted baseline is the
-  fully resident two-bank window and rejects larger tables before FIRE.
+  ping-pong window of ``bank_size`` points; the sole host observer refills the
+  idle bank behind the engine cursor.  This model verifies the active refill
+  handshake against reference and proves STALL (hold, never a wrong point) on a
+  late refill.  Production treats any observed UNDERFLOW as a failed run; the
+  FPGA remains the autonomous owner of point timing.
 
 The RTL combines the edge FIFO and the scan ping-pong; each is verified here
 independently and against the same ``reference_play`` ground truth.
@@ -486,7 +486,7 @@ def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: i
 
 
 # ----------------------------------------------------------------------------
-# scan ping-pong refill model (dormant in the current deployed host)
+# scan ping-pong refill model (current sole-host-observer contract)
 # ----------------------------------------------------------------------------
 def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: int = 0,
                         raise_on_underflow: bool = False):

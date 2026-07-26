@@ -20,10 +20,10 @@ from zlc_neutral_atom.artifacts import (
     FitResultArtifactRef,
     FitResultRepository,
 )
-from zlc_neutral_atom.logic_nodes.camera_capture.artifact import CaptureRepository
-from zlc_neutral_atom.logic_nodes.camera_capture.reference import CaptureArtifactRef
+from zlc_neutral_atom.capture.artifact import CaptureRepository
+from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.logic_nodes.calibration.repository import CalibrationRepository
+from zlc_neutral_atom.logic_nodes.readout.calibration.repository import CalibrationRepository
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.runtime.ports import BoundDevice
 from zlc_neutral_atom.runtime.run import RunPlan
@@ -32,7 +32,7 @@ from zlc_storage import RepositoryRootBusy
 
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGING_PULSE = ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+IMAGING_PULSE = ROOT / "pulses" / "imaging_template.json"
 MOT_SCAN_PULSE = ROOT / "pulses" / "mot_field_template.json"
 
 

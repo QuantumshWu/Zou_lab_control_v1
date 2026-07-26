@@ -37,7 +37,6 @@ def test_definition_records_are_closed_frozen_metadata() -> None:
         "Probe measurement",
         "tests.ProbeMeasurementRequest",
         "tests.ProbeMeasurementBinding",
-        "0" * 64,
     )
     processor = ProcessorDefinition(
         key,
@@ -46,6 +45,7 @@ def test_definition_records_are_closed_frozen_metadata() -> None:
     )
 
     assert task.key is measurement.key is processor.key
+    assert not hasattr(measurement, "capture_spec_owner_fingerprint")
     with pytest.raises(FrozenInstanceError):
         task.title = "mutated"
 
@@ -64,7 +64,7 @@ def test_definition_records_are_closed_frozen_metadata() -> None:
             "Probe",
             "tests.Request",
             "tests.Binding",
-            "not-a-sha256",
+            "0" * 64,
         ),
     ],
 )

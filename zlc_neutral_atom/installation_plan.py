@@ -1,6 +1,6 @@
 """Single public topology plan for each supported installation backend.
 
-The runtime bootstrap validates the devices it composed against this immutable
+Installation composition validates the devices it built against this immutable
 plan, while DeviceManager renders the same values.  Public roles, their domains,
 and expected adapter identities therefore cannot drift between the actual
 installation and its editor.

@@ -38,7 +38,6 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetPreviewDelta,
     DatasetPreviewSnapshot,
 )
-from zlc_neutral_atom.logic_nodes.pulse_scan import ScanOutputContract
 
 
 MOT_FIELD_LIVE_OUTPUT_DECLARATIONS = (
@@ -54,8 +53,6 @@ def _source_to_output_points(
 
     if source.repeat_axis != output.repeat_axis:
         raise ValueError("MOT preview transform changed the repeat axis")
-    if source.cell_schema != output.cell_schema:
-        raise ValueError("MOT preview transform changed camera frame values")
     source_ids = tuple(axis.axis_id for axis in source.point_axes)
     output_ids = tuple(axis.axis_id for axis in output.point_axes)
     try:
@@ -108,31 +105,21 @@ front unchanged, so the application live-output owner can publish only data whos
         self,
         request: MotFieldRequest,
         source_schema: DatasetSchema,
-        output_contract: ScanOutputContract,
     ) -> None:
         if not isinstance(request, MotFieldRequest):
             raise TypeError("request must be MotFieldRequest")
         if not isinstance(source_schema, DatasetSchema):
             raise TypeError("source_schema must be DatasetSchema")
-        if not isinstance(output_contract, ScanOutputContract):
-            raise TypeError("output_contract must be ScanOutputContract")
-        if (
-            output_contract.committed_transform.input_schema_fingerprint
-            != source_schema.fingerprint
-        ):
-            raise ValueError("MOT output contract belongs to another source schema")
-
-        transformed = output_contract.output_dataset_schema
         self._source_schema = source_schema
-        self._output_schema = mot_intensity_schema(request, transformed)
+        self._output_schema = mot_intensity_schema(request, source_schema)
         self._output_block_id = BlockId("mot-field-live-grid")
         self._source_to_output_points = _source_to_output_points(
             source_schema,
-            transformed,
+            self._output_schema,
         )
         self._projector: MotRoiProjector = build_mot_intensity_projector(
             request,
-            transformed,
+            source_schema,
         )
         self._values = np.zeros(self._output_schema.physical_shape, dtype=np.float64)
         self._valid = np.zeros(self._output_schema.physical_shape[:2], dtype=bool)

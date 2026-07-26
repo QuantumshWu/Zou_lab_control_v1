@@ -352,7 +352,7 @@ def test_product_render_dpi_and_save_draw_use_the_render_owner_context(
 def test_notebook_fit_figure_maps_each_visible_batch_and_skips_failure(monkeypatch, tmp_path):
     with zlc.connect("virtual", repository=tmp_path / "workspace") as exp:
         capture_ref = exp.readout.capture(
-            ROOT / "zlc_neutral_atom" / "assets" / "imaging_template.json"
+            ROOT / "pulses" / "imaging_template.json"
         )
         execution = exp.fit(
             capture_ref,
