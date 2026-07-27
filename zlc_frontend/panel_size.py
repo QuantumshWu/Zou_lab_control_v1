@@ -13,10 +13,16 @@ this module owns only the presentation spelling and validation.
 
 from __future__ import annotations
 
-__all__ = ["PANEL_SIZES", "panel_size_cells"]
+__all__ = ["DEFAULT_PANEL_SIZE", "PANEL_SIZES", "panel_size_cells"]
 
 
 PANEL_SIZES = ("1x2", "2x2", "4x2", "1x4", "2x4", "4x4", "4x8", "8x4", "8x8")
+# One ordinary-panel policy for every host.  Grid derives its one-time initial
+# recommendation from facet topology and Pulse owns a dedicated timing-layout
+# policy; neither exception rewrites this ordinary default.
+DEFAULT_PANEL_SIZE = "2x2"
+if DEFAULT_PANEL_SIZE not in PANEL_SIZES:
+    raise RuntimeError("default panel size is absent from the frontend vocabulary")
 
 
 def panel_size_cells(size: str) -> tuple[int, int]:

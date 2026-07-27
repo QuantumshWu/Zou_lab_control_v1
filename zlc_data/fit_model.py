@@ -1,14 +1,15 @@
 """Closed model catalogue for generic named-axis fitting.
 
-The catalogue contains only domain-neutral curve/image models.  Readout
-mixtures, calibration PSFs and histogram decisions deliberately remain in
-their bounded domains even when their formulas look superficially similar.
+The catalogue contains only domain-neutral curve/image/distribution models.
+Readout decisions and calibration PSFs remain in their bounded domains even
+when their formulas look superficially similar.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 from types import MappingProxyType
 from typing import Mapping
 
@@ -147,7 +148,8 @@ RADIAN = ParameterUnitRelation.RADIAN
 POSITIVE = FitParameterDomain.POSITIVE
 NONNEGATIVE = FitParameterDomain.NONNEGATIVE
 PHASE_RADIANS = FitParameterDomain.PHASE_RADIANS
-GENERIC_CURVE = (HISTOGRAM_BIN, SCAN_POINT, SPATIAL_X, SPATIAL_Y, SPECTRAL)
+GENERIC_CURVE = (SCAN_POINT, SPATIAL_X, SPATIAL_Y, SPECTRAL)
+HISTOGRAM_CURVE = (HISTOGRAM_BIN,)
 SPACE_X = (SPATIAL_X,)
 SPACE_Y = (SPATIAL_Y,)
 
@@ -173,6 +175,29 @@ _MODELS = (
             FitParameterDefinition("offset", VALUE),
             FitParameterDefinition("sigma", AXIS_0, POSITIVE),
             FitParameterDefinition("center", AXIS_0),
+        ),
+    ),
+    FitModelDefinition(
+        "histogram_gaussian",
+        "Single Gaussian",
+        (HISTOGRAM_CURVE,),
+        (
+            FitParameterDefinition("amplitude", VALUE, NONNEGATIVE),
+            FitParameterDefinition("center", AXIS_0),
+            FitParameterDefinition("sigma", AXIS_0, POSITIVE),
+        ),
+    ),
+    FitModelDefinition(
+        "bimodal_gaussian",
+        "Bimodal Gaussian",
+        (HISTOGRAM_CURVE,),
+        (
+            FitParameterDefinition("center", AXIS_0),
+            FitParameterDefinition("center_splitting", AXIS_0, NONNEGATIVE),
+            FitParameterDefinition("left_amplitude", VALUE, NONNEGATIVE),
+            FitParameterDefinition("left_sigma", AXIS_0, POSITIVE),
+            FitParameterDefinition("right_amplitude", VALUE, NONNEGATIVE),
+            FitParameterDefinition("right_sigma", AXIS_0, POSITIVE),
         ),
     ),
     FitModelDefinition(
@@ -272,6 +297,27 @@ def evaluate_fit_model(
     return np.asarray(result, dtype=np.float64)
 
 
+def evaluate_fit_model_components(
+    model: FitModelDefinition | str,
+    coordinates: tuple[np.ndarray, ...],
+    parameters: np.ndarray | tuple[float, ...],
+) -> tuple[np.ndarray, ...]:
+    """Evaluate model-owned visual components without duplicating formulas."""
+
+    definition = fit_model_definition(model) if isinstance(model, str) else model
+    total = evaluate_fit_model(definition, coordinates, parameters)
+    if definition.model_id != "bimodal_gaussian":
+        return (total,)
+    x = np.asarray(coordinates[0], dtype=np.float64)
+    values = np.asarray(parameters, dtype=np.float64).reshape(-1)
+    left, right = _bimodal_gaussian_components(x, *values)
+    return (
+        np.asarray(left, dtype=np.float64),
+        np.asarray(right, dtype=np.float64),
+        total,
+    )
+
+
 def initialize_fit_model(
     model: FitModelDefinition,
     coordinates: tuple[np.ndarray, ...],
@@ -299,6 +345,44 @@ def initialize_fit_model(
     return canonical
 
 
+def histogram_gaussian_display_diagnostic(
+    bin_edges: np.ndarray,
+    counts: np.ndarray,
+) -> tuple[float, float, float] | None:
+    """Return a fast, display-only Gaussian moment diagnostic.
+
+    The rolling monitor's side distribution is a read-only visual aid, not a
+    Fit command and never a source of published parameters.  It nevertheless
+    reuses the closed model catalogue's initializer so its Gaussian formula
+    and parameter ordering cannot drift into a second fitting authority.
+    """
+
+    edges = np.asarray(bin_edges, dtype=np.float64)
+    weights = np.asarray(counts, dtype=np.float64)
+    if (
+        edges.ndim != 1
+        or weights.ndim != 1
+        or edges.size != weights.size + 1
+        or weights.size < 3
+        or not np.all(np.isfinite(edges))
+        or not np.all(np.isfinite(weights))
+        or not np.all(np.diff(edges) > 0.0)
+        or np.any(weights < 0.0)
+        or float(np.sum(weights)) <= 0.0
+    ):
+        return None
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    try:
+        parameters = initialize_fit_model(
+            fit_model_definition("histogram_gaussian"),
+            (centers,),
+            weights,
+        )[0]
+    except ValueError:
+        return None
+    return tuple(float(value) for value in parameters)
+
+
 def _span(values: np.ndarray) -> float:
     span = float(np.max(values) - np.min(values))
     return abs(span) if span != 0 else 1.0
@@ -323,6 +407,51 @@ def _lorentzian(x, center, fwhm, amplitude, offset):
 
 def _gaussian_offset(x, amplitude, offset, sigma, center):
     return amplitude * np.exp(-((x - center) ** 2) / (2.0 * sigma**2)) + offset
+
+
+def _bimodal_gaussian(
+    x,
+    center,
+    center_splitting,
+    left_amplitude,
+    left_sigma,
+    right_amplitude,
+    right_sigma,
+):
+    left, right = _bimodal_gaussian_components(
+        x,
+        center,
+        center_splitting,
+        left_amplitude,
+        left_sigma,
+        right_amplitude,
+        right_sigma,
+    )
+    return left + right
+
+
+def _bimodal_gaussian_components(
+    x,
+    center,
+    center_splitting,
+    left_amplitude,
+    left_sigma,
+    right_amplitude,
+    right_sigma,
+):
+    left_center = center - center_splitting / 2.0
+    right_center = center + center_splitting / 2.0
+    left = left_amplitude * np.exp(
+        -((x - left_center) ** 2) / (2.0 * left_sigma**2)
+    )
+    right = right_amplitude * np.exp(
+        -((x - right_center) ** 2) / (2.0 * right_sigma**2)
+    )
+    return left, right
+
+
+def _histogram_gaussian(x, amplitude, center, sigma):
+    return amplitude * np.exp(-((x - center) ** 2) / (2.0 * sigma**2))
 
 
 def _symmetric_lorentzian_doublet(
@@ -395,6 +524,72 @@ def _init_gaussian(x: np.ndarray, y: np.ndarray) -> tuple[tuple[float, ...], ...
         (-amplitude, high_y, sigma, float(x[np.argmin(y)])),
     )
     return seeds
+
+
+def _init_bimodal_gaussian(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> tuple[tuple[float, ...], ...]:
+    """Seed two positive peaks from the largest between-class separation."""
+
+    order = np.argsort(x, kind="stable")
+    x = x[order]
+    y = np.clip(y[order], 0.0, None)
+    total = float(np.sum(y))
+    if total <= 0.0:
+        raise ValueError("bimodal Gaussian initialization requires positive counts")
+    left_weight = np.cumsum(y)[:-1]
+    left_moment = np.cumsum(y * x)[:-1]
+    right_weight = total - left_weight
+    total_moment = float(np.sum(y * x))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        score = np.where(
+            (left_weight > 0.0) & (right_weight > 0.0),
+            left_weight
+            * right_weight
+            * np.square(
+                left_moment / left_weight
+                - (total_moment - left_moment) / right_weight
+            ),
+            0.0,
+        )
+    split = int(np.argmax(score))
+    if not np.isfinite(score[split]) or score[split] <= 0.0:
+        split = max(0, min(len(x) - 2, len(x) // 2 - 1))
+
+    def component(values_x, weights):
+        weight = float(np.sum(weights))
+        if weight <= 0.0:
+            raise ValueError("bimodal Gaussian seed produced an empty component")
+        center = float(np.sum(weights * values_x) / weight)
+        variance = float(np.sum(weights * (values_x - center) ** 2) / weight)
+        sigma = max(math.sqrt(max(variance, 0.0)), _span(x) / 100.0)
+        nearest = int(np.argmin(np.abs(x - center)))
+        amplitude = max(float(y[nearest]), 1.0)
+        return amplitude, center, sigma
+
+    left = component(x[: split + 1], y[: split + 1])
+    right = component(x[split + 1 :], y[split + 1 :])
+    if left[1] > right[1]:
+        left, right = right, left
+    center = (left[1] + right[1]) / 2.0
+    splitting = right[1] - left[1]
+    return ((center, splitting, left[0], left[2], right[0], right[2]),)
+
+
+def _init_histogram_gaussian(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> tuple[tuple[float, ...], ...]:
+    weights = np.clip(y, 0.0, None)
+    total = float(np.sum(weights))
+    if total <= 0.0:
+        raise ValueError("histogram Gaussian initialization requires positive counts")
+    center = float(np.sum(weights * x) / total)
+    variance = float(np.sum(weights * (x - center) ** 2) / total)
+    sigma = max(math.sqrt(max(variance, 0.0)), _span(x) / 100.0)
+    amplitude = max(float(np.max(weights)), 1.0)
+    return ((amplitude, center, sigma),)
 
 
 def _init_symmetric_lorentzian_doublet(
@@ -525,6 +720,11 @@ _IMPLEMENTATION_BY_ID = MappingProxyType(
     {
         "lorentzian": (_lorentzian, _init_lorentzian),
         "gaussian_offset": (_gaussian_offset, _init_gaussian),
+        "histogram_gaussian": (
+            _histogram_gaussian,
+            _init_histogram_gaussian,
+        ),
+        "bimodal_gaussian": (_bimodal_gaussian, _init_bimodal_gaussian),
         "symmetric_lorentzian_doublet": (
             _symmetric_lorentzian_doublet,
             _init_symmetric_lorentzian_doublet,
@@ -545,4 +745,6 @@ __all__ = [
     "ParameterUnitRelation",
     "fit_model_catalog",
     "fit_model_definition",
+    "evaluate_fit_model_components",
+    "histogram_gaussian_display_diagnostic",
 ]

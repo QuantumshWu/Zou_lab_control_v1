@@ -12,10 +12,18 @@ from dataclasses import dataclass
 import math
 from numbers import Real
 
+from .panel_size import DEFAULT_PANEL_SIZE, panel_size_cells
+
 
 DESIGN_DPI = 300
 PANEL_DISPLAY_SCALE = 0.7
 LIVE_PANEL_DPI = DESIGN_DPI * PANEL_DISPLAY_SCALE
+# A saved plot increases raster density; it does not author a larger logical
+# panel.  Keeping this beside the live geometry constants prevents exporters
+# from obtaining more pixels by choosing another named panel size, which would
+# also change the fixed data box, margins, and apparent typography.
+PANEL_EXPORT_DPI = 600
+PANEL_EXPORT_PIXEL_RATIO = PANEL_EXPORT_DPI / LIVE_PANEL_DPI
 STOCK_DATA_PX = (480, 360)
 STOCK_MARGINS_PX = (110, 110, 100, 40)
 
@@ -155,8 +163,6 @@ def _panel_geometry_px(
     *,
     kind: str,
 ) -> tuple[int, int, int, int, int, int]:
-    from zlc_frontend.panel_size import panel_size_cells
-
     rows, columns = panel_size_cells(size)
     left, right, bottom, top = panel_margins_px(kind)
     return (
@@ -170,7 +176,7 @@ def _panel_geometry_px(
 
 
 def panel_figure_size_inches(
-    size: str = "2x2",
+    size: str = DEFAULT_PANEL_SIZE,
     *,
     kind: str = "default",
 ) -> tuple[float, float]:
@@ -187,7 +193,7 @@ def panel_figure_size_inches(
 
 
 def panel_display_size(
-    size: str = "2x2",
+    size: str = DEFAULT_PANEL_SIZE,
     *,
     kind: str = "default",
 ) -> tuple[int, int]:
@@ -201,14 +207,12 @@ def panel_display_size(
 
 
 def panel_surface_geometry(
-    size: str = "2x2",
+    size: str = DEFAULT_PANEL_SIZE,
     *,
     pixel_ratio: float = 1.0,
     kind: str = "default",
 ) -> PanelSurfaceGeometry:
     """Resolve the sole live-surface geometry for one named panel."""
-
-    from zlc_frontend.panel_size import panel_size_cells
 
     if not isinstance(size, str):
         raise TypeError("panel size must be text")
@@ -238,7 +242,7 @@ def panel_surface_geometry(
 
 
 def panel_axes_bounds(
-    size: str = "2x2",
+    size: str = DEFAULT_PANEL_SIZE,
     *,
     kind: str = "default",
 ) -> tuple[float, float, float, float]:
@@ -259,7 +263,7 @@ def panel_axes_bounds(
 
 
 def panel_data_box(
-    size: str = "2x2",
+    size: str = DEFAULT_PANEL_SIZE,
     *,
     kind: str = "default",
 ) -> NormalizedBox:
@@ -399,6 +403,53 @@ def optimal_grid_size(rows: int, columns: int) -> str:
     return f"{row_units}x{column_units}"
 
 
+def optimal_grid_size_for_cells(cell_count: int) -> str:
+    """Return Main's sole cardinality-driven Grid size recommendation."""
+
+    rows, columns = grid_shape_for(cell_count)
+    return optimal_grid_size(rows, columns)
+
+
+def optimal_grid_size_for_view(schema, view) -> str:
+    """Return the canonical initial size for one resolved Grid view.
+
+    Grid size is a presentation policy, so callers must not rediscover cell
+    counts from evaluated arrays or renderer artists.  The authored facet axis
+    and its display selection are the complete topology; Main's near-square
+    packing and per-axis size thresholds then provide the one recommendation.
+    An explicitly stored/user-selected size remains authoritative after this
+    initial recommendation has been consumed.
+    """
+
+    from zlc_data import DatasetSchema
+    from .figure import (
+        ViewSpec,
+        dataset_axes,
+        display_axis_indices,
+        grid_facet_axis,
+        validate_view_spec,
+    )
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(view, ViewSpec):
+        raise TypeError("view must be ViewSpec")
+    if view.schema_fingerprint != schema.fingerprint:
+        raise ValueError("Grid view belongs to another Dataset schema")
+    validate_view_spec(schema, view)
+    facet_axis_id = grid_facet_axis(view)
+    facet_axis = next(
+        (axis for axis in dataset_axes(schema) if axis.axis_id == facet_axis_id),
+        None,
+    )
+    if facet_axis is None:  # validate_view_spec normally closes this invariant.
+        raise ValueError("Grid facet axis is absent from the Dataset schema")
+    cell_count = len(tuple(display_axis_indices(facet_axis, view.display_selections)))
+    if cell_count <= 0:
+        raise ValueError("Grid facet selection must contain at least one cell")
+    return optimal_grid_size_for_cells(cell_count)
+
+
 def site_grid_geometry(
     size: str,
     recommended: str,
@@ -471,7 +522,7 @@ def _image_panel_layout(data: NormalizedBox) -> ImagePanelLayout:
     return ImagePanelLayout(data, image, distribution, colorbar)
 
 
-def image_panel_layout(size: str = "2x2") -> ImagePanelLayout:
+def image_panel_layout(size: str = DEFAULT_PANEL_SIZE) -> ImagePanelLayout:
     """Return Main's exact design-space image split for a named preset."""
 
     return _image_panel_layout(panel_data_box(size))
@@ -499,7 +550,7 @@ def _rolling_panel_layout(data: NormalizedBox) -> RollingPanelLayout:
     return RollingPanelLayout(data, history, distribution)
 
 
-def rolling_panel_layout(size: str = "2x2") -> RollingPanelLayout:
+def rolling_panel_layout(size: str = DEFAULT_PANEL_SIZE) -> RollingPanelLayout:
     """Return Main's exact design-space rolling split for a named preset."""
 
     return _rolling_panel_layout(panel_data_box(size))
@@ -547,6 +598,8 @@ __all__ = [
     "PanelSurfaceGeometry",
     "RollingPanelLayout",
     "PANEL_DISPLAY_SCALE",
+    "PANEL_EXPORT_DPI",
+    "PANEL_EXPORT_PIXEL_RATIO",
     "LIVE_PANEL_DPI",
     "PANEL_MARGINS_PX",
     "PANEL_UNIT_PX",
@@ -560,6 +613,8 @@ __all__ = [
     "grid_shape_for_aspect",
     "optimal_pulse_size",
     "optimal_grid_size",
+    "optimal_grid_size_for_cells",
+    "optimal_grid_size_for_view",
     "panel_axes_bounds",
     "panel_data_box",
     "panel_data_box_for_raster",

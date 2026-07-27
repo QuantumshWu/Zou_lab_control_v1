@@ -446,10 +446,17 @@ class PanelEditor(QtWidgets.QWidget):
 
         if self._snapshot_value is None or self._snapshot_figure is None:
             return None
+        front = None if self._board is None else self._board.front_frame
+        payload = (
+            None
+            if front is None or len(front.panels) != 1
+            else front.panels[0].display_payload
+        )
         return (
             self._snapshot_value,
             self._snapshot_figure,
             self._snapshot_source_component,
+            payload,
         )
 
     def freeze_current_view_request(self, *, axis_labels=None, short_labels=None):

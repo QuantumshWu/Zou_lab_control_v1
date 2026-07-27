@@ -26,8 +26,10 @@ from .fit_model import (
     FitParameterDefinition,
     FitParameterDomain,
     ParameterUnitRelation,
+    evaluate_fit_model_components,
     fit_model_catalog,
     fit_model_definition,
+    histogram_gaussian_display_diagnostic,
 )
 from .fit_problem import (
     bind_fit,
@@ -255,6 +257,8 @@ __all__ = [
     "encode_fit_spec",
     "fit_model_catalog",
     "fit_model_definition",
+    "evaluate_fit_model_components",
+    "histogram_gaussian_display_diagnostic",
     "fit_spec_from_tree",
     "fit_spec_for",
     "suggest_fit_draft",

@@ -25,10 +25,7 @@ from zlc_data import (
     FitResultBatch,
     FitSpec,
     Selection,
-    bind_fit,
-    fit_model_catalog,
     fit_spec_for,
-    suggest_fit_draft,
 )
 from zlc_neutral_atom.artifacts import (
     AdmittedFitResult,
@@ -498,64 +495,32 @@ class Experiment:
             ).schema
 
         def prepare_fit(
-            fit_axis_ids: tuple[AxisId, ...],
+            visible_figure,
             authority_selection: Selection | None,
+            histogram_projection,
         ):
-            if not fit_axis_ids or any(
-                not isinstance(axis_id, AxisId) for axis_id in fit_axis_ids
-            ):
-                raise ValueError("Figure Fit requires exact named display axes")
-            if authority_selection is not None and not isinstance(
-                authority_selection,
-                Selection,
-            ):
-                raise TypeError("Figure Fit selection must be Selection or None")
             with _service_guard(self._services) as services:
                 schema = source_schema(services)
             seed_spec = initial_fit_spec
             if seed_spec is not None:
                 if seed_spec.input_schema_fingerprint != schema.fingerprint:
                     raise ValueError("initial FitSpec belongs to another source schema")
-                if seed_spec.fit_axis_ids != tuple(fit_axis_ids):
-                    raise ValueError(
-                        "displayed named Fit axes differ from the initial FitSpec"
-                    )
-            from zlc_frontend import fit_authoring_option
+            from zlc_frontend import DataFigure, prepare_fit_authoring_options
 
-            options = []
-            for definition in fit_model_catalog():
-                try:
-                    bound = suggest_fit_draft(
-                        schema,
-                        definition.model_id,
-                        fit_axis_ids=tuple(fit_axis_ids),
-                        selection=authority_selection,
-                        constraints=(
-                            seed_spec.constraints
-                            if seed_spec is not None
-                            and definition.model_id == seed_spec.model_id
-                            else ()
-                        ),
-                        numeric_policy=(
-                            seed_spec.numeric_policy
-                            if seed_spec is not None
-                            and definition.model_id == seed_spec.model_id
-                            else FitNumericPolicy()
-                        ),
-                    )
-                    if (
-                        seed_spec is not None
-                        and definition.model_id == seed_spec.model_id
-                        and bound.spec.committed_transform
-                        == seed_spec.committed_transform
-                    ):
-                        del bound
-                        bound = bind_fit(seed_spec, schema)
-                except ValueError:
-                    continue
-                option = fit_authoring_option(bound)
-                options.append(option)
-                del bound
+            if not isinstance(visible_figure, DataFigure):
+                raise TypeError("Figure Fit requires its exact visible DataFigure")
+            layer = visible_figure.document.layers[0]
+            visible_schema = visible_figure.datasets.resolve(
+                layer.dataset_id
+            ).block.schema
+            if visible_schema.fingerprint != schema.fingerprint:
+                raise ValueError("visible Figure belongs to another Fit source schema")
+            options = prepare_fit_authoring_options(
+                visible_figure,
+                authority_selection,
+                seed_spec=seed_spec,
+                histogram_projection=histogram_projection,
+            )
             if not options:
                 raise ValueError(
                     "the displayed named axes and selection have no compatible Fit model"

@@ -39,7 +39,11 @@ from zlc_data import (  # noqa: E402
     bind_fit,
     fit_spec_for,
 )
-from zlc_frontend import CurvePanelPayload, DataFigure  # noqa: E402
+from zlc_frontend import (  # noqa: E402
+    DEFAULT_PANEL_SIZE,
+    CurvePanelPayload,
+    DataFigure,
+)
 from zlc_frontend.curve_display import (  # noqa: E402
     CurveDisplayState,
     curve_display_form_values,
@@ -247,6 +251,7 @@ def test_curve_surface_dpr_is_runtime_state_and_never_stretches_old_front(
     window = open_data_figure_workbench(_curve_figure())
     try:
         _until(application, lambda: window.worker_idle and window.raster_ready)
+        assert window._surface_geometry.size_name == DEFAULT_PANEL_SIZE
         board, first_frame, _payload = _typed_front(window)
         first_geometry = window._surface_geometry
         first_display = window._display

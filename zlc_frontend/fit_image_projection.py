@@ -11,8 +11,6 @@ from zlc_data import (
     DatasetSchema,
     FitBatchStatus,
     FitResultBatch,
-    IndexSelection,
-    SCALAR_AXIS,
     Selection,
     resolve_selection_indices,
     validate_fit_result_source_binding,
@@ -20,24 +18,25 @@ from zlc_data import (
 from zlc_storage import canonical_text
 
 from .figure import (
-    AxisAddress,
-    AxisResolution,
     AxisViewRole,
-    EvaluatedCell,
     EvaluatedFigureData,
     EvaluatedImage,
     EvaluatedInput,
-    EvaluatedLayer,
-    EvaluatedSeries,
     FigureDocument,
     FigureLayer,
     ViewIntent,
 )
 from .figure.contract import _selection_fit_projection, dataset_axes
+from .fit_projection import (
+    figure_panel_title,
+    fit_batch_multi_index,
+    fit_batch_storage_index,
+    fit_panel_selection,
+    iter_evaluated_figure_panels,
+)
 from .fit_grid import (
     _fit_cell_address,
     _fit_cell_summary_text,
-    coordinate_label,
 )
 from .image_view import ImageViewportTransform
 from .render import RadialGaussianImageFitOverlay
@@ -138,202 +137,6 @@ class RadialGaussianImageFitPanel:
     @property
     def caption(self) -> str:
         return self.fit_overlay.caption
-
-
-def address_label(
-    items: tuple[AxisAddress, ...] | tuple[AxisResolution, ...],
-) -> str:
-    labels = []
-    for item in items:
-        coordinate = coordinate_label(item.coordinate)
-        if isinstance(item, AxisAddress):
-            labels.append(f"{item.axis_name}={coordinate}")
-            continue
-        labels.append(f"{item.axis_id.value}={coordinate}")
-    return ", ".join(labels)
-
-
-def reduction_label(reductions) -> str:
-    labels = []
-    for reduction in reductions:
-        axes = ",".join(axis_id.value for axis_id in reduction.axis_ids)
-        contributors = coordinate_label(reduction.minimum_contributors)
-        if reduction.minimum_contributors != reduction.maximum_contributors:
-            contributors = (
-                f"{coordinate_label(reduction.minimum_contributors)}.."
-                f"{coordinate_label(reduction.maximum_contributors)}"
-            )
-        labels.append(
-            f"{reduction.method.value.lower()}({axes}, n={contributors})"
-        )
-    return "; ".join(labels)
-
-
-def _iter_evaluated_figure_panels(evaluated: EvaluatedFigureData):
-    if not isinstance(evaluated, EvaluatedFigureData):
-        raise TypeError("evaluated must be EvaluatedFigureData")
-    for layer in evaluated.layers:
-        for cell in layer.cells:
-            if all(isinstance(series.data, EvaluatedImage) for series in cell.series):
-                for series in cell.series:
-                    yield layer, cell, (series,)
-            else:
-                yield layer, cell, cell.series
-
-
-def evaluated_figure_panels(evaluated: EvaluatedFigureData):
-    """Return the canonical display-panel order without importing a renderer."""
-
-    return tuple(_iter_evaluated_figure_panels(evaluated))
-
-
-def _fit_batch_multi_index(
-    result: FitResultBatch,
-    layer: EvaluatedLayer,
-    cell: EvaluatedCell,
-    series: EvaluatedSeries,
-) -> tuple[int, ...]:
-
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("result must be FitResultBatch")
-    addresses = (*cell.facet_address, *series.batch_address)
-    by_axis = {item.axis_id: item.index for item in addresses}
-    if len(by_axis) != len(addresses):
-        raise RuntimeError("figure batch/facet addresses contain a duplicate axis")
-    for resolution in layer.resolutions:
-        incumbent = by_axis.setdefault(resolution.axis_id, resolution.index)
-        if incumbent != resolution.index:
-            raise RuntimeError("figure address and resolution disagree")
-    expected = {axis.axis_id for axis in result.batch_axis_specs}
-    # The canonical scalar carrier is a real physical `(1)` data axis and its
-    # explicit display selection therefore appears in evaluator resolutions.
-    # It is intentionally absent from FitSpec batch axes because it carries no
-    # independent batch identity.
-    extras = set(by_axis) - expected - {SCALAR_AXIS.axis_id}
-    if extras:
-        raise RuntimeError(
-            f"figure resolved non-batch fit axes: {sorted(map(str, extras))}"
-        )
-    multi = []
-    for axis in result.batch_axis_specs:
-        if axis.axis_id in by_axis:
-            multi.append(by_axis[axis.axis_id])
-        elif axis.size == 1:
-            multi.append(0)
-        else:
-            raise RuntimeError(f"figure does not identify fit batch axis {axis.axis_id}")
-    return tuple(multi)
-
-
-def fit_batch_storage_index(
-    result: FitResultBatch,
-    layer: EvaluatedLayer,
-    cell: EvaluatedCell,
-    series: EvaluatedSeries,
-) -> int | None:
-    """Resolve one displayed cell to its authoritative sparse fit row."""
-
-    multi = _fit_batch_multi_index(result, layer, cell, series)
-    try:
-        return result.batch_layout.storage_index(multi)
-    except KeyError:
-        # Sparse logical galleries retain their holes.  Never shift a later
-        # stored row into the missing cell.
-        return None
-
-
-def fit_panel_selection(
-    layer: EvaluatedLayer,
-    cell: EvaluatedCell,
-    series_group: tuple[EvaluatedSeries, ...],
-    result: FitResultBatch | None,
-) -> Selection | None:
-    expected = (
-        set()
-        if result is None
-        else {axis.axis_id for axis in result.batch_axis_specs}
-    )
-    addresses = [*cell.facet_address]
-    if len(series_group) == 1:
-        addresses.extend(series_group[0].batch_address)
-    addresses.extend(layer.resolutions)
-    by_axis = {}
-    for address in addresses:
-        if expected and address.axis_id not in expected:
-            continue
-        incumbent = by_axis.setdefault(address.axis_id, address.index)
-        if incumbent != address.index:
-            raise RuntimeError("figure panel addresses disagree")
-    terms = tuple(
-        IndexSelection(axis_id, index)
-        for axis_id, index in sorted(
-            by_axis.items(),
-            key=lambda item: item[0].value,
-        )
-    )
-    return None if not terms else Selection(terms)
-
-
-def panel_focus_selection(
-    layer: EvaluatedLayer,
-    cell: EvaluatedCell,
-    series_group: tuple[EvaluatedSeries, ...],
-) -> Selection | None:
-    """Return the stable logical cell identity used by live overview focus.
-
-    Facet and single-series batch addresses identify the cell.  Dynamic
-    resolution facts such as ``LatestNonempty`` identify the snapshot used to
-    evaluate it, not the cell itself; including them made a valid focus stale
-    whenever the next live snapshot advanced.
-    """
-
-    if not isinstance(layer, EvaluatedLayer):
-        raise TypeError("layer must be EvaluatedLayer")
-    if not isinstance(cell, EvaluatedCell):
-        raise TypeError("cell must be EvaluatedCell")
-    if not isinstance(series_group, tuple) or any(
-        not isinstance(series, EvaluatedSeries) for series in series_group
-    ):
-        raise TypeError("series_group must contain EvaluatedSeries values")
-    addresses = [*cell.facet_address]
-    if len(series_group) == 1:
-        addresses.extend(series_group[0].batch_address)
-    by_axis = {}
-    for address in addresses:
-        incumbent = by_axis.setdefault(address.axis_id, address.index)
-        if incumbent != address.index:
-            raise RuntimeError("figure panel addresses disagree")
-    terms = tuple(
-        IndexSelection(axis_id, index)
-        for axis_id, index in sorted(
-            by_axis.items(),
-            key=lambda item: item[0].value,
-        )
-    )
-    return None if not terms else Selection(terms)
-
-
-def figure_panel_title(
-    document: FigureDocument,
-    layer: EvaluatedLayer,
-    cell: EvaluatedCell,
-    series_group: tuple[EvaluatedSeries, ...],
-) -> str:
-    title = document.descriptor(layer.dataset_id).label
-    addresses = cell.facet_address
-    if len(series_group) == 1:
-        addresses = (*addresses, *series_group[0].batch_address)
-    details = address_label(addresses)
-    resolved = address_label(layer.resolutions)
-    if details:
-        title = f"{title} — {details}"
-    if resolved:
-        title = f"{title}\nview: {resolved}"
-    if len(series_group) == 1:
-        reduced = reduction_label(series_group[0].reductions)
-        if reduced:
-            title = f"{title}\nreduce: {reduced}"
-    return title
 
 
 def radial_gaussian_fit_geometry(
@@ -637,7 +440,7 @@ def radial_gaussian_image_fit_panels(
 
     home_viewport = ImageViewportTransform(result.fit_axis_specs)
     projected = []
-    for layer, cell, series_group in _iter_evaluated_figure_panels(evaluated):
+    for layer, cell, series_group in iter_evaluated_figure_panels(evaluated):
         if layer.layer_id != layer_id:
             continue
         if layer.dataset_id != document_layer.dataset_id:
@@ -658,7 +461,7 @@ def radial_gaussian_image_fit_panels(
             )
         if home_viewport.raster_shape != image.values.shape:
             raise ValueError("radial fit axes differ from evaluated image geometry")
-        multi_index = _fit_batch_multi_index(result, layer, cell, series)
+        multi_index = fit_batch_multi_index(result, layer, cell, series)
         storage = fit_batch_storage_index(result, layer, cell, series)
         selection = fit_panel_selection(layer, cell, series_group, result)
         caption = figure_panel_title(document, layer, cell, series_group)
@@ -699,5 +502,4 @@ def radial_gaussian_image_fit_panels(
 
 __all__ = [
     "RadialGaussianImageFitPanel",
-    "panel_focus_selection",
 ]

@@ -6,6 +6,7 @@ import os
 import struct
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -36,9 +37,12 @@ from zlc_frontend import (
     ImageDisplayState,
     FigureSource,
     PanelProvenance,
+    PlotPanelComposeRequest,
+    PlotPanelSession,
     PlotReportDocument,
     plot_report_page,
     render_plot_report,
+    suggest_default_grid_view,
 )
 from zlc_frontend.encoded_raster import (
     EncodedRasterDocument,
@@ -46,6 +50,7 @@ from zlc_frontend.encoded_raster import (
     encode_raster_buffer_png,
 )
 from zlc_frontend.plot_layout import panel_surface_geometry
+from zlc_frontend.render_style import style_context, tick_fontsize
 from zlc_frontend.qt_widgets import RasterPixelRatioObserver, ensure_qt_app
 from zlc_frontend.render import RasterBuffer
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
@@ -106,6 +111,67 @@ def _png_size(payload: bytes) -> tuple[int, int]:
     return struct.unpack(">II", payload[16:24])
 
 
+def _grid_report_page(cell_count: int):
+    repeat = AxisSpec(AxisId("grid.repeat"), "repeat", REPEAT, 1, (0,))
+    point = AxisSpec(
+        AxisId("grid.site"),
+        "site",
+        SCAN_POINT,
+        cell_count,
+        tuple(range(cell_count)),
+    )
+    frame = CoordinateFrameId("grid.camera")
+    y_axis = AxisSpec(
+        AxisId("grid.y"), "y", SPATIAL_Y, 2, (0, 1), "pixel", frame,
+    )
+    x_axis = AxisSpec(
+        AxisId("grid.x"), "x", SPATIAL_X, 2, (0, 1), "pixel", frame,
+    )
+    schema = DatasetSchema(
+        repeat,
+        (point,),
+        PointLayout.rect_c((cell_count,)),
+        ValueSchema(
+            (y_axis, x_axis),
+            ValidityContract.components(y_axis.axis_id, x_axis.axis_id),
+            np.dtype("<f8"),
+            "count",
+        ),
+    )
+    values = np.arange(4 * cell_count, dtype="<f8").reshape(
+        1,
+        cell_count,
+        2,
+        2,
+    )
+    block = DataBlock(
+        BlockId(f"grid-report-{cell_count}"),
+        DatasetRevision(0),
+        values,
+        DatasetComponentValidity(
+            (y_axis.axis_id, x_axis.axis_id),
+            np.ones(values.shape, dtype=np.bool_),
+        ),
+        schema,
+    )
+    snapshot = OwnedSnapshot(
+        block.ref(StreamGenerationId(f"grid-report-{cell_count}")),
+        block,
+    )
+    suggestion = suggest_default_grid_view(schema)
+    assert suggestion.spec is not None
+    return plot_report_page(
+        "grid",
+        "Grid",
+        kind="grid",
+        source=FigureSource(snapshot),
+        display=ImageDisplayState(),
+        provenance=PanelProvenance("run", "epoch", "b" * 64),
+        value_label="Counts",
+        view=suggestion.spec,
+    )
+
+
 def _until(application, predicate, *, timeout=5.0) -> None:
     deadline = time.monotonic() + timeout
     while not predicate() and time.monotonic() < deadline:
@@ -136,6 +202,40 @@ def test_plot_report_runtime_dpr_uses_frontend_surface_without_mutating_document
         authored_contract.size_name,
         pixel_ratio=1.25,
     ).raster_size
+
+
+def test_grid_report_uses_the_same_topology_optimal_size_as_live_grid():
+    assert _grid_report_page(10).contract.size_name == "2x2"
+    assert _grid_report_page(36).contract.size_name == "4x4"
+
+
+def test_squeezed_grid_consumes_the_shared_main_cell_font_policy():
+    page = _grid_report_page(36)
+    session = PlotPanelSession(replace(page.contract, size_name="2x2"))
+    try:
+        result = session.compose(
+            PlotPanelComposeRequest(
+                page.source,
+                page.display,
+                page.provenance,
+            )
+        )
+        assert result.faceted is not None
+        renderer = session._composer._faceted_overview_renderer
+        assert renderer._font_scale == 0.5
+        with style_context():
+            expected = tick_fontsize() * 0.5
+        assert all(axis.title.get_fontsize() == expected for axis in renderer._axes)
+        visible_tick_labels = tuple(
+            label
+            for axis in renderer._axes
+            for label in (*axis.get_xticklabels(), *axis.get_yticklabels())
+            if label.get_visible()
+        )
+        assert visible_tick_labels
+        assert all(label.get_fontsize() == expected for label in visible_tick_labels)
+    finally:
+        session.close()
 
 
 def test_calibration_report_dpr_reuses_document_and_retires_old_front(monkeypatch):

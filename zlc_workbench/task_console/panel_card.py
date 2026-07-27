@@ -67,6 +67,7 @@ from zlc_frontend import (
     HISTOGRAM_THRESHOLDS_PARAM as _HISTOGRAM_THRESHOLDS_PARAM,
     RELIM_PARAM as _RELIM_PARAM,
     VIEW_SPEC_PARAM as _VIEW_SPEC_PARAM,
+    ViewIntent,
     grid_view_intents as _grid_view_intents,
     repeat_mode_label as _repeat_mode_label,
 )
@@ -151,12 +152,24 @@ class PanelCard(FluentGroupBox):
     def __init__(self, config: PanelConfig, parent=None, *,
                  signal_groups_provider=None,
                  render_request=None,
-                 presentation_provider=None):
+                 presentation_provider=None,
+                 initial_grid_size_pending: bool = False):
         fit_spec = self.validate_config(config)
+        if type(initial_grid_size_pending) is not bool:
+            raise TypeError("initial_grid_size_pending must be bool")
+        if initial_grid_size_pending and config.kind != "grid":
+            raise ValueError(
+                "only a fresh Grid panel may await an initial size recommendation"
+            )
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent)
         self.config = config
+        # Runtime-only admission fact supplied by the composition root.  It is
+        # never encoded in PanelConfig: a loaded size and a user-authored size
+        # are already authoritative.  A fresh Grid consumes this exactly once,
+        # when the first complete schema/ViewSpec raster is presented.
+        self._initial_grid_size_pending = initial_grid_size_pending
         # One call returns the complete frontend picker tree for the current
         # topology.  The composition root builds it from one topology
         # projection, so opening Setting never scans the same producers once
@@ -200,6 +213,14 @@ class PanelCard(FluentGroupBox):
         self._fit_active_spec = fit_spec
         self._fit_active_source = None
         self._fit_active_source_component = None
+        # A Fit submitted from the live Setting surface freezes that surface on
+        # the exact immutable Figure revision that the command consumed.  The
+        # data plane continues to advance and ``_candidate_value`` remembers
+        # its newest value, but painting a newer revision would make an exact
+        # Fit result invisible (or tempt a renderer to attach it to the wrong
+        # frame).  Edit/DataFigure surfaces are already frozen by their own
+        # source owner, so only the live card needs this explicit pin.
+        self._fit_live_surface_source = None
         self._fit_result = None
         self._fit_result_identity = None
         self._fit_request_revision = 0
@@ -212,11 +233,10 @@ class PanelCard(FluentGroupBox):
         self.board = None
         self._pending_frame = None    # composed front awaiting its present pass
         self._pending_faceted_result = None
-        self._last_value = None       # last value drawn, for an immediate re-render
-        # A grid has no renderable front until the operator chooses a named
-        # facet.  Keep the latest already-immutable data-plane value so that
-        # making that choice can render immediately; this is not a second
-        # snapshot, mutable cache, or accepted-front claim.
+        # The newest already-immutable data-plane value may be newer than the
+        # front on screen.  It is input to worker composition only; visible
+        # schema, Setting/Edit controls, selectors and Fit always derive from
+        # ``_presented_value`` until the matching raster is committed.
         self._candidate_value = None
         # Worker completion and visible presentation are different facts.
         # Promote this group only after the Qt board accepts its matching
@@ -231,7 +251,6 @@ class PanelCard(FluentGroupBox):
         self._presented_contract = None
         self._presented_value = None
         self._presented_render_request_revision = None
-        self._candidate_schema = None
         self._grid_focus = None
         self._render_request_revision = 0
         self._requested_signature = None
@@ -357,7 +376,7 @@ class PanelCard(FluentGroupBox):
     def _fit_capable_kind(self) -> bool:
         """Whether this panel can expose the named-axis Figure Fit editor."""
 
-        return self.config.kind in {"1d", "monitor", "2d", "grid"}
+        return self.config.kind in {"1d", "monitor", "2d", "hist", "grid"}
 
     def make_fit_authoring_pane(
         self,
@@ -397,6 +416,10 @@ class PanelCard(FluentGroupBox):
         )
         self._fit_panes.append(pane)
         self._fit_context_providers[pane] = context_provider
+        pane.set_live_source_frozen(
+            context_provider is None
+            and self._fit_live_surface_source is not None
+        )
         if context_provider is not None:
             self.refresh_fit_authoring_pane(pane)
             return pane
@@ -450,6 +473,17 @@ class PanelCard(FluentGroupBox):
             if self._fit_context_providers.get(pane) is None
         )
 
+    def _set_fit_live_surface_source(self, source) -> None:
+        """Set the exact live Fit source and reconcile its existing UI views."""
+
+        if source is not None and getattr(source, "snapshot", None) is None:
+            raise TypeError("live Fit source must own an immutable snapshot")
+        self._fit_live_surface_source = source
+        frozen = source is not None
+        for pane in tuple(self._fit_panes):
+            if self._fit_context_providers.get(pane) is None:
+                pane.set_live_source_frozen(frozen)
+
     def _fit_context_for_pane(self, pane: FitAuthoringPane):
         """Resolve one pane's exact immutable command source and Figure."""
 
@@ -460,17 +494,19 @@ class PanelCard(FluentGroupBox):
             value = self._presented_value
             figure = self._presented_figure
             source_component = None
+            payload = self.frozen_render_payload()
         else:
             context = provider()
             if context is None:
                 return None
-            if not isinstance(context, tuple) or len(context) not in (2, 3):
+            if not isinstance(context, tuple) or len(context) not in (2, 3, 4):
                 raise TypeError(
                     "Fit context provider must return "
-                    "(value, figure[, causal ancestry])"
+                    "(value, figure[, causal ancestry[, rendered payload]])"
                 )
             value, figure = context[:2]
-            source_component = context[2] if len(context) == 3 else None
+            source_component = context[2] if len(context) >= 3 else None
+            payload = context[3] if len(context) == 4 else None
         snapshot = getattr(value, "snapshot", None)
         if snapshot is None or figure is None:
             return None
@@ -481,7 +517,16 @@ class PanelCard(FluentGroupBox):
         entries = tuple(figure.datasets.entries)
         if len(entries) != 1 or entries[0].snapshot.ref != snapshot.ref:
             raise ValueError("Fit context Figure belongs to another source revision")
-        return value, figure, source_component
+        histogram_projection = None
+        if figure.document.layers[0].view.intent is ViewIntent.HISTOGRAM:
+            from zlc_frontend import HistogramPanelPayload
+
+            if not isinstance(payload, HistogramPanelPayload):
+                raise ValueError(
+                    "Histogram Fit requires the exact rendered bin projection"
+                )
+            histogram_projection = payload.bin_projection
+        return value, figure, source_component, histogram_projection
 
     def refresh_fit_authoring_pane(self, pane: FitAuthoringPane) -> bool:
         """Reconcile one visible pane against its own exact Figure source."""
@@ -490,7 +535,7 @@ class PanelCard(FluentGroupBox):
         if context is None:
             pane.set_busy("prepare", draft_ready=False)
             return False
-        value, figure, _source_component = context
+        value, figure, _source_component, histogram_projection = context
         selection = self._fit_selection_for_value(value)
         seed = self._fit_active_spec
         if (
@@ -506,6 +551,7 @@ class PanelCard(FluentGroupBox):
                 figure,
                 selection,
                 seed_spec=seed,
+                histogram_projection=histogram_projection,
             )
         except (TypeError, ValueError, RuntimeError) as error:
             if pane.fit_models:
@@ -622,6 +668,14 @@ class PanelCard(FluentGroupBox):
         snapshot = None if source is None else getattr(source, "snapshot", None)
         if figure is None or snapshot is None:
             return
+        payload = self.frozen_render_payload()
+        histogram_projection = None
+        if figure.document.layers[0].view.intent is ViewIntent.HISTOGRAM:
+            from zlc_frontend import HistogramPanelPayload
+
+            if not isinstance(payload, HistogramPanelPayload):
+                return
+            histogram_projection = payload.bin_projection
 
         # A committed Fit may belong to a frozen Edit source.  Use it only as a
         # reversible seed when this live schema is compatible; never retarget or
@@ -660,6 +714,9 @@ class PanelCard(FluentGroupBox):
             figure.document.revision,
             figure.document.layers[0].view,
             selection_identity,
+            None
+            if histogram_projection is None
+            else tuple(float(value) for value in histogram_projection.bin_edges),
         )
         if identity != self._fit_options_identity:
             from zlc_frontend import prepare_fit_authoring_options
@@ -669,6 +726,7 @@ class PanelCard(FluentGroupBox):
                     figure,
                     selection,
                     seed_spec=seed,
+                    histogram_projection=histogram_projection,
                 )
             except (TypeError, ValueError, RuntimeError) as error:
                 self._fit_options = ()
@@ -738,7 +796,7 @@ class PanelCard(FluentGroupBox):
         if context is None:
             self.set_status("Fit source is not currently available", error=True)
             return
-        source, figure, source_component = context
+        source, figure, source_component, histogram_projection = context
         selection = self._fit_selection_for_value(source)
         from zlc_frontend import (
             fit_spec_from_arguments,
@@ -750,6 +808,7 @@ class PanelCard(FluentGroupBox):
                 figure,
                 selection,
                 seed_spec=spec,
+                histogram_projection=histogram_projection,
             )
             option = next(
                 item
@@ -770,10 +829,20 @@ class PanelCard(FluentGroupBox):
         self._fit_active_spec = exact_spec
         self._fit_active_source = source
         self._fit_active_source_component = source_component
+        self._set_fit_live_surface_source(
+            source
+            if self._fit_context_providers.get(owner) is None
+            else None
+        )
         self._commit_persisted_params(
             {_FIT_SPEC_PARAM: fit_spec_to_tree(exact_spec)}
         )
         self._clear_fit_result(notify=True)
+        # Clear an older overlay and, for a live Fit, revoke any already-queued
+        # newer camera front before the solver returns.  This is an explicit
+        # Figure command, so using the frozen command source here is not a
+        # data-acquisition side effect.
+        self._request_current_render(force=True)
         self._queue_active_fit()
 
     def _queue_active_fit(self) -> None:
@@ -832,16 +901,22 @@ class PanelCard(FluentGroupBox):
             return False
         self._fit_pending_source_ref = None
         if error is not None:
-            for pane in tuple(self._fit_panes):
-                pane.set_busy(None, draft_ready=False)
-            if not request.cancelled.is_set():
-                self.set_status(f"Fit failed: {error}", error=True)
+            self._finish_fit_failure(
+                request,
+                error,
+                cancelled=request.cancelled.is_set(),
+            )
             return True
         from hashlib import sha256
         from zlc_data import FitResultBatch, encode_fit_result_batch
 
         if not isinstance(result, FitResultBatch) or result.source_ref != snapshot.ref:
-            self.set_status("Fit worker returned another source revision", error=True)
+            diagnostic = (
+                "Fit worker returned another result type"
+                if not isinstance(result, FitResultBatch)
+                else "Fit worker returned another source revision"
+            )
+            self._finish_fit_failure(request, diagnostic, cancelled=False)
             return True
         self._fit_result = result
         self._fit_active_source_component = request.source_component
@@ -860,8 +935,60 @@ class PanelCard(FluentGroupBox):
         self._request_current_render()
         return True
 
-    def clear_fit(self) -> None:
-        """Remove the active request, overlay, and every fit.* output."""
+    def reject_fit_request(
+        self,
+        request: FigureFitRequest,
+        diagnostic: str,
+    ) -> bool:
+        """Close a frozen Fit that failed before worker admission.
+
+        Freezing establishes the same exact-source pin and pending identity as
+        an admitted worker request.  A composition-root ancestry/capture
+        failure is therefore a terminal completion of that request, not a
+        status-only early return.
+        """
+
+        message = str(diagnostic).strip()
+        if not message:
+            raise ValueError("Fit rejection diagnostic must not be empty")
+        return self.accept_fit_completion(request, None, message)
+
+    def _finish_fit_failure(
+        self,
+        request: FigureFitRequest,
+        diagnostic: str,
+        *,
+        cancelled: bool,
+    ) -> None:
+        """Close every terminal failure edge of one still-current Fit command."""
+
+        if not isinstance(request, FigureFitRequest):
+            raise TypeError("Fit failure cleanup requires FigureFitRequest")
+        if not isinstance(cancelled, bool):
+            raise TypeError("cancelled must be bool")
+        if self._fit_live_surface_source is request.source:
+            self._set_fit_live_surface_source(None)
+        for pane in tuple(self._fit_panes):
+            pane.set_busy(None, draft_ready=False)
+        if not cancelled:
+            self.set_status(f"Fit failed: {diagnostic}", error=True)
+        # Acquisition may have advanced while the command surface was pinned.
+        # Every non-success terminal resumes the newest admitted candidate.
+        self._request_current_render(force=True)
+
+    def _retire_fit_command(
+        self,
+        *,
+        notify: bool,
+        emit_changed: bool,
+    ) -> bool:
+        """Retire one Fit command/result without choosing the next picture.
+
+        Clear, source rebind, and shutdown all cross the same authority
+        boundary.  They must cancel the lane and release the exact live source
+        pin together; only their caller knows whether to resume the newest
+        source, render a newly bound signal, or paint nothing during teardown.
+        """
 
         had_state = self._fit_active_spec is not None or self._fit_result is not None
         self._fit_request_revision += 1
@@ -870,12 +997,28 @@ class PanelCard(FluentGroupBox):
         self._fit_active_spec = None
         self._fit_active_source = None
         self._fit_active_source_component = None
-        self._commit_persisted_params(remove=(_FIT_SPEC_PARAM,))
-        self._clear_fit_result(notify=True)
+        self._set_fit_live_surface_source(None)
+        self._commit_persisted_params(
+            remove=(_FIT_SPEC_PARAM,),
+            emit_changed=emit_changed,
+        )
+        self._clear_fit_result(notify=notify)
         for pane in tuple(self._fit_panes):
             pane.set_busy(None, draft_ready=False)
+        return had_state
+
+    def clear_fit(self) -> None:
+        """Remove the active request, overlay, and every fit.* output."""
+
+        had_state = self._retire_fit_command(
+            notify=True,
+            emit_changed=True,
+        )
         if had_state:
-            self._request_current_render()
+            # The latest immutable data-plane value may have arrived while the
+            # exact Fit Figure was pinned.  ``force`` resumes directly from
+            # that candidate even if acquisition stopped in the meantime.
+            self._request_current_render(force=True)
     # ------------------------------------------------------------- settings UI
 
     def _make_param_widget(self, spec: FormFieldProps, *, apply=None) -> QtWidgets.QWidget:
@@ -1305,6 +1448,17 @@ class PanelCard(FluentGroupBox):
         if value is None or getattr(value, "snapshot", None) is None:
             self.set_status(f"waiting for {name}", error=False)
             return None
+        fit_source = self._fit_live_surface_source
+        if (
+            fit_source is not None
+            and value.snapshot.ref != fit_source.snapshot.ref
+        ):
+            # A live Fit is an exact-revision Figure command.  Acquisition and
+            # signal publication continue, but the card keeps painting the
+            # command Figure until Fit is cleared or replaced.  Remember only
+            # the newest immutable candidate so release can resume immediately.
+            self._remember_candidate_value(value)
+            return None
         if self._pending_interaction_origin is not None:
             # One selector transaction is defined on the exact immutable
             # front the operator saw.  Remember the newest live value for the
@@ -1355,17 +1509,19 @@ class PanelCard(FluentGroupBox):
         if self._pending_interaction_origin is not None:
             # A held pointer gesture edits the exact data front the operator
             # can still see.  A newer live-camera completion may already be in
-            # ``_last_value`` while its raster is queued or while the held
+            # ``_candidate_value`` while its raster is queued or while the held
             # front deliberately remains painted.  Advancing to that value
             # here would splice two input identities into one gesture.
             value = self._presented_value
+        elif self._fit_live_surface_source is not None:
+            value = self._fit_live_surface_source
+        elif force and self._candidate_value is not None:
+            # Explicit Refresh/Clear after a pinned Fit resumes the newest
+            # already-observed immutable source even when acquisition has
+            # stopped and will not produce another timer edge.
+            value = self._candidate_value
         else:
-            value = (
-                self._candidate_value
-                if self.config.kind == "grid"
-                and self._candidate_value is not None
-                else self._last_value
-            )
+            value = self._presented_value
         if (
             not name
             or value is None
@@ -1408,20 +1564,12 @@ class PanelCard(FluentGroupBox):
         except (TypeError, ValueError) as error:
             self.set_status(str(error), error=True)
             return None
-        if schema != self._candidate_schema:
-            self._reconcile_persisted_view_for_schema(schema)
-            self._candidate_schema = schema
-            self._grid_focus = None
-            self._pending_faceted_result = None
-            self._pending_figure = None
-            self._pending_display = None
-            self._pending_contract = None
-            self._pending_value = None
-            self._pending_render_request_revision = None
-            self._refresh_grid_view_controls()
-            self._refresh_repeat_mode_control()
-            self._refresh_view_spec_controls()
-        self._candidate_value = value
+        self._remember_candidate_value(value)
+        visible_schema = self._current_schema()
+        schema_transition = (
+            visible_schema is not None
+            and visible_schema.fingerprint != schema.fingerprint
+        )
         view = self._effective_view_spec(schema)
         if self.config.kind != "sites" and view is None:
             self.set_status(
@@ -1429,15 +1577,30 @@ class PanelCard(FluentGroupBox):
                 error=False,
             )
             return None
+        size_name = self.config.size
+        if self._initial_grid_size_pending:
+            from zlc_frontend.plot_layout import optimal_grid_size_for_view
+
+            try:
+                size_name = optimal_grid_size_for_view(schema, view)
+            except (TypeError, ValueError) as error:
+                self.set_status(
+                    f"Grid initial size unavailable: {error}",
+                    error=True,
+                )
+                return None
         contract = self._plot_panel_contract(
             view,
             value_name=str(value.name),
             axis_labels=axis_labels,
             short_labels=short_labels,
-            size_name=self.config.size,
+            size_name=size_name,
             pixel_ratio=self._raster_pixel_ratio,
         )
-        display = self._display_state(contract)
+        display = self._display_state(
+            contract,
+            reset_view=schema_transition,
+        )
         fit_result = self._fit_result
         fit_result_identity = self._fit_result_identity
         if (
@@ -1446,7 +1609,11 @@ class PanelCard(FluentGroupBox):
         ):
             fit_result = None
             fit_result_identity = None
-        focus = self._grid_focus if self.config.kind == "grid" else None
+        focus = (
+            self._grid_focus
+            if self.config.kind == "grid" and not schema_transition
+            else None
+        )
         next_revision = self._render_request_revision + 1
         request = self._build_surface_render_request(
             value,
@@ -1601,6 +1768,15 @@ class PanelCard(FluentGroupBox):
         """
 
         source_ref = request.value.snapshot.ref
+        fit_source = self._fit_live_surface_source
+        if (
+            fit_source is not None
+            and source_ref != fit_source.snapshot.ref
+        ):
+            # A newer camera compose may already have been queued when the
+            # operator pressed Fit.  Exact source pinning is therefore also an
+            # admission rule, not only a rule for future request creation.
+            return False
         latest_ref = self._latest_requested_source_ref
         if (
             latest_ref is None
@@ -1737,17 +1913,12 @@ class PanelCard(FluentGroupBox):
                     return True
                 pending_figure = figure
             pending_display = request.display
-        self._last_value = request.value
         self._remember_candidate_value(request.value)
         self._pending_figure = pending_figure
         self._pending_display = pending_display
         self._pending_contract = request.contract
         self._pending_value = request.value
         self._pending_render_request_revision = int(request.request_revision)
-        self._candidate_schema = request.value.snapshot.block.schema
-        self._refresh_grid_view_controls()
-        self._refresh_repeat_mode_control()
-        self._refresh_view_spec_controls()
         self.set_status("ok", error=False)
         return True
 
@@ -1882,11 +2053,23 @@ class PanelCard(FluentGroupBox):
             ),
         )
 
-    def _display_state(self, contract):
-        """Resolve the one frontend-owned display contract for this card."""
+    def _display_state(self, contract, *, reset_view: bool = False):
+        """Resolve the one frontend-owned display contract for this card.
+
+        A candidate from another schema/generation composes at its home view;
+        it cannot consume the viewport or Grid focus authored against the
+        still-visible schema.  The stored view is retired only if that
+        candidate is later presented.
+        """
 
         from zlc_frontend import plot_panel_display_state
-        pin_x, pin_y = self._view_pin or (None, None)
+        if not isinstance(reset_view, bool):
+            raise TypeError("reset_view must be bool")
+        pin_x, pin_y = (
+            (None, None)
+            if reset_view
+            else (self._view_pin or (None, None))
+        )
         return plot_panel_display_state(
             contract,
             self.config.params,
@@ -2001,6 +2184,7 @@ class PanelCard(FluentGroupBox):
         pending_contract = self._pending_contract
         pending_value = self._pending_value
         pending_render_request_revision = self._pending_render_request_revision
+        visible_schema = self._current_schema()
         self._pending_figure = None
         self._pending_display = None
         self._pending_contract = None
@@ -2009,10 +2193,18 @@ class PanelCard(FluentGroupBox):
         if pending_contract is None:
             raise RuntimeError("pending raster has no PlotPanel contract")
         pending_size_name = str(pending_contract.size_name)
-        geometry_changes = (
-            self._presented_contract is not None
-            and pending_size_name != self._presented_contract.size_name
+        initial_grid_size_commit = (
+            self._initial_grid_size_pending
+            and self.config.kind == "grid"
         )
+        geometry_changes = (
+            pending_size_name != self.config.size
+            or (
+                self._presented_contract is not None
+                and pending_size_name != self._presented_contract.size_name
+            )
+        )
+        initial_size_changed = False
         if geometry_changes:
             self.setUpdatesEnabled(False)
         try:
@@ -2070,6 +2262,33 @@ class PanelCard(FluentGroupBox):
             self._presented_render_request_revision = (
                 pending_render_request_revision
             )
+            if initial_grid_size_commit:
+                self._initial_grid_size_pending = False
+                if self.config.size != pending_size_name:
+                    self.config.size = pending_size_name
+                    initial_size_changed = True
+                    combo = getattr(self, "size_combo", None)
+                    if combo is not None:
+                        with _signals_blocked(combo):
+                            combo.setCurrentIndex(
+                                combo.findData(pending_size_name)
+                            )
+            presented_schema = pending_value.snapshot.block.schema
+            schema_changed = (
+                visible_schema is not None
+                and visible_schema.fingerprint != presented_schema.fingerprint
+            )
+            if schema_changed:
+                # Viewport and focused-cell state belong to the old visible
+                # schema.  The candidate already rendered at home; retire the
+                # old state only now that its matching raster has replaced the
+                # old front.
+                self._view_pin = None
+                self._grid_focus = None
+            self._reconcile_persisted_view_for_schema(presented_schema)
+            self._refresh_grid_view_controls()
+            self._refresh_repeat_mode_control()
+            self._refresh_view_spec_controls()
             self._refresh_unit_readout()
             self._settle_pending_interaction_through(
                 pending_display.revision,
@@ -2093,6 +2312,8 @@ class PanelCard(FluentGroupBox):
         finally:
             if geometry_changes:
                 self.setUpdatesEnabled(True)
+        if initial_size_changed:
+            self.changed.emit()
         self._sync_fit_authoring_from_presented(
             prepare_authoring=any(
                 pane.isVisible() for pane in self._live_fit_panes()
@@ -2224,7 +2445,11 @@ class PanelCard(FluentGroupBox):
         if index >= 0:
             self.size_combo.setCurrentIndex(index)
         self.size_combo.setToolTip("Panel size preset (height × width half-units)")
-        self.size_combo.currentIndexChanged.connect(
+        # ``activated`` is the operator-authoring boundary.  It also fires
+        # when the operator explicitly re-selects the already visible preset,
+        # which must cancel a still-pending one-shot Grid recommendation.
+        # Programmatic reconciliation is presentation, not authoring.
+        self.size_combo.activated.connect(
             lambda _i: self._on_size(
                 str(self.size_combo.currentData() or self.config.size)
             )
@@ -2434,14 +2659,17 @@ class PanelCard(FluentGroupBox):
         return combo.reconcile_signal_tree_metadata(groups)
 
     def _current_schema(self):
-        value = self._last_value
+        """Schema of the visible front, or the first front awaiting presentation.
+
+        A candidate may seed an initially blank card's Setting because no older
+        pixels or controls exist to contradict it.  Once any front is visible,
+        only that exact front owns Setting until its replacement is presented.
+        """
+
+        value = self._presented_value or self._candidate_value
         snapshot = None if value is None else getattr(value, "snapshot", None)
         block = None if snapshot is None else getattr(snapshot, "block", None)
-        return (
-            self._candidate_schema
-            if block is None
-            else getattr(block, "schema", None)
-        )
+        return None if block is None else getattr(block, "schema", None)
 
     def _make_grid_view_rows(self, label_w, *, apply, parent):
         intent_combo = FluentComboBox()
@@ -3028,6 +3256,11 @@ class PanelCard(FluentGroupBox):
         if name == self.config.signal:
             return
         self.config.signal = name
+        # A Fit result is exact-revision state of the old Figure, not a panel
+        # preference that may survive a dataset rebind.  Retire it through the
+        # same authority edge as Clear, but let the new binding below issue the
+        # sole render request for this transaction.
+        self._retire_fit_command(notify=True, emit_changed=False)
         self._commit_persisted_params(
             remove=(
                 _VIEW_SPEC_PARAM,
@@ -3036,15 +3269,26 @@ class PanelCard(FluentGroupBox):
             ),
             emit_changed=False,
         )
-        self._last_value = None
         self._candidate_value = None
-        self._clear_figure_outputs(notify=True)
-        self._candidate_schema = None
         self._grid_focus = None
-        self._pending_faceted_result = None
+        self._view_pin = None
+        self._invalidate_render_binding()
+        self._presented_figure = None
+        self._presented_display = None
+        self._presented_contract = None
+        self._presented_value = None
+        self._presented_render_request_revision = None
+        if self.board is None:
+            self._clear_figure_outputs(notify=True)
+        else:
+            # A binding change is not a request to rebuild the stable widget;
+            # it atomically retires the old pixels, Figure context and selector
+            # outputs before a request for the newly selected route is issued.
+            self.board.clear()
+        self._refresh_grid_view_controls()
         self._refresh_repeat_mode_control()
         self._refresh_view_spec_controls()
-        self._invalidate_render_binding()
+        self._refresh_unit_readout()
         self._render_version = -1
         self._request_display_render()
         self.changed.emit()
@@ -3052,7 +3296,7 @@ class PanelCard(FluentGroupBox):
     def _current_unit_text(self) -> str:
         """The visible signal's producer-declared unit."""
 
-        value = self._presented_value or self._last_value
+        value = self._presented_value or self._candidate_value
         if value is None:
             return "—"
         return value.unit or "dimensionless"
@@ -3385,9 +3629,21 @@ class PanelCard(FluentGroupBox):
         self.changed.emit()
 
     def _on_size(self, size: str) -> None:
-        if str(size) == self.config.size:
+        # The first explicit operator choice wins even if it happens to equal
+        # the stock 2x2 value.  No schema-driven recommendation may later
+        # overwrite a user-authored size.
+        had_pending_recommendation = self._initial_grid_size_pending
+        self._initial_grid_size_pending = False
+        size = str(size)
+        if size == self.config.size:
+            if had_pending_recommendation:
+                # Supersede any recommended-size answer already in flight.
+                # The replacement request is authored from the explicit 2x2
+                # config, so the old 4x4 contract cannot be admitted/presented.
+                self._invalidate_render_binding()
+                self._request_display_render(force=True)
             return
-        self.config.size = str(size)
+        self.config.size = size
         self._invalidate_render_binding()
         if self._presented_contract is None:
             # With no painted front there is nothing to stretch.  Keep initial
@@ -3402,7 +3658,7 @@ class PanelCard(FluentGroupBox):
         # Once a front exists, geometry is presented only with the matching
         # worker raster in ``present``.  The accepted surface therefore remains
         # exactly unchanged while this latest-only request is in flight.
-        self._request_display_render()
+        self._request_display_render(force=self._presented_value is None)
         self.changed.emit()
 
     def _set_param(self, key: str, value) -> bool:
@@ -3534,7 +3790,7 @@ class PanelCard(FluentGroupBox):
                     return (float(limits[0]), float(limits[1]))
         return None
 
-    def _request_display_render(self) -> None:
+    def _request_display_render(self, *, force: bool = False) -> None:
         """Commit one display revision and enqueue one latest-only compose.
 
         This method never rasterises and never waits.  The console freezes the
@@ -3543,7 +3799,7 @@ class PanelCard(FluentGroupBox):
         """
 
         self._display_revision += 1
-        self._request_current_render()
+        self._request_current_render(force=force)
 
     def _request_current_render(
         self,
@@ -3594,6 +3850,62 @@ class PanelCard(FluentGroupBox):
         board = self.board
         if board is not None and hasattr(board, "set_selectors_enabled"):
             board.set_selectors_enabled(bool(self._selectors_on))
+
+    def retire_source_generation(self) -> None:
+        """Retire every exact-revision state owned by the current live source.
+
+        A panel binding (the authored signal name, size and display choices)
+        survives a producer restart.  Its accepted pixels, selector commits,
+        Fit command/result and worker identities do not: all of them name one
+        immutable producer generation.  Keeping any one of those facts would
+        either republish retired ancestry or let an old Fit pin prevent the
+        replacement generation from ever reaching the screen.
+
+        This is the card-side half of the composition root's causal retirement
+        transaction.  It mutates only the stable card/host in place; no widget
+        or renderer is rebuilt, and publication notification is deliberately
+        suppressed because the data/presentation owners withdraw the complete
+        causal closure atomically in the surrounding transaction.
+        """
+
+        pending_origin = self._pending_interaction_origin
+        pending_host = self._pending_interaction_host
+        if pending_origin is not None and pending_host is not None:
+            pending_host.discard_pending_interaction(pending_origin)
+        self._pending_interaction_origin = None
+        self._pending_interaction_host = None
+        self._pending_interaction_revision = None
+
+        self._retire_fit_command(notify=False, emit_changed=False)
+        self.invalidate_figure_output_requests()
+        self._invalidate_render_binding()
+        self._candidate_value = None
+        self._grid_focus = None
+        self._presented_figure = None
+        self._presented_display = None
+        self._presented_contract = None
+        self._presented_value = None
+        self._presented_render_request_revision = None
+        self._clear_figure_outputs(notify=False)
+
+        # Fit options are projections of the retired source schema/Figure, not
+        # persistent panel preferences.  Clear every live/Edit presentation so
+        # a frozen old Edit surface cannot issue a command after its causal
+        # source has left the data plane.  A replacement live front prepares
+        # the same stable widgets again through the ordinary single owner.
+        self._fit_options = ()
+        self._fit_options_identity = None
+        self._fit_draft = None
+        self._fit_draft_context = None
+        for pane in tuple(self._fit_panes):
+            if pane.fit_models:
+                pane.clear_options()
+            pane.set_busy("prepare", draft_ready=False)
+
+        board = self.board
+        if board is not None:
+            board.clear()
+        self._render_version = -1
 
     # ------------------------------------------------------------- plot lifecycle
     def _invalidate_render_binding(self) -> None:
@@ -3646,7 +3958,6 @@ class PanelCard(FluentGroupBox):
         self._pending_value = None
         self._pending_render_request_revision = None
         self._candidate_value = None
-        self._candidate_schema = None
         self._grid_focus = None
         self._presented_figure = None
         self._presented_display = None
@@ -3680,6 +3991,7 @@ class PanelCard(FluentGroupBox):
         self._fit_active_spec = None
         self._fit_active_source = None
         self._fit_active_source_component = None
+        self._fit_live_surface_source = None
         self._fit_result = None
         self._fit_result_identity = None
         self._teardown_plot()

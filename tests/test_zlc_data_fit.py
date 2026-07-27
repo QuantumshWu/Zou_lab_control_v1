@@ -175,6 +175,8 @@ def test_catalog_is_closed_canonical_and_rejects_unknown_models():
     assert tuple(model.model_id for model in catalog) == (
         "lorentzian",
         "gaussian_offset",
+        "histogram_gaussian",
+        "bimodal_gaussian",
         "symmetric_lorentzian_doublet",
         "damped_sine",
         "exponential_decay",
@@ -186,6 +188,15 @@ def test_catalog_is_closed_canonical_and_rejects_unknown_models():
     assert {model_id: model.parameter_names for model_id, model in by_id.items()} == {
         "lorentzian": ("center", "fwhm", "amplitude", "offset"),
         "gaussian_offset": ("amplitude", "offset", "sigma", "center"),
+        "histogram_gaussian": ("amplitude", "center", "sigma"),
+        "bimodal_gaussian": (
+            "center",
+            "center_splitting",
+            "left_amplitude",
+            "left_sigma",
+            "right_amplitude",
+            "right_sigma",
+        ),
         "symmetric_lorentzian_doublet": (
             "center",
             "common_fwhm",
@@ -323,10 +334,10 @@ def test_initializers_match_independent_seed_examples():
     )
 
 
-def test_generic_curve_models_accept_authoritative_histogram_bin_axes():
+def test_histogram_bin_axes_use_the_histogram_model_family():
     x = np.linspace(-3.0, 3.0, 31)
     bins = axis("bins", HISTOGRAM_BIN, x.size, coordinates=x, unit="count")
-    values = 0.5 + 4.0 * np.exp(-((x - 0.4) ** 2) / (2.0 * 0.8**2))
+    values = 4.0 * np.exp(-((x - 0.4) ** 2) / (2.0 * 0.8**2))
     snapshot = snapshot_for(
         repeat=1,
         point_axes=(bins,),
@@ -340,9 +351,18 @@ def test_generic_curve_models_accept_authoritative_histogram_bin_axes():
         (snapshot.block.schema.repeat_axis.axis_id,),
         "gaussian_offset",
     )
-    result = bind_fit(spec, snapshot.block.schema).run(snapshot)
+    with pytest.raises(ValueError, match="does not satisfy model roles"):
+        bind_fit(spec, snapshot.block.schema)
+    histogram_spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        None,
+        (bins.axis_id,),
+        (snapshot.block.schema.repeat_axis.axis_id,),
+        "histogram_gaussian",
+    )
+    result = bind_fit(histogram_spec, snapshot.block.schema).run(snapshot)
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    np.testing.assert_allclose(result.parameter_values[0], (4.0, 0.5, 0.8, 0.4), rtol=1e-5)
+    np.testing.assert_allclose(result.parameter_values[0], (4.0, 0.4, 0.8), rtol=1e-5)
     np.testing.assert_allclose(
         evaluate_fit_model(
             "exponential_decay",

@@ -16,7 +16,7 @@ from zlc_storage.canonical import (
 )
 
 from ._arrays import canonical_dtype, immutable_array
-from .axis import AxisId, AxisSpec, SCALAR_AXIS
+from .axis import HISTOGRAM_BIN, AxisId, AxisSpec, SCALAR_AXIS
 from .layout import AxisLayout, AxisLayoutMode
 from .numeric import (
     canonical_mean_dtype,
@@ -50,6 +50,7 @@ from .value import (
 TRANSFORM_SPEC_SCHEMA = "zlc_data.DataTransformSpec"
 COMMITTED_TRANSFORM_SCHEMA = "zlc_data.CommittedTransform"
 TRANSFORMED_SCHEMA_SCHEMA = "zlc_data.TransformedSchema"
+HISTOGRAM_BIN_AXIS_ID = AxisId("zlc_data.histogram-bin")
 
 
 class ReductionMethod(str, Enum):
@@ -109,16 +110,65 @@ class ReductionSpec:
 
 
 @dataclass(frozen=True)
+class HistogramSpec:
+    """Freeze one value-distribution projection as analysis authority.
+
+    A histogram shown by a Figure is presentation-only.  Pressing Fit commits
+    the exact visible bin edges and the named SAMPLE axes through this value;
+    the ordinary transform/Fit pipeline then fits counts on a declared
+    ``HISTOGRAM_BIN`` axis.  No renderer-side micro-fit may become authority.
+    """
+
+    axis_ids: tuple[AxisId, ...]
+    bin_edges: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        axis_ids = tuple(self.axis_ids)
+        if not axis_ids or any(not isinstance(axis_id, AxisId) for axis_id in axis_ids):
+            raise ValueError("HistogramSpec axis_ids must contain named sample axes")
+        if len(set(axis_ids)) != len(axis_ids):
+            raise ValueError("HistogramSpec axis_ids must be unique")
+        if HISTOGRAM_BIN_AXIS_ID in axis_ids:
+            raise ValueError("histogram bin axis cannot also be a sample axis")
+        edges = tuple(float(value) for value in self.bin_edges)
+        if len(edges) < 2 or not all(math.isfinite(value) for value in edges):
+            raise ValueError("HistogramSpec bin_edges must be finite boundaries")
+        if any(right <= left for left, right in zip(edges, edges[1:])):
+            raise ValueError("HistogramSpec bin_edges must be strictly increasing")
+        object.__setattr__(
+            self,
+            "axis_ids",
+            tuple(sorted(axis_ids, key=lambda item: item.value)),
+        )
+        object.__setattr__(self, "bin_edges", edges)
+
+    @property
+    def bin_axis_id(self) -> AxisId:
+        """Return the one canonical derived distribution axis identity."""
+
+        return HISTOGRAM_BIN_AXIS_ID
+
+
+@dataclass(frozen=True)
 class DataTransformSpec:
-    operations: tuple[Selection | ReductionSpec, ...]
+    operations: tuple[Selection | ReductionSpec | HistogramSpec, ...]
 
     def __post_init__(self) -> None:
         operations = tuple(self.operations)
         if any(
-            not isinstance(operation, (Selection, ReductionSpec))
+            not isinstance(operation, (Selection, ReductionSpec, HistogramSpec))
             for operation in operations
         ):
             raise TypeError("DataTransformSpec contains an unsupported operation")
+        histogram_positions = tuple(
+            index
+            for index, operation in enumerate(operations)
+            if isinstance(operation, HistogramSpec)
+        )
+        if len(histogram_positions) > 1:
+            raise ValueError("DataTransformSpec permits at most one HistogramSpec")
+        if histogram_positions and histogram_positions[0] != len(operations) - 1:
+            raise ValueError("HistogramSpec must be the terminal transform operation")
         object.__setattr__(self, "operations", operations)
 
 
@@ -486,8 +536,10 @@ def _run_operations(state: _State, spec: DataTransformSpec) -> _State:
     for operation in spec.operations:
         if isinstance(operation, Selection):
             state = _apply_selection(state, operation)
-        else:
+        elif isinstance(operation, ReductionSpec):
             state = _apply_reduction(state, operation)
+        else:
+            state = _apply_histogram(state, operation)
     return _ensure_scalar_carrier(state)
 
 
@@ -651,6 +703,174 @@ def _select_data_axis(state: _State, position: int, term) -> _State:
         state.schema.value_unit,
     )
     return _State(schema, values, validity)
+
+
+def _apply_histogram(state: _State, histogram: HistogramSpec) -> _State:
+    """Materialize exact counts over named sample axes and frozen bin edges."""
+
+    cell_ids = tuple(axis.axis_id for axis in state.schema.cell_axes)
+    data_ids = tuple(axis.axis_id for axis in state.schema.data_axes)
+    available = cell_ids + data_ids
+    unknown = tuple(axis_id for axis_id in histogram.axis_ids if axis_id not in available)
+    if unknown:
+        raise KeyError(f"histogram sample axes are absent from transformed schema: {unknown}")
+    if histogram.bin_axis_id in available:
+        raise ValueError("histogram bin axis collides with an input axis")
+    if state.schema.dtype.kind not in "biuf":
+        raise TypeError("histogram projection requires real numeric or boolean values")
+
+    sample_ids = set(histogram.axis_ids)
+    cell_positions = tuple(
+        index for index, axis_id in enumerate(cell_ids) if axis_id in sample_ids
+    )
+    data_positions = tuple(
+        index for index, axis_id in enumerate(data_ids) if axis_id in sample_ids
+    )
+    remaining_cell_positions = tuple(
+        index for index in range(len(cell_ids)) if index not in cell_positions
+    )
+    remaining_data_positions = tuple(
+        index for index in range(len(data_ids)) if index not in data_positions
+    )
+    remaining_cell_axes = tuple(
+        state.schema.cell_axes[index] for index in remaining_cell_positions
+    )
+    remaining_data_axes = tuple(
+        state.schema.data_axes[index] for index in remaining_data_positions
+    )
+    output_layout = _reduce_layout(
+        state.schema.cell_layout,
+        cell_positions,
+        MissingPolicy.OMIT_MISSING,
+    )
+    edges = np.asarray(histogram.bin_edges, dtype=np.dtype("<f8"))
+    centers = tuple(((edges[:-1] + edges[1:]) * 0.5).tolist())
+    bin_axis = AxisSpec(
+        histogram.bin_axis_id,
+        "value",
+        HISTOGRAM_BIN,
+        len(edges) - 1,
+        centers,
+        state.schema.value_unit,
+    )
+    schema = TransformedSchema(
+        remaining_cell_axes,
+        output_layout,
+        (*remaining_data_axes, bin_axis),
+        tuple(axis.axis_id for axis in remaining_data_axes),
+        np.dtype("<i8"),
+        "count",
+    )
+    if state.values is None:
+        return _State(schema, None, None)
+    assert state.validity is not None
+
+    values = np.asarray(state.values)
+    expanded_validity = np.asarray(
+        _expand_transformed_validity(state.validity, state.schema),
+        dtype=bool,
+    )
+    output = np.zeros(schema.physical_shape, dtype=np.dtype("<i8"))
+    output_validity = np.zeros(schema.physical_shape, dtype=bool)
+
+    # Build the physical-row grouping once.  Re-scanning every source row for
+    # every output cell makes a multi-cell Histogram quadratic; the layout is
+    # the canonical mapping, so each source row can be assigned exactly once.
+    grouped_rows: list[list[int]] = [
+        [] for _ in range(output_layout.storage_size)
+    ]
+    if remaining_cell_positions:
+        source_columns = tuple(
+            state.schema.cell_layout.axis_indices(position)
+            for position in remaining_cell_positions
+        )
+        for source_row in range(state.schema.cell_layout.storage_size):
+            key = tuple(int(column[source_row]) for column in source_columns)
+            grouped_rows[output_layout.storage_index(key)].append(source_row)
+    elif grouped_rows:
+        grouped_rows[0].extend(range(state.schema.cell_layout.storage_size))
+    elif state.schema.cell_layout.storage_size:
+        raise RuntimeError("histogram output layout lost non-empty source rows")
+
+    remaining_data_shape = tuple(axis.size for axis in remaining_data_axes)
+    remaining_data_size = math.prod(remaining_data_shape)
+    sample_data_shape = tuple(
+        state.schema.data_axes[position].size for position in data_positions
+    )
+    sample_data_size = math.prod(sample_data_shape)
+    permutation = (
+        0,
+        *(1 + position for position in remaining_data_positions),
+        *(1 + position for position in data_positions),
+    )
+    grouped_values = np.transpose(values, permutation).reshape(
+        state.schema.cell_layout.storage_size,
+        remaining_data_size,
+        sample_data_size,
+    )
+    grouped_validity = np.transpose(expanded_validity, permutation).reshape(
+        state.schema.cell_layout.storage_size,
+        remaining_data_size,
+        sample_data_size,
+    )
+    bin_count = len(edges) - 1
+    output_by_remaining = output.reshape(
+        output_layout.storage_size,
+        remaining_data_size,
+        bin_count,
+    )
+    validity_by_remaining = output_validity.reshape(
+        output_layout.storage_size,
+        remaining_data_size,
+        bin_count,
+    )
+
+    for output_row, source_rows in enumerate(grouped_rows):
+        if not source_rows:
+            raise RuntimeError("histogram runtime layout produced an empty output group")
+        row_indices = np.asarray(source_rows, dtype=np.intp)
+        group_values = grouped_values[row_indices]
+        group_validity = grouped_validity[row_indices]
+        valid_flat = np.flatnonzero(group_validity)
+        if not valid_flat.size:
+            continue
+        valid_values = group_values.reshape(-1)[valid_flat]
+        if not bool(np.all(np.isfinite(valid_values))):
+            raise ValueError("histogram projection received a valid non-finite value")
+
+        # The transposed group is (source row, remaining-data cell,
+        # sample-data cell), so integer arithmetic recovers the output data
+        # address without enumerating/storing every ndindex tuple.
+        remaining_indices = (
+            valid_flat // sample_data_size
+        ) % remaining_data_size
+        bin_indices = np.searchsorted(edges, valid_values, side="right") - 1
+        bin_indices[valid_values == edges[-1]] = bin_count - 1
+        retained = (bin_indices >= 0) & (bin_indices < bin_count)
+        if not bool(np.all(retained)):
+            raise ValueError(
+                "histogram bin edges do not retain every authoritative sample"
+            )
+        combined_indices = remaining_indices * bin_count + bin_indices
+        counts = np.bincount(
+            combined_indices,
+            minlength=remaining_data_size * bin_count,
+        ).reshape(remaining_data_size, bin_count)
+        output_by_remaining[output_row] = counts.astype(
+            np.dtype("<i8"),
+            copy=False,
+        )
+        has_samples = np.bincount(
+            remaining_indices,
+            minlength=remaining_data_size,
+        ) > 0
+        validity_by_remaining[output_row, has_samples, :] = True
+
+    return _State(
+        schema,
+        output,
+        _compact_transformed_validity(output_validity, schema),
+    )
 
 
 def _apply_reduction(state: _State, reduction: ReductionSpec) -> _State:
@@ -1100,6 +1320,8 @@ def _reduce_layout(
 __all__ = [
     "CommittedTransform",
     "DataTransformSpec",
+    "HistogramSpec",
+    "HISTOGRAM_BIN_AXIS_ID",
     "MissingPolicy",
     "ReductionMethod",
     "ReductionSpec",

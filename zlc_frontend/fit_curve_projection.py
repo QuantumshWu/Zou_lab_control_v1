@@ -31,7 +31,7 @@ from .figure import (
     ViewIntent,
 )
 from .figure.contract import _selection_fit_projection, dataset_axes
-from .fit_image_projection import fit_batch_storage_index
+from .fit_projection import fit_batch_storage_index
 from .render import CurveFitOverlay
 
 

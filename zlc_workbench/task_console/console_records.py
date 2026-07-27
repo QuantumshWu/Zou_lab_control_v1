@@ -23,7 +23,7 @@ import copy
 from typing import Mapping
 from uuid import uuid4
 
-from zlc_frontend.panel_size import panel_size_cells
+from zlc_frontend.panel_size import DEFAULT_PANEL_SIZE, panel_size_cells
 from zlc_frontend.plot_kind import PLOT_KIND_SPECS
 from zlc_storage.canonical import canonical_text, exact_mapping, normalized_text
 
@@ -201,7 +201,7 @@ class PanelConfig:
         title: str = "",
         row: int = 0,
         col: int = 0,
-        size: str = "2x2",
+        size: str = DEFAULT_PANEL_SIZE,
         signal: str = "",
         params: Mapping[str, object] | None = None,
     ):

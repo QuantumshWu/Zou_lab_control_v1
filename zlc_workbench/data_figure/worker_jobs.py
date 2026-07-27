@@ -20,7 +20,14 @@ from zlc_data import (
     FitSpec,
     Selection,
 )
-from zlc_frontend import BoardFrame, FitAuthoringOption, validate_fit_authoring_options
+from zlc_frontend import (
+    BoardFrame,
+    DataFigure,
+    FitAuthoringOption,
+    HistogramBinProjection,
+    histogram_fit_transform,
+    validate_fit_authoring_options,
+)
 from zlc_frontend.data_figure_presentation import (
     DataFigureDisplayState,
     fit_result_draft_summary,
@@ -81,12 +88,21 @@ def _require_not_cancelled(cancelled: threading.Event) -> None:
 
 def _prepare_fit_options(
     prepare,
+    figure: DataFigure,
     fit_axis_ids: tuple[AxisId, ...],
     axis_roles: tuple[tuple[AxisId, AxisViewRole], ...],
     selection: Selection | None,
+    histogram_projection: HistogramBinProjection | None,
     allow_prepared_transform: bool = False,
 ) -> tuple[FitAuthoringOption, ...]:
-    options = tuple(prepare(fit_axis_ids, selection))
+    if not isinstance(figure, DataFigure):
+        raise TypeError("Fit preparation requires the exact visible DataFigure")
+    if histogram_projection is not None and not isinstance(
+        histogram_projection,
+        HistogramBinProjection,
+    ):
+        raise TypeError("histogram_projection must be HistogramBinProjection or None")
+    options = tuple(prepare(figure, selection, histogram_projection))
     if not options or any(
         not isinstance(option, FitAuthoringOption) for option in options
     ):
@@ -97,12 +113,29 @@ def _prepare_fit_options(
         raise ValueError("Fit options require one source schema and unique models")
     if any(option.spec.fit_axis_ids != fit_axis_ids for option in options):
         raise ValueError("Fit option axes differ from the exact displayed axes")
+    validated_allow_prepared_transform = bool(allow_prepared_transform)
+    if histogram_projection is not None:
+        required_transform = histogram_fit_transform(
+            figure,
+            histogram_projection,
+        )
+        if any(
+            option.spec.committed_transform != required_transform
+            for option in options
+        ):
+            raise ValueError(
+                "Histogram Fit options differ from the exact visible sample/bin authority"
+            )
+        # This is not permission for an injected arbitrary transform: the
+        # exact committed transform was reconstructed above from this Figure's
+        # named view plus the painted bin projection and matched byte-for-byte.
+        validated_allow_prepared_transform = True
     return validate_fit_authoring_options(
         options,
         fit_axis_ids=fit_axis_ids,
         axis_roles=axis_roles,
         selection=selection,
-        allow_prepared_transform=allow_prepared_transform,
+        allow_prepared_transform=validated_allow_prepared_transform,
     )
 
 

@@ -23,13 +23,13 @@ from .histogram_display import (
     FacetedHistogramDisplayState,
     HistogramCountScale,
     HistogramDisplayState,
-    HistogramFitMode,
     histogram_cell_thresholds_from_tree,
 )
 from .image_display import ImageColormap, ImageDisplayState
 from .figure_source import FigureSource
 from .meter_display import MeterDisplayState
 from .panel_params import resolved_panel_param
+from .panel_size import DEFAULT_PANEL_SIZE
 from .panel_policy import (
     HISTOGRAM_CELL_THRESHOLDS_PARAM,
     HISTOGRAM_THRESHOLDS_PARAM,
@@ -69,7 +69,7 @@ class PlotPanelContract:
     kind: str
     title: str
     value_label: str
-    size_name: str = "2x2"
+    size_name: str = DEFAULT_PANEL_SIZE
     pixel_ratio: float = 1.0
     view: ViewSpec | None = None
     rolling_distribution: bool = False
@@ -588,17 +588,13 @@ def plot_panel_display_state(
     if intent is ViewIntent.HISTOGRAM:
         param_kind = "hist" if contract.faceted else contract.kind
         count_scale = resolved_panel_param(param_kind, params, "count_scale")
-        fit_mode = resolved_panel_param(param_kind, params, "fit_mode")
         if not isinstance(count_scale, HistogramCountScale):
             raise TypeError("histogram count_scale lost its typed value")
-        if not isinstance(fit_mode, HistogramFitMode):
-            raise TypeError("histogram fit_mode lost its typed value")
         display = HistogramDisplayState(
             revision=revision,
             relim_mode=mode,
             count_scale=count_scale,
             bin_count=int(resolved_panel_param(param_kind, params, "bin_count")),
-            fit_mode=fit_mode,
             fixed_count_limits=fixed,
             x_view=x_view,
             thresholds=(

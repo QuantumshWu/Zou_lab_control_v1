@@ -51,6 +51,7 @@ from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
 from zlc_neutral_atom.timing.pulse_parameter_scan import AutonomousScanSlotProgram
 from zlc_pulse import FrozenScanTable, RepeatRegion, ScanParameter
 from zlc_frontend import CurvePanelPayload, DataFigure
+from zlc_frontend.data_figure_presentation import data_figure_initial_size_name
 from zlc_frontend.curve_display import (
     CurveDisplayState,
     curve_display_form_values,
@@ -416,6 +417,21 @@ def test_all_invalid_curve_grid_has_one_deterministic_overview_range() -> None:
         assert tuple(axis.get_ylim() for axis in rendered.axes) == ((0.0, 1.0),) * 3
     finally:
         release_agg_figure(rendered)
+
+
+def test_curve_grid_window_consumes_frontend_topology_size_policy(
+    application,
+) -> None:
+    figure = _curve_grid()
+    window = figure_workbench.create_data_figure_pane(figure)
+    try:
+        _until(application, lambda: window.raster_ready and window.worker_idle)
+        assert (
+            window._surface_geometry.size_name
+            == data_figure_initial_size_name(figure)
+        )
+    finally:
+        _close(application, window)
 
 
 def test_curve_grid_focus_interaction_back_and_atomic_exports(

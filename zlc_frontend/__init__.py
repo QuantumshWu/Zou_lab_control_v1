@@ -39,7 +39,6 @@ from .histogram_display import (
     HistogramCellThresholds,
     HistogramCountScale,
     HistogramDisplayState,
-    HistogramFitMode,
     HistogramViewportTransform,
     faceted_histogram_display_with_thresholds,
     histogram_cell_thresholds_from_tree,
@@ -110,6 +109,7 @@ from .fit_editor import (
     fit_axis_summary,
     fit_projection_metadata,
     fit_spec_from_arguments,
+    histogram_fit_transform,
     prepare_fit_authoring_options,
     reconcile_fit_authoring_draft,
     validate_fit_authoring_options,
@@ -118,6 +118,7 @@ from .render import (
     BoardFrame,
     CoherenceStamp,
     CurveFitOverlay,
+    HistogramFitOverlay,
     CurvePanelPayload,
     DocumentInputIdentity,
     DocumentPresentationStamp,
@@ -197,7 +198,7 @@ from .figure_outputs import (
 )
 from .figure_source import FigureSource
 from .panel_render import PanelProvenance
-from .panel_size import PANEL_SIZES, panel_size_cells
+from .panel_size import DEFAULT_PANEL_SIZE, PANEL_SIZES, panel_size_cells
 from .plot_kind import PLOT_KIND_SPECS, PLOT_KIND_SPEC_BY_KEY, PlotKindSpec
 from .plot_panel import (
     PlotDisplayState,
@@ -242,6 +243,7 @@ __all__ = [
     "CROSS_DATA_OUTPUT",
     "CurveDisplayState",
     "CurveFitOverlay",
+    "DEFAULT_PANEL_SIZE",
     "CurveInteractionIntent",
     "CurvePanelPayload",
     "CurveRangeGesture",
@@ -317,13 +319,13 @@ __all__ = [
     "HistogramCountScale",
     "HistogramDisplayState",
     "FacetedHistogramDisplayState",
-    "HistogramFitMode",
     "HISTOGRAM_CELL_THRESHOLDS_PARAM",
     "HISTOGRAM_THRESHOLDS_PARAM",
     "HistogramValueRangeSelection",
     "MeterDisplayState",
     "HistogramInteractionIntent",
     "HistogramPanelPayload",
+    "HistogramFitOverlay",
     "HistogramRangeGesture",
     "HistogramThresholdCommit",
     "HistogramViewportCommit",
@@ -410,6 +412,7 @@ __all__ = [
     "fit_authoring_option",
     "fit_projection_metadata",
     "fit_spec_from_arguments",
+    "histogram_fit_transform",
     "prepare_fit_authoring_options",
     "reconcile_fit_authoring_draft",
     "validate_fit_authoring_options",

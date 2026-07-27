@@ -672,45 +672,28 @@ def test_archive_payload_owns_complete_typed_presentation() -> None:
     assert reopened.figure.document == figure.document
 
 
-def test_frontend_contract_registry_and_histogram_result_are_closed() -> None:
+def test_frontend_contract_registry_and_rolling_histogram_diagnostic_are_closed() -> None:
     from types import MappingProxyType
 
     import pytest
 
-    from zlc_data import HistogramFitResult, confidence_weighted_fidelity
+    from zlc_data import histogram_gaussian_display_diagnostic
     from zlc_frontend.figure import VIEW_CONTRACTS, ViewIntent
 
     assert isinstance(VIEW_CONTRACTS, MappingProxyType)
     with pytest.raises(TypeError):
         VIEW_CONTRACTS[ViewIntent.CURVE] = object()
 
-    with pytest.raises(ValueError, match="sigmas must be positive"):
-        HistogramFitResult(
-            "single",
-            1,
-            np.asarray((1.0, 0.0, 0.0)),
-            True,
-            False,
-            None,
-            "ok",
-        )
-    with pytest.raises(ValueError, match="exactly one threshold"):
-        HistogramFitResult(
-            "double",
-            2,
-            np.asarray((1.0, 0.0, 1.0, 1.0, 2.0, 1.0)),
-            True,
-            True,
-            None,
-            "ok",
-        )
-    fidelity, raw, separation = confidence_weighted_fidelity(
-        0.5,
-        0.0,
-        0.0,
-        1.0,
-        1.0,
-        0.0,
-        1.0,
+    assert histogram_gaussian_display_diagnostic(
+        np.asarray((0.0, 1.0, 2.0)),
+        np.asarray((1.0, 2.0, 3.0)),
+    ) is None
+    diagnostic = histogram_gaussian_display_diagnostic(
+        np.asarray((-2.0, -1.0, 0.0, 1.0, 2.0)),
+        np.asarray((1.0, 4.0, 4.0, 1.0)),
     )
-    assert np.isfinite((fidelity, raw, separation)).all()
+    assert diagnostic is not None
+    amplitude, center, sigma = diagnostic
+    assert amplitude == 4.0
+    assert center == pytest.approx(0.0)
+    assert sigma > 0.0

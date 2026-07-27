@@ -23,13 +23,13 @@ from .curve_display import (
     curve_home_x_limits,
     numeric_curve_coordinates,
 )
-from .fit_image_projection import (
+from .fit_projection import (
     evaluated_figure_panels as _panels,
     figure_panel_title as _panel_title,
-    fit_batch_storage_index as _batch_storage_index,
     panel_focus_selection as _panel_focus_selection,
-    radial_gaussian_fit_geometry,
+    fit_batch_storage_index as _batch_storage_index,
 )
+from .fit_image_projection import radial_gaussian_fit_geometry
 from .image_display import (
     ImageDisplayState,
     evaluated_image_data_range,
@@ -237,6 +237,7 @@ class FacetedPanelAggRenderer:
         "_curve_y_limits",
         "_dpi",
         "_figure",
+        "_font_scale",
         "_height",
         "_histogram_count_limits",
         "_histogram_count_scale",
@@ -273,6 +274,7 @@ class FacetedPanelAggRenderer:
         self._owner_thread = threading.get_ident()
         self._closed = False
         self._figure = None
+        self._font_scale = 1.0
         self._axes = ()
         self._cells = ()
         self._columns = 0
@@ -382,7 +384,7 @@ class FacetedPanelAggRenderer:
             constrained_layout=False,
         )
         FigureCanvasAgg(figure)
-        axes, _rows, columns, _font_scale = _live_grid_axes(
+        axes, _rows, columns, font_scale = _live_grid_axes(
             figure,
             size=self._size_name,
             cell_count=len(panels),
@@ -393,6 +395,7 @@ class FacetedPanelAggRenderer:
         self._figure = figure
         self._axes = axes[: len(panels)]
         self._columns = columns
+        self._font_scale = font_scale
         self._kind = kind
         self._cells = tuple(_FacetedCellArtists(kind) for _ in panels)
         apply_title(figure, self._title)
@@ -684,13 +687,10 @@ class FacetedPanelAggRenderer:
                 cell_display,
                 panel_counts,
                 edges,
-                analysis_counts_group=panel_counts,
-                analysis_edges=edges,
                 fit_artists=state.histogram_fit,
                 threshold_artists=state.histogram_thresholds,
                 stats_text=None,
                 show_stats=False,
-                infer_fit_threshold=False,
                 threshold_linewidth=1.4,
             )
             state.histogram_thresholds = list(thresholds)
@@ -857,12 +857,16 @@ class FacetedPanelAggRenderer:
         apply_title(
             axis,
             _live_grid_cell_title(cell, series_group),
-            size=tick_fontsize(),
+            size=tick_fontsize() * self._font_scale,
             pad=1.5,
         )
         axis.set_xlabel("")
         axis.set_ylabel("")
-        axis.tick_params(axis="both", labelsize=tick_fontsize(), length=2)
+        axis.tick_params(
+            axis="both",
+            labelsize=tick_fontsize() * self._font_scale,
+            length=2,
+        )
         if index % self._columns:
             axis.set_yticks([])
             if axis.get_yscale() != "linear":

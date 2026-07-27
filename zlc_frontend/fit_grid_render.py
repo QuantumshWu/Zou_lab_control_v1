@@ -26,6 +26,7 @@ from .image_display import (
     image_viewport_for_display_state,
     resolve_image_color_limits_from_range,
 )
+from .panel_size import DEFAULT_PANEL_SIZE
 from .plot_layout import PanelSurfaceGeometry, panel_surface_geometry
 from .render import (
     BoardFrame,
@@ -135,7 +136,7 @@ class FitGridRenderSession:
     def __init__(
         self,
         *,
-        size_name: str = "2x2",
+        size_name: str = DEFAULT_PANEL_SIZE,
         pixel_ratio: float = 1.0,
     ) -> None:
         self._surface_geometry = panel_surface_geometry(

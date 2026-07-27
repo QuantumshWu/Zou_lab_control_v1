@@ -54,14 +54,6 @@ class HistogramCountScale(str, Enum):
     LOG = "log"
 
 
-class HistogramFitMode(str, Enum):
-    """The established bounded presentation fit shown on a Distribution."""
-
-    NONE = "none"
-    SINGLE = "single"
-    DOUBLE = "double"
-
-
 def _histogram_bin_count(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
         raise TypeError("histogram bin_count must be an integer")
@@ -93,7 +85,6 @@ class HistogramDisplayState:
     relim_mode: RelimMode = RelimMode.TIGHT
     count_scale: HistogramCountScale = HistogramCountScale.LINEAR
     bin_count: int = DEFAULT_HISTOGRAM_BINS
-    fit_mode: HistogramFitMode = HistogramFitMode.DOUBLE
     x_view: DisplayRange | None = None
     fixed_count_limits: DisplayRange | None = None
     # ZERO OR MORE vertical threshold cut lines (the design's frozen histogram
@@ -112,8 +103,6 @@ class HistogramDisplayState:
             raise TypeError("relim_mode must be RelimMode")
         if not isinstance(self.count_scale, HistogramCountScale):
             raise TypeError("count_scale must be HistogramCountScale")
-        if not isinstance(self.fit_mode, HistogramFitMode):
-            raise TypeError("fit_mode must be HistogramFitMode")
         object.__setattr__(self, "bin_count", _histogram_bin_count(self.bin_count))
         object.__setattr__(
             self,
@@ -344,16 +333,6 @@ _HISTOGRAM_DISPLAY_FORM = FormSpec(
             default=DEFAULT_HISTOGRAM_BINS,
             minimum=MIN_HISTOGRAM_BINS,
         ),
-        FormFieldProps(
-            "fit_mode",
-            "choice",
-            "Fit",
-            default=HistogramFitMode.DOUBLE,
-            choices=tuple(
-                FormChoice(mode.value.title(), mode)
-                for mode in HistogramFitMode
-            ),
-        ),
         FormFieldProps("x_min", "float", "X minimum", default=None),
         FormFieldProps("x_max", "float", "X maximum", default=None),
         FormFieldProps("count_min", "float", "Count minimum", default=None),
@@ -379,7 +358,6 @@ def histogram_display_form_values(
         "relim_mode": state.relim_mode,
         "count_scale": state.count_scale,
         "bin_count": state.bin_count,
-        "fit_mode": state.fit_mode,
         "x_min": x_min,
         "x_max": x_max,
         "count_min": count_min,
@@ -414,9 +392,6 @@ def histogram_display_from_form(
     if not isinstance(count_scale, HistogramCountScale):
         raise TypeError("count_scale form value must be HistogramCountScale")
     bin_count = _histogram_bin_count(values["bin_count"])
-    fit_mode = values["fit_mode"]
-    if not isinstance(fit_mode, HistogramFitMode):
-        raise TypeError("fit_mode form value must be HistogramFitMode")
     x_view = display_range_from_form(values, "x_min", "x_max", "x_view")
     submitted_fixed = display_range_from_form(
         values,
@@ -453,7 +428,6 @@ def histogram_display_from_form(
         relim_mode=relim_mode,
         count_scale=count_scale,
         bin_count=bin_count,
-        fit_mode=fit_mode,
         x_view=x_view,
         fixed_count_limits=fixed_count_limits,
         # The display form does not edit thresholds; the authored cut lines
@@ -801,7 +775,9 @@ class HistogramBinProjection:
     Counts and edges are computed by this constructor and cannot be supplied
     independently by a caller.  The retained sample-array identities let the
     payload boundary prove that Agg and Qt consume the projection derived from
-    those exact evaluated series without a second binning pass.
+    those exact evaluated series without a second binning pass.  It remains a
+    display value until an explicit Fit command freezes its named SAMPLE axes
+    and these exact edges into the canonical terminal ``HistogramSpec``.
     """
 
     series_samples: tuple[np.ndarray, ...]
@@ -890,8 +866,8 @@ def _windowed_histogram_projection(
                 np.dtype(np.int64),
             )
         )
-    # Under/overflow are construction-time conservation facts only.  A
-    # display micro-fit consumes the visible bars it actually annotates.
+    # Under/overflow are construction-time conservation facts only.  Grid
+    # thumbnail bars stay display-only and never become formal Fit authority.
     return tuple(visible_counts), edges
 
 
@@ -916,7 +892,6 @@ __all__ = [
     "FacetedHistogramDisplayState",
     "HistogramCountScale",
     "HistogramCellThresholds",
-    "HistogramFitMode",
     "HistogramBinProjection",
     "HistogramDisplayState",
     "HistogramViewportTransform",

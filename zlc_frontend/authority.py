@@ -10,6 +10,7 @@ from __future__ import annotations
 from zlc_data import (
     CoordinateRangeSelection,
     DataTransformSpec,
+    HistogramSpec,
     IndexRangeSelection,
     IndexSelection,
     ReductionSpec,
@@ -60,6 +61,12 @@ def describe_authoritative_transform(
                 f"/{operation.missing_policy.value}"
                 f"/{operation.validity_policy.value}"
                 f"{minimum}"
+            )
+        elif isinstance(operation, HistogramSpec):
+            axes = ",".join(axis_id.value for axis_id in operation.axis_ids)
+            operations.append(
+                f"histogram({axes})→{operation.bin_axis_id.value}"
+                f"[{len(operation.bin_edges) - 1} bins]"
             )
         else:  # pragma: no cover - DataTransformSpec owns the closed union.
             raise TypeError("DataTransformSpec contains an unsupported operation")

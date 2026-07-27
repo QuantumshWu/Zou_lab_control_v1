@@ -116,6 +116,9 @@ def test_panel_derived_signal_advances_with_its_source_as_one_causal_front():
     )
     from zlc_neutral_atom.runtime.dataset import MonitorCoverage
     from zlc_workbench.task_console.console_records import panel_signal_key
+    from zlc_workbench.task_console.presentation_index import (
+        ConsolePresentationIndex,
+    )
     from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
 
     first_snapshot, y_axis, x_axis = _image_snapshot(revision=3)
@@ -150,27 +153,36 @@ def test_panel_derived_signal_advances_with_its_source_as_one_causal_front():
     )
     area_name = panel_signal_key("area-panel", AREA_DATA_OUTPUT)
     plane = SignalDataPlane()
+    presentations = ConsolePresentationIndex()
     try:
         plane.attach(node, slot)
         plane.mark_changed(node)
         source_3 = plane.freeze().value("camera/frame")
         assert source_3 is not None
         capture_3 = plane.capture_source_component(source_3)
-        plane.publish_derived(
+        outputs_3 = materialize_area_outputs(
+            FigureSource(
+                source_3.snapshot,
+                source_contract_id="tests.camera-frame",
+            ),
+            selection,
+        )
+        published_3 = plane.publish_derived(
             "area-panel",
             source_3,
-            _derived_routes("area-panel", materialize_area_outputs(
-                FigureSource(
-                    source_3.snapshot,
-                    source_contract_id="tests.camera-frame",
-                ),
-                selection,
-            )),
+            _derived_routes("area-panel", outputs_3),
             source_component=capture_3,
         )
+        presentations.publish(
+            published_3,
+            {area_name: outputs_3[AREA_DATA_OUTPUT].presentation},
+        )
         coherent_3 = plane.freeze()
+        presentations.reconcile_visible(coherent_3.signals)
         assert coherent_3.value("camera/frame").snapshot.ref.revision.value == 3
-        assert coherent_3.value(area_name).snapshot.ref.revision.value == 3
+        area_3 = coherent_3.value(area_name)
+        assert area_3.snapshot.ref.revision.value == 3
+        assert presentations.presentation_for(area_3) is not None
 
         snapshot_4, _y_axis, _x_axis = _image_snapshot(revision=4)
         state["output"] = LiveDatasetOutput(
@@ -188,23 +200,249 @@ def test_panel_derived_signal_advances_with_its_source_as_one_causal_front():
         assert source_4 is not None
         assert source_4.snapshot.ref.revision.value == 4
         capture_4 = plane.capture_source_component(source_4)
-        plane.publish_derived(
+        outputs_4 = materialize_area_outputs(
+            FigureSource(
+                source_4.snapshot,
+                source_contract_id="tests.camera-frame",
+            ),
+            selection,
+        )
+        published_4 = plane.publish_derived(
             "area-panel",
             source_4,
-            _derived_routes("area-panel", materialize_area_outputs(
-                FigureSource(
-                    source_4.snapshot,
-                    source_contract_id="tests.camera-frame",
-                ),
-                selection,
-            )),
+            _derived_routes("area-panel", outputs_4),
             source_component=capture_4,
         )
+        presentations.publish(
+            published_4,
+            {area_name: outputs_4[AREA_DATA_OUTPUT].presentation},
+        )
+        # The N+1 sidecar is staged, but the consumer-visible causal front is
+        # still N.  Publishing N+1 must not invalidate the presentation beside
+        # the exact N value that TaskConsole topology and Setting still read.
+        presentations.reconcile_visible(staged.signals)
+        assert presentations.presentation_for(staged.value(area_name)) is not None
         coherent_4 = plane.freeze()
+        presentations.reconcile_visible(coherent_4.signals)
         assert coherent_4.value("camera/frame").snapshot.ref.revision.value == 4
-        assert coherent_4.value(area_name).snapshot.ref.revision.value == 4
+        area_4 = coherent_4.value(area_name)
+        assert area_4.snapshot.ref.revision.value == 4
+        assert presentations.presentation_for(area_4) is not None
+        assert presentations.presentation_for(area_3) is None
     finally:
         plane.close()
+
+
+def test_presentation_replacement_is_atomic_and_retires_renamed_routes():
+    """A conflict cannot half-admit siblings; a rename leaves no stale route."""
+
+    import pytest
+
+    from zlc_frontend.figure_outputs import FigureOutputPresentation
+    from zlc_neutral_atom.processing.signal_plane import SignalValue
+    from zlc_workbench.task_console.presentation_index import (
+        ConsolePresentationIndex,
+    )
+
+    snapshot, _y_axis, _x_axis = _image_snapshot(revision=11)
+
+    def value(name: str) -> SignalValue:
+        return SignalValue(
+            name=name,
+            source_instance_id="presentation-owner",
+            snapshot=snapshot,
+            coverage=None,
+            run_id="presentation-run",
+            epoch_id="presentation-epoch",
+            join_digest="a" * 64,
+        )
+
+    def presentation(name: str, short: str) -> FigureOutputPresentation:
+        return FigureOutputPresentation(
+            name,
+            f"tests.presentation.{name}",
+            short,
+            short,
+            f"{short} description",
+        )
+
+    old_name = "@panel/atomic/area.data"
+    sibling_name = "@panel/atomic/cross.data"
+    renamed_name = "@panel/atomic/roi.data"
+    old_value = value(old_name)
+    sibling_value = value(sibling_name)
+    renamed_value = value(renamed_name)
+    old_presentation = presentation("area.data", "Area")
+    index = ConsolePresentationIndex()
+    index.publish({old_name: old_value}, {old_name: old_presentation})
+    index.reconcile_visible({old_name: old_value})
+
+    # Put the new sibling first: the old loop-mutating implementation admitted
+    # it before discovering the conflict in the second item.
+    with pytest.raises(ValueError, match="conflicting presentations"):
+        index.publish(
+            {
+                sibling_name: sibling_value,
+                old_name: old_value,
+            },
+            {
+                sibling_name: presentation("cross.data", "Cross"),
+                old_name: presentation("area.data", "Conflicting area"),
+            },
+        )
+    assert sibling_name not in index._routes
+    assert index.presentation_for(old_value) == old_presentation
+
+    renamed_presentation = presentation("roi.data", "ROI")
+    prepared = index.prepare_publish(
+        {renamed_name: renamed_value},
+        {renamed_name: renamed_presentation},
+        withdraw=(old_name,),
+    )
+    index.commit_prepared(prepared)
+    index.reconcile_visible({renamed_name: renamed_value})
+    assert old_name not in index._routes
+    assert index.presentation_for(renamed_value) == renamed_presentation
+
+
+def test_logic_generation_retirement_promotes_value_and_presentation_together():
+    """Restart/remove retires the source and its full Figure descendant tree."""
+
+    from zlc_data import IndexRangeSelection, Selection
+    from zlc_frontend.figure_outputs import (
+        AREA_DATA_OUTPUT,
+        FigureOutputPresentation,
+        materialize_area_outputs,
+    )
+    from zlc_frontend.figure_source import FigureSource
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_neutral_atom.dataset_output import (
+        DatasetOutputDeclaration,
+        LiveDatasetOutput,
+    )
+    from zlc_neutral_atom.runtime.dataset import MonitorCoverage
+    from zlc_workbench.task_console.console_state import TaskConsoleState
+    from zlc_workbench.task_console.window import TaskConsole
+
+    application = ensure_qt_app()
+    snapshot, _y_axis, _x_axis = _image_snapshot(revision=17)
+    declaration = DatasetOutputDeclaration("figure", "tests.logic-figure")
+    key = "logic/figure"
+    node = SimpleNamespace(
+        instance_id="logic-generation",
+        dataset_output_declarations=(declaration,),
+        signal_key=lambda name: key,
+        published_signals=lambda: (key,),
+    )
+    closed = []
+    slot = SimpleNamespace(
+        freeze_live_outputs=lambda: (
+            "logic-run",
+            "logic-epoch",
+            {
+                "figure": LiveDatasetOutput(
+                    declaration,
+                    snapshot,
+                    MonitorCoverage(1, 1, 0, False),
+                    "f" * 64,
+                )
+            },
+        ),
+        close=lambda: closed.append(True),
+        notification_failure=None,
+    )
+    presentation = FigureOutputPresentation(
+        "figure",
+        "tests.logic-figure",
+        "Figure",
+        "Figure",
+        "Exact logic-owned Figure output.",
+    )
+    console = TaskConsole(state=TaskConsoleState())
+    try:
+        console._data.attach(node, slot)
+        console._data.mark_changed(node)
+        front = console._data.freeze()
+        value = front.value(key)
+        assert value is not None
+        console._presentations.publish({key: value}, {key: presentation})
+        console._presentations.register_final_projector(
+            node.instance_id,
+            lambda *_args: {},
+        )
+        console._promote_data_front(front)
+        assert console._presentations.presentation_for(value) == presentation
+
+        selection = Selection(
+            (
+                IndexRangeSelection(_y_axis.axis_id, 1, 4),
+                IndexRangeSelection(_x_axis.axis_id, 1, 5),
+            )
+        )
+        first_outputs = materialize_area_outputs(
+            FigureSource(value.snapshot, source_contract_id=declaration.contract_id),
+            selection,
+        )
+        first_name = "@panel/first-area/area.data"
+        first_values = console._data.publish_derived(
+            "first-area",
+            value,
+            _derived_routes("first-area", first_outputs),
+            source_component=console._data.capture_source_component(value),
+        )
+        console._presentations.publish(
+            first_values,
+            {first_name: first_outputs[AREA_DATA_OUTPUT].presentation},
+        )
+        first_front = console._data.freeze()
+        console._promote_data_front(first_front)
+        first_value = first_front.value(first_name)
+        assert first_value is not None
+
+        downstream_selection = Selection(
+            (
+                IndexRangeSelection(_y_axis.axis_id, 0, 3),
+                IndexRangeSelection(_x_axis.axis_id, 0, 4),
+            )
+        )
+        second_outputs = materialize_area_outputs(
+            FigureSource(
+                first_value.snapshot,
+                source_contract_id=first_outputs[
+                    AREA_DATA_OUTPUT
+                ].presentation.contract_id,
+            ),
+            downstream_selection,
+        )
+        second_name = "@panel/second-area/area.data"
+        second_values = console._data.publish_derived(
+            "second-area",
+            first_value,
+            _derived_routes("second-area", second_outputs),
+            source_component=console._data.capture_source_component(first_value),
+        )
+        console._presentations.publish(
+            second_values,
+            {second_name: second_outputs[AREA_DATA_OUTPUT].presentation},
+        )
+        console._promote_data_front(console._data.freeze())
+        assert console._tick_data.value(second_name) is not None
+
+        console._retire_logic_node_publications(
+            node,
+            unregister_final_projector=True,
+        )
+        assert console._tick_data.value(key) is None
+        assert console._tick_data.value(first_name) is None
+        assert console._tick_data.value(second_name) is None
+        assert key not in console._presentations._routes
+        assert first_name not in console._presentations._routes
+        assert second_name not in console._presentations._routes
+        assert not console._data._derived
+        assert node.instance_id not in console._presentations._final_projectors
+        assert closed == [True]
+    finally:
+        close_task_console(application, console)
 
 
 def test_area_output_carries_complete_presentation_and_typed_source_transform():
@@ -356,9 +594,11 @@ def test_task_console_mechanically_adapts_frontend_figure_presentation():
         console._signal_topology_changed()
         console._promote_data_front(console._data.freeze())
         topology = console._signal_topology()
+        published_keys = []
         for output in outputs.values():
             presentation = output.presentation
             key = panel_signal_key(card.panel_id, presentation.name)
+            published_keys.append(key)
             projected = topology[key].declaration
             assert isinstance(projected, OutputPresentation)
             assert projected.name == presentation.name
@@ -366,5 +606,8 @@ def test_task_console_mechanically_adapts_frontend_figure_presentation():
             assert projected.short == presentation.short
             assert projected.axis_label == presentation.axis_label
             assert projected.description == presentation.description
+        assert console._remove_panel(card)
+        assert all(console._tick_data.value(key) is None for key in published_keys)
+        assert all(key not in console._presentations._routes for key in published_keys)
     finally:
         close_task_console(application, console)

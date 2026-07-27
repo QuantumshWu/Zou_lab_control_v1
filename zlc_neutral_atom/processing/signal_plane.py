@@ -448,6 +448,97 @@ class _CausalPublication:
         return self.source_component.extend(self.edge)
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedFinalPublication:
+    """Validated replacement for one run-owned FINAL route set."""
+
+    owner_id: str
+    node: object
+    values: Mapping[str, SignalValue]
+
+    def __post_init__(self) -> None:
+        owner_id = canonical_text(self.owner_id, "FINAL signal owner_id")
+        values = dict(self.values)
+        if not values:
+            raise ValueError("prepared FINAL publication must contain values")
+        if any(not isinstance(value, SignalValue) for value in values.values()):
+            raise TypeError("prepared FINAL publication contains another value type")
+        object.__setattr__(self, "owner_id", owner_id)
+        object.__setattr__(self, "values", MappingProxyType(values))
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedDerivedPublication:
+    """Validated replacement for one composition-owned derived route set.
+
+    The object is intentionally private to the data plane.  A composition root
+    may hold it while it prepares an adjacent sidecar transaction, then commit
+    both facts without any validation or array/schema work between them.
+    """
+
+    owner_id: str
+    publication: _CausalPublication | None
+    values: Mapping[str, SignalValue]
+
+    def __post_init__(self) -> None:
+        owner_id = canonical_text(self.owner_id, "derived signal owner_id")
+        values = dict(self.values)
+        if self.publication is not None:
+            if not isinstance(self.publication, _CausalPublication):
+                raise TypeError("prepared derived publication has another type")
+            if values != dict(self.publication.edge.outputs):
+                raise ValueError(
+                    "prepared derived values differ from their causal publication"
+                )
+        elif values:
+            raise ValueError("prepared derived withdrawal cannot contain values")
+        object.__setattr__(self, "owner_id", owner_id)
+        object.__setattr__(self, "values", MappingProxyType(values))
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSignalRetirement:
+    """Exact producer generation and its complete causal publication closure."""
+
+    node: object
+    owner_id: str
+    retired_signal_names: frozenset[str]
+    processor_publications: Mapping[str, _CausalPublication]
+    derived_publications: Mapping[str, _CausalPublication]
+    dependent_processors: tuple[object, ...]
+
+    def __post_init__(self) -> None:
+        owner_id = canonical_text(self.owner_id, "retired signal owner_id")
+        names = frozenset(
+            canonical_text(name, "retired signal name")
+            for name in self.retired_signal_names
+        )
+        processors = dict(self.processor_publications)
+        derived = dict(self.derived_publications)
+        if any(
+            not isinstance(publication, _CausalPublication)
+            for publication in (*processors.values(), *derived.values())
+        ):
+            raise TypeError("prepared retirement contains another publication type")
+        object.__setattr__(self, "owner_id", owner_id)
+        object.__setattr__(self, "retired_signal_names", names)
+        object.__setattr__(
+            self,
+            "processor_publications",
+            MappingProxyType(processors),
+        )
+        object.__setattr__(
+            self,
+            "derived_publications",
+            MappingProxyType(derived),
+        )
+        object.__setattr__(
+            self,
+            "dependent_processors",
+            tuple(self.dependent_processors),
+        )
+
+
 @dataclass(slots=True)
 class _LatestOnlyProcessorEntry:
     node: LatestProcessorControl
@@ -554,6 +645,30 @@ class _LatestOnlyProcessorLane:
         ):
             self._entries.pop(_node_instance_id(node), None)
 
+    def retire_dependents(self, nodes: tuple[object, ...]) -> None:
+        """Discard work whose frozen input generation has been retired.
+
+        A HostedProcessor is deliberately bound to one producer object,
+        lifecycle generation, run and epoch.  It cannot silently rebind when
+        that producer restarts.  Marking it cancelled here guarantees that an
+        already-running pure evaluation is discarded by :meth:`drain`; the
+        normal node callback then leaves the authored row restartable against
+        the replacement generation.
+        """
+
+        for node in nodes:
+            key = _node_instance_id(node)
+            entry = self._entries.get(key)
+            if entry is None:
+                continue
+            if entry.node is not node:
+                raise RuntimeError(
+                    "prepared retirement found another Processor generation"
+                )
+            entry.cancel_requested = True
+            entry.pending_source = None
+            entry.pending_source_component = None
+
     def route(
         self,
         signals: Mapping[str, SignalValue],
@@ -628,6 +743,13 @@ class _LatestOnlyProcessorLane:
 
         for entry in tuple(self._entries.values()):
             if not entry.prepare_future.done():
+                continue
+            # Retirement/cancel is the terminal authority for this binding.
+            # A late application-build exception belongs to work that can no
+            # longer publish and must not overwrite CANCELLED with FAILED or
+            # invoke application_ready after its source generation is gone.
+            if entry.cancel_requested and entry.work_future is None:
+                self._retire_cancelled(entry)
                 continue
             if entry.application is None:
                 try:
@@ -1007,16 +1129,18 @@ class SignalDataPlane:
         else:
             del self._reactive_source_counts[source_name]
 
-    def publish_final(
+    def prepare_final(
         self,
         node,
         projected: Mapping[str, FinalDatasetOutput],
-    ) -> Mapping[str, SignalValue]:
-        """Admit one successful Run's already-materialized FINAL datasets.
+    ) -> _PreparedFinalPublication:
+        """Validate one successful Run's FINAL datasets without publishing.
 
         ``projected`` is keyed by the catalog's bare output names.  The data
         plane qualifies them with the exact producer instance just like a live
-        slot; it never invents an output that the node did not declare.
+        slot; it never invents an output that the node did not declare.  A
+        composition root may prepare matching frontend sidecars before it
+        commits either half of that output fact.
         """
 
         if not isinstance(projected, Mapping):
@@ -1076,9 +1200,36 @@ class SignalDataPlane:
         with self._lock:
             if self._closed:
                 raise RuntimeError("signal data plane is closed")
-            self._finals[key] = (node, frozen)
+        return _PreparedFinalPublication(key, node, frozen)
+
+    def commit_prepared_final(
+        self,
+        prepared: _PreparedFinalPublication,
+    ) -> Mapping[str, SignalValue]:
+        """Install an already-valid FINAL replacement with no projection work."""
+
+        if not isinstance(prepared, _PreparedFinalPublication):
+            raise TypeError("prepared FINAL publication must come from this plane")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("signal data plane is closed")
+            self._finals[prepared.owner_id] = (
+                prepared.node,
+                dict(prepared.values),
+            )
             self._membership_changed = True
-        return MappingProxyType(dict(frozen))
+        return prepared.values
+
+    def publish_final(
+        self,
+        node,
+        projected: Mapping[str, FinalDatasetOutput],
+    ) -> Mapping[str, SignalValue]:
+        """Validate and publish one successful Run's FINAL datasets."""
+
+        return self.commit_prepared_final(
+            self.prepare_final(node, projected)
+        )
 
     def publish_processor(
         self,
@@ -1159,18 +1310,20 @@ class SignalDataPlane:
             self._membership_changed = True
         return MappingProxyType(dict(frozen))
 
-    def publish_derived(
+    def prepare_derived(
         self,
         owner_id: str,
         source: SignalValue,
         values: Mapping[str, DerivedSignalOutput],
         *,
         source_component: object | None = None,
-    ) -> Mapping[str, SignalValue]:
-        """Publish one complete derived transaction under qualified names.
+    ) -> _PreparedDerivedPublication:
+        """Validate one complete derived replacement without publishing it.
 
         The application composition root owns the route names.  This method
-        sees no presentation-layer type.
+        sees no presentation-layer type.  Separating preparation from the
+        no-fail replacement lets that root prepare matching frontend sidecars
+        before either owner exposes half of the cross-layer fact.
         """
 
         from zlc_neutral_atom.processing.causal import derive_dataset_event_digest
@@ -1231,35 +1384,216 @@ class SignalDataPlane:
             ):
                 raise ValueError("derived source_component belongs to another revision")
             component = component.through_signal(source.name)
-            self._derived[identity] = _CausalPublication(
+            publication = _CausalPublication(
                 edge=edge,
                 source_component=component,
             )
-            self._membership_changed = True
-        return MappingProxyType(dict(frozen))
+        return _PreparedDerivedPublication(identity, publication, frozen)
 
-    def withdraw_derived(self, owner_id: str) -> None:
-        """Remove every derived signal owned by one composition attachment."""
+    def prepare_derived_withdrawal(
+        self,
+        owner_id: str,
+    ) -> _PreparedDerivedPublication:
+        """Prepare removal of one composition attachment's complete output set."""
 
         identity = canonical_text(owner_id, "derived signal owner_id")
         if not identity:
             raise ValueError("owner_id must not be empty")
         with self._lock:
-            if self._derived.pop(identity, None) is not None:
-                self._membership_changed = True
+            if self._closed:
+                raise RuntimeError("signal data plane is closed")
+        return _PreparedDerivedPublication(identity, None, {})
 
-    def detach(self, node) -> None:
-        key = _node_instance_id(node)
-        self._processor_lane.detach(node)
+    def commit_prepared_derived(
+        self,
+        prepared: _PreparedDerivedPublication,
+    ) -> Mapping[str, SignalValue]:
+        """Commit one already-valid replacement with no domain/schema work."""
+
+        if not isinstance(prepared, _PreparedDerivedPublication):
+            raise TypeError("prepared must come from this signal data plane")
         with self._lock:
+            if self._closed:
+                raise RuntimeError("signal data plane is closed")
+            if prepared.publication is None:
+                if self._derived.pop(prepared.owner_id, None) is not None:
+                    self._membership_changed = True
+            else:
+                self._derived[prepared.owner_id] = prepared.publication
+                self._membership_changed = True
+        return prepared.values
+
+    def publish_derived(
+        self,
+        owner_id: str,
+        source: SignalValue,
+        values: Mapping[str, DerivedSignalOutput],
+        *,
+        source_component: object | None = None,
+    ) -> Mapping[str, SignalValue]:
+        """Validate and publish one complete derived transaction."""
+
+        prepared = self.prepare_derived(
+            owner_id,
+            source,
+            values,
+            source_component=source_component,
+        )
+        return self.commit_prepared_derived(prepared)
+
+    def withdraw_derived(self, owner_id: str) -> None:
+        """Remove every derived signal owned by one composition attachment."""
+
+        self.commit_prepared_derived(
+            self.prepare_derived_withdrawal(owner_id)
+        )
+
+    def prepare_retirement(self, node: object) -> _PreparedSignalRetirement:
+        """Freeze one producer generation's transitive causal retirement.
+
+        Removing only the producer slot is insufficient: every retained
+        Processor/Figure publication carries the exact source component it
+        evaluated, and coherence would otherwise re-introduce that component
+        into the next front.  This preparation computes the whole descendant
+        closure once so the composition root can stage matching presentation
+        withdrawals before either owner changes.
+        """
+
+        key = _node_instance_id(node)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("signal data plane is closed")
+            slot_entry = self._slots.get(key)
+            if slot_entry is not None and slot_entry[0] is not node:
+                raise RuntimeError("signal owner id belongs to another generation")
+            final_entry = self._finals.get(key)
+            if final_entry is not None and final_entry[0] is not node:
+                raise RuntimeError("FINAL owner id belongs to another generation")
+            signal_names = set(_node_declared_signal_names(node))
+            signal_names.update(self._slot_signal_names.get(key, ()))
+            signal_names.update(self._cache.get(key, ()))
+            if final_entry is not None:
+                signal_names.update(final_entry[1])
+            processors = dict(self._processors)
+            derived = dict(self._derived)
+        active_processors = tuple(self._processor_lane.active_bindings())
+        retired_processors: dict[str, _CausalPublication] = {}
+        retired_derived: dict[str, _CausalPublication] = {}
+        dependent_processors: dict[str, object] = {}
+
+        changed = True
+        while changed:
+            changed = False
+            for processor_node, source_name in active_processors:
+                processor_key = _node_instance_id(processor_node)
+                if (
+                    processor_key != key
+                    and source_name in signal_names
+                    and processor_key not in dependent_processors
+                ):
+                    dependent_processors[processor_key] = processor_node
+                    before = len(signal_names)
+                    signal_names.update(
+                        _node_declared_signal_names(processor_node)
+                    )
+                    changed = changed or len(signal_names) != before
+            for publication_key, publication in processors.items():
+                if publication_key in retired_processors:
+                    continue
+                ancestry = publication.source_component.signals
+                if (
+                    publication_key == key
+                    or publication.edge.source_name in signal_names
+                    or not signal_names.isdisjoint(ancestry)
+                ):
+                    retired_processors[publication_key] = publication
+                    signal_names.update(publication.edge.outputs)
+                    changed = True
+            for publication_key, publication in derived.items():
+                if publication_key in retired_derived:
+                    continue
+                ancestry = publication.source_component.signals
+                if (
+                    publication.edge.source_name in signal_names
+                    or not signal_names.isdisjoint(ancestry)
+                ):
+                    retired_derived[publication_key] = publication
+                    signal_names.update(publication.edge.outputs)
+                    changed = True
+
+        return _PreparedSignalRetirement(
+            node=node,
+            owner_id=key,
+            retired_signal_names=frozenset(signal_names),
+            processor_publications=retired_processors,
+            derived_publications=retired_derived,
+            dependent_processors=tuple(dependent_processors.values()),
+        )
+
+    def commit_prepared_retirement(
+        self,
+        prepared: _PreparedSignalRetirement,
+    ) -> None:
+        """Retire an already-validated producer and every causal descendant."""
+
+        if not isinstance(prepared, _PreparedSignalRetirement):
+            raise TypeError("prepared retirement must come from this data plane")
+        key = prepared.owner_id
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("signal data plane is closed")
+            slot_entry = self._slots.get(key)
+            if slot_entry is not None and slot_entry[0] is not prepared.node:
+                raise RuntimeError("prepared retirement is stale")
+            final_entry = self._finals.get(key)
+            if final_entry is not None and final_entry[0] is not prepared.node:
+                raise RuntimeError("prepared FINAL retirement is stale")
+            for publication_key, publication in prepared.processor_publications.items():
+                if self._processors.get(publication_key) is not publication:
+                    raise RuntimeError("prepared Processor retirement is stale")
+            for publication_key, publication in prepared.derived_publications.items():
+                if self._derived.get(publication_key) is not publication:
+                    raise RuntimeError("prepared derived retirement is stale")
+
+        # All exact-generation checks complete before the lane is mutated.
+        # From here onward every operation is an idempotent owner replacement;
+        # no stale prepared transaction can partially cancel live work.
+        self._processor_lane.retire_dependents(prepared.dependent_processors)
+        self._processor_lane.detach(prepared.node)
+        with self._lock:
+
             self._remove_reactive_processor_locked(key)
+            for dependent in prepared.dependent_processors:
+                self._remove_reactive_processor_locked(
+                    _node_instance_id(dependent)
+                )
             entry = self._slots.pop(key, None)
             self._slot_signal_names.pop(key, None)
             self._dirty.discard(key)
             self._cache.pop(key, None)
             self._finals.pop(key, None)
             self._processors.pop(key, None)
+            for publication_key in prepared.processor_publications:
+                self._processors.pop(publication_key, None)
+            for publication_key in prepared.derived_publications:
+                self._derived.pop(publication_key, None)
             self._failures.pop(key, None)
+            retained_candidate = {
+                name: value
+                for name, value in self._candidate_front.signals.items()
+                if name not in prepared.retired_signal_names
+            }
+            self._candidate_front = SignalFront(
+                signals=MappingProxyType(retained_candidate),
+                failures=self._candidate_front.failures,
+            )
+            self._candidate_source_components = MappingProxyType(
+                {
+                    name: component
+                    for name, component in self._candidate_source_components.items()
+                    if name not in prepared.retired_signal_names
+                }
+            )
             self._membership_changed = True
         if entry is not None:
             _node, slot = entry

@@ -118,6 +118,214 @@ def _image_value(
     )
 
 
+def _large_grid_value(*, revision: int):
+    """Small pixels but enough facets to require the 4x4 Grid surface."""
+
+    from zlc_data import (
+        REPEAT,
+        SPATIAL_X,
+        SPATIAL_Y,
+        AxisId,
+        AxisSpec,
+        BlockId,
+        CoordinateFrameId,
+        DataBlock,
+        DatasetComponentValidity,
+        DatasetRevision,
+        DatasetSchema,
+        OwnedSnapshot,
+        PointLayout,
+        StreamGenerationId,
+        ValidityContract,
+        ValueSchema,
+    )
+    from zlc_neutral_atom.processing.signal_plane import SignalValue
+
+    repeat = AxisSpec(
+        AxisId("current.grid.repeat"),
+        "repeat",
+        REPEAT,
+        36,
+        tuple(range(36)),
+    )
+    frame = CoordinateFrameId("current.grid.camera")
+    y_axis = AxisSpec(
+        AxisId("current.grid.y"),
+        "camera y",
+        SPATIAL_Y,
+        3,
+        (0.0, 1.0, 2.0),
+        "pixel",
+        frame,
+    )
+    x_axis = AxisSpec(
+        AxisId("current.grid.x"),
+        "camera x",
+        SPATIAL_X,
+        3,
+        (0.0, 1.0, 2.0),
+        "pixel",
+        frame,
+    )
+    values = np.arange(36 * 3 * 3, dtype=np.float64).reshape(36, 1, 3, 3)
+    schema = DatasetSchema(
+        repeat,
+        (),
+        PointLayout.rect_c(()),
+        ValueSchema(
+            (y_axis, x_axis),
+            ValidityContract.components(y_axis.axis_id, x_axis.axis_id),
+            values.dtype,
+            value_unit="count",
+        ),
+    )
+    block = DataBlock(
+        BlockId("current-grid"),
+        DatasetRevision(int(revision)),
+        values,
+        DatasetComponentValidity(
+            (y_axis.axis_id, x_axis.axis_id),
+            np.ones(values.shape, dtype=np.bool_),
+        ),
+        schema,
+    )
+    snapshot = OwnedSnapshot(
+        block.ref(StreamGenerationId("current-grid-generation")),
+        block,
+    )
+    return SignalValue(
+        name="image",
+        source_instance_id="current-grid-boundary",
+        snapshot=snapshot,
+        coverage=None,
+        run_id=f"current-grid-run-{int(revision)}",
+        epoch_id="current-grid-epoch",
+        join_digest="9" * 64,
+    )
+
+
+def _curve_value(*, revision: int, center: float):
+    from zlc_data import (
+        REPEAT,
+        SCAN_POINT,
+        AxisId,
+        AxisSpec,
+        BlockId,
+        DataBlock,
+        DatasetRevision,
+        DatasetSchema,
+        OwnedSnapshot,
+        PointLayout,
+        StreamGenerationId,
+        VALID,
+        ValueSchema,
+    )
+    from zlc_neutral_atom.processing.signal_plane import SignalValue
+
+    x = np.linspace(-5.0, 5.0, 161)
+    repeat = AxisSpec(AxisId("current.curve.repeat"), "repeat", REPEAT, 1, (0,))
+    scan = AxisSpec(
+        AxisId("current.curve.scan"),
+        "detuning",
+        SCAN_POINT,
+        len(x),
+        tuple(float(value) for value in x),
+        "MHz",
+    )
+    values = (
+        2.0 + 18.0 * np.exp(-((x - float(center)) ** 2) / (2.0 * 0.8**2))
+    )[None, :, None]
+    schema = DatasetSchema(
+        repeat,
+        (scan,),
+        PointLayout.rect_c((len(x),)),
+        ValueSchema.scalar(np.dtype("<f8"), "count"),
+    )
+    block = DataBlock(
+        BlockId("current-curve"),
+        DatasetRevision(int(revision)),
+        values,
+        VALID,
+        schema,
+    )
+    snapshot = OwnedSnapshot(
+        block.ref(StreamGenerationId("current-curve-generation")),
+        block,
+    )
+    return SignalValue(
+        name="image",
+        source_instance_id="current-curve-boundary",
+        snapshot=snapshot,
+        coverage=None,
+        run_id=f"current-curve-run-{int(revision)}",
+        epoch_id=f"current-curve-epoch-{int(revision)}",
+        join_digest="7" * 64,
+    )
+
+
+def _histogram_value(*, revision: int):
+    from zlc_data import (
+        REPEAT,
+        SCAN_POINT,
+        AxisId,
+        AxisSpec,
+        BlockId,
+        DataBlock,
+        DatasetRevision,
+        DatasetSchema,
+        OwnedSnapshot,
+        PointLayout,
+        StreamGenerationId,
+        VALID,
+        ValueSchema,
+    )
+    from zlc_neutral_atom.processing.signal_plane import SignalValue
+
+    rng = np.random.default_rng(481516)
+    samples = np.concatenate(
+        (rng.normal(-2.0, 0.45, 360), rng.normal(2.1, 0.65, 440))
+    )
+    repeat = AxisSpec(
+        AxisId("current.hist.repeat"),
+        "repeat",
+        REPEAT,
+        samples.size,
+    )
+    point = AxisSpec(
+        AxisId("current.hist.point"),
+        "point",
+        SCAN_POINT,
+        1,
+        (0,),
+    )
+    schema = DatasetSchema(
+        repeat,
+        (point,),
+        PointLayout.rect_c((1,)),
+        ValueSchema.scalar(np.dtype("<f8"), "count"),
+    )
+    block = DataBlock(
+        BlockId("current-histogram"),
+        DatasetRevision(int(revision)),
+        samples[:, None, None],
+        VALID,
+        schema,
+    )
+    snapshot = OwnedSnapshot(
+        block.ref(StreamGenerationId("current-histogram-generation")),
+        block,
+    )
+    return SignalValue(
+        name="image",
+        source_instance_id="current-histogram-boundary",
+        snapshot=snapshot,
+        coverage=None,
+        run_id=f"current-histogram-run-{int(revision)}",
+        epoch_id=f"current-histogram-epoch-{int(revision)}",
+        join_digest="6" * 64,
+    )
+
+
 def _wait(application, predicate, *, timeout: float = 15.0) -> None:
     from PyQt5 import QtCore
 
@@ -128,7 +336,7 @@ def _wait(application, predicate, *, timeout: float = 15.0) -> None:
     assert predicate()
 
 
-def _present_value(console, card, value, *, frame_key) -> None:
+def _present_value(console, card, value, *, frame_key) -> bool:
     from zlc_neutral_atom.dataset_output import (
         DatasetOutputDeclaration,
         LiveDatasetOutput,
@@ -157,6 +365,10 @@ def _present_value(console, card, value, *, frame_key) -> None:
         state.slot = slot
         console._data.attach(node, slot)
         console._current_test_source = state
+    schema = value.snapshot.block.schema
+    total_cells = (
+        schema.repeat_axis.size * schema.point_layout.storage_size
+    )
     state.current = (
         value.run_id,
         value.epoch_id,
@@ -164,7 +376,7 @@ def _present_value(console, card, value, *, frame_key) -> None:
             "image": LiveDatasetOutput(
                 state.declaration,
                 value.snapshot,
-                MonitorCoverage(1, 1, 0, False),
+                MonitorCoverage(total_cells, total_cells, 0, False),
                 value.join_digest,
             )
         },
@@ -174,13 +386,14 @@ def _present_value(console, card, value, *, frame_key) -> None:
     console._promote_data_front(front)
     value = front.value("image")
     assert value is not None
-    request = card._freeze_value_render_request(
-        value,
+    request = card.freeze_render_request(
+        front,
         frame_key,
         force=True,
     )
-    assert request is not None
-    console._render_lane.enqueue((request,))
+    if request is not None:
+        console._render_lane.enqueue((request,))
+    return request is not None
 
 
 def test_cross_publishes_selected_native_data_with_scalar_shape() -> None:
@@ -258,9 +471,17 @@ def test_auto_view_is_explicit_and_slider_edits_persist_the_typed_spec() -> None
         schema = card.frozen_render_value().schema
         view = card._effective_view_spec(schema)
         assert view is not None
-        assert set(card.view_spec_editor._rows) == {
-            axis.axis_id for axis in dataset_axes(schema)
+        axes_by_id = {axis.axis_id: axis for axis in dataset_axes(schema)}
+        editable_axis_ids = {
+            binding.axis_id
+            for binding in view.axis_bindings
+            if (
+                binding.role in (AxisViewRole.SLIDER, AxisViewRole.SELECTED)
+                and isinstance(binding.selector, FixedIndex)
+                and axes_by_id[binding.axis_id].size > 1
+            )
         }
+        assert set(card.view_spec_editor._rows) == editable_axis_ids
         slider = next(
             binding
             for binding in view.axis_bindings
@@ -287,6 +508,145 @@ def test_auto_view_is_explicit_and_slider_edits_persist_the_typed_spec() -> None
             editor.view_spec_editor._view.binding(slider.axis_id).selector.index
             == 5
         )
+    finally:
+        close_task_console(application, console)
+
+
+def test_grid_initial_optimal_size_is_fresh_only_and_commits_with_its_raster() -> None:
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
+    from zlc_workbench.task_console.window import TaskConsole
+
+    application = ensure_qt_app()
+    value = _large_grid_value(revision=1)
+
+    fresh = TaskConsole(state=TaskConsoleState(), window_px=(1000, 800))
+    try:
+        fresh.show()
+        application.processEvents()
+        grid_index = fresh.kind_combo.findData("grid")
+        assert grid_index >= 0
+        fresh.kind_combo.setCurrentIndex(grid_index)
+        fresh._add_panel()
+        card = fresh.cards[-1]
+        assert card.config.size == "2x2"
+        assert card._initial_grid_size_pending
+        card.config.signal = value.name
+        assert _present_value(fresh, card, value, frame_key=("grid", 1))
+        # Worker submission alone cannot resize the card or mutate persisted
+        # config.  The matching 4x4 raster is the commit receipt.
+        assert card.config.size == "2x2"
+        _wait(
+            application,
+            lambda: card._presented_contract is not None
+            and card._presented_contract.size_name == "4x4",
+        )
+        assert card.config.size == "4x4"
+        assert not card._initial_grid_size_pending
+        assert card.size_combo.currentData() == "4x4"
+        assert (
+            card.board.width(),
+            card.board.height(),
+        ) == card._presented_contract.logical_size
+    finally:
+        close_task_console(application, fresh)
+
+    loaded = TaskConsole(
+        state=TaskConsoleState(
+            panels=(
+                PanelConfig(
+                    kind="grid",
+                    title="Loaded grid",
+                    size="1x2",
+                    signal="image",
+                ),
+            ),
+        ),
+        window_px=(1000, 800),
+    )
+    try:
+        loaded.show()
+        application.processEvents()
+        card = loaded.cards[0]
+        assert not card._initial_grid_size_pending
+        assert _present_value(loaded, card, value, frame_key=("loaded-grid", 1))
+        _wait(application, lambda: card._presented_contract is not None)
+        assert card._presented_contract.size_name == "1x2"
+        assert card.config.size == "1x2"
+    finally:
+        close_task_console(application, loaded)
+
+    manual = TaskConsole(state=TaskConsoleState(), window_px=(1000, 800))
+    try:
+        manual.show()
+        application.processEvents()
+        grid_index = manual.kind_combo.findData("grid")
+        assert grid_index >= 0
+        manual.kind_combo.setCurrentIndex(grid_index)
+        manual._add_panel()
+        card = manual.cards[-1]
+        assert card._initial_grid_size_pending
+        card._on_size("2x4")
+        assert not card._initial_grid_size_pending
+        card.config.signal = value.name
+        assert _present_value(manual, card, value, frame_key=("manual-grid", 1))
+        _wait(application, lambda: card._presented_contract is not None)
+        assert card._presented_contract.size_name == "2x4"
+        assert card.config.size == "2x4"
+    finally:
+        close_task_console(application, manual)
+
+
+def test_explicit_stock_grid_size_supersedes_in_flight_recommendation(
+    monkeypatch,
+) -> None:
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.task_console.console_state import TaskConsoleState
+    from zlc_workbench.task_console.window import TaskConsole
+
+    application = ensure_qt_app()
+    console = TaskConsole(state=TaskConsoleState(), window_px=(1000, 800))
+    try:
+        console.show()
+        application.processEvents()
+        grid_index = console.kind_combo.findData("grid")
+        assert grid_index >= 0
+        console.kind_combo.setCurrentIndex(grid_index)
+        console._add_panel()
+        card = console.cards[-1]
+        card.config.signal = "image"
+
+        captured = []
+        lane_type = type(console._render_lane)
+
+        def capture(_lane, requests) -> None:
+            captured.extend(requests)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(lane_type, "enqueue", capture)
+            assert _present_value(
+                console,
+                card,
+                _large_grid_value(revision=1),
+                frame_key=("grid-size-race", 1),
+            )
+            recommendation = captured[-1]
+            assert recommendation.contract.size_name == "4x4"
+
+            captured.clear()
+            card._on_size("2x2")
+            assert not card._initial_grid_size_pending
+            assert card.config.size == "2x2"
+            assert captured
+            explicit = captured[-1]
+            assert explicit.contract.size_name == "2x2"
+            assert explicit.source_key != recommendation.source_key
+            assert not card.accept_render_result(
+                recommendation,
+                frame=object(),
+                figure=object(),
+            )
     finally:
         close_task_console(application, console)
 
@@ -536,6 +896,608 @@ def test_fit_button_presents_overlay_and_publishes_readable_figure_signals() -> 
             for key in console._tick_data.names()
             if "/fit." in key
         } == {second.run_id}
+    finally:
+        close_task_console(application, console)
+
+
+def test_live_fit_keeps_its_exact_figure_and_paints_the_frontend_orange_ring() -> None:
+    """A fast camera cannot outrun the Figure revision submitted to Fit."""
+
+    from matplotlib.colors import to_rgba
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_data import FitBatchStatus
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_frontend.render_style import FIT_RADIAL_COLOR
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
+    from zlc_workbench.task_console.window import TaskConsole
+
+    application = ensure_qt_app()
+    console = TaskConsole(
+        state=TaskConsoleState(
+            panels=(PanelConfig(kind="2d", title="Camera", signal="image"),),
+        ),
+        window_px=(900, 700),
+    )
+    try:
+        console.show()
+        application.processEvents()
+        console._timer.stop()
+        card = console.cards[0]
+        fitted = _image_value(revision=1, center_x=27.0)
+        newer = _image_value(revision=2, center_x=39.0)
+        newest = _image_value(revision=3, center_x=45.0)
+        assert _present_value(console, card, fitted, frame_key=("image", 1))
+        _wait(
+            application,
+            lambda: card.frozen_render_payload() is not None,
+        )
+        before = card.board.front_frame.panels[0].raster
+
+        QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
+        pane = card.fit_authoring_pane
+        _wait(
+            application,
+            lambda: bool(pane.fit_models) and pane.fit_button.isEnabled(),
+        )
+        assert pane.model_combo.currentData() == "radial_gaussian_center"
+        QtTest.QTest.mouseClick(pane.fit_button, QtCore.Qt.LeftButton)
+
+        # Both frames become real data-plane fronts while the solver/render
+        # workers run.  Neither may replace the exact Figure being fitted.
+        assert not _present_value(
+            console,
+            card,
+            newer,
+            frame_key=("image", 2),
+        )
+        assert not _present_value(
+            console,
+            card,
+            newest,
+            frame_key=("image", 3),
+        )
+        _wait(
+            application,
+            lambda: card._fit_result is not None
+            and card._fit_result.source_ref == fitted.snapshot.ref
+            and card.frozen_render_payload() is not None
+            and card.frozen_render_payload().fit_overlay is not None,
+        )
+
+        assert card.frozen_render_value().snapshot.ref == fitted.snapshot.ref
+        overlay = card.frozen_render_payload().fit_overlay
+        assert overlay.status is FitBatchStatus.CONVERGED
+        assert overlay.center_xy is not None
+        assert overlay.one_over_e_radius is not None
+        assert overlay.result_identity == card._fit_result_identity
+
+        # Validate the actual immutable pixels shown by the formal Figure
+        # surface, not merely the presence of an overlay DTO.
+        after = card.board.front_frame.panels[0].raster
+        before_rgba = np.frombuffer(before.pixels, dtype=np.uint8).reshape(
+            before.height,
+            before.width,
+            4,
+        )
+        after_rgba = np.frombuffer(after.pixels, dtype=np.uint8).reshape(
+            after.height,
+            after.width,
+            4,
+        )
+        expected_rgb = np.rint(
+            np.asarray(to_rgba(FIT_RADIAL_COLOR)[:3]) * 255.0
+        ).astype(np.uint8)
+        before_orange = np.all(before_rgba[..., :3] == expected_rgb, axis=-1)
+        after_orange = np.all(after_rgba[..., :3] == expected_rgb, axis=-1)
+        assert int(after_orange.sum()) > int(before_orange.sum())
+
+        parameter_names = {
+            definition.name
+            for definition in card._fit_result.parameter_definitions
+        }
+        _wait(
+            application,
+            lambda: {
+                name.rsplit("/fit.", 1)[1]
+                for name in console._tick_data.names()
+                if "/fit." in name
+            }
+            == parameter_names,
+        )
+        # Predictions/overlays are presentation only; the public signal plane
+        # contains model parameters and no fitted curve/image dataset.
+        assert all(
+            not name.endswith(("fit.curve", "fit.overlay", "fit.prediction"))
+            for name in console._tick_data.names()
+        )
+
+        QtTest.QTest.mouseClick(pane.clear_button, QtCore.Qt.LeftButton)
+        _wait(
+            application,
+            lambda: card.frozen_render_value().snapshot.ref == newest.snapshot.ref
+            and card.frozen_render_payload().fit_overlay is None,
+        )
+        _wait(
+            application,
+            lambda: not any("/fit." in name for name in console._tick_data.names()),
+        )
+    finally:
+        close_task_console(application, console)
+
+
+def test_successful_fit_retires_with_its_producer_and_replacement_renders() -> None:
+    """A producer generation owns its Fit pin, overlay and parameter routes."""
+
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
+    from zlc_workbench.task_console.window import TaskConsole
+
+    application = ensure_qt_app()
+    console = TaskConsole(
+        state=TaskConsoleState(
+            panels=(PanelConfig(kind="2d", title="Camera", signal="image"),),
+        ),
+        window_px=(900, 700),
+    )
+    try:
+        console.show()
+        application.processEvents()
+        console._timer.stop()
+        card = console.cards[0]
+        old_value = _image_value(revision=1, center_x=27.0)
+        replacement_value = _image_value(revision=2, center_x=42.0)
+        assert _present_value(console, card, old_value, frame_key=("retire-fit", 1))
+        _wait(application, lambda: card.frozen_render_payload() is not None)
+
+        QtTest.QTest.mouseClick(card.edit_button, QtCore.Qt.LeftButton)
+        _wait(application, lambda: id(card) in console._panel_editors)
+        editor = console._panel_editors[id(card)]
+        _wait(
+            application,
+            lambda: editor._board is not None
+            and editor._board.front_frame is not None,
+        )
+        QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
+        pane = card.fit_authoring_pane
+        _wait(application, lambda: bool(pane.fit_models) and pane.fit_button.isEnabled())
+        QtTest.QTest.mouseClick(pane.fit_button, QtCore.Qt.LeftButton)
+        _wait(
+            application,
+            lambda: card._fit_result is not None
+            and card.frozen_render_payload().fit_overlay is not None
+            and editor._board.front_frame.panels[0].display_payload.fit_overlay
+            is not None
+            and any("/fit." in name for name in console._tick_data.names()),
+        )
+
+        retired = console._current_test_source
+        console._retire_logic_node_publications(retired.node)
+        assert card._fit_active_spec is None
+        assert card._fit_active_source is None
+        assert card._fit_live_surface_source is None
+        assert card._fit_result is None
+        assert card._fit_result_identity is None
+        assert pane._busy_kind == "prepare"
+        assert card.board.front_frame is None
+        assert not any("/fit." in name for name in console._tick_data.names())
+        _wait(
+            application,
+            lambda: editor._board.front_frame.panels[0].display_payload.fit_overlay
+            is None,
+        )
+
+        # Reuse the user-visible route with a new producer object.  No manual
+        # Clear is needed and no old overlay/pin can intercept the new front.
+        console._current_test_source = None
+        assert _present_value(
+            console,
+            card,
+            replacement_value,
+            frame_key=("retire-fit", 2),
+        )
+        _wait(
+            application,
+            lambda: card._presented_value is not None
+            and card._presented_value.run_id == replacement_value.run_id
+            and card.frozen_render_payload().fit_overlay is None,
+        )
+        assert card._fit_live_surface_source is None
+        assert not any("/fit." in name for name in console._tick_data.names())
+    finally:
+        close_task_console(application, console)
+
+
+def test_inflight_fit_producer_retirement_clears_busy_and_rejects_late_result(
+    monkeypatch,
+) -> None:
+    """Lane cancellation cannot be the only Fit retirement acknowledgement."""
+
+    import threading
+
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_frontend.qt_widgets import FigureFitLane, ensure_qt_app
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
+    from zlc_workbench.task_console.window import TaskConsole
+
+    original_execute = FigureFitLane._execute
+    entered = threading.Event()
+    release = threading.Event()
+
+    def held_execute(request):
+        entered.set()
+        if not release.wait(10.0):
+            raise RuntimeError("test Fit retirement gate timed out")
+        return original_execute(request)
+
+    monkeypatch.setattr(FigureFitLane, "_execute", staticmethod(held_execute))
+    application = ensure_qt_app()
+    console = TaskConsole(
+        state=TaskConsoleState(
+            panels=(PanelConfig(kind="1d", title="Curve", signal="image"),),
+        ),
+        window_px=(900, 700),
+    )
+    try:
+        console.show()
+        application.processEvents()
+        console._timer.stop()
+        card = console.cards[0]
+        old_value = _curve_value(revision=1, center=-0.8)
+        replacement_value = _curve_value(revision=2, center=1.2)
+        assert _present_value(console, card, old_value, frame_key=("retire-busy", 1))
+        _wait(application, lambda: card.frozen_render_payload() is not None)
+
+        QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
+        pane = card.fit_authoring_pane
+        _wait(application, lambda: bool(pane.fit_models) and pane.fit_button.isEnabled())
+        pane.model_combo.setCurrentIndex(
+            pane.model_combo.findData("gaussian_offset")
+        )
+        QtTest.QTest.mouseClick(pane.fit_button, QtCore.Qt.LeftButton)
+        assert entered.wait(5.0)
+        assert pane._busy_kind == "fit"
+
+        retired = console._current_test_source
+        console._retire_logic_node_publications(retired.node)
+        assert card._fit_active_spec is None
+        assert card._fit_pending_source_ref is None
+        assert card._fit_live_surface_source is None
+        assert pane._busy_kind == "prepare"
+        assert not any("/fit." in name for name in console._tick_data.names())
+
+        release.set()
+        _wait(application, lambda: console._fit_lane._future is None)
+        application.processEvents(QtCore.QEventLoop.AllEvents, 50)
+        assert card._fit_result is None
+        assert card._fit_live_surface_source is None
+        assert not any("/fit." in name for name in console._tick_data.names())
+
+        console._current_test_source = None
+        assert _present_value(
+            console,
+            card,
+            replacement_value,
+            frame_key=("retire-busy", 2),
+        )
+        _wait(
+            application,
+            lambda: card._presented_value is not None
+            and card._presented_value.run_id == replacement_value.run_id,
+        )
+        assert card.frozen_render_payload().fit_overlays == ()
+    finally:
+        release.set()
+        close_task_console(application, console)
+
+
+def test_curve_fit_pins_exact_live_front_and_every_failure_resumes_latest(
+    monkeypatch,
+) -> None:
+    """CURVE shares the Fit command lifecycle; no failure can strand its pin."""
+
+    import threading
+
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_frontend.qt_widgets import FigureFitLane, ensure_qt_app
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
+    from zlc_workbench.task_console.window import TaskConsole
+
+    original_execute = FigureFitLane._execute
+    entered = threading.Event()
+    release = threading.Event()
+
+    def held_execute(request):
+        entered.set()
+        if not release.wait(10.0):
+            raise RuntimeError("test Fit gate timed out")
+        return original_execute(request)
+
+    monkeypatch.setattr(FigureFitLane, "_execute", staticmethod(held_execute))
+    application = ensure_qt_app()
+    console = TaskConsole(
+        state=TaskConsoleState(
+            panels=(PanelConfig(kind="1d", title="Curve", signal="image"),),
+        ),
+        window_px=(900, 700),
+    )
+    try:
+        console.show()
+        application.processEvents()
+        console._timer.stop()
+        card = console.cards[0]
+        fitted = _curve_value(revision=1, center=-0.8)
+        newer = _curve_value(revision=2, center=0.6)
+        newest = _curve_value(revision=3, center=1.4)
+        assert _present_value(console, card, fitted, frame_key=("curve", 1))
+        _wait(application, lambda: card.frozen_render_payload() is not None)
+        before = card.board.front_frame.panels[0].raster.pixels
+
+        QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
+        pane = card.fit_authoring_pane
+        _wait(application, lambda: bool(pane.fit_models) and pane.fit_button.isEnabled())
+        gaussian = pane.model_combo.findData("gaussian_offset")
+        assert gaussian >= 0
+        pane.model_combo.setCurrentIndex(gaussian)
+        QtTest.QTest.mouseClick(pane.fit_button, QtCore.Qt.LeftButton)
+        assert entered.wait(5.0)
+        assert not _present_value(console, card, newer, frame_key=("curve", 2))
+        assert not _present_value(console, card, newest, frame_key=("curve", 3))
+        release.set()
+        _wait(
+            application,
+            lambda: card._fit_result is not None
+            and card.frozen_render_value().snapshot.ref == fitted.snapshot.ref
+            and bool(card.frozen_render_payload().fit_overlays),
+        )
+        assert card.board.front_frame.panels[0].raster.pixels != before
+        parameter_names = {
+            definition.name for definition in card._fit_result.parameter_definitions
+        }
+        _wait(
+            application,
+            lambda: {
+                name.rsplit("/fit.", 1)[1]
+                for name in console._tick_data.names()
+                if "/fit." in name
+            }
+            == parameter_names,
+        )
+        assert all(
+            not name.endswith(("fit.curve", "fit.overlay", "fit.prediction"))
+            for name in console._tick_data.names()
+        )
+
+        QtTest.QTest.mouseClick(pane.clear_button, QtCore.Qt.LeftButton)
+        _wait(
+            application,
+            lambda: card.frozen_render_value().snapshot.ref == newest.snapshot.ref
+            and not card.frozen_render_payload().fit_overlays,
+        )
+
+        # A malformed worker completion is a terminal failure, not a permanent
+        # command pin.  The newest admitted data front must resume immediately.
+        monkeypatch.setattr(
+            FigureFitLane,
+            "_execute",
+            staticmethod(lambda request: (request, object(), None)),
+        )
+        QtTest.QTest.mouseClick(pane.fit_button, QtCore.Qt.LeftButton)
+        failed_newest = _curve_value(revision=4, center=2.0)
+        assert not _present_value(
+            console,
+            card,
+            failed_newest,
+            frame_key=("curve", 4),
+        )
+        _wait(
+            application,
+            lambda: card._fit_live_surface_source is None
+            and card.frozen_render_value().snapshot.ref
+            == failed_newest.snapshot.ref
+            and pane.fit_button.isEnabled(),
+        )
+        assert not any("/fit." in name for name in console._tick_data.names())
+
+        # Even an exception escaping the worker callable keeps the submitted
+        # request identity, so the same panel-terminal cleanup releases the
+        # exact-source pin and resumes the newest data-plane front.
+        exception_entered = threading.Event()
+        exception_release = threading.Event()
+        terminal_failures = []
+        original_finish_failure = card._finish_fit_failure
+
+        def record_terminal_failure(request, diagnostic, *, cancelled):
+            terminal_failures.append((request, diagnostic, cancelled))
+            return original_finish_failure(
+                request,
+                diagnostic,
+                cancelled=cancelled,
+            )
+
+        monkeypatch.setattr(
+            card,
+            "_finish_fit_failure",
+            record_terminal_failure,
+        )
+
+        def exploding_execute(request):
+            exception_entered.set()
+            if not exception_release.wait(10.0):
+                raise RuntimeError("test exception gate timed out")
+            raise RuntimeError("unexpected executor failure")
+
+        monkeypatch.setattr(
+            FigureFitLane,
+            "_execute",
+            staticmethod(exploding_execute),
+        )
+        QtTest.QTest.mouseClick(pane.fit_button, QtCore.Qt.LeftButton)
+        assert exception_entered.wait(5.0)
+        exception_newest = _curve_value(revision=5, center=2.8)
+        assert not _present_value(
+            console,
+            card,
+            exception_newest,
+            frame_key=("curve", 5),
+        )
+        exception_release.set()
+        _wait(
+            application,
+            lambda: card._fit_live_surface_source is None
+            and card.frozen_render_value().snapshot.ref
+            == exception_newest.snapshot.ref
+            and pane.fit_button.isEnabled(),
+        )
+        assert len(terminal_failures) == 1
+        assert "unexpected executor failure" in terminal_failures[0][1]
+    finally:
+        release.set()
+        close_task_console(application, console)
+
+
+def test_histogram_fit_draws_the_formal_components_and_publishes_only_parameters() -> None:
+    """TaskConsole HIST consumes the same formal Fit path as DataFigure."""
+
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_data import FitBatchStatus
+    from zlc_frontend import HistogramPanelPayload
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
+    from zlc_workbench.task_console.window import TaskConsole
+
+    application = ensure_qt_app()
+    console = TaskConsole(
+        state=TaskConsoleState(
+            panels=(PanelConfig(kind="hist", title="Histogram", signal="image"),),
+        ),
+        window_px=(900, 700),
+    )
+    try:
+        console.show()
+        application.processEvents()
+        console._timer.stop()
+        card = console.cards[0]
+        source = _histogram_value(revision=1)
+        assert _present_value(console, card, source, frame_key=("histogram", 1))
+        _wait(
+            application,
+            lambda: isinstance(card.frozen_render_payload(), HistogramPanelPayload),
+        )
+        before = card.board.front_frame.panels[0].raster.pixels
+
+        QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
+        pane = card.fit_authoring_pane
+        _wait(application, lambda: bool(pane.fit_models) and pane.fit_button.isEnabled())
+        assert pane.fit_models[:2] == (
+            "bimodal_gaussian",
+            "histogram_gaussian",
+        )
+        bimodal = pane.model_combo.findData("bimodal_gaussian")
+        assert bimodal >= 0
+        pane.model_combo.setCurrentIndex(bimodal)
+        QtTest.QTest.mouseClick(pane.fit_button, QtCore.Qt.LeftButton)
+        _wait(
+            application,
+            lambda: card._fit_result is not None
+            and card._fit_result.statuses == (FitBatchStatus.CONVERGED,)
+            and isinstance(card.frozen_render_payload(), HistogramPanelPayload)
+            and bool(card.frozen_render_payload().fit_overlays),
+            timeout=25.0,
+        )
+
+        payload = card.frozen_render_payload()
+        assert len(payload.fit_overlays) == 1
+        assert len(payload.fit_overlays[0].component_predictions) == 3
+        assert card.board.front_frame.panels[0].raster.pixels != before
+        parameter_names = {
+            definition.name for definition in card._fit_result.parameter_definitions
+        }
+        _wait(
+            application,
+            lambda: {
+                name.rsplit("/fit.", 1)[1]
+                for name in console._tick_data.names()
+                if "/fit." in name
+            }
+            == parameter_names,
+        )
+        assert all(
+            not name.endswith(("fit.curve", "fit.overlay", "fit.prediction"))
+            for name in console._tick_data.names()
+        )
+    finally:
+        close_task_console(application, console)
+
+
+def test_fit_source_capture_failure_releases_the_frozen_command(
+    monkeypatch,
+) -> None:
+    """A pre-worker ancestry failure is a terminal Fit completion."""
+
+    from PyQt5 import QtCore, QtTest
+
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_workbench.task_console.console_records import PanelConfig
+    from zlc_workbench.task_console.console_state import TaskConsoleState
+    from zlc_workbench.task_console.window import TaskConsole
+
+    application = ensure_qt_app()
+    console = TaskConsole(
+        state=TaskConsoleState(
+            panels=(PanelConfig(kind="1d", title="Curve", signal="image"),),
+        ),
+        window_px=(900, 700),
+    )
+    try:
+        console.show()
+        application.processEvents()
+        console._timer.stop()
+        card = console.cards[0]
+        fitted = _curve_value(revision=1, center=-0.5)
+        assert _present_value(console, card, fitted, frame_key=("capture", 1))
+        _wait(application, lambda: card.frozen_render_payload() is not None)
+
+        QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
+        pane = card.fit_authoring_pane
+        _wait(application, lambda: bool(pane.fit_models) and pane.fit_button.isEnabled())
+        gaussian = pane.model_combo.findData("gaussian_offset")
+        assert gaussian >= 0
+        pane.model_combo.setCurrentIndex(gaussian)
+
+        def fail_capture(_source):
+            raise RuntimeError("causal ancestry unavailable")
+
+        monkeypatch.setattr(
+            console._data,
+            "capture_source_component",
+            fail_capture,
+        )
+        QtTest.QTest.mouseClick(pane.fit_button, QtCore.Qt.LeftButton)
+        _wait(
+            application,
+            lambda: card._fit_live_surface_source is None
+            and card._fit_pending_source_ref is None
+            and pane.fit_button.isEnabled(),
+        )
+        assert "causal ancestry unavailable" in card._status_text
+
+        newest = _curve_value(revision=2, center=1.5)
+        assert _present_value(console, card, newest, frame_key=("capture", 2))
+        _wait(
+            application,
+            lambda: card.frozen_render_value().snapshot.ref == newest.snapshot.ref,
+        )
     finally:
         close_task_console(application, console)
 

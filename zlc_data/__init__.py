@@ -1,7 +1,5 @@
 """Headless, domain-neutral semantics for named multidimensional data."""
 
-from importlib import import_module
-
 from ._arrays import (
     immutable_array,
     immutable_bool_broadcast,
@@ -95,6 +93,8 @@ from .selection import (
 from .transform import (
     CommittedTransform,
     DataTransformSpec,
+    HISTOGRAM_BIN_AXIS_ID,
+    HistogramSpec,
     MissingPolicy,
     ReductionMethod,
     ReductionSpec,
@@ -138,37 +138,16 @@ from .fit import (
     decode_fit_spec,
     encode_fit_result_batch,
     encode_fit_spec,
+    evaluate_fit_model_components,
     fit_model_catalog,
     fit_model_definition,
+    histogram_gaussian_display_diagnostic,
     fit_spec_from_tree,
     fit_spec_for,
     fit_spec_to_tree,
     suggest_fit_draft,
     validate_fit_result_source_binding,
 )
-
-_LAZY_EXPORTS = {
-    "HistogramFitResult": ("histogram_fit", "HistogramFitResult"),
-    "confidence_weighted_fidelity": (
-        "histogram_fit",
-        "confidence_weighted_fidelity",
-    ),
-    "fit_histogram": ("histogram_fit", "fit_histogram"),
-}
-
-
-def __getattr__(name: str):
-    try:
-        module_name, attribute_name = _LAZY_EXPORTS[name]
-    except KeyError as exc:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
-    value = getattr(import_module(f".{module_name}", __name__), attribute_name)
-    globals()[name] = value
-    return value
-
-
-def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 __all__ = [
     "AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID",
@@ -201,7 +180,8 @@ __all__ = [
     "FitParameterDomain",
     "FitResultBatch",
     "FitSpec",
-    "HistogramFitResult",
+    "HISTOGRAM_BIN_AXIS_ID",
+    "HistogramSpec",
     "INVALID",
     "HISTOGRAM_BIN",
     "MONITOR_HISTORY",
@@ -248,7 +228,6 @@ __all__ = [
     "apply_transform",
     "bind_fit",
     "commit_transform",
-    "confidence_weighted_fidelity",
     "committed_transform_from_tree",
     "committed_transform_to_tree",
     "dataset_schema_fingerprint",
@@ -276,7 +255,8 @@ __all__ = [
     "expand_component_validity",
     "expand_value_validity",
     "fit_model_catalog",
-    "fit_histogram",
+    "evaluate_fit_model_components",
+    "histogram_gaussian_display_diagnostic",
     "fit_model_definition",
     "fit_spec_from_tree",
     "fit_spec_for",

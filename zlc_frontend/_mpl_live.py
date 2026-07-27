@@ -16,16 +16,9 @@ from .figure import (
     EvaluatedMeter,
     FigureDocument,
 )
-from .fit_image_projection import (
-    RadialGaussianImageFitPanel,
-    address_label as _address_label,
+from .fit_projection import (
     evaluated_figure_panels as _panels,
     figure_panel_title as _panel_title,
-    fit_batch_storage_index as _batch_storage_index,
-    fit_panel_selection as _fit_panel_selection,
-    panel_focus_selection as _panel_focus_selection,
-    radial_gaussian_fit_geometry,
-    reduction_label as _reduction_label,
 )
 from .curve_display import (
     CurveDisplayState,
@@ -41,7 +34,6 @@ from .histogram_display import (
     HistogramBinProjection,
     HistogramCountScale,
     HistogramDisplayState,
-    HistogramFitMode,
     HistogramViewportTransform,
     histogram_count_limits,
     histogram_home_x_limits,
@@ -54,6 +46,7 @@ from .display_range import (
 from .render import (
     CurveFitOverlay,
     CurvePanelPayload,
+    HistogramFitOverlay,
     HistogramPanelPayload,
     ImagePanelPayload,
     ImagePanelRasterGeometry,
@@ -538,9 +531,12 @@ class SinglePanelAggRenderer:
         side.set_xlim(0.0, self._side_count_ceiling)
         side.set_ylim(*y_limits)
 
-        from zlc_data import fit_histogram
+        from zlc_data import (
+            evaluate_fit_model_components,
+            histogram_gaussian_display_diagnostic,
+        )
 
-        fit = fit_histogram(edges, counts, "single")
+        parameters = histogram_gaussian_display_diagnostic(edges, counts)
         if self._gauss_artist is None:
             (self._gauss_artist,) = side.plot(
                 (),
@@ -548,11 +544,14 @@ class SinglePanelAggRenderer:
                 color=PALETTE["fit_right"],
                 alpha=1.0,
             )
-        if fit.valid:
+        if parameters is not None:
             coordinates = np.linspace(y_limits[0], y_limits[1], 100)
-            self._gauss_artist.set_data(fit.evaluate(coordinates), coordinates)
-            parameters = fit.single_parameters
-            assert parameters is not None
+            gaussian = evaluate_fit_model_components(
+                "histogram_gaussian",
+                (coordinates,),
+                parameters,
+            )[0]
+            self._gauss_artist.set_data(gaussian, coordinates)
             _amplitude, mean, sigma = parameters
             label = (
                 r"$\sigma/\sqrt{\mu}$=N/A"
@@ -585,6 +584,8 @@ class SinglePanelAggRenderer:
         previous_relim_mode: RelimMode | None,
         previous_count_scale: HistogramCountScale | None,
         projection_value_range: tuple[float, float] | None = None,
+        bin_projection: HistogramBinProjection | None = None,
+        fit_overlays: tuple[HistogramFitOverlay, ...] = (),
     ) -> tuple[RasterBuffer, HistogramPanelPayload]:
         """Render one front-bound shared-bin Histogram projection."""
 
@@ -596,6 +597,8 @@ class SinglePanelAggRenderer:
                 previous_relim_mode=previous_relim_mode,
                 previous_count_scale=previous_count_scale,
                 projection_value_range=projection_value_range,
+                bin_projection=bin_projection,
+                fit_overlays=fit_overlays,
             )
 
     def _render_interactive_histogram(
@@ -607,6 +610,8 @@ class SinglePanelAggRenderer:
         previous_relim_mode: RelimMode | None,
         previous_count_scale: HistogramCountScale | None,
         projection_value_range: tuple[float, float] | None,
+        bin_projection: HistogramBinProjection | None,
+        fit_overlays: tuple[HistogramFitOverlay, ...],
     ) -> tuple[RasterBuffer, HistogramPanelPayload]:
         if not isinstance(state, HistogramDisplayState):
             raise TypeError("state must be HistogramDisplayState")
@@ -619,11 +624,30 @@ class SinglePanelAggRenderer:
             raise ValueError("interactive histogram series must share value_unit")
         # Validate finite samples and freeze one common edge vector before this
         # persistent Agg surface is changed.
-        bin_projection = HistogramBinProjection(
-            tuple(item.samples for item in histograms),
-            bins=state.bin_count,
-            value_range=projection_value_range,
-        )
+        if bin_projection is not None and projection_value_range is not None:
+            raise ValueError(
+                "histogram render accepts either an exact bin projection or a value range"
+            )
+        if bin_projection is None:
+            bin_projection = HistogramBinProjection(
+                tuple(item.samples for item in histograms),
+                bins=state.bin_count,
+                value_range=projection_value_range,
+            )
+        elif (
+            not isinstance(bin_projection, HistogramBinProjection)
+            or bin_projection.requested_bin_count != state.bin_count
+            or len(bin_projection.series_samples) != len(histograms)
+            or any(
+                projected is not histogram.samples
+                for projected, histogram in zip(
+                    bin_projection.series_samples,
+                    histograms,
+                    strict=True,
+                )
+            )
+        ):
+            raise ValueError("histogram render received another source projection")
         figure, axis, layer, _cell, series_group = self._prepare_panel(
             evaluated,
             histogram_bins=state.bin_count,
@@ -655,6 +679,7 @@ class SinglePanelAggRenderer:
             axis,
             state,
             bin_projection,
+            fit_overlays=fit_overlays,
         )
         raster = self._draw_raster(figure)
         actual_x_limits = validated_display_range(
@@ -703,6 +728,7 @@ class SinglePanelAggRenderer:
             labels,
             bin_projection,
             thresholds=effective_thresholds,
+            fit_overlays=fit_overlays,
         )
 
     def _update_histogram_presentation(
@@ -710,6 +736,8 @@ class SinglePanelAggRenderer:
         axis,
         state: HistogramDisplayState,
         projection,
+        *,
+        fit_overlays: tuple[HistogramFitOverlay, ...],
     ) -> tuple[float, ...]:
         """Update the shared full-panel presentation in place."""
 
@@ -723,6 +751,7 @@ class SinglePanelAggRenderer:
             state,
             projection.bin_counts,
             projection.bin_edges,
+            fit_overlays=fit_overlays,
             fit_artists=self._hist_fit_artists,
             threshold_artists=self._hist_threshold_artists,
             stats_text=self._hist_stats_text,

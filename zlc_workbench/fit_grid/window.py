@@ -12,6 +12,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from zlc_data import Selection
 from zlc_frontend import (
     BoardFrame,
+    DEFAULT_PANEL_SIZE,
     FigurePanelRegion,
     FitGridCellSummary,
     FitGridModel,
@@ -139,7 +140,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
             self._apply_surface_pixel_ratio,
         )
         self._surface_geometry = panel_surface_geometry(
-            "2x2",
+            DEFAULT_PANEL_SIZE,
             pixel_ratio=self._surface_pixel_ratio_observer.current_ratio,
         )
         self._render_session = FitGridRenderSession(
@@ -864,7 +865,7 @@ class SavedFitGridWindow(FrozenRasterWindow):
 
         if self._closing:
             return
-        geometry = panel_surface_geometry("2x2", pixel_ratio=ratio)
+        geometry = panel_surface_geometry(DEFAULT_PANEL_SIZE, pixel_ratio=ratio)
         if geometry == self._surface_geometry:
             return
         self._surface_geometry = geometry

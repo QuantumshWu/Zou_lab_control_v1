@@ -10,8 +10,6 @@ from .render import BoardFrame
 from .display_range import validated_display_range
 from .data_figure_presentation import (
     DATA_FIGURE_PANEL_ID,
-    DEFAULT_DATA_FIGURE_RASTER_SIZE,
-    DEFAULT_DATA_FIGURE_SIZE_NAME,
     DataFigureDisplayState,
     DataFigureFront,
     DataFigureGridDisplayState,
@@ -20,6 +18,7 @@ from .data_figure_presentation import (
     classify_faceted_data_figure,
     classify_single_data_figure,
     data_figure_front_contract,
+    data_figure_initial_size_name,
     data_figure_join_digest,
     data_figure_payload_intent,
     data_figure_summary,
@@ -34,6 +33,7 @@ from .fit_editor import fit_projection_metadata
 from .figure import ViewIntent
 from .figure_source import FigureSource
 from .histogram_display import histogram_projection_home_x_limits
+from .panel_size import DEFAULT_PANEL_SIZE
 from .plot_layout import panel_surface_geometry
 from .plot_panel import (
     PlotPanelComposeRequest,
@@ -126,7 +126,7 @@ def _presentation_label(
 def render_data_figure_grid_overview(
     figure: DataFigure,
     *,
-    raster_size: tuple[int, int] = DEFAULT_DATA_FIGURE_RASTER_SIZE,
+    raster_size: tuple[int, int] | None = None,
     size_name: str | None = None,
     pixel_ratio: float = 1.0,
     display_state: DataFigureGridDisplayState | None = None,
@@ -171,12 +171,16 @@ def render_data_figure_grid_overview(
         "presentation_value_label",
     )
     surface_size_name = (
-        DEFAULT_DATA_FIGURE_SIZE_NAME if size_name is None else str(size_name)
+        data_figure_initial_size_name(figure)
+        if size_name is None
+        else str(size_name)
     )
     geometry = panel_surface_geometry(
         surface_size_name,
         pixel_ratio=pixel_ratio,
     )
+    if raster_size is None:
+        raster_size = geometry.raster_size
     if tuple(raster_size) != geometry.raster_size:
         raise ValueError(
             "DataFigure grid geometry must come from panel_surface_geometry"
@@ -262,7 +266,7 @@ def render_data_figure_front(
     fit_result_identity: str | None = None,
     histogram_projection_value_range: tuple[float, float] | None = None,
     release_initial_canonical_on_commit: bool = False,
-    raster_size: tuple[int, int] = DEFAULT_DATA_FIGURE_RASTER_SIZE,
+    raster_size: tuple[int, int] | None = None,
     size_name: str | None = None,
     pixel_ratio: float = 1.0,
     presentation_title: str | None = None,
@@ -311,13 +315,13 @@ def render_data_figure_front(
         figure.document.datasets[0].label,
         "presentation_value_label",
     )
-    surface_size_name = (
-        DEFAULT_DATA_FIGURE_SIZE_NAME if size_name is None else str(size_name)
-    )
+    surface_size_name = DEFAULT_PANEL_SIZE if size_name is None else str(size_name)
     geometry = panel_surface_geometry(
         surface_size_name,
         pixel_ratio=pixel_ratio,
     )
+    if raster_size is None:
+        raster_size = geometry.raster_size
     if tuple(raster_size) != geometry.raster_size:
         raise ValueError(
             "DataFigure raster geometry must come from panel_surface_geometry"

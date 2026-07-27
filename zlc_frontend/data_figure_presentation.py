@@ -58,16 +58,12 @@ from .image_display import (
     image_display_from_form,
 )
 from .image_view import image_viewport_for_evaluated_image
-from .plot_layout import panel_surface_geometry
+from .panel_size import DEFAULT_PANEL_SIZE
+from .plot_layout import optimal_grid_size_for_view
 from .plot_panel import PlotPanelContract
 from zlc_storage import canonical_digest
 
 DATA_FIGURE_PANEL_ID = "generic-typed"
-
-DEFAULT_DATA_FIGURE_SIZE_NAME = "4x4"
-DEFAULT_DATA_FIGURE_RASTER_SIZE = panel_surface_geometry(
-    DEFAULT_DATA_FIGURE_SIZE_NAME
-).raster_size
 
 def data_figure_summary(figure: DataFigure) -> str:
     document = figure.document
@@ -273,6 +269,17 @@ def classify_faceted_data_figure(
             ):
                 return None, None, "typed CURVE grid cells do not share x axis and unit"
     return intent, len(cells), None
+
+
+def data_figure_initial_size_name(figure: DataFigure) -> str:
+    """Apply the product's one ordinary/Grid initial-size policy to a Figure."""
+
+    _intent, panel_count, _reason = classify_faceted_data_figure(figure)
+    if panel_count is None:
+        return DEFAULT_PANEL_SIZE
+    layer = figure.document.layers[0]
+    snapshot = figure.datasets.resolve(layer.dataset_id)
+    return optimal_grid_size_for_view(snapshot.block.schema, layer.view)
 
 @dataclass(frozen=True, slots=True)
 class DataFigureGridOverview:
@@ -796,14 +803,17 @@ def validate_rendered_data_figure_payload(
             expected_state.relim_mode is RelimMode.FIXED
             and viewport.count_limits != expected_state.fixed_count_limits
         )
+        or ((not payload.fit_overlays) != (fit_result_identity is None))
+        or any(
+            overlay.result_identity != fit_result_identity
+            for overlay in payload.fit_overlays
+        )
     ):
         raise ValueError("histogram worker returned conflicting authored state")
 
 
 __all__ = [
     "DATA_FIGURE_PANEL_ID",
-    "DEFAULT_DATA_FIGURE_RASTER_SIZE",
-    "DEFAULT_DATA_FIGURE_SIZE_NAME",
     "DataFigureDisplayState",
     "DataFigureFront",
     "DataFigureGridDisplayState",
@@ -816,6 +826,7 @@ __all__ = [
     "data_figure_display_form_values",
     "data_figure_display_state_from_form",
     "data_figure_display_state_with_x_view",
+    "data_figure_initial_size_name",
     "data_figure_front_contract",
     "data_figure_join_digest",
     "data_figure_payload_intent",

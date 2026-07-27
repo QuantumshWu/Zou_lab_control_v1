@@ -20,7 +20,6 @@ from zlc_frontend import (
     FixedIndex,
     HistogramCellThresholds,
     HistogramDisplayState,
-    HistogramFitMode,
     ImageColormap,
     ImageDisplayState,
     FigureSource,
@@ -115,7 +114,6 @@ def _histogram_page(
     )
     base_display = HistogramDisplayState(
         bin_count=max(5, int(np.asarray(model.bin_edges).size) - 1),
-        fit_mode=HistogramFitMode.NONE,
     )
     cell_thresholds = tuple(
         HistogramCellThresholds(
@@ -177,7 +175,6 @@ def _pooled_page(
         source=FigureSource(snapshot),
         display=HistogramDisplayState(
             bin_count=60,
-            fit_mode=HistogramFitMode.NONE,
             thresholds=(0.0,),
         ),
         provenance=_provenance(view, f"pooled-{model.label}", snapshot),

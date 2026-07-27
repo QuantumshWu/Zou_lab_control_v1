@@ -57,7 +57,6 @@ from .histogram_display import (
     FacetedHistogramDisplayState,
     HistogramCountScale,
     HistogramDisplayState,
-    HistogramFitMode,
     histogram_cell_thresholds_from_tree,
     histogram_cell_thresholds_to_tree,
 )
@@ -284,7 +283,6 @@ def _display_state_to_tree(
             "relim_mode": state.relim_mode.value,
             "count_scale": state.count_scale.value,
             "bin_count": state.bin_count,
-            "fit_mode": state.fit_mode.value,
             "x_view": _optional_range_to_tree(state.x_view),
             "fixed_count_limits": _optional_range_to_tree(
                 state.fixed_count_limits
@@ -386,7 +384,6 @@ def _display_state_from_tree(tree: Any) -> FigureDisplayState | None:
                 "relim_mode",
                 "count_scale",
                 "bin_count",
-                "fit_mode",
                 "x_view",
                 "fixed_count_limits",
                 "thresholds",
@@ -401,7 +398,6 @@ def _display_state_from_tree(tree: Any) -> FigureDisplayState | None:
             relim_mode=RelimMode(data["relim_mode"]),
             count_scale=HistogramCountScale(data["count_scale"]),
             bin_count=data["bin_count"],
-            fit_mode=HistogramFitMode(data["fit_mode"]),
             x_view=_optional_range_from_tree(
                 data["x_view"],
                 "histogram x_view",

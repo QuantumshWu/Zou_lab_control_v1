@@ -13,17 +13,18 @@ from zlc_frontend import (
 )
 from zlc_frontend.figure import ViewIntent
 from zlc_frontend.data_figure_presentation import (
-    DEFAULT_DATA_FIGURE_SIZE_NAME,
     DataFigureDisplayState,
     DataFigureFront,
     DataFigureGridDisplayState,
     DataFigureGridFocusRequest,
     classify_faceted_data_figure,
     classify_single_data_figure,
+    data_figure_initial_size_name,
     default_data_figure_display_state,
     display_state_intent,
     grid_display_state_intent,
 )
+from zlc_frontend.panel_size import DEFAULT_PANEL_SIZE
 from zlc_frontend.data_figure_render import (
     DataFigureRenderSession,
     render_data_figure_grid_overview,
@@ -49,7 +50,7 @@ def _figure_window_factory(
     initial_display: DataFigureDisplayState | None = None,
     initial_grid_display: DataFigureGridDisplayState | None = None,
     embedded: bool = False,
-    size_name: str = DEFAULT_DATA_FIGURE_SIZE_NAME,
+    size_name: str = DEFAULT_PANEL_SIZE,
     presentation_title: str | None = None,
     presentation_value_label: str | None = None,
 ):
@@ -315,7 +316,7 @@ def create_data_figure_pane(
     local_fit_archive_metadata: Mapping[str, object] | None = None,
     open_fit: bool = False,
     embedded: bool = True,
-    size_name: str = DEFAULT_DATA_FIGURE_SIZE_NAME,
+    size_name: str | None = None,
     presentation_title: str | None = None,
     presentation_value_label: str | None = None,
 ) -> DataFigureWindow:
@@ -328,6 +329,11 @@ def create_data_figure_pane(
 
     if not isinstance(figure, DataFigure):
         raise TypeError("figure must be DataFigure")
+    resolved_size_name = (
+        data_figure_initial_size_name(figure)
+        if size_name is None
+        else str(size_name)
+    )
     if not isinstance(local_fit, bool):
         raise TypeError("local_fit must be bool")
     if not local_fit and any(
@@ -368,7 +374,7 @@ def create_data_figure_pane(
         initial_grid_display=initial_grid_display,
         initial_fit_result_identity=initial_fit_result_identity,
         embedded=embedded,
-        size_name=size_name,
+        size_name=resolved_size_name,
         presentation_title=presentation_title,
         presentation_value_label=presentation_value_label,
     )()

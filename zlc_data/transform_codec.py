@@ -18,6 +18,7 @@ from .transform import (
     TRANSFORM_SPEC_SCHEMA,
     CommittedTransform,
     DataTransformSpec,
+    HistogramSpec,
     MissingPolicy,
     ReductionMethod,
     ReductionSpec,
@@ -47,7 +48,7 @@ def data_transform_spec_to_tree(spec: DataTransformSpec) -> dict[str, Any]:
             operations.append(
                 {"kind": "SELECT", "selection": selection_to_tree(operation)}
             )
-        else:
+        elif isinstance(operation, ReductionSpec):
             operations.append(
                 {
                     "kind": "REDUCE",
@@ -58,6 +59,14 @@ def data_transform_spec_to_tree(spec: DataTransformSpec) -> dict[str, Any]:
                     "minimum_valid_count": operation.minimum_valid_count,
                 }
             )
+        else:
+            operations.append(
+                {
+                    "kind": "HISTOGRAM",
+                    "axis_ids": [axis_id.value for axis_id in operation.axis_ids],
+                    "bin_edges": list(operation.bin_edges),
+                }
+            )
     return {"schema": TRANSFORM_SPEC_SCHEMA, "operations": operations}
 
 
@@ -65,7 +74,7 @@ def data_transform_spec_from_tree(tree: Any) -> DataTransformSpec:
     data = _exact_map(tree, {"schema", "operations"}, TRANSFORM_SPEC_SCHEMA)
     if not isinstance(data["operations"], list):
         raise ValueError("DataTransformSpec operations must be a list")
-    operations: list[Selection | ReductionSpec] = []
+    operations: list[Selection | ReductionSpec | HistogramSpec] = []
     for raw in data["operations"]:
         if not isinstance(raw, dict) or not isinstance(raw.get("kind"), str):
             raise ValueError("transform operation must be a tagged map")
@@ -100,6 +109,23 @@ def data_transform_spec_from_tree(tree: Any) -> DataTransformSpec:
                     MissingPolicy(item["missing_policy"]),
                     ValidityPolicy(item["validity_policy"]),
                     item["minimum_valid_count"],
+                )
+            )
+        elif raw["kind"] == "HISTOGRAM":
+            item = _exact_map(
+                raw,
+                {"kind", "axis_ids", "bin_edges"},
+                "HISTOGRAM",
+                discriminator="kind",
+            )
+            if not isinstance(item["axis_ids"], list):
+                raise ValueError("histogram axis_ids must be a list")
+            if not isinstance(item["bin_edges"], list):
+                raise ValueError("histogram bin_edges must be a list")
+            operations.append(
+                HistogramSpec(
+                    tuple(AxisId(value) for value in item["axis_ids"]),
+                    tuple(item["bin_edges"]),
                 )
             )
         else:

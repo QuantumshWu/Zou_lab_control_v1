@@ -460,6 +460,75 @@ class CurveFitOverlay:
             )
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class HistogramFitOverlay:
+    """One formal Fit prediction bound to one exact Histogram series."""
+
+    source_ref: DatasetRevisionRef
+    result_identity: str
+    series_batch_address: tuple[AxisAddress, ...]
+    batch_storage_index: int | None
+    status: FitBatchStatus | None
+    diagnostic: str
+    coordinates: np.ndarray
+    component_predictions: tuple[np.ndarray, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_ref, DatasetRevisionRef):
+            raise TypeError("histogram fit overlay source_ref must be DatasetRevisionRef")
+        object.__setattr__(
+            self,
+            "result_identity",
+            _text(self.result_identity, "histogram fit result_identity"),
+        )
+        address = tuple(self.series_batch_address)
+        if any(not isinstance(item, AxisAddress) for item in address):
+            raise TypeError(
+                "histogram fit series_batch_address requires AxisAddress values"
+            )
+        object.__setattr__(self, "series_batch_address", address)
+        storage = self.batch_storage_index
+        if storage is not None:
+            storage = _nonnegative(storage, "histogram fit batch_storage_index")
+            object.__setattr__(self, "batch_storage_index", storage)
+        status = self.status
+        if status is not None and not isinstance(status, FitBatchStatus):
+            raise TypeError("histogram fit overlay status must be FitBatchStatus or None")
+        if (storage is None) != (status is None):
+            raise ValueError("histogram fit storage and status must be present together")
+        if not isinstance(self.diagnostic, str):
+            raise TypeError("histogram fit overlay diagnostic must be str")
+
+        coordinates = np.asarray(self.coordinates, dtype=np.dtype("<f8"))
+        components = tuple(
+            np.asarray(values, dtype=np.dtype("<f8"))
+            for values in self.component_predictions
+        )
+        if coordinates.ndim != 1 or any(values.shape != coordinates.shape for values in components):
+            raise ValueError("histogram fit coordinates/components must be aligned vectors")
+        if status is FitBatchStatus.CONVERGED:
+            if not components or coordinates.size < 2:
+                raise ValueError("converged histogram fit requires prediction components")
+            if not bool(np.all(np.isfinite(coordinates))) or any(
+                not bool(np.all(np.isfinite(values))) for values in components
+            ):
+                raise ValueError("converged histogram fit prediction must be finite")
+        elif coordinates.size or components:
+            raise ValueError("failed histogram fit cells cannot retain predictions")
+        frozen_coordinates = np.frombuffer(
+            coordinates.tobytes(order="C"),
+            dtype=np.dtype("<f8"),
+        )
+        frozen_coordinates.setflags(write=False)
+        frozen_components = []
+        for values in components:
+            owned = np.frombuffer(values.tobytes(order="C"), dtype=np.dtype("<f8"))
+            owned.setflags(write=False)
+            frozen_components.append(owned)
+        object.__setattr__(self, "coordinates", frozen_coordinates)
+        object.__setattr__(self, "component_predictions", tuple(frozen_components))
+
+
 @dataclass(frozen=True, slots=True)
 class ImagePanelRasterGeometry:
     """Exact top-origin axes boxes inside a worker-composed image panel raster."""
@@ -725,9 +794,10 @@ class PulsePanelPayload:
 class HistogramPanelPayload:
     """Exact samples plus one shared, immutable display bin projection.
 
-    Binning is presentation-only.  ``series`` retains the evaluator's exact
-    samples, sample-axis coordinates, component-validity filtering and dropped
-    counts; the shared counts/edges never become a fit or threshold authority.
+    Ordinary binning is presentation-only.  ``series`` retains the evaluator's
+    exact samples, sample-axis coordinates, component-validity filtering and
+    dropped counts.  Only an explicit Fit command may promote the named SAMPLE
+    axes plus these exact edges into a terminal authoritative ``HistogramSpec``.
     """
 
     evaluated_input: EvaluatedInput
@@ -738,6 +808,7 @@ class HistogramPanelPayload:
     # The drawn threshold cut lines (display state echoed by the renderer so
     # the board can grab them in the value coordinate).
     thresholds: tuple[float, ...] = ()
+    fit_overlays: tuple[HistogramFitOverlay, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -747,6 +818,10 @@ class HistogramPanelPayload:
         )
         if any(not math.isfinite(value) for value in self.thresholds):
             raise ValueError("histogram payload thresholds must be finite")
+        fit_overlays = tuple(self.fit_overlays)
+        if any(not isinstance(item, HistogramFitOverlay) for item in fit_overlays):
+            raise TypeError("histogram payload fit_overlays require HistogramFitOverlay values")
+        object.__setattr__(self, "fit_overlays", fit_overlays)
         if not isinstance(self.evaluated_input, EvaluatedInput):
             raise TypeError("histogram payload requires one EvaluatedInput")
         if not isinstance(self.viewport, HistogramViewportTransform):
@@ -826,6 +901,24 @@ class HistogramPanelPayload:
                 )
         if len(projection.bin_counts) != len(series):
             raise ValueError("histogram bin_counts must align with series")
+        if fit_overlays:
+            if len(fit_overlays) != len(series):
+                raise ValueError("histogram Fit overlays must align with series")
+            if len({overlay.result_identity for overlay in fit_overlays}) != 1:
+                raise ValueError("histogram payload cannot mix Fit result identities")
+            if any(
+                overlay.source_ref != self.evaluated_input.ref
+                or overlay.series_batch_address != item.batch_address
+                for overlay, item in zip(fit_overlays, series, strict=True)
+            ):
+                raise ValueError("histogram Fit overlay belongs to another exact series")
+            stored = tuple(
+                overlay.batch_storage_index
+                for overlay in fit_overlays
+                if overlay.batch_storage_index is not None
+            )
+            if len(stored) != len(set(stored)):
+                raise ValueError("two histogram series map to one Fit storage row")
         if self.viewport.home_x_limits != (float(edges[0]), float(edges[-1])):
             raise ValueError(
                 "histogram viewport home range differs from shared bin edges"
@@ -1300,6 +1393,7 @@ __all__ = [
     "DocumentInputIdentity",
     "DocumentPresentationStamp",
     "HistogramPanelPayload",
+    "HistogramFitOverlay",
     "MeterPanelPayload",
     "detached_render_fault",
     "DisplayPayload",

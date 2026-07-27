@@ -152,6 +152,7 @@ class _GatedProcessorNode:
             for name in declared_outputs
         )
         self.failure = None
+        self.cancelled = False
 
     def signal_key(self, name: str) -> str:
         return f"{self.instance_id}/{name}"
@@ -181,9 +182,8 @@ class _GatedProcessorNode:
     def accept_processor_failure(self, error) -> None:
         self.failure = error
 
-    @staticmethod
-    def accept_processor_cancelled() -> None:
-        return None
+    def accept_processor_cancelled(self) -> None:
+        self.cancelled = True
 
     @staticmethod
     def request_processor_owner_wake() -> None:
@@ -552,6 +552,140 @@ def test_source_and_processor_descendants_advance_as_one_local_component(
     withdrawn = plane.freeze()
     assert withdrawn.value("camera/frame") is not None
     assert withdrawn.value("occupancy/occupied") is None
+
+
+def test_source_retirement_discards_inflight_processor_and_all_descendants() -> None:
+    """An old worker answer cannot recreate a retired producer generation."""
+
+    from zlc_neutral_atom.processing.signal_plane import DerivedSignalOutput
+
+    plane, source_state, source_node, first = _live_source_plane()
+    gates = {1: threading.Event(), 2: threading.Event()}
+    gates[1].set()
+    try:
+        processor = _GatedProcessorNode(
+            plane,
+            instance_id="occupancy",
+            source_name="camera/frame",
+            declared_outputs=("occupied",),
+            gates=gates,
+        )
+        plane.attach_latest_only_processor(
+            processor,
+            source_name="camera/frame",
+            initial_source=first.value("camera/frame"),
+        )
+        admitted = _wait_for_signal_revision(
+            plane,
+            "occupancy/occupied",
+            1,
+        )
+        occupied = admitted.value("occupancy/occupied")
+        area_snapshot = _live_output(
+            "area",
+            1,
+            "b" * 64,
+            generation="area-generation-1",
+        ).snapshot
+        plane.publish_derived(
+            "area-panel",
+            occupied,
+            {
+                "panel/area": DerivedSignalOutput(
+                    snapshot=area_snapshot,
+                    source_ref=occupied.snapshot.ref,
+                    derivation_digest="c" * 64,
+                    preserve_source_coverage=True,
+                )
+            },
+            source_component=plane.capture_source_component(occupied),
+        )
+        complete = plane.freeze()
+        assert complete.value("camera/frame") is not None
+        assert complete.value("occupancy/occupied") is not None
+        assert complete.value("panel/area") is not None
+
+        source_state["frame"] = _live_output("frame", 2, "d" * 64)
+        source_state["frame_aux"] = _live_output("frame_aux", 2, "e" * 64)
+        plane.mark_changed(source_node)
+        plane.freeze()
+        entry = plane._processor_lane._entries[processor.instance_id]
+        assert entry.work_source.snapshot.ref.revision.value == 2
+        assert not entry.work_future.done()
+
+        retirement = plane.prepare_retirement(source_node)
+        assert retirement.retired_signal_names.issuperset(
+            {"camera/frame", "camera/frame_aux", "occupancy/occupied", "panel/area"}
+        )
+        plane.commit_prepared_retirement(retirement)
+        retired = plane.freeze()
+        assert retired.value("camera/frame") is None
+        assert retired.value("camera/frame_aux") is None
+        assert retired.value("occupancy/occupied") is None
+        assert retired.value("panel/area") is None
+
+        gates[2].set()
+        deadline = time.monotonic() + 2.0
+        while not entry.work_future.done() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert entry.work_future.done()
+        after_completion = plane.freeze()
+        assert after_completion.value("occupancy/occupied") is None
+        assert after_completion.value("panel/area") is None
+        assert processor.cancelled
+        assert processor.failure is None
+        assert processor.instance_id not in plane._processor_lane._entries
+    finally:
+        gates[1].set()
+        gates[2].set()
+        plane.close()
+
+
+def test_source_retirement_wins_over_late_processor_prepare_failure() -> None:
+    """Cancelled source ancestry cannot become a stale prepare-time failure."""
+
+    plane, _source_state, source_node, first = _live_source_plane()
+    prepare_started = threading.Event()
+    release_prepare = threading.Event()
+
+    class PendingPrepareProcessor(_GatedProcessorNode):
+        def prepare_processor_application(self):
+            prepare_started.set()
+            if not release_prepare.wait(2.0):
+                raise TimeoutError("test prepare gate did not open")
+            raise RuntimeError("retired prepare failure")
+
+    processor = PendingPrepareProcessor(
+        plane,
+        instance_id="pending-occupancy",
+        source_name="camera/frame",
+        declared_outputs=("occupied",),
+        gates={},
+    )
+    try:
+        plane.attach_latest_only_processor(
+            processor,
+            source_name="camera/frame",
+            initial_source=first.value("camera/frame"),
+        )
+        assert prepare_started.wait(1.0)
+        retirement = plane.prepare_retirement(source_node)
+        plane.commit_prepared_retirement(retirement)
+        assert plane.freeze().value("camera/frame") is None
+
+        entry = plane._processor_lane._entries[processor.instance_id]
+        release_prepare.set()
+        deadline = time.monotonic() + 2.0
+        while not entry.prepare_future.done() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert entry.prepare_future.done()
+        plane.freeze()
+        assert processor.cancelled
+        assert processor.failure is None
+        assert processor.instance_id not in plane._processor_lane._entries
+    finally:
+        release_prepare.set()
+        plane.close()
 
 
 def test_processor_chain_presents_the_completed_causal_edge_closure() -> None:

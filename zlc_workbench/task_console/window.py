@@ -617,15 +617,26 @@ class TaskConsole(QtWidgets.QWidget):
         self._recompute_tick_interval()    # the loaded panels' rates set the timer base
         self._update_summary()
 
-    def _new_panel_card(self, config: PanelConfig) -> PanelCard:
+    def _new_panel_card(
+        self,
+        config: PanelConfig,
+        *,
+        initial_grid_size_pending: bool = False,
+    ) -> PanelCard:
         """Build a PanelCard wired to the console's signal providers -- the ONE place the
         provider block lives, so adding/renaming a provider is a single edit here instead of three
-        parallel edits at every PanelCard construction site (load, add, or task result)."""
+        parallel edits at every PanelCard construction site (load, add, or task result).
+
+        ``initial_grid_size_pending`` is runtime-only composition intent.  Load
+        paths omit it because a persisted size is authoritative; only fresh
+        user/task Grid creation opts in.
+        """
         card = PanelCard(
             config, parent=self.board,
             signal_groups_provider=self._panel_signal_groups,
             render_request=self._request_card_render,
             presentation_provider=self._presentations.presentation_for,
+            initial_grid_size_pending=initial_grid_size_pending,
         )
         card.set_raster_pixel_ratio(self._raster_pixel_ratio)
         return card
@@ -737,45 +748,85 @@ class TaskConsole(QtWidgets.QWidget):
             return
         outputs = {} if front is None else dict(front.outputs)
         source = request.source_value
+        previous_presentations = self._card_output_presentations.get(
+            card.panel_id,
+            frozenset(),
+        )
+        presentations = (
+            frozenset(value.presentation for value in outputs.values())
+            if error is None and outputs and source is not None
+            else frozenset()
+        )
+        previous_names = {
+            panel_signal_key(card.panel_id, value.name)
+            for value in previous_presentations
+        }
         if error is None and outputs and source is not None:
-            derived = {
-                panel_signal_key(card.panel_id, value.presentation.name):
-                DerivedSignalOutput(
+            derived = {}
+            sidecars = {}
+            for value in outputs.values():
+                key = panel_signal_key(card.panel_id, value.presentation.name)
+                if key in derived:
+                    card.set_status(
+                        "Figure output: duplicate presentation route",
+                        error=True,
+                    )
+                    return
+                derived[key] = DerivedSignalOutput(
                     snapshot=value.snapshot,
                     source_ref=value.source_ref,
                     derivation_digest=value.derivation_digest,
                     preserve_source_coverage=value.preserve_source_coverage,
                     source_transform=value.source_transform,
                 )
-                for value in outputs.values()
-            }
-            published = self._data.publish_derived(
-                card.panel_id,
-                source,
-                derived,
-                source_component=request.source_component,
-            )
-            self._presentations.publish(
-                published,
-                {
-                    panel_signal_key(card.panel_id, value.presentation.name):
-                    value.presentation
-                    for value in outputs.values()
-                },
-            )
+                sidecars[key] = value.presentation
+            try:
+                prepared_data = self._data.prepare_derived(
+                    card.panel_id,
+                    source,
+                    derived,
+                    source_component=request.source_component,
+                )
+                prepared_presentations = self._presentations.prepare_publish(
+                    prepared_data.values,
+                    sidecars,
+                    withdraw=previous_names.difference(sidecars),
+                )
+            except (TypeError, ValueError, RuntimeError) as preparation_error:
+                # Neither owner has changed.  An invalid Figure transaction
+                # remains an observable card error, never a half-published
+                # signal that can later crash topology or Setting.
+                card.set_status(
+                    f"Figure output: {preparation_error}",
+                    error=True,
+                )
+                return
         else:
-            self._withdraw_panel_outputs(card.panel_id)
+            try:
+                prepared_data = self._data.prepare_derived_withdrawal(
+                    card.panel_id
+                )
+                prepared_presentations = self._presentations.prepare_publish(
+                    {},
+                    {},
+                    withdraw=previous_names,
+                )
+            except (TypeError, ValueError, RuntimeError) as preparation_error:
+                card.set_status(
+                    f"Figure output: {preparation_error}",
+                    error=True,
+                )
+                return
+        # Both commits are replacement-only operations over fully validated
+        # immutable facts.  No callback, freeze, topology projection or other
+        # fallible work may observe the interval between them.
+        self._data.commit_prepared_derived(prepared_data)
+        self._presentations.commit_prepared(prepared_presentations)
         # Publication is the topology boundary.  Promote the completed worker
         # transaction before the projection owner reads its declared outputs.
         self._promote_data_front(self._data.freeze())
-        presentations = (
-            frozenset(value.presentation for value in outputs.values())
-            if error is None
-            else frozenset()
-        )
         if (
-            self._card_output_presentations.get(card.panel_id, frozenset())
-            != presentations
+            previous_presentations != presentations
         ):
             self._card_output_presentations[card.panel_id] = presentations
             self._signal_topology_changed()
@@ -787,10 +838,17 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _withdraw_panel_outputs(self, panel_id: str) -> None:
         presentations = self._card_output_presentations.get(panel_id, frozenset())
-        self._presentations.withdraw_signals(
+        names = tuple(
             panel_signal_key(panel_id, value.name) for value in presentations
         )
-        self._data.withdraw_derived(panel_id)
+        prepared_data = self._data.prepare_derived_withdrawal(panel_id)
+        prepared_presentations = self._presentations.prepare_publish(
+            {},
+            {},
+            withdraw=names,
+        )
+        self._data.commit_prepared_derived(prepared_data)
+        self._presentations.commit_prepared(prepared_presentations)
 
     # ----------------------------------------------------------------- control
     def _card_reads(self, card: "PanelCard") -> set:
@@ -1259,6 +1317,12 @@ class TaskConsole(QtWidgets.QWidget):
         invoking the topology owner or rebuilding a picker model.
         """
 
+        # Frontend sidecars and their neutral values cross the visible boundary
+        # together.  A newer Figure/compound presentation may already be
+        # staged while the data plane deliberately retains an older complete
+        # causal component; reconciling by exact SignalValue identity keeps
+        # both facts coherent without putting UI metadata in the data plane.
+        self._presentations.reconcile_visible(front.signals)
         self._tick_data = front
         # The data plane may deliberately retain the previous visible causal
         # closure while a live selector for the newest source revision is
@@ -2099,12 +2163,18 @@ class TaskConsole(QtWidgets.QWidget):
         # Every new panel gets a unique "<kind> #N" title so two defaults never share
         # one name in the card header / Edit tab / frame title.
         title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
-        config = PanelConfig(kind=str(kind), title=title, row=GAP, col=GAP, size="1x2")
+        # PanelConfig owns the ordinary stock 2x2 default.  Do not restate a
+        # shell-specific size here; Pulse and a resolved Grid are the only
+        # plot families with topology-derived initial-size policies.
+        config = PanelConfig(kind=str(kind), title=title, row=GAP, col=GAP)
         # APPEND the new card LAST in order (``_attach_card`` adds it to the end of ``self.cards``);
         # the order-driven :func:`pack` in ``_arrange`` then lands it in the next free BOTTOM slot,
         # never a middle hole.  No pixel seed needed -- pack recomputes every card's position from
         # the order alone.
-        card = self._new_panel_card(config)
+        card = self._new_panel_card(
+            config,
+            initial_grid_size_pending=str(kind) == "grid",
+        )
         self._attach_card(card)
         self._arrange()
         # Adding a plot is one visible navigation action: reveal the Monitor
@@ -2147,6 +2217,10 @@ class TaskConsole(QtWidgets.QWidget):
             self._withdraw_panel_outputs(card.panel_id)
             self._card_output_presentations.pop(card.panel_id, None)
             self._transient_panel_ids.discard(card.panel_id)
+            # Panel removal is a GUI-owner transaction, not a promise for the
+            # next timer beat.  Retire the value + sidecar pair and promote the
+            # resulting front before any picker/topology projection can run.
+            self._promote_data_front(self._data.freeze())
             self._signal_topology_changed()
             phases.add("removed")
         if "qt_detached" not in phases:
@@ -2366,16 +2440,22 @@ class TaskConsole(QtWidgets.QWidget):
                     "restart blocked: previous owner thread did not terminate", error=True
                 )
             return
+        if previous is not None:
+            # A replacement generation cannot begin while the previous
+            # generation still owns its data-plane route.  Retire the complete
+            # value/presentation front first; the new node reuses the same
+            # catalog namespace but publishes a new immutable generation.
+            self._retire_logic_node_publications(previous)
         try:
             self._begin_run(node)
         except Exception as exc:
+            self._presentations.unregister_final_projector(node.instance_id)
+            self._signal_topology_changed()
             row.set_state("error", status=f"start failed: {exc}")
             if editor is not None:
                 editor.set_running(False)
                 editor.set_status(f"start failed: {exc}", error=True)
             return
-        if previous is not None and previous is not node:
-            self._data.detach(previous)
         # Commit the replacement to the row only after start submission succeeds.
         self._logic_nodes[id(row)] = node
         self._last_node[id(row)] = node           # survives Stop, for signal-source labelling
@@ -2438,10 +2518,10 @@ class TaskConsole(QtWidgets.QWidget):
                     title=str(declaration.short or declaration.name),
                     row=GAP,
                     col=GAP,
-                    size="2x2",
                     signal=key,
                     params=default.params,
-                )
+                ),
+                initial_grid_size_pending=kind == "grid",
             )
             self._attach_card(card)
             if value.transient:
@@ -2684,7 +2764,10 @@ class TaskConsole(QtWidgets.QWidget):
                     ),
                 )
             except (RuntimeError, TypeError, ValueError) as error:
-                card.set_status(f"Fit source unavailable: {error}", error=True)
+                card.reject_fit_request(
+                    request,
+                    f"source unavailable: {error}",
+                )
                 return
         self._fit_lane.enqueue(request)
 
@@ -2724,6 +2807,59 @@ class TaskConsole(QtWidgets.QWidget):
         render_complete = self._render_lane.shutdown()
         fit_complete = self._fit_lane.shutdown()
         return render_complete and fit_complete
+
+    def _retire_logic_node_publications(
+        self,
+        node: _ConsoleNode,
+        *,
+        unregister_final_projector: bool = False,
+    ) -> None:
+        """Retire one generation's data and presentation as one owner action.
+
+        Retirement covers the complete causal descendant closure, not merely
+        the node's declared routes.  Otherwise a retained selector or
+        Processor publication could re-introduce the old generation while the
+        coherence gate builds its next front.  A topology reader must never
+        run between that retirement and promotion of the matching immutable
+        front.  This is the single path shared by restart and row removal.
+        """
+
+        prepared_data = self._data.prepare_retirement(node)
+        retired_names = prepared_data.retired_signal_names
+        for card in self.cards:
+            output_prefix = f"@panel/{card.panel_id}/"
+            owns_retired_output = any(
+                name.startswith(output_prefix) for name in retired_names
+            )
+            if self._card_reads(card).intersection(retired_names) or owns_retired_output:
+                # A worker may already hold the old exact source component.
+                # Revoke all old work first.  The card retirement below emits
+                # the one overlay-clear presentation for any open frozen Edit
+                # surface; forgetting after that emission would discard the
+                # cleanup and leave the old Fit artist painted indefinitely.
+                self._forget_card_render(card)
+                # Cancelling a lane alone cannot clear a successful Fit or a
+                # pending request removed before terminal completion.
+                card.retire_source_generation()
+            if owns_retired_output:
+                # The set records currently published routes, not selector
+                # authoring.  Clearing it makes the first output from a future
+                # source generation a real topology admission again.
+                self._card_output_presentations[card.panel_id] = frozenset()
+        prepared_presentations = self._presentations.prepare_publish(
+            {},
+            {},
+            withdraw=retired_names,
+        )
+        # Withdrawal retains the currently visible sidecar until the neutral
+        # front is promoted, so stage it before closing the producer slot.
+        # Slot close is allowed to notify its owner; such a callback therefore
+        # still observes matching value/presentation facts.
+        self._presentations.commit_prepared(prepared_presentations)
+        self._data.commit_prepared_retirement(prepared_data)
+        if unregister_final_projector:
+            self._presentations.unregister_final_projector(node.instance_id)
+        self._promote_data_front(self._data.freeze())
 
     def _stop_logic_node(
         self,
@@ -2791,9 +2927,10 @@ class TaskConsole(QtWidgets.QWidget):
         self._logic_nodes.pop(id(row), None)
         self._last_node.pop(id(row), None)
         if gone is not None:
-            self._presentations.withdraw_signals(gone.published_signals())
-            self._presentations.unregister_final_projector(gone.instance_id)
-            self._data.detach(gone)
+            self._retire_logic_node_publications(
+                gone,
+                unregister_final_projector=True,
+            )
         if row in self.logic_nodes:
             self.logic_nodes.remove(row)
         self._signal_topology_changed()
@@ -2892,13 +3029,31 @@ class TaskConsole(QtWidgets.QWidget):
                                 node.final_result,
                                 projected,
                             )
-                            published = self._data.publish_final(node, projected)
-                            self._presentations.publish(
-                                published,
-                                {
-                                    node.signal_key(name): presentation
-                                    for name, presentation in presentations.items()
-                                },
+                            prepared_data = self._data.prepare_final(
+                                node,
+                                projected,
+                            )
+                            sidecars = {
+                                node.signal_key(name): presentation
+                                for name, presentation in presentations.items()
+                            }
+                            prepared_presentations = (
+                                self._presentations.prepare_publish(
+                                    prepared_data.values,
+                                    sidecars,
+                                    withdraw=set(node.published_signals()).difference(
+                                        sidecars
+                                    ),
+                                )
+                            )
+                            # FINAL Dataset values and their frontend-owned
+                            # presentation metadata are one composition fact.
+                            # Both projections have already succeeded; these
+                            # replacement-only commits cannot strand a SiteMap
+                            # or Figure value without its exact sidecar.
+                            self._data.commit_prepared_final(prepared_data)
+                            self._presentations.commit_prepared(
+                                prepared_presentations
                             )
                         except (TypeError, ValueError, RuntimeError) as error:
                             output_error = f"{type(error).__name__}: {error}"

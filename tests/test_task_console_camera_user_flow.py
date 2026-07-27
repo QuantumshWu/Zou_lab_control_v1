@@ -430,17 +430,14 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
         until(application, lambda: card.settings_popup.isVisible())
         assert card.view_spec_editor.isVisible()
-        visible_roles = {
-            axis_id: combo.currentText().split(" ·", 1)[0]
-            for axis_id, (_row, combo) in card.view_spec_editor._rows.items()
+        assert set(card.view_spec_editor._rows) == {
+            scan_x.axis_id,
+            scan_y.axis_id,
         }
-        assert visible_roles == {
-            repeat.axis_id: "facet",
-            scan_x.axis_id: "slider",
-            scan_y.axis_id: "slider",
-            image_y.axis_id: "image y",
-            image_x.axis_id: "image x",
-        }
+        assert all(
+            combo.isEnabled()
+            for _row, combo in card.view_spec_editor._rows.values()
+        )
         popup_width = card.settings_popup.width()
         assert popup_width == card.settings_popup.minimumWidth()
         assert popup_width == card.settings_popup.maximumWidth()
@@ -1013,6 +1010,222 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         )
         assert board.image_selector_fault(card.panel_id) is None
 
+        # Recreate Area, then consume it through a second real 2-D Plot Panel.
+        # This is the product path that used to make Setting intermittently
+        # read a new ROI schema beside old pixels/controls.
+        from dataclasses import replace
+
+        from zlc_frontend.figure_outputs import (
+            AREA_DATA_OUTPUT,
+            FigureOutputSession,
+        )
+        from zlc_neutral_atom.processing.signal_plane import (
+            signal_revision_identity,
+        )
+        from zlc_workbench.task_console.console_records import panel_signal_key
+
+        area_start = plot_point(0.12, 0.16)
+        area_end = plot_point(0.42, 0.48)
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=area_start)
+        drag_mouse_move(board, area_end, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=area_end)
+        area_signal = panel_signal_key(card.panel_id, AREA_DATA_OUTPUT)
+        until(
+            application,
+            lambda: console._tick_data.value(area_signal) is not None,
+            timeout=15.0,
+        )
+        area_card = _add_plot_and_bind(
+            console,
+            add,
+            "2d",
+            area_signal,
+            application,
+        )
+        until(
+            application,
+            lambda: area_card._presented_value is not None,
+            timeout=15.0,
+        )
+        if not area_card.settings_popup.isVisible():
+            QtTest.QTest.mouseClick(
+                area_card.setting_button,
+                QtCore.Qt.LeftButton,
+            )
+        until(application, lambda: area_card.settings_popup.isVisible())
+        assert area_card.view_spec_editor._rows == {}
+        assert area_card.view_spec_editor.isHidden()
+
+        first_roi_schema = area_card._presented_value.schema.fingerprint
+        area_start = plot_point(0.20, 0.24)
+        area_end = plot_point(0.62, 0.72)
+        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=area_start)
+        drag_mouse_move(board, area_end, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=area_end)
+        until(
+            application,
+            lambda: area_card._presented_value is not None
+            and area_card._presented_value.schema.fingerprint
+            != first_roi_schema,
+            timeout=15.0,
+        )
+        assert not area_card._status_error
+        assert area_card.view_spec_editor._rows == {}
+        assert area_card.view_spec_editor.isHidden()
+
+        # Give the downstream Figure its own Area output.  It is now a real
+        # causal descendant of the first Area signal, so an upstream N+1 must
+        # wait for this Figure's matching N+1 instead of exposing mixed fronts.
+        area_board = area_card.board.board
+        until(application, lambda: area_board.selectors_enabled)
+        area_binding = area_board._image_bindings[area_card.panel_id]
+        area_target = area_board._selector_target(area_binding)
+        assert area_target is not None
+        area_plot = area_target[0]
+
+        def area_plot_point(
+            x_fraction: float,
+            y_fraction: float,
+        ) -> QtCore.QPoint:
+            return QtCore.QPoint(
+                int(round(area_plot.left() + x_fraction * area_plot.width())),
+                int(round(area_plot.top() + y_fraction * area_plot.height())),
+            )
+
+        downstream_start = area_plot_point(0.18, 0.20)
+        downstream_end = area_plot_point(0.70, 0.76)
+        QtTest.QTest.mousePress(
+            area_board,
+            QtCore.Qt.LeftButton,
+            pos=downstream_start,
+        )
+        drag_mouse_move(area_board, downstream_end, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseRelease(
+            area_board,
+            QtCore.Qt.LeftButton,
+            pos=downstream_end,
+        )
+        downstream_area_signal = panel_signal_key(
+            area_card.panel_id,
+            AREA_DATA_OUTPUT,
+        )
+        until(
+            application,
+            lambda: console._tick_data.value(downstream_area_signal) is not None,
+            timeout=15.0,
+        )
+
+        # Deterministically stop at the old-visible/new-candidate boundary:
+        # camera N+1 and Area N+1 are complete, while the downstream Area panel
+        # still keeps the coherent N closure visible.  Restart the source Logic
+        # node through its real Start button before the queued descendant can
+        # be accepted.  Topology must keep the exact N sidecar and never throw.
+        until(application, lambda: console._render_lane.idle, timeout=15.0)
+        console._timer.stop()
+        visible_source = console._tick_data.value(signal)
+        visible_area = console._tick_data.value(area_signal)
+        assert visible_source is not None and visible_area is not None
+        until(
+            application,
+            lambda: bool(console._data._dirty),
+            timeout=10.0,
+        )
+        retained_front = console._data.freeze()
+        candidate_source = console._data.candidate_value(signal)
+        assert retained_front.value(area_signal) is not None
+        assert candidate_source is not None
+        assert (
+            signal_revision_identity(candidate_source)
+            != signal_revision_identity(visible_source)
+        )
+        source_entry = console._signal_topology()[signal]
+        output_request = card.freeze_figure_output_request(
+            source_contract_id=source_entry.declaration.contract_id,
+            live_source_override=candidate_source,
+        )
+        assert output_request is not None and output_request.request is not None
+        output_request = replace(
+            output_request,
+            source_component=console._data.capture_source_component(
+                candidate_source
+            ),
+        )
+        output_session = FigureOutputSession()
+        try:
+            candidate_outputs = output_session.evaluate(output_request.request)
+        finally:
+            output_session.close()
+        assert AREA_DATA_OUTPUT in candidate_outputs.outputs
+        console._accept_figure_output_completion(
+            output_request,
+            candidate_outputs,
+            None,
+        )
+        staged_route = console._presentations._routes[area_signal]
+        still_visible = console._tick_data.value(area_signal)
+        assert still_visible is not None
+        assert staged_route.visible is not None
+        assert staged_route.candidate is not None
+        assert (
+            staged_route.visible.revision_identity
+            == signal_revision_identity(still_visible)
+        )
+        assert (
+            staged_route.candidate.revision_identity
+            != staged_route.visible.revision_identity
+        )
+        assert console._presentations.presentation_for(still_visible) is not None
+        old_route_identities = {
+            entry.revision_identity
+            for route_name in (area_signal, downstream_area_signal)
+            for entry in (
+                console._presentations._routes[route_name].visible,
+                console._presentations._routes[route_name].candidate,
+            )
+            if entry is not None
+        }
+        old_generation = (visible_source.run_id, visible_source.epoch_id)
+        previous_node = console._logic_nodes[id(row)]
+
+        editor.form.stop_button.click()
+        console._timer.start()
+        until(
+            application,
+            lambda: not previous_node.running,
+            timeout=15.0,
+        )
+        editor.form.start_button.click()
+        # Restart retires the complete old causal tree before the replacement
+        # generation may publish.  Neither a staged selector completion nor a
+        # downstream selector may resurrect the old Camera run/epoch.
+        until(
+            application,
+            lambda: (
+                (replacement := console._logic_nodes.get(id(row))) is not None
+                and replacement is not previous_node
+            ),
+            timeout=15.0,
+        )
+        # A completion already frozen against the retired generation is stale
+        # even if it arrives after the replacement has started.
+        console._accept_figure_output_completion(
+            output_request,
+            candidate_outputs,
+            None,
+        )
+        restarted_front = console._tick_data
+        for route_name in (signal, area_signal, downstream_area_signal):
+            value = restarted_front.value(route_name)
+            assert value is None or (value.run_id, value.epoch_id) != old_generation
+        for route_name in (area_signal, downstream_area_signal):
+            route = console._presentations._routes.get(route_name)
+            if route is not None:
+                assert all(
+                    entry is None
+                    or entry.revision_identity not in old_route_identities
+                    for entry in (route.visible, route.candidate)
+                )
+
         capture_offscreen_window(
             application,
             console,
@@ -1124,9 +1337,10 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             "roi_radius",
             "camera_role",
         }
+        calibration_output = tmp_path / "calibration-output"
         _replace_path_value(
             calibration_widgets["folder"],
-            str(tmp_path / "calibration-output"),
+            str(calibration_output),
         )
         _replace_spin_value(calibration_widgets["threshold_frames"], "10")
         QtTest.QTest.mouseClick(
@@ -1149,6 +1363,106 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             time.sleep(0.005)
         assert saw_calibration_panel
         assert not console._task_locked
+        site_map_signal = console_signal_key(
+            calibration_row.node.node_id,
+            "site_map",
+        )
+        until(
+            application,
+            lambda: any(
+                card.config.signal == site_map_signal
+                and card.config.kind == "sites"
+                and card.board is not None
+                and card.board.front_frame is not None
+                for card in console.cards
+            ),
+            timeout=15.0,
+        )
+        site_map_card = next(
+            card
+            for card in console.cards
+            if card.config.signal == site_map_signal
+            and card.config.kind == "sites"
+        )
+
+        # Exercise the real FINAL projector and the exact presentation that
+        # TaskConsole admitted beside its visible SignalValue.  This is not a
+        # report-shaped contract reconstructed by the test.
+        from zlc_frontend import (
+            DEFAULT_PANEL_SIZE,
+            PlotPanelComposeRequest,
+            PlotPanelSession,
+        )
+        from zlc_frontend.plot_layout import (
+            PANEL_EXPORT_PIXEL_RATIO,
+            panel_surface_geometry,
+        )
+        from zlc_frontend.site_map import SiteMapPresentation
+        from zlc_neutral_atom.logic_nodes.readout.calibration.ui.view_projection import (
+            project_calibration_final_views,
+        )
+
+        retained = console._last_node[id(calibration_row)]
+        visible_front = console._data.freeze()
+        site_map_value = visible_front.value(site_map_signal)
+        assert site_map_value is not None
+        visible_presentation = console._presentations.presentation_for(
+            site_map_value
+        )
+        assert isinstance(visible_presentation, SiteMapPresentation)
+        projected = project_calibration_final_views(
+            retained.prepared_command,
+            retained.final_result,
+            retained.materialized_final_outputs,
+        )["site_map"]
+        assert visible_presentation.view_identity == projected.view_identity
+        assert visible_presentation.background_input == projected.background_input
+        assert visible_presentation.site_state_input == projected.site_state_input
+
+        contract = site_map_card.frozen_plot_panel_contract()
+        assert contract.kind == "sites"
+        assert contract.size_name == DEFAULT_PANEL_SIZE
+        axis_labels, short_labels = console._panel_render_labels()
+        request = site_map_card.freeze_render_request(
+            visible_front,
+            ("calibration-final-site-map", site_map_value.snapshot.ref.revision.value),
+            force=True,
+            axis_labels=axis_labels,
+            short_labels=short_labels,
+        )
+        assert request is not None
+        assert request.contract == contract
+        assert request.source.site_map is visible_presentation
+        direct_session = PlotPanelSession(request.contract)
+        try:
+            direct = direct_session.compose(
+                PlotPanelComposeRequest(
+                    request.source,
+                    request.display,
+                    request.provenance,
+                )
+            )
+        finally:
+            direct_session.close()
+        assert direct.frame is not None
+        visible_raster = site_map_card.board.front_frame.panels[0].raster
+        assert direct.frame.panels[0].raster == visible_raster
+
+        # The saved report uses denser export pixels for the same ordinary
+        # logical 2x2 surface.  It does not obtain resolution by authoring a
+        # larger panel.
+        overview_png = (calibration_output / "report" / "overview.png").read_bytes()
+        assert overview_png.startswith(b"\x89PNG\r\n\x1a\n")
+        import struct
+
+        overview_pixels = struct.unpack(">II", overview_png[16:24])
+        export_geometry = panel_surface_geometry(
+            DEFAULT_PANEL_SIZE,
+            pixel_ratio=PANEL_EXPORT_PIXEL_RATIO,
+        )
+        assert overview_pixels == export_geometry.raster_size
+        assert export_geometry.logical_size == contract.logical_size
+
         calibration_final = console_signal_key(
             calibration_row.node.node_id,
             "calibration",

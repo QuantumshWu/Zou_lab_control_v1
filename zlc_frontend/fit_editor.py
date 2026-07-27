@@ -14,18 +14,35 @@ from dataclasses import dataclass, replace
 from zlc_data import (
     AxisId,
     BoundFit,
+    DataTransformSpec,
     FitNumericPolicy,
     FitSpec,
+    HISTOGRAM_BIN_AXIS_ID,
+    HistogramSpec,
+    IndexSelection,
+    MissingPolicy,
+    ReductionMethod,
+    ReductionSpec,
     Selection,
+    ValidityPolicy,
     bind_fit,
+    commit_transform,
     fit_model_catalog,
+    fit_spec_for,
     suggest_fit_draft,
 )
 
 from ._fit_arguments import format_fit_arguments, parse_fit_arguments
 from .authority import describe_authoritative_transform
 from .data_figure import DataFigure
-from .figure import AxisViewRole, ViewIntent
+from .figure import (
+    AxisViewRole,
+    DisplayReductionMethod,
+    FixedIndex,
+    LatestNonempty,
+    ViewIntent,
+)
+from .histogram_display import HistogramBinProjection
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +212,8 @@ def fit_projection_metadata(
             axis_id for axis_id, role in roles if role is AxisViewRole.IMAGE_Y
         )
         fit_axes = (*x_axes, *y_axes)
+    elif intent is ViewIntent.HISTOGRAM:
+        fit_axes = (HISTOGRAM_BIN_AXIS_ID,)
     else:
         fit_axes = ()
     expected = (
@@ -202,6 +221,8 @@ def fit_projection_metadata(
         if intent is ViewIntent.CURVE
         else 2
         if intent is ViewIntent.IMAGE
+        else 1
+        if intent is ViewIntent.HISTOGRAM
         else 0
     )
     if len(fit_axes) != expected:
@@ -281,11 +302,109 @@ def validate_fit_authoring_options(
     return tuple(prepared)
 
 
+def histogram_fit_transform(
+    figure: DataFigure,
+    projection: HistogramBinProjection,
+):
+    """Commit the exact displayed samples/bins without promoting display state.
+
+    The Figure view remains presentation-only.  This function copies only its
+    explicit named selection/reduction intent and the already-painted bin
+    edges into a new authoritative transform when the operator asks to Fit.
+    """
+
+    if not isinstance(projection, HistogramBinProjection):
+        raise TypeError("Histogram Fit requires its exact visible bin projection")
+    layer = figure.document.layers[0]
+    evaluated_layer = figure.evaluated.layers[0]
+    if layer.layer_id != evaluated_layer.layer_id:
+        raise ValueError("Histogram Figure layer identity changed during Fit preparation")
+    view = layer.view
+    fixed_by_axis: dict[AxisId, int] = {}
+    resolution_by_axis = {
+        resolution.axis_id: resolution.index
+        for resolution in evaluated_layer.resolutions
+    }
+    for binding in view.axis_bindings:
+        if binding.role not in (AxisViewRole.SELECTED, AxisViewRole.SLIDER):
+            continue
+        selector = binding.selector
+        if isinstance(selector, FixedIndex):
+            fixed_by_axis[binding.axis_id] = selector.index
+        elif isinstance(selector, LatestNonempty):
+            try:
+                fixed_by_axis[binding.axis_id] = resolution_by_axis[binding.axis_id]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Histogram Fit cannot resolve latest index for {binding.axis_id}"
+                ) from exc
+        else:  # pragma: no cover - ViewSpec owns the closed selector union.
+            raise TypeError("Histogram Figure has an unsupported selector")
+
+    operations: list[object] = []
+    for display_selection in view.display_selections:
+        retained = tuple(
+            term
+            for term in display_selection.terms
+            if term.axis_id not in fixed_by_axis
+        )
+        if retained:
+            operations.append(Selection(retained))
+    if fixed_by_axis:
+        operations.append(
+            Selection(
+                tuple(
+                    IndexSelection(axis_id, index)
+                    for axis_id, index in fixed_by_axis.items()
+                )
+            )
+        )
+
+    reduced = tuple(
+        binding
+        for binding in view.axis_bindings
+        if binding.role is AxisViewRole.REDUCED
+    )
+    if reduced:
+        methods = {binding.reduction.method for binding in reduced}
+        if len(methods) != 1:
+            raise ValueError("Histogram Fit reductions must share one method")
+        method = next(iter(methods))
+        operations.append(
+            ReductionSpec(
+                tuple(binding.axis_id for binding in reduced),
+                ReductionMethod.MEAN
+                if method is DisplayReductionMethod.MEAN
+                else ReductionMethod.SUM,
+                missing_policy=MissingPolicy.OMIT_MISSING,
+                validity_policy=ValidityPolicy.OMIT_INVALID,
+            )
+        )
+
+    sample_axis_ids = tuple(
+        binding.axis_id
+        for binding in view.axis_bindings
+        if binding.role is AxisViewRole.SAMPLE
+    )
+    operations.append(
+        HistogramSpec(
+            sample_axis_ids,
+            tuple(float(value) for value in projection.bin_edges),
+        )
+    )
+    snapshot = figure.datasets.resolve(layer.dataset_id)
+    return commit_transform(
+        snapshot.block.schema,
+        DataTransformSpec(tuple(operations)),
+    )
+
+
 def prepare_fit_authoring_options(
     figure: DataFigure,
     selection: Selection | None,
     *,
     seed_spec: FitSpec | None = None,
+    histogram_projection: HistogramBinProjection | None = None,
 ) -> tuple[FitAuthoringOption, ...]:
     """Prepare every compatible model for one exact authored Figure.
 
@@ -305,8 +424,15 @@ def prepare_fit_authoring_options(
         raise ValueError("Figure Fit requires exactly one dataset layer")
     layer = figure.document.layers[0]
     intent = layer.view.intent
-    if intent not in (ViewIntent.CURVE, ViewIntent.IMAGE):
-        raise ValueError("Fit is available only for curve and image Figures")
+    if intent not in (ViewIntent.CURVE, ViewIntent.IMAGE, ViewIntent.HISTOGRAM):
+        raise ValueError("Fit is available only for curve, image, and histogram Figures")
+    if intent is ViewIntent.HISTOGRAM:
+        if selection is not None:
+            raise ValueError("Histogram Fit authority comes from its named sample view")
+        if histogram_projection is None:
+            raise ValueError("Histogram Fit requires the exact painted bin projection")
+    elif histogram_projection is not None:
+        raise ValueError("only a Histogram Figure accepts a bin projection")
 
     fit_axis_ids, axis_roles = fit_projection_metadata(figure, intent)
     snapshot = figure.datasets.resolve(layer.dataset_id)
@@ -333,13 +459,58 @@ def prepare_fit_authoring_options(
             seed_matches_authority = tuple(transform.spec.operations) == (selection,)
 
     options = []
-    for definition in fit_model_catalog():
+    histogram_transform = (
+        histogram_fit_transform(figure, histogram_projection)
+        if intent is ViewIntent.HISTOGRAM
+        else None
+    )
+    catalog = fit_model_catalog()
+    if intent is ViewIntent.HISTOGRAM:
+        preferred = ("bimodal_gaussian", "histogram_gaussian")
+        catalog = tuple(
+            sorted(
+                catalog,
+                key=lambda definition: (
+                    preferred.index(definition.model_id)
+                    if definition.model_id in preferred
+                    else len(preferred),
+                    definition.model_id,
+                ),
+            )
+        )
+    for definition in catalog:
         same_seed_model = bool(
             seed_spec is not None
             and seed_spec.model_id == definition.model_id
         )
         try:
-            if same_seed_model and seed_matches_authority:
+            if intent is ViewIntent.HISTOGRAM:
+                if (
+                    same_seed_model
+                    and seed_matches_schema
+                    and seed_spec is not None
+                    and seed_spec.committed_transform == histogram_transform
+                ):
+                    bound = bind_fit(seed_spec, schema)
+                else:
+                    bound = bind_fit(
+                        fit_spec_for(
+                            schema,
+                            definition.model_id,
+                            committed_transform=histogram_transform,
+                            fit_axis_ids=(HISTOGRAM_BIN_AXIS_ID,),
+                            constraints=(
+                                seed_spec.constraints if same_seed_model else ()
+                            ),
+                            numeric_policy=(
+                                seed_spec.numeric_policy
+                                if same_seed_model
+                                else FitNumericPolicy()
+                            ),
+                        ),
+                        schema,
+                    )
+            elif same_seed_model and seed_matches_authority:
                 bound = bind_fit(seed_spec, schema)
             else:
                 bound = suggest_fit_draft(
@@ -458,5 +629,6 @@ __all__ = [
     "prepare_fit_authoring_options",
     "reconcile_fit_authoring_draft",
     "fit_spec_from_arguments",
+    "histogram_fit_transform",
     "validate_fit_authoring_options",
 ]

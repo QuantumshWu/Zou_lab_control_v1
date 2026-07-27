@@ -15,17 +15,7 @@ from .figure import (
     EvaluatedMeter,
     FigureDocument,
 )
-from .fit_image_projection import (
-    RadialGaussianImageFitPanel,
-    address_label as _address_label,
-    evaluated_figure_panels as _panels,
-    figure_panel_title as _panel_title,
-    fit_batch_storage_index as _batch_storage_index,
-    fit_panel_selection as _fit_panel_selection,
-    panel_focus_selection as _panel_focus_selection,
-    radial_gaussian_fit_geometry,
-    reduction_label as _reduction_label,
-)
+from .fit_projection import fit_batch_storage_index as _batch_storage_index
 from .curve_display import (
     CurveDisplayState,
     CurveViewportTransform,

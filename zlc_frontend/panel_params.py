@@ -34,10 +34,6 @@ _HISTOGRAM_COUNT_SCALE = _canonical_field(
     histogram_display_form_spec(),
     "count_scale",
 )
-_HISTOGRAM_FIT_MODE = _canonical_field(
-    histogram_display_form_spec(),
-    "fit_mode",
-)
 
 
 PANEL_PARAMS: Mapping[str, tuple[FormFieldProps, ...]] = MappingProxyType({
@@ -59,7 +55,6 @@ PANEL_PARAMS: Mapping[str, tuple[FormFieldProps, ...]] = MappingProxyType({
     "hist": (
         _HISTOGRAM_BIN_COUNT,
         _HISTOGRAM_COUNT_SCALE,
-        _HISTOGRAM_FIT_MODE,
     ),
 })
 

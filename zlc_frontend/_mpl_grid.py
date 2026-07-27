@@ -13,16 +13,11 @@ from .figure import (
     EvaluatedMeter,
     FigureDocument,
 )
-from .fit_image_projection import (
-    RadialGaussianImageFitPanel,
-    address_label as _address_label,
+from .fit_projection import (
     evaluated_figure_panels as _panels,
-    figure_panel_title as _panel_title,
-    fit_batch_storage_index as _batch_storage_index,
     fit_panel_selection as _fit_panel_selection,
     panel_focus_selection as _panel_focus_selection,
-    radial_gaussian_fit_geometry,
-    reduction_label as _reduction_label,
+    fit_batch_storage_index as _batch_storage_index,
 )
 from .data_figure import FigurePanelRegion
 from .plot_layout import (
@@ -31,7 +26,7 @@ from .plot_layout import (
     image_panel_layout,
     image_panel_layout_for_raster,
     LIVE_PANEL_DPI,
-    optimal_grid_size,
+    optimal_grid_size_for_cells,
     panel_data_box,
     panel_data_box_for_raster,
     panel_figure_size_inches,
@@ -106,12 +101,16 @@ def _live_grid_axes(
 
     tick_points = float(matplotlib.rcParams["xtick.labelsize"])
     rows, columns = grid_shape_for(cell_count)
+    # Main's recommendation belongs to facet cardinality, before an IMAGE's
+    # fixed aspect repacks those same cells.  Keep that one recommendation for
+    # both the initial size policy and the two-tier cell-font comparison;
+    # deriving it again from renderer packing would create a second owner.
+    recommended = optimal_grid_size_for_cells(cell_count)
     if cell_aspect is not None:
-        provisional = optimal_grid_size(rows, columns)
         region_px, _column_gap, _row_gap, _margins, _font_scale = (
             site_grid_geometry(
                 size,
-                provisional,
+                recommended,
                 tick_font_points=tick_points,
             )
         )
@@ -120,7 +119,6 @@ def _live_grid_axes(
             cell_aspect,
             region_px,
         )
-    recommended = optimal_grid_size(rows, columns)
     data_px, column_gap, row_gap, margins, font_scale = site_grid_geometry(
         size,
         recommended,
@@ -158,7 +156,7 @@ def _live_grid_axes(
 def _live_grid_cell_title(cell, series_group) -> str:
     """Return Main's role-authored facet identifier."""
 
-    from .fit_image_projection import address_label
+    from .fit_projection import address_label
 
     addresses = tuple(cell.facet_address)
     if len(series_group) == 1:

@@ -259,6 +259,27 @@ class FitAuthoringPane(QtWidgets.QWidget):
             kind == "fit" or (idle and (editor_ready or self._draft_ready))
         )
 
+    def set_live_source_frozen(self, frozen: bool) -> None:
+        """Expose the live-surface Fit pin through the existing Clear action.
+
+        A fixed DataFigure/Edit source never calls this method.  A live Figure
+        does, so the operator can see that acquisition still advances behind
+        the exact fitted revision and that Clear is the action that resumes it.
+        No second status widget or per-window Fit control is introduced.
+        """
+
+        frozen = bool(frozen)
+        self.clear_button.setText(
+            "Clear · Resume live" if frozen else "Clear"
+        )
+        self.clear_button.setToolTip(
+            (
+                "Figure frozen at fitted revision; Clear resumes the latest live frame"
+                if frozen
+                else "Clear the current Fit"
+            )
+        )
+
     @staticmethod
     def _validated_options(
         options: tuple[FitAuthoringOption, ...],

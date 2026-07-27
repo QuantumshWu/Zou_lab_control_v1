@@ -10,7 +10,6 @@ from zlc_frontend.figure import (
     AxisViewBinding,
     AxisViewRole,
     FixedIndex,
-    LatestNonempty,
     ViewSpec,
     dataset_axes,
     validate_view_spec,
@@ -19,19 +18,6 @@ from zlc_frontend.figure import (
 from .fluent import FluentComboBox, FluentSettingRow, signals_blocked
 
 __all__ = ["ViewSpecEditor"]
-
-
-_ROLE_TEXT = {
-    AxisViewRole.X: "x axis",
-    AxisViewRole.IMAGE_X: "image x",
-    AxisViewRole.IMAGE_Y: "image y",
-    AxisViewRole.SAMPLE: "samples",
-    AxisViewRole.BATCH: "batch / series",
-    AxisViewRole.FACET: "facet",
-    AxisViewRole.SLIDER: "slider",
-    AxisViewRole.SELECTED: "selected",
-    AxisViewRole.REDUCED: "reduce",
-}
 
 
 def _coordinate_text(axis, index: int) -> str:
@@ -43,12 +29,19 @@ def _coordinate_text(axis, index: int) -> str:
 
 
 class ViewSpecEditor(QtWidgets.QWidget):
-    """Show every named axis role and edit only explicit index selectors.
+    """Edit only the named axis selections an operator can actually change.
 
-    The widget never guesses a view.  Its owner supplies the exact effective
-    ``ViewSpec`` produced by frontend policy.  Rows are reconciled by AxisId:
-    ordinary data revisions update nothing, while a true schema change adds,
-    removes, or reorders only the affected rows.
+    X/Y, reduction, batch, facet, and automatic-latest roles are resolved
+    presentation state, not controls.  Showing those as disabled combo boxes
+    made an internal ``ViewSpec`` look like a broken form (for example
+    ``Reduce``, ``ROI X`` and ``ROI Y`` rows that could not be edited).  Repeat
+    and Grid facet have their own explicit controls; this editor owns only a
+    finite ``FixedIndex`` choice on a ``SELECTED``/``SLIDER`` axis.
+
+    The owner supplies the exact effective ``ViewSpec`` produced by frontend
+    policy.  Rows are reconciled by AxisId: ordinary data revisions update
+    nothing, while a true schema change adds, removes, or reorders only the
+    affected editable rows.
     """
 
     viewChanged = QtCore.pyqtSignal(object)
@@ -76,7 +69,16 @@ class ViewSpecEditor(QtWidgets.QWidget):
         if not isinstance(view, ViewSpec):
             raise TypeError("view editor requires ViewSpec or None")
         validate_view_spec(schema, view)
-        axes = tuple(dataset_axes(schema))
+        axes = tuple(
+            axis
+            for axis in dataset_axes(schema)
+            if (
+                (binding := view.binding(axis.axis_id)).role
+                in (AxisViewRole.SLIDER, AxisViewRole.SELECTED)
+                and isinstance(binding.selector, FixedIndex)
+                and axis.size > 1
+            )
+        )
         axis_ids = {axis.axis_id for axis in axes}
         self._updating = True
         try:
@@ -110,41 +112,28 @@ class ViewSpecEditor(QtWidgets.QWidget):
                 self._layout.insertWidget(position, row)
                 self._seed_combo(axis, view.binding(axis.axis_id), combo)
                 row.setToolTip(
-                    f"{axis.axis_id.value} · declared role {axis.role.value} · "
-                    f"view role {view.binding(axis.axis_id).role.value}"
+                    f"Choose which {axis.name} coordinate this panel displays."
                 )
                 row.show()
         finally:
             self._updating = False
         self._schema = schema
         self._view = view
-        self.show()
+        self.setVisible(bool(axes))
 
     def _seed_combo(self, axis, binding: AxisViewBinding, combo) -> None:
-        role_text = _ROLE_TEXT[binding.role]
+        if (
+            binding.role not in (AxisViewRole.SLIDER, AxisViewRole.SELECTED)
+            or not isinstance(binding.selector, FixedIndex)
+            or axis.size <= 1
+        ):
+            raise ValueError("view editor received a non-editable axis binding")
         with signals_blocked(combo):
             combo.clear()
-            selector = binding.selector
-            if isinstance(selector, FixedIndex):
-                for index in range(axis.size):
-                    combo.addItem(
-                        f"{role_text} · {_coordinate_text(axis, index)}",
-                        index,
-                    )
-                combo.setCurrentIndex(int(selector.index))
-                combo.setEnabled(axis.size > 1)
-            elif isinstance(selector, LatestNonempty):
-                combo.addItem(f"{role_text} · latest nonempty", None)
-                combo.setEnabled(False)
-            elif binding.reduction is not None:
-                combo.addItem(
-                    f"{role_text} · {binding.reduction.method.value.lower()}",
-                    None,
-                )
-                combo.setEnabled(False)
-            else:
-                combo.addItem(role_text, None)
-                combo.setEnabled(False)
+            for index in range(axis.size):
+                combo.addItem(_coordinate_text(axis, index), index)
+            combo.setCurrentIndex(int(binding.selector.index))
+            combo.setEnabled(True)
 
     def _commit_index(self, axis_id, combo_index: int) -> None:
         if self._updating or self._schema is None or self._view is None:

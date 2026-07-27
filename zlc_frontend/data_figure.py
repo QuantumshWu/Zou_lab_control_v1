@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 from zlc_data import (
     DatasetSchema,
     FitResultBatch,
+    HISTOGRAM_BIN,
+    HistogramSpec,
     Selection,
     validate_fit_result_source_binding,
 )
@@ -159,17 +161,34 @@ def _validated_fit_result_mapping(
         if not source_and_view_validated:
             validate_fit_result_source_binding(result, source_ref, source_schema)
         if result.spec.committed_transform is not None and not source_and_view_validated:
-            try:
-                _validate_selection_fit_view(
-                    source_schema,
-                    result,
-                    layer.view,
-                )
-            except ValueError as exc:
-                raise ValueError(
-                    "transformed fit overlay is not faithfully displayable: "
-                    f"{exc}"
-                ) from exc
+            operations = tuple(result.spec.committed_transform.spec.operations)
+            histogram = operations[-1] if operations else None
+            if isinstance(histogram, HistogramSpec):
+                if layer.view.intent is not ViewIntent.HISTOGRAM:
+                    raise ValueError(
+                        "histogram Fit authority requires a HISTOGRAM Figure"
+                    )
+                sample_axes = {
+                    binding.axis_id
+                    for binding in layer.view.axis_bindings
+                    if binding.role is AxisViewRole.SAMPLE
+                }
+                if set(histogram.axis_ids) != sample_axes:
+                    raise ValueError(
+                        "histogram Fit sample axes differ from the Figure view"
+                    )
+            else:
+                try:
+                    _validate_selection_fit_view(
+                        source_schema,
+                        result,
+                        layer.view,
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "transformed fit overlay is not faithfully displayable: "
+                        f"{exc}"
+                    ) from exc
         fit_layers[layer_id] = (layer, result)
 
     if evaluated is None:
@@ -184,7 +203,19 @@ def _validated_fit_result_mapping(
     for layer, result in fit_layers.values():
         fit_axes = result.fit_axis_specs
         if len(fit_axes) == 1:
-            if (
+            if layer.view.intent is ViewIntent.HISTOGRAM:
+                transform = result.spec.committed_transform
+                operations = () if transform is None else transform.spec.operations
+                if (
+                    fit_axes[0].role != HISTOGRAM_BIN
+                    or not operations
+                    or not isinstance(operations[-1], HistogramSpec)
+                    or operations[-1].bin_axis_id != fit_axes[0].axis_id
+                ):
+                    raise ValueError(
+                        "histogram Fit overlay requires its committed bin axis"
+                    )
+            elif (
                 layer.view.intent is not ViewIntent.CURVE
                 or layer.view.binding(fit_axes[0].axis_id).role is not AxisViewRole.X
             ):
@@ -426,7 +457,7 @@ class DataFigure:
         )
         # Imported lazily because fit_image_projection also imports the public
         # FigurePanelRegion DTO from this module.
-        from .fit_image_projection import panel_focus_selection
+        from .fit_projection import panel_focus_selection
 
         series_group = cell.series
         actual_selection = panel_focus_selection(layer, cell, series_group)
@@ -788,6 +819,28 @@ class DataFigure:
             self._document,
             self._evaluated,
             self._single_panel_source_schema(),
+            result,
+            result_identity=result_identity,
+            check_cancelled=check_cancelled,
+        )
+
+    def transient_single_panel_histogram_fit_overlays(
+        self,
+        projection,
+        result: FitResultBatch,
+        *,
+        result_identity: str,
+        check_cancelled=None,
+    ):
+        """Project one formal Fit result onto this exact histogram front."""
+
+        from .fit_histogram_projection import (
+            transient_single_panel_histogram_fit_overlays,
+        )
+
+        return transient_single_panel_histogram_fit_overlays(
+            self,
+            projection,
             result,
             result_identity=result_identity,
             check_cancelled=check_cancelled,

@@ -51,6 +51,7 @@ from .figure import (
 )
 from .histogram_display import (
     FacetedHistogramDisplayState,
+    HistogramBinProjection,
     HistogramDisplayState,
 )
 from .image_display import (
@@ -58,6 +59,7 @@ from .image_display import (
     image_viewport_for_display_state,
     resolve_image_color_limits,
 )
+from .panel_size import DEFAULT_PANEL_SIZE
 from .plot_layout import panel_surface_geometry
 from .render import PanelPresentationIdentity
 
@@ -215,7 +217,7 @@ class PanelComposer:
         panel_id: str,
         *,
         intent: ViewIntent = ViewIntent.IMAGE,
-        size_name: str = "2x2",
+        size_name: str = DEFAULT_PANEL_SIZE,
         pixel_ratio: float = 1.0,
         selection=None,
         label: str = "",
@@ -928,10 +930,24 @@ class PanelComposer:
         if self._intent is ViewIntent.HISTOGRAM:
             if not isinstance(data, EvaluatedHistogram):
                 raise PanelRenderError("this signal does not evaluate to a histogram")
+            projection = self._histogram_projection(
+                evaluated,
+                display,
+                value_range=histogram_projection_value_range,
+            )
+            overlays = ()
+            if fit_result is not None:
+                overlays = figure.transient_single_panel_histogram_fit_overlays(
+                    projection,
+                    fit_result,
+                    result_identity=fit_result_identity,
+                    check_cancelled=check_cancelled,
+                )
             return self._histogram_front(
                 evaluated,
                 display,
-                projection_value_range=histogram_projection_value_range,
+                projection=projection,
+                fit_overlays=overlays,
             )
         if self._intent is ViewIntent.METER:
             if not isinstance(data, EvaluatedMeter):
@@ -1016,12 +1032,26 @@ class PanelComposer:
                 self._curve_relim_mode = display.relim_mode
                 return raster, payload
             if self._intent is ViewIntent.HISTOGRAM:
+                projection = self._histogram_projection(
+                    figure.evaluated,
+                    display,
+                )
+                overlays = ()
+                if fit_result is not None:
+                    overlays = figure.transient_single_panel_histogram_fit_overlays(
+                        projection,
+                        fit_result,
+                        result_identity=fit_result_identity,
+                        check_cancelled=check_cancelled,
+                    )
                 raster, payload = renderer.render_interactive_histogram(
                     figure.evaluated,
                     display,
                     current_count_limits=self._histogram_count_limits,
                     previous_relim_mode=self._histogram_relim_mode,
                     previous_count_scale=self._histogram_count_scale,
+                    bin_projection=projection,
+                    fit_overlays=overlays,
                 )
                 self._histogram_count_limits = payload.viewport.count_limits
                 self._histogram_relim_mode = display.relim_mode
@@ -1252,25 +1282,44 @@ class PanelComposer:
         evaluated,
         display: HistogramDisplayState,
         *,
-        projection_value_range: tuple[float, float] | None = None,
+        projection: HistogramBinProjection,
+        fit_overlays=(),
     ):
-        options = {}
-        if projection_value_range is not None:
-            from .display_range import validated_display_range
-
-            options["projection_value_range"] = validated_display_range(
-                projection_value_range,
-                "histogram projection value range",
-            )
         raster, payload = self._agg().render_interactive_histogram(
             evaluated,
             display,
             current_count_limits=self._histogram_count_limits,
             previous_relim_mode=self._histogram_relim_mode,
             previous_count_scale=self._histogram_count_scale,
-            **options,
+            bin_projection=projection,
+            fit_overlays=fit_overlays,
         )
         self._histogram_count_limits = payload.viewport.count_limits
         self._histogram_relim_mode = display.relim_mode
         self._histogram_count_scale = display.count_scale
         return raster, payload
+
+    @staticmethod
+    def _histogram_projection(
+        evaluated,
+        display: HistogramDisplayState,
+        *,
+        value_range: tuple[float, float] | None = None,
+    ) -> HistogramBinProjection:
+        """Freeze full-sample bins; x-view zoom never changes Fit authority."""
+
+        if not isinstance(display, HistogramDisplayState):
+            raise TypeError("histogram projection requires HistogramDisplayState")
+        if len(evaluated.layers) != 1 or len(evaluated.layers[0].cells) != 1:
+            raise PanelRenderError("histogram projection requires one logical panel")
+        series = evaluated.layers[0].cells[0].series
+        histograms = tuple(item.data for item in series)
+        if not histograms or any(
+            not isinstance(item, EvaluatedHistogram) for item in histograms
+        ):
+            raise PanelRenderError("histogram projection requires histogram series")
+        return HistogramBinProjection(
+            tuple(item.samples for item in histograms),
+            bins=display.bin_count,
+            value_range=value_range,
+        )

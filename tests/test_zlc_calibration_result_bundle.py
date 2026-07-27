@@ -15,6 +15,9 @@ from zlc_frontend import (
     render_plot_report,
 )
 from zlc_frontend.encoded_raster import encode_raster_buffer_png
+from zlc_frontend.plot_layout import (
+    PANEL_EXPORT_PIXEL_RATIO,
+)
 from zlc_data import (
     SITE,
     SPATIAL_X,
@@ -218,12 +221,18 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         render_report=_render_current_report,
     )
 
-    # Calibration supplies only the typed SiteMap page.  Its saved overview
-    # must be the exact raster produced when an ordinary Plot Panel consumes
-    # the same frontend contract, source, display state, and provenance.
+    # Calibration supplies only the typed SiteMap page.  The report writer
+    # must persist exactly the raster produced by the frontend report contract;
+    # the real TaskConsole FINAL-card route is covered by the GUI product-flow
+    # test rather than reconstructed here.
     document = project_calibration_plot_report(view)
     overview = next(page for page in document.pages if page.key == "overview")
-    session = PlotPanelSession(overview.contract)
+    assert overview.contract.size_name == "2x2"
+    report_runtime_contract = replace(
+        overview.contract,
+        pixel_ratio=PANEL_EXPORT_PIXEL_RATIO,
+    )
+    session = PlotPanelSession(report_runtime_contract)
     try:
         direct = session.compose(
             PlotPanelComposeRequest(
@@ -234,6 +243,10 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         )
         assert direct.frame is not None
         assert len(direct.frame.panels) == 1
+        presentation = direct.frame.panels[0].coherence_stamp.presentations
+        assert len(presentation) == 1
+        assert presentation[0].panel_id == report_runtime_contract.panel_id
+        assert presentation[0].panel_revision == overview.display.revision
         direct_png = encode_raster_buffer_png(direct.frame.panels[0].raster)
     finally:
         session.close()

@@ -20,10 +20,12 @@ from .plot_panel import (
 )
 from .figure_source import FigureSource
 from .panel_render import PanelProvenance
-from .plot_layout import panel_surface_geometry
-
-
-_REPORT_PANEL_SIZE = "8x8"
+from .plot_layout import (
+    PANEL_EXPORT_PIXEL_RATIO,
+    optimal_grid_size_for_view,
+    panel_surface_geometry,
+)
+from .panel_size import DEFAULT_PANEL_SIZE
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +90,17 @@ def plot_report_page(
 
     key = canonical_text(key, "report page key")
     title = canonical_text(title, "report page title")
+    # Ordinary pages use the product's stock 2x2 surface.  A Grid uses the
+    # exact same schema/view topology policy as an interactive Grid; export
+    # resolution remains a separate terminal-render concern below.
+    size_name = DEFAULT_PANEL_SIZE
+    if str(kind) == "grid":
+        if view is None:
+            raise ValueError("Grid report page requires a resolved ViewSpec")
+        size_name = optimal_grid_size_for_view(
+            source.snapshot.block.schema,
+            view,
+        )
     return PlotReportPage(
         key,
         title,
@@ -96,7 +109,7 @@ def plot_report_page(
             kind,
             title,
             str(value_label),
-            size_name=_REPORT_PANEL_SIZE,
+            size_name=size_name,
             view=view,
         ),
         source,
@@ -115,22 +128,26 @@ def _one_panel_png(frame) -> bytes:
 def render_plot_report(
     document: PlotReportDocument,
     *,
-    surface_pixel_ratio: float = 1.0,
+    surface_pixel_ratio: float | None = None,
     checkpoint: Callable[[], None] | None = None,
 ) -> EncodedRasterDocument:
     """Render one immutable report for the caller's runtime raster surface.
 
     ``PlotReportDocument`` carries scientific inputs and authored display
-    intent only.  Screen DPR is deliberately supplied at this terminal render
-    boundary, so moving a window never rebuilds calibration physics or mutates
-    the document.  Every runtime page geometry is derived by the frontend's
-    sole :func:`panel_surface_geometry` owner.
+    intent only.  Its named logical panel size is therefore identical to an
+    interactive Plot Panel.  Screen DPR is supplied at this terminal render
+    boundary; a saved report defaults to the frontend's export pixel density.
+    More output pixels never masquerade as a larger named panel, so fixed
+    typography, margins, and data-box proportions cannot drift between a live
+    card and a report.
     """
 
     if not isinstance(document, PlotReportDocument):
         raise TypeError("document must be PlotReportDocument")
     if checkpoint is not None and not callable(checkpoint):
         raise TypeError("checkpoint must be callable or None")
+    if surface_pixel_ratio is None:
+        surface_pixel_ratio = PANEL_EXPORT_PIXEL_RATIO
     encoded: list[EncodedRasterPage] = []
     for page in document.pages:
         if checkpoint is not None:

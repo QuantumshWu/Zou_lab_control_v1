@@ -19,7 +19,6 @@ from .histogram_display import (
     HistogramBinProjection,
     HistogramCountScale,
     HistogramDisplayState,
-    HistogramFitMode,
     HistogramViewportTransform,
     histogram_count_limits,
     histogram_home_x_limits,
@@ -213,93 +212,70 @@ def _update_histogram_presentation(
     counts_group,
     edges,
     *,
-    analysis_counts_group=None,
-    analysis_edges=None,
+    fit_overlays=(),
     fit_artists=(),
     threshold_artists=(),
     stats_text=None,
     show_stats: bool,
-    infer_fit_threshold: bool = True,
     threshold_linewidth: float,
 ):
-    """Draw/update the one established histogram fit/cut presentation.
+    """Draw explicit thresholds and a formal FitResultBatch projection.
 
-    A full Distribution and every compact Grid cell call this same owner.  The
-    caller supplies only whether the tiny thumbnail has room for statistics
-    and the established narrow threshold stroke; fit policy, colours, derived
-    cut semantics, and text remain single-sourced here.
+    Binning and ordinary rendering never solve a model.  ``fit_overlays`` is
+    the already-validated, exact-source projection produced by the shared
+    Figure Fit path; an empty tuple means no Fit command is attached.
     """
 
     if not isinstance(state, HistogramDisplayState):
         raise TypeError("state must be HistogramDisplayState")
     if not isinstance(show_stats, bool):
         raise TypeError("show_stats must be bool")
-    if not isinstance(infer_fit_threshold, bool):
-        raise TypeError("infer_fit_threshold must be bool")
-
-    from zlc_data import confidence_weighted_fidelity
-
-    from zlc_data import fit_histogram
-
     counts_group = tuple(np.asarray(item, dtype=np.float64) for item in counts_group)
     if not counts_group:
         raise ValueError("histogram presentation requires at least one count series")
     edges = np.asarray(edges, dtype=np.float64)
-    analysis_counts_group = (
-        counts_group
-        if analysis_counts_group is None
-        else tuple(
-            np.asarray(item, dtype=np.float64)
-            for item in analysis_counts_group
-        )
-    )
-    if len(analysis_counts_group) != len(counts_group):
-        raise ValueError(
-            "histogram analysis and visible series counts must align"
-        )
-    analysis_edges = np.asarray(
-        edges if analysis_edges is None else analysis_edges,
-        dtype=np.float64,
-    )
-    counts = analysis_counts_group[0]
-    fit = fit_histogram(analysis_edges, counts, state.fit_mode.value)
+    if edges.shape != (counts_group[0].size + 1,) or any(
+        counts.shape != counts_group[0].shape for counts in counts_group
+    ):
+        raise ValueError("histogram counts and edges must share one projection")
+
+    from .render import HistogramFitOverlay
+
+    fit_overlays = tuple(fit_overlays)
+    if fit_overlays and (
+        len(fit_overlays) != len(counts_group)
+        or any(not isinstance(item, HistogramFitOverlay) for item in fit_overlays)
+    ):
+        raise ValueError("formal histogram Fit overlays must align with series")
 
     fit_artists = tuple(fit_artists)
+    required_artist_count = 3 * len(counts_group)
+    if fit_artists and len(fit_artists) != required_artist_count:
+        for artist in fit_artists:
+            artist.remove()
+        fit_artists = ()
     if not fit_artists:
         fit_artists = tuple(
-            axis.plot((), (), **spec)[0] for spec in bimodal_fit_line_specs()
+            axis.plot((), (), **spec)[0]
+            for _series in counts_group
+            for spec in bimodal_fit_line_specs()
         )
-    if len(fit_artists) != 3:
-        raise RuntimeError("histogram presentation requires three fit artists")
-    left_artist, right_artist, total_artist = fit_artists
     for artist in fit_artists:
         artist.set_data((), ())
-    if fit.valid:
-        # The model is fitted from the complete sample projection but drawn
-        # only across the robust visible thumbnail domain.
-        coordinates = np.linspace(edges[0], edges[-1], 400)
-        left, right, total = fit.curves(coordinates)
-        visible_bin_width = float(edges[-1] - edges[0]) / max(
-            len(edges) - 1,
-            1,
-        )
-        analysis_bin_width = float(
-            analysis_edges[-1] - analysis_edges[0]
-        ) / max(len(analysis_edges) - 1, 1)
-        presentation_scale = visible_bin_width / analysis_bin_width
-        if left is not None:
-            left_artist.set_data(coordinates, left * presentation_scale)
-            right_artist.set_data(coordinates, right * presentation_scale)
-        total_artist.set_data(coordinates, total * presentation_scale)
+    for series_index, overlay in enumerate(fit_overlays):
+        if overlay.status is None or not overlay.component_predictions:
+            continue
+        artists = fit_artists[3 * series_index : 3 * series_index + 3]
+        components = overlay.component_predictions
+        if len(components) == 1:
+            artists[2].set_data(overlay.coordinates, components[0])
+        elif len(components) == 3:
+            for artist, values in zip(artists, components, strict=True):
+                artist.set_data(overlay.coordinates, values)
+        else:
+            raise ValueError("histogram Fit model exposed an unsupported component count")
 
     thresholds = tuple(float(value) for value in state.thresholds)
-    if (
-        infer_fit_threshold
-        and not thresholds
-        and fit.separated
-        and fit.threshold is not None
-    ):
-        thresholds = (float(fit.threshold),)
     threshold_artists = list(threshold_artists)
     while len(threshold_artists) < len(thresholds):
         threshold_artists.append(
@@ -334,75 +310,24 @@ def _update_histogram_presentation(
             threshold = thresholds[0]
             left_fraction = _histogram_left_fraction(
                 threshold,
-                counts,
-                analysis_edges,
-            )
-            fidelity = None
-            parameters = fit.bimodal_parameters
-            if parameters is not None and fit.separated:
-                amp0, mean0, sigma0, amp1, mean1, sigma1 = parameters
-                _weighted, raw, _separation = confidence_weighted_fidelity(
-                    threshold,
-                    mean0,
-                    sigma0,
-                    abs(amp0 * sigma0),
-                    mean1,
-                    sigma1,
-                    abs(amp1 * sigma1),
-                )
-                fidelity = float(raw)
-            fidelity_text = (
-                "fit F=N/A"
-                if fidelity is None
-                else f"fit F={100.0 * fidelity:.1f}%"
-            )
-            fit_cut = (
-                ""
-                if fit.threshold is None
-                else f"\nfit cut={fit.threshold:.4g}"
+                counts_group[0],
+                edges,
             )
             stats_text.set_text(
-                f"th={threshold:.4g}\n{fidelity_text}\n"
+                f"th={threshold:.4g}\n"
                 f"L/R={100.0 * left_fraction:.1f}%/"
-                f"{100.0 * (1.0 - left_fraction):.1f}%{fit_cut}"
+                f"{100.0 * (1.0 - left_fraction):.1f}%"
             )
-        elif fit.single_parameters is not None:
-            _amplitude, mean, sigma = fit.single_parameters
-            fitted = np.asarray(
-                fit.evaluate(
-                    (analysis_edges[:-1] + analysis_edges[1:]) / 2.0
-                )
-            )
-            total_count = float(np.sum(counts))
-            out_of_fit = (
-                None
-                if total_count <= 0.0
-                else max(
-                    0.0,
-                    1.0
-                    - float(
-                        np.sum(
-                            np.minimum(
-                                counts,
-                                np.clip(fitted, 0.0, None),
-                            )
-                        )
-                    )
-                    / total_count,
-                )
-            )
-            suffix = (
-                ""
-                if out_of_fit is None
-                else f"\nout-of-fit={100.0 * out_of_fit:.1f}%"
-            )
-            stats_text.set_text(
-                f"gauss mean={mean:.4g}\nsd={abs(sigma):.3g}{suffix}"
-            )
-        elif state.fit_mode is HistogramFitMode.NONE:
-            stats_text.set_text("")
         else:
-            stats_text.set_text("single peak (no split)")
+            failed = next(
+                (
+                    overlay.diagnostic
+                    for overlay in fit_overlays
+                    if overlay.diagnostic
+                ),
+                "",
+            )
+            stats_text.set_text(failed)
     elif stats_text is not None:
         stats_text.set_text("")
 

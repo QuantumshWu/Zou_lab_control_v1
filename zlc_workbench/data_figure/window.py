@@ -924,7 +924,7 @@ class DataFigureWindow(FrozenRasterWindow):
             active
             and self._fit_bindings is not None
             and self._grid_overview is None
-            and self._view_family in ("curve", "image")
+            and self._view_family in ("curve", "image", "histogram")
         )
         self._interaction_switch.setEnabled(active)
         self._overview_button.setEnabled(
@@ -955,7 +955,7 @@ class DataFigureWindow(FrozenRasterWindow):
         return bool(
             self._fit_bindings is not None
             and self._grid_overview is None
-            and intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
+            and intent in (ViewIntent.CURVE, ViewIntent.IMAGE, ViewIntent.HISTOGRAM)
         )
 
     def _fit_authoring_busy_kind(self) -> str | None:
@@ -995,6 +995,8 @@ class DataFigureWindow(FrozenRasterWindow):
             if self._view_family == "curve"
             else ViewIntent.IMAGE
             if self._view_family == "image"
+            else ViewIntent.HISTOGRAM
+            if self._view_family == "histogram"
             else None
         )
         if (
@@ -1046,13 +1048,26 @@ class DataFigureWindow(FrozenRasterWindow):
         self._status.setText("PREPARING FIT")
         self._diagnostic.setText("")
         self._fit_job_revision = self._fit_editor_revision
+        visible_figure = self._visible_figure
+        visible_payload = self._visible_typed_payload()
+        if visible_figure is None or visible_payload is None:
+            pane.set_busy(None, draft_ready=self._fit_draft is not None)
+            self._status.setText("FIT SOURCE NOT READY")
+            return
+        histogram_projection = (
+            visible_payload.bin_projection
+            if isinstance(visible_payload, HistogramPanelPayload)
+            else None
+        )
         if not self._submit_fit_future(
             "prepare",
             _prepare_fit_options,
             bindings.prepare,
+            visible_figure,
             self._fit_axis_ids,
             self._fit_axis_roles,
             self._fit_selection_candidate,
+            histogram_projection,
             bindings.allow_prepared_transform,
         ):
             self._fit_job_revision = None

@@ -153,7 +153,15 @@ class FigureFitLane:
                 raise RuntimeError("Fit lane admitted overlapping work")
             self._active = request
             self._future = future
-        future.add_done_callback(self._finished)
+        # Preserve the immutable request identity outside the Future result.
+        # Even an unexpected executor/Future failure must still be routable to
+        # the one panel whose exact live surface is pinned by this command.
+        future.add_done_callback(
+            lambda completed, submitted=request: self._finished(
+                submitted,
+                completed,
+            )
+        )
 
     @staticmethod
     def _execute(request: FigureFitRequest):
@@ -169,14 +177,16 @@ class FigureFitLane:
             return request, None, "TypeError: fit engine returned another result type"
         return request, result, None
 
-    def _finished(self, future: Future) -> None:
+    def _finished(self, request: FigureFitRequest, future: Future) -> None:
         try:
             completion = future.result()
         except BaseException as error:
-            completion = (None, None, f"{type(error).__name__}: {error}")
+            completion = (request, None, f"{type(error).__name__}: {error}")
         with self._lock:
             if self._future is not future:
                 raise RuntimeError("Figure Fit future identity changed")
+            if self._active is not request:
+                raise RuntimeError("Figure Fit request identity changed")
             self._future = None
             self._active = None
             if self._closing:

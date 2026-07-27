@@ -88,7 +88,7 @@ def build_fit_problem(
         scalar_data_positions,
         axis_indices,
         row_groups,
-        data_combinations,
+        data_batch_shape,
         batch_layout,
         present_counts,
     ) = _schema_batch_plan(bound, abort_check)
@@ -119,7 +119,7 @@ def build_fit_problem(
             coordinate_source_by_id,
             data_dimension_indices,
         )
-        for data_multi in data_combinations:
+        for data_multi in np.ndindex(data_batch_shape):
             _check_abort(abort_check)
             data_batch_values = {
                 data_ids[position]: int(data_multi[index])
@@ -223,7 +223,7 @@ def validate_fit_result_source_binding(
         _scalar_data_positions,
         _axis_indices,
         _row_groups,
-        _data_combinations,
+        _data_batch_shape,
         batch_layout,
         present_counts,
     ) = _schema_batch_plan(bound, None)
@@ -296,7 +296,6 @@ def _schema_batch_plan(
 
     mapping: list[tuple[int, ...]] = []
     present_counts: list[int] = []
-    data_combinations = tuple(np.ndindex(data_batch_shape))
     fit_data_count = math.prod(
         schema.data_axes[position].size for position in data_fit_positions
     )
@@ -305,7 +304,7 @@ def _schema_batch_plan(
             cell_ids[position]: cell_batch_key[index]
             for index, position in enumerate(cell_batch_positions)
         }
-        for data_multi in data_combinations:
+        for data_multi in np.ndindex(data_batch_shape):
             data_batch_values = {
                 data_ids[position]: int(data_multi[index])
                 for index, position in enumerate(data_batch_positions)
@@ -331,7 +330,7 @@ def _schema_batch_plan(
         scalar_data_positions,
         axis_indices,
         row_groups,
-        data_combinations,
+        data_batch_shape,
         batch_layout,
         tuple(present_counts),
     )

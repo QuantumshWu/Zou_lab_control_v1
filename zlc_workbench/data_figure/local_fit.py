@@ -94,24 +94,25 @@ def local_fit_bindings(
     )
 
     def prepare(
-        fit_axis_ids,
+        visible_figure: DataFigure,
         authority_selection: Selection | None,
+        histogram_projection,
     ) -> tuple[FitAuthoringOption, ...]:
-        axes = tuple(fit_axis_ids)
-        if not axes:
-            raise ValueError("local Figure Fit requires exact named display axes")
+        if not isinstance(visible_figure, DataFigure):
+            raise TypeError("local Figure Fit requires its exact visible DataFigure")
+        if visible_figure.document != figure.document:
+            raise ValueError("local Figure Fit received another document")
         if authority_selection is not None and not isinstance(
             authority_selection,
             Selection,
         ):
             raise TypeError("local Figure Fit selection must be Selection or None")
         options = prepare_fit_authoring_options(
-            figure,
+            visible_figure,
             authority_selection,
             seed_spec=seed_spec,
+            histogram_projection=histogram_projection,
         )
-        if any(option.spec.fit_axis_ids != axes for option in options):
-            raise RuntimeError("Fit host axes differ from the authored Figure")
         return options
 
     def execute(spec: FitSpec, cancel_check, deadline_monotonic: float):
