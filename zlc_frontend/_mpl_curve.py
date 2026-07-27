@@ -36,8 +36,8 @@ from .render_style import (
     CURVE_MARKER,
     FIT_CONTOUR_COLOR,
     FIT_CONTOUR_LINEWIDTH,
+    FIT_DIM_ALPHA,
     FIT_FAILURE_COLOR,
-    FIT_LINESTYLE,
     HIST_FILL_ALPHA,
     LINE_CYCLE,
     PALETTE,
@@ -45,6 +45,7 @@ from .render_style import (
     apply_title,
     axis_label_fontsize,
     bimodal_fit_line_specs,
+    curve_fit_line_kwargs,
     render_style_context,
     small_fontsize,
     threshold_line_kwargs,
@@ -83,7 +84,7 @@ def _curve(axis, layer, cell, series_group, fit_result):
             multiple_series=multiple_series,
         )
         style = {"color": LINE_CYCLE[index % len(LINE_CYCLE)]}
-        axis.plot(
+        source_artist, = axis.plot(
             x,
             values,
             marker=CURVE_MARKER,
@@ -99,9 +100,10 @@ def _curve(axis, layer, cell, series_group, fit_result):
                 axis.plot(
                     coordinates,
                     predicted,
-                    linestyle=FIT_LINESTYLE,
                     label=("fit" if label is None else f"fit {label}"),
+                    **curve_fit_line_kwargs(),
                 )
+                source_artist.set_alpha(FIT_DIM_ALPHA)
     data = series_group[0].data
     axis.set_xlabel(_axis_label(data.x_axis))
     axis.set_ylabel(

@@ -893,6 +893,76 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             first_front.panels[0].raster.pixels
         )
 
+        # Exercise Fit through the actual DeviceManager -> Camera Measurement
+        # -> live 2-D Plot Panel controls.  A DTO or changed byte stream is not
+        # sufficient evidence: the same painted camera revision must visibly
+        # gain the frontend's canonical orange centre/radius overlay.
+        from matplotlib.colors import to_rgba
+
+        from zlc_data import FitBatchStatus
+        from zlc_frontend.render_style import FIT_RADIAL_COLOR
+
+        if not card.settings_popup.isVisible():
+            QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
+        until(application, lambda: card.settings_popup.isVisible())
+        fit_pane = card.fit_authoring_pane
+        until(
+            application,
+            lambda: bool(fit_pane.fit_models)
+            and fit_pane.fit_button.isEnabled(),
+            timeout=15.0,
+        )
+        assert fit_pane.model_combo.currentData() == "radial_gaussian_center"
+        fitted_ref = card._presented_value.snapshot.ref
+        before_fit = card.board.front_frame.panels[0].raster
+        QtTest.QTest.mouseClick(fit_pane.fit_button, QtCore.Qt.LeftButton)
+        until(
+            application,
+            lambda: (
+                card._fit_result is not None
+                and card._fit_result.source_ref == fitted_ref
+                and card._fit_result.statuses == (FitBatchStatus.CONVERGED,)
+                and card.frozen_render_payload() is not None
+                and card.frozen_render_payload().fit_overlay is not None
+            ),
+            timeout=20.0,
+        )
+        assert card._presented_value.snapshot.ref == fitted_ref
+        after_fit = card.board.front_frame.panels[0].raster
+        expected_fit_rgb = np.rint(
+            np.asarray(to_rgba(FIT_RADIAL_COLOR)[:3]) * 255.0
+        ).astype(np.uint8)
+
+        def exact_fit_pixels(raster) -> int:
+            rgba = np.frombuffer(raster.pixels, dtype=np.uint8).reshape(
+                raster.height,
+                raster.width,
+                4,
+            )
+            return int(
+                np.all(rgba[..., :3] == expected_fit_rgb, axis=-1).sum()
+            )
+
+        assert exact_fit_pixels(after_fit) > exact_fit_pixels(before_fit)
+        assert "no retained producer transaction" not in card.status.text()
+        capture_offscreen_window(
+            application,
+            console,
+            tmp_path / "camera-live-fit.png",
+            settle_ms=50,
+        )
+        QtTest.QTest.mouseClick(fit_pane.clear_button, QtCore.Qt.LeftButton)
+        until(
+            application,
+            lambda: (
+                card._presented_value is not None
+                and card._presented_value.snapshot.ref != fitted_ref
+                and card.frozen_render_payload() is not None
+                and card.frozen_render_payload().fit_overlay is None
+            ),
+            timeout=15.0,
+        )
+
         # No-button movement is inert: the board does not even request tracking.
         board = card.board.board
         assert not board.hasMouseTracking()
@@ -989,10 +1059,35 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             QtCore.Qt.MiddleButton,
             pos=pan_start,
         )
+        pressed_ref = card._presented_value.snapshot.ref
+        # Leave the button down while the free-running camera advances.  This
+        # is the real race: the board still paints ``pressed_ref`` and the card
+        # must not promote a newer semantic owner before the first move.
+        until(
+            application,
+            lambda: (
+                card._candidate_value is not None
+                and card._candidate_value.snapshot.ref != pressed_ref
+            ),
+            timeout=10.0,
+        )
+        assert card._presented_value.snapshot.ref == pressed_ref
+        held_front = card.board.front_frame
+        assert held_front is not None
+        assert held_front.panels[0].raster.pixels
         initial_revision = card._display_revision
         drag_mouse_move(board, first_move, QtCore.Qt.MiddleButton)
         first_revision = card._display_revision
         assert first_revision > initial_revision
+        # The press-time raster remains a complete visible front while the
+        # worker computes the matching viewport answer; there is no blank
+        # intermediate state and no QImage stretching placeholder.
+        during_move_front = card.board.front_frame
+        during_move_origin = board.visible_image_origin()
+        assert during_move_front is not None
+        assert during_move_front.panels[0].raster.pixels
+        assert during_move_origin is not None
+        assert during_move_origin.input_identity.ref == pressed_ref
         until(
             application,
             lambda: (
@@ -1027,6 +1122,23 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         area_start = plot_point(0.12, 0.16)
         area_end = plot_point(0.42, 0.48)
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=area_start)
+        area_pressed_ref = card._presented_value.snapshot.ref
+        area_pressed_component = card.frozen_render_source_component()
+        assert area_pressed_component is not None
+        # Area must own the same press-time presentation transaction as pan.
+        # Let the free-running camera overtake it before the first move; the
+        # completed selection still has to publish from the pixels the user
+        # actually enclosed, not from whichever revision is latest at release.
+        until(
+            application,
+            lambda: (
+                card._candidate_value is not None
+                and card._candidate_value.snapshot.ref != area_pressed_ref
+            ),
+            timeout=10.0,
+        )
+        assert card._presented_value.snapshot.ref == area_pressed_ref
+        assert card.frozen_render_source_component() is area_pressed_component
         drag_mouse_move(board, area_end, QtCore.Qt.LeftButton)
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=area_end)
         area_signal = panel_signal_key(card.panel_id, AREA_DATA_OUTPUT)
@@ -1035,6 +1147,7 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             lambda: console._tick_data.value(area_signal) is not None,
             timeout=15.0,
         )
+        assert "no retained producer transaction" not in card.status.text()
         area_card = _add_plot_and_bind(
             console,
             add,
@@ -1276,6 +1389,42 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             tmp_path / "camera-live-edit-scrolled.png",
             settle_ms=100,
         )
+
+        # Edit is a second presentation surface, not a global pause switch for
+        # the live card.  Hold a real pan on its frozen image while Camera keeps
+        # advancing: Edit must retain its own transaction and Live must keep
+        # promoting complete fronts.  This catches any future attempt to put a
+        # card-global pointer pin back between the two surfaces.
+        edit_board = edit._board.board
+        edit_binding = edit_board._image_bindings[card.panel_id]
+        edit_target = edit_board._selector_target(edit_binding)
+        assert edit_target is not None
+        edit_plot = edit_target[0]
+        edit_start = edit_plot.center()
+        edit_end = QtCore.QPoint(
+            edit_start.x() + max(2, edit_plot.width() // 20),
+            edit_start.y(),
+        )
+        edit_snapshot_ref = edit._snapshot_value.snapshot.ref
+        live_ref = card._presented_value.snapshot.ref
+        QtTest.QTest.mousePress(
+            edit_board,
+            QtCore.Qt.MiddleButton,
+            pos=edit_start,
+        )
+        until(
+            application,
+            lambda: card._presented_value.snapshot.ref != live_ref,
+            timeout=10.0,
+        )
+        assert edit._snapshot_value.snapshot.ref == edit_snapshot_ref
+        drag_mouse_move(edit_board, edit_end, QtCore.Qt.MiddleButton)
+        QtTest.QTest.mouseRelease(
+            edit_board,
+            QtCore.Qt.MiddleButton,
+            pos=edit_end,
+        )
+        assert edit_board.image_selector_fault(card.panel_id) is None
     finally:
         if not widget_gone(console_wrapper):
             console_wrapper.close()
@@ -2036,39 +2185,25 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             occupied_signal,
             application,
         )
-        rate_card = _add_plot_and_bind(
-            console,
-            add,
-            "meter",
-            rate_signal,
-            application,
-        )
         until(
             application,
             lambda: (
                 sites_card.board is not None
                 and sites_card.board.front_frame is not None
-                and rate_card.board is not None
-                and rate_card.board.front_frame is not None
             ),
             timeout=20.0,
         )
         first_sites_front = sites_card.board.front_frame
-        first_rate_front = rate_card.board.front_frame
         until(
             application,
             lambda: (
                 sites_card.board.front_frame is not None
                 and sites_card.board.front_frame.sequence
                 > first_sites_front.sequence
-                and rate_card.board.front_frame is not None
-                and rate_card.board.front_frame.sequence
-                > first_rate_front.sequence
             ),
             timeout=10.0,
         )
         assert not sites_card.board.board.hasMouseTracking()
-        assert not rate_card.board.board.hasMouseTracking()
     finally:
         if (
             pulse_body is not None

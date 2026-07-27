@@ -422,15 +422,10 @@ class PanelEditor(QtWidgets.QWidget):
         self._presented_render_request_revision = self._render_request_revision
         self._pending_render_result = None
         self._snapshot_value = value
-        try:
-            self._snapshot_source_component = (
-                self.console._data.capture_source_component(value)
-            )
-        except (RuntimeError, TypeError, ValueError):
-            # A standalone/static Figure surface has no TaskConsole causal
-            # graph.  It may still render and fit, but cannot publish a routed
-            # signal until a real producer is attached.
-            self._snapshot_source_component = None
+        # Edit copies the exact ancestry already promoted with the painted live
+        # front.  Looking it up again in an advancing data plane would splice a
+        # newer camera transaction into this explicitly frozen surface.
+        self._snapshot_source_component = card.frozen_render_source_component()
         self._snapshot_figure = figure
         self._snapshot_display = display
         self._snapshot_contract = contract
@@ -475,6 +470,7 @@ class PanelEditor(QtWidgets.QWidget):
             ),
             axis_labels=axis_labels,
             short_labels=short_labels,
+            source_component=self._snapshot_source_component,
         )
 
     def invalidate_raster_surface(self) -> None:
@@ -636,6 +632,18 @@ class PanelEditor(QtWidgets.QWidget):
         board.viewCommitted.connect(self._forward_view_commit)
         board.colorLimitsCommitted.connect(self._forward_color_limits)
         board.thresholdsCommitted.connect(self._forward_thresholds)
+        board.interactionStarted.connect(
+            lambda origin, host=board: self.card._begin_pointer_interaction(
+                host,
+                origin,
+                value=self._snapshot_value,
+                source_component=self._snapshot_source_component,
+                surface_id=self.render_surface_id,
+            )
+        )
+        board.interactionFinished.connect(
+            lambda host=board: self.card._finish_pointer_interaction(host)
+        )
         self._board = board
         self.canvas_holder.addWidget(board)
         return board

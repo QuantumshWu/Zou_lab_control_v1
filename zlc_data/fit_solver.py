@@ -20,7 +20,13 @@ from .fit_contract import (
     FitParameterConstraint,
     FitResultBatch,
 )
-from .fit_model import FitParameterDomain, evaluate_fit_model, initialize_fit_model
+from .fit_model import (
+    FitParameterDomain,
+    _radial_cartesian_grid,
+    _radial_gaussian_center_jacobian,
+    evaluate_fit_model,
+    initialize_fit_model,
+)
 from .fit_problem import build_fit_problem
 from .value import OwnedSnapshot
 
@@ -48,6 +54,13 @@ class _ResolvedInitialization:
     fixed: np.ndarray
     fixed_values: np.ndarray
     free_indices: np.ndarray
+
+
+@dataclass(frozen=True)
+class _NumericalView:
+    coordinates: tuple[np.ndarray, ...]
+    observations: np.ndarray
+    subsampled: bool
 
 
 @dataclass(frozen=True)
@@ -212,6 +225,12 @@ def _fit_cell(
             bound,
             model_seeds,
         )
+        numerical_view = _numerical_view(
+            bound,
+            model_coordinates,
+            observations,
+            initialization.seeds,
+        )
         _check_host_abort(cancel_check, host_deadline)
     except _CellFailure:
         raise
@@ -228,7 +247,11 @@ def _fit_cell(
         result[initialization.free_indices] = free
         return result
 
-    def residual(free: np.ndarray) -> np.ndarray:
+    def evaluated_residual(
+        free: np.ndarray,
+        evaluation_coordinates: tuple[np.ndarray, ...],
+        evaluation_observations: np.ndarray,
+    ) -> np.ndarray:
         nonlocal evaluation_count
         _check_host_abort(cancel_check, host_deadline)
         if evaluation_count >= bound.spec.numeric_policy.max_evaluations:
@@ -240,8 +263,15 @@ def _fit_cell(
         evaluation_count += 1
         parameters = full_parameters(np.asarray(free, dtype=np.float64))
         with np.errstate(all="ignore"):
-            predicted = evaluate_fit_model(bound.model, model_coordinates, parameters)
-        values = np.asarray(predicted, dtype=np.float64).reshape(-1) - observations
+            predicted = evaluate_fit_model(
+                bound.model,
+                evaluation_coordinates,
+                parameters,
+            )
+        values = (
+            np.asarray(predicted, dtype=np.float64).reshape(-1)
+            - evaluation_observations
+        )
         if not np.all(np.isfinite(values)):
             raise _CellFailure(
                 FitBatchStatus.NUMERIC_ERROR,
@@ -250,8 +280,19 @@ def _fit_cell(
             )
         return values
 
+    def residual(free: np.ndarray) -> np.ndarray:
+        return evaluated_residual(
+            free,
+            numerical_view.coordinates,
+            numerical_view.observations,
+        )
+
     if initialization.free_indices.size == 0:
-        residual_values = residual(np.empty(0, dtype=np.float64))
+        residual_values = evaluated_residual(
+            np.empty(0, dtype=np.float64),
+            model_coordinates,
+            observations,
+        )
         return _success_metrics(
             initialization.fixed_values,
             np.zeros((len(bound.model.parameters), len(bound.model.parameters))),
@@ -304,6 +345,65 @@ def _fit_cell(
                     evaluations=evaluation_count,
                 )
             continue
+        if numerical_view.subsampled:
+            remaining_evaluations = (
+                bound.spec.numeric_policy.max_evaluations - evaluation_count
+            )
+            if remaining_evaluations <= 0:
+                raise _CellFailure(
+                    FitBatchStatus.EVALUATION_LIMIT,
+                    "per-batch model evaluation limit exceeded before full-image polish",
+                    evaluations=evaluation_count,
+                )
+
+            def authoritative_jacobian(free: np.ndarray) -> np.ndarray:
+                _check_host_abort(cancel_check, host_deadline)
+                parameters = full_parameters(np.asarray(free, dtype=np.float64))
+                with np.errstate(all="ignore"):
+                    jacobian = _radial_gaussian_center_jacobian(
+                        model_coordinates,
+                        parameters,
+                    )[:, initialization.free_indices]
+                if not np.all(np.isfinite(jacobian)):
+                    raise _CellFailure(
+                        FitBatchStatus.NUMERIC_ERROR,
+                        "radial full-image Jacobian produced non-finite values",
+                        evaluations=evaluation_count,
+                    )
+                return jacobian
+
+            polished = least_squares(
+                lambda free: evaluated_residual(
+                    free,
+                    model_coordinates,
+                    observations,
+                ),
+                solved.x,
+                jac=authoritative_jacobian,
+                bounds=(free_lower, free_upper),
+                method="trf",
+                ftol=1e-8,
+                xtol=1e-8,
+                gtol=1e-8,
+                x_scale=1.0,
+                loss="linear",
+                f_scale=1.0,
+                diff_step=None,
+                tr_solver="exact",
+                tr_options=None,
+                max_nfev=remaining_evaluations,
+            )
+            if not polished.success:
+                last_message = f"full-image polish failed: {polished.message}"
+                if polished.status == 0:
+                    raise _CellFailure(
+                        FitBatchStatus.EVALUATION_LIMIT,
+                        "radial full-image polish exhausted its evaluation limit",
+                        evaluations=evaluation_count,
+                    )
+                continue
+            solved = polished
+
         parameters = full_parameters(solved.x)
         residual_values = np.asarray(solved.fun, dtype=np.float64).reshape(-1)
         candidate_rss = _sum_squares(residual_values)
@@ -347,6 +447,80 @@ def _fit_cell(
         observations,
         residual_values,
     )
+
+
+def _numerical_view(
+    bound: BoundFit,
+    coordinates: tuple[np.ndarray, ...],
+    observations: np.ndarray,
+    seeds: tuple[np.ndarray, ...],
+) -> _NumericalView:
+    """Choose the model's nonlinear refinement view.
+
+    Only the radial image model has a distinct numerical path.  Its complete
+    camera plane determines the robust moment seed and remains the authority for
+    candidate ranking/RSS/R-squared.  Repeated nonlinear evaluations use dense
+    samples around every coherent feature plus a regular whole-frame background
+    mesh, so a megapixel background is not recomputed thousands of times.
+    """
+
+    if bound.model.model_id != "radial_gaussian_center":
+        return _NumericalView(coordinates, observations, False)
+    indices = _radial_refinement_indices(coordinates, observations, seeds)
+    if indices is None:
+        return _NumericalView(coordinates, observations, False)
+    return _NumericalView(
+        tuple(np.take(values, indices) for values in coordinates),
+        np.take(observations, indices),
+        True,
+    )
+
+
+def _radial_refinement_indices(
+    coordinates: tuple[np.ndarray, ...],
+    observations: np.ndarray,
+    seeds: tuple[np.ndarray, ...],
+) -> np.ndarray | None:
+    if len(coordinates) != 2 or not seeds:
+        return None
+    x, y = coordinates
+    cartesian = _radial_cartesian_grid(x, y, observations)
+    if cartesian is None:
+        return None
+    x_values, y_values, _image, observation_indices = cartesian
+
+    def coordinate_step(values: np.ndarray) -> float:
+        differences = np.diff(values)
+        positive = differences[differences > 0.0]
+        return float(np.min(positive)) if positive.size else 1.0
+
+    local_step = max(coordinate_step(x_values), coordinate_step(y_values))
+    selected = np.zeros(observations.size, dtype=bool)
+    for seed in seeds:
+        radius = abs(float(seed[2]))
+        center_x = float(seed[3])
+        center_y = float(seed[4])
+        if not all(np.isfinite(value) for value in (radius, center_x, center_y)):
+            continue
+        dense_radius = max(6.0 * radius, 12.0 * local_step)
+        selected |= (
+            (x - center_x) ** 2 + (y - center_y) ** 2 <= dense_radius**2
+        )
+
+    # Sixty-four intervals per spatial direction are a deterministic quadrature
+    # of the slowly varying background/offset, not a caller-visible resource or
+    # memory budget.  The feature neighbourhood above stays fully sampled.
+    x_mesh = np.unique(
+        np.linspace(0, x_values.size - 1, min(x_values.size, 65), dtype=np.int64)
+    )
+    y_mesh = np.unique(
+        np.linspace(0, y_values.size - 1, min(y_values.size, 65), dtype=np.int64)
+    )
+    selected[observation_indices[np.ix_(x_mesh, y_mesh)].reshape(-1)] = True
+    indices = np.flatnonzero(selected)
+    if indices.size < 2 * len(seeds[0]) or indices.size * 2 >= observations.size:
+        return None
+    return indices.astype(np.int64, copy=False)
 
 
 def _complete_user_seed(bound: BoundFit) -> tuple[float, ...] | None:

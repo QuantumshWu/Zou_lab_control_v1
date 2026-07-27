@@ -67,7 +67,7 @@ PLOT_KIND_SPECS: tuple[PlotKindSpec, ...] = (
         input_format="value must be a 1D vector (N,) or per-site array",
     ),
     PlotKindSpec(
-        key="meter", label="Meter",
+        key="meter", label="Meter", panel=False,
         input_format="value must resolve to one explicit scalar",
     ),
     PlotKindSpec(

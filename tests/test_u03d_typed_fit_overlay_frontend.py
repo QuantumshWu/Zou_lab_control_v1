@@ -59,6 +59,7 @@ from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
 from zlc_frontend.fit_curve_projection import (
     materialize_curve_fit_overlay_plan,
 )
+from zlc_frontend.render_style import FIT_DIM_ALPHA, curve_fit_line_kwargs
 
 
 def _curve_fixture(
@@ -368,6 +369,17 @@ def test_interactive_renderer_validates_join_then_failure_clears_old_success():
         assert isinstance(payload, CurvePanelPayload)
         assert payload.fit_overlays == overlays
         assert all(item.get_visible() for item in renderer._fit_artists)
+        fit_style = curve_fit_line_kwargs()
+        for source_artist, fit_artist in zip(
+            renderer._artists,
+            renderer._fit_artists,
+            strict=True,
+        ):
+            assert source_artist.get_alpha() == FIT_DIM_ALPHA
+            assert fit_artist.get_color() == fit_style["color"]
+            assert fit_artist.get_linestyle() == fit_style["linestyle"]
+            assert fit_artist.get_linewidth() == fit_style["linewidth"]
+            assert fit_artist.get_marker() in (None, "None")
         previous = tuple(np.asarray(item.get_ydata()).copy() for item in renderer._fit_artists)
 
         with pytest.raises(ValueError, match="another series address"):
@@ -414,6 +426,7 @@ def test_interactive_renderer_validates_join_then_failure_clears_old_success():
         assert failed_payload.fit_overlays == replacement
         assert all(not item.get_visible() for item in renderer._fit_artists)
         assert all(np.asarray(item.get_ydata()).size == 0 for item in renderer._fit_artists)
+        assert all(item.get_alpha() == 1.0 for item in renderer._artists)
         assert "SOLVER_FAILED" in renderer._fit_diagnostic_artists[0].get_text()
         assert "NOT_PRESENT" in renderer._fit_diagnostic_artists[1].get_text()
     finally:

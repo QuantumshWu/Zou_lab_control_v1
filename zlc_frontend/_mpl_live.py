@@ -77,8 +77,8 @@ from .render_style import (
     CURVE_MARKER,
     FIT_CONTOUR_COLOR,
     FIT_CONTOUR_LINEWIDTH,
+    FIT_DIM_ALPHA,
     FIT_FAILURE_COLOR,
-    FIT_LINESTYLE,
     HIST_FILL_ALPHA,
     LINE_CYCLE,
     PALETTE,
@@ -86,6 +86,7 @@ from .render_style import (
     apply_title,
     axis_label_fontsize,
     bimodal_fit_line_specs,
+    curve_fit_line_kwargs,
     render_style_context,
     small_fontsize,
     threshold_line_kwargs,
@@ -820,14 +821,12 @@ class SinglePanelAggRenderer:
                 self._artists = tuple(axis.lines)
                 fit_artists = []
                 diagnostic_artists = []
-                for index, source_artist in enumerate(self._artists):
+                for index, _source_artist in enumerate(self._artists):
                     fit_artist, = axis.plot(
                         (),
                         (),
-                        color=source_artist.get_color(),
-                        linestyle=FIT_LINESTYLE,
-                        marker=None,
                         label="_nolegend_",
+                        **curve_fit_line_kwargs(),
                     )
                     fit_artists.append(fit_artist)
                     diagnostic_artists.append(
@@ -951,8 +950,15 @@ class SinglePanelAggRenderer:
             raise RuntimeError("curve fit artist topology differs from its series")
         labels = self._series_labels(layer.layer_id, series_group)
         active_fit_artists = []
-        for index, (fit_artist, diagnostic_artist, series, label) in enumerate(
+        for index, (
+            source_artist,
+            fit_artist,
+            diagnostic_artist,
+            series,
+            label,
+        ) in enumerate(
             zip(
+                self._artists,
                 self._fit_artists,
                 self._fit_diagnostic_artists,
                 series_group,
@@ -976,6 +982,7 @@ class SinglePanelAggRenderer:
                 fit_artist.set_label(f"fit {label}")
                 diagnostic_artist.set_text("")
                 active_fit_artists.append(fit_artist)
+                source_artist.set_alpha(FIT_DIM_ALPHA)
             else:
                 # Clearing both data and visibility is intentional: either fact
                 # alone is too easy for a later Matplotlib mutation to undo.
@@ -987,6 +994,7 @@ class SinglePanelAggRenderer:
                     if overlay is None
                     else f"fit {label}: {overlay.diagnostic}"
                 )
+                source_artist.set_alpha(1.0)
 
         legend = axis.get_legend()
         if legend is not None:

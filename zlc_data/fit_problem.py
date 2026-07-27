@@ -368,12 +368,14 @@ def _coordinates_for_indices(
     if source is FitCoordinateSource.LOGICAL_INDEX:
         return np.asarray(indices, dtype=np.float64) + axis.index_origin
     assert axis.coordinates is not None
-    values = np.fromiter(
-        (float(axis.coordinates[int(index)]) for index in indices.reshape(-1)),
-        dtype=np.dtype("<f8"),
-        count=indices.size,
+    # Axis coordinates are validated once when the fit is bound.  Convert that
+    # axis-sized vector once and gather in NumPy; iterating millions of repeated
+    # camera indices in Python made coordinate packing slower than the fit.
+    declared = np.asarray(axis.coordinates, dtype=np.dtype("<f8"))
+    return np.take(
+        declared,
+        indices,
     )
-    return values.reshape(indices.shape)
 
 
 def _compact_row_selector(row_ids: np.ndarray) -> slice | np.ndarray:

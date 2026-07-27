@@ -2,6 +2,11 @@
 
 from .axis import AxisId, SCALAR
 
+from .bimodal_distribution import (
+    BimodalDistributionAnalysis,
+    analyze_bimodal_distribution,
+)
+
 from .fit_codec import (
     decode_fit_result_batch,
     decode_fit_spec,
@@ -237,6 +242,7 @@ def suggest_fit_draft(
 
 
 __all__ = [
+    "BimodalDistributionAnalysis",
     "BoundFit",
     "FitBatchStatus",
     "FitCancelled",
@@ -251,6 +257,7 @@ __all__ = [
     "FitSpec",
     "ParameterUnitRelation",
     "bind_fit",
+    "analyze_bimodal_distribution",
     "decode_fit_result_batch",
     "decode_fit_spec",
     "encode_fit_result_batch",

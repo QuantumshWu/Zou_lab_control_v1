@@ -120,6 +120,7 @@ from .snapshot_projection import (
     materialize_scalar_dataset,
 )
 from .fit import (
+    BimodalDistributionAnalysis,
     BoundFit,
     FitBatchStatus,
     FitCancelled,
@@ -134,6 +135,7 @@ from .fit import (
     FitSpec,
     ParameterUnitRelation,
     bind_fit,
+    analyze_bimodal_distribution,
     decode_fit_result_batch,
     decode_fit_spec,
     encode_fit_result_batch,
@@ -150,6 +152,7 @@ from .fit import (
 )
 
 __all__ = [
+    "BimodalDistributionAnalysis",
     "AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID",
     "AxisId",
     "AxisLayout",
@@ -226,6 +229,7 @@ __all__ = [
     "axis_layout_to_tree",
     "axis_to_tree",
     "apply_transform",
+    "analyze_bimodal_distribution",
     "bind_fit",
     "commit_transform",
     "committed_transform_from_tree",

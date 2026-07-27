@@ -118,6 +118,8 @@ class QtRasterBoard(QtWidgets.QWidget):
 
     imagePanelLeftDoubleClicked = QtCore.pyqtSignal(str)
     crossSelected = QtCore.pyqtSignal(object)
+    interactionStarted = QtCore.pyqtSignal(object)
+    interactionFinished = QtCore.pyqtSignal()
 
     def __init__(
         self,
@@ -144,6 +146,37 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._closed = False
         self.setFocusPolicy(QtCore.Qt.ClickFocus)
         self.setMinimumSize(128, 64)
+
+    def _begin_interaction_hold(self, hold: _HeldPanelFront) -> None:
+        """Pin the exact painted panel before any pointer motion can race live data."""
+
+        if not isinstance(hold, _HeldPanelFront):
+            raise TypeError("interaction hold must retain one painted panel front")
+        if self._selector_hold is not None:
+            raise RuntimeError("another pointer interaction is already active")
+        self._selector_hold = hold
+        _payload, origin = self._visible_display(
+            hold.panel_id,
+            (
+                ImagePanelPayload,
+                SiteMapPanelPayload,
+                CurvePanelPayload,
+                HistogramPanelPayload,
+                PulsePanelPayload,
+            ),
+        )
+        if origin is None:
+            self._selector_hold = None
+            raise RuntimeError("interaction hold has no exact painted origin")
+        self.interactionStarted.emit(origin)
+
+    def _finish_interaction_hold(self) -> None:
+        """Release exactly one pointer pin and notify its presentation owner."""
+
+        if self._selector_hold is None:
+            return
+        self._selector_hold = None
+        self.interactionFinished.emit()
 
     @property
     def panel_ids(self) -> tuple[str, ...]:
@@ -1533,8 +1566,8 @@ class QtRasterBoard(QtWidgets.QWidget):
                 event.accept()
                 return
             if event.button() == QtCore.Qt.MiddleButton:
-                self._selector_hold = _held_panel_from_numeric_target(
-                    numeric_target
+                self._begin_interaction_hold(
+                    _held_panel_from_numeric_target(numeric_target)
                 )
                 binding.pan_anchor = point[0]
                 binding.pan_origin = viewport
@@ -1551,8 +1584,9 @@ class QtRasterBoard(QtWidgets.QWidget):
                 grabbed = _threshold_line_hit(
                     numeric_target, event.localPos())
                 if grabbed is not None:
-                    self._selector_hold = (
-                        _held_panel_from_numeric_target(numeric_target))
+                    self._begin_interaction_hold(
+                        _held_panel_from_numeric_target(numeric_target)
+                    )
                     binding.threshold_drag = grabbed
                     binding.threshold_candidate = tuple(
                         numeric_target.payload.thresholds)
@@ -1588,8 +1622,8 @@ class QtRasterBoard(QtWidgets.QWidget):
                         ),
                         event.localPos(),
                     )
-                self._selector_hold = _held_panel_from_numeric_target(
-                    numeric_target
+                self._begin_interaction_hold(
+                    _held_panel_from_numeric_target(numeric_target)
                 )
                 if handle is not None and display_rectangle is not None:
                     binding.rectangle_drag = RectangleDrag.begin(
@@ -1656,7 +1690,7 @@ class QtRasterBoard(QtWidgets.QWidget):
         ):
             handle = _clim_handle_at(event.pos(), rail_target[0], rail_target[4])
             if handle is not None:
-                self._selector_hold = _held_panel_from_target(target)
+                self._begin_interaction_hold(_held_panel_from_target(target))
                 binding.clim_drag = handle
                 binding.clim_origin_limits = rail_target[4].color_limits
                 binding.clim_candidate = rail_target[4].color_limits
@@ -1694,7 +1728,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             if binding.interaction_callback is None:
                 super().mousePressEvent(event)
                 return
-            self._selector_hold = _held_panel_from_target(target)
+            self._begin_interaction_hold(_held_panel_from_target(target))
             binding.pan_anchor = QtCore.QPointF(event.localPos())
             binding.pan_origin = self._viewport_for_target(binding, target)
             binding.pan_target_size = (
@@ -1733,7 +1767,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             if handle is None or visible_bounds is None
             else RectangleDrag.begin(visible_bounds, handle, point)
         )
-        self._selector_hold = _held_panel_from_target(target)
+        self._begin_interaction_hold(_held_panel_from_target(target))
         self.update()
         event.accept()
 
@@ -2757,7 +2791,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._selector_hold is not None
             and self._selector_hold.panel_id == binding.panel_id
         ):
-            self._selector_hold = None
+            self._finish_interaction_hold()
 
     def _clear_image_transient(
         self,
@@ -2775,7 +2809,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._selector_hold is not None
             and self._selector_hold.panel_id == binding.panel_id
         ):
-            self._selector_hold = None
+            self._finish_interaction_hold()
 
     def _cancel_numeric_gesture(
         self,
@@ -2788,7 +2822,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._selector_hold is not None
             and self._selector_hold.panel_id == binding.panel_id
         ):
-            self._selector_hold = None
+            self._finish_interaction_hold()
 
     def _clear_numeric_transient(
         self,
@@ -2806,7 +2840,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._selector_hold is not None
             and self._selector_hold.panel_id == binding.panel_id
         ):
-            self._selector_hold = None
+            self._finish_interaction_hold()
 
     def _cancel_active_gesture(
         self,
@@ -2824,7 +2858,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 binding,
                 clear_span=clear_numeric_spans,
             )
-        self._selector_hold = None
+        self._finish_interaction_hold()
 
     def _reset_image_binding(self, panel_id: str) -> None:
         binding = self._image_bindings.get(panel_id)

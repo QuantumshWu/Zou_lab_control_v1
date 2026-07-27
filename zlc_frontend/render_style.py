@@ -262,7 +262,6 @@ FIT_RADIAL_COLOR = _PALETTE["fit_right"]
 FIT_RADIAL_CENTER_SIZE = 8.0
 FIT_RADIAL_RING_LINEWIDTH = 1.8
 FIT_RADIAL_RING_ALPHA = 0.9
-FIT_LINESTYLE = "--"
 CURVE_LINESTYLE = "-"
 CURVE_MARKER = None
 ANNOTATION_FONT_SIZE = float(_DEFAULT_STYLE["legend.fontsize"])
@@ -325,6 +324,25 @@ HIST_FILL_ALPHA = 0.4
 FIT_DIM_ALPHA = 0.5
 
 
+def curve_fit_line_kwargs() -> dict[str, Any]:
+    """Canonical fitted-curve artist style for every Figure renderer.
+
+    A fitted curve is a result overlay, not another source series.  Giving it
+    the source line's colour made a converged Fit effectively invisible on a
+    grey single-series plot.  Embedded panels, grids, and standalone Figures
+    all consume this one orange solid-line contract.
+    """
+
+    return {
+        "color": _PALETTE["fit_right"],
+        "linestyle": "-",
+        "linewidth": 2.0,
+        "alpha": 0.5,
+        "marker": None,
+        "zorder": 5,
+    }
+
+
 def bimodal_fit_line_specs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """``ax.plot`` style kwargs for the THREE bimodal fit curves (left / right / total), in that
     order.  ONE owned source of the fit-line COLOUR (from PALETTE) plus its linewidth/alpha, so the
@@ -341,6 +359,7 @@ def bimodal_fit_line_specs() -> tuple[dict[str, Any], dict[str, Any], dict[str, 
 __all__ = [
     "ANNOTATION_FONT_SIZE",
     "bimodal_fit_line_specs",
+    "curve_fit_line_kwargs",
     "CURVE_LINESTYLE",
     "CURVE_MARKER",
     "DESIGN_DPI",
@@ -348,7 +367,6 @@ __all__ = [
     "FIT_CONTOUR_LINEWIDTH",
     "HIST_FILL_ALPHA",
     "FIT_FAILURE_COLOR",
-    "FIT_LINESTYLE",
     "FIT_RADIAL_CENTER_SIZE",
     "FIT_RADIAL_COLOR",
     "FIT_RADIAL_RING_ALPHA",

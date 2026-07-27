@@ -23,6 +23,7 @@ from zlc_data import (
     AxisLayoutMode,
     AxisRoleId,
     AxisSpec,
+    BimodalDistributionAnalysis,
     BlockId,
     BoundFit,
     CellValidity,
@@ -51,6 +52,7 @@ from zlc_data import (
     ValidityContract,
     ValueSchema,
     bind_fit,
+    analyze_bimodal_distribution,
     commit_transform,
     decode_fit_result_batch,
     decode_fit_spec,
@@ -334,6 +336,42 @@ def test_initializers_match_independent_seed_examples():
     )
 
 
+def test_radial_full_image_jacobian_matches_central_difference():
+    import zlc_data.fit_model as model_module
+
+    x, y = np.meshgrid(
+        np.linspace(-3.0, 4.0, 13),
+        np.linspace(-2.0, 5.0, 11),
+        indexing="ij",
+    )
+    coordinates = (x.reshape(-1), y.reshape(-1))
+    parameters = np.array((4.2, 0.7, 1.6, 0.3, -0.4))
+    analytic = model_module._radial_gaussian_center_jacobian(
+        coordinates,
+        parameters,
+    )
+    numeric = np.empty_like(analytic)
+    for index, value in enumerate(parameters):
+        step = 1e-6 * max(abs(float(value)), 1.0)
+        upper = parameters.copy()
+        lower = parameters.copy()
+        upper[index] += step
+        lower[index] -= step
+        numeric[:, index] = (
+            evaluate_fit_model(
+                "radial_gaussian_center",
+                coordinates,
+                upper,
+            )
+            - evaluate_fit_model(
+                "radial_gaussian_center",
+                coordinates,
+                lower,
+            )
+        ) / (2.0 * step)
+    np.testing.assert_allclose(analytic, numeric, rtol=2e-7, atol=2e-9)
+
+
 def test_histogram_bin_axes_use_the_histogram_model_family():
     x = np.linspace(-3.0, 3.0, 31)
     bins = axis("bins", HISTOGRAM_BIN, x.size, coordinates=x, unit="count")
@@ -371,6 +409,94 @@ def test_histogram_bin_axes_use_the_histogram_model_family():
         ),
         (4.5, 0.5 + 4.0 / np.e),
     )
+
+
+def test_bimodal_distribution_analysis_uses_the_catalogue_and_is_immutable():
+    centers = np.linspace(-6.0, 7.0, 80)
+    expected = np.array((0.2, 4.4, 1100.0, 0.55, 720.0, 0.72))
+    counts = evaluate_fit_model("bimodal_gaussian", (centers,), expected)
+
+    analysis = analyze_bimodal_distribution(centers, counts)
+
+    assert isinstance(analysis, BimodalDistributionAnalysis)
+    assert analysis.status is FitBatchStatus.CONVERGED
+    assert analysis.diagnostic == ""
+    assert analysis.separated
+    assert analysis.threshold is not None
+    assert expected[0] - expected[1] / 2.0 < analysis.threshold
+    assert analysis.threshold < expected[0] + expected[1] / 2.0
+    left, right, total = analysis.component_predictions
+    np.testing.assert_allclose(left + right, total, rtol=1e-14, atol=1e-14)
+    np.testing.assert_allclose(total, counts, rtol=2e-7, atol=2e-7)
+    assert not analysis.coordinates.flags.writeable
+    assert all(not values.flags.writeable for values in analysis.component_predictions)
+    with pytest.raises(ValueError):
+        analysis.component_predictions[0][0] = 0.0
+
+
+def test_bimodal_distribution_does_not_publish_unresolved_threshold():
+    centers = np.linspace(-4.0, 4.0, 100)
+    # Ashman's D is below the resolved-bimodality boundary even though two
+    # catalogue components mathematically exist and can be fitted exactly.
+    expected = np.array((0.0, 1.0, 800.0, 0.8, 760.0, 0.9))
+    counts = evaluate_fit_model("bimodal_gaussian", (centers,), expected)
+
+    analysis = analyze_bimodal_distribution(centers, counts)
+
+    assert analysis.status is FitBatchStatus.CONVERGED
+    assert not analysis.separated
+    assert analysis.threshold is None
+    assert len(analysis.component_predictions) == 3
+
+
+def test_bimodal_component_threshold_requires_main_separation_and_one_crossing():
+    from zlc_data.bimodal_distribution import _resolved_bimodal_threshold
+
+    # Main's boundary is inclusive: splitting / (sigma_L + sigma_R) == 1.5.
+    boundary = np.array((10.0, 6.0, 4.0, 2.0, 4.0, 2.0))
+    assert _resolved_bimodal_threshold(boundary, support=(0.0, 20.0)) == pytest.approx(
+        10.0
+    )
+    below = boundary.copy()
+    below[1] = np.nextafter(6.0, 0.0)
+    assert _resolved_bimodal_threshold(below, support=(0.0, 20.0)) is None
+
+    # Even a wide split does not define a between-means cut when the enormous
+    # left component still dominates at the right component's own mean.
+    one_dominant_component = np.array((10.0, 8.0, 1e16, 1.0, 1.0, 1.0))
+    assert (
+        _resolved_bimodal_threshold(
+            one_dominant_component,
+            support=(0.0, 20.0),
+        )
+        is None
+    )
+
+
+def test_bimodal_distribution_returns_typed_failure_without_invented_payload():
+    centers = np.linspace(-1.0, 1.0, 40)
+    analysis = analyze_bimodal_distribution(centers, np.zeros_like(centers))
+
+    assert analysis.status is FitBatchStatus.INITIALIZATION_FAILED
+    assert analysis.diagnostic
+    assert analysis.component_predictions == ()
+    assert analysis.threshold is None
+    assert not analysis.separated
+
+
+def test_bimodal_distribution_validates_carrier_and_honours_host_abort():
+    with pytest.raises(ValueError, match="same shape"):
+        analyze_bimodal_distribution(np.arange(8.0), np.ones(7))
+    with pytest.raises(ValueError, match="strictly increasing"):
+        analyze_bimodal_distribution(np.array((0.0, 2.0, 1.0)), np.ones(3))
+    with pytest.raises(ValueError, match="cannot be negative"):
+        analyze_bimodal_distribution(np.arange(8.0), -np.ones(8))
+    with pytest.raises(FitCancelled):
+        analyze_bimodal_distribution(
+            np.arange(8.0),
+            np.ones(8),
+            cancel_check=lambda: True,
+        )
     np.testing.assert_allclose(
         evaluate_fit_model(
             "radial_gaussian_center",
@@ -1005,6 +1131,114 @@ def test_large_radial_image_uses_every_valid_observation_and_fits_2d():
     np.testing.assert_allclose(result.parameter_values[0], expected, rtol=2e-3, atol=2e-3)
 
 
+def test_megapixel_radial_fit_refines_locally_but_scores_every_camera_pixel(
+    monkeypatch,
+):
+    import zlc_data.fit_solver as solver_module
+
+    width, height = 1920, 1200
+    x = axis(
+        "x",
+        SPATIAL_X,
+        width,
+        coordinates=range(width),
+        unit="px",
+        frame="camera",
+    )
+    y = axis(
+        "y",
+        SPATIAL_Y,
+        height,
+        coordinates=range(height),
+        unit="px",
+        frame="camera",
+    )
+    expected_center = np.array((950.4, 610.2))
+    expected_radius = 17.0
+    x_grid = np.arange(width, dtype=np.float64)[:, None]
+    y_grid = np.arange(height, dtype=np.float64)[None, :]
+    rng = np.random.default_rng(421)
+    image = np.clip(
+        7.0
+        + 8.0
+        * np.exp(
+            -(
+                (x_grid - expected_center[0]) ** 2
+                + (y_grid - expected_center[1]) ** 2
+            )
+            / expected_radius**2
+        )
+        + rng.normal(0.0, 1.5, size=(width, height)),
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(),
+        point_layout=PointLayout.rect_c(()),
+        data_axes=(x, y),
+        values=image.reshape(1, 1, width, height),
+    )
+    spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        None,
+        (x.axis_id, y.axis_id),
+        (snapshot.block.schema.repeat_axis.axis_id,),
+        "radial_gaussian_center",
+    )
+
+    solve_residual_sizes = []
+    scipy_solve = solver_module.least_squares
+
+    def traced_solve(fun, *args, **kwargs):
+        residual_sizes = []
+
+        def traced_residual(parameters):
+            values = fun(parameters)
+            residual_sizes.append(values.size)
+            return values
+
+        result = scipy_solve(traced_residual, *args, **kwargs)
+        solve_residual_sizes.append(tuple(residual_sizes))
+        return result
+
+    monkeypatch.setattr(solver_module, "least_squares", traced_solve)
+    result = bind_fit(spec, snapshot.block.schema).run(snapshot)
+
+    assert result.statuses == (FitBatchStatus.CONVERGED,)
+    assert len(solve_residual_sizes) == 2
+    assert max(solve_residual_sizes[0]) < image.size // 20
+    assert set(solve_residual_sizes[1]) == {image.size}
+    assert result.used_observation_counts[0] == image.size
+    np.testing.assert_allclose(
+        result.parameter_values[0, 3:5],
+        expected_center,
+        atol=1.0,
+    )
+    assert result.parameter_values[0, 2] == pytest.approx(
+        expected_radius,
+        abs=0.75,
+    )
+    assert result.covariance_valid[0]
+
+    prediction = evaluate_fit_model(
+        "radial_gaussian_center",
+        (
+            np.broadcast_to(x_grid, image.shape),
+            np.broadcast_to(y_grid, image.shape),
+        ),
+        result.parameter_values[0],
+    )
+    authoritative_residual = prediction - image
+    expected_rss = float(np.sum(authoritative_residual**2))
+    expected_total = float(np.sum((image - float(np.mean(image))) ** 2))
+    assert result.residual_sum_squares[0] == pytest.approx(expected_rss, rel=1e-12)
+    assert result.r_squared[0] == pytest.approx(
+        1.0 - expected_rss / expected_total,
+        rel=1e-12,
+    )
+
+
 def test_radial_roi_keeps_absolute_coordinate_less_centers_and_index_units():
     x = axis("x", SPATIAL_X, 61)
     y = axis("y", SPATIAL_Y, 41)
@@ -1155,6 +1389,49 @@ def test_full_2d_fit_does_not_turn_one_outlier_into_the_only_feature():
         result.parameter_values[0, 3:5],
         expected[3:5],
         atol=0.05,
+    )
+
+
+@pytest.mark.parametrize("amplitude", (9.0, -9.0))
+def test_noisy_radial_seed_tracks_coherent_bright_and_dark_features(amplitude):
+    width, height = 320, 240
+    x = axis("x", SPATIAL_X, width, frame="camera")
+    y = axis("y", SPATIAL_Y, height, frame="camera")
+    x_grid = np.arange(width, dtype=np.float64)[:, None]
+    y_grid = np.arange(height, dtype=np.float64)[None, :]
+    expected = (amplitude, 20.0, 9.0, 173.2, 108.7)
+    rng = np.random.default_rng(917 if amplitude > 0.0 else 918)
+    image = evaluate_fit_model(
+        "radial_gaussian_center",
+        (
+            np.broadcast_to(x_grid, (width, height)),
+            np.broadcast_to(y_grid, (width, height)),
+        ),
+        expected,
+    ) + rng.normal(0.0, 0.8, size=(width, height))
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(),
+        point_layout=PointLayout.rect_c(()),
+        data_axes=(x, y),
+        values=image.reshape(1, 1, width, height),
+    )
+    spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        None,
+        (x.axis_id, y.axis_id),
+        (snapshot.block.schema.repeat_axis.axis_id,),
+        "radial_gaussian_center",
+    )
+
+    result = bind_fit(spec, snapshot.block.schema).run(snapshot)
+
+    assert result.statuses == (FitBatchStatus.CONVERGED,)
+    assert np.sign(result.parameter_values[0, 0]) == np.sign(amplitude)
+    np.testing.assert_allclose(
+        result.parameter_values[0, 2:5],
+        expected[2:5],
+        atol=0.25,
     )
 
 

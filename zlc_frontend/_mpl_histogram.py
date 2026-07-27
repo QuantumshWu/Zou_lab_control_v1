@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import numpy as np
+from zlc_data import FitBatchStatus, analyze_bimodal_distribution
 from .figure import (
     EvaluatedAxis,
     EvaluatedCurve,
@@ -30,7 +31,6 @@ from .render_style import (
     FIT_CONTOUR_COLOR,
     FIT_CONTOUR_LINEWIDTH,
     FIT_FAILURE_COLOR,
-    FIT_LINESTYLE,
     HIST_FILL_ALPHA,
     LINE_CYCLE,
     PALETTE,
@@ -219,11 +219,14 @@ def _update_histogram_presentation(
     show_stats: bool,
     threshold_linewidth: float,
 ):
-    """Draw explicit thresholds and a formal FitResultBatch projection.
+    """Draw Distribution's one automatic analysis or a formal Fit projection.
 
-    Binning and ordinary rendering never solve a model.  ``fit_overlays`` is
-    the already-validated, exact-source projection produced by the shared
-    Figure Fit path; an empty tuple means no Fit command is attached.
+    The bounded automatic two-Gaussian analysis is display-only and consumes
+    the already-binned primary series on the render worker.  It never creates
+    a Fit artifact or publishes parameters.  ``fit_overlays`` is the
+    authoritative exact-source Figure Fit projection; its presence suppresses
+    the automatic analysis completely.  Authored thresholds always override
+    the automatic display cut without mutating ``state``.
     """
 
     if not isinstance(state, HistogramDisplayState):
@@ -248,6 +251,14 @@ def _update_histogram_presentation(
     ):
         raise ValueError("formal histogram Fit overlays must align with series")
 
+    automatic_analysis = None
+    if not fit_overlays:
+        bin_centers = (edges[:-1] + edges[1:]) * 0.5
+        automatic_analysis = analyze_bimodal_distribution(
+            bin_centers,
+            counts_group[0],
+        )
+
     fit_artists = tuple(fit_artists)
     required_artist_count = 3 * len(counts_group)
     if fit_artists and len(fit_artists) != required_artist_count:
@@ -262,20 +273,36 @@ def _update_histogram_presentation(
         )
     for artist in fit_artists:
         artist.set_data((), ())
-    for series_index, overlay in enumerate(fit_overlays):
-        if overlay.status is None or not overlay.component_predictions:
-            continue
-        artists = fit_artists[3 * series_index : 3 * series_index + 3]
-        components = overlay.component_predictions
-        if len(components) == 1:
-            artists[2].set_data(overlay.coordinates, components[0])
-        elif len(components) == 3:
-            for artist, values in zip(artists, components, strict=True):
-                artist.set_data(overlay.coordinates, values)
-        else:
-            raise ValueError("histogram Fit model exposed an unsupported component count")
+    if fit_overlays:
+        for series_index, overlay in enumerate(fit_overlays):
+            if overlay.status is None or not overlay.component_predictions:
+                continue
+            artists = fit_artists[3 * series_index : 3 * series_index + 3]
+            components = overlay.component_predictions
+            if len(components) == 1:
+                artists[2].set_data(overlay.coordinates, components[0])
+            elif len(components) == 3:
+                for artist, values in zip(artists, components, strict=True):
+                    artist.set_data(overlay.coordinates, values)
+            else:
+                raise ValueError(
+                    "histogram Fit model exposed an unsupported component count"
+                )
+    elif automatic_analysis.status is FitBatchStatus.CONVERGED:
+        for artist, values in zip(
+            fit_artists[:3],
+            automatic_analysis.component_predictions,
+            strict=True,
+        ):
+            artist.set_data(automatic_analysis.coordinates, values)
 
     thresholds = tuple(float(value) for value in state.thresholds)
+    if (
+        not thresholds
+        and automatic_analysis is not None
+        and automatic_analysis.threshold is not None
+    ):
+        thresholds = (float(automatic_analysis.threshold),)
     threshold_artists = list(threshold_artists)
     while len(threshold_artists) < len(thresholds):
         threshold_artists.append(

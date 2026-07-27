@@ -28,7 +28,6 @@ from .render_style import (
     FIT_CONTOUR_COLOR,
     FIT_CONTOUR_LINEWIDTH,
     FIT_FAILURE_COLOR,
-    FIT_LINESTYLE,
     HIST_FILL_ALPHA,
     LINE_CYCLE,
     PALETTE,

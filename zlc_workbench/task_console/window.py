@@ -10,7 +10,7 @@ import inspect
 import os
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Mapping, Sequence
@@ -681,6 +681,7 @@ class TaskConsole(QtWidgets.QWidget):
         card: PanelCard,
         *,
         live_source_override=None,
+        live_source_component_override=None,
     ) -> None:
         """Send immutable Figure intent to the existing worker owner."""
 
@@ -697,6 +698,9 @@ class TaskConsole(QtWidgets.QWidget):
                     else source_entry.declaration.contract_id
                 ),
                 live_source_override=live_source_override,
+                live_source_component_override=(
+                    live_source_component_override
+                ),
             )
         except (TypeError, ValueError) as error:
             card.set_status(f"Figure output: {error}", error=True)
@@ -704,14 +708,11 @@ class TaskConsole(QtWidgets.QWidget):
         if request is None:
             return
         if request.source_value is not None and request.source_component is None:
-            try:
-                source_component = self._data.capture_source_component(
-                    request.source_value
-                )
-            except (RuntimeError, TypeError, ValueError) as error:
-                card.set_status(f"Figure output: {error}", error=True)
-                return
-            request = replace(request, source_component=source_component)
+            card.set_status(
+                "Figure output: painted source has no committed producer transaction",
+                error=True,
+            )
+            return
         self._render_lane.enqueue_outputs((request,))
 
     def _route_candidate_figure_outputs(self) -> None:
@@ -727,9 +728,15 @@ class TaskConsole(QtWidgets.QWidget):
                 continue
             candidate = self._data.candidate_value(source_name)
             if candidate is not None:
+                try:
+                    source_component = self._data.capture_source_component(candidate)
+                except (RuntimeError, TypeError, ValueError) as error:
+                    card.set_status(f"Figure output: {error}", error=True)
+                    continue
                 self._request_figure_outputs(
                     card,
                     live_source_override=candidate,
+                    live_source_component_override=source_component,
                 )
 
     def _accept_figure_output_completion(
@@ -2673,12 +2680,21 @@ class TaskConsole(QtWidgets.QWidget):
         axis_labels, short_labels = self._panel_render_labels()
         requests = []
         for card, key in batch:
+            value = snapshot.value(str(card.config.signal or ""))
+            source_component = None
+            if value is not None:
+                try:
+                    source_component = self._data.capture_source_component(value)
+                except (RuntimeError, TypeError, ValueError) as error:
+                    card.set_status(f"Render source: {error}", error=True)
+                    continue
             request = card.freeze_render_request(
                 snapshot,
                 key,
                 force=force,
                 axis_labels=axis_labels,
                 short_labels=short_labels,
+                source_component=source_component,
             )
             if request is not None:
                 requests.append(request)
@@ -2756,19 +2772,11 @@ class TaskConsole(QtWidgets.QWidget):
         if request is None:
             return
         if request.source_component is None:
-            try:
-                request = replace(
-                    request,
-                    source_component=self._data.capture_source_component(
-                        request.source
-                    ),
-                )
-            except (RuntimeError, TypeError, ValueError) as error:
-                card.reject_fit_request(
-                    request,
-                    f"source unavailable: {error}",
-                )
-                return
+            card.reject_fit_request(
+                request,
+                "painted source has no committed producer transaction",
+            )
+            return
         self._fit_lane.enqueue(request)
 
     def _accept_fit_completion(self, completion: object) -> None:

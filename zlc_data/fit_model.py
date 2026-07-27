@@ -504,6 +504,34 @@ def _radial_gaussian_center(
     return amplitude * np.exp(-squared_radius / one_over_e_radius**2) + offset
 
 
+def _radial_gaussian_center_jacobian(
+    coordinates: tuple[np.ndarray, np.ndarray],
+    parameters: np.ndarray,
+) -> np.ndarray:
+    """Exact residual Jacobian for the full-image radial polish."""
+
+    x, y = (
+        np.asarray(values, dtype=np.float64).reshape(-1)
+        for values in coordinates
+    )
+    amplitude, _offset, radius, center_x, center_y = np.asarray(
+        parameters,
+        dtype=np.float64,
+    )
+    delta_x = x - center_x
+    delta_y = y - center_y
+    squared_radius = delta_x**2 + delta_y**2
+    exponential = np.exp(-squared_radius / radius**2)
+    scaled = amplitude * exponential
+    jacobian = np.empty((x.size, 5), dtype=np.float64)
+    jacobian[:, 0] = exponential
+    jacobian[:, 1] = 1.0
+    jacobian[:, 2] = scaled * (2.0 * squared_radius / radius**3)
+    jacobian[:, 3] = scaled * (2.0 * delta_x / radius**2)
+    jacobian[:, 4] = scaled * (2.0 * delta_y / radius**2)
+    return jacobian
+
+
 def _init_lorentzian(x: np.ndarray, y: np.ndarray) -> tuple[tuple[float, ...], ...]:
     width = _span(x) / 4.0
     y_range = _span(y)
@@ -689,6 +717,14 @@ def _init_center(
     y: np.ndarray,
     z: np.ndarray,
 ) -> tuple[tuple[float, ...], ...]:
+    spatial_seeds = _spatial_radial_center_seeds(x, y, z)
+    if spatial_seeds:
+        return spatial_seeds
+
+    # Sparse/non-Cartesian point clouds have no neighbourhood topology on which
+    # to distinguish a coherent image feature from one exceptional sample.  The
+    # original full-observation moment remains the deterministic fallback for
+    # those inputs (and for the deliberately tiny initializer examples).
     offset = float(np.median(z))
     seeds: list[tuple[float, ...]] = []
     for sign in (1.0, -1.0):
@@ -714,6 +750,137 @@ def _init_center(
     if not seeds:
         raise ValueError("radial center fit requires non-flat contrast")
     return tuple(seeds)
+
+
+def _spatial_radial_center_seeds(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+) -> tuple[tuple[float, ...], ...]:
+    """Find coherent bright/dark image features before nonlinear refinement.
+
+    A camera image can contain millions of background pixels.  Raw positive
+    moments then measure the camera rectangle and its read noise rather than a
+    small cloud.  Here the complete image still establishes the background,
+    noise scale, and moments, while a 3x3 spatial median rejects isolated hot
+    pixels before connected signal support is identified.  This is a model
+    initializer, not a lossy data transform: the solver later validates the
+    fitted parameters against every authoritative observation.
+    """
+
+    cartesian = _radial_cartesian_grid(x, y, z)
+    if cartesian is None:
+        return ()
+    x_values, y_values, image, _observation_indices = cartesian
+    if x_values.size < 5 or y_values.size < 5:
+        return ()
+    from scipy.ndimage import generate_binary_structure, label, median_filter
+
+    filtered = median_filter(image, size=3, mode="nearest")
+    offset = float(np.median(image))
+    noise_scale = 1.4826 * float(np.median(np.abs(image - offset)))
+    numeric_floor = np.finfo(np.float64).eps * max(
+        abs(offset),
+        float(np.max(image) - np.min(image)),
+        1.0,
+    )
+    x_grid = x_values[:, None]
+    y_grid = y_values[None, :]
+    connectivity = generate_binary_structure(2, 2)
+    coordinate_steps = tuple(
+        float(np.min(differences))
+        for values in (x_values, y_values)
+        if (differences := np.diff(values))[differences > 0.0].size
+    )
+    radius_floor = min(coordinate_steps, default=1.0)
+
+    seeds: list[tuple[float, ...]] = []
+    for sign in (1.0, -1.0):
+        contrast = sign * (filtered - offset)
+        peak = float(np.max(contrast))
+        support_floor = max(3.0 * noise_scale, 0.05 * peak, numeric_floor)
+        if peak <= support_floor:
+            continue
+        components, component_count = label(
+            contrast > support_floor,
+            structure=connectivity,
+        )
+        if component_count == 0:
+            continue
+        excess = np.maximum(contrast - support_floor, 0.0)
+        component_weights = np.bincount(
+            components.reshape(-1),
+            weights=excess.reshape(-1),
+            minlength=component_count + 1,
+        )
+        component_id = 1 + int(np.argmax(component_weights[1:]))
+        component = components == component_id
+        weights = np.where(component, excess, 0.0)
+        total = float(np.sum(weights))
+        if total <= 0.0:
+            continue
+        center_x = float(np.sum(weights * x_grid) / total)
+        center_y = float(np.sum(weights * y_grid) / total)
+        squared_radius = (x_grid - center_x) ** 2 + (y_grid - center_y) ** 2
+        one_over_e_radius = max(
+            float(np.sqrt(np.sum(weights * squared_radius) / total)),
+            radius_floor,
+        )
+        amplitude = sign * float(np.max(contrast[component]))
+        seeds.append(
+            (amplitude, offset, one_over_e_radius, center_x, center_y)
+        )
+    return tuple(seeds)
+
+
+def _radial_cartesian_grid(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Recover a complete Cartesian image without assuming storage order."""
+
+    # FitProblem packs fit axes in canonical C order.  Recognize that ordinary
+    # path in linear time; hashing millions of repeated camera coordinates with
+    # ``np.unique`` cost more than the refinement itself.
+    if z.size and x.shape == y.shape == z.shape:
+        starts = np.concatenate(
+            (
+                np.array((0,), dtype=np.int64),
+                np.flatnonzero(x[1:] != x[:-1]).astype(np.int64, copy=False) + 1,
+                np.array((z.size,), dtype=np.int64),
+            )
+        )
+        run_lengths = np.diff(starts)
+        if run_lengths.size and np.all(run_lengths == run_lengths[0]):
+            x_size = int(run_lengths.size)
+            y_size = int(run_lengths[0])
+            x_grid = x.reshape(x_size, y_size)
+            y_grid = y.reshape(x_size, y_size)
+            x_values = x_grid[:, 0]
+            y_values = y_grid[0, :]
+            if np.all(x_grid == x_values[:, None]) and np.all(
+                y_grid == y_values[None, :]
+            ):
+                return (
+                    np.asarray(x_values, dtype=np.float64),
+                    np.asarray(y_values, dtype=np.float64),
+                    np.asarray(z, dtype=np.float64).reshape(x_size, y_size),
+                    np.arange(z.size, dtype=np.int64).reshape(x_size, y_size),
+                )
+
+    x_values, x_inverse = np.unique(x, return_inverse=True)
+    y_values, y_inverse = np.unique(y, return_inverse=True)
+    if x_values.size * y_values.size != z.size:
+        return None
+    flat_positions = x_inverse * y_values.size + y_inverse
+    if np.unique(flat_positions).size != z.size:
+        return None
+    image = np.empty((x_values.size, y_values.size), dtype=np.float64)
+    observation_indices = np.empty(image.shape, dtype=np.int64)
+    image.reshape(-1)[flat_positions] = z
+    observation_indices.reshape(-1)[flat_positions] = np.arange(z.size)
+    return x_values, y_values, image, observation_indices
 
 
 _IMPLEMENTATION_BY_ID = MappingProxyType(

@@ -37,7 +37,7 @@ from zlc_workbench.task_console.console_records import (
 )
 
 
-KINDS = ("2d", "sites", "1d", "meter", "monitor", "hist", "grid")
+KINDS = ("2d", "sites", "1d", "monitor", "hist", "grid")
 DEFAULT = {
     "panel_id": "panel-test",
     "title": "",
@@ -140,7 +140,7 @@ def test_negative_positions_are_never_silently_rewritten() -> None:
 
 def test_only_end_to_end_live_renderers_are_addable() -> None:
     assert list(PANEL_KINDS) == list(KINDS)
-    for kind in ("pulse",):
+    for kind in ("meter", "pulse"):
         with pytest.raises(ValueError):
             PanelConfig(kind=kind)
 

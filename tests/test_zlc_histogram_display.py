@@ -22,6 +22,7 @@ from zlc_data import (
     StreamGenerationId,
     ValidityContract,
     ValueSchema,
+    analyze_bimodal_distribution,
 )
 from zlc_frontend.display_range import RelimMode
 from zlc_frontend.figure import (
@@ -459,7 +460,14 @@ def test_histogram_threshold_lines_render_and_echo_into_the_payload() -> None:
             previous_relim_mode=None,
             previous_count_scale=None,
         )
-        assert bare_payload.thresholds == ()
+        automatic = analyze_bimodal_distribution(
+            (bare_payload.bin_edges[:-1] + bare_payload.bin_edges[1:]) * 0.5,
+            bare_payload.bin_counts[0],
+        )
+        expected_automatic_thresholds = (
+            () if automatic.threshold is None else (automatic.threshold,)
+        )
+        assert bare_payload.thresholds == expected_automatic_thresholds
         cut = 4.5
         raster, payload = renderer.render_interactive_histogram(
             evaluated,

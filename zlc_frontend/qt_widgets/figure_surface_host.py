@@ -211,6 +211,8 @@ class FigureSurfaceHost(QtWidgets.QWidget):
     panelDoubleClicked = QtCore.pyqtSignal(str)
     figureOutputsChanged = QtCore.pyqtSignal()
     interactionRejected = QtCore.pyqtSignal(str)
+    interactionStarted = QtCore.pyqtSignal(object)
+    interactionFinished = QtCore.pyqtSignal()
 
     def __init__(
         self,
@@ -265,6 +267,13 @@ class FigureSurfaceHost(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._presenter)
+
+        # A surface transaction starts on pointer press, not on the first
+        # motion-derived commit.  Forward the low-level lifecycle so an
+        # application owner can pin the exact value/Figure ancestry that is
+        # still painted while a live producer continues publishing.
+        self.board.interactionStarted.connect(self.interactionStarted.emit)
+        self.board.interactionFinished.connect(self.interactionFinished.emit)
 
         self._output_authority.changed.connect(self.figureOutputsChanged.emit)
 

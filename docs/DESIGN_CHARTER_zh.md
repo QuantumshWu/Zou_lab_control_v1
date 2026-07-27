@@ -24,8 +24,8 @@
 
 10. Dataset 永久是 `(R,P,*data_shape)`；R 与 P 是物理存储维度，point axes/PointLayout 单独描述 P 的逻辑多维结构。标量固定为 `(R,P,1)` 和 canonical scalar axis。禁止 first、flatten、按 singleton/rank 猜语义或隐式平均信息轴。
 11. ComponentValidity 必须覆盖其声明的 data axes；reduce/Fit/histogram/meter/派生 signal 全部消费同一 validity。显示 projection 不能静默升级成 fit/scan/artifact 的权威 transform。
-12. Area、锁定 Cross 和 Fit 属于 Figure。它们只在明确手势或提交后发布派生 signal，不重配 Measurement、不建立 ROI processor、不弹第二个 DataFigure。普通 pointer motion 不发布 hover 数据。
-13. 所有 plot kind 共用 FigureSpec/Divider、renderer、selector 几何、panel size 与 Setting/Edit owner。frontend 的 `FigureSurfaceHost`、`FigureOutputAuthority` 与 `FigureSurfaceLane` 分别独占 Qt figure surface、派生输出 authority 与 render lane；Qt 只接收 immutable raster/front 和 typed geometry，matplotlib 只在 worker-owned headless render 路径。Workbench 只能组合和布局这些 owner。
+12. Area、锁定 Cross 和 Fit 属于 Figure。它们只在明确手势或提交后发布派生 signal，不重配 Measurement、不建立 ROI processor、不弹第二个 DataFigure。普通 pointer motion 不发布 hover 数据。一次可见 Figure front 必须把 immutable raster、typed Figure/display、exact dataset value 与其 producer transaction sidecar 同时提升；鼠标按下即按 surface 固定这组事实，直到手势完成。不得在点击 Fit/Area 时向已经前进的数据面反查旧 revision 的 ancestry；纯显示 surface 没有 producer sidecar 时仍可 zoom/pan，但不得伪造可路由派生 signal。
+13. 所有 plot kind 共用 FigureSpec/Divider、renderer、selector 几何、panel size 与 Setting/Edit owner。frontend 的 `FigureSurfaceHost`、`FigureOutputAuthority` 与 `FigureSurfaceLane` 分别独占 Qt figure surface、派生输出 authority 与 render lane；Qt 只接收 immutable raster/front 和 typed geometry，matplotlib 只在 worker-owned headless render 路径。Workbench 只能组合和布局这些 owner。正式 Add Panel 只有 `2d/sites/1d/monitor/hist/grid`；Meter 只可作为内部静态数值 primitive，不能形成第二个用户 plot kind。Distribution 在 render worker 对已经冻结的 bin projection 自动运行 zlc_data 唯一的双高斯显示分析并绘制 components/可分阈值；它不提交 Fit、不发布 `fit.*`，显式 Figure Fit 存在时后者覆盖自动显示分析。
 14. 普通编辑事件只原位更新稳定 widget。Add/Remove/Reorder 只增删移动对应控件；unit/name/value/delay/binding/visibility 不得重建整树。全量 reconcile 只允许 document generation 或 target topology 真正替换。
 15. TaskConsole、PulseGUI、DeviceManager、FigureViewer 的正式外观和手感由当前共享 frontend/workbench owner 与已验收产品合同决定。只有调查一个明确旧行为时才按需运行 `ZLC_main` 作 oracle；不得把 main 当默认 UI 权威或批量搬运来源。偏离当前产品合同必须有明确产品或正确性收益，不能由实现方便产生。
 

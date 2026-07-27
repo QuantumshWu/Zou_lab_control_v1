@@ -12,6 +12,7 @@ stored and what is drawn cannot drift.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 from typing import Mapping
 from PyQt5 import QtCore, QtWidgets
@@ -88,6 +89,17 @@ _FIT_SPEC_PARAM = "figure_fit_spec"
 # qt_widgets submodules are reached as ATTRIBUTES of the one facade binding: their names are
 # deliberately absent from the facade __all__, and the package forbids outside deep imports.
 FORM_WIDGET_HANDLERS = _qt_widgets.FORM_WIDGET_HANDLERS
+
+
+@dataclass(frozen=True, slots=True)
+class _PointerInteractionPin:
+    """One pressed Figure surface and the exact semantic front it displays."""
+
+    host: object
+    origin: object
+    value: object
+    source_component: object | None
+    surface_id: str
 
 
 
@@ -238,6 +250,7 @@ class PanelCard(FluentGroupBox):
         # schema, Setting/Edit controls, selectors and Fit always derive from
         # ``_presented_value`` until the matching raster is committed.
         self._candidate_value = None
+        self._candidate_source_component = None
         # Worker completion and visible presentation are different facts.
         # Promote this group only after the Qt board accepts its matching
         # immutable frame in ``present()``.
@@ -245,11 +258,13 @@ class PanelCard(FluentGroupBox):
         self._pending_display = None
         self._pending_contract = None
         self._pending_value = None
+        self._pending_source_component = None
         self._pending_render_request_revision = None
         self._presented_figure = None
         self._presented_display = None
         self._presented_contract = None
         self._presented_value = None
+        self._presented_source_component = None
         self._presented_render_request_revision = None
         self._grid_focus = None
         self._render_request_revision = 0
@@ -270,6 +285,11 @@ class PanelCard(FluentGroupBox):
         # but it cannot settle this intent.  Pulse Preview uses the identical
         # revision-owned answer rule.
         self._pending_interaction_revision = None
+        # Pointer-down is itself a presentation transaction boundary.  The
+        # board freezes the exact painted origin before motion; this card pins
+        # the matching value/Figure/component until release so a live camera
+        # cannot advance the semantic owner underneath a drag.
+        self._pointer_interaction_pin: _PointerInteractionPin | None = None
         # Bumped by every display-knob edit.  The renderer reads it to tell a
         # genuinely new display from a repeat of the same one.
         self._display_revision = 0
@@ -355,6 +375,7 @@ class PanelCard(FluentGroupBox):
         self._pending_display = None
         self._pending_contract = None
         self._pending_value = None
+        self._pending_source_component = None
         self._pending_render_request_revision = None
         if self.board is not None:
             self.board.clear()
@@ -493,7 +514,7 @@ class PanelCard(FluentGroupBox):
         if provider is None:
             value = self._presented_value
             figure = self._presented_figure
-            source_component = None
+            source_component = self._presented_source_component
             payload = self.frozen_render_payload()
         else:
             context = provider()
@@ -1203,6 +1224,18 @@ class PanelCard(FluentGroupBox):
         self.board.thresholdsCommitted.connect(
             self._on_histogram_thresholds_committed
         )
+        self.board.interactionStarted.connect(
+            lambda origin, host=self.board: self._begin_pointer_interaction(
+                host,
+                origin,
+                value=self._presented_value,
+                source_component=self._presented_source_component,
+                surface_id=self.panel_id,
+            )
+        )
+        self.board.interactionFinished.connect(
+            lambda host=self.board: self._finish_pointer_interaction(host)
+        )
         # The console switch may have been armed before this card received its
         # first frame.  Replay the card-owned state onto the newly-created host;
         # otherwise the visible switch says ON while this first surface stays
@@ -1289,6 +1322,7 @@ class PanelCard(FluentGroupBox):
         *,
         source_contract_id: str | None,
         live_source_override=None,
+        live_source_component_override=None,
     ) -> _PanelFigureOutputRequest | None:
         """Freeze Figure intent only; derived arrays stay off the Qt owner."""
 
@@ -1301,8 +1335,10 @@ class PanelCard(FluentGroupBox):
         live_source, area_commit, cross_commit, _live_fit_result = (
             self.frozen_figure_output_state()
         )
+        live_source_component = self._presented_source_component
         if live_source_override is not None:
             live_source = live_source_override
+            live_source_component = live_source_component_override
             authority = self._figure_output_authority
             area_commit = (
                 authority.area_commit
@@ -1372,7 +1408,9 @@ class PanelCard(FluentGroupBox):
             source_value,
             request,
             source_component=(
-                fit_source_component if fit_result is not None else None
+                fit_source_component
+                if fit_result is not None
+                else live_source_component
             ),
         )
 
@@ -1432,6 +1470,7 @@ class PanelCard(FluentGroupBox):
         force: bool = False,
         axis_labels=None,
         short_labels=None,
+        source_component=None,
     ) -> _PanelRenderRequest | None:
         """Freeze one worker request without exposing mutable Qt/card state.
 
@@ -1457,14 +1496,20 @@ class PanelCard(FluentGroupBox):
             # signal publication continue, but the card keeps painting the
             # command Figure until Fit is cleared or replaced.  Remember only
             # the newest immutable candidate so release can resume immediately.
-            self._remember_candidate_value(value)
+            self._remember_candidate_value(
+                value,
+                source_component=source_component,
+            )
             return None
-        if self._pending_interaction_origin is not None:
+        if self._live_surface_interaction_pending():
             # One selector transaction is defined on the exact immutable
             # front the operator saw.  Remember the newest live value for the
             # next ordinary tick, but never let it replace the interaction's
             # pinned render request or splice a new input revision into a drag.
-            self._remember_candidate_value(value)
+            self._remember_candidate_value(
+                value,
+                source_component=source_component,
+            )
             return None
         return self._freeze_value_render_request(
             value,
@@ -1472,10 +1517,11 @@ class PanelCard(FluentGroupBox):
             force=force,
             axis_labels=axis_labels,
             short_labels=short_labels,
+            source_component=source_component,
         )
 
-    def _remember_candidate_value(self, value) -> None:
-        """Retain only the newest observed source value without rendering it."""
+    def _remember_candidate_value(self, value, *, source_component=None) -> None:
+        """Retain the newest value and its exact producer sidecar as one fact."""
 
         source_ref = value.snapshot.ref
         candidate_ref = getattr(
@@ -1483,12 +1529,19 @@ class PanelCard(FluentGroupBox):
             "ref",
             None,
         )
-        if (
+        advances = (
             candidate_ref is None
             or candidate_ref.stream_generation != source_ref.stream_generation
             or candidate_ref.revision <= source_ref.revision
-        ):
+        )
+        if advances:
             self._candidate_value = value
+            self._candidate_source_component = source_component
+        elif candidate_ref == source_ref and source_component is not None:
+            # A worker request may first observe the immutable value and have its
+            # opaque producer sidecar attached by the composition root before
+            # completion.  Never replace a retained sidecar with ``None``.
+            self._candidate_source_component = source_component
 
     def freeze_current_view_request(
         self,
@@ -1506,7 +1559,7 @@ class PanelCard(FluentGroupBox):
         """
 
         name = self.config.signal
-        if self._pending_interaction_origin is not None:
+        if self._live_surface_interaction_pending():
             # A held pointer gesture edits the exact data front the operator
             # can still see.  A newer live-camera completion may already be in
             # ``_candidate_value`` while its raster is queued or while the held
@@ -1533,12 +1586,32 @@ class PanelCard(FluentGroupBox):
             else:
                 self.set_status("pick a signal in Setting", error=False)
             return None
+        source_component = None
+        value_ref = value.snapshot.ref
+        presented_ref = getattr(
+            getattr(self._presented_value, "snapshot", None),
+            "ref",
+            None,
+        )
+        if value_ref == presented_ref:
+            source_component = self._presented_source_component
+        elif (
+            self._candidate_value is not None
+            and value_ref == self._candidate_value.snapshot.ref
+        ):
+            source_component = self._candidate_source_component
+        elif (
+            self._fit_active_source is not None
+            and value_ref == self._fit_active_source.snapshot.ref
+        ):
+            source_component = self._fit_active_source_component
         return self._freeze_value_render_request(
             value,
             self._render_version,
             force=force,
             axis_labels=axis_labels,
             short_labels=short_labels,
+            source_component=source_component,
         )
 
     def _freeze_value_render_request(
@@ -1549,6 +1622,7 @@ class PanelCard(FluentGroupBox):
         force: bool,
         axis_labels=None,
         short_labels=None,
+        source_component=None,
     ) -> _PanelRenderRequest | None:
         """Freeze one immutable value/display pair for the raster worker."""
 
@@ -1564,7 +1638,10 @@ class PanelCard(FluentGroupBox):
         except (TypeError, ValueError) as error:
             self.set_status(str(error), error=True)
             return None
-        self._remember_candidate_value(value)
+        self._remember_candidate_value(
+            value,
+            source_component=source_component,
+        )
         visible_schema = self._current_schema()
         schema_transition = (
             visible_schema is not None
@@ -1625,6 +1702,7 @@ class PanelCard(FluentGroupBox):
             source=source,
             fit_result=fit_result,
             fit_result_identity=fit_result_identity,
+            source_component=source_component,
         )
         if not force and request.signature == self._requested_signature:
             return None
@@ -1645,6 +1723,7 @@ class PanelCard(FluentGroupBox):
         axis_labels=None,
         short_labels=None,
         display=None,
+        source_component=None,
     ) -> _PanelRenderRequest:
         """Freeze an additional presentation of one already accepted value.
 
@@ -1699,6 +1778,7 @@ class PanelCard(FluentGroupBox):
             fit_result=fit_result,
             fit_result_identity=fit_result_identity,
             surface_id=str(surface_id),
+            source_component=source_component,
         )
 
     def _build_surface_render_request(
@@ -1714,6 +1794,7 @@ class PanelCard(FluentGroupBox):
         fit_result,
         fit_result_identity,
         surface_id: str | None = None,
+        source_component=None,
     ) -> _PanelRenderRequest:
         """Freeze one frontend-owned presentation for either Qt surface."""
 
@@ -1745,6 +1826,7 @@ class PanelCard(FluentGroupBox):
             fit_result,
             fit_result_identity,
             surface_id=surface_id,
+            source_component=source_component,
         )
 
     def accept_render_result(
@@ -1787,14 +1869,28 @@ class PanelCard(FluentGroupBox):
             or source_ref.schema_fingerprint != latest_ref.schema_fingerprint
         ):
             return False
-        pending_interaction = self._pending_interaction_origin
-        if pending_interaction is not None:
+        pointer_pin = self._pointer_interaction_pin
+        pinned_interaction = (
+            pointer_pin.origin
+            if pointer_pin is not None and pointer_pin.host is self.board
+            else (
+                self._pending_interaction_origin
+                if self._pending_interaction_host is self.board
+                else None
+            )
+        )
+        if pinned_interaction is not None:
             pending_ref = getattr(
-                pending_interaction.input_identity,
+                pinned_interaction.input_identity,
                 "ref",
                 None,
             )
             if pending_ref is None or source_ref != pending_ref:
+                self._settle_pending_interaction_through(
+                    request.display.revision,
+                    failed=True,
+                    answer_host=self.board,
+                )
                 return False
         if error is not None and (
             source_ref.revision != latest_ref.revision
@@ -1913,11 +2009,15 @@ class PanelCard(FluentGroupBox):
                     return True
                 pending_figure = figure
             pending_display = request.display
-        self._remember_candidate_value(request.value)
+        self._remember_candidate_value(
+            request.value,
+            source_component=request.source_component,
+        )
         self._pending_figure = pending_figure
         self._pending_display = pending_display
         self._pending_contract = request.contract
         self._pending_value = request.value
+        self._pending_source_component = request.source_component
         self._pending_render_request_revision = int(request.request_revision)
         self.set_status("ok", error=False)
         return True
@@ -1957,6 +2057,101 @@ class PanelCard(FluentGroupBox):
         self._pending_interaction_origin = None
         self._pending_interaction_host = None
         self._pending_interaction_revision = None
+        self._resume_latest_candidate_after_interaction()
+
+    def _clear_pending_render_result(self) -> None:
+        """Discard one unpainted worker answer without touching the stable host."""
+
+        self._pending_frame = None
+        self._pending_faceted_result = None
+        self._pending_figure = None
+        self._pending_display = None
+        self._pending_contract = None
+        self._pending_value = None
+        self._pending_source_component = None
+        self._pending_render_request_revision = None
+
+    def _begin_pointer_interaction(
+        self,
+        host,
+        origin,
+        *,
+        value,
+        source_component,
+        surface_id: str,
+    ) -> None:
+        """Pin one surface's exact data and ancestry at pointer press."""
+
+        if host is None or origin != host.visible_interaction_origin():
+            return
+        if value is None:
+            self.set_status(
+                "painted Figure front has no immutable data value",
+                error=True,
+            )
+            return
+        visible_ref = getattr(getattr(value, "snapshot", None), "ref", None)
+        origin_ref = getattr(origin.input_identity, "ref", None)
+        if visible_ref is None or origin_ref != visible_ref:
+            self.set_status(
+                "interaction origin differs from the painted data front",
+                error=True,
+            )
+            return
+        self._pointer_interaction_pin = _PointerInteractionPin(
+            host,
+            origin,
+            value,
+            source_component,
+            str(surface_id),
+        )
+        if host is not self.board:
+            return
+        pending_ref = getattr(
+            getattr(self._pending_value, "snapshot", None),
+            "ref",
+            None,
+        )
+        if pending_ref is not None and pending_ref != origin_ref:
+            self._clear_pending_render_result()
+
+    def _finish_pointer_interaction(self, host) -> None:
+        """Release the press-time pin after the frontend has delivered its intent."""
+
+        pin = self._pointer_interaction_pin
+        if pin is None or host is not pin.host:
+            return
+        self._pointer_interaction_pin = None
+        self._resume_latest_candidate_after_interaction()
+
+    def _live_surface_interaction_pending(self) -> bool:
+        """Whether the live card, rather than a frozen Edit surface, is pinned."""
+
+        pin = self._pointer_interaction_pin
+        return (
+            (pin is not None and pin.host is self.board)
+            or (
+                self._pending_interaction_origin is not None
+                and self._pending_interaction_host is self.board
+            )
+        )
+
+    def _resume_latest_candidate_after_interaction(self) -> None:
+        """Catch the live surface up once no gesture or render receipt owns it."""
+
+        if (
+            self._live_surface_interaction_pending()
+            or self._candidate_value is None
+        ):
+            return
+        candidate_ref = self._candidate_value.snapshot.ref
+        presented_ref = getattr(
+            getattr(self._presented_value, "snapshot", None),
+            "ref",
+            None,
+        )
+        if candidate_ref != presented_ref:
+            self._request_current_render(force=True)
 
     def _continues_pending_interaction(self, host, origin) -> bool:
         """Whether ``origin`` is a newer front of this host's same gesture.
@@ -2138,6 +2333,17 @@ class PanelCard(FluentGroupBox):
             raise RuntimeError("the panel has no presented data value")
         return value
 
+    def frozen_render_source_component(self):
+        """Return the opaque ancestry committed with the painted value.
+
+        The value and this component cross the visible boundary together.  A
+        selector, Fit command, or frozen Edit surface copies this exact fact;
+        none may ask an advancing live data plane to reconstruct an old front.
+        Static Figure surfaces legitimately return ``None``.
+        """
+
+        return self._presented_source_component
+
     def frozen_render_payload(self):
         """Return the exact typed payload painted by the current focused front."""
 
@@ -2183,12 +2389,14 @@ class PanelCard(FluentGroupBox):
         pending_display = self._pending_display
         pending_contract = self._pending_contract
         pending_value = self._pending_value
+        pending_source_component = self._pending_source_component
         pending_render_request_revision = self._pending_render_request_revision
         visible_schema = self._current_schema()
         self._pending_figure = None
         self._pending_display = None
         self._pending_contract = None
         self._pending_value = None
+        self._pending_source_component = None
         self._pending_render_request_revision = None
         if pending_contract is None:
             raise RuntimeError("pending raster has no PlotPanel contract")
@@ -2259,6 +2467,7 @@ class PanelCard(FluentGroupBox):
             self._presented_display = pending_display
             self._presented_contract = pending_contract
             self._presented_value = pending_value
+            self._presented_source_component = pending_source_component
             self._presented_render_request_revision = (
                 pending_render_request_revision
             )
@@ -3270,6 +3479,7 @@ class PanelCard(FluentGroupBox):
             emit_changed=False,
         )
         self._candidate_value = None
+        self._candidate_source_component = None
         self._grid_focus = None
         self._view_pin = None
         self._invalidate_render_binding()
@@ -3277,6 +3487,7 @@ class PanelCard(FluentGroupBox):
         self._presented_display = None
         self._presented_contract = None
         self._presented_value = None
+        self._presented_source_component = None
         self._presented_render_request_revision = None
         if self.board is None:
             self._clear_figure_outputs(notify=True)
@@ -3875,16 +4086,19 @@ class PanelCard(FluentGroupBox):
         self._pending_interaction_origin = None
         self._pending_interaction_host = None
         self._pending_interaction_revision = None
+        self._pointer_interaction_pin = None
 
         self._retire_fit_command(notify=False, emit_changed=False)
         self.invalidate_figure_output_requests()
         self._invalidate_render_binding()
         self._candidate_value = None
+        self._candidate_source_component = None
         self._grid_focus = None
         self._presented_figure = None
         self._presented_display = None
         self._presented_contract = None
         self._presented_value = None
+        self._presented_source_component = None
         self._presented_render_request_revision = None
         self._clear_figure_outputs(notify=False)
 
@@ -3923,6 +4137,7 @@ class PanelCard(FluentGroupBox):
         self._pending_display = None
         self._pending_contract = None
         self._pending_value = None
+        self._pending_source_component = None
         self._pending_render_request_revision = None
         self._render_request_revision += 1
         self._requested_signature = None
@@ -3949,6 +4164,7 @@ class PanelCard(FluentGroupBox):
         self._pending_interaction_origin = None
         self._pending_interaction_host = None
         self._pending_interaction_revision = None
+        self._pointer_interaction_pin = None
         self.board = None
         self._pending_frame = None
         self._pending_faceted_result = None
@@ -3956,13 +4172,16 @@ class PanelCard(FluentGroupBox):
         self._pending_display = None
         self._pending_contract = None
         self._pending_value = None
+        self._pending_source_component = None
         self._pending_render_request_revision = None
         self._candidate_value = None
+        self._candidate_source_component = None
         self._grid_focus = None
         self._presented_figure = None
         self._presented_display = None
         self._presented_contract = None
         self._presented_value = None
+        self._presented_source_component = None
         self._presented_render_request_revision = None
         self._clear_figure_outputs(notify=False)
         self._requested_signature = None

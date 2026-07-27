@@ -58,15 +58,16 @@ from .plot_layout import (
 )
 from .render_style import (
     ANNOTATION_FONT_SIZE,
+    FIT_DIM_ALPHA,
     FIT_FAILURE_COLOR,
     FIT_RADIAL_CENTER_SIZE,
     FIT_RADIAL_COLOR,
     FIT_RADIAL_RING_ALPHA,
     FIT_RADIAL_RING_LINEWIDTH,
-    FIT_LINESTYLE,
     HIST_FILL_ALPHA,
     apply_title,
     axis_label_fontsize,
+    curve_fit_line_kwargs,
     render_style_context,
     tick_fontsize,
 )
@@ -528,14 +529,12 @@ class FacetedPanelAggRenderer:
                 state.source = tuple(axis.lines)
                 fit_artists = []
                 diagnostics = []
-                for index, source_artist in enumerate(state.source):
+                for index, _source_artist in enumerate(state.source):
                     fit_artist, = axis.plot(
                         (),
                         (),
-                        color=source_artist.get_color(),
-                        linestyle=FIT_LINESTYLE,
-                        marker=None,
                         label="_nolegend_",
+                        **curve_fit_line_kwargs(),
                     )
                     fit_artists.append(fit_artist)
                     diagnostics.append(
@@ -580,6 +579,7 @@ class FacetedPanelAggRenderer:
                     multiple_series=multiple,
                 )
                 source_artist.set_label(label)
+                source_artist.set_alpha(1.0)
                 fit_artist.set_data((), ())
                 fit_artist.set_visible(False)
                 fit_artist.set_label("_nolegend_")
@@ -604,6 +604,7 @@ class FacetedPanelAggRenderer:
                 )
                 fit_artist.set_visible(True)
                 fit_artist.set_label(f"fit {label}")
+                source_artist.set_alpha(FIT_DIM_ALPHA)
             axis.set_xlabel(_axis_label(series_group[0].data.x_axis))
             axis.set_ylabel(self._value_label)
             axis.set_xlim(*x_limits)

@@ -56,6 +56,11 @@ class FigureSurfaceRenderRequest:
     # ``panel_id`` remains the Figure's semantic identity; ``surface_id`` is
     # only the composition/presentation route.
     surface_id: str | None = None
+    # Opaque application ancestry frozen beside ``value``.  The frontend lane
+    # neither imports nor interprets it; it merely preserves the exact source
+    # fact until the matching raster is admitted.  A live producer may advance
+    # before the operator acts on the painted revision.
+    source_component: object | None = None
 
     @property
     def render_surface_id(self) -> str:

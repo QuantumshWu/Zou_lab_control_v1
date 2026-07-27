@@ -15,6 +15,7 @@ GOLDEN = {
     "2d": ("2D image", True),
     "sites": ("Site map", True),
     "1d": ("1D vector", True),
+    "meter": ("Meter", False),
     "monitor": ("Rolling trace", True),
     "hist": ("Distribution", True),
     "pulse": ("Pulse sequence", False),
