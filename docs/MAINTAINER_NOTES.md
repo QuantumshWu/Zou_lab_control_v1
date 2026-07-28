@@ -28,7 +28,7 @@ The refreshed M0 authority closes all of the following together:
 
 - System Architecture is the sole normative design and contains the converged Point, View/Fit, Signal transaction, Run admission, hardware, storage, form and product-flow contracts.
 - The adversarial audit corrections are merged into System Architecture §4, §5, §8, §9 and §10; this checkpoint does not restate those contracts.
-- System Architecture §3.3–§3.5 no longer turns point semantics into a public type family: PointColumn/GridTopology reuse AxisId, one discriminated AxisSourceRef replaces five ref classes, `point_ordinals` is the row-filter payload, grouping is a plain source tuple, and the sole resolved value is data-owned ResolvedPointRows. Frontend validation delegates privately from the existing Figure contract and does not own a second resolved DTO/module.
+- System Architecture §3.3–§3.5 no longer turns point semantics into a public type family: PointColumn/GridTopology reuse AxisId, one discriminated AxisSourceRef replaces five ref classes, `point_ordinals` is the row-filter payload, grouping is a plain source tuple, and the sole resolved value is data-owned ResolvedPointRows. A point ordinal itself is the observation address, so the result has no mirrored address field. Frontend validation delegates privately from the existing Figure contract and does not own a second resolved DTO/module.
 - The stale per-revision Presented*, horizontal M1 and public session/lane/admission type implications are absent from the target design except where named as deletion evidence.
 - `AGENTS.md` contains execution protocol only.
 - this file contains checkpoint/operations only.
