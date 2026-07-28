@@ -95,13 +95,11 @@ DatasetValidity =
 Dataset 的 point truth 固定为：
 
 ```text
-PointCoordinateId: stable typed identifier
-
 PointColumn:
-  coordinate_id: PointCoordinateId
+  coordinate_id: AxisId
   name: str
   role: AxisRoleId
-  value_kind: PointCoordinateKind.NUMERIC | PointCoordinateKind.TEXT
+  value_kind: NUMERIC | TEXT
   values: immutable tuple of exactly P canonical scalar values
   unit: canonical str | None
   coordinate_frame: canonical str | None       # opaque equality tag，不做坐标代数
@@ -115,10 +113,10 @@ PointTable:
 确定规则：
 
 - row ordinal 是 frozen Dataset/Run 内唯一 point identity；Dataset/Run generation 提供作用域，不增加永远等于 ordinal 的 UUID `PointId`。
-- `zlc_data.canonical_coordinate_scalar` 是 AxisSpec、PointColumn 与 GridDimension domain 共用的唯一 normalizer/equality owner：vocabulary 为 `None | str | int | finite float`，NumPy scalar 先归一化，integral float 归一为 int，`-0.0` 归一为 `0.0`；bool、NaN/Inf、bytes、容器和任意 Python object 一律拒绝。codec 使用同一 projector，禁止三处各写一套规则。
+- `zlc_data.canonical_coordinate_scalar` 是 AxisSpec、PointColumn 与 GridTopology coordinate domain 共用的唯一 normalizer/equality owner：vocabulary 为 `None | str | int | finite float`，NumPy scalar 先归一化，integral float 归一为 int，`-0.0` 归一为 `0.0`；bool、NaN/Inf、bytes、容器和任意 Python object 一律拒绝。codec 使用同一 projector，禁止三处各写一套规则。
 - PointColumn 的 `value_kind` 纳入 codec/fingerprint并显式声明 NUMERIC 或 TEXT；除 `None` 外不得混合数值与字符串，TEXT 不得有 unit。`None` 是 missing coordinate，不是一个可 facet/group 的类别：用到该 coordinate 的 display 会把对应 row 标为 invalid并显示 dropped count，Fit 排除并记录 observation count，GridTopology domain/映射则直接拒绝 `None`。
 - `AxisRoleId` 在这里只是语义标签，不把 PointColumn 变成独立 ndarray axis。合法 point-domain role 明确限定为 `SCAN_POINT/READOUT_EVENT/MONITOR_HISTORY/SPATIAL_X/SPATIAL_Y/SPECTRAL/HISTOGRAM_BIN/SITE`；`REPEAT/SCALAR/COMPONENT` 不得进入 PointColumn。未来若新增合法 role，必须先在唯一数据合同中扩展该闭集及 codec test，不能由 leaf 自行放宽。
-- `coordinate_id` 在一个 PointTable 内唯一；每列长度必须等于 P；PointTable、GridTopology 和 cell schema 全部进入 DatasetSchema fingerprint。
+- `coordinate_id` 复用已有 `AxisId`，不再增加只在 point column 中改名转发的 `PointCoordinateId`。它在一个 PointTable 内唯一；每列长度必须等于 P；PointTable、GridTopology 和 cell schema 全部进入 DatasetSchema fingerprint。
 - coordinate column 和完整 coordinate tuple 都允许重复；coordinate equality 不是身份。
 - 行顺序就是 authored、compiled、emitted、captured 和 provenance 顺序。
 - `P=1` 且零 coordinate column 完全合法。
@@ -128,19 +126,16 @@ PointTable:
 
 ```text
 GridTopology:
-  dimensions: ordered GridDimension values
+  dimension_ids: ordered tuple[AxisId, ...]
+  coordinate_domains: one ordered unique scalar tuple per dimension
   row_to_cell: exactly P entries, ordinal -> logical cell tuple
-
-GridDimension:
-  source_coordinate_id: PointCoordinateId
-  coordinate_domain: ordered unique values
 ```
 
 规则：
 
 - 只有知道数据确实是 grid 的 producer 才能声明；绝不从 rank、unique-count、Python 变量或笛卡尔积推断。
 - `row_to_cell` 必须 in-bounds 且 injective；可以 incomplete，因此支持 sparse 和 serpentine。completeness 是派生事实，不是另一个布尔真相。
-- 每个 mapped row 的 PointColumn 值必须等于相应 dimension domain 的 cell 值；每个 source_coordinate_id 只能出现一次，它同时就是该 logical dimension 的身份。删除无独立语义、必须与 source id 永久同步的第二个 GridDimensionId。
+- 每个 mapped row 的 PointColumn 值必须等于相应 dimension domain 的 cell 值；每个 dimension_id 必须引用唯一 PointColumn 并只能出现一次，它同时就是该 logical dimension 的身份。不得为同一 tuple entry 再建 `GridDimension` 或 `GridDimensionId` wrapper。
 - 同一 sweep 内重复访问同一 logical cell 的 trajectory 不带 GridTopology；完整 grid 的重复 sweep 应进入 R。
 - 只有把 point rows 映射成二维/多维 logical cells（densify、grid image、topology-dimension selector/facet）才需要 GridTopology；普通 `PlotKind.GRID` 是“一个 FACET source 的 small multiples”容器，可 facet R、trailing data axis、PointRows（逐ordinal）或 PointCoordinate，完全不要求 GridTopology。
 - `AxisLayout` 仍可服务 FitResultBatch 等真正具有独立 batch grid 的结果，但不再充当 Dataset point truth。
@@ -150,12 +145,10 @@ GridDimension:
 `ViewSpec` 不再并存“tensor axis bindings”和另一套残缺的 point projection。它只保存一套 closed typed source bindings：
 
 ```text
-AxisSourceRef =
-    TensorAxisRef(AxisId)                    # R 或 trailing data axis
-  | PointRowsRef                            # 唯一物理 P row domain
-  | PointOrdinalRef                         # 0..P-1，仍与 PointRows 共享 domain
-  | PointCoordinateRef(PointCoordinateId)   # 长度 P 的相关 column
-  | GridDimensionRef(PointCoordinateId)     # 该 column 在 GridTopology 中的 logical domain
+AxisSourceRef:
+  kind: TENSOR | POINT_ROWS | POINT_ORDINAL |
+        POINT_COORDINATE | GRID_DIMENSION
+  axis_id: AxisId | None
 
 SourceViewBinding:
   source: AxisSourceRef
@@ -163,15 +156,14 @@ SourceViewBinding:
         SELECTED | REDUCED
   selector/reduction: 仅在该 role 要求时存在
 
-PointRowSelection = AllRows |
-                    PointOrdinalSelection(nonempty strictly increasing unique ordinals)
-
 ViewSpec:
   schema_fingerprint
   intent
   source_bindings
-  point_row_selection: PointRowSelection       # 唯一 P-row filter authority
+  point_ordinals: tuple[int, ...] | None       # 唯一 P-row filter authority
 ```
+
+`AxisSourceRef` 是一个 discriminated immutable value，不是五个 subclass、五套 descriptor 或五个模块。`TENSOR`、`POINT_COORDINATE`、`GRID_DIMENSION` 携一个已有 `AxisId`；`POINT_ROWS`、`POINT_ORDINAL` 不携 id。`point_ordinals=None` 表示全部 authored rows；显式值必须非空、严格递增、唯一且在表内。不得再建立 `PointCoordinateId`、`PointRowSelection`、`PointGroupSpec` 或同义 request DTO。
 
 精确验证规则：
 
@@ -179,24 +171,24 @@ ViewSpec:
 
 | source | 合法 display roles | 额外条件 |
 |---|---|---|
-| `TensorAxisRef` | X、IMAGE_X/Y、SAMPLE、BATCH、FACET、SELECTED、REDUCED | 由 ViewContract/AxisRole 再收窄；`LatestNonempty` 只允许 repeat TensorAxisRef |
-| `PointRowsRef` | SAMPLE、BATCH、FACET、REDUCED | 先应用唯一 `point_row_selection`；BATCH/FACET 表示每个 surviving row 一个 cell；SAMPLE 只在 Histogram；binding 不得再携 row selector |
-| `PointOrdinalRef` | X；以及 PRESERVE_ROWS 下与一个 TensorAxis 配对的 IMAGE_X 或 IMAGE_Y | 唯一`0..P-1`坐标；不得BATCH/FACET。Image中它定义dense row-cell geometry |
-| NUMERIC `PointCoordinateRef` | X、BATCH、FACET；以及 PRESERVE_ROWS 下与一个 TensorAxis 配对的 IMAGE_X 或 IMAGE_Y | BATCH/FACET按canonical value分组；Image仍按authored row ordinal放置cell，只把coordinate作逐row label/metadata，不按不规则值拉伸/重采样；不可SAMPLE/REDUCED |
-| TEXT `PointCoordinateRef` | BATCH、FACET | 不得作为数值 X/Image/Fit independent source；missing rows 按固定规则丢弃并计数 |
-| `GridDimensionRef` | X、IMAGE_X/Y、BATCH、FACET、SELECTED、REDUCED | 必须 `GRID_CELLS` 且 topology member；不可 SAMPLE；有序 categorical domain 由 cell ordinal 渲染并显示原 label |
+| `TENSOR` | X、IMAGE_X/Y、SAMPLE、BATCH、FACET、SELECTED、REDUCED | 由 ViewContract/AxisRole 再收窄；`LatestNonempty` 只允许 repeat source |
+| `POINT_ROWS` | SAMPLE、BATCH、FACET、REDUCED | 先应用唯一 `point_ordinals`；BATCH/FACET 表示每个 surviving row 一个 cell；SAMPLE 只在 Histogram；binding 不得再携 row selector |
+| `POINT_ORDINAL` | X；以及 PRESERVE_ROWS 下与一个 TENSOR source 配对的 IMAGE_X 或 IMAGE_Y | 唯一 `0..P-1` 坐标；不得 BATCH/FACET。Image 中它定义 dense row-cell geometry |
+| NUMERIC `POINT_COORDINATE` | X、BATCH、FACET；以及 PRESERVE_ROWS 下与一个 TENSOR source 配对的 IMAGE_X 或 IMAGE_Y | BATCH/FACET 按 canonical value 分组；Image 仍按 authored row ordinal 放置 cell，只把 coordinate 作逐 row label/metadata，不按不规则值拉伸/重采样；不可 SAMPLE/REDUCED |
+| TEXT `POINT_COORDINATE` | BATCH、FACET | 不得作为数值 X/Image/Fit independent source；missing rows 按固定规则丢弃并计数 |
+| `GRID_DIMENSION` | X、IMAGE_X/Y、BATCH、FACET、SELECTED、REDUCED | 必须 `GRID_CELLS` 且 topology member；不可 SAMPLE；有序 categorical domain 由 cell ordinal 渲染并显示原 label |
 
-- data-owned `PointGroupSpec` 是 canonical ordered typed group-source tuple，只允许单独的 `PointRowsRef`，或一组 `PointCoordinateRef`，或一组 `GridDimensionRef`；raw/topology不能混。resolver把raw sources按PointTable column declaration、topology sources按GridTopology dimension declaration canonicalize，caller/wire点击顺序不是authority。`zlc_data.resolve_point_rows(PointTable, GridTopology|None, PointRowSelection, PointGroupSpec)` 先应用 exact row filter，再输出 immutable `ResolvedPointRows`：surviving ordinals、每个 group 的 typed sources/address/canonical value tuple、exact member ordinals、observation addresses、missing/drop count。PointRows groups按authored ordinal；raw composite key groups按首次出现；topology composite address按declared domains的lexicographic cell order且只返回实际occupied groups；组内永远authored ordinal order。FitResultBatch durable descriptor保存typed sources、group address/value与exact ordinals，不能只保存ref/string。
-- point 解析分成两层且都只有一个 owner。上述 `zlc_data.resolve_point_rows` 只认识 row、coordinate、selection/group，绝不认识 X/FACET/PlotKind。`zlc_frontend.resolve_view_point_projection(SourceViewBinding, schema)` 唯一负责 ViewContract/source-role 组合验证，委托前者并输出 frontend `ResolvedPointProjection`。Curve/Image/Histogram/Grid evaluator 与 atomic-front→Fit translator 全部消费这一个 frontend resolver；translator 再冻结为 data-owned CommittedTransform/FitSpec，禁止 zlc_data 反向导入 frontend。
-- 组合合法性固定：`point_row_selection` 是唯一 row subset authority；PointRows binding 再携 selector、PointOrdinalRef 做 BATCH/FACET、或任何独立 `SLIDER` role 都 bind-time 拒绝。`SLIDER` 只是 frontend 根据 `SELECTED + SelectorSpec`、source cardinality 与 editability policy投影出的控件，不进 ViewSpec/codec。同一个 underlying PointCoordinateId 不得同时以 PointCoordinateRef 和 GridDimensionRef 绑定；一个 View 最多一个 PointRowsRef consuming role；同一 source 只能出现一次；point-domain 总 facet 仍最多一个。`coordinate X + coordinate BATCH/FACET`、`PointRows SAMPLE + coordinate/GridDimension BATCH/FACET`、`one numeric point coordinate/ordinal image axis + one Tensor image axis` 合法；`PointRows REDUCED/BATCH/FACET + coordinate X`、两个 raw point coordinates 组成 IMAGE_X/Y、raw coordinate binding 与任何 GridDimensionRef 混用均拒绝。GridDimensionRef 出现后，所有 point coordinate display/group roles 都必须走 topology refs。
-- `TensorAxisRef`、`PointRowsRef`、coordinate/ordinal refs 与 `GridDimensionRef` 是不同 source type；但后三类全部共享一个物理 PointRows domain，绝不能因为出现两列坐标就做 Cartesian product。
-- coordinate Eq/Range/In只可作为UI临时query；Eq/In的literal必须与column value_kind匹配，Range只允许NUMERIC，None永不匹配。Apply时必须在frozen PointTable上解析成`PointOrdinalSelection`才进View/Fit/codec；重复coordinate命中全部rows，selection按authored ordinal保留不重排，空结果明确NEEDS_INPUT/validation error而不是伪造空Dataset。
-- `PointOrdinalRef` 的 descriptor 唯一定义为 `name='point'`、`role=SCAN_POINT`、`unit=None`、`coordinate_frame=None`、values=`0..P-1`；View/Fit/evaluator 只能读取该 resolver output，不能各自命名或补 metadata。
-- point-domain mode 不另存字段：没有GridDimensionRef时派生`PRESERVE_ROWS`，P是一条dense authored sequence；出现任一GridDimensionRef时派生`GRID_CELLS`。PointCoordinateRef可作Curve真实X；PointCoordinateRef/PointOrdinalRef也可与恰好一个TensorAxis组成`P × data-axis`Image，但其pixel geometry永远是authored ordinal cells，raw coordinate仅作labels/metadata，故duplicate/nonmonotonic/irregular值不被伪装成均匀物理距离。两个相关point columns绝不能分别当IMAGE_X/IMAGE_Y。
-- `PointCoordinateRef(BATCH/FACET)` 只表示按 exact canonical composite value tuple 对 rows 分组，不是独立 tensor batch axis：组内 row 保持 authored order，组顺序按首次出现；多个 group coordinates 的 source/address 顺序按 PointTable column declaration，不按hash、名称、wire点击或序列化顺序。Point reduce/sample作用于`PointRowsRef`，row select只在point_row_selection，不作用于coordinate field。
-- `PointRowsRef(SAMPLE)` 明确把 surviving P rows 当样本；因此 Calibration 可以同时把 R 与 P 设为 SAMPLE。`PointRowsRef(REDUCED/BATCH/FACET)` 分别表示沿 surviving P rows reduce、逐 row batch 或逐 row small multiples；选 row 只由 `point_row_selection` 表达，不伪造 AxisSpec 或第二 selector。
-- 派生的 `GRID_CELLS` 只有 GridTopology 存在且 source-coordinate/domain/row mapping 验证通过才合法；GridDimensionRef 可做 X/IMAGE_X/IMAGE_Y/SELECTED/REDUCED/BATCH/FACET。二维 scalar grid image 必须绑定两个 GridDimensionRef；sparse cell 保持 invalid mask，不填值、不平均。
-- 一个 `PlotKind.GRID` 恰有一个 FACET binding；facet 可以来自任意合法 source。仅当该 source 是 GridDimensionRef 时要求 topology。
+- data-owned `zlc_data.resolve_point_rows(PointTable, GridTopology|None, point_ordinals, group_sources)` 只接受普通 `tuple[AxisSourceRef, ...]`，不接受 request class。group sources 只允许单独的 `POINT_ROWS`，或一组 `POINT_COORDINATE`，或一组 `GRID_DIMENSION`；raw/topology不能混。resolver把raw sources按PointTable column declaration、topology sources按GridTopology dimension declaration canonicalize，caller/wire点击顺序不是authority。它输出唯一 immutable `ResolvedPointRows`：surviving ordinals、每个 group 的 typed sources/address/canonical value tuple、exact member ordinals、observation addresses、missing/drop count。PointRows groups按authored ordinal；raw composite key groups按首次出现；topology composite address按declared domains的lexicographic cell order且只返回实际occupied groups；组内永远authored ordinal order。FitResultBatch durable descriptor保存typed sources、group address/value与exact ordinals，不能只保存ref/string。
+- point 解析分成两层但不产生第二结果模型。上述 data resolver 只认识 row、coordinate、filter/group，绝不认识 X/FACET/PlotKind。frontend 在现有 Figure contract owner 中用私有函数验证 ViewContract/source-role 组合，随后直接委托 data resolver并消费同一个 `ResolvedPointRows`；少量 metadata/cardinality 只用私有函数局部 tuple。不得新增 frontend resolved DTO、resolver module或公开 projection descriptor。Curve/Image/Histogram/Grid evaluator 与 atomic-front→Fit translator 走同一私有入口；translator 再冻结为 data-owned CommittedTransform/FitSpec，禁止 zlc_data 反向导入 frontend。
+- 组合合法性固定：`point_ordinals` 是唯一 row subset authority；`POINT_ROWS` binding 再携 selector、`POINT_ORDINAL` 做 BATCH/FACET、或任何独立 `SLIDER` role 都 bind-time 拒绝。`SLIDER` 只是 frontend 根据 `SELECTED + SelectorSpec`、source cardinality 与 editability policy投影出的控件，不进 ViewSpec/codec。同一个 underlying AxisId 不得同时以 `POINT_COORDINATE` 和 `GRID_DIMENSION` 绑定；一个 View 最多一个 `POINT_ROWS` consuming role；同一 source 只能出现一次；point-domain 总 facet 仍最多一个。`coordinate X + coordinate BATCH/FACET`、`POINT_ROWS SAMPLE + coordinate/grid BATCH/FACET`、`one numeric point coordinate/ordinal image axis + one tensor image axis` 合法；`POINT_ROWS REDUCED/BATCH/FACET + coordinate X`、两个 raw point coordinates 组成 IMAGE_X/Y、raw coordinate binding 与任何 grid source 混用均拒绝。grid source出现后，所有 point coordinate display/group roles 都必须走 topology source。
+- 五种 source kind 具有不同语义，但后四种全部共享一个物理 PointRows domain，绝不能因为出现两列坐标就做 Cartesian product。
+- coordinate Eq/Range/In只可作为UI临时query；Eq/In的literal必须与column value_kind匹配，Range只允许NUMERIC，None永不匹配。Apply时必须在frozen PointTable上解析成exact `point_ordinals`才进View/Fit/codec；重复coordinate命中全部rows，selection按authored ordinal保留不重排，空结果明确NEEDS_INPUT/validation error而不是伪造空Dataset。
+- `POINT_ORDINAL` 的 metadata 唯一定义为 `name='point'`、`role=SCAN_POINT`、`unit=None`、`coordinate_frame=None`、values=`0..P-1`；View/Fit/evaluator 只能读取同一 helper 的结果，不能各自命名或补 descriptor。
+- point-domain mode 不另存字段：没有`GRID_DIMENSION` source时派生`PRESERVE_ROWS`，P是一条dense authored sequence；出现任一`GRID_DIMENSION` source时派生`GRID_CELLS`。`POINT_COORDINATE`可作Curve真实X；`POINT_COORDINATE/POINT_ORDINAL`也可与恰好一个`TENSOR` source组成`P × data-axis`Image，但其pixel geometry永远是authored ordinal cells，raw coordinate仅作labels/metadata，故duplicate/nonmonotonic/irregular值不被伪装成均匀物理距离。两个相关point columns绝不能分别当IMAGE_X/IMAGE_Y。
+- `POINT_COORDINATE(BATCH/FACET)` 只表示按 exact canonical composite value tuple 对 rows 分组，不是独立 tensor batch axis：组内 row 保持 authored order，组顺序按首次出现；多个 group coordinates 的 source/address 顺序按 PointTable column declaration，不按hash、名称、wire点击或序列化顺序。Point reduce/sample作用于`POINT_ROWS`，row select只在`point_ordinals`，不作用于coordinate field。
+- `POINT_ROWS(SAMPLE)` 明确把 surviving P rows 当样本；因此 Calibration 可以同时把 R 与 P 设为 SAMPLE。`POINT_ROWS(REDUCED/BATCH/FACET)` 分别表示沿 surviving P rows reduce、逐 row batch 或逐 row small multiples；选 row 只由 `point_ordinals` 表达，不伪造 AxisSpec 或第二 selector。
+- 派生的 `GRID_CELLS` 只有 GridTopology 存在且 source-coordinate/domain/row mapping 验证通过才合法；`GRID_DIMENSION` 可做 X/IMAGE_X/IMAGE_Y/SELECTED/REDUCED/BATCH/FACET。二维 scalar grid image 必须绑定两个 grid sources；sparse cell 保持 invalid mask，不填值、不平均。
+- 一个 `PlotKind.GRID` 恰有一个 FACET binding；facet 可以来自任意合法 source。仅当该 source kind 是 `GRID_DIMENSION` 时要求 topology。
 - Curve/Histogram/Image evaluator 消费同一 SourceViewBinding 语义。trailing spatial data axes 可直接形成 Image；普通 finite 非网格多维 scan、相关 `(x_i,y_i,z_i)` trajectory、重复点和 hysteresis 由 PointTable 原样支持。
 - adaptive/growing scan table 不属于当前 frozen finite baseline：bind 后增长明确拒绝，不隐含支持。
 
@@ -225,11 +217,11 @@ FitSpec:
   model + arguments
 ```
 
-- 多元模型可显式选择多个 PointCoordinateRef；它们共享同一批 rows，不产生 P²/P³。
-- Fit independent source 只允许 numeric TensorAxisRef、PointOrdinalRef、NUMERIC PointCoordinateRef、NUMERIC GridDimensionRef，或严格绑定同一 committed transform digest/effective schema 的 numeric TransformOutputAxisRef；PointRowsRef、TEXT/missing coordinate 不能当模型自变量。ordered tuple 严格保持 model arity 顺序，绝不 canonical-sort。
+- 多元模型可显式选择多个 `POINT_COORDINATE` source；它们共享同一批 rows，不产生 P²/P³。
+- Fit independent source 只允许 numeric `TENSOR`、`POINT_ORDINAL`、NUMERIC `POINT_COORDINATE`、NUMERIC `GRID_DIMENSION`，或严格绑定同一 committed transform digest/effective schema 的 numeric TransformOutputAxisRef；`POINT_ROWS`、TEXT/missing coordinate 不能当模型自变量。ordered tuple 严格保持 model arity 顺序，绝不 canonical-sort。
 - Histogram Fit 冻结 exact sample projection 与 HistogramSpec/actual bins 为 CommittedTransform；X 明确使用 `TransformOutputAxisRef(transform_digest, HISTOGRAM_BIN axis id)`，不能按名字、当前 renderer bins 或 input schema 猜。该 ref 目前只允许 independent_sources，不预建通用 transform-axis binding 系统。
-- Fit authority 只存一份：point-row filter 只在 `CommittedTransform.exact_point_ordinals`；tensor/grid selector、reducer 与 sample operation 只在它的 typed ordered operations；`CommittedTransform` 不再嵌套第二份 ViewSpec/PointRowSelection。`FitSpec` 只增加 model arity 与 batch grouping，不复制 transform payload。codec/bind 对重复或矛盾声明直接拒绝。
-- Fit role 闭集固定：`batch_sources`只允许TensorAxisRef、PointRowsRef（逐surviving row）、PointCoordinateRef（按值分组）或GridDimensionRef。transform中Tensor可SELECTED/REDUCED/SAMPLE，GridDimension只可SELECTED/REDUCED，PointRows只可SAMPLE/REDUCED；PointRows SELECTED永远非法，P-row filter只在exact_point_ordinals。一个source不能同时属于independent/batch/sample/reduction/selection，raw/topology coordinate也不能双绑；PointRows SAMPLE/REDUCED与raw PointCoordinate independent互斥，Histogram只能由其TransformOutputAxisRef作X。Fit bind只调用data-owned resolve_point_rows；来自Figure的Fit由frontend resolver翻译成该data plan。
+- Fit authority 只存一份：point-row filter 只在 `CommittedTransform.exact_point_ordinals`；tensor/grid selector、reducer 与 sample operation 只在它的 typed ordered operations；`CommittedTransform` 不再嵌套第二份 ViewSpec 或 row-selection object。`FitSpec` 只增加 model arity 与 batch grouping，不复制 transform payload。codec/bind 对重复或矛盾声明直接拒绝。
+- Fit role 闭集固定：`batch_sources`只允许`TENSOR`、`POINT_ROWS`（逐surviving row）、`POINT_COORDINATE`（按值分组）或`GRID_DIMENSION`。transform中TENSOR可SELECTED/REDUCED/SAMPLE，GRID_DIMENSION只可SELECTED/REDUCED，POINT_ROWS只可SAMPLE/REDUCED；POINT_ROWS SELECTED永远非法，P-row filter只在exact_point_ordinals。一个source不能同时属于independent/batch/sample/reduction/selection，raw/topology coordinate也不能双绑；POINT_ROWS SAMPLE/REDUCED与raw POINT_COORDINATE independent互斥，Histogram只能由其TransformOutputAxisRef作X。Fit bind只调用data-owned resolve_point_rows；来自Figure的Fit由frontend私有resolver翻译成该data plan。
 - 未选择的 coordinate columns 只是 metadata，绝不自动变成 batch。用户选择 coordinate 为 group/batch 或 GridDimension 为 BATCH 时，Fit commit 冻结 exact group membership、batch address 和 row ordinals；重复值可包含多个 rows，稀疏组合写入 sparse batch layout。FitResultBatch 的 batch descriptor 保存 typed AxisSourceRef，而不是退化成 AxisId/string。
 - Fit translator 可由当前可见 View 预填，但点击时必须重新验证并冻结上述独立 authority；View 的动态 selector、latest 或 display reduction 不能直接进入 solver。
 
@@ -254,7 +246,7 @@ FitSpec:
 | Pool as samples | `SAMPLE` | 只在 Histogram View；Fit 通过冻结该 Histogram sample projection 获得 authority |
 | Facet | `SourceViewBinding(..., FACET)` | 通用 Grid facet selector，可选择 R、真实 data axis、PointRows/PointCoordinate 或 topology dimension；不属于 repeat 下拉 |
 
-一个 Grid view 总共只能有一个 facet source。UI 可把所有合法项放在同一 selector，但 item data 必须保存 typed `AxisSourceRef`，不能把 `AxisId`、PointCoordinateRef 与 GridDimensionRef 混成字符串；后二者即便包装同一 PointCoordinateId，语义也不同。
+一个 Grid view 总共只能有一个 facet source。UI 可把所有合法项放在同一 selector，但 item data 必须保存 typed `AxisSourceRef`，不能把 `AxisId`、`POINT_COORDINATE` 与 `GRID_DIMENSION` source 混成字符串；后二者即便携同一 AxisId，语义也不同。
 
 该收敛不删除产品默认。`zlc_frontend.default_repeat_binding(intent)` 是唯一纯策略函数，直接返回 canonical binding：Curve/Image=`REDUCED+MEAN`，Histogram/Distribution=`SAMPLE`，Meter=`SELECTED+LatestNonempty`；Grid 若 facet source 是 R 则 R=`FACET`，否则继承 cell intent 的默认。UI、Calibration 和 FigureViewer 不得重写这张表。
 
@@ -268,10 +260,10 @@ FitSpec:
 
 | plot intent | 必须解析的 source | 其它有信息 source 的默认 |
 |---|---|---|
-| Curve | explicit X优先；否则唯一role-preferred numeric X；普通point sequence无唯一coordinate时使用PointOrdinalRef；多个preferred candidates则NEEDS_INPUT | R=MEAN；非R source仅在contract明确`default_batch`时BATCH，否则可index者`SELECTED+FixedIndex(0)`并永久显示；绝不默认reduce；不可选择则NEEDS_INPUT |
-| Image/SiteMap | 恰好两个合法IMAGE_X/Y；只允许两个Tensor axes、两个GridDimensionRef，或一个numeric PointCoordinate/Ordinal + 一个Tensor axis | R=MEAN；其它非R source一律可index则`SELECTED+FixedIndex(0)`并显示，不默认reduce；不可选择则NEEDS_INPUT |
+| Curve | explicit X优先；否则唯一role-preferred numeric X；普通point sequence无唯一coordinate时使用`POINT_ORDINAL` source；多个preferred candidates则NEEDS_INPUT | R=MEAN；非R source仅在contract明确`default_batch`时BATCH，否则可index者`SELECTED+FixedIndex(0)`并永久显示；绝不默认reduce；不可选择则NEEDS_INPUT |
+| Image/SiteMap | 恰好两个合法IMAGE_X/Y；只允许两个TENSOR sources、两个GRID_DIMENSION sources，或一个numeric POINT_COORDINATE/POINT_ORDINAL source + 一个TENSOR source | R=MEAN；其它非R source一律可index则`SELECTED+FixedIndex(0)`并显示，不默认reduce；不可选择则NEEDS_INPUT |
 | Histogram/Distribution | SAMPLE sources必须由FigureIntent/ViewContract role policy明示；R默认SAMPLE，P只有contract明示才用PointRows SAMPLE | 非sample source仅在contract明确`default_batch`时BATCH，否则可index者SELECTED；FACET只由外层Grid拥有；自动bimodal analysis不改变authority |
-| Grid | explicit FACET优先，否则唯一facet-preferred source；再加typed cell intent（Curve/Histogram/Image） | 恰好一个facet；移除后递归使用cell policy；无/多候选则NEEDS_INPUT；GridTopology只在选GridDimensionRef时需要 |
+| Grid | explicit FACET优先，否则唯一facet-preferred source；再加typed cell intent（Curve/Histogram/Image） | 恰好一个facet；移除后递归使用cell policy；无/多候选则NEEDS_INPUT；GridTopology只在选GRID_DIMENSION source时需要 |
 | Rolling | MONITOR_HISTORY 是唯一 X | 其余按 Curve 规则；rolling history 不是 R |
 | Meter | 仅内部 scalar primitive，R=LatestNonempty | 任一未消费的有信息 source 都使 contract NEEDS_INPUT |
 | Pulse | 专用 pulse FigureIntent | 只消费 pulse document/timing contract，不参与 Dataset 轴猜测 |
@@ -647,7 +639,7 @@ atomic publish exact canonical manifest + durability barrier
 只有同时满足以下条件才可声称迁移完成：
 
 1. 生产代码、public surface、codec、文档与current tests中不存在任何被替代的数据布局、repeat enum、专用grid/Fit renderer、frontend FigureFitLane、Fit隐式live pin、PresentedSignalPublication/PresentedSignalFront、per-revision presentation sidecar、ConsolePresentationIndex、动态混合Area/Cross/Fit的FigureOutputSession、GUI冲突裁决、重复display form、numeric文本sentinel、pseudo task、retrospective transaction、持久commit side authority、中央concrete catalog或fake catalog state；死symbol、alias、reader、wrapper与目录均为零。
-2. regular/sparse/serpentine/arbitrary/duplicate/P=1 PointTable 全部 round-trip；canonical scalar/role 闭集拒绝非法值。PointGroupSpec的row/coordinate/topology order、membership、missing count及FitResultBatch descriptor精确round-trip。source-role组合枚举全部fail/pass正确，PointRows/PointOrdinal/row-filter/SELECTED无双authority；一般非网格多维scan、多PointCoordinate Fit/group、P×data-axis Image均不Cartesian-expand，每ordinal只有一个observation address，只有GridTopology路径densify。
+2. regular/sparse/serpentine/arbitrary/duplicate/P=1 PointTable 全部 round-trip；canonical scalar/role 闭集拒绝非法值。`resolve_point_rows` 的普通 source tuple 与 `ResolvedPointRows` 对 row/coordinate/topology order、membership、missing count及FitResultBatch descriptor精确round-trip。source-role组合枚举全部fail/pass正确，POINT_ROWS/POINT_ORDINAL/point_ordinals/SELECTED无双authority；一般非网格多维scan、多POINT_COORDINATE Fit/group、P×data-axis Image均不Cartesian-expand，每ordinal只有一个observation address，只有GridTopology路径densify。
 3. PulseScan 改 RepeatRegion 不改变 Dataset R；改 sweep count 只改变 R；硬件仍一次 autonomous stream。
 4. selector/Fit/Processor都携exact parent；neutral SignalFront保证raw+derived connected panels只原子提升完整frontier，siblings不拆、无关producer可独立前进。每个UI attachment的generation-static FigureIntent在进入UI topology前一次冻结，每revision无presentation sidecar；Workbench只能由同一个exact SignalFront生成全部FigureFront并原子present完整board，attachment失败不阻止neutral signal。one-to-one/fixed-fanout/fan-in的FormalAssociationCapability判定唯一且PulseScan不靠heuristic；FixedPublicationEvents扩展有grid的base table时slot dimension保持row_to_cell injective。
 5. Calibration、TaskConsole、DataFigure、FigureViewer对同一FigureIntent/source/complete display state/size/DPR使用同一canonical PlotPanel base raster与frontend overlay contract；FigureFront含actual bins/group/effective schema及与base raster同compose的RenderedGeometry。source front swap期间gesture锁旧front，resize/DPR invalidation则无final publication地cancel并recompose，绝不跨geometry映射。Cross/Area连续交互同源且无hover；Live Fit期间base持续前进、Edit Fit不影响任一Monitor，overlay携独立source ref并显示CURRENT/LAGGING或隐藏INCOMPATIBLE，Fit params仅EVENT_RESULT。standalone不伪造signal，ROI→ROI→Fit及三个以上retained revisions无presentation/transaction race。
