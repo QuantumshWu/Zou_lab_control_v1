@@ -6,10 +6,7 @@ from zlc_neutral_atom.logic_nodes.pulse_scan.application import PreparedExactSca
 from zlc_neutral_atom.logic_nodes.pulse_scan.declaration import PULSE_SCAN_LOGIC_NODE
 from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import PulseScanBoundRequest
 from zlc_neutral_atom.runtime.hosted_run import HostedRun
-from zlc_workbench.task_console.capability import (
-    ConsoleCapabilityAttachment,
-    ConsoleSignalEventSourceProvider,
-)
+from zlc_workbench.task_console.capability import ConsoleCapabilityAttachment
 from zlc_workbench.task_console.declaration_projection import project_declaration_spec
 from zlc_workbench.task_console.console_records import console_signal_key
 
@@ -49,9 +46,9 @@ def pulse_scan_task_console_adapter(*, prepare, read_pulse_template):
         if not isinstance(request, PulseScanBoundRequest):
             raise TypeError("PulseScan owner returned another bound request type")
         source_input = resolved.only_dataset()
-        source_node = source_input.producer.run_node
-        if not isinstance(source_node, ConsoleSignalEventSourceProvider):
+        if not source_input.producer.running:
             raise ValueError("PulseScan source must be a running Logic node")
+        source_publication = host.current_publication(source_input)
 
         def prepare_scan(current):
             if current != request:
@@ -60,7 +57,15 @@ def pulse_scan_task_console_adapter(*, prepare, read_pulse_template):
                 raise RuntimeError(
                     "start the selected signal producer before PulseScan"
                 )
-            return prepare(current, source_node.signal_event_source())
+            source, output_name, transform = host.data_plane.signal_event_binding(
+                source_input.selection.signal_key,
+                expected_generation=source_publication.generation,
+            )
+            if output_name != request.signal.output.name:
+                raise RuntimeError("PulseScan signal route changed its output")
+            if transform != request.signal.transform:
+                raise RuntimeError("PulseScan signal route changed its transform")
+            return prepare(current, source)
 
         node = HostedRun(
             definition_key=spec.key,

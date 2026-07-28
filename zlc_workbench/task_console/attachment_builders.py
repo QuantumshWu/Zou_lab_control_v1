@@ -9,12 +9,11 @@ from zlc_neutral_atom.processing.hosted_processor import (
     HostedProcessor,
     ProcessorPublication,
 )
+from zlc_neutral_atom.processing.signal_plane import SignalPublication
 from zlc_neutral_atom.runtime.hosted_run import HostedRun
-from zlc_neutral_atom.runtime.signal_source import SignalEventSource
 from zlc_workbench.task_console.capability import (
     ConsoleCapabilityAttachment,
     ConsoleNodeHost,
-    ConsoleSignalEventSourceProvider,
 )
 from zlc_workbench.task_console.console_records import console_signal_key
 
@@ -26,7 +25,9 @@ def run_attachment(
     prepare: Callable[[object], object],
     start: Callable[[object, HostedRun, ConsoleNodeHost], object] | None = None,
     start_with_live_output: Callable[[object, object], object] | None = None,
-    materialize_final_presentations: Callable[[object, object, object], object]
+    project_signal_presentation: Callable[
+        [object, str, SignalPublication], object | None
+    ]
     | None = None,
     resolve_artifact_reference: Callable[[object], object] | None = None,
 ) -> ConsoleCapabilityAttachment:
@@ -74,12 +75,6 @@ def run_attachment(
             qualify_output=lambda name: console_signal_key(instance_id, name),
             request_owner_wake=host.request_owner_wake,
         )
-        if materialize_final_presentations is not None:
-            host.presentation_index.register_final_projector(
-                instance_id,
-                materialize_final_presentations,
-            )
-
         def start_prepared(command):
             if live_output_starter is not None:
                 from zlc_neutral_atom.runtime.live_output_host import (
@@ -102,7 +97,11 @@ def run_attachment(
         node.bind_starter(start_prepared)
         return node
 
-    return ConsoleCapabilityAttachment(spec, create_node)
+    return ConsoleCapabilityAttachment(
+        spec,
+        create_node,
+        project_signal_presentation,
+    )
 
 
 def processor_attachment(
@@ -110,7 +109,10 @@ def processor_attachment(
     *,
     bind_request: Callable[[object, BoundNodeInputs], object],
     prepare: Callable[[object], object],
-    project_presentations: Callable[..., Mapping[str, object]] | None = None,
+    project_signal_presentation: Callable[
+        [object, str, SignalPublication], object | None
+    ]
+    | None = None,
     resolve_artifact_reference: Callable[[object], object] | None = None,
 ) -> ConsoleCapabilityAttachment:
     """Attach a source-driven Processor to the host's internal live lane."""
@@ -119,8 +121,10 @@ def processor_attachment(
         raise TypeError("bind_request must be callable")
     if not callable(prepare):
         raise TypeError("prepare must be callable")
-    if project_presentations is not None and not callable(project_presentations):
-        raise TypeError("project_presentations must be callable or None")
+    if project_signal_presentation is not None and not callable(
+        project_signal_presentation
+    ):
+        raise TypeError("project_signal_presentation must be callable or None")
 
     def materialize_publication(result, source):
         outputs = getattr(result, "outputs", None)
@@ -151,37 +155,7 @@ def processor_attachment(
             raise RuntimeError(
                 "start the selected Dataset producer before its Processor"
             )
-        initial_source = host.current_value(source_input)
-        source_event_source = None
-        if isinstance(source_node, ConsoleSignalEventSourceProvider):
-            try:
-                candidate = source_node.signal_event_source()
-            except (RuntimeError, TypeError, ValueError):
-                candidate = None
-            if candidate is not None:
-                if not isinstance(candidate, SignalEventSource):
-                    raise TypeError(
-                        "producer returned another live signal source type"
-                    )
-                source_event_source = candidate
-
-        def observe_publication(result, source, published) -> None:
-            if project_presentations is None:
-                return
-            presentations = project_presentations(
-                result,
-                run_id=source.run_id,
-                provenance_epoch_id=source.epoch_id,
-            )
-            if not isinstance(presentations, Mapping):
-                raise TypeError(
-                    "Processor presentation projection must return a mapping"
-                )
-            qualified = {
-                console_signal_key(instance_id, name): presentation
-                for name, presentation in presentations.items()
-            }
-            host.presentation_index.publish(published, qualified)
+        initial_publication = host.current_publication(source_input)
 
         return HostedProcessor(
             definition_key=spec.key,
@@ -192,17 +166,19 @@ def processor_attachment(
             ),
             source_signal=source_input.selection.signal_key,
             source_node=source_node,
-            initial_source=initial_source,
-            source_event_source=source_event_source,
+            initial_publication=initial_publication,
             prepare_application=lambda: prepare(request),
             materialize_publication=materialize_publication,
             qualify_output=lambda name: console_signal_key(instance_id, name),
-            publication_observer=observe_publication,
             data_plane=host.data_plane,
             request_owner_wake=host.request_owner_wake,
         )
 
-    return ConsoleCapabilityAttachment(spec, create_node)
+    return ConsoleCapabilityAttachment(
+        spec,
+        create_node,
+        project_signal_presentation,
+    )
 
 
 __all__ = ["processor_attachment", "run_attachment"]

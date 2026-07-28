@@ -168,6 +168,10 @@ class PreparedOccupancyProcessor:
     def selected_model_kind(self) -> ReadoutModelKind:
         return self._selected_model_kind
 
+    @property
+    def site_map(self):
+        return self._calibration.artifact.site_map
+
     def signal_value_schema(self, output_name: str) -> ValueSchema:
         """Return one declared per-event output schema before starting the worker."""
 

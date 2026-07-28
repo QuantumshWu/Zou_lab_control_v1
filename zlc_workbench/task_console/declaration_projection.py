@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 
 from zlc_neutral_atom.input_spec import ArtifactInputSpec
 from zlc_neutral_atom.logic_node_declaration import (
@@ -10,6 +10,7 @@ from zlc_neutral_atom.logic_node_declaration import (
     LogicNodeDeclaration,
     PathPresentationHint,
 )
+from zlc_neutral_atom.processing.signal_plane import SignalPublication
 from zlc_workbench.form_projection import project_authoring_form
 from .input_binding import ResolvedArtifactInput, project_input_fields
 from zlc_workbench.task_console.attachment_builders import (
@@ -126,7 +127,9 @@ def project_run_declaration(
     | None = None,
     start: Callable[[object, object, object], object] | None = None,
     start_with_live_output: Callable[[object, object], object] | None = None,
-    materialize_final_presentations: Callable[[object, object, object], object]
+    project_signal_presentation: Callable[
+        [object, str, SignalPublication], object | None
+    ]
     | None = None,
 ):
     """Build the common finite-run attachment for one declaration."""
@@ -147,7 +150,7 @@ def project_run_declaration(
         prepare=prepare,
         start=start,
         start_with_live_output=start_with_live_output,
-        materialize_final_presentations=materialize_final_presentations,
+        project_signal_presentation=project_signal_presentation,
         resolve_artifact_reference=_artifact_resolver(
             declaration,
             resolve_artifact_reference=resolve_artifact_reference,
@@ -159,7 +162,10 @@ def project_processor_declaration(
     declaration: LogicNodeDeclaration,
     *,
     prepare: Callable[[object], object],
-    project_presentations: Callable[..., Mapping[str, object]] | None = None,
+    project_signal_presentation: Callable[
+        [object, str, SignalPublication], object | None
+    ]
+    | None = None,
     dynamic_choice_context: object | None = None,
     resolve_artifact_reference: Callable[[ResolvedArtifactInput], object]
     | None = None,
@@ -168,8 +174,10 @@ def project_processor_declaration(
 
     if not callable(prepare):
         raise TypeError("Processor prepare must be callable")
-    if project_presentations is not None and not callable(project_presentations):
-        raise TypeError("project_presentations must be callable or None")
+    if project_signal_presentation is not None and not callable(
+        project_signal_presentation
+    ):
+        raise TypeError("project_signal_presentation must be callable or None")
     spec = project_declaration_spec(
         declaration,
         dynamic_choice_context=dynamic_choice_context,
@@ -178,7 +186,7 @@ def project_processor_declaration(
         spec,
         bind_request=declaration.bind_request,
         prepare=prepare,
-        project_presentations=project_presentations,
+        project_signal_presentation=project_signal_presentation,
         resolve_artifact_reference=_artifact_resolver(
             declaration,
             resolve_artifact_reference=resolve_artifact_reference,

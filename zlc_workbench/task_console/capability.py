@@ -15,11 +15,12 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Protocol, runtime_checkable
-
 from zlc_neutral_atom.node_input import BoundNodeInputs
-from zlc_neutral_atom.processing.signal_plane import SignalDataPlane, SignalValue
-from zlc_neutral_atom.runtime.signal_source import SignalEventSource
+from zlc_neutral_atom.processing.signal_plane import (
+    SignalDataPlane,
+    SignalPublication,
+    SignalValue,
+)
 from .input_binding import (
     ResolvedArtifactInput,
     ResolvedDatasetInput,
@@ -28,9 +29,6 @@ from .input_binding import (
 )
 
 from .catalog_bridge import ConsoleNodeSpec
-from .presentation_index import ConsolePresentationIndex
-
-
 @dataclass(frozen=True, slots=True)
 class ConsoleNodeInputs:
     """One resolution transaction in routing and domain vocabularies.
@@ -79,15 +77,12 @@ class ConsoleNodeHost:
     """Generic services available while a concrete attachment creates a node."""
 
     data_plane: SignalDataPlane
-    presentation_index: ConsolePresentationIndex
     resolve_inputs: Callable[[ConsoleNodeSpec, Mapping[str, object]], Mapping[str, ResolvedNodeInput]]
     request_owner_wake: Callable[[], None]
 
     def __post_init__(self) -> None:
         if not isinstance(self.data_plane, SignalDataPlane):
             raise TypeError("data_plane must be SignalDataPlane")
-        if not isinstance(self.presentation_index, ConsolePresentationIndex):
-            raise TypeError("presentation_index must be ConsolePresentationIndex")
         for name in (
             "resolve_inputs",
             "request_owner_wake",
@@ -112,31 +107,27 @@ class ConsoleNodeHost:
         )
         return ConsoleNodeInputs(resolved, bound)
 
-    def current_value(self, binding: ResolvedDatasetInput) -> SignalValue:
-        """Return the currently admitted immutable value of one selected input."""
+    def current_publication(
+        self,
+        binding: ResolvedDatasetInput,
+    ) -> SignalPublication:
+        """Return the exact current publication of one selected input."""
 
         if not isinstance(binding, ResolvedDatasetInput):
             raise TypeError("binding must be ResolvedDatasetInput")
-        value = self.data_plane.freeze().value(binding.selection.signal_key)
+        front = self.data_plane.freeze()
+        signal_key = binding.selection.signal_key
+        value = front.value(signal_key)
+        publication = front.publication(signal_key)
         if not isinstance(value, SignalValue):
             raise RuntimeError(
                 "the selected running Dataset producer has not published a value"
             )
-        return value
-
-
-@runtime_checkable
-class ConsoleSignalEventSourceProvider(Protocol):
-    """Stable Workbench seam for a running row's actual event source.
-
-    The provider itself never pretends to own optional association methods.
-    Callers inspect the returned neutral source against the exact capability
-    protocol they require.  The row's Python type therefore stays stable across
-    prepare, start, and terminal transitions.
-    """
-
-    def signal_event_source(self) -> SignalEventSource:
-        """Return the currently running typed source or raise explicitly."""
+        if not isinstance(publication, SignalPublication):
+            raise RuntimeError("the selected signal has no exact publication")
+        if publication.value(signal_key) is not value:
+            raise RuntimeError("signal value and publication are not one front")
+        return publication
 
 
 ConsoleNodeFactory = Callable[
@@ -162,12 +153,20 @@ class ConsoleCapabilityAttachment:
 
     spec: ConsoleNodeSpec
     create_node: ConsoleNodeFactory
+    project_signal_presentation: Callable[
+        [object, str, SignalPublication],
+        object | None,
+    ] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.spec, ConsoleNodeSpec):
             raise TypeError("spec must be ConsoleNodeSpec")
         if not callable(self.create_node):
             raise TypeError("create_node must be callable")
+        if self.project_signal_presentation is not None and not callable(
+            self.project_signal_presentation
+        ):
+            raise TypeError("project_signal_presentation must be callable or None")
 
     @property
     def key(self):
@@ -179,5 +178,4 @@ __all__ = [
     "ConsoleNodeFactory",
     "ConsoleNodeHost",
     "ConsoleNodeInputs",
-    "ConsoleSignalEventSourceProvider",
 ]

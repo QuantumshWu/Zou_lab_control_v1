@@ -7,25 +7,34 @@ from collections.abc import Callable
 from zlc_neutral_atom.dataset_output import LiveDatasetOutputOwner
 from zlc_neutral_atom.processing.signal_plane import SignalDataPlane, SignalProducer
 from zlc_neutral_atom.runtime.preview import LiveDatasetViewSpec
+from zlc_neutral_atom.runtime.signal_source import SignalEventSource
 from .live_dataset import LiveDatasetPort
 
 
 class LiveDatasetHost:
     """Attach at most one live Dataset slot to one hosted producer generation."""
 
-    __slots__ = ("_data_plane", "_node", "_opened")
+    __slots__ = ("_data_plane", "_event_source", "_node", "_opened")
 
     def __init__(
         self,
         node: SignalProducer,
         data_plane: SignalDataPlane,
+        *,
+        event_source: SignalEventSource | None = None,
     ) -> None:
         if not isinstance(node, SignalProducer):
             raise TypeError("node must implement SignalProducer")
         if not isinstance(data_plane, SignalDataPlane):
             raise TypeError("data_plane must be SignalDataPlane")
+        if event_source is not None and not isinstance(
+            event_source,
+            SignalEventSource,
+        ):
+            raise TypeError("event_source must implement SignalEventSource")
         self._node = node
         self._data_plane = data_plane
+        self._event_source = event_source
         self._opened = False
 
     def open_live_dataset(
@@ -45,7 +54,11 @@ class LiveDatasetHost:
             output_owner=output_owner,
         )
         try:
-            self._data_plane.attach(self._node, slot)
+            self._data_plane.attach(
+                self._node,
+                slot,
+                event_source=self._event_source,
+            )
             slot.set_change_listener(
                 lambda: self._data_plane.mark_changed(self._node)
             )
@@ -77,7 +90,11 @@ class LiveDatasetHost:
         if not callable(getattr(live_output, "freeze_live_outputs", None)):
             raise TypeError("live output exposes no typed Dataset materializer")
         try:
-            self._data_plane.attach(self._node, live_output)
+            self._data_plane.attach(
+                self._node,
+                live_output,
+                event_source=self._event_source,
+            )
             live_output.set_change_listener(
                 lambda: self._data_plane.mark_changed(self._node)
             )
@@ -105,6 +122,9 @@ def start_with_live_output(
     live_host = LiveDatasetHost(
         node,
         data_plane,
+        event_source=(
+            command if isinstance(command, SignalEventSource) else None
+        ),
     )
     try:
         return start(command, live_host)

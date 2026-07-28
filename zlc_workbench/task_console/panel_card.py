@@ -37,7 +37,6 @@ from zlc_frontend.qt_widgets import (
     FigureOutputAuthority,
     FigureSurfaceContext,
     FigureSurfaceHost,
-    FigureSurfaceOutputRequest as _PanelFigureOutputRequest,
     FigureSurfaceRenderRequest as _PanelRenderRequest,
     ViewSpecEditor,
     GREEN,
@@ -80,6 +79,7 @@ from .console_records import (
 )
 from zlc_frontend.panel_size import PANEL_SIZES
 from zlc_frontend.plot_kind import PLOT_KIND_SPEC_BY_KEY
+from zlc_neutral_atom.processing.signal_plane import SignalPublication
 
 from .panel_board import card_size as _card_size
 
@@ -98,8 +98,28 @@ class _PointerInteractionPin:
     host: object
     origin: object
     value: object
-    source_component: object | None
+    publication: SignalPublication
     surface_id: str
+
+
+def _require_publication_value(
+    publication: SignalPublication,
+    value,
+) -> SignalPublication:
+    """Validate one private Workbench publication/value pair.
+
+    Frontend requests deliberately carry no neutral transaction object.  The
+    composition layer therefore retains this exact pair and verifies identity
+    whenever a render, gesture, Fit, or Edit snapshot crosses an operation
+    boundary.
+    """
+
+    if not isinstance(publication, SignalPublication):
+        raise TypeError("Figure source requires an exact SignalPublication")
+    name = str(getattr(value, "name", ""))
+    if not name or publication.value(name) is not value:
+        raise ValueError("SignalPublication does not own the Figure source value")
+    return publication
 
 
 
@@ -204,16 +224,13 @@ class PanelCard(FluentGroupBox):
         # right-click coordinate.  Neither is a Measurement parameter and
         # neither opens another window.
         self._figure_output_authority = FigureOutputAuthority(self)
-        self._figure_output_owner_token = object()
-        self._figure_output_request_revision = 0
-        self._figure_output_request_signature = object()
         # Figure Fit is one card-owned committed command/result with two
         # editable surfaces (Setting and Edit).  Neither surface owns a solver.
         # The command retains the exact source of the surface that submitted
         # it; renderers show its result only on a matching source revision.
         self._fit_panes: list[FitAuthoringPane] = []
         # ``None`` means the live card context.  Edit supplies a callable that
-        # returns its exact frozen (value, DataFigure, causal ancestry).  The pane is
+        # returns its exact frozen (value, DataFigure, publication).  The pane is
         # still only an editor; the single committed command/result below owns
         # execution authority.
         self._fit_context_providers: dict[FitAuthoringPane, object | None] = {}
@@ -224,7 +241,7 @@ class PanelCard(FluentGroupBox):
         self._fit_draft_context = None
         self._fit_active_spec = fit_spec
         self._fit_active_source = None
-        self._fit_active_source_component = None
+        self._fit_active_publication = None
         # A Fit submitted from the live Setting surface freezes that surface on
         # the exact immutable Figure revision that the command consumed.  The
         # data plane continues to advance and ``_candidate_value`` remembers
@@ -250,7 +267,7 @@ class PanelCard(FluentGroupBox):
         # schema, Setting/Edit controls, selectors and Fit always derive from
         # ``_presented_value`` until the matching raster is committed.
         self._candidate_value = None
-        self._candidate_source_component = None
+        self._candidate_publication = None
         # Worker completion and visible presentation are different facts.
         # Promote this group only after the Qt board accepts its matching
         # immutable frame in ``present()``.
@@ -258,13 +275,13 @@ class PanelCard(FluentGroupBox):
         self._pending_display = None
         self._pending_contract = None
         self._pending_value = None
-        self._pending_source_component = None
+        self._pending_publication = None
         self._pending_render_request_revision = None
         self._presented_figure = None
         self._presented_display = None
         self._presented_contract = None
         self._presented_value = None
-        self._presented_source_component = None
+        self._presented_publication = None
         self._presented_render_request_revision = None
         self._grid_focus = None
         self._render_request_revision = 0
@@ -375,7 +392,7 @@ class PanelCard(FluentGroupBox):
         self._pending_display = None
         self._pending_contract = None
         self._pending_value = None
-        self._pending_source_component = None
+        self._pending_publication = None
         self._pending_render_request_revision = None
         if self.board is not None:
             self.board.clear()
@@ -409,7 +426,8 @@ class PanelCard(FluentGroupBox):
         """Build an editor for this card's one committed Figure Fit state.
 
         The default pane acts on the live card.  An Edit surface supplies one
-        provider returning its exact frozen ``(SignalValue, DataFigure)``.
+        provider returning its exact frozen
+        ``(SignalValue, DataFigure, SignalPublication)``.
         This explicit source edge is what prevents a Fit click
         on an old Edit snapshot from silently fitting a newer monitor frame.
         """
@@ -514,23 +532,23 @@ class PanelCard(FluentGroupBox):
         if provider is None:
             value = self._presented_value
             figure = self._presented_figure
-            source_component = self._presented_source_component
+            publication = self._presented_publication
             payload = self.frozen_render_payload()
         else:
             context = provider()
             if context is None:
                 return None
-            if not isinstance(context, tuple) or len(context) not in (2, 3, 4):
+            if not isinstance(context, tuple) or len(context) not in (3, 4):
                 raise TypeError(
                     "Fit context provider must return "
-                    "(value, figure[, causal ancestry[, rendered payload]])"
+                    "(value, figure, publication[, rendered payload])"
                 )
-            value, figure = context[:2]
-            source_component = context[2] if len(context) >= 3 else None
+            value, figure, publication = context[:3]
             payload = context[3] if len(context) == 4 else None
         snapshot = getattr(value, "snapshot", None)
         if snapshot is None or figure is None:
             return None
+        _require_publication_value(publication, value)
         from zlc_frontend import DataFigure
 
         if not isinstance(figure, DataFigure):
@@ -547,7 +565,7 @@ class PanelCard(FluentGroupBox):
                     "Histogram Fit requires the exact rendered bin projection"
                 )
             histogram_projection = payload.bin_projection
-        return value, figure, source_component, histogram_projection
+        return value, figure, publication, histogram_projection
 
     def refresh_fit_authoring_pane(self, pane: FitAuthoringPane) -> bool:
         """Reconcile one visible pane against its own exact Figure source."""
@@ -556,7 +574,7 @@ class PanelCard(FluentGroupBox):
         if context is None:
             pane.set_busy("prepare", draft_ready=False)
             return False
-        value, figure, _source_component, histogram_projection = context
+        value, figure, _publication, histogram_projection = context
         selection = self._fit_selection_for_value(value)
         seed = self._fit_active_spec
         if (
@@ -622,10 +640,10 @@ class PanelCard(FluentGroupBox):
         commit = self._figure_output_authority.area_commit
         if (
             commit is not None
-            and isinstance(commit.selection, Selection)
+            and isinstance(commit.authority, Selection)
             and self._figure_commit_matches_value(commit, value)
         ):
-            return commit.selection
+            return commit.authority
         return None
 
     def _fit_selection_changed(self) -> None:
@@ -818,7 +836,7 @@ class PanelCard(FluentGroupBox):
         if context is None:
             self.set_status("Fit source is not currently available", error=True)
             return
-        source, figure, source_component, histogram_projection = context
+        source, figure, publication, histogram_projection = context
         selection = self._fit_selection_for_value(source)
         from zlc_frontend import (
             fit_spec_from_arguments,
@@ -850,7 +868,7 @@ class PanelCard(FluentGroupBox):
         self._fit_draft = draft
         self._fit_active_spec = exact_spec
         self._fit_active_source = source
-        self._fit_active_source_component = source_component
+        self._fit_active_publication = publication
         self._set_fit_live_surface_source(
             source
             if self._fit_context_providers.get(owner) is None
@@ -889,7 +907,7 @@ class PanelCard(FluentGroupBox):
         self.fit_requested.emit()
 
     def freeze_fit_request(self):
-        """Freeze the active Fit against its command surface's exact source."""
+        """Freeze one Fit request with its exact private source publication."""
 
         spec = self._fit_active_spec
         source = self._fit_active_source
@@ -901,18 +919,25 @@ class PanelCard(FluentGroupBox):
             != snapshot.ref.schema_fingerprint
         ):
             return None
+        publication = self._fit_active_publication
+        _require_publication_value(publication, source)
         self._fit_request_revision += 1
         request = FigureFitRequest(
             self.panel_id,
             self._fit_request_revision,
             source,
             spec,
-            self._fit_active_source_component,
         )
         self._fit_pending_source_ref = snapshot.ref
-        return request
+        return request, publication
 
-    def accept_fit_completion(self, request, result, error: str | None) -> bool:
+    def accept_fit_completion(
+        self,
+        request,
+        publication,
+        result,
+        error: str | None,
+    ) -> bool:
         """Admit a result only for the still-current committed command."""
 
         if not isinstance(request, FigureFitRequest):
@@ -923,10 +948,12 @@ class PanelCard(FluentGroupBox):
             request.panel_id != self.panel_id
             or request.request_revision != self._fit_request_revision
             or snapshot is None
-            or request.source.snapshot.ref != snapshot.ref
+            or request.source is not source
+            or self._fit_active_publication is not publication
             or self._fit_active_spec != request.spec
         ):
             return False
+        _require_publication_value(publication, source)
         self._fit_pending_source_ref = None
         if error is not None:
             self._finish_fit_failure(
@@ -947,7 +974,6 @@ class PanelCard(FluentGroupBox):
             self._finish_fit_failure(request, diagnostic, cancelled=False)
             return True
         self._fit_result = result
-        self._fit_active_source_component = request.source_component
         self._fit_result_identity = "draft-fit:" + sha256(
             encode_fit_result_batch(result)
         ).hexdigest()
@@ -962,24 +988,6 @@ class PanelCard(FluentGroupBox):
         self.fit_presentation_changed.emit()
         self._request_current_render()
         return True
-
-    def reject_fit_request(
-        self,
-        request: FigureFitRequest,
-        diagnostic: str,
-    ) -> bool:
-        """Close a frozen Fit that failed before worker admission.
-
-        Freezing establishes the same exact-source pin and pending identity as
-        an admitted worker request.  A composition-root ancestry/capture
-        failure is therefore a terminal completion of that request, not a
-        status-only early return.
-        """
-
-        message = str(diagnostic).strip()
-        if not message:
-            raise ValueError("Fit rejection diagnostic must not be empty")
-        return self.accept_fit_completion(request, None, message)
 
     def _finish_fit_failure(
         self,
@@ -1024,7 +1032,7 @@ class PanelCard(FluentGroupBox):
         self.fit_cancel_requested.emit()
         self._fit_active_spec = None
         self._fit_active_source = None
-        self._fit_active_source_component = None
+        self._fit_active_publication = None
         self._set_fit_live_surface_source(None)
         self._commit_persisted_params(
             remove=(_FIT_SPEC_PARAM,),
@@ -1236,7 +1244,7 @@ class PanelCard(FluentGroupBox):
                 host,
                 origin,
                 value=self._presented_value,
-                source_component=self._presented_source_component,
+                publication=self._presented_publication,
                 surface_id=self.panel_id,
             )
         )
@@ -1273,14 +1281,17 @@ class PanelCard(FluentGroupBox):
         return source_identity_matches_snapshot(commit.source_identity, snapshot)
 
     def frozen_figure_output_state(self):
-        """Return Figure intents against the exact immutable visible data value.
+        """Return selector intents with their exact visible publication/value.
 
-        The returned value is merely the already-owned data-plane value
-        promoted in :meth:`present`; this method performs no acquisition and
-        creates no GUI/data snapshot.
+        Area and Cross are independent continuous routes.  This method exposes
+        only their frozen declarations and the exact neutral publication that
+        owns the painted value; it neither evaluates nor bundles their arrays.
         """
 
         value = self._presented_value
+        publication = self._presented_publication
+        if value is not None:
+            _require_publication_value(publication, value)
         authority = self._figure_output_authority
         area_commit = (
             authority.area_commit
@@ -1292,17 +1303,7 @@ class PanelCard(FluentGroupBox):
             if self._figure_commit_matches_value(authority.cross_commit, value)
             else None
         )
-        fit_result = self._fit_result
-        if (
-            fit_result is not None
-            and (
-                value is None
-                or fit_result.source_ref
-                != getattr(getattr(value, "snapshot", None), "ref", None)
-            )
-        ):
-            fit_result = None
-        return value, area_commit, cross_commit, fit_result
+        return publication, value, area_commit, cross_commit
 
     def frozen_fit_output_state(self):
         """Return the committed Fit with the exact surface source it consumed.
@@ -1322,121 +1323,9 @@ class PanelCard(FluentGroupBox):
             != getattr(getattr(source, "snapshot", None), "ref", None)
         ):
             return None, None, None
-        return source, result, self._fit_active_source_component
-
-    def freeze_figure_output_request(
-        self,
-        *,
-        source_contract_id: str | None,
-        live_source_override=None,
-        live_source_component_override=None,
-    ) -> _PanelFigureOutputRequest | None:
-        """Freeze Figure intent only; derived arrays stay off the Qt owner."""
-
-        from zlc_frontend.figure_outputs import (
-            FigureOutputRequest,
-        )
-        from zlc_frontend.figure_source import FigureSource
-        from zlc_frontend.site_map import SiteMapPresentation
-
-        live_source, area_commit, cross_commit, _live_fit_result = (
-            self.frozen_figure_output_state()
-        )
-        live_source_component = self._presented_source_component
-        if live_source_override is not None:
-            live_source = live_source_override
-            live_source_component = live_source_component_override
-            authority = self._figure_output_authority
-            area_commit = (
-                authority.area_commit
-                if self._figure_commit_matches_value(
-                    authority.area_commit,
-                    live_source,
-                )
-                else None
-            )
-            cross_commit = (
-                authority.cross_commit
-                if self._figure_commit_matches_value(
-                    authority.cross_commit,
-                    live_source,
-                )
-                else None
-            )
-        fit_source, fit_result, fit_source_component = self.frozen_fit_output_state()
-        source = fit_source if fit_result is not None else live_source
-        if (
-            source is not None
-            and live_source is not None
-            and source.snapshot.ref != live_source.snapshot.ref
-        ):
-            area_commit = None
-            cross_commit = None
-
-        request = None
-        source_value = None
-        if source is not None:
-            presentation = self._presentation_provider(source)
-            site_map = (
-                presentation
-                if isinstance(presentation, SiteMapPresentation)
-                else None
-            )
-            request = FigureOutputRequest(
-                FigureSource(
-                    source.snapshot,
-                    site_map,
-                    source_contract_id=source_contract_id,
-                ),
-                area=area_commit,
-                cross=cross_commit,
-                fit_result=fit_result,
-                fit_result_identity=(
-                    self._fit_result_identity if fit_result is not None else None
-                ),
-            )
-            source_value = source
-
-        signature = (
-            None if source is None else source.snapshot.ref,
-            source_contract_id,
-            area_commit,
-            cross_commit,
-            self._fit_result_identity if fit_result is not None else None,
-        )
-        if signature == self._figure_output_request_signature:
-            return None
-        self._figure_output_request_signature = signature
-        self._figure_output_request_revision += 1
-        return _PanelFigureOutputRequest(
-            self.panel_id,
-            self._figure_output_owner_token,
-            self._figure_output_request_revision,
-            source_value,
-            request,
-            source_component=(
-                fit_source_component
-                if fit_result is not None
-                else live_source_component
-            ),
-        )
-
-    def accepts_figure_output_completion(
-        self,
-        request: _PanelFigureOutputRequest,
-    ) -> bool:
-        """Accept only the newest intent frozen by this Figure owner."""
-
-        return (
-            isinstance(request, _PanelFigureOutputRequest)
-            and request.panel_id == self.panel_id
-            and request.owner_token is self._figure_output_owner_token
-            and request.request_revision == self._figure_output_request_revision
-        )
-
-    def invalidate_figure_output_requests(self) -> None:
-        self._figure_output_request_revision += 1
-        self._figure_output_request_signature = object()
+        publication = self._fit_active_publication
+        _require_publication_value(publication, source)
+        return publication, source, result
 
     def has_live_selector_outputs(self) -> bool:
         """Whether a generation-scoped selector must follow source revisions."""
@@ -1474,10 +1363,10 @@ class PanelCard(FluentGroupBox):
         snapshot,
         frame_key,
         *,
+        publication: SignalPublication,
         force: bool = False,
         axis_labels=None,
         short_labels=None,
-        source_component=None,
     ) -> _PanelRenderRequest | None:
         """Freeze one worker request without exposing mutable Qt/card state.
 
@@ -1494,6 +1383,7 @@ class PanelCard(FluentGroupBox):
         if value is None or getattr(value, "snapshot", None) is None:
             self.set_status(f"waiting for {name}", error=False)
             return None
+        _require_publication_value(publication, value)
         fit_source = self._fit_live_surface_source
         if (
             fit_source is not None
@@ -1505,7 +1395,7 @@ class PanelCard(FluentGroupBox):
             # the newest immutable candidate so release can resume immediately.
             self._remember_candidate_value(
                 value,
-                source_component=source_component,
+                publication=publication,
             )
             return None
         if self._live_surface_interaction_pending():
@@ -1515,7 +1405,7 @@ class PanelCard(FluentGroupBox):
             # pinned render request or splice a new input revision into a drag.
             self._remember_candidate_value(
                 value,
-                source_component=source_component,
+                publication=publication,
             )
             return None
         return self._freeze_value_render_request(
@@ -1524,31 +1414,45 @@ class PanelCard(FluentGroupBox):
             force=force,
             axis_labels=axis_labels,
             short_labels=short_labels,
-            source_component=source_component,
+            publication=publication,
         )
 
-    def _remember_candidate_value(self, value, *, source_component=None) -> None:
-        """Retain the newest value and its exact producer sidecar as one fact."""
+    def _remember_candidate_value(
+        self,
+        value,
+        *,
+        publication: SignalPublication,
+    ) -> None:
+        """Retain the newest exact publication/value pair as one fact."""
 
-        source_ref = value.snapshot.ref
-        candidate_ref = getattr(
-            getattr(self._candidate_value, "snapshot", None),
-            "ref",
-            None,
-        )
+        _require_publication_value(publication, value)
+        candidate = self._candidate_publication
         advances = (
-            candidate_ref is None
-            or candidate_ref.stream_generation != source_ref.stream_generation
-            or candidate_ref.revision <= source_ref.revision
+            candidate is None
+            or candidate.owner_id != publication.owner_id
+            or candidate.generation != publication.generation
+            or candidate.sequence <= publication.sequence
         )
         if advances:
             self._candidate_value = value
-            self._candidate_source_component = source_component
-        elif candidate_ref == source_ref and source_component is not None:
-            # A worker request may first observe the immutable value and have its
-            # opaque producer sidecar attached by the composition root before
-            # completion.  Never replace a retained sidecar with ``None``.
-            self._candidate_source_component = source_component
+            self._candidate_publication = publication
+
+    def _retained_publication_for_value(self, value) -> SignalPublication | None:
+        """Return the exact private publication retained beside ``value``."""
+
+        pairs = (
+            (self._candidate_value, self._candidate_publication),
+            (self._pending_value, self._pending_publication),
+            (self._presented_value, self._presented_publication),
+            (self._fit_active_source, self._fit_active_publication),
+        )
+        pin = self._pointer_interaction_pin
+        if pin is not None:
+            pairs += ((pin.value, pin.publication),)
+        for retained_value, publication in pairs:
+            if retained_value is value and publication is not None:
+                return _require_publication_value(publication, value)
+        return None
 
     def freeze_current_view_request(
         self,
@@ -1593,32 +1497,20 @@ class PanelCard(FluentGroupBox):
             else:
                 self.set_status("pick a signal in Setting", error=False)
             return None
-        source_component = None
-        value_ref = value.snapshot.ref
-        presented_ref = getattr(
-            getattr(self._presented_value, "snapshot", None),
-            "ref",
-            None,
-        )
-        if value_ref == presented_ref:
-            source_component = self._presented_source_component
-        elif (
-            self._candidate_value is not None
-            and value_ref == self._candidate_value.snapshot.ref
-        ):
-            source_component = self._candidate_source_component
-        elif (
-            self._fit_active_source is not None
-            and value_ref == self._fit_active_source.snapshot.ref
-        ):
-            source_component = self._fit_active_source_component
+        publication = self._retained_publication_for_value(value)
+        if publication is None:
+            self.set_status(
+                "painted Figure source has no exact signal publication",
+                error=True,
+            )
+            return None
         return self._freeze_value_render_request(
             value,
             self._render_version,
             force=force,
             axis_labels=axis_labels,
             short_labels=short_labels,
-            source_component=source_component,
+            publication=publication,
         )
 
     def _freeze_value_render_request(
@@ -1626,10 +1518,10 @@ class PanelCard(FluentGroupBox):
         value,
         frame_key,
         *,
+        publication: SignalPublication,
         force: bool,
         axis_labels=None,
         short_labels=None,
-        source_component=None,
     ) -> _PanelRenderRequest | None:
         """Freeze one immutable value/display pair for the raster worker."""
 
@@ -1640,14 +1532,14 @@ class PanelCard(FluentGroupBox):
             source = plot_panel_input(
                 self.config.kind,
                 value.snapshot,
-                self._presentation_provider(value),
+                self._presentation_provider(value, publication),
             )
         except (TypeError, ValueError) as error:
             self.set_status(str(error), error=True)
             return None
         self._remember_candidate_value(
             value,
-            source_component=source_component,
+            publication=publication,
         )
         visible_schema = self._current_schema()
         schema_transition = (
@@ -1709,7 +1601,6 @@ class PanelCard(FluentGroupBox):
             source=source,
             fit_result=fit_result,
             fit_result_identity=fit_result_identity,
-            source_component=source_component,
         )
         if not force and request.signature == self._requested_signature:
             return None
@@ -1730,7 +1621,7 @@ class PanelCard(FluentGroupBox):
         axis_labels=None,
         short_labels=None,
         display=None,
-        source_component=None,
+        publication: SignalPublication,
     ) -> _PanelRenderRequest:
         """Freeze an additional presentation of one already accepted value.
 
@@ -1748,13 +1639,14 @@ class PanelCard(FluentGroupBox):
         snapshot = getattr(value, "snapshot", None)
         if snapshot is None:
             raise TypeError("render surface value must carry an OwnedSnapshot")
+        _require_publication_value(publication, value)
         schema = snapshot.block.schema
         from zlc_frontend.plot_panel import plot_panel_input
 
         source = plot_panel_input(
             self.config.kind,
             snapshot,
-            self._presentation_provider(value),
+            self._presentation_provider(value, publication),
         )
         view = self._effective_view_spec(schema)
         if self.config.kind != "sites" and view is None:
@@ -1785,7 +1677,6 @@ class PanelCard(FluentGroupBox):
             fit_result=fit_result,
             fit_result_identity=fit_result_identity,
             surface_id=str(surface_id),
-            source_component=source_component,
         )
 
     def _build_surface_render_request(
@@ -1801,7 +1692,6 @@ class PanelCard(FluentGroupBox):
         fit_result,
         fit_result_identity,
         surface_id: str | None = None,
-        source_component=None,
     ) -> _PanelRenderRequest:
         """Freeze one frontend-owned presentation for either Qt surface."""
 
@@ -1833,7 +1723,6 @@ class PanelCard(FluentGroupBox):
             fit_result,
             fit_result_identity,
             surface_id=surface_id,
-            source_component=source_component,
         )
 
     def accept_render_result(
@@ -1856,6 +1745,9 @@ class PanelCard(FluentGroupBox):
         and generation replacement still reject a superseded result.
         """
 
+        publication = self._retained_publication_for_value(request.value)
+        if publication is None:
+            return False
         source_ref = request.value.snapshot.ref
         fit_source = self._fit_live_surface_source
         if (
@@ -1939,8 +1831,8 @@ class PanelCard(FluentGroupBox):
                     and int(render_revision) >= int(request.request_revision)
                 ):
                     return False
-        self._render_version = request.frame_key
         if error is not None:
+            self._render_version = request.frame_key
             self._settle_pending_interaction_through(
                 request.display.revision,
                 failed=True,
@@ -1948,6 +1840,8 @@ class PanelCard(FluentGroupBox):
             )
             self.set_status(error, error=True)
             return True
+        pending_frame = None
+        pending_faceted = None
         if request.contract.faceted:
             from zlc_frontend.panel_render import FacetedPanelResult
 
@@ -1961,9 +1855,7 @@ class PanelCard(FluentGroupBox):
                     "render worker returned no complete faceted front",
                     error=True,
                 )
-                return True
-            self._pending_faceted_result = faceted_result
-            self._pending_frame = None
+                return False
             pending_figure = faceted_result.figure
             if figure is not pending_figure:
                 self._settle_pending_interaction_through(
@@ -1975,7 +1867,8 @@ class PanelCard(FluentGroupBox):
                     "faceted worker result lost its exact DataFigure",
                     error=True,
                 )
-                return True
+                return False
+            pending_faceted = faceted_result
             pending_display = request.display
             if faceted_result.focus is not None:
                 from zlc_frontend.histogram_display import (
@@ -1995,10 +1888,8 @@ class PanelCard(FluentGroupBox):
                 answer_host=self.board,
             )
             self.set_status("render worker returned no complete front", error=True)
-            return True
+            return False
         else:
-            self._pending_frame = frame
-            self._pending_faceted_result = None
             pending_figure = None
             if self.config.kind != "sites":
                 from zlc_frontend import DataFigure
@@ -2013,19 +1904,23 @@ class PanelCard(FluentGroupBox):
                         "render worker returned no exact DataFigure",
                         error=True,
                     )
-                    return True
+                    return False
                 pending_figure = figure
+            pending_frame = frame
             pending_display = request.display
         self._remember_candidate_value(
             request.value,
-            source_component=request.source_component,
+            publication=publication,
         )
+        self._pending_frame = pending_frame
+        self._pending_faceted_result = pending_faceted
         self._pending_figure = pending_figure
         self._pending_display = pending_display
         self._pending_contract = request.contract
         self._pending_value = request.value
-        self._pending_source_component = request.source_component
+        self._pending_publication = publication
         self._pending_render_request_revision = int(request.request_revision)
+        self._render_version = request.frame_key
         self.set_status("ok", error=False)
         return True
 
@@ -2075,8 +1970,22 @@ class PanelCard(FluentGroupBox):
         self._pending_display = None
         self._pending_contract = None
         self._pending_value = None
-        self._pending_source_component = None
+        self._pending_publication = None
         self._pending_render_request_revision = None
+
+    def _has_staged_render(self, request: _PanelRenderRequest) -> bool:
+        return bool(
+            self._pending_render_request_revision == request.request_revision
+            and self._pending_value is request.value
+            and (
+                self._pending_frame is not None
+                or self._pending_faceted_result is not None
+            )
+        )
+
+    def _discard_staged_render(self, request: _PanelRenderRequest) -> None:
+        if self._has_staged_render(request):
+            self._clear_pending_render_result()
 
     def _begin_pointer_interaction(
         self,
@@ -2084,10 +1993,10 @@ class PanelCard(FluentGroupBox):
         origin,
         *,
         value,
-        source_component,
+        publication: SignalPublication,
         surface_id: str,
     ) -> None:
-        """Pin one surface's exact data and ancestry at pointer press."""
+        """Pin one surface's exact publication/value at pointer press."""
 
         if host is None or origin != host.visible_interaction_origin():
             return
@@ -2096,6 +2005,11 @@ class PanelCard(FluentGroupBox):
                 "painted Figure front has no immutable data value",
                 error=True,
             )
+            return
+        try:
+            _require_publication_value(publication, value)
+        except (TypeError, ValueError) as error:
+            self.set_status(str(error), error=True)
             return
         visible_ref = getattr(getattr(value, "snapshot", None), "ref", None)
         origin_ref = getattr(origin.input_identity, "ref", None)
@@ -2109,7 +2023,7 @@ class PanelCard(FluentGroupBox):
             host,
             origin,
             value,
-            source_component,
+            publication,
             str(surface_id),
         )
         if host is not self.board:
@@ -2340,16 +2254,13 @@ class PanelCard(FluentGroupBox):
             raise RuntimeError("the panel has no presented data value")
         return value
 
-    def frozen_render_source_component(self):
-        """Return the opaque ancestry committed with the painted value.
+    def frozen_render_publication(self) -> SignalPublication:
+        """Return the exact neutral publication paired with the painted value."""
 
-        The value and this component cross the visible boundary together.  A
-        selector, Fit command, or frozen Edit surface copies this exact fact;
-        none may ask an advancing live data plane to reconstruct an old front.
-        Static Figure surfaces legitimately return ``None``.
-        """
-
-        return self._presented_source_component
+        value = self._presented_value
+        if value is None:
+            raise RuntimeError("the panel has no presented data value")
+        return _require_publication_value(self._presented_publication, value)
 
     def frozen_render_payload(self):
         """Return the exact typed payload painted by the current focused front."""
@@ -2396,14 +2307,14 @@ class PanelCard(FluentGroupBox):
         pending_display = self._pending_display
         pending_contract = self._pending_contract
         pending_value = self._pending_value
-        pending_source_component = self._pending_source_component
+        pending_publication = self._pending_publication
         pending_render_request_revision = self._pending_render_request_revision
         visible_schema = self._current_schema()
         self._pending_figure = None
         self._pending_display = None
         self._pending_contract = None
         self._pending_value = None
-        self._pending_source_component = None
+        self._pending_publication = None
         self._pending_render_request_revision = None
         if pending_contract is None:
             raise RuntimeError("pending raster has no PlotPanel contract")
@@ -2474,7 +2385,10 @@ class PanelCard(FluentGroupBox):
             self._presented_display = pending_display
             self._presented_contract = pending_contract
             self._presented_value = pending_value
-            self._presented_source_component = pending_source_component
+            self._presented_publication = _require_publication_value(
+                pending_publication,
+                pending_value,
+            )
             self._presented_render_request_revision = (
                 pending_render_request_revision
             )
@@ -2536,12 +2450,6 @@ class PanelCard(FluentGroupBox):
             )
         )
         self.front_presented.emit()
-        if (
-            self._figure_output_authority.area_commit is not None
-            or self._figure_output_authority.cross_commit is not None
-            or self._fit_result is not None
-        ):
-            self.figure_outputs_changed.emit()
 
     def setting_label_width(self, _metrics) -> int:
         """One label column for Setting and Edit, independent of live text."""
@@ -2855,7 +2763,7 @@ class PanelCard(FluentGroupBox):
         if combo is not None:
             self._fill_slot_combo(combo, self.config.signal)
 
-    def reconcile_visible_signal_metadata(self) -> bool:
+    def refresh_open_signal_metadata(self) -> bool:
         """Refresh one open Setting picker's leaf metadata in place.
 
         Signal topology is owned by the console's explicit add/remove/start/stop
@@ -3486,7 +3394,7 @@ class PanelCard(FluentGroupBox):
             emit_changed=False,
         )
         self._candidate_value = None
-        self._candidate_source_component = None
+        self._candidate_publication = None
         self._grid_focus = None
         self._view_pin = None
         self._invalidate_render_binding()
@@ -3494,7 +3402,7 @@ class PanelCard(FluentGroupBox):
         self._presented_display = None
         self._presented_contract = None
         self._presented_value = None
-        self._presented_source_component = None
+        self._presented_publication = None
         self._presented_render_request_revision = None
         if self.board is None:
             self._clear_figure_outputs(notify=True)
@@ -4096,16 +4004,15 @@ class PanelCard(FluentGroupBox):
         self._pointer_interaction_pin = None
 
         self._retire_fit_command(notify=False, emit_changed=False)
-        self.invalidate_figure_output_requests()
         self._invalidate_render_binding()
         self._candidate_value = None
-        self._candidate_source_component = None
+        self._candidate_publication = None
         self._grid_focus = None
         self._presented_figure = None
         self._presented_display = None
         self._presented_contract = None
         self._presented_value = None
-        self._presented_source_component = None
+        self._presented_publication = None
         self._presented_render_request_revision = None
         self._clear_figure_outputs(notify=False)
 
@@ -4144,7 +4051,7 @@ class PanelCard(FluentGroupBox):
         self._pending_display = None
         self._pending_contract = None
         self._pending_value = None
-        self._pending_source_component = None
+        self._pending_publication = None
         self._pending_render_request_revision = None
         self._render_request_revision += 1
         self._requested_signature = None
@@ -4179,16 +4086,16 @@ class PanelCard(FluentGroupBox):
         self._pending_display = None
         self._pending_contract = None
         self._pending_value = None
-        self._pending_source_component = None
+        self._pending_publication = None
         self._pending_render_request_revision = None
         self._candidate_value = None
-        self._candidate_source_component = None
+        self._candidate_publication = None
         self._grid_focus = None
         self._presented_figure = None
         self._presented_display = None
         self._presented_contract = None
         self._presented_value = None
-        self._presented_source_component = None
+        self._presented_publication = None
         self._presented_render_request_revision = None
         self._clear_figure_outputs(notify=False)
         self._requested_signature = None
@@ -4216,7 +4123,7 @@ class PanelCard(FluentGroupBox):
         self._fit_draft_context = None
         self._fit_active_spec = None
         self._fit_active_source = None
-        self._fit_active_source_component = None
+        self._fit_active_publication = None
         self._fit_live_surface_source = None
         self._fit_result = None
         self._fit_result_identity = None

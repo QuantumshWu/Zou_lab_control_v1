@@ -84,8 +84,35 @@ def _close_api(api: OccupancyApi) -> tuple[Exception, ...]:
 
 
 def _bind_task_console(api: OccupancyApi, _catalog: object, projection):
-    from .ui.view_projection import project_occupancy_views
+    from zlc_neutral_atom.processing.hosted_processor import HostedProcessor
+    from zlc_neutral_atom.processing.signal_plane import SignalPublication
+    from .processor import OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION
+    from .ui.view_projection import project_occupancy_site_map
     from .workbench_adapter import resolve_occupancy_calibration_input
+
+    site_map_name = OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION.name
+
+    def project_signal_presentation(
+        node: object,
+        output_name: str,
+        publication: SignalPublication,
+    ):
+        if output_name != site_map_name:
+            return None
+        if not isinstance(node, HostedProcessor):
+            raise TypeError("Occupancy presentation requires HostedProcessor")
+        parent = publication.parents[0] if len(publication.parents) == 1 else None
+        background = (
+            None if parent is None else parent.value(node.source_signal)
+        )
+        occupied = publication.value(node.signal_key(output_name))
+        if background is None or occupied is None:
+            return None
+        return project_occupancy_site_map(
+            node.prepared_application,
+            background,
+            occupied,
+        )
 
     return projection.processor(
         OCCUPANCY_LOGIC_NODE,
@@ -95,7 +122,7 @@ def _bind_task_console(api: OccupancyApi, _catalog: object, projection):
             resolve_final_or_saved=projection.resolve_final_or_saved,
             load_saved_calibration=api.load_saved_calibration,
         ),
-        project_presentations=project_occupancy_views,
+        project_signal_presentation=project_signal_presentation,
     )
 
 

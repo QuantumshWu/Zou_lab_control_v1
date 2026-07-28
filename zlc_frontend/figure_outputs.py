@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from types import MappingProxyType
 from typing import Mapping
 
 import numpy as np
@@ -49,13 +48,13 @@ from zlc_data import (
     committed_transform_to_tree,
     dataset_revision_ref_to_tree,
     expand_dataset_validity,
-    selection_to_tree,
     fit_spec_to_tree,
     materialize_dataset_acceptance_mask,
     materialize_fit_parameter_snapshots,
     materialize_scalar_dataset,
     projected_dataset_output_contract_id,
     resolve_selection_indices,
+    selection_to_tree,
 )
 from .curve_display import numeric_curve_coordinates
 from .data_figure import DataFigure
@@ -111,14 +110,15 @@ __all__ = [
     "FigureDerivedSignal",
     "FigureAreaCommit",
     "FigureCrossCommit",
-    "FigureOutputFront",
     "FigureOutputPresentation",
-    "FigureOutputRequest",
-    "FigureOutputSession",
     "HistogramValueRangeSelection",
     "area_data_output_presentation",
     "bind_area_data_commit",
     "bind_cross_data_commit",
+    "cross_data_output_presentation",
+    "fit_parameter_output_presentation",
+    "figure_event_transform",
+    "figure_selector_identity",
     "figure_derived_signal",
     "figure_derivation_digest",
     "figure_output_contract_id",
@@ -231,241 +231,20 @@ class FigureCrossCommit:
 
 
 @dataclass(frozen=True, slots=True)
-class FigureOutputRequest:
-    """Immutable Figure-output intent evaluated outside any GUI owner.
-
-    The source has already been selected by the composition root.  Area and
-    Cross commits are generation-scoped, while a Fit result is exact-revision
-    scoped.  This request neither knows panel routing names nor publishes into
-    an application data plane.
-    """
-
-    source: FigureSource
-    area: FigureAreaCommit | None = None
-    cross: FigureCrossCommit | None = None
-    fit_result: object | None = None
-    fit_result_identity: str | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.source, FigureSource):
-            raise TypeError("Figure output request source must be FigureSource")
-        snapshot = self.source.snapshot
-        for label, commit, expected_type in (
-            ("Area", self.area, FigureAreaCommit),
-            ("Cross", self.cross, FigureCrossCommit),
-        ):
-            if commit is None:
-                continue
-            if not isinstance(commit, expected_type):
-                raise TypeError(f"{label} request has another commit type")
-            if not source_identity_matches_snapshot(commit.source_identity, snapshot):
-                raise ValueError(f"{label} commit belongs to another source generation")
-        if self.fit_result is None:
-            if self.fit_result_identity is not None:
-                raise ValueError("Fit identity requires a Fit result")
-        else:
-            from zlc_data import FitResultBatch
-
-            if not isinstance(self.fit_result, FitResultBatch):
-                raise TypeError("Figure output Fit result must be FitResultBatch")
-            if self.fit_result.source_ref != snapshot.ref:
-                raise ValueError("Figure output Fit belongs to another source revision")
-            identity = str(self.fit_result_identity or "").strip()
-            if not identity:
-                raise ValueError("Figure output Fit requires an exact result identity")
-            object.__setattr__(self, "fit_result_identity", identity)
-
-
-@dataclass(frozen=True, slots=True)
-class FigureOutputFront:
-    """One complete immutable answer from :class:`FigureOutputSession`."""
-
-    outputs: Mapping[str, "FigureDerivedSignal"]
-    failures: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        values = dict(self.outputs)
-        if any(not isinstance(value, FigureDerivedSignal) for value in values.values()):
-            raise TypeError("Figure output front contains another value type")
-        mismatched = tuple(
-            key
-            for key, value in values.items()
-            if key != value.presentation.name
-        )
-        if mismatched:
-            raise ValueError(
-                "Figure output mapping keys differ from frontend presentation names: "
-                f"{mismatched}"
-            )
-        failures = tuple(str(value) for value in self.failures)
-        object.__setattr__(self, "outputs", MappingProxyType(values))
-        object.__setattr__(self, "failures", failures)
-
-
-def _area_dependency(request: FigureOutputRequest) -> tuple[object, ...] | None:
-    commit = request.area
-    if commit is None:
-        return None
-    authority = commit.authority
-    if isinstance(authority, Selection):
-        authority_identity: object = selection_to_tree(authority)
-    elif isinstance(authority, CommittedTransform):
-        authority_identity = committed_transform_to_tree(authority)
-    else:
-        authority_identity = {
-            "histogram_value_range": [authority.lower, authority.upper],
-            "source_transform": committed_transform_to_tree(
-                authority.source_transform
-            ),
-        }
-    site_map = request.source.site_map
-    return (
-        request.source.snapshot.ref,
-        request.source.source_contract_id,
-        None if site_map is None else site_map.view_identity,
-        canonical_digest(authority_identity),
-    )
-
-
-def _cross_dependency(request: FigureOutputRequest) -> tuple[object, ...] | None:
-    commit = request.cross
-    if commit is None:
-        return None
-    return (
-        request.source.snapshot.ref,
-        canonical_digest(
-            {
-                "transform": committed_transform_to_tree(commit.transform),
-                "intent": commit.intent.value,
-                "point": commit.point,
-                "histogram_bin": commit.histogram_bin,
-            }
-        ),
-    )
-
-
-class FigureOutputSession:
-    """Persistent headless materializer for one Figure's derived signals.
-
-    A live Area depends on each exact source revision and is therefore rebuilt
-    when the source advances.  Cross and Fit work is cached by its own exact
-    dependency rather than being repeated merely because a raster was painted.
-    The session keeps no queue, policy, routing, or Qt state.
-    """
-
-    def __init__(self) -> None:
-        self._area_key: tuple[object, ...] | None = None
-        self._area_outputs: Mapping[str, FigureDerivedSignal] = MappingProxyType({})
-        self._area_failures: tuple[str, ...] = ()
-        self._cross_key: tuple[object, ...] | None = None
-        self._cross_outputs: Mapping[str, FigureDerivedSignal] = MappingProxyType({})
-        self._cross_failures: tuple[str, ...] = ()
-        self._fit_key: tuple[object, ...] | None = None
-        self._fit_outputs: Mapping[str, FigureDerivedSignal] = MappingProxyType({})
-        self._fit_failures: tuple[str, ...] = ()
-
-    @staticmethod
-    def _materialize(
-        label: str,
-        operation,
-    ) -> tuple[Mapping[str, "FigureDerivedSignal"], tuple[str, ...]]:
-        try:
-            outputs = operation()
-        except (KeyError, TypeError, ValueError, RuntimeError) as error:
-            return MappingProxyType({}), (f"{label}: {error}",)
-        return MappingProxyType(dict(outputs)), ()
-
-    def evaluate(self, request: FigureOutputRequest) -> FigureOutputFront:
-        if not isinstance(request, FigureOutputRequest):
-            raise TypeError("Figure output session requires FigureOutputRequest")
-
-        area_key = _area_dependency(request)
-        if area_key != self._area_key:
-            self._area_key = area_key
-            if request.area is None:
-                self._area_outputs, self._area_failures = MappingProxyType({}), ()
-            else:
-                self._area_outputs, self._area_failures = self._materialize(
-                    "Area",
-                    lambda: materialize_area_outputs(
-                        request.source,
-                        request.area,
-                    ),
-                )
-
-        cross_key = _cross_dependency(request)
-        if cross_key != self._cross_key:
-            self._cross_key = cross_key
-            if request.cross is None:
-                self._cross_outputs, self._cross_failures = MappingProxyType({}), ()
-            else:
-                self._cross_outputs, self._cross_failures = self._materialize(
-                    "Cross",
-                    lambda: materialize_cross_outputs(
-                        request.source,
-                        request.cross,
-                    ),
-                )
-
-        fit_key = (
-            None
-            if request.fit_result is None
-            else (request.source.snapshot.ref, request.fit_result_identity)
-        )
-        if fit_key != self._fit_key:
-            self._fit_key = fit_key
-            if request.fit_result is None:
-                self._fit_outputs, self._fit_failures = MappingProxyType({}), ()
-            else:
-                self._fit_outputs, self._fit_failures = self._materialize(
-                    "Fit",
-                    lambda: materialize_fit_outputs(
-                        request.source,
-                        request.fit_result,
-                    ),
-                )
-
-        outputs: dict[str, FigureDerivedSignal] = {}
-        for group in (self._area_outputs, self._cross_outputs, self._fit_outputs):
-            overlap = outputs.keys() & group.keys()
-            if overlap:
-                raise RuntimeError(
-                    f"Figure output owners overlap: {tuple(sorted(overlap))}"
-                )
-            outputs.update(group)
-        return FigureOutputFront(
-            outputs,
-            self._area_failures + self._cross_failures + self._fit_failures,
-        )
-
-    def close(self) -> None:
-        self._area_key = None
-        self._area_outputs = MappingProxyType({})
-        self._area_failures = ()
-        self._cross_key = None
-        self._cross_outputs = MappingProxyType({})
-        self._cross_failures = ()
-        self._fit_key = None
-        self._fit_outputs = MappingProxyType({})
-        self._fit_failures = ()
-
-
-@dataclass(frozen=True, slots=True)
 class FigureDerivedSignal:
     """One headless Figure-derived dataset plus derivation identity.
 
     Run identity and routing names intentionally do not appear here.  Those are
     application-shell concerns; the Figure owns only the immutable snapshot,
-    exact derivation, complete frontend-owned presentation, and whether source
-    coverage remains meaningful for the derived value.
+    exact derivation, and whether source coverage remains meaningful for the
+    derived value.  Presentation is generation-static topology metadata, never
+    a per-revision sidecar on this value.
     """
 
     snapshot: OwnedSnapshot
     source_ref: DatasetRevisionRef
     derivation_digest: str
-    presentation: FigureOutputPresentation
     preserve_source_coverage: bool = False
-    source_transform: DataTransformSpec | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, OwnedSnapshot):
@@ -475,17 +254,8 @@ class FigureDerivedSignal:
         if self.snapshot.ref.revision != self.source_ref.revision:
             raise ValueError("Figure signal revision differs from its source")
         sha256_text(self.derivation_digest, "Figure signal derivation_digest")
-        if not isinstance(self.presentation, FigureOutputPresentation):
-            raise TypeError(
-                "Figure signal presentation must be FigureOutputPresentation"
-            )
         if type(self.preserve_source_coverage) is not bool:
             raise TypeError("preserve_source_coverage must be bool")
-        if self.source_transform is not None:
-            if not isinstance(self.source_transform, DataTransformSpec):
-                raise TypeError("Figure signal source_transform must be DataTransformSpec")
-            if not self.source_transform.operations:
-                raise ValueError("Figure signal source_transform must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1046,6 +816,131 @@ def area_data_output_presentation(
     )
 
 
+def figure_event_transform(
+    source: FigureSource,
+    commit: FigureAreaCommit | FigureCrossCommit,
+) -> DataTransformSpec:
+    """Return the exact replayable event projection for a selector route.
+
+    Absence of an event-local mapping is explicit: histogram value/bin
+    analysis, SiteMap-specific selections, and point-row subsets raise instead
+    of advertising a weaker transform.  Composition may then bind the route as
+    continuous without granting FormalPulseScan association.
+    """
+
+    if not isinstance(source, FigureSource):
+        raise TypeError("Figure event transform requires FigureSource")
+    snapshot = source.snapshot
+    if isinstance(commit, FigureAreaCommit):
+        if not source_identity_matches_snapshot(commit.source_identity, snapshot):
+            raise ValueError("Area commit belongs to another source generation")
+        transform = commit.authority
+        if not isinstance(transform, CommittedTransform):
+            raise ValueError("Area selection has no replayable event transform")
+    elif isinstance(commit, FigureCrossCommit):
+        if not source_identity_matches_snapshot(commit.source_identity, snapshot):
+            raise ValueError("Cross commit belongs to another source generation")
+        if commit.intent is ViewIntent.HISTOGRAM:
+            raise ValueError("Histogram Cross is event fan-in")
+        transform = commit.transform
+    else:
+        raise TypeError("selector commit must be FigureAreaCommit or FigureCrossCommit")
+    full_rows = tuple(range(snapshot.block.schema.point_table.row_count))
+    if transform.exact_point_ordinals != full_rows:
+        raise ValueError("point-row selection has no one-to-one event mapping")
+    return transform.spec
+
+
+def figure_selector_identity(
+    commit: FigureAreaCommit | FigureCrossCommit,
+) -> str:
+    """Canonical generation identity for one committed selector route."""
+
+    if isinstance(commit, FigureAreaCommit):
+        authority = commit.authority
+        if isinstance(authority, CommittedTransform):
+            payload = {"committed_transform": committed_transform_to_tree(authority)}
+        elif isinstance(authority, Selection):
+            payload = {"selection": selection_to_tree(authority)}
+        elif isinstance(authority, HistogramValueRangeSelection):
+            payload = {
+                "histogram_value_range": [authority.lower, authority.upper],
+                "source_transform": committed_transform_to_tree(
+                    authority.source_transform
+                ),
+            }
+        else:  # FigureAreaCommit closes this boundary.
+            raise TypeError("Area commit has another authority type")
+        kind = "area"
+        source_identity = commit.source_identity
+    elif isinstance(commit, FigureCrossCommit):
+        kind = "cross"
+        source_identity = commit.source_identity
+        payload = {
+            "transform": committed_transform_to_tree(commit.transform),
+            "intent": commit.intent.value,
+            "point": commit.point,
+            "histogram_bin": commit.histogram_bin,
+        }
+    else:
+        raise TypeError("selector commit must be FigureAreaCommit or FigureCrossCommit")
+    return canonical_digest(
+        {
+            "owner": "zlc_frontend.figure-selector-generation",
+            "kind": kind,
+            "source": {
+                "block_id": source_identity.block_id.value,
+                "stream_generation": source_identity.stream_generation.value,
+                "schema_fingerprint": source_identity.schema_fingerprint,
+            },
+            "authority": payload,
+        }
+    )
+
+
+def cross_data_output_presentation(
+    commit: FigureCrossCommit,
+) -> FigureOutputPresentation:
+    """Return the sole public presentation of one committed Cross output."""
+
+    if not isinstance(commit, FigureCrossCommit):
+        raise TypeError("Cross presentation requires FigureCrossCommit")
+    if commit.intent is ViewIntent.HISTOGRAM:
+        if commit.histogram_bin is None:
+            raise ValueError("Histogram Cross presentation requires its bin")
+        lower, upper, include_upper = commit.histogram_bin
+        close = "]" if include_upper else ")"
+        description = (
+            f"Cross-selected histogram bin count for [{lower}, {upper}{close}."
+        )
+    else:
+        description = f"Cross-selected {commit.intent.value.lower()} value."
+    return FigureOutputPresentation(
+        CROSS_DATA_OUTPUT,
+        FIGURE_CROSS_DATA_OUTPUT_CONTRACT_ID,
+        "Cross data",
+        "Cross data",
+        description,
+    )
+
+
+def fit_parameter_output_presentation(
+    parameter_name: str,
+    model_id: str,
+) -> FigureOutputPresentation:
+    """Return the sole public presentation of one Fit parameter output."""
+
+    parameter = canonical_text(parameter_name, "Fit parameter name")
+    model = canonical_text(model_id, "Fit model id")
+    return FigureOutputPresentation(
+        f"{FIT_OUTPUT_PREFIX}{parameter}",
+        FIGURE_FIT_PARAMETER_OUTPUT_CONTRACT_ID,
+        parameter,
+        parameter,
+        f"Figure Fit parameter {parameter} from model {model}.",
+    )
+
+
 def figure_output_revision_ref(
     output_name: str,
     source_ref: DatasetRevisionRef,
@@ -1112,33 +1007,12 @@ def _materialize_committed_snapshot(
     )
 
 
-def _replayable_association_spec(
-    source: OwnedSnapshot,
-    transform: CommittedTransform,
-) -> DataTransformSpec | None:
-    """Project only transforms the current SignalPlane can replay exactly.
-
-    M1 authority always keeps exact point rows in ``CommittedTransform``.
-    The existing association channel still accepts only operations, so a
-    point-subset commit must not claim a weaker replayable transform. M2 will
-    replace that channel at the transaction owner rather than adding a second
-    row-selection payload here.
-    """
-
-    full_rows = tuple(range(source.block.schema.point_table.row_count))
-    if transform.exact_point_ordinals != full_rows or not transform.spec.operations:
-        return None
-    return transform.spec
-
-
 def figure_derived_signal(
     output_name: str,
     snapshot: OwnedSnapshot,
     source: FigureSource,
     *,
     preserve_source_coverage: bool,
-    presentation: FigureOutputPresentation,
-    source_transform: DataTransformSpec | None = None,
     derivation_digest: str | None = None,
 ) -> FigureDerivedSignal:
     if not isinstance(source, FigureSource):
@@ -1155,9 +1029,7 @@ def figure_derived_signal(
             if derivation_digest is None
             else derivation_digest
         ),
-        presentation=presentation,
         preserve_source_coverage=preserve_source_coverage,
-        source_transform=source_transform,
     )
 
 
@@ -1221,17 +1093,6 @@ def materialize_area_outputs(
                 selected,
                 source,
                 preserve_source_coverage=True,
-                presentation=area_data_output_presentation(
-                    source.source_contract_id,
-                ),
-                # The published values include both the optional Figure
-                # context selection and this histogram value-range acceptance
-                # mask.  Until that mask has a first-class authoritative
-                # DataTransform operation, exposing only ``source_selection``
-                # would claim a replayable transform that produces different
-                # data.  Keep the complete materialized output, but do not
-                # advertise it as association-preserving.
-                source_transform=None,
             )
         }
     site_map = source.site_map
@@ -1260,10 +1121,6 @@ def materialize_area_outputs(
             selected,
             source,
             preserve_source_coverage=True,
-            presentation=area_data_output_presentation(
-                source.source_contract_id,
-            ),
-            source_transform=_replayable_association_spec(snapshot, authority),
         )
     }
 
@@ -1296,7 +1153,6 @@ def materialize_cross_outputs(
         scalar_values = values.reshape(1)
         scalar_validity = validity.reshape(1)
         unit = transformed.schema.cell_schema.value_unit
-        description = f"Cross-selected {commit.intent.value.lower()} value."
     elif commit.intent is ViewIntent.HISTOGRAM:
         if commit.histogram_bin is None:
             raise RuntimeError("Histogram Cross lost its committed bin")
@@ -1311,10 +1167,6 @@ def materialize_cross_outputs(
         )
         scalar_validity = np.ones((1,), dtype=np.bool_)
         unit = None
-        close = "]" if include_upper else ")"
-        description = (
-            f"Cross-selected histogram bin count for [{lower}, {upper}{close}."
-        )
     else:  # FigureCrossCommit closes this; retain the materializer boundary.
         raise RuntimeError("Cross commit has no data-value semantics")
 
@@ -1337,25 +1189,12 @@ def materialize_cross_outputs(
             semantic_identity,
         ),
     )
-    source_transform = (
-        None
-        if commit.intent is ViewIntent.HISTOGRAM
-        else _replayable_association_spec(snapshot, commit.transform)
-    )
     return {
         CROSS_DATA_OUTPUT: figure_derived_signal(
             CROSS_DATA_OUTPUT,
             output_snapshot,
             source,
             preserve_source_coverage=False,
-            presentation=FigureOutputPresentation(
-                CROSS_DATA_OUTPUT,
-                FIGURE_CROSS_DATA_OUTPUT_CONTRACT_ID,
-                "Cross data",
-                "Cross data",
-                description,
-            ),
-            source_transform=source_transform,
             derivation_digest=figure_derivation_digest(
                 CROSS_DATA_OUTPUT,
                 output_snapshot,
@@ -1405,20 +1244,14 @@ def materialize_fit_outputs(
     )
     output: dict[str, FigureDerivedSignal] = {}
     for parameter_name, fit_snapshot in snapshots.items():
-        output_name = f"{FIT_OUTPUT_PREFIX}{parameter_name}"
+        presentation = fit_parameter_output_presentation(
+            parameter_name,
+            result.spec.model_id,
+        )
+        output_name = presentation.name
         output[output_name] = FigureDerivedSignal(
             snapshot=fit_snapshot,
             source_ref=result.source_ref,
-            presentation=FigureOutputPresentation(
-                output_name,
-                FIGURE_FIT_PARAMETER_OUTPUT_CONTRACT_ID,
-                parameter_name,
-                parameter_name,
-                (
-                    f"Figure Fit parameter {parameter_name} from model "
-                    f"{result.spec.model_id}."
-                ),
-            ),
             preserve_source_coverage=False,
             derivation_digest=canonical_digest(
                 {

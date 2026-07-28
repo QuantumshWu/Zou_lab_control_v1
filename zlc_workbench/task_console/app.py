@@ -21,7 +21,6 @@ def open_task_console(
 
     from .capability import ConsoleNodeHost
     from .catalog_bridge import ConsoleCatalogView
-    from .presentation_index import ConsolePresentationIndex
     from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
     from .window import show_task_console
 
@@ -39,7 +38,6 @@ def open_task_console(
         console[0].request_owner_wake()
 
     data_plane = SignalDataPlane()
-    presentation_index = ConsolePresentationIndex()
 
     def resolve_inputs(spec, values):
         if not console:
@@ -50,10 +48,18 @@ def open_task_console(
 
     host = ConsoleNodeHost(
         data_plane=data_plane,
-        presentation_index=presentation_index,
         resolve_inputs=resolve_inputs,
         request_owner_wake=request_owner_wake,
     )
+
+    def project_signal_presentation(node, output_name, publication):
+        attachment = ports.attachment_for(node.definition_key)
+        if attachment is None:
+            return None
+        projector = attachment.project_signal_presentation
+        if projector is None:
+            return None
+        return projector(node, output_name, publication)
 
     def run_factory(
         spec,
@@ -79,7 +85,7 @@ def open_task_console(
         catalog_view=catalog_view,
         run_factory=run_factory,
         data_plane=data_plane,
-        presentation_index=presentation_index,
+        project_signal_presentation=project_signal_presentation,
         **kwargs,
     )
     console.append(body)

@@ -22,7 +22,6 @@ from zlc_neutral_atom.artifact_output import ArtifactOutputDeclaration
 from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
 from .owner_mailbox import RunOwnerMailbox
-from zlc_neutral_atom.runtime.signal_source import SignalEventSource
 
 __all__ = ["HostedRun"]
 
@@ -175,28 +174,6 @@ class HostedRun:
 
         return self._request
 
-    def value_schema(self, output_name: str):
-        """Delegate one running producer's declared live-event schema."""
-
-        command = self._prepared_command
-        if command is None:
-            raise RuntimeError("producer has not finished prepare/start submission")
-        resolve = getattr(command, "value_schema", None)
-        if not callable(resolve):
-            raise TypeError("this producer does not expose live signal events")
-        return resolve(output_name)
-
-    def open_signal_cursor(self, output_name: str):
-        """Open a future-only cursor without exposing the prepared command."""
-
-        command = self._prepared_command
-        if command is None:
-            raise RuntimeError("producer has not finished prepare/start submission")
-        open_cursor = getattr(command, "open_signal_cursor", None)
-        if not callable(open_cursor):
-            raise TypeError("this producer does not expose live signal events")
-        return open_cursor(output_name)
-
     def dataset_output_binding(self, output_name: str):
         """Return an optional domain-owned binding for one running Dataset output."""
 
@@ -205,16 +182,6 @@ class HostedRun:
             raise RuntimeError("producer has not finished prepare/start submission")
         resolve = getattr(command, "dataset_output_binding", None)
         return None if not callable(resolve) else resolve(output_name)
-
-    def signal_event_source(self) -> SignalEventSource:
-        """Return the prepared command's real source without proxy capabilities."""
-
-        if not self.running:
-            raise RuntimeError("producer signal source is not running")
-        command = self._prepared_command
-        if not isinstance(command, SignalEventSource):
-            raise TypeError("this producer does not expose live signal events")
-        return command
 
     @property
     def handle(self):

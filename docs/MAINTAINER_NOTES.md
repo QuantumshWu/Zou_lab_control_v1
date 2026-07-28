@@ -7,9 +7,9 @@ This file is a current hand-off note, not an architecture authority. Normative d
 - Branch: `codex/system-architecture-migration`
 - M0 normative design baseline: `aaaa063ca5a8535c4f316df95e62574edce46cd3`; canonical observation-address clarification: `0af9354`.
 - Last code checkpoint before the normative freeze: `09fad53 Fix live Figure transactions and restore plot fits`
-- Completed architecture cut in this checkpoint: **M1 — minimal PointTable/GridTopology/source-binding replacement**
-- Active next cut: **M2 — Signal transaction**
-- Active worktree state: M1 has one point truth and no production compatibility model. After this checkpoint the only expected worktree exception is the untracked user file below; resume from M2 and do not replay M1.
+- Completed architecture cuts in this checkpoint: **M1 — minimal PointTable/GridTopology/source-binding replacement** and **M2 — exact Signal transaction**
+- Active next cut: **M3 — Figure/View/Fit convergence**
+- Active worktree state: M1 and M2 each have one mutable truth owner and no production compatibility model. After this checkpoint the only expected worktree exception is the untracked user file below; resume from M3 and do not replay M1 or M2.
 - Expected worktree exception: untracked user file `pulses/scan_test.json`; never read, modify, stage or commit it.
 - External temporary audit ledger: `../ARCHITECTURE_AUDIT_CURRENT.md`; it is not a product/design authority and is deleted only after M0–M7 evidence is fully merged and all implementation cuts finish.
 
@@ -55,3 +55,24 @@ Use the narrowest current test or product flow for the active boundary. Broad ve
 - Fixed-scope production Python changed from 174,687 to 172,061 physical lines: 421 to 415 modules, 1,025 to 1,016 classes, 602 to 598 dataclasses and 35 to 33 enums. The complete cut is `+8,464/-11,090`, net `-2,626`, with zero new production modules and six deletions.
 - Production compileall and `git diff --check` pass. No RTL/Tcl/XDC, tests, tutorials, fixtures or temporary evidence changed. Forty-nine historical tests still name the replaced model; per user direction and System Architecture M7 they must be rewritten or deleted there, never used to restore compatibility during M1.
 - Next action is M2 only. Recover its owner/deletion/public-concept contract from the Goal, audit M2/C rows and System Architecture §5/§8 M2 before touching product code.
+
+## M2 frozen preflight
+
+- Fixed-scope baseline before M2 product edits is 415 production Python modules and 172,061 physical lines. The worktree has no product diff; `pulses/scan_test.json` remains the sole untracked user file and is outside the cut.
+- The only mutable Signal generation/frontier authority will be `SignalDataPlane`. The existing acquisition `EventRef`/reservation owner, `MonitorDataset` materialization owner, Camera association adapter, PulseScan exact collector and frozen RTL remain unchanged.
+- The sole allowed new public concept is one immutable `SignalPublication`, earned by atomic siblings, exact parent references and monotonic transaction sequence and consumed by Processor routing, Figure-derived publication and Workbench operations. M2 adds zero public presentation types and no public Prepared/Presented/Route/Manager/borrow/lease framework.
+- Delete, do not wrap: `_CausalEdge`/`_CausalComponent` retrospective reconstruction, source-component capture/plumbing, per-revision `source_transform` association guesses, `ConsolePresentationIndex`, Window presentation reconciliation/topology repair and `_card_output_presentations`, dynamic mixed `FigureOutputRequest`/`FigureOutputFront`/`FigureOutputSession`, raster-lane output sessions, and TaskConsole recursive association heuristics.
+- Keep and reassign: `SignalValue` and `SignalFront`; pure `FigureAreaCommit`/`FigureCrossCommit` and materializers; generation-static `FigureOutputPresentation`; the existing Fit solver lane until M3; frontend SiteMap rendering rebuilt from exact signal/artifact facts; exact hardware association and reservation contracts.
+- Area and Cross are separate continuous routes driven from exact source publications independently of paint cadence. Fit parameters are a separate event-result publication and never withdraw or block selector routes. Workbench constructs and presents connected panel fronts from one exact `SignalFront`; a failed attachment/render keeps the prior complete group and is nonfatal.
+- Formal association is a frozen neutral route fact backed directly by the existing `SignalEventAssociationSource`; TaskConsole never infers it from panel names or display transforms. No EmissionSlot/PointEmissionMap framework is introduced because the current FormalPulseScan product has no fixed-K publication consumer.
+- Required M2 evidence is: raw→ROI dual panels; raw→ROI→ROI→Fit under at least three interleaved retained revisions; an independent producer advancing concurrently; atomic Camera frame siblings; and FormalPulseScan over Camera/Area/Occupancy with Fit/Histogram rejected before FIRE. Retirement with active/pending work must not revive a generation.
+
+## M2 closure evidence
+
+- `SignalDataPlane` is the sole mutable generation/publication/frontier owner. Its one new public value, immutable `SignalPublication`, freezes the sibling bundle, owner generation, monotonic sequence and exact parent publications; only the plane constructs `SignalPublication` and `SignalFront`.
+- Retrospective `_Causal*` reconstruction, source-component plumbing, per-revision presentation data, `ConsolePresentationIndex`, mixed `FigureOutputRequest`/`FigureOutputFront`/`FigureOutputSession`, raster output sessions and Window topology repair are deleted. Area and Cross now have independent continuous routes; Fit parameters use an exact-parent event route; SiteMap presentation is projected from exact signal/artifact facts.
+- Product witnesses passed for raw→ROI, three-revision raw→ROI→ROI→Fit with an independently advancing producer, atomic Camera frame siblings, exact Fit completion tokens, complete render groups and restarted-owner generation isolation. Retirement and terminal counterexamples proved that stale, fake, duplicate or late publications cannot revive a generation.
+- FormalPulseScan preflight accepted Camera, Area and Occupancy event sources and rejected Fit and Histogram before cursor/FIRE. Formal association is validated against the frozen route and value schema; TaskConsole performs no name-, panel- or display-based reconstruction.
+- Fixed-scope production Python changed from 415 modules / 172,061 lines / 1,016 classes / 598 dataclasses / 33 enums to 414 / 171,987 / 1,004 / 589 / 33. Production diff is `+3,062/-3,136`, net `-74`, with zero new modules and one deleted owner module.
+- Production compileall, changed-module import smoke, `git diff --check`, forbidden-symbol search and constructor-owner search pass. No RTL/Tcl/XDC, tests, tutorials, fixtures or temporary evidence changed; `pulses/scan_test.json` remains untouched and untracked.
+- Next action is M3 only. Recover its Fit-surface, regular-raster, canonical Figure/Form and deletion contracts before changing product code.

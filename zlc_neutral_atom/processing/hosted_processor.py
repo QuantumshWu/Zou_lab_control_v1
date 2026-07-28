@@ -18,7 +18,7 @@ from zlc_neutral_atom.dataset_output import (
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
 from zlc_neutral_atom.runtime.signal_source import SignalEventSource
-from .signal_plane import SignalDataPlane, SignalValue
+from .signal_plane import SignalDataPlane, SignalPublication, SignalValue
 
 __all__ = [
     "HostedProcessor",
@@ -82,17 +82,12 @@ class HostedProcessor:
         dataset_output_declarations: tuple[DatasetOutputDeclaration, ...],
         source_signal: str,
         source_node: HostedProcessorSource,
-        initial_source: SignalValue,
-        source_event_source: SignalEventSource | None = None,
+        initial_publication: SignalPublication,
         prepare_application: Callable[[], object],
         materialize_publication: Callable[
             [object, SignalValue], ProcessorPublication
         ],
         qualify_output: Callable[[str], str],
-        publication_observer: Callable[
-            [object, SignalValue, Mapping[str, SignalValue]], None
-        ]
-        | None,
         data_plane: SignalDataPlane,
         request_owner_wake: Callable[[], None],
     ) -> None:
@@ -100,23 +95,19 @@ class HostedProcessor:
             raise TypeError("definition_key must be DefinitionKey")
         if not isinstance(source_node, HostedProcessorSource):
             raise TypeError("source_node must implement HostedProcessorSource")
-        if not isinstance(initial_source, SignalValue):
-            raise TypeError("initial_source must be SignalValue")
+        if not isinstance(initial_publication, SignalPublication):
+            raise TypeError("initial_publication must be SignalPublication")
         source_signal = str(source_signal).strip()
         if not source_signal:
             raise ValueError("source_signal must be non-empty")
+        initial_source = initial_publication.value(source_signal)
+        if not isinstance(initial_source, SignalValue):
+            raise ValueError("initial publication lacks the selected signal")
         if initial_source.name != source_signal:
             raise ValueError("initial source differs from the selected signal")
         if not isinstance(initial_source.coverage, MonitorCoverage):
             raise ValueError(
                 "latest-only Processor input requires typed monitor coverage"
-            )
-        if source_event_source is not None and not isinstance(
-            source_event_source,
-            SignalEventSource,
-        ):
-            raise TypeError(
-                "source_event_source must implement SignalEventSource or be None"
             )
         source_generation = source_node.lifecycle_generation
         if (
@@ -135,8 +126,6 @@ class HostedProcessor:
             raise TypeError("materialize_publication must be callable")
         if not callable(qualify_output):
             raise TypeError("qualify_output must be callable")
-        if publication_observer is not None and not callable(publication_observer):
-            raise TypeError("publication_observer must be callable or None")
         if not isinstance(data_plane, SignalDataPlane):
             raise TypeError("data_plane must be SignalDataPlane")
         if not callable(request_owner_wake):
@@ -166,18 +155,18 @@ class HostedProcessor:
         self._dataset_output_declarations = declarations
         self._output_names = output_names
         self._source_node = source_node
-        self._source_event_source = source_event_source
         self._signal_event_source: SignalEventSource | None = None
         self._signal_events_close_requested = False
         self._signal_events_closed = False
         self._source_lifecycle_generation = source_generation
-        self._initial_source: SignalValue | None = initial_source
+        self._source_signal_generation = initial_publication.generation
+        self._initial_publication: SignalPublication | None = initial_publication
         self._source_run_id = initial_source.run_id
         self._source_epoch_id = initial_source.epoch_id
         self._prepare_application = prepare_application
+        self._prepared_application: object | None = None
         self._materialize_publication = materialize_publication
         self._qualify_output = qualify_output
-        self._publication_observer = publication_observer
         self._data_plane = data_plane
         self._request_owner_wake = request_owner_wake
         self._run_id = RunId(f"processor-{uuid.uuid4().hex}")
@@ -218,6 +207,17 @@ class HostedProcessor:
         return self._output_names
 
     @property
+    def source_signal(self) -> str:
+        return self._source_signal
+
+    @property
+    def prepared_application(self) -> object:
+        application = self._prepared_application
+        if application is None:
+            raise RuntimeError("Processor application is not ready")
+        return application
+
+    @property
     def running(self) -> bool:
         return self._state is RunState.RUNNING
 
@@ -240,22 +240,6 @@ class HostedProcessor:
             for output in self._dataset_output_declarations
         )
 
-    def value_schema(self, output_name: str) -> ValueSchema:
-        """Return one running Processor output's owner-defined event schema."""
-
-        name = self._require_output_name(output_name)
-        source = self._running_signal_source()
-        schema = source.value_schema(name)
-        if not isinstance(schema, ValueSchema):
-            raise TypeError("Processor signal source returned another schema type")
-        return schema
-
-    def open_signal_cursor(self, output_name: str):
-        """Open a future-only cursor over one running Processor output."""
-
-        name = self._require_output_name(output_name)
-        return self._running_signal_source().open_signal_cursor(name)
-
     @property
     def worker_idle(self) -> bool:
         """Whether the optional derived-event worker has fully stopped."""
@@ -270,15 +254,15 @@ class HostedProcessor:
             raise RuntimeError("Processor nodes are one-shot")
         self._state = RunState.RUNNING
         self._phase = "preparing Processor application"
-        source, self._initial_source = self._initial_source, None
-        if source is None:
-            self._fail(RuntimeError("Processor lost its initial source"))
+        publication, self._initial_publication = self._initial_publication, None
+        if publication is None:
+            self._fail(RuntimeError("Processor lost its initial publication"))
             return
         try:
             self._data_plane.attach_latest_only_processor(
                 self,
                 source_name=self._source_signal,
-                initial_source=source,
+                initial_publication=publication,
             )
         except Exception as error:
             self._fail(error)
@@ -294,7 +278,6 @@ class HostedProcessor:
         idle = self._data_plane.cancel_latest_only_processor(self)
         if idle and not self._processor_lane_retired:
             self._processor_lane_retired = True
-            self._data_plane.withdraw_processor(self)
         self._finish_pending_terminal()
 
     def poll(self) -> RunSnapshot | None:
@@ -369,16 +352,20 @@ class HostedProcessor:
             raise TypeError("Processor prepare returned no evaluable application")
         if self._state is not RunState.RUNNING or self._cancel_requested:
             return
+        self._prepared_application = application
         start_signal_events = getattr(application, "start_signal_events", None)
         if start_signal_events is not None:
             if not callable(start_signal_events):
                 raise TypeError(
                     "Processor application start_signal_events must be callable"
                 )
-            upstream = self._source_event_source
-            if upstream is None:
-                raise TypeError(
-                    "Processor live events require a SignalEventSource input"
+            upstream, _output_name, transform = self._data_plane.signal_event_binding(
+                self._source_signal,
+                expected_generation=self._source_signal_generation,
+            )
+            if transform is not None:
+                raise ValueError(
+                    "latest-only Processor event input must be a direct output"
                 )
             derived = start_signal_events(upstream)
             try:
@@ -391,6 +378,7 @@ class HostedProcessor:
             self._signal_event_source = derived
             self._signal_events_close_requested = False
             self._signal_events_closed = False
+            self._data_plane.bind_processor_event_source(self, derived)
         self._phase = "waiting for a new source revision"
 
     def processor_work_started(self, source: SignalValue) -> None:
@@ -404,6 +392,7 @@ class HostedProcessor:
     def accept_processor_result(
         self,
         source: SignalValue,
+        source_publication: SignalPublication,
         result: object,
     ) -> None:
         if self._state is not RunState.RUNNING or self._cancel_requested:
@@ -412,14 +401,11 @@ class HostedProcessor:
         publication = self._materialize_publication(result, source)
         if not isinstance(publication, ProcessorPublication):
             raise TypeError("Processor result adapter returned another value")
-        published = self._data_plane.publish_processor(
+        self._data_plane.publish_processor(
             self,
             publication.outputs,
-            source=source,
+            source_publication=source_publication,
         )
-        observer = self._publication_observer
-        if observer is not None:
-            observer(result, source, published)
         self._phase = "waiting for a new source revision"
 
     def accept_processor_failure(self, error: Exception) -> None:
@@ -438,7 +424,6 @@ class HostedProcessor:
                 self._pending_terminal_state = RunState.CANCELLED
             self._processor_lane_retired = True
             self._request_signal_events_close()
-            self._data_plane.withdraw_processor(self)
             self._finish_pending_terminal()
 
     def request_processor_owner_wake(self) -> None:
@@ -453,27 +438,7 @@ class HostedProcessor:
         idle = self._data_plane.cancel_latest_only_processor(self)
         if idle:
             self._processor_lane_retired = True
-        self._data_plane.withdraw_processor(self)
         self._finish_pending_terminal()
-
-    def _require_output_name(self, output_name: str) -> str:
-        if (
-            not isinstance(output_name, str)
-            or not output_name
-            or output_name.strip() != output_name
-        ):
-            raise ValueError("Processor output name must be canonical text")
-        if output_name not in self._output_names:
-            raise KeyError(f"Processor has no output {output_name!r}")
-        return output_name
-
-    def _running_signal_source(self) -> SignalEventSource:
-        if self._state is not RunState.RUNNING or self._cancel_requested:
-            raise RuntimeError("Processor signal events are not running")
-        source = self._signal_event_source
-        if source is None:
-            raise TypeError("this Processor does not expose live signal events")
-        return source
 
     def _validate_signal_event_source(self, source: object) -> None:
         if not isinstance(source, SignalEventSource):
@@ -541,11 +506,6 @@ class HostedProcessor:
         self._pending_terminal_state = None
         self._pending_terminal_error = None
         return True
-
-    def signal_event_source(self) -> SignalEventSource:
-        """Return the application-owned source without changing this node's type."""
-
-        return self._running_signal_source()
 
     def _snapshot(self) -> RunSnapshot:
         state = self._state

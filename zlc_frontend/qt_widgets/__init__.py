@@ -53,7 +53,6 @@ _EXPORTS_BY_MODULE = {
     ".figure_surface_lane": (
         "FigureSurfaceCompletion",
         "FigureSurfaceLane",
-        "FigureSurfaceOutputRequest",
         "FigureSurfaceRenderRequest",
     ),
     ".figure_info_pane": ("FigureInfoPane",),

@@ -102,15 +102,36 @@ def _close_api(api: CalibrationApi) -> tuple[Exception, ...]:
 
 
 def _bind_task_console(api: CalibrationApi, _catalog: object, projection):
-    from .ui.view_projection import project_calibration_final_views
+    from zlc_neutral_atom.processing.signal_plane import SignalPublication
+    from zlc_neutral_atom.runtime.hosted_run import HostedRun
+    from .projection import CALIBRATION_FINAL_OUTPUT_DECLARATIONS
+    from .ui.view_projection import project_calibration_site_map
     from .workbench_adapter import start_calibration_task_command
+
+    site_map_name = CALIBRATION_FINAL_OUTPUT_DECLARATIONS[0].name
+
+    def project_signal_presentation(
+        node: object,
+        output_name: str,
+        publication: SignalPublication,
+    ):
+        if output_name != site_map_name:
+            return None
+        if not isinstance(node, HostedRun):
+            raise TypeError("Calibration presentation requires HostedRun")
+        command = node.prepared_command
+        result = node.final_result
+        value = publication.value(node.signal_key(output_name))
+        if command is None or result is None or value is None:
+            return None
+        return project_calibration_site_map(command, result, value)
 
     return projection.run(
         CALIBRATION_LOGIC_NODE,
         prepare=api.prepare_calibration_task,
         dynamic_choice_context=api.sitemap_camera_roles(),
         start_with_live_output=start_calibration_task_command,
-        materialize_final_presentations=project_calibration_final_views,
+        project_signal_presentation=project_signal_presentation,
     )
 
 

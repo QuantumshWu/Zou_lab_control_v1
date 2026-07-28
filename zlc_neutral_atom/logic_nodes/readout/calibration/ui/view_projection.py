@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from zlc_frontend.site_map import SiteMapPresentation
-from zlc_neutral_atom.dataset_output import FinalDatasetOutput
-from zlc_neutral_atom.logic_nodes.readout.calibration.projection import (
-    CALIBRATION_FINAL_OUTPUT_DECLARATIONS,
-)
+from zlc_neutral_atom.processing.signal_plane import SignalValue
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
 from zlc_neutral_atom.logic_nodes.readout.calibration.task import PreparedCalibrationTask
 from zlc_frontend.site_map_view import (
@@ -69,30 +65,22 @@ def calibration_authority_summary(
     )
 
 
-def project_calibration_final_views(
+def project_calibration_site_map(
     command: PreparedCalibrationTask,
     result: CalibrationArtifactRef,
-    outputs: Mapping[str, FinalDatasetOutput],
-) -> dict[str, SiteMapPresentation]:
+    value: SignalValue,
+) -> SiteMapPresentation:
     """Map frozen Calibration facts into a frontend-owned SiteMap view."""
 
     if not isinstance(command, PreparedCalibrationTask):
         raise TypeError("command must be PreparedCalibrationTask")
     if not isinstance(result, CalibrationArtifactRef):
         raise TypeError("result must be CalibrationArtifactRef")
-    if not isinstance(outputs, Mapping):
-        raise TypeError("outputs must be a mapping")
+    if not isinstance(value, SignalValue):
+        raise TypeError("value must be SignalValue")
 
     context = command.site_map_context(result)
-    declaration = CALIBRATION_FINAL_OUTPUT_DECLARATIONS[0]
-    site_map_name = declaration.name
-    output = outputs.get(site_map_name)
-    if (
-        not isinstance(output, FinalDatasetOutput)
-        or output.declaration != declaration
-    ):
-        raise ValueError("calibration SiteMap requires its declared Dataset output")
-    snapshot = output.snapshot
+    snapshot = value.snapshot
     valid_count = int(context.site_validity.sum())
     view = build_site_map_snapshot_view(
         snapshot,
@@ -101,19 +89,19 @@ def project_calibration_final_views(
         centers_xy=context.centers_xy,
         site_validity=context.site_validity,
         site_geometry_identity=context.calibration_identity,
-        coherence_identity=output.join_digest,
-        run_id=f"calibration-{output.join_digest}",
-        provenance_epoch_id=snapshot.ref.stream_generation.value,
+        coherence_identity=value.join_digest,
+        run_id=value.run_id,
+        provenance_epoch_id=value.epoch_id,
         summary=(
             f"{context.calibration_identity} | reference average | "
             f"valid sites={valid_count}/{context.site_axis.size}"
         ),
         presentation_kind="calibration-sites",
     )
-    return {site_map_name: view}
+    return view
 
 
 __all__ = [
     "calibration_authority_summary",
-    "project_calibration_final_views",
+    "project_calibration_site_map",
 ]

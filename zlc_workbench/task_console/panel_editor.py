@@ -99,7 +99,7 @@ class PanelEditor(QtWidgets.QWidget):
         self._board = None
         self.render_surface_id = f"{card.panel_id}::edit::{id(self):x}"
         self._snapshot_value = None
-        self._snapshot_source_component = None
+        self._snapshot_publication = None
         self._snapshot_figure = None
         self._snapshot_display = None
         self._snapshot_contract = None
@@ -366,6 +366,7 @@ class PanelEditor(QtWidgets.QWidget):
             return
         try:
             value = card.frozen_render_value()
+            publication = card.frozen_render_publication()
             contract = card.frozen_plot_panel_contract()
             size_name = contract.size_name
             if card.config.kind == "sites":
@@ -422,10 +423,10 @@ class PanelEditor(QtWidgets.QWidget):
         self._presented_render_request_revision = self._render_request_revision
         self._pending_render_result = None
         self._snapshot_value = value
-        # Edit copies the exact ancestry already promoted with the painted live
-        # front.  Looking it up again in an advancing data plane would splice a
-        # newer camera transaction into this explicitly frozen surface.
-        self._snapshot_source_component = card.frozen_render_source_component()
+        # Edit copies the exact publication already promoted with the painted
+        # live front.  Looking it up again in an advancing data plane would
+        # splice a newer camera transaction into this frozen surface.
+        self._snapshot_publication = publication
         self._snapshot_figure = figure
         self._snapshot_display = display
         self._snapshot_contract = contract
@@ -450,7 +451,7 @@ class PanelEditor(QtWidgets.QWidget):
         return (
             self._snapshot_value,
             self._snapshot_figure,
-            self._snapshot_source_component,
+            self._snapshot_publication,
             payload,
         )
 
@@ -460,18 +461,22 @@ class PanelEditor(QtWidgets.QWidget):
         if self.card is None or self._snapshot_value is None:
             return None
         self._render_request_revision += 1
-        return self.card.freeze_surface_request(
-            self._snapshot_value,
-            surface_id=self.render_surface_id,
-            request_revision=self._render_request_revision,
-            frame_key=(
-                "edit-snapshot",
-                self._snapshot_value.snapshot.ref,
-            ),
-            axis_labels=axis_labels,
-            short_labels=short_labels,
-            source_component=self._snapshot_source_component,
-        )
+        try:
+            return self.card.freeze_surface_request(
+                self._snapshot_value,
+                surface_id=self.render_surface_id,
+                request_revision=self._render_request_revision,
+                frame_key=(
+                    "edit-snapshot",
+                    self._snapshot_value.snapshot.ref,
+                ),
+                axis_labels=axis_labels,
+                short_labels=short_labels,
+                publication=self._snapshot_publication,
+            )
+        except (KeyError, LookupError, RuntimeError, TypeError, ValueError) as error:
+            self.status.setText(f"{type(error).__name__}: {error}")
+            return None
 
     def invalidate_raster_surface(self) -> None:
         """Make a prior-screen front ineligible without rebuilding this tab."""
@@ -494,8 +499,10 @@ class PanelEditor(QtWidgets.QWidget):
         value = self._snapshot_value
         if (
             value is None
+            or self._snapshot_publication is None
             or request.render_surface_id != self.render_surface_id
-            or request.value.snapshot.ref != value.snapshot.ref
+            or request.value is not value
+            or self._snapshot_publication.value(value.name) is not value
             or request.contract.pixel_ratio != self.card.raster_pixel_ratio
         ):
             return False
@@ -525,15 +532,15 @@ class PanelEditor(QtWidgets.QWidget):
 
             if not isinstance(faceted_result, FacetedPanelResult):
                 self.status.setText("render worker returned no faceted front")
-                return True
+                return False
             if figure is not faceted_result.figure:
                 self.status.setText("faceted render lost its exact DataFigure")
-                return True
+                return False
         elif frame is None or (
             self.card.config.kind != "sites" and figure is None
         ):
             self.status.setText("render worker returned no complete front")
-            return True
+            return False
         self._pending_render_result = (
             request,
             frame,
@@ -541,6 +548,14 @@ class PanelEditor(QtWidgets.QWidget):
             figure,
         )
         return True
+
+    def _has_staged_render(self, request) -> bool:
+        pending = self._pending_render_result
+        return bool(pending is not None and pending[0] is request)
+
+    def _discard_staged_render(self, request) -> None:
+        if self._has_staged_render(request):
+            self._pending_render_result = None
 
     def present_render_result(self) -> None:
         """Present one accepted frozen-input answer on the Qt owner."""
@@ -637,7 +652,7 @@ class PanelEditor(QtWidgets.QWidget):
                 host,
                 origin,
                 value=self._snapshot_value,
-                source_component=self._snapshot_source_component,
+                publication=self._snapshot_publication,
                 surface_id=self.render_surface_id,
             )
         )
@@ -698,7 +713,7 @@ class PanelEditor(QtWidgets.QWidget):
         if self.card is not None and self._fit_pane is not None:
             self.card.release_fit_authoring_pane(self._fit_pane)
         self._fit_pane = None
-        self._snapshot_source_component = None
+        self._snapshot_publication = None
         if self.card is not None:
             try:
                 self.card.fit_presentation_changed.disconnect(

@@ -34,7 +34,6 @@ from zlc_frontend.figure import DatasetId, EvaluatedImage, EvaluatedInput, evalu
 from zlc_frontend.figure_outputs import (
     AREA_DATA_OUTPUT,
     FigureDerivedSignal,
-    area_data_output_presentation,
     figure_derived_signal,
     figure_output_revision_ref,
 )
@@ -201,9 +200,6 @@ def _site_map_area_outputs(
             result,
             source,
             preserve_source_coverage=False,
-            presentation=area_data_output_presentation(
-                source.source_contract_id,
-            ),
             derivation_digest=derivation_digest,
         )
     }

@@ -34,14 +34,6 @@ class FigureFitRequest:
     request_revision: int
     source: object
     spec: FitSpec
-    # Opaque causal ancestry captured by the composition root when the command
-    # surface froze its source.  The solver never reads it; publication uses it
-    # to admit fit parameters beside the exact source revision they derive from.
-    source_component: object | None = field(
-        default=None,
-        compare=False,
-        repr=False,
-    )
     cancelled: threading.Event = field(
         default_factory=threading.Event,
         compare=False,
@@ -100,9 +92,9 @@ class FigureFitLane:
         )
         self._lock = threading.Lock()
         self._future: Future | None = None
-        self._active: FigureFitRequest | None = None
+        self._active: tuple[FigureFitRequest, object] | None = None
         self._completion = None
-        self._pending: dict[str, FigureFitRequest] = {}
+        self._pending: dict[str, tuple[FigureFitRequest, object]] = {}
         self._closing = False
         self._shutdown_complete = False
         self._shutdown_notified = False
@@ -124,7 +116,7 @@ class FigureFitLane:
         with self._lock:
             return self._shutdown_failures
 
-    def enqueue(self, request: FigureFitRequest) -> None:
+    def enqueue(self, request: FigureFitRequest, completion_token: object) -> None:
         if not isinstance(request, FigureFitRequest):
             raise TypeError("fit lane requires FigureFitRequest")
         with self._lock:
@@ -132,9 +124,12 @@ class FigureFitLane:
                 return
             busy = self._future is not None or self._completion is not None
             if busy:
-                self._pending[request.panel_id] = request
+                previous = self._pending.get(request.panel_id)
+                self._pending[request.panel_id] = (request, completion_token)
+                if previous is not None:
+                    previous[0].cancelled.set()
                 return
-        self._start(request)
+        self._start(request, completion_token)
 
     def forget(self, panel_id: str) -> None:
         identity = str(panel_id).strip()
@@ -142,26 +137,27 @@ class FigureFitLane:
             pending = self._pending.pop(identity, None)
             active = self._active
         if pending is not None:
-            pending.cancelled.set()
-        if active is not None and active.panel_id == identity:
-            active.cancelled.set()
+            pending[0].cancelled.set()
+        if active is not None and active[0].panel_id == identity:
+            active[0].cancelled.set()
 
-    def _start(self, request: FigureFitRequest) -> None:
-        future = self._pool.submit(self._execute, request)
+    def _start(self, request: FigureFitRequest, completion_token: object) -> None:
         with self._lock:
             if self._closing:
                 request.cancelled.set()
                 return
             if self._future is not None:
                 raise RuntimeError("Fit lane admitted overlapping work")
-            self._active = request
+            future = self._pool.submit(self._execute, request)
+            self._active = (request, completion_token)
             self._future = future
         # Preserve the immutable request identity outside the Future result.
         # Even an unexpected executor/Future failure must still be routable to
         # the one panel whose exact live surface is pinned by this command.
         future.add_done_callback(
-            lambda completed, submitted=request: self._finished(
+            lambda completed, submitted=request, token=completion_token: self._finished(
                 submitted,
+                token,
                 completed,
             )
         )
@@ -175,20 +171,32 @@ class FigureFitLane:
                 cancel_check=request.cancelled.is_set,
             )
         except BaseException as error:
-            return request, None, f"{type(error).__name__}: {error}"
+            return None, f"{type(error).__name__}: {error}"
         if not isinstance(result, FitResultBatch):
-            return request, None, "TypeError: fit engine returned another result type"
-        return request, result, None
+            return None, "TypeError: fit engine returned another result type"
+        return result, None
 
-    def _finished(self, request: FigureFitRequest, future: Future) -> None:
+    def _finished(
+        self,
+        request: FigureFitRequest,
+        completion_token: object,
+        future: Future,
+    ) -> None:
         try:
-            completion = future.result()
+            result, error = future.result()
         except BaseException as error:
-            completion = (request, None, f"{type(error).__name__}: {error}")
+            result = None
+            error = f"{type(error).__name__}: {error}"
+        completion = (completion_token, request, result, error)
         with self._lock:
             if self._future is not future:
                 raise RuntimeError("Figure Fit future identity changed")
-            if self._active is not request:
+            active = self._active
+            if (
+                active is None
+                or active[0] is not request
+                or active[1] is not completion_token
+            ):
                 raise RuntimeError("Figure Fit request identity changed")
             self._future = None
             self._active = None
@@ -229,8 +237,8 @@ class FigureFitLane:
             if self._closing or not self._pending:
                 return
             panel_id = next(iter(self._pending))
-            request = self._pending.pop(panel_id)
-        self._start(request)
+            request, completion_token = self._pending.pop(panel_id)
+        self._start(request, completion_token)
 
     def shutdown(self) -> bool:
         """Cancel admission and report only after active solver work retires."""
@@ -245,8 +253,8 @@ class FigureFitLane:
             self._completion = None
             active_future = self._future
         if active is not None:
-            active.cancelled.set()
-        for request in pending:
+            active[0].cancelled.set()
+        for request, _completion_token in pending:
             request.cancelled.set()
         self._pool.shutdown(wait=False, cancel_futures=True)
         if active_future is not None:

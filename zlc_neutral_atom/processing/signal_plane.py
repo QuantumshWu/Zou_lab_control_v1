@@ -23,12 +23,17 @@ from different runs advance independently.
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import threading
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol, runtime_checkable
 
-from zlc_data import DataTransformSpec, DatasetRevisionRef, OwnedSnapshot
+from zlc_data import (
+    DataTransformSpec,
+    DatasetRevisionRef,
+    OwnedSnapshot,
+    ValueSchema,
+)
 from zlc_neutral_atom.dataset_output import (
     DatasetOutputDeclaration,
     FinalDatasetOutput,
@@ -38,7 +43,11 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetCoverage,
     MonitorCoverage,
 )
-from zlc_neutral_atom.runtime.signal_source import SignalEventSource
+from zlc_neutral_atom.runtime.signal_source import (
+    SignalEventAssociationSource,
+    SignalEventSource,
+    authoritative_signal_event_source,
+)
 from zlc_storage import canonical_text, sha256_text
 
 __all__ = [
@@ -46,6 +55,7 @@ __all__ = [
     "LatestProcessorControl",
     "SignalDataPlane",
     "SignalFront",
+    "SignalPublication",
     "SignalProducer",
     "SignalValue",
     "signal_revision_identity",
@@ -83,6 +93,7 @@ class LatestProcessorControl(SignalProducer, Protocol):
     def accept_processor_result(
         self,
         source: "SignalValue",
+        source_publication: "SignalPublication",
         result: object,
     ) -> None: ...
 
@@ -101,7 +112,6 @@ class DerivedSignalOutput:
     source_ref: DatasetRevisionRef
     derivation_digest: str
     preserve_source_coverage: bool = False
-    source_transform: DataTransformSpec | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, OwnedSnapshot):
@@ -113,11 +123,6 @@ class DerivedSignalOutput:
         sha256_text(self.derivation_digest, "derived signal derivation_digest")
         if type(self.preserve_source_coverage) is not bool:
             raise TypeError("preserve_source_coverage must be bool")
-        if self.source_transform is not None:
-            if not isinstance(self.source_transform, DataTransformSpec):
-                raise TypeError("source_transform must be DataTransformSpec")
-            if not self.source_transform.operations:
-                raise ValueError("source_transform must not be empty")
 
 
 @dataclass(frozen=True)
@@ -135,7 +140,6 @@ class SignalValue:
     epoch_id: str                   # causation domain the run belongs to
     join_digest: str                # exact immutable source/coherence digest
     transient: bool = False         # withdrawn with its live producer
-    source_transform: DataTransformSpec | None = None
 
     def __post_init__(self) -> None:
         name = canonical_text(self.name, "signal name")
@@ -155,11 +159,6 @@ class SignalValue:
         join_digest = sha256_text(self.join_digest, "signal join_digest")
         if not isinstance(self.transient, bool):
             raise TypeError("signal transient flag must be bool")
-        if self.source_transform is not None:
-            if not isinstance(self.source_transform, DataTransformSpec):
-                raise TypeError("Signal source_transform has an unknown type")
-            if not self.source_transform.operations:
-                raise ValueError("Signal source_transform must not be empty")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "source_instance_id", source_instance_id)
         object.__setattr__(self, "run_id", run_id)
@@ -226,18 +225,140 @@ class SignalValue:
         return 0
 
 
+@dataclass(frozen=True, eq=False)
+class SignalPublication:
+    """One exact immutable signal transaction.
+
+    A publication is the causal unit.  Its signal mapping is one atomic sibling
+    bundle and its parents are direct strong references to the exact immutable
+    publications consumed to produce it.  The process-local generation and
+    sequence are minted only by :class:`SignalDataPlane`; no retainer, latest
+    lookup, or presentation index is needed to recover ancestry afterwards.
+    """
+
+    owner_id: str
+    generation: int
+    sequence: int
+    signals: Mapping[str, SignalValue]
+    _issuer: object = field(repr=False, compare=False)
+    parents: tuple["SignalPublication", ...] = ()
+
+    def __post_init__(self) -> None:
+        owner_id = canonical_text(self.owner_id, "signal publication owner_id")
+        if (
+            isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or self.generation < 1
+        ):
+            raise ValueError("signal publication generation must be positive int")
+        if (
+            isinstance(self.sequence, bool)
+            or not isinstance(self.sequence, int)
+            or self.sequence < 1
+        ):
+            raise ValueError("signal publication sequence must be positive int")
+        signals = dict(self.signals)
+        if not signals:
+            raise ValueError("signal publication requires an atomic sibling bundle")
+        if any(
+            not isinstance(name, str)
+            or not isinstance(value, SignalValue)
+            or value.name != name
+            for name, value in signals.items()
+        ):
+            raise TypeError("signal publication mapping differs from its SignalValues")
+        parents = tuple(self.parents)
+        if any(not isinstance(value, SignalPublication) for value in parents):
+            raise TypeError("signal publication parents must be SignalPublication values")
+        if len({id(value) for value in parents}) != len(parents):
+            raise ValueError("signal publication parents must be unique")
+        object.__setattr__(self, "owner_id", owner_id)
+        object.__setattr__(self, "signals", MappingProxyType(signals))
+        object.__setattr__(self, "parents", parents)
+
+    @property
+    def transaction_id(self) -> tuple[str, int, int]:
+        return self.owner_id, self.generation, self.sequence
+
+    def value(self, name: str) -> SignalValue | None:
+        return self.signals.get(str(name))
+
+
 @dataclass(frozen=True)
 class SignalFront:
     """Immutable front: coherent derived components, independent producers."""
 
     signals: Mapping[str, SignalValue]
     failures: Mapping[str, str]     # producer instance_id -> freeze failure
+    publication_by_signal: Mapping[str, SignalPublication] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    _continuous_group_by_signal: Mapping[str, frozenset[str]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        signals = dict(self.signals)
+        failures = dict(self.failures)
+        publications = dict(self.publication_by_signal)
+        groups = {
+            str(name): frozenset(members)
+            for name, members in self._continuous_group_by_signal.items()
+        }
+        if any(not isinstance(value, SignalValue) for value in signals.values()):
+            raise TypeError("SignalFront signals must contain SignalValue values")
+        if any(not isinstance(value, str) for value in failures.values()):
+            raise TypeError("SignalFront failures must contain strings")
+        if set(publications) != set(signals):
+            raise ValueError("SignalFront publications must cover every signal")
+        for name, publication in publications.items():
+            if not isinstance(publication, SignalPublication):
+                raise TypeError("SignalFront contains another publication type")
+            if publication.value(name) is not signals[name]:
+                raise ValueError(
+                    "SignalFront value is not owned by its exact publication"
+                )
+        for name, members in groups.items():
+            if name not in signals or name not in members:
+                raise ValueError("continuous group must contain its visible signal")
+            if not members or not members.issubset(signals):
+                raise ValueError("continuous group contains a non-visible signal")
+            if any(groups.get(member) != members for member in members):
+                raise ValueError("continuous signal groups must be symmetric")
+        object.__setattr__(self, "signals", MappingProxyType(signals))
+        object.__setattr__(self, "failures", MappingProxyType(failures))
+        object.__setattr__(
+            self,
+            "publication_by_signal",
+            MappingProxyType(publications),
+        )
+        object.__setattr__(
+            self,
+            "_continuous_group_by_signal",
+            MappingProxyType(groups),
+        )
 
     def names(self) -> tuple[str, ...]:
         return tuple(self.signals)
 
     def value(self, name: str) -> SignalValue | None:
         return self.signals.get(str(name))
+
+    def publication(self, name: str) -> SignalPublication | None:
+        return self.publication_by_signal.get(str(name))
+
+    def continuous_group(self, name: str) -> frozenset[str]:
+        """Return the already-resolved visible causal group for one signal."""
+
+        selected = str(name)
+        if selected not in self.signals:
+            return frozenset()
+        return self._continuous_group_by_signal.get(
+            selected,
+            frozenset((selected,)),
+        )
 
 
 def _declared_outputs(declarations) -> dict[str, DatasetOutputDeclaration]:
@@ -342,473 +463,207 @@ def _evaluate_prepared_processor_application(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _CausalEdge:
-    """One exact source revision -> complete derived-output transaction."""
-
-    owner_key: str
-    source_name: str
-    source_identity: tuple[object, ...]
-    outputs: Mapping[str, SignalValue]
-
-    def __post_init__(self) -> None:
-        owner_key = canonical_text(self.owner_key, "causal edge owner key")
-        source_name = canonical_text(self.source_name, "causal edge source name")
-        source_identity = tuple(self.source_identity)
-        outputs = dict(self.outputs)
-        if not source_identity:
-            raise ValueError("causal edge source identity must not be empty")
-        if not outputs:
-            raise ValueError("causal edge must publish outputs")
-        if any(not isinstance(value, SignalValue) for value in outputs.values()):
-            raise TypeError("causal edge outputs must be SignalValue values")
-        object.__setattr__(self, "owner_key", owner_key)
-        object.__setattr__(self, "source_name", source_name)
-        object.__setattr__(self, "source_identity", source_identity)
-        object.__setattr__(self, "outputs", MappingProxyType(outputs))
-
-
-@dataclass(frozen=True, slots=True)
-class _CausalComponent:
-    """One root producer transaction plus its ordered derived edges."""
-
-    root_signals: Mapping[str, SignalValue]
-    edges: tuple[_CausalEdge, ...] = ()
-
-    def __post_init__(self) -> None:
-        root = dict(self.root_signals)
-        edges = tuple(self.edges)
-        if not root:
-            raise ValueError("causal component requires root signals")
-        if any(not isinstance(value, SignalValue) for value in root.values()):
-            raise TypeError(
-                "causal component must contain SignalValue values"
-            )
-        accumulated = dict(root)
-        for edge in edges:
-            if not isinstance(edge, _CausalEdge):
-                raise TypeError("causal component has another edge type")
-            source = accumulated.get(edge.source_name)
-            if (
-                source is None
-                or signal_revision_identity(source) != edge.source_identity
-            ):
-                raise ValueError(
-                    "causal component edge has another source revision"
-                )
-            overlap = set(accumulated).intersection(edge.outputs)
-            if overlap:
-                raise ValueError(
-                    "causal component edge redefines signals: "
-                    + ", ".join(sorted(overlap))
-                )
-            accumulated.update(edge.outputs)
-        object.__setattr__(self, "root_signals", MappingProxyType(root))
-        object.__setattr__(self, "edges", edges)
-
-    @property
-    def signals(self) -> Mapping[str, SignalValue]:
-        values = dict(self.root_signals)
-        for edge in self.edges:
-            values.update(edge.outputs)
-        return MappingProxyType(values)
-
-    def extend(
-        self,
-        edge: _CausalEdge,
-    ) -> _CausalComponent:
-        return _CausalComponent(self.root_signals, (*self.edges, edge))
-
-    def through_signal(self, name: str) -> _CausalComponent:
-        selected = canonical_text(name, "causal source name")
-        if selected in self.root_signals:
-            return _CausalComponent(self.root_signals)
-        for index, edge in enumerate(self.edges):
-            if selected in edge.outputs:
-                return _CausalComponent(
-                    self.root_signals,
-                    self.edges[: index + 1],
-                )
-        raise KeyError(selected)
-
-
-@dataclass(frozen=True, slots=True)
-class _CausalPublication:
-    edge: _CausalEdge
-    source_component: _CausalComponent
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.edge, _CausalEdge):
-            raise TypeError("causal publication has another edge type")
-        if not isinstance(self.source_component, _CausalComponent):
-            raise TypeError("causal publication has another source component type")
-        self.source_component.extend(self.edge)
-
-    def output_component(self) -> _CausalComponent:
-        return self.source_component.extend(self.edge)
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedFinalPublication:
-    """Validated replacement for one run-owned FINAL route set."""
+@dataclass(slots=True)
+class _GenerationState:
+    """The sole mutable state for one process-local signal generation."""
 
     owner_id: str
-    node: object
-    values: Mapping[str, SignalValue]
-
-    def __post_init__(self) -> None:
-        owner_id = canonical_text(self.owner_id, "FINAL signal owner_id")
-        values = dict(self.values)
-        if not values:
-            raise ValueError("prepared FINAL publication must contain values")
-        if any(not isinstance(value, SignalValue) for value in values.values()):
-            raise TypeError("prepared FINAL publication contains another value type")
-        object.__setattr__(self, "owner_id", owner_id)
-        object.__setattr__(self, "values", MappingProxyType(values))
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedDerivedPublication:
-    """Validated replacement for one composition-owned derived route set.
-
-    The object is intentionally private to the data plane.  A composition root
-    may hold it while it prepares an adjacent sidecar transaction, then commit
-    both facts without any validation or array/schema work between them.
-    """
-
-    owner_id: str
-    publication: _CausalPublication | None
-    values: Mapping[str, SignalValue]
-
-    def __post_init__(self) -> None:
-        owner_id = canonical_text(self.owner_id, "derived signal owner_id")
-        values = dict(self.values)
-        if self.publication is not None:
-            if not isinstance(self.publication, _CausalPublication):
-                raise TypeError("prepared derived publication has another type")
-            if values != dict(self.publication.edge.outputs):
-                raise ValueError(
-                    "prepared derived values differ from their causal publication"
-                )
-        elif values:
-            raise ValueError("prepared derived withdrawal cannot contain values")
-        object.__setattr__(self, "owner_id", owner_id)
-        object.__setattr__(self, "values", MappingProxyType(values))
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedSignalRetirement:
-    """Exact producer generation and its complete causal publication closure."""
-
-    node: object
-    owner_id: str
-    retired_signal_names: frozenset[str]
-    processor_publications: Mapping[str, _CausalPublication]
-    derived_publications: Mapping[str, _CausalPublication]
-    dependent_processors: tuple[object, ...]
-
-    def __post_init__(self) -> None:
-        owner_id = canonical_text(self.owner_id, "retired signal owner_id")
-        names = frozenset(
-            canonical_text(name, "retired signal name")
-            for name in self.retired_signal_names
-        )
-        processors = dict(self.processor_publications)
-        derived = dict(self.derived_publications)
-        if any(
-            not isinstance(publication, _CausalPublication)
-            for publication in (*processors.values(), *derived.values())
-        ):
-            raise TypeError("prepared retirement contains another publication type")
-        object.__setattr__(self, "owner_id", owner_id)
-        object.__setattr__(self, "retired_signal_names", names)
-        object.__setattr__(
-            self,
-            "processor_publications",
-            MappingProxyType(processors),
-        )
-        object.__setattr__(
-            self,
-            "derived_publications",
-            MappingProxyType(derived),
-        )
-        object.__setattr__(
-            self,
-            "dependent_processors",
-            tuple(self.dependent_processors),
-        )
+    generation: int
+    kind: str
+    output_names: tuple[str, ...]
+    bare_names: Mapping[str, str]
+    node: object | None = None
+    slot: object | None = None
+    source_name: str | None = None
+    source_owner_id: str | None = None
+    source_generation: int | None = None
+    event_root_name: str | None = None
+    publication: SignalPublication | None = None
+    event_source: SignalEventSource | None = None
+    route_identity: str | None = None
+    source_transform: DataTransformSpec | None = None
+    preserves_event_association: bool = False
+    association_value_schema: ValueSchema | None = None
+    bound_parent: SignalPublication | None = None
+    last_parent_sequence: int = 0
+    published_names: tuple[str, ...] | None = None
+    schema_fingerprints: Mapping[str, str] | None = None
+    next_sequence: int = 1
+    failure: str | None = None
+    terminal: bool = False
+    retired: bool = False
 
 
 @dataclass(slots=True)
-class _LatestOnlyProcessorEntry:
+class _ProcessorEntry:
     node: LatestProcessorControl
     source_name: str
     prepare_future: Future
     application: object | None = None
     work_future: Future | None = None
-    work_source: SignalValue | None = None
-    work_source_component: _CausalComponent | None = None
-    pending_source: SignalValue | None = None
-    pending_source_component: _CausalComponent | None = None
-    last_source_identity: tuple[object, ...] | None = None
+    work_publication: SignalPublication | None = None
+    pending_publication: SignalPublication | None = None
+    last_publication: SignalPublication | None = None
     cancel_requested: bool = False
 
 
 class _LatestOnlyProcessorLane:
-    """Internal shared worker lane for explicit source revisions.
-
-    This host has no graph, scheduler policy, restart machinery, or domain
-    algorithm.  It serializes already-prepared Processor operations owned by
-    processors in one host and keeps at most the newest not-yet-run source
-    revision per node.  Replacing pending work is a host scheduling decision,
-    not acquisition loss: it must never rewrite the producer-owned
-    ``MonitorCoverage`` carried by that revision.
-    """
+    """One private latest-only execution seam for reactive Processors."""
 
     def __init__(self) -> None:
         self._executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="signal-latest-processor",
         )
-        self._entries: dict[str, _LatestOnlyProcessorEntry] = {}
+        self._processors: dict[str, _ProcessorEntry] = {}
         self._closed = False
 
     @staticmethod
-    def _require_node_contract(node: object) -> LatestProcessorControl:
+    def _require_node(node: object) -> LatestProcessorControl:
         if not isinstance(node, LatestProcessorControl):
-            raise TypeError(
-                "latest-only processor must implement LatestProcessorControl"
-            )
+            raise TypeError("Processor must implement LatestProcessorControl")
         return node
 
-    def attach(
+    def attach_processor(
         self,
         node: LatestProcessorControl,
         source_name: str,
-        initial_source: SignalValue,
-        initial_source_component: _CausalComponent,
+        initial_publication: SignalPublication,
     ) -> None:
         if self._closed:
-            raise RuntimeError("latest-only Processor lane is closed")
-        node = self._require_node_contract(node)
+            raise RuntimeError("continuous worker lane is closed")
+        node = self._require_node(node)
         name = canonical_text(source_name, "processor source name")
-        if not isinstance(initial_source, SignalValue):
-            raise TypeError("initial Processor source must be SignalValue")
-        if initial_source.name != name:
-            raise ValueError("initial Processor source has another signal name")
-        source_component = self._require_source_component(
-            initial_source,
-            initial_source_component,
-        )
+        source = initial_publication.value(name)
+        if source is None:
+            raise ValueError("initial publication has no selected Processor source")
         key = _node_instance_id(node)
-        if key in self._entries:
+        if key in self._processors:
             raise RuntimeError("Processor node is already attached")
-        node.validate_processor_source(initial_source)
+        node.validate_processor_source(source)
         future = self._executor.submit(node.prepare_processor_application)
         future.add_done_callback(
-            lambda _future, current=node: self._wake_owner_if_open(current)
+            lambda _future, current=node: self._wake_processor(current)
         )
-        self._entries[key] = _LatestOnlyProcessorEntry(
+        self._processors[key] = _ProcessorEntry(
             node=node,
             source_name=name,
             prepare_future=future,
-            pending_source=initial_source,
-            pending_source_component=source_component,
-            last_source_identity=signal_revision_identity(initial_source),
+            pending_publication=initial_publication,
+            last_publication=initial_publication,
         )
 
-    def cancel(self, node: object) -> bool:
-        """Stop accepting revisions; return whether no worker still owns it."""
-
-        entry = self._entries.get(_node_instance_id(node))
-        if entry is None:
-            return True
-        entry.cancel_requested = True
-        entry.pending_source = None
-        entry.pending_source_component = None
-        idle = entry.prepare_future.done() and (
-            entry.work_future is None or entry.work_future.done()
-        )
-        if idle:
-            self._retire_cancelled(entry)
-        return idle
-
-    def detach(self, node: object) -> None:
-        entry = self._entries.get(_node_instance_id(node))
-        if entry is None:
-            return
-        entry.cancel_requested = True
-        entry.pending_source = None
-        entry.pending_source_component = None
-        if entry.prepare_future.done() and (
-            entry.work_future is None or entry.work_future.done()
-        ):
-            self._entries.pop(_node_instance_id(node), None)
-
-    def retire_dependents(self, nodes: tuple[object, ...]) -> None:
-        """Discard work whose frozen input generation has been retired.
-
-        A HostedProcessor is deliberately bound to one producer object,
-        lifecycle generation, run and epoch.  It cannot silently rebind when
-        that producer restarts.  Marking it cancelled here guarantees that an
-        already-running pure evaluation is discarded by :meth:`drain`; the
-        normal node callback then leaves the authored row restartable against
-        the replacement generation.
-        """
-
-        for node in nodes:
-            key = _node_instance_id(node)
-            entry = self._entries.get(key)
-            if entry is None:
-                continue
-            if entry.node is not node:
-                raise RuntimeError(
-                    "prepared retirement found another Processor generation"
-                )
-            entry.cancel_requested = True
-            entry.pending_source = None
-            entry.pending_source_component = None
-
-    def route(
-        self,
-        signals: Mapping[str, SignalValue],
-        source_components: Mapping[
-            str,
-            _CausalComponent,
-        ],
-    ) -> None:
-        """Offer each attached node the exact newest accepted source revision."""
-
+    def route(self, publications: Mapping[str, SignalPublication]) -> None:
         if self._closed:
             return
-        for entry in tuple(self._entries.values()):
+        for entry in tuple(self._processors.values()):
             if entry.cancel_requested:
                 continue
-            source = signals.get(entry.source_name)
-            if source is None:
+            publication = publications.get(entry.source_name)
+            if publication is None or publication is entry.last_publication:
                 continue
-            identity = signal_revision_identity(source)
-            if identity == entry.last_source_identity:
+            source = publication.value(entry.source_name)
+            if source is None:
+                self._fail_processor(
+                    entry,
+                    RuntimeError("Processor publication lost its selected signal"),
+                )
                 continue
             try:
                 entry.node.validate_processor_source(source)
-                source_component = source_components.get(source.name)
-                if source_component is None:
-                    raise RuntimeError(
-                        "Processor source has no retained producer transaction"
-                    )
-                source_component = self._require_source_component(
-                    source,
-                    source_component,
-                )
             except Exception as error:
-                self._retire_failed(entry, error)
+                self._fail_processor(entry, error)
                 continue
-            entry.last_source_identity = identity
-            entry.pending_source = source
-            entry.pending_source_component = source_component
-            self._start_pending(entry)
+            entry.last_publication = publication
+            entry.pending_publication = publication
+            self._start_processor(entry)
 
-    def active_bindings(self) -> tuple[tuple[object, str], ...]:
-        """Return the currently admitted source edges on the owner thread."""
-
-        return tuple(
-            (entry.node, entry.source_name)
-            for entry in self._entries.values()
-            if not entry.cancel_requested
-        )
-
-    def source_component_for_publication(
-        self,
-        node: object,
-        source: SignalValue,
-    ) -> _CausalComponent:
-        """Return the exact transaction retained beside the completed work."""
-
-        entry = self._entries.get(_node_instance_id(node))
-        if entry is None or entry.work_source is None:
-            raise RuntimeError("Processor publication has no admitted work source")
-        if (
-            signal_revision_identity(entry.work_source)
-            != signal_revision_identity(source)
-        ):
-            raise RuntimeError("Processor publication source differs from its work")
-        component = entry.work_source_component
-        if component is None:
-            raise RuntimeError("Processor lane lost its source transaction")
-        return component
-
-    def drain(self) -> None:
-        """Admit completed worker results on the host owner thread."""
-
-        for entry in tuple(self._entries.values()):
+    def drain_processors(self) -> None:
+        for entry in tuple(self._processors.values()):
             if not entry.prepare_future.done():
                 continue
-            # Retirement/cancel is the terminal authority for this binding.
-            # A late application-build exception belongs to work that can no
-            # longer publish and must not overwrite CANCELLED with FAILED or
-            # invoke application_ready after its source generation is gone.
             if entry.cancel_requested and entry.work_future is None:
-                self._retire_cancelled(entry)
+                self._cancelled_processor(entry)
                 continue
             if entry.application is None:
                 try:
                     application = entry.prepare_future.result()
                     entry.node.processor_application_ready(application)
                 except Exception as error:
-                    self._retire_failed(entry, error)
+                    self._fail_processor(entry, error)
                     continue
                 entry.application = application
             work = entry.work_future
             if work is not None and work.done():
-                source = entry.work_source
+                publication = entry.work_publication
+                entry.work_future = None
+                entry.work_publication = None
                 if entry.cancel_requested:
-                    entry.work_future = None
-                    entry.work_source = None
-                    entry.work_source_component = None
-                    self._retire_cancelled(entry)
+                    self._cancelled_processor(entry)
                     continue
                 try:
+                    if publication is None:
+                        raise RuntimeError("Processor lane lost its exact publication")
+                    source = publication.value(entry.source_name)
                     if source is None:
-                        raise RuntimeError(
-                            "Processor lane lost its source revision"
-                        )
+                        raise RuntimeError("Processor publication lost its source")
                     result = work.result()
-                    entry.node.accept_processor_result(source, result)
+                    entry.node.accept_processor_result(
+                        source,
+                        publication,
+                        result,
+                    )
                 except Exception as error:
-                    entry.work_future = None
-                    entry.work_source = None
-                    entry.work_source_component = None
-                    self._retire_failed(entry, error)
+                    self._fail_processor(entry, error)
                     continue
-                entry.work_future = None
-                entry.work_source = None
-                entry.work_source_component = None
             if entry.cancel_requested:
                 if entry.work_future is None:
-                    self._retire_cancelled(entry)
+                    self._cancelled_processor(entry)
                 continue
-            self._start_pending(entry)
+            self._start_processor(entry)
 
-    def _start_pending(self, entry: _LatestOnlyProcessorEntry) -> None:
+    def cancel_processor(self, node: object) -> bool:
+        entry = self._processors.get(_node_instance_id(node))
+        if entry is None:
+            return True
+        entry.cancel_requested = True
+        entry.pending_publication = None
+        idle = entry.prepare_future.done() and (
+            entry.work_future is None or entry.work_future.done()
+        )
+        if idle:
+            self._cancelled_processor(entry)
+        return idle
+
+    def detach_processor(self, node: object) -> None:
+        entry = self._processors.pop(_node_instance_id(node), None)
+        if entry is not None:
+            entry.cancel_requested = True
+            entry.pending_publication = None
+
+    def active_processor_bindings(self) -> tuple[tuple[object, str], ...]:
+        return tuple(
+            (entry.node, entry.source_name)
+            for entry in self._processors.values()
+            if not entry.cancel_requested
+        )
+
+    def _start_processor(self, entry: _ProcessorEntry) -> None:
         if (
             entry.cancel_requested
             or entry.application is None
             or entry.work_future is not None
-            or entry.pending_source is None
+            or entry.pending_publication is None
         ):
             return
+        publication, entry.pending_publication = entry.pending_publication, None
+        source = publication.value(entry.source_name)
         try:
-            source, entry.pending_source = entry.pending_source, None
-            source_component = entry.pending_source_component
-            entry.pending_source_component = None
-            if source_component is None:
-                raise RuntimeError("Processor lane lost its pending source transaction")
+            if source is None:
+                raise RuntimeError("Processor pending publication lost its source")
             coverage = source.coverage
             if not isinstance(coverage, MonitorCoverage):
-                raise TypeError(
-                    "latest-only Processor source must carry MonitorCoverage"
-                )
+                raise TypeError("latest Processor source requires MonitorCoverage")
             entry.node.processor_work_started(source)
             future = self._executor.submit(
                 _evaluate_prepared_processor_application,
@@ -817,50 +672,23 @@ class _LatestOnlyProcessorLane:
                 coverage,
             )
         except Exception as error:
-            self._retire_failed(entry, error)
+            self._fail_processor(entry, error)
             return
-        future.add_done_callback(
-            lambda _future, current=entry.node: self._wake_owner_if_open(current)
-        )
-        entry.work_source = source
-        entry.work_source_component = source_component
+        entry.work_publication = publication
         entry.work_future = future
+        future.add_done_callback(
+            lambda _future, current=entry.node: self._wake_processor(current)
+        )
 
-    @staticmethod
-    def _require_source_component(
-        source: SignalValue,
-        component: _CausalComponent,
-    ) -> _CausalComponent:
-        if not isinstance(component, _CausalComponent):
-            raise TypeError(
-                "Processor source transaction has another component type"
-            )
-        selected = component.signals.get(source.name)
-        if (
-            selected is None
-            or signal_revision_identity(selected)
-            != signal_revision_identity(source)
-        ):
-            raise ValueError(
-                "Processor source transaction does not contain its selected revision"
-            )
-        return component.through_signal(source.name)
-
-    def _retire_failed(
-        self,
-        entry: _LatestOnlyProcessorEntry,
-        error: Exception,
-    ) -> None:
-        self._entries.pop(_node_instance_id(entry.node), None)
+    def _fail_processor(self, entry: _ProcessorEntry, error: Exception) -> None:
+        self._processors.pop(_node_instance_id(entry.node), None)
         entry.node.accept_processor_failure(error)
 
-    def _retire_cancelled(self, entry: _LatestOnlyProcessorEntry) -> None:
-        self._entries.pop(_node_instance_id(entry.node), None)
+    def _cancelled_processor(self, entry: _ProcessorEntry) -> None:
+        self._processors.pop(_node_instance_id(entry.node), None)
         entry.node.accept_processor_cancelled()
 
-    def _wake_owner_if_open(self, node: object) -> None:
-        """Never enqueue an owner wake after the data plane has retired."""
-
+    def _wake_processor(self, node: object) -> None:
         if not self._closed:
             node.request_processor_owner_wake()
 
@@ -868,65 +696,30 @@ class _LatestOnlyProcessorLane:
         if self._closed:
             return
         self._closed = True
-        for entry in tuple(self._entries.values()):
+        for entry in self._processors.values():
             entry.cancel_requested = True
-            entry.pending_source = None
-            entry.pending_source_component = None
-        # Running evaluations consume only immutable inputs and publish only
-        # when drain() admits them.  Once closed there is no consumer, so do
-        # not block the owner waiting for pure work that will be discarded.
+            entry.pending_publication = None
         self._executor.shutdown(wait=False, cancel_futures=True)
-        self._entries.clear()
+        self._processors.clear()
 
 
 class SignalDataPlane:
-    """Own live slots and coalesce their revision notifications.
-
-    Slots arrive from the RUN seam: a node's start closure builds one and
-    registers it here, so this plane never talks to the domain itself -- it
-    holds what the monitor handed back and reads it atomically.
-    """
+    """One owner for signal generations, publications, and visible frontiers."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._processor_lane = _LatestOnlyProcessorLane()
-        self._slots: dict[str, tuple[object, object]] = {}
-        self._slot_signal_names: dict[str, frozenset[str]] = {}
+        self._lane = _LatestOnlyProcessorLane()
+        self._publication_issuer = object()
+        self._states: dict[str, _GenerationState] = {}
+        self._next_generation = 1
         self._dirty: set[str] = set()
-        self._cache: dict[str, dict[str, SignalValue]] = {}
-        self._finals: dict[
-            str,
-            tuple[object, dict[str, SignalValue]],
-        ] = {}
-        self._processors: dict[str, _CausalPublication] = {}
-        self._derived: dict[str, _CausalPublication] = {}
-        self._failures: dict[str, str] = {}
+        self._front_signals: frozenset[str] = frozenset()
         self._membership_changed = False
         self._closed = False
-        self._reactive_processor_sources: dict[str, str] = {}
-        self._reactive_source_counts: dict[str, int] = {}
         self._request_owner_wake: Callable[[], None] | None = None
-        empty = MappingProxyType({})
-        self._front = SignalFront(signals=empty, failures=empty)
-        self._candidate_front = self._front
-        self._front_source_components: Mapping[
-            str,
-            _CausalComponent,
-        ] = empty
-        self._candidate_source_components: Mapping[
-            str,
-            _CausalComponent,
-        ] = empty
+        self._front = SignalFront({}, {})
 
     def bind_owner_wake(self, request_owner_wake: Callable[[], None]) -> None:
-        """Bind the sole host-owner wake before live producers are attached.
-
-        A manually driven/headless data plane may remain unbound and call
-        :meth:`freeze` explicitly.  A reactive host binds this once, so producer
-        revisions and Processor completions cannot depend on an unrelated
-        polling timer beat.
-        """
-
         if not callable(request_owner_wake):
             raise TypeError("request_owner_wake must be callable")
         with self._lock:
@@ -936,235 +729,504 @@ class SignalDataPlane:
                 raise RuntimeError("signal data plane owner wake is already bound")
             self._request_owner_wake = request_owner_wake
 
-    # ------------------------------------------------------------ membership
-    def attach(self, node, slot) -> None:
+    def set_front_signals(self, signal_names) -> None:
+        """Set the connected continuous signal set whose front must be coherent."""
+
+        names = frozenset(
+            canonical_text(name, "connected signal name")
+            for name in signal_names
+        )
+        wake = None
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("signal data plane is closed")
+            if names != self._front_signals:
+                self._front_signals = names
+                self._membership_changed = True
+                wake = self._request_owner_wake
+        if wake is not None:
+            wake()
+
+    def _mint_generation_locked(self) -> int:
+        generation = self._next_generation
+        self._next_generation += 1
+        return generation
+
+    def _state_for_signal_locked(
+        self,
+        signal_name: str,
+    ) -> _GenerationState | None:
+        selected = None
+        for state in self._states.values():
+            if state.retired or signal_name not in state.output_names:
+                continue
+            if selected is not None:
+                raise RuntimeError(
+                    f"signal {signal_name!r} has more than one generation owner"
+                )
+            selected = state
+        return selected
+
+    def _assert_names_available_locked(
+        self,
+        owner_id: str,
+        output_names: tuple[str, ...],
+    ) -> None:
+        for name in output_names:
+            state = self._state_for_signal_locked(name)
+            if state is not None and state.owner_id != owner_id:
+                raise RuntimeError(
+                    f"signal {name!r} is already owned by {state.owner_id!r}"
+                )
+
+    def _install_state_locked(
+        self,
+        *,
+        owner_id: str,
+        kind: str,
+        output_names: tuple[str, ...],
+        bare_names: Mapping[str, str],
+        node: object | None = None,
+        slot: object | None = None,
+        source_name: str | None = None,
+        event_root_name: str | None = None,
+        event_source: SignalEventSource | None = None,
+        route_identity: str | None = None,
+        source_transform: DataTransformSpec | None = None,
+        preserves_event_association: bool = False,
+        association_value_schema: ValueSchema | None = None,
+    ) -> _GenerationState:
+        identity = canonical_text(owner_id, "signal generation owner_id")
+        names = tuple(
+            canonical_text(name, "signal generation output name")
+            for name in output_names
+        )
+        if not names or len(set(names)) != len(names):
+            raise ValueError("signal generation outputs must be non-empty and unique")
+        if identity in self._states:
+            raise RuntimeError("signal generation owner is already active")
+        bare = dict(bare_names)
+        if set(bare) != set(names):
+            raise ValueError("signal generation bare names differ from its outputs")
+        if any(
+            not isinstance(value, str) or not value or value.strip() != value
+            for value in bare.values()
+        ):
+            raise ValueError("signal generation bare names must be canonical text")
+        source_state = None
+        if source_name is not None:
+            source_name = canonical_text(source_name, "signal route source name")
+            source_state = self._state_for_signal_locked(source_name)
+            if source_state is None:
+                raise LookupError(
+                    f"signal route source {source_name!r} is not active"
+                )
+        if event_source is not None and not isinstance(
+            event_source,
+            SignalEventSource,
+        ):
+            raise TypeError("event_source must implement SignalEventSource")
+        if route_identity is not None:
+            route_identity = canonical_text(
+                route_identity,
+                "signal route identity",
+            )
+        if source_transform is not None:
+            if not isinstance(source_transform, DataTransformSpec):
+                raise TypeError("source_transform must be DataTransformSpec")
+            if not source_transform.operations:
+                raise ValueError("empty source_transform must be None")
+        if type(preserves_event_association) is not bool:
+            raise TypeError("preserves_event_association must be bool")
+        if association_value_schema is not None and not isinstance(
+            association_value_schema,
+            ValueSchema,
+        ):
+            raise TypeError("association_value_schema must be ValueSchema")
+        if association_value_schema is not None and not preserves_event_association:
+            raise ValueError(
+                "association_value_schema requires an association-preserving route"
+            )
+        self._assert_names_available_locked(identity, names)
+        state = _GenerationState(
+            owner_id=identity,
+            generation=self._mint_generation_locked(),
+            kind=canonical_text(kind, "signal generation kind"),
+            output_names=names,
+            bare_names=MappingProxyType(bare),
+            node=node,
+            slot=slot,
+            source_name=source_name,
+            source_owner_id=(
+                None if source_state is None else source_state.owner_id
+            ),
+            source_generation=(
+                None if source_state is None else source_state.generation
+            ),
+            event_root_name=event_root_name,
+            event_source=event_source,
+            route_identity=route_identity,
+            source_transform=source_transform,
+            preserves_event_association=preserves_event_association,
+            association_value_schema=association_value_schema,
+        )
+        self._states[identity] = state
+        self._membership_changed = True
+        return state
+
+    @staticmethod
+    def _node_route_names(node: object) -> tuple[
+        tuple[str, ...],
+        Mapping[str, str],
+    ]:
+        producer = _require_signal_producer(node)
+        declarations = _declared_outputs(producer.dataset_output_declarations)
+        qualified = tuple(str(producer.signal_key(name)) for name in declarations)
+        return (
+            qualified,
+            MappingProxyType(
+                {
+                    selected: bare
+                    for selected, bare in zip(
+                        qualified,
+                        declarations,
+                        strict=True,
+                    )
+                }
+            ),
+        )
+
+    def reserve(self, node: object) -> int:
+        """Reserve one producer generation before its worker can publish.
+
+        The composition owner performs this before submitting a run.  A later
+        live attachment upgrades the same state in place; a FINAL-only run uses
+        it directly.  Publication can therefore never recreate a generation
+        after retirement.
+        """
+
+        owner_id = _node_instance_id(node)
+        output_names, bare_names = self._node_route_names(node)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("signal data plane is closed")
+            existing = self._states.get(owner_id)
+            if existing is not None:
+                if (
+                    not existing.retired
+                    and not existing.terminal
+                    and existing.kind == "producer"
+                    and existing.node is node
+                    and existing.output_names == output_names
+                    and dict(existing.bare_names) == dict(bare_names)
+                    and existing.slot is None
+                ):
+                    return existing.generation
+                raise RuntimeError("producer generation is already active")
+            state = self._install_state_locked(
+                owner_id=owner_id,
+                kind="producer",
+                output_names=output_names,
+                bare_names=bare_names,
+                node=node,
+            )
+            return state.generation
+
+    def attach(
+        self,
+        node,
+        slot,
+        *,
+        event_source: SignalEventSource | None = None,
+    ) -> None:
         if slot is None:
             raise ValueError("a monitor slot is required")
         if not callable(getattr(slot, "freeze_live_outputs", None)):
             raise TypeError(
                 "live slot must expose application-owned freeze_live_outputs()"
             )
-        _node_instance_id(node)
-        key = _node_instance_id(node)
-        signal_names = frozenset(_node_declared_signal_names(node))
+        if event_source is not None and not isinstance(
+            event_source,
+            SignalEventSource,
+        ):
+            raise TypeError("event_source must implement SignalEventSource")
+        owner_id = _node_instance_id(node)
+        output_names, bare_names = self._node_route_names(node)
         with self._lock:
             if self._closed:
                 raise RuntimeError("signal data plane is closed")
-            if key in self._slots:
+            state = self._states.get(owner_id)
+            if (
+                state is None
+                or state.retired
+                or state.terminal
+                or state.kind != "producer"
+                or state.node is not node
+                or state.output_names != output_names
+                or dict(state.bare_names) != dict(bare_names)
+                or state.slot is not None
+            ):
                 raise RuntimeError(
-                    "signal producer already owns a run-scoped live route"
+                    "live output requires the producer's reserved generation"
                 )
-            self._slots[key] = (node, slot)
-            self._slot_signal_names[key] = signal_names
-            # The live-output host attaches before the domain binds its materializer.
-            # Only the slot's first real revision marks it dirty; trying to freeze
-            # here would turn the normal ARMED/no-frame-yet state into a false
-            # "no active dataset" failure for externally triggered producers.
-            self._dirty.discard(key)
-            self._cache.pop(key, None)
-            self._failures.pop(key, None)
+            state.slot = slot
+            state.event_source = event_source
             self._membership_changed = True
 
     def mark_changed(self, node) -> None:
-        """Mark one producer dirty from its worker-safe change listener."""
-
-        key = _node_instance_id(node)
+        owner_id = _node_instance_id(node)
         with self._lock:
-            if key in self._slots:
-                self._dirty.add(key)
-                # A passive producer is sampled at its consumer cadence. A
-                # reactive Processor has no polling clock, so its input event
-                # must wake the owner immediately to route that exact revision.
-                signal_names = self._slot_signal_names[key]
-                wake = self._request_owner_wake if any(
-                    name in self._reactive_source_counts
-                    for name in signal_names
-                ) else None
-            else:
-                wake = None
+            state = self._states.get(owner_id)
+            if (
+                state is None
+                or state.retired
+                or state.terminal
+                or state.node is not node
+                or state.slot is None
+            ):
+                return
+            self._dirty.add(owner_id)
+            output_names = frozenset(state.output_names)
+            wake = (
+                self._request_owner_wake
+                if any(
+                    candidate.source_name in output_names
+                    for candidate in self._states.values()
+                    if (
+                        not candidate.retired
+                        and candidate.kind in {"processor", "continuous"}
+                    )
+                )
+                else None
+            )
         if wake is not None:
             wake()
+
+    def latest_publication(self, signal_name: str) -> SignalPublication | None:
+        name = canonical_text(signal_name, "signal name")
+        with self._lock:
+            state = self._state_for_signal_locked(name)
+            return None if state is None else state.publication
+
+    def publication_owner(self, publication: SignalPublication) -> object | None:
+        """Return the exact active generation owner of one issued publication.
+
+        Composition occasionally needs generation-static leaf facts that live
+        on the admitted node (for example Calibration geometry).  Resolving
+        those facts by scanning a current UI row with the same textual owner id
+        can splice an older retained front into a restarted node.  The plane is
+        already the sole generation owner, so it alone may resolve this narrow
+        process-local reference.  No presentation state is stored here.
+        """
+
+        with self._lock:
+            self._require_issued_publication_locked(publication)
+            state = self._states.get(publication.owner_id)
+            if (
+                state is None
+                or state.retired
+                or state.generation != publication.generation
+            ):
+                return None
+            return state.node
 
     def attach_latest_only_processor(
         self,
         node: object,
         *,
         source_name: str,
-        initial_source: SignalValue,
+        initial_publication: SignalPublication,
     ) -> None:
-        """Attach one processor to an explicit already-accepted source revision."""
-
         source_name = canonical_text(source_name, "processor source name")
+        if not isinstance(initial_publication, SignalPublication):
+            raise TypeError("Processor requires an exact SignalPublication")
+        source = initial_publication.value(source_name)
+        if source is None:
+            raise ValueError("Processor publication has no selected signal")
+        owner_id = _node_instance_id(node)
+        output_names, bare_names = self._node_route_names(node)
         with self._lock:
             if self._closed:
                 raise RuntimeError("signal data plane is closed")
-            initial_component = self._source_component_locked(
+            self._require_issued_publication_locked(initial_publication)
+            source_state = self._state_for_signal_locked(source_name)
+            if (
+                source_state is None
+                or source_state.publication is not initial_publication
+            ):
+                raise RuntimeError(
+                    "Processor source is not the exact current publication"
+                )
+            state = self._install_state_locked(
+                owner_id=owner_id,
+                kind="processor",
+                output_names=output_names,
+                bare_names=bare_names,
+                node=node,
+                source_name=source_name,
+            )
+        try:
+            self._lane.attach_processor(
+                node,
                 source_name,
-                initial_source,
+                initial_publication,
             )
-        self._processor_lane.attach(
-            node,
-            source_name,
-            initial_source,
-            initial_component,
-        )
-        with self._lock:
-            key = _node_instance_id(node)
-            self._reactive_processor_sources[key] = source_name
-            self._reactive_source_counts[source_name] = (
-                self._reactive_source_counts.get(source_name, 0) + 1
-            )
-
-    def _source_component_locked(
-        self,
-        source_name: str,
-        source: SignalValue,
-    ) -> _CausalComponent:
-        """Resolve one accepted source to its complete retained transaction."""
-
-        expected = signal_revision_identity(source)
-        candidate = self._candidate_source_components.get(source_name)
-        if candidate is not None:
-            selected = candidate.signals.get(source_name)
-            if (
-                selected is not None
-                and signal_revision_identity(selected) == expected
-            ):
-                return candidate.through_signal(source_name)
-        presented = self._front_source_components.get(source_name)
-        if presented is not None:
-            selected = presented.signals.get(source_name)
-            if (
-                selected is not None
-                and signal_revision_identity(selected) == expected
-            ):
-                return presented.through_signal(source_name)
-        for values in self._cache.values():
-            selected = values.get(source_name)
-            if (
-                selected is not None
-                and signal_revision_identity(selected) == expected
-            ):
-                return _CausalComponent(values).through_signal(source_name)
-        for _node, values in self._finals.values():
-            selected = values.get(source_name)
-            if (
-                selected is not None
-                and signal_revision_identity(selected) == expected
-            ):
-                return _CausalComponent(values).through_signal(source_name)
-        for publication in self._processors.values():
-            component = publication.output_component()
-            selected = component.signals.get(source_name)
-            if (
-                selected is not None
-                and signal_revision_identity(selected) == expected
-            ):
-                return component.through_signal(source_name)
-        for publication in self._derived.values():
-            component = publication.output_component()
-            selected = component.signals.get(source_name)
-            if (
-                selected is not None
-                and signal_revision_identity(selected) == expected
-            ):
-                return component.through_signal(source_name)
-        raise RuntimeError(
-            "derived signal source has no retained producer transaction"
-        )
-
-    def candidate_value(self, source_name: str) -> SignalValue | None:
-        """Return the newest admitted value for background derived work.
-
-        This value is not a consumer-visible coherence claim.  It may be newer than
-        :meth:`freeze` while an active causal descendant is still pending.
-        """
-
-        name = canonical_text(source_name, "candidate signal name")
-        with self._lock:
-            return self._candidate_front.value(name)
-
-    def capture_source_component(
-        self,
-        source: SignalValue,
-    ) -> object:
-        """Freeze the exact causal ancestry carried by one worker request."""
-
-        if not isinstance(source, SignalValue):
-            raise TypeError("causal source capture requires SignalValue")
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("signal data plane is closed")
-            return self._source_component_locked(source.name, source)
+        except BaseException:
+            with self._lock:
+                if self._states.get(owner_id) is state:
+                    self._states.pop(owner_id, None)
+                    self._membership_changed = True
+            raise
 
     def cancel_latest_only_processor(self, node: object) -> bool:
-        """Stop routing new revisions to one processor."""
-
-        idle = self._processor_lane.cancel(node)
-        with self._lock:
-            self._remove_reactive_processor_locked(_node_instance_id(node))
+        idle = self._lane.cancel_processor(node)
         self.withdraw_processor(node)
         return idle
 
-    def drain_latest_only_processors(self) -> None:
-        """Admit completed shared-lane work on the host owner thread."""
-
-        self._processor_lane.drain()
+    def bind_processor_event_source(
+        self,
+        node: object,
+        event_source: SignalEventSource,
+    ) -> None:
+        if not isinstance(event_source, SignalEventSource):
+            raise TypeError("event_source must implement SignalEventSource")
+        owner_id = _node_instance_id(node)
+        with self._lock:
+            state = self._states.get(owner_id)
+            if (
+                state is None
+                or state.retired
+                or state.kind != "processor"
+                or state.node is not node
+            ):
+                raise RuntimeError("Processor generation is no longer active")
+            if state.publication is not None:
+                raise RuntimeError(
+                    "Processor event source must be bound before first publication"
+                )
+            if state.event_source is not None:
+                raise RuntimeError("Processor event source is already bound")
+            state.event_source = event_source
 
     def withdraw_processor(self, node: object) -> None:
-        """Withdraw a stopped Processor's transient publication."""
+        self._withdraw_owner(_node_instance_id(node))
 
-        key = _node_instance_id(node)
-        with self._lock:
-            if self._processors.pop(key, None) is not None:
-                self._membership_changed = True
-
-    def _remove_reactive_processor_locked(self, key: str) -> None:
-        source_name = self._reactive_processor_sources.pop(key, None)
-        if source_name is None:
-            return
-        remaining = self._reactive_source_counts[source_name] - 1
-        if remaining:
-            self._reactive_source_counts[source_name] = remaining
-        else:
-            del self._reactive_source_counts[source_name]
-
-    def prepare_final(
+    def _require_issued_publication_locked(
         self,
-        node,
-        projected: Mapping[str, FinalDatasetOutput],
-    ) -> _PreparedFinalPublication:
-        """Validate one successful Run's FINAL datasets without publishing.
+        publication: SignalPublication,
+    ) -> None:
+        if not isinstance(publication, SignalPublication):
+            raise TypeError("signal parent must be SignalPublication")
+        if publication._issuer is not self._publication_issuer:
+            raise ValueError("signal publication was not issued by this data plane")
 
-        ``projected`` is keyed by the catalog's bare output names.  The data
-        plane qualifies them with the exact producer instance just like a live
-        slot; it never invents an output that the node did not declare.  A
-        composition root may prepare matching frontend sidecars before it
-        commits either half of that output fact.
-        """
-
-        if not isinstance(projected, Mapping):
-            raise TypeError("projected FINAL signals must be a mapping")
-        _node_instance_id(node)
-        declarations = _require_signal_producer(node).dataset_output_declarations
-        declared = _declared_outputs(declarations)
-        output_names = tuple(projected)
-        if any(
-            not isinstance(name, str) or not name or name.strip() != name
-            for name in output_names
+    def _require_route_parent_locked(
+        self,
+        state: _GenerationState,
+        publication: SignalPublication,
+        *,
+        exact_bound: bool = False,
+    ) -> SignalValue:
+        self._require_issued_publication_locked(publication)
+        source_name = state.source_name
+        if source_name is None:
+            raise RuntimeError("derived generation has no frozen source")
+        if (
+            publication.owner_id != state.source_owner_id
+            or publication.generation != state.source_generation
         ):
-            raise ValueError("FINAL output keys must be canonical text")
-        actual = set(output_names)
-        if not actual:
-            raise ValueError("FINAL output owner must return a non-empty mapping")
-        if not actual.issubset(declared):
+            raise ValueError("signal parent belongs to another source generation")
+        source = publication.value(source_name)
+        if source is None:
+            raise ValueError("signal parent lacks the frozen route source")
+        if exact_bound and publication is not state.bound_parent:
+            raise ValueError("event result publication differs from its bound parent")
+        return source
+
+    def _validate_generation_values_locked(
+        self,
+        state: _GenerationState,
+        values: Mapping[str, SignalValue],
+        *,
+        terminal: bool,
+    ) -> None:
+        names = tuple(values)
+        if not names or not set(names).issubset(state.output_names):
             raise ValueError(
-                "FINAL output owner published an output absent from the "
-                "producer vocabulary: "
-                f"declared={tuple(sorted(declared))}, "
-                f"unknown={tuple(sorted(actual - set(declared)))}"
+                "signal publication is outside its declared output vocabulary"
             )
-        owner_id = _node_instance_id(node)
+        canonical_names = tuple(
+            name for name in state.output_names if name in values
+        )
+        if not terminal:
+            if state.published_names is None:
+                state.published_names = canonical_names
+            elif state.published_names != canonical_names:
+                raise ValueError(
+                    "live sibling bundle changed inside one generation"
+                )
+        schemas = {
+            name: values[name].snapshot.ref.schema_fingerprint
+            for name in canonical_names
+        }
+        prior = {} if state.schema_fingerprints is None else dict(
+            state.schema_fingerprints
+        )
+        for name, fingerprint in schemas.items():
+            if name in prior and prior[name] != fingerprint:
+                raise ValueError(
+                    "signal publication schema changed inside one generation"
+                )
+            prior[name] = fingerprint
+        state.schema_fingerprints = MappingProxyType(prior)
+
+    def _publish_locked(
+        self,
+        state: _GenerationState,
+        values: Mapping[str, SignalValue],
+        *,
+        parents: tuple[SignalPublication, ...] = (),
+        terminal: bool = False,
+    ) -> SignalPublication:
+        if state.retired or self._states.get(state.owner_id) is not state:
+            raise RuntimeError("signal generation is no longer active")
+        if state.terminal:
+            raise RuntimeError("signal generation has already published terminal")
+        if len(parents) > 1:
+            raise ValueError("current signal routes accept at most one exact parent")
+        for parent in parents:
+            self._require_issued_publication_locked(parent)
+        frozen = MappingProxyType(
+            {
+                name: values[name]
+                for name in state.output_names
+                if name in values
+            }
+        )
+        self._validate_generation_values_locked(
+            state,
+            frozen,
+            terminal=terminal,
+        )
+        publication = SignalPublication(
+            owner_id=state.owner_id,
+            generation=state.generation,
+            sequence=state.next_sequence,
+            signals=frozen,
+            _issuer=self._publication_issuer,
+            parents=parents,
+        )
+        state.next_sequence += 1
+        state.publication = publication
+        state.failure = None
+        state.terminal = terminal
+        if terminal:
+            self._dirty.discard(state.owner_id)
+        self._membership_changed = True
+        return publication
+
+    @staticmethod
+    def _run_id_for_final(node: object) -> str:
         handle = getattr(node, "handle", None)
         run_id_value = getattr(handle, "run_id", None)
         run_id = getattr(run_id_value, "value", run_id_value)
@@ -1172,115 +1234,112 @@ class SignalDataPlane:
             raise ValueError(
                 "a successful FINAL publication must retain its RunHandle RunId"
             )
-        frozen: dict[str, SignalValue] = {}
-        for output_name, value in projected.items():
-            if not isinstance(value, FinalDatasetOutput):
-                raise TypeError(
-                    "FINAL values must be FinalDatasetOutput"
-                )
-            output = value
-            _require_published_declaration(
-                str(output_name),
-                output,
-                declared,
-            )
-            key = node.signal_key(output.name)
-            snapshot = output.snapshot
-            frozen[key] = SignalValue(
-                name=key,
-                source_instance_id=owner_id,
-                snapshot=snapshot,
-                coverage=None,
-                run_id=run_id,
-                epoch_id=snapshot.ref.stream_generation.value,
-                join_digest=output.join_digest,
-                transient=False,
-            )
-        key = _node_instance_id(node)
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("signal data plane is closed")
-        return _PreparedFinalPublication(key, node, frozen)
-
-    def commit_prepared_final(
-        self,
-        prepared: _PreparedFinalPublication,
-    ) -> Mapping[str, SignalValue]:
-        """Install an already-valid FINAL replacement with no projection work."""
-
-        if not isinstance(prepared, _PreparedFinalPublication):
-            raise TypeError("prepared FINAL publication must come from this plane")
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("signal data plane is closed")
-            self._finals[prepared.owner_id] = (
-                prepared.node,
-                dict(prepared.values),
-            )
-            self._membership_changed = True
-        return prepared.values
+        return run_id
 
     def publish_final(
         self,
         node,
         projected: Mapping[str, FinalDatasetOutput],
     ) -> Mapping[str, SignalValue]:
-        """Validate and publish one successful Run's FINAL datasets."""
-
-        return self.commit_prepared_final(
-            self.prepare_final(node, projected)
+        if not isinstance(projected, Mapping):
+            raise TypeError("projected FINAL signals must be a mapping")
+        owner_id = _node_instance_id(node)
+        output_names, bare_names = self._node_route_names(node)
+        declared = _declared_outputs(
+            _require_signal_producer(node).dataset_output_declarations
         )
+        if not projected or not set(projected).issubset(declared):
+            raise ValueError(
+                "FINAL publication must be a non-empty declared output subset"
+            )
+        run_id = self._run_id_for_final(node)
+        values: dict[str, SignalValue] = {}
+        by_bare = {bare: qualified for qualified, bare in bare_names.items()}
+        for bare in declared:
+            if bare not in projected:
+                continue
+            output = projected[bare]
+            if not isinstance(output, FinalDatasetOutput):
+                raise TypeError("FINAL values must be FinalDatasetOutput")
+            _require_published_declaration(bare, output, declared)
+            qualified = by_bare[bare]
+            values[qualified] = SignalValue(
+                name=qualified,
+                source_instance_id=owner_id,
+                snapshot=output.snapshot,
+                coverage=None,
+                run_id=run_id,
+                epoch_id=output.snapshot.ref.stream_generation.value,
+                join_digest=output.join_digest,
+                transient=False,
+            )
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("signal data plane is closed")
+            state = self._states.get(owner_id)
+            if (
+                state is None
+                or state.retired
+                or state.node is not node
+                or state.kind != "producer"
+                or state.output_names != output_names
+                or dict(state.bare_names) != dict(bare_names)
+            ):
+                raise RuntimeError("FINAL owner differs from its active generation")
+            publication = self._publish_locked(
+                state,
+                values,
+                terminal=True,
+            )
+        return publication.signals
 
     def publish_processor(
         self,
         node,
         outputs: Mapping[str, LiveDatasetOutput],
         *,
-        source: SignalValue,
+        source_publication: SignalPublication,
     ) -> Mapping[str, SignalValue]:
-        """Namespace one Processor-owned typed output transaction.
-
-        The Processor owns bare names, Datasets, coverage, and join identity.
-        The plane validates the frozen declaration and qualifies routing names;
-        a presentation host may keep a separate sidecar keyed by the returned
-        immutable values.
-        """
-
         if not isinstance(outputs, Mapping):
             raise TypeError("processor outputs must be a mapping")
-        if not isinstance(source, SignalValue):
-            raise TypeError("processor source must be SignalValue")
-        _node_instance_id(node)
-        declarations = _require_signal_producer(node).dataset_output_declarations
-        declared = _declared_outputs(declarations)
-        output_names = tuple(outputs)
-        if any(
-            not isinstance(name, str) or not name or name.strip() != name
-            for name in output_names
-        ):
-            raise ValueError("processor output keys must be canonical text")
-        actual = set(output_names)
-        if not actual:
-            raise ValueError("processor output owner must return a non-empty mapping")
-        expected_outputs = set(declared)
-        if actual != expected_outputs:
-            raise ValueError(
-                "Processor publication must cover its complete frozen output "
-                f"vocabulary: missing={tuple(sorted(expected_outputs - actual))}, "
-                f"unknown={tuple(sorted(actual - expected_outputs))}"
-            )
+        if not isinstance(source_publication, SignalPublication):
+            raise TypeError("Processor publication requires its exact parent")
         owner_id = _node_instance_id(node)
-        frozen: dict[str, SignalValue] = {}
-        for output_name in outputs:
-            output = outputs[output_name]
+        declared = _declared_outputs(
+            _require_signal_producer(node).dataset_output_declarations
+        )
+        if set(outputs) != set(declared):
+            raise ValueError(
+                "Processor publication must cover its complete frozen output vocabulary"
+            )
+        with self._lock:
+            state = self._states.get(owner_id)
+            if (
+                state is None
+                or state.retired
+                or state.kind != "processor"
+                or state.node is not node
+            ):
+                raise RuntimeError("Processor generation is no longer active")
+            self._require_route_parent_locked(state, source_publication)
+            if source_publication.sequence <= state.last_parent_sequence:
+                raise RuntimeError("Processor result belongs to an obsolete parent")
+            source_name = state.source_name
+            bare_names = dict(state.bare_names)
+        assert source_name is not None
+        source = source_publication.value(source_name)
+        if source is None:
+            raise ValueError("Processor parent lacks its selected signal")
+        by_bare = {bare: qualified for qualified, bare in bare_names.items()}
+        values: dict[str, SignalValue] = {}
+        for bare in declared:
+            output = outputs[bare]
             if not isinstance(output, LiveDatasetOutput):
-                raise TypeError(
-                    "processor outputs must contain LiveDatasetOutput"
-                )
-            _require_published_declaration(output_name, output, declared)
-            selected = node.signal_key(output_name)
-            frozen[selected] = SignalValue(
-                name=selected,
+                raise TypeError("processor outputs must be LiveDatasetOutput")
+            _require_published_declaration(bare, output, declared)
+            qualified = by_bare[bare]
+            values[qualified] = SignalValue(
+                name=qualified,
                 source_instance_id=owner_id,
                 snapshot=output.snapshot,
                 coverage=output.coverage,
@@ -1289,64 +1348,229 @@ class SignalDataPlane:
                 join_digest=output.join_digest,
                 transient=True,
             )
-        source_component = self._processor_lane.source_component_for_publication(
-            node,
-            source,
+        with self._lock:
+            if self._states.get(owner_id) is not state or state.retired:
+                raise RuntimeError("Processor generation retired during publication")
+            self._require_route_parent_locked(state, source_publication)
+            if source_publication.sequence <= state.last_parent_sequence:
+                raise RuntimeError("Processor result belongs to an obsolete parent")
+            publication = self._publish_locked(
+                state,
+                values,
+                parents=(source_publication,),
+            )
+            state.last_parent_sequence = source_publication.sequence
+        return publication.signals
+
+    def _route_binding_locked(
+        self,
+        signal_name: str,
+    ) -> tuple[str, DataTransformSpec | None]:
+        state = self._state_for_signal_locked(signal_name)
+        if state is None:
+            raise LookupError(f"signal {signal_name!r} is not active")
+        if state.kind != "continuous":
+            return signal_name, None
+        if (
+            not state.preserves_event_association
+            or state.event_root_name is None
+        ):
+            raise TypeError(
+                f"signal {signal_name!r} has no event-local association route"
+            )
+        return state.event_root_name, state.source_transform
+
+    def signal_event_binding(
+        self,
+        signal_name: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> tuple[SignalEventSource, str, DataTransformSpec | None]:
+        name = canonical_text(signal_name, "signal event route name")
+        if expected_generation is not None and (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation < 1
+        ):
+            raise ValueError("expected_generation must be a positive int")
+        with self._lock:
+            selected = self._state_for_signal_locked(name)
+            if selected is None or selected.retired:
+                raise LookupError(f"signal {name!r} is not active")
+            if (
+                expected_generation is not None
+                and selected.generation != expected_generation
+            ):
+                raise RuntimeError("signal generation changed before event binding")
+            root_name, transform = self._route_binding_locked(name)
+            root = self._state_for_signal_locked(root_name)
+            if (
+                root is None
+                or root.retired
+                or root.kind not in {"producer", "processor"}
+            ):
+                raise TypeError("signal route root has no live event owner")
+            source = root.event_source
+            if source is None:
+                raise TypeError("signal route root has no frozen SignalEventSource")
+            return source, root.bare_names[root_name], transform
+
+    def signal_route_source(
+        self,
+        signal_name: str,
+    ) -> tuple[str, DataTransformSpec | None]:
+        """Return the frozen qualified root and transform of a formal route."""
+
+        name = canonical_text(signal_name, "signal route name")
+        with self._lock:
+            return self._route_binding_locked(name)
+
+    def has_event_association(self, signal_name: str) -> bool:
+        try:
+            source, output_name, transform = self.signal_event_binding(signal_name)
+            projected = authoritative_signal_event_source(
+                source,
+                output_name,
+                transform,
+            )
+        except (KeyError, LookupError, RuntimeError, TypeError, ValueError):
+            return False
+        return isinstance(projected, SignalEventAssociationSource)
+
+    def bind_continuous_derived(
+        self,
+        owner_id: str,
+        *,
+        source_name: str,
+        output_names,
+        route_identity: str,
+        source_transform: DataTransformSpec | None = None,
+        preserves_event_association: bool = False,
+    ) -> int:
+        identity = canonical_text(owner_id, "derived route owner_id")
+        source_name = canonical_text(source_name, "derived route source name")
+        names = tuple(
+            canonical_text(name, "derived route output name")
+            for name in output_names
         )
-        key = _node_instance_id(node)
-        edge = _CausalEdge(
-            owner_key=f"processor:{_node_instance_id(node)}",
-            source_name=source.name,
-            source_identity=signal_revision_identity(source),
-            outputs=frozen,
-        )
+        route_identity = canonical_text(route_identity, "derived route identity")
         with self._lock:
             if self._closed:
                 raise RuntimeError("signal data plane is closed")
-            self._processors[key] = _CausalPublication(
-                edge=edge,
-                source_component=source_component,
+            source_state = self._state_for_signal_locked(source_name)
+            if source_state is None:
+                raise RuntimeError("derived route source generation is not active")
+            event_root_name = None
+            cumulative = None
+            association_value_schema = None
+            if preserves_event_association:
+                if len(names) != 1:
+                    raise ValueError(
+                        "association-preserving route requires exactly one output"
+                    )
+                root_name, prior = self._route_binding_locked(source_name)
+                operations = () if prior is None else prior.operations
+                if source_transform is not None:
+                    operations = (*operations, *source_transform.operations)
+                cumulative = (
+                    DataTransformSpec(tuple(operations)) if operations else None
+                )
+                event_root_name = root_name
+                root = self._state_for_signal_locked(root_name)
+                if (
+                    root is None
+                    or root.retired
+                    or root.event_source is None
+                ):
+                    raise TypeError(
+                        "association-preserving route has no frozen event source"
+                    )
+                root_output_name = root.bare_names[root_name]
+                projected = authoritative_signal_event_source(
+                    root.event_source,
+                    root_output_name,
+                    cumulative,
+                )
+                if not isinstance(projected, SignalEventAssociationSource):
+                    raise TypeError(
+                        "derived route source has no formal association capability"
+                    )
+                association_value_schema = projected.value_schema(root_output_name)
+                if not isinstance(association_value_schema, ValueSchema):
+                    raise TypeError(
+                        "associated event source returned another schema type"
+                    )
+            existing = self._states.get(identity)
+            if existing is not None and not existing.retired:
+                same = (
+                    existing.kind == "continuous"
+                    and existing.source_name == source_name
+                    and existing.output_names == names
+                    and existing.route_identity == route_identity
+                    and existing.event_root_name == event_root_name
+                    and existing.source_transform == cumulative
+                    and existing.preserves_event_association
+                    == preserves_event_association
+                    and existing.association_value_schema
+                    == association_value_schema
+                )
+                if same:
+                    return existing.generation
+                raise RuntimeError(
+                    "derived route configuration changed; withdraw it before rebinding"
+                )
+            state = self._install_state_locked(
+                owner_id=identity,
+                kind="continuous",
+                output_names=names,
+                bare_names={name: name for name in names},
+                source_name=source_name,
+                event_root_name=event_root_name,
+                route_identity=route_identity,
+                source_transform=cumulative,
+                preserves_event_association=preserves_event_association,
+                association_value_schema=association_value_schema,
             )
-            self._membership_changed = True
-        return MappingProxyType(dict(frozen))
+            return state.generation
 
-    def prepare_derived(
-        self,
-        owner_id: str,
-        source: SignalValue,
+    @staticmethod
+    def _derived_values(
+        state: _GenerationState,
+        source_publication: SignalPublication,
         values: Mapping[str, DerivedSignalOutput],
         *,
-        source_component: object | None = None,
-    ) -> _PreparedDerivedPublication:
-        """Validate one complete derived replacement without publishing it.
-
-        The application composition root owns the route names.  This method
-        sees no presentation-layer type.  Separating preparation from the
-        no-fail replacement lets that root prepare matching frontend sidecars
-        before either owner exposes half of the cross-layer fact.
-        """
-
+        transient: bool,
+    ) -> Mapping[str, SignalValue]:
         from zlc_neutral_atom.processing.causal import derive_dataset_event_digest
 
-        identity = canonical_text(owner_id, "derived signal owner_id")
-        if not identity:
-            raise ValueError("owner_id must not be empty")
-        if not isinstance(values, Mapping):
-            raise TypeError("derived values must be a mapping")
-        if not isinstance(source, SignalValue):
-            raise TypeError("derived source must be SignalValue")
-        if not values:
-            raise ValueError("use withdraw_derived() to remove derived outputs")
-        frozen: dict[str, SignalValue] = {}
-        for name, value in values.items():
-            name = canonical_text(name, "qualified derived signal name")
+        source_name = state.source_name
+        if source_name is None:
+            raise RuntimeError("derived generation has no source")
+        source = source_publication.value(source_name)
+        if source is None:
+            raise ValueError("derived parent lacks its selected signal")
+        if set(values) != set(state.output_names):
+            raise ValueError(
+                "derived publication differs from its frozen sibling vocabulary"
+            )
+        result = {}
+        for name in state.output_names:
+            value = values[name]
             if not isinstance(value, DerivedSignalOutput):
                 raise TypeError("derived values must contain DerivedSignalOutput")
-            if value.source_ref != getattr(source.snapshot, "ref", None):
+            if value.source_ref != source.snapshot.ref:
                 raise ValueError("derived output belongs to another source revision")
-            frozen[name] = SignalValue(
+            expected_schema = state.association_value_schema
+            if (
+                expected_schema is not None
+                and value.snapshot.block.schema.cell_schema != expected_schema
+            ):
+                raise ValueError(
+                    "derived output schema differs from its formal event projection"
+                )
+            result[name] = SignalValue(
                 name=name,
-                source_instance_id=identity,
+                source_instance_id=state.owner_id,
                 snapshot=value.snapshot,
                 coverage=(
                     source.coverage if value.preserve_source_coverage else None
@@ -1357,600 +1581,314 @@ class SignalDataPlane:
                     source.join_digest,
                     value.derivation_digest,
                 ),
-                transient=False,
-                source_transform=value.source_transform,
+                transient=transient,
             )
-        edge = _CausalEdge(
-            owner_key=f"derived:{identity}",
-            source_name=source.name,
-            source_identity=signal_revision_identity(source),
-            outputs=frozen,
-        )
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("signal data plane is closed")
-            component = (
-                self._source_component_locked(source.name, source)
-                if source_component is None
-                else source_component
-            )
-            if not isinstance(component, _CausalComponent):
-                raise TypeError("derived source_component has another type")
-            selected_source = component.signals.get(source.name)
-            if (
-                selected_source is None
-                or signal_revision_identity(selected_source)
-                != signal_revision_identity(source)
-            ):
-                raise ValueError("derived source_component belongs to another revision")
-            component = component.through_signal(source.name)
-            publication = _CausalPublication(
-                edge=edge,
-                source_component=component,
-            )
-        return _PreparedDerivedPublication(identity, publication, frozen)
+        return MappingProxyType(result)
 
-    def prepare_derived_withdrawal(
+    def publish_continuous_derived(
         self,
         owner_id: str,
-    ) -> _PreparedDerivedPublication:
-        """Prepare removal of one composition attachment's complete output set."""
-
-        identity = canonical_text(owner_id, "derived signal owner_id")
-        if not identity:
-            raise ValueError("owner_id must not be empty")
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("signal data plane is closed")
-        return _PreparedDerivedPublication(identity, None, {})
-
-    def commit_prepared_derived(
-        self,
-        prepared: _PreparedDerivedPublication,
-    ) -> Mapping[str, SignalValue]:
-        """Commit one already-valid replacement with no domain/schema work."""
-
-        if not isinstance(prepared, _PreparedDerivedPublication):
-            raise TypeError("prepared must come from this signal data plane")
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("signal data plane is closed")
-            if prepared.publication is None:
-                if self._derived.pop(prepared.owner_id, None) is not None:
-                    self._membership_changed = True
-            else:
-                self._derived[prepared.owner_id] = prepared.publication
-                self._membership_changed = True
-        return prepared.values
-
-    def publish_derived(
-        self,
-        owner_id: str,
-        source: SignalValue,
+        generation: int,
+        source_publication: SignalPublication,
         values: Mapping[str, DerivedSignalOutput],
-        *,
-        source_component: object | None = None,
-    ) -> Mapping[str, SignalValue]:
-        """Validate and publish one complete derived transaction."""
-
-        prepared = self.prepare_derived(
-            owner_id,
-            source,
+    ) -> bool:
+        identity = canonical_text(owner_id, "derived route owner_id")
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise ValueError("derived generation must be a positive int")
+        if not isinstance(source_publication, SignalPublication):
+            raise TypeError("derived result requires its exact parent publication")
+        with self._lock:
+            state = self._states.get(identity)
+            if (
+                state is None
+                or state.retired
+                or state.generation != generation
+                or state.kind != "continuous"
+            ):
+                return False
+            self._require_route_parent_locked(state, source_publication)
+            if source_publication.sequence <= state.last_parent_sequence:
+                return False
+        frozen = self._derived_values(
+            state,
+            source_publication,
             values,
-            source_component=source_component,
+            transient=True,
         )
-        return self.commit_prepared_derived(prepared)
+        with self._lock:
+            if (
+                self._states.get(identity) is not state
+                or state.retired
+                or state.generation != generation
+            ):
+                return False
+            self._require_route_parent_locked(state, source_publication)
+            if source_publication.sequence <= state.last_parent_sequence:
+                return False
+            self._publish_locked(
+                state,
+                frozen,
+                parents=(source_publication,),
+            )
+            state.last_parent_sequence = source_publication.sequence
+            return True
+
+    def fail_continuous_derived(
+        self,
+        owner_id: str,
+        generation: int,
+        source_publication: SignalPublication,
+        error: Exception,
+    ) -> bool:
+        identity = canonical_text(owner_id, "derived route owner_id")
+        if not isinstance(source_publication, SignalPublication):
+            raise TypeError("derived failure requires its exact parent publication")
+        if not isinstance(error, Exception):
+            raise TypeError("derived failure must be an Exception")
+        with self._lock:
+            state = self._states.get(identity)
+            if (
+                state is None
+                or state.retired
+                or state.generation != generation
+                or state.kind != "continuous"
+            ):
+                return False
+            self._require_route_parent_locked(state, source_publication)
+            if source_publication.sequence <= state.last_parent_sequence:
+                return False
+            state.last_parent_sequence = source_publication.sequence
+            state.failure = f"{type(error).__name__}: {error}"
+            self._membership_changed = True
+            return True
+
+    def continuous_needs_publication(
+        self,
+        owner_id: str,
+        generation: int,
+        source_publication: SignalPublication,
+    ) -> bool:
+        """Whether one active route has not published this exact parent yet."""
+
+        identity = canonical_text(owner_id, "derived route owner_id")
+        if not isinstance(source_publication, SignalPublication):
+            raise TypeError("derived route parent must be SignalPublication")
+        with self._lock:
+            state = self._states.get(identity)
+            if (
+                state is None
+                or state.retired
+                or state.kind != "continuous"
+                or state.generation != generation
+            ):
+                return False
+            self._require_route_parent_locked(state, source_publication)
+            return source_publication.sequence > state.last_parent_sequence
+
+    def bind_event_derived(
+        self,
+        owner_id: str,
+        *,
+        source_name: str,
+        source_publication: SignalPublication,
+        output_names,
+    ) -> int:
+        identity = canonical_text(owner_id, "event result owner_id")
+        source_name = canonical_text(source_name, "event result source name")
+        names = tuple(
+            canonical_text(name, "event result output name")
+            for name in output_names
+        )
+        if not isinstance(source_publication, SignalPublication):
+            raise TypeError("event result binding requires its exact parent")
+        if source_publication.value(source_name) is None:
+            raise ValueError("event result parent lacks its selected signal")
+        self._withdraw_owner(identity)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("signal data plane is closed")
+            self._require_issued_publication_locked(source_publication)
+            source_state = self._state_for_signal_locked(source_name)
+            if (
+                source_state is None
+                or source_state.publication is None
+                or source_state.owner_id != source_publication.owner_id
+                or source_state.generation != source_publication.generation
+            ):
+                raise RuntimeError("event result source has no exact publication")
+            state = self._install_state_locked(
+                owner_id=identity,
+                kind="event",
+                output_names=names,
+                bare_names={name: name for name in names},
+                source_name=source_name,
+            )
+            state.bound_parent = source_publication
+            return state.generation
+
+    def publish_event_derived(
+        self,
+        owner_id: str,
+        generation: int,
+        source_publication: SignalPublication,
+        values: Mapping[str, DerivedSignalOutput],
+    ) -> Mapping[str, SignalValue] | None:
+        identity = canonical_text(owner_id, "event result owner_id")
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise ValueError("event result generation must be a positive int")
+        if not isinstance(source_publication, SignalPublication):
+            raise TypeError("event result requires its exact parent publication")
+        with self._lock:
+            state = self._states.get(identity)
+            if (
+                state is None
+                or state.retired
+                or state.generation != generation
+                or state.kind != "event"
+            ):
+                return None
+            source_name = state.source_name
+            self._require_route_parent_locked(
+                state,
+                source_publication,
+                exact_bound=True,
+            )
+        if source_name is None:
+            raise RuntimeError("event result generation lost its source")
+        frozen = self._derived_values(
+            state,
+            source_publication,
+            values,
+            transient=True,
+        )
+        with self._lock:
+            if (
+                self._states.get(identity) is not state
+                or state.retired
+                or state.generation != generation
+            ):
+                return None
+            self._require_route_parent_locked(
+                state,
+                source_publication,
+                exact_bound=True,
+            )
+            publication = self._publish_locked(
+                state,
+                frozen,
+                parents=(source_publication,),
+                terminal=True,
+            )
+        return publication.signals
 
     def withdraw_derived(self, owner_id: str) -> None:
-        """Remove every derived signal owned by one composition attachment."""
-
-        self.commit_prepared_derived(
-            self.prepare_derived_withdrawal(owner_id)
+        self._withdraw_owner(
+            canonical_text(owner_id, "derived signal owner_id")
         )
 
-    def prepare_retirement(self, node: object) -> _PreparedSignalRetirement:
-        """Freeze one producer generation's transitive causal retirement.
-
-        Removing only the producer slot is insufficient: every retained
-        Processor/Figure publication carries the exact source component it
-        evaluated, and coherence would otherwise re-introduce that component
-        into the next front.  This preparation computes the whole descendant
-        closure once so the composition root can stage matching presentation
-        withdrawals before either owner changes.
-        """
-
-        key = _node_instance_id(node)
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("signal data plane is closed")
-            slot_entry = self._slots.get(key)
-            if slot_entry is not None and slot_entry[0] is not node:
-                raise RuntimeError("signal owner id belongs to another generation")
-            final_entry = self._finals.get(key)
-            if final_entry is not None and final_entry[0] is not node:
-                raise RuntimeError("FINAL owner id belongs to another generation")
-            signal_names = set(_node_declared_signal_names(node))
-            signal_names.update(self._slot_signal_names.get(key, ()))
-            signal_names.update(self._cache.get(key, ()))
-            if final_entry is not None:
-                signal_names.update(final_entry[1])
-            processors = dict(self._processors)
-            derived = dict(self._derived)
-        active_processors = tuple(self._processor_lane.active_bindings())
-        retired_processors: dict[str, _CausalPublication] = {}
-        retired_derived: dict[str, _CausalPublication] = {}
-        dependent_processors: dict[str, object] = {}
-
+    def _retirement_closure_locked(
+        self,
+        root_owner_id: str,
+    ) -> tuple[_GenerationState, ...]:
+        root = self._states.get(root_owner_id)
+        if root is None or root.retired:
+            return ()
+        selected = {root.owner_id}
+        retired_names = set(root.output_names)
         changed = True
         while changed:
             changed = False
-            for processor_node, source_name in active_processors:
-                processor_key = _node_instance_id(processor_node)
-                if (
-                    processor_key != key
-                    and source_name in signal_names
-                    and processor_key not in dependent_processors
-                ):
-                    dependent_processors[processor_key] = processor_node
-                    before = len(signal_names)
-                    signal_names.update(
-                        _node_declared_signal_names(processor_node)
-                    )
-                    changed = changed or len(signal_names) != before
-            for publication_key, publication in processors.items():
-                if publication_key in retired_processors:
+            for state in self._states.values():
+                if state.retired or state.owner_id in selected:
                     continue
-                ancestry = publication.source_component.signals
-                if (
-                    publication_key == key
-                    or publication.edge.source_name in signal_names
-                    or not signal_names.isdisjoint(ancestry)
-                ):
-                    retired_processors[publication_key] = publication
-                    signal_names.update(publication.edge.outputs)
+                if state.source_name in retired_names:
+                    selected.add(state.owner_id)
+                    retired_names.update(state.output_names)
                     changed = True
-            for publication_key, publication in derived.items():
-                if publication_key in retired_derived:
-                    continue
-                ancestry = publication.source_component.signals
-                if (
-                    publication.edge.source_name in signal_names
-                    or not signal_names.isdisjoint(ancestry)
-                ):
-                    retired_derived[publication_key] = publication
-                    signal_names.update(publication.edge.outputs)
-                    changed = True
-
-        return _PreparedSignalRetirement(
-            node=node,
-            owner_id=key,
-            retired_signal_names=frozenset(signal_names),
-            processor_publications=retired_processors,
-            derived_publications=retired_derived,
-            dependent_processors=tuple(dependent_processors.values()),
+        states = tuple(
+            self._states[owner_id]
+            for owner_id in tuple(self._states)
+            if owner_id in selected
         )
+        for state in states:
+            state.retired = True
+            state.publication = None
+            state.failure = None
+            self._dirty.discard(state.owner_id)
+        self._membership_changed = True
+        return states
 
-    def commit_prepared_retirement(
-        self,
-        prepared: _PreparedSignalRetirement,
-    ) -> None:
-        """Retire an already-validated producer and every causal descendant."""
-
-        if not isinstance(prepared, _PreparedSignalRetirement):
-            raise TypeError("prepared retirement must come from this data plane")
-        key = prepared.owner_id
+    def _withdraw_owner(self, owner_id: str) -> frozenset[str]:
         with self._lock:
-            if self._closed:
-                raise RuntimeError("signal data plane is closed")
-            slot_entry = self._slots.get(key)
-            if slot_entry is not None and slot_entry[0] is not prepared.node:
-                raise RuntimeError("prepared retirement is stale")
-            final_entry = self._finals.get(key)
-            if final_entry is not None and final_entry[0] is not prepared.node:
-                raise RuntimeError("prepared FINAL retirement is stale")
-            for publication_key, publication in prepared.processor_publications.items():
-                if self._processors.get(publication_key) is not publication:
-                    raise RuntimeError("prepared Processor retirement is stale")
-            for publication_key, publication in prepared.derived_publications.items():
-                if self._derived.get(publication_key) is not publication:
-                    raise RuntimeError("prepared derived retirement is stale")
+            states = self._retirement_closure_locked(owner_id)
+            for state in states:
+                self._states.pop(state.owner_id, None)
+        retired_names = frozenset(
+            name for state in states for name in state.output_names
+        )
+        slots = []
+        for state in states:
+            if state.kind == "processor" and state.node is not None:
+                self._lane.cancel_processor(state.node)
+                self._lane.detach_processor(state.node)
+            if state.slot is not None:
+                slots.append(state.slot)
+        errors = []
+        for slot in slots:
+            try:
+                slot.close()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise ExceptionGroup("signal generation cleanup failed", errors)
+        return retired_names
 
-        # All exact-generation checks complete before the lane is mutated.
-        # From here onward every operation is an idempotent owner replacement;
-        # no stale prepared transaction can partially cancel live work.
-        self._processor_lane.retire_dependents(prepared.dependent_processors)
-        self._processor_lane.detach(prepared.node)
+    def retire(self, node: object) -> frozenset[str]:
+        owner_id = _node_instance_id(node)
         with self._lock:
-
-            self._remove_reactive_processor_locked(key)
-            for dependent in prepared.dependent_processors:
-                self._remove_reactive_processor_locked(
-                    _node_instance_id(dependent)
-                )
-            entry = self._slots.pop(key, None)
-            self._slot_signal_names.pop(key, None)
-            self._dirty.discard(key)
-            self._cache.pop(key, None)
-            self._finals.pop(key, None)
-            self._processors.pop(key, None)
-            for publication_key in prepared.processor_publications:
-                self._processors.pop(publication_key, None)
-            for publication_key in prepared.derived_publications:
-                self._derived.pop(publication_key, None)
-            self._failures.pop(key, None)
-            retained_candidate = {
-                name: value
-                for name, value in self._candidate_front.signals.items()
-                if name not in prepared.retired_signal_names
-            }
-            self._candidate_front = SignalFront(
-                signals=MappingProxyType(retained_candidate),
-                failures=self._candidate_front.failures,
-            )
-            self._candidate_source_components = MappingProxyType(
-                {
-                    name: component
-                    for name, component in self._candidate_source_components.items()
-                    if name not in prepared.retired_signal_names
-                }
-            )
-            self._membership_changed = True
-        if entry is not None:
-            _node, slot = entry
-            slot.close()
+            state = self._states.get(owner_id)
+            if state is not None and state.node is not node:
+                raise RuntimeError("signal owner id belongs to another generation")
+        return self._withdraw_owner(owner_id)
 
     def detach_live(self, node) -> None:
-        """Withdraw only one node's run-scoped live route, retaining FINAL data."""
-
-        key = _node_instance_id(node)
+        owner_id = _node_instance_id(node)
         with self._lock:
-            entry = self._slots.pop(key, None)
-            self._slot_signal_names.pop(key, None)
-            self._dirty.discard(key)
-            self._cache.pop(key, None)
-            self._failures.pop(key, None)
-            if entry is not None:
-                self._membership_changed = True
-        if entry is not None:
-            _node, slot = entry
-            slot.close()
-
-    def close(self) -> None:
-        """Release every live slot owned by this plane."""
-
-        with self._lock:
-            if self._closed:
+            state = self._states.get(owner_id)
+            if state is None:
                 return
-            self._closed = True
-            entries = tuple(self._slots.values())
-            self._slots.clear()
-            self._slot_signal_names.clear()
-            self._dirty.clear()
-            self._cache.clear()
-            self._finals.clear()
-            self._processors.clear()
-            self._derived.clear()
-            self._failures.clear()
-            self._reactive_processor_sources.clear()
-            self._reactive_source_counts.clear()
-            self._membership_changed = True
-            self._request_owner_wake = None
-            empty = MappingProxyType({})
-            self._candidate_front = SignalFront(signals=empty, failures=empty)
-            self._candidate_source_components = empty
-        for _node, slot in entries:
+            if state.node is not node:
+                raise RuntimeError("signal owner id belongs to another generation")
+            slot = state.slot
+            state.slot = None
+            retained_final = bool(
+                state.publication is not None
+                and all(
+                    not value.transient
+                    for value in state.publication.signals.values()
+                )
+            )
+        if slot is not None:
             slot.close()
-        self._processor_lane.close()
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._slots)
-
-    # ---------------------------------------------------------------- freeze
-    def freeze(self) -> SignalFront:
-        """Return the current immutable signal front, advancing changed sources.
-
-        A slot that cannot be frozen (its run went terminal, its dataset was
-        withdrawn) contributes a FAILURE entry, never an exception: one dead
-        source must not blank unrelated consumers, while its failure remains
-        observable.
-
-        With no producer revision or membership change this returns the exact
-        same object.  A host timer is therefore only a polling clock; it cannot
-        manufacture a new aggregate data front merely because time passed.
-        """
-
-        self._processor_lane.drain()
-        with self._lock:
-            if not self._dirty and not self._membership_changed:
-                return self._front
-            slots = dict(self._slots)
-            dirty = self._dirty.intersection(slots)
-            self._dirty.difference_update(dirty)
-            # Consume only the membership state observed above.  A concurrent
-            # attach/detach after this lock is released sets it again and is
-            # therefore rebuilt on the next owner tick.
-            self._membership_changed = False
-        for key in dirty:
-            node, slot = slots[key]
-            owner_id = _node_instance_id(node)
-            try:
-                result = self._freeze_one(node, slot, owner_id)
-            except Exception as error:
-                failure = f"{type(error).__name__}: {error}"
-                with self._lock:
-                    if self._slots.get(key) == (node, slot):
-                        self._cache.pop(key, None)
-                        self._failures[key] = failure
-                continue
-            frozen, alignment_failure = result
-            with self._lock:
-                if self._slots.get(key) == (node, slot):
-                    self._cache[key] = frozen
-                    if alignment_failure is None:
-                        self._failures.pop(key, None)
-                    else:
-                        self._failures[key] = alignment_failure
-        signals: dict[str, SignalValue] = {}
-        failures: dict[str, str] = {}
-        with self._lock:
-            current = dict(self._slots)
-            cached = {key: dict(value) for key, value in self._cache.items()}
-            finals = {
-                key: (node, dict(value))
-                for key, (node, value) in self._finals.items()
-            }
-            processors = dict(self._processors)
-            active_processor_sources = tuple(
-                source_name
-                for _node, source_name in self._processor_lane.active_bindings()
-            )
-            source_transactions = []
-            for key, (node, _slot) in current.items():
-                names = list(cached.get(key, ()))
-                declared = set(_node_declared_signal_names(node))
-                names.extend(
-                    name
-                    for name in declared
-                    if name not in names
-                    and (previous := self._front.signals.get(name)) is not None
-                    and previous.transient
-                )
-                names.extend(
-                    source_name
-                    for source_name in active_processor_sources
-                    if source_name in declared and source_name not in names
-                )
-                if names:
-                    source_transactions.append(tuple(names))
-            source_transactions.extend(
-                tuple(values)
-                for _key, (_node, values) in finals.items()
-                if values
-            )
-            derived_publications = dict(self._derived)
-            failed = dict(self._failures)
-        for key, (node, _slot) in current.items():
-            signals.update(cached.get(key, {}))
-            failure = failed.get(key)
-            if failure is not None:
-                failures[_node_instance_id(node)] = failure
-        for _key, (_node, values) in finals.items():
-            signals.update(values)
-        for publication in processors.values():
-            signals.update(publication.edge.outputs)
-        for publication in derived_publications.values():
-            signals.update(publication.edge.outputs)
-        # Route the newest candidate even when it is not presentable yet.  The
-        # worker must see revision N in order to produce the descendant values
-        # that make N coherent; consumers keep the previous component until
-        # those values arrive.
-        source_components: dict[
-            str,
-            _CausalComponent,
-        ] = {}
-        for names in source_transactions:
-            root = {
-                name: signals[name]
-                for name in names
-                if name in signals
-            }
-            if root:
-                component = _CausalComponent(root)
-                for name in component.root_signals:
-                    source_components[name] = component
-        for publication in (*processors.values(), *derived_publications.values()):
-            component = publication.output_component()
-            for name in publication.edge.outputs:
-                source_components[name] = component
-        candidate_front = SignalFront(
-            signals=MappingProxyType(dict(signals)),
-            failures=MappingProxyType(dict(failures)),
-        )
-        with self._lock:
-            self._candidate_front = candidate_front
-            self._candidate_source_components = MappingProxyType(
-                dict(source_components)
-            )
-        self._processor_lane.route(signals, source_components)
-        signals, presented_source_components = self._coherent_linked_front(
-            signals,
-            source_components,
-            processors,
-            derived_publications,
-            tuple(source_transactions),
-        )
-        front = SignalFront(
-            signals=MappingProxyType(signals),
-            failures=MappingProxyType(failures),
-        )
-        with self._lock:
-            self._front = front
-            self._front_source_components = MappingProxyType(
-                presented_source_components
-            )
-        return front
-
-    def _coherent_linked_front(
-        self,
-        candidate: Mapping[str, SignalValue],
-        candidate_source_components: Mapping[
-            str,
-            _CausalComponent,
-        ],
-        processors: Mapping[str, _CausalPublication],
-        derived_publications: Mapping[str, _CausalPublication],
-        source_transactions: tuple[tuple[str, ...], ...],
-    ) -> tuple[
-        dict[str, SignalValue],
-        dict[str, _CausalComponent],
-    ]:
-        """Expose each already-admitted linked component as one coherent front.
-
-        Physical causality has already been proved by the neutral processing
-        owner before publication.  This method owns only consumer visibility:
-        if a descendant for candidate revision N has not arrived yet, consumers
-        retain the complete prior linked front instead of observing a mixture
-        of N and N-1.  Two unrelated source components remain independent.
-        """
-
-        current = dict(candidate)
-        adjacency: dict[str, set[str]] = {}
-        incoherent: set[str] = set()
-        publications = (*processors.values(), *derived_publications.values())
-        selected_edges = {
-            publication.edge.owner_key: publication.edge
-            for publication in publications
-        }
-        component_candidates = list(candidate_source_components.values())
-
-        # Every completed derived result retains the exact source transaction
-        # it evaluated.  Present that completed transaction even when
-        # acquisition has already advanced the raw latest candidate; the newer
-        # candidate remains available to the worker and is not discarded.
-        for publication in publications:
-            source_component = publication.source_component
-            current.update(source_component.signals)
-            for edge in source_component.edges:
-                selected_edges[edge.owner_key] = edge
-            component_candidates.append(source_component)
-            component_candidates.append(publication.output_component())
-
-        # A live slot freezes all of its declared outputs in one producer
-        # transaction.  If a Processor consumes one member, staging must retain
-        # its siblings too; otherwise a three-frame Camera revision could be
-        # split into frame_0=N-1 and frame_1=N.
-        for names in source_transactions:
-            if not names:
-                continue
-            anchor = names[0]
-            adjacency.setdefault(anchor, set()).update(names[1:])
-            for name in names[1:]:
-                adjacency.setdefault(name, set()).add(anchor)
-
-        for node, source_name in self._processor_lane.active_bindings():
-            output_names = _node_declared_signal_names(node)
-            if not output_names:
-                raise ValueError("Processor node declares no outputs")
-            adjacency.setdefault(source_name, set()).update(output_names)
-            for output_name in output_names:
-                adjacency.setdefault(output_name, set()).add(source_name)
-
-            source = current.get(source_name)
-            edge = selected_edges.get(
-                f"processor:{_node_instance_id(node)}"
-            )
-            accepted_source = None if edge is None else edge.source_identity
-            outputs_match = edge is not None and all(
-                (presented := current.get(name)) is not None
-                and signal_revision_identity(presented)
-                == signal_revision_identity(value)
-                for name, value in edge.outputs.items()
-            )
-            if (
-                source is None
-                or accepted_source != signal_revision_identity(source)
-                or not outputs_match
-            ):
-                incoherent.add(source_name)
-                incoherent.update(output_names)
-
-        # Application-derived outputs are ordinary causal descendants too.  A
-        # publication stays active until withdrawn; while its next worker
-        # answer is pending, the complete prior source + derived component is
-        # retained rather than mixing source N with derived N-1.
-        for publication in derived_publications.values():
-            edge = selected_edges.get(publication.edge.owner_key)
-            source_name = publication.edge.source_name
-            output_names = tuple(publication.edge.outputs)
-            adjacency.setdefault(source_name, set()).update(output_names)
-            for output_name in output_names:
-                adjacency.setdefault(output_name, set()).add(source_name)
-
-            source = current.get(source_name)
-            accepted_source = None if edge is None else edge.source_identity
-            outputs_match = edge is not None and all(
-                (presented := current.get(name)) is not None
-                and signal_revision_identity(presented)
-                == signal_revision_identity(value)
-                for name, value in edge.outputs.items()
-            )
-            if (
-                source is None
-                or accepted_source != signal_revision_identity(source)
-                or not outputs_match
-            ):
-                incoherent.add(source_name)
-                incoherent.update(output_names)
-
-        blocked = set(incoherent)
-        pending = list(incoherent)
-        while pending:
-            name = pending.pop()
-            for neighbour in adjacency.get(name, ()):
-                if neighbour not in blocked:
-                    blocked.add(neighbour)
-                    pending.append(neighbour)
-
-        if blocked:
-            previous = self._front.signals
-            for name in blocked:
-                old = previous.get(name)
-                if old is None:
-                    current.pop(name, None)
-                else:
-                    current[name] = old
-
-        front_components: dict[str, _CausalComponent] = {}
-        for name in blocked:
-            previous_component = self._front_source_components.get(name)
-            if previous_component is not None and name in current:
-                front_components[name] = previous_component
-        for component in reversed(component_candidates):
-            values = component.signals
-            for name, value in values.items():
-                presented = current.get(name)
-                if (
-                    name not in front_components
-                    and presented is not None
-                    and signal_revision_identity(presented)
-                    == signal_revision_identity(value)
-                ):
-                    front_components[name] = component.through_signal(name)
-        return current, front_components
+        if not retained_final:
+            self._withdraw_owner(owner_id)
 
     def _freeze_one(
         self,
-        node,
-        slot,
-        owner_id: str,
-    ) -> tuple[dict[str, SignalValue], str | None]:
-        """Namespace one application-owned mapping onto declared outputs.
-
-        Application-owned derived branches are published later from the exact
-        accepted source front and never reconfigure this producer.
-        """
-
+        state: _GenerationState,
+    ) -> tuple[Mapping[str, SignalValue], str | None]:
+        node = state.node
+        slot = state.slot
+        if node is None or slot is None:
+            raise RuntimeError("live generation lost its producer slot")
         run_id, causation, outputs = slot.freeze_live_outputs()
         if not isinstance(run_id, str) or not run_id:
             raise TypeError("live dataset run_id must be a non-empty string")
@@ -1960,38 +1898,353 @@ class SignalDataPlane:
             )
         if not isinstance(outputs, Mapping) or not outputs:
             raise ValueError("live output owner must return a non-empty mapping")
-        declarations = _require_signal_producer(node).dataset_output_declarations
-        declared = _declared_outputs(declarations)
-        bare_names = tuple(outputs)
-        if any(
-            not isinstance(name, str) or not name or name.strip() != name
-            for name in bare_names
-        ):
-            raise ValueError("live output names must be canonical text")
-        actual = set(bare_names)
-        if not actual.issubset(declared):
+        declared = _declared_outputs(
+            _require_signal_producer(node).dataset_output_declarations
+        )
+        if not set(outputs).issubset(declared):
             raise ValueError(
-                "live output owner published an output absent from the "
-                "producer vocabulary: "
-                f"declared={tuple(sorted(declared))}, "
-                f"unknown={tuple(sorted(actual - set(declared)))}"
+                "live publication contains an undeclared output"
             )
+        by_bare = {
+            bare: qualified
+            for qualified, bare in state.bare_names.items()
+        }
         frozen: dict[str, SignalValue] = {}
-        for output_name in bare_names:
-            output = outputs[output_name]
+        for bare in declared:
+            if bare not in outputs:
+                continue
+            output = outputs[bare]
             if not isinstance(output, LiveDatasetOutput):
                 raise TypeError("live output values must be LiveDatasetOutput")
-            _require_published_declaration(output_name, output, declared)
-            output_snapshot = output.snapshot
-            selected = node.signal_key(output_name)
-            frozen[selected] = SignalValue(
-                name=selected,
-                source_instance_id=owner_id,
-                snapshot=output_snapshot,
+            _require_published_declaration(bare, output, declared)
+            qualified = by_bare[bare]
+            frozen[qualified] = SignalValue(
+                name=qualified,
+                source_instance_id=state.owner_id,
+                snapshot=output.snapshot,
                 coverage=output.coverage,
                 run_id=run_id,
                 epoch_id=causation,
                 join_digest=output.join_digest,
                 transient=True,
             )
-        return frozen, getattr(slot, "notification_failure", None)
+        return (
+            MappingProxyType(frozen),
+            getattr(slot, "notification_failure", None),
+        )
+
+    @staticmethod
+    def _publication_roots(
+        publication: SignalPublication,
+    ) -> frozenset[tuple[str, int, int]]:
+        pending = [publication]
+        roots = set()
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if current.transaction_id in seen:
+                continue
+            seen.add(current.transaction_id)
+            if current.parents:
+                pending.extend(current.parents)
+            else:
+                roots.add(current.transaction_id)
+        return frozenset(roots)
+
+    @staticmethod
+    def _collect_publication_ancestry(
+        publication: SignalPublication,
+    ) -> Mapping[str, SignalPublication] | None:
+        pending = [publication]
+        by_name: dict[str, SignalPublication] = {}
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if current.transaction_id in seen:
+                continue
+            seen.add(current.transaction_id)
+            for name in current.signals:
+                previous = by_name.get(name)
+                if (
+                    previous is not None
+                    and previous.transaction_id != current.transaction_id
+                ):
+                    return None
+                by_name[name] = current
+            pending.extend(current.parents)
+        return by_name
+
+    @staticmethod
+    def _name_is_ancestor(
+        ancestor: str,
+        descendant: str,
+        source_by_output: Mapping[str, str],
+    ) -> bool:
+        seen = set()
+        current = descendant
+        while current in source_by_output and current not in seen:
+            seen.add(current)
+            current = source_by_output[current]
+            if current == ancestor:
+                return True
+        return False
+
+    def _build_front_locked(self) -> SignalFront:
+        latest: dict[str, SignalPublication] = {}
+        failures = {}
+        active_names = set()
+        event_names = set()
+        adjacency: dict[str, set[str]] = {}
+        source_by_output: dict[str, str] = {}
+
+        for state in self._states.values():
+            if state.retired:
+                continue
+            if state.failure is not None:
+                failures[state.owner_id] = state.failure
+            publication = state.publication
+            if state.terminal and publication is not None:
+                state_active_names = set(publication.signals)
+            else:
+                state_active_names = set(state.output_names)
+            active_names.update(state_active_names)
+            if state.kind == "event":
+                event_names.update(state_active_names)
+            if publication is not None:
+                for name in publication.signals:
+                    if name in latest:
+                        raise RuntimeError(f"signal {name!r} has two publications")
+                    latest[name] = publication
+            siblings = () if publication is None else tuple(publication.signals)
+            for name in siblings:
+                adjacency.setdefault(name, set()).update(
+                    candidate for candidate in siblings if candidate != name
+                )
+            if (
+                state.kind in {"processor", "continuous"}
+                and state.source_name is not None
+            ):
+                for output_name in state.output_names:
+                    source_by_output[output_name] = state.source_name
+                    adjacency.setdefault(output_name, set()).add(state.source_name)
+                    adjacency.setdefault(state.source_name, set()).add(output_name)
+
+        selected = dict(latest)
+        requested = self._front_signals.intersection(active_names).difference(
+            event_names
+        )
+        pending = set(requested)
+        components = []
+        while pending:
+            seed = pending.pop()
+            component = {seed}
+            stack = [seed]
+            while stack:
+                current = stack.pop()
+                for neighbour in adjacency.get(current, ()):
+                    if neighbour in active_names and neighbour not in component:
+                        component.add(neighbour)
+                        stack.append(neighbour)
+            pending.difference_update(component)
+            components.append(component)
+
+        previous_publications = self._front.publication_by_signal
+        for component in components:
+            requested_component = requested.intersection(component)
+            leaves = tuple(
+                name
+                for name in requested_component
+                if not any(
+                    other != name
+                    and self._name_is_ancestor(name, other, source_by_output)
+                    for other in requested_component
+                )
+            )
+            leaf_publications = tuple(
+                latest.get(name)
+                for name in leaves
+            )
+            coherent = bool(leaves) and all(
+                publication is not None
+                for publication in leaf_publications
+            )
+            ancestry: dict[str, SignalPublication] = {}
+            if coherent:
+                root_sets = {
+                    self._publication_roots(publication)
+                    for publication in leaf_publications
+                    if publication is not None
+                }
+                coherent = len(root_sets) == 1
+            if coherent:
+                for publication in leaf_publications:
+                    assert publication is not None
+                    current = self._collect_publication_ancestry(publication)
+                    if current is None:
+                        coherent = False
+                        break
+                    for name, candidate in current.items():
+                        previous = ancestry.get(name)
+                        if (
+                            previous is not None
+                            and previous.transaction_id
+                            != candidate.transaction_id
+                        ):
+                            coherent = False
+                            break
+                        ancestry[name] = candidate
+                    if not coherent:
+                        break
+            if coherent and any(
+                name not in ancestry for name in requested_component
+            ):
+                coherent = False
+
+            if coherent:
+                for name, publication in ancestry.items():
+                    if name in component and name in active_names:
+                        selected[name] = publication
+            else:
+                for name in component:
+                    previous = previous_publications.get(name)
+                    current_state = self._state_for_signal_locked(name)
+                    if (
+                        previous is None
+                        or name not in active_names
+                        or current_state is None
+                        or current_state.owner_id != previous.owner_id
+                        or current_state.generation != previous.generation
+                    ):
+                        selected.pop(name, None)
+                    else:
+                        selected[name] = previous
+
+        signals = {}
+        publications = {}
+        for name, publication in selected.items():
+            if name not in active_names:
+                continue
+            value = publication.value(name)
+            if value is None:
+                raise RuntimeError("front publication lost one of its signals")
+            signals[name] = value
+            publications[name] = publication
+        groups = {}
+        for component in components:
+            members = frozenset(
+                name
+                for name in requested.intersection(component)
+                if name in signals
+            )
+            for name in members:
+                groups[name] = members
+        return SignalFront(
+            signals,
+            failures,
+            publications,
+            groups,
+        )
+
+    def freeze(self) -> SignalFront:
+        """Advance changed generations and return one immutable coherent front."""
+
+        self._lane.drain_processors()
+        with self._lock:
+            if not self._dirty and not self._membership_changed:
+                return self._front
+            dirty = tuple(self._dirty)
+            self._dirty.clear()
+            states = {
+                owner_id: self._states.get(owner_id)
+                for owner_id in dirty
+            }
+            self._membership_changed = False
+
+        for owner_id, state in states.items():
+            if (
+                state is None
+                or state.retired
+                or state.terminal
+                or state.slot is None
+            ):
+                continue
+            try:
+                values, warning = self._freeze_one(state)
+            except Exception as error:
+                with self._lock:
+                    if (
+                        self._states.get(owner_id) is state
+                        and not state.retired
+                        and not state.terminal
+                    ):
+                        state.failure = f"{type(error).__name__}: {error}"
+                        self._membership_changed = True
+                continue
+            try:
+                with self._lock:
+                    if (
+                        self._states.get(owner_id) is state
+                        and not state.retired
+                        and not state.terminal
+                    ):
+                        self._publish_locked(state, values)
+                        state.failure = warning
+            except Exception as error:
+                with self._lock:
+                    if (
+                        self._states.get(owner_id) is state
+                        and not state.retired
+                        and not state.terminal
+                    ):
+                        state.failure = f"{type(error).__name__}: {error}"
+                        self._membership_changed = True
+
+        with self._lock:
+            latest = {
+                name: publication
+                for state in self._states.values()
+                if not state.retired and state.publication is not None
+                for name, publication in (
+                    (name, state.publication)
+                    for name in state.publication.signals
+                )
+            }
+        self._lane.route(latest)
+        with self._lock:
+            front = self._build_front_locked()
+            self._front = front
+            self._membership_changed = False
+            return front
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            states = tuple(self._states.values())
+            self._states.clear()
+            self._dirty.clear()
+            self._front_signals = frozenset()
+            self._request_owner_wake = None
+            self._front = SignalFront({}, {})
+        self._lane.close()
+        errors = []
+        seen_slots = set()
+        for state in states:
+            slot = state.slot
+            if slot is None or id(slot) in seen_slots:
+                continue
+            seen_slots.add(id(slot))
+            try:
+                slot.close()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise ExceptionGroup("signal data plane close failed", errors)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return sum(
+                state.slot is not None and not state.retired
+                for state in self._states.values()
+            )

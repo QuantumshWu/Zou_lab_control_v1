@@ -4,22 +4,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from zlc_data import IndexSelection, Selection
+from zlc_data import IndexSelection, Selection, dataset_cell_value
 from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 from zlc_frontend import automatic_figure_view
 from zlc_frontend.figure import ViewIntent, ViewPreferences
 from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import ExactOccupancyCellSource
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import ResolvedOccupancy
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
-    OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION,
-    OccupancyProcessorEvaluation,
     occupancy_artifact_output_name,
 )
+from zlc_neutral_atom.logic_nodes.readout.occupancy.processor_application import (
+    PreparedOccupancyProcessor,
+)
+from zlc_neutral_atom.processing.signal_plane import SignalValue
 from zlc_frontend.site_map_view import (
     SiteMapView,
     build_site_map_cell_view,
 )
-from zlc_storage import canonical_digest, canonical_text
+from zlc_storage import canonical_digest
 from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 
 
@@ -141,46 +143,62 @@ def build_exact_occupancy_cell_view(
     )
 
 
-def project_occupancy_views(
-    result: object,
-    *,
-    run_id: str,
-    provenance_epoch_id: str,
-) -> dict[str, SiteMapView]:
-    """Map an already-closed evaluation into a frontend SiteMap view."""
+def project_occupancy_site_map(
+    application: PreparedOccupancyProcessor,
+    background: SignalValue,
+    occupied: SignalValue,
+) -> SiteMapView:
+    """Project one exact parent/result publication with no revision side index."""
 
-    if not isinstance(result, OccupancyProcessorEvaluation):
-        raise TypeError("Occupancy application returned another result type")
-    run_id = canonical_text(run_id, "run_id")
-    provenance_epoch_id = canonical_text(
-        provenance_epoch_id,
-        "provenance_epoch_id",
+    if not isinstance(application, PreparedOccupancyProcessor):
+        raise TypeError("application must be PreparedOccupancyProcessor")
+    if not isinstance(background, SignalValue) or not isinstance(
+        occupied,
+        SignalValue,
+    ):
+        raise TypeError("Occupancy presentation requires exact SignalValues")
+    source_schema = background.schema
+    occupied_schema = occupied.schema
+    if (
+        source_schema.repeat_axis.size != 1
+        or source_schema.point_table.row_count != 1
+        or occupied_schema.repeat_axis.size != 1
+        or occupied_schema.point_table.row_count != 1
+    ):
+        raise ValueError("live Occupancy SiteMap requires R=1 and P=1")
+    source_value = dataset_cell_value(background.block, 0, 0)
+    occupied_value = dataset_cell_value(occupied.block, 0, 0)
+    selection = Selection(
+        (IndexSelection(source_schema.repeat_axis.axis_id, 0),)
     )
-    site_map = result.site_map
-    calibration_identity = result.calibration_ref.target_ref
-    occupied_name = OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION.name
-    presentation = build_site_map_cell_view(
-        result.background_value,
-        result.background_ref,
-        result.occupied_value,
-        result.occupied_ref,
-        result.selection,
+    logical_point = (
+        source_schema.grid_topology.row_to_cell[0]
+        if source_schema.grid_topology is not None
+        else (0,)
+    )
+    site_map = application.site_map
+    calibration_identity = application.request.calibration_ref.target_ref
+    return build_site_map_cell_view(
+        source_value,
+        background.snapshot.ref,
+        occupied_value,
+        occupied.snapshot.ref,
+        selection,
         site_axis=site_map.site_axis,
         coordinate_frame=site_map.coordinate_frame,
         centers_xy=site_map.coordinates_xy,
         site_geometry_identity=calibration_identity,
-        coherence_identity=result.outputs[occupied_name].join_digest,
-        run_id=run_id,
-        provenance_epoch_id=provenance_epoch_id,
+        coherence_identity=occupied.join_digest,
+        run_id=occupied.run_id,
+        provenance_epoch_id=occupied.epoch_id,
         summary=(
-            f"source run={run_id} | "
+            f"source run={occupied.run_id} | "
             f"calibration={calibration_identity} | "
-            f"revision={result.background_ref.revision.value} | "
-            f"logical point={result.logical_point}"
+            f"revision={background.snapshot.ref.revision.value} | "
+            f"logical point={logical_point}"
         ),
         presentation_kind="occupancy-cell",
     )
-    return {occupied_name: presentation}
 
 
 def project_occupancy_figure(
@@ -214,6 +232,6 @@ def project_occupancy_figure(
 __all__ = [
     "OccupancyFigureProjection",
     "build_exact_occupancy_cell_view",
-    "project_occupancy_views",
+    "project_occupancy_site_map",
     "project_occupancy_figure",
 ]
