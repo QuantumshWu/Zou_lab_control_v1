@@ -112,8 +112,7 @@ preview images belong under `_output/` as listed above.
 
 ## Design and operations
 
-- [System architecture](docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md)
-- [Design charter](docs/DESIGN_CHARTER_zh.md)
+- [System architecture — sole normative design](docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md)
 - [Real-hardware bring-up](docs/REAL_HARDWARE_BRINGUP_zh.md)
 - [FPGA server notes](fpga/README.md)
 - [Verification guide](tests/README.md)

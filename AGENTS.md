@@ -1,50 +1,60 @@
-# AGENTS.md — 当前仓库执行契约
+# Zou_lab_control 实现执行协议
 
-## 恢复与权威
+本文件只规定如何恢复、实现、审查、验证和提交。规范架构与产品合同只见 `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md`；不得在这里复制第二份 owner、数据模型或 UI 设计。
 
-- 权威顺序固定为：用户最新明确要求 → 当前完整 `/goal` → 物理/算法事实 → `docs/DESIGN_CHARTER_zh.md` 与相关设计章节 → 当前实现 → 当前合同测试。`main` 只在某个具体旧行为或算法确需独立 oracle 时按需查阅，不是默认 UI、架构或实现权威。
-- 每次上下文压缩后先完整读取当前 `/goal`，再从 Git 状态、当前 plan 与最近实现 checkpoint 恢复；只读取本任务相关的设计章节。不得重新回答用户已经得到答案的问题，不得重做已闭合审查，也不得把历史台账状态冒充当前任务。
-- 发现设计与事实冲突时，先由代码、真实产品流和物理约束重新推导，再同步修正设计；不能为了维护旧文档或旧测试而保留错误实现。
+## 1. 权威与恢复
 
-## 当前包与产品边界
+1. 权威顺序：用户最新明确要求 → 当前完整 `/goal` → 物理/算法事实 → System Architecture 相关章节 → 当前实现 → 仍有效的公开合同测试。
+2. 每次上下文压缩、暂停恢复或新进程开始时：
+   - 完整读取当前 `/goal`；
+   - 检查当前分支、HEAD/tree、`git status --short`、最近提交和 `docs/MAINTAINER_NOTES.md`；
+   - 只读取当前 dependency cut 相关的 System Architecture 章节；
+   - 从 Git 和 checkpoint 推导“已完成/正在做/下一步”，不得凭记忆或固定切片编号恢复。
+3. 不重复回答、重审、重做或重新解释已经闭合的事项。新证据与已闭合结论冲突时，明确指出证据和受影响 owner，再更新当前方案。
+4. `pulses/scan_test.json` 是用户文件：不得读取、修改、删除、移动、stage 或提交。
+5. `main` 只在调查一个明确旧行为或独立科学算法时定点查阅；不默认扫描旧树，不以旧测试、旧包结构或旧 UI 实现反向约束当前架构。
 
-目标依赖方向按路径而不是只按顶层包名判定；下列箭头表示“左侧可以导入右侧”：
+## 2. 实现方法
 
-```text
-zlc_data -> zlc_storage.canonical
-zlc_neutral_atom(headless framework/capability core) -> zlc_data + zlc_pulse + zlc_storage
-zlc_frontend(presentation-only; no neutral dependency) -> zlc_data + zlc_storage
-zlc_workbench(Qt product composition/layout) -> zlc_frontend + zlc_neutral_atom(headless API) + data/pulse
-zlc_neutral_atom/logic_nodes/<capability>/workbench_adapter.py -> own core（仅真实启动差异，可选）
-zlc_neutral_atom/logic_nodes/<capability>/ui/<leaf> -> own capability core + generic frontend/workbench
-Zou_lab_control -> installation/runtime/repository + declarations/preparers/loaders + optional frontend/workbench
-```
+6. 先定位物理语义、唯一 owner、producer/consumer 和生命周期，再修改。不得以 fallback、额外状态、特殊分支、防抖、重试或 test-only guard 掩盖根因。
+7. 每个工作单元必须是 dependency-closed cut：
+   - 定义或修正一个公开合同；
+   - 迁移全部生产者、消费者、codec、artifact、UI/API 接缝；
+   - 删除被替代实现、reader、alias、wrapper、fixture、测试和文档；
+   - 搜索死符号与反向依赖；
+   - 用最窄真实产品流证明。
+8. 若真实设备、profiling 或代码依赖证伪设计，先重新推导最小机制，再在同一 cut 更新 System Architecture、实现和当前测试。不得为保护已写代码而辩护旧设计。
+9. 新 abstraction 必须指出当前 consumer、被消除的重复/风险、生命周期 owner 和 contract test。单成员 enum、单实例 forwarding wrapper、重复 DTO、未来扩展点和无消费者 public surface 默认删除。
+10. 不保留兼容层、双格式、旧 reader、migration adapter、改名 re-export、历史 archive 或“暂时残余”。最后一个 consumer 迁走时同切片删除完整闭包。
+11. 未进入“已由证据证明现有 RTL/bitstream 有 bug 或偏离既定设计”的独立任务，不得修改 RTL、Tcl、XDC 或 bitstream。普通软件实现不能借机设计硬件新能力。
+12. 不把用户报告逐条变成特判。先横扫同一 owner 的所有入口和同根机制；真正只属于唯一 owner 的局部不变量可以局部修复，不为它创建全局框架。
 
-- `zlc_neutral_atom/logic_nodes/` 只拥有实验领域能力，不等于“每个直接子目录都是一个节点”。独立 capability 可以直接闭合；同一物理族的多个 capability 必须放在一个具名 family 下，由 family 根拥有真正共享的领域机制、每个可枚举叶节点各自导出一份 headless `LogicNodeDeclaration`。例如 Readout family 拥有 Calibration/Occupancy/Fidelity 共享的读出合同，Release-recapture family 拥有两帧同 loading→survival 的机制，Temperature 与 Grey-molasses detuning 仍是设备 claim/扫描轴/输出语义不同的两个叶节点。不得把 family 共享机制伪装成第二个节点，也不得为了消除 sibling import 把它提升进 framework/runtime。
-- Definition、request/config、算法、输出/schema/materializer 与 artifact 必须在自己的 capability leaf 或其唯一 family owner 内闭合。`LogicNodeDeclaration` 一次包含字段、path hints、dynamic-choice resolver、typed inputs/outputs、default views 及 request build/bind；普通节点由通用 TaskConsole projector 自动生成 form、Setting/Edit、signal 与默认 panel，不得另建 per-node UI/attachment。
-- 只有通用 host 无法表达的真实启动调用差异才允许根下可选、headless `workbench_adapter.py`；它只适配 prepared command 的启动形状，不拥有字段、presenter 或 lifecycle。只有 declaration + generic Figure 无法表达的特殊产品交互才允许 inert `ui/**`；当前有证据的例外仅为 PulseScan scan-table/slot、Calibration 多页报告/创建面和 Occupancy exact-cell 导航面。它们的普通字段仍走 declaration projector，SiteMap/Figure 交互仍委托 frontend 唯一 owner。capability 根不得 eager import adapter/UI，`ui/__init__.py` 必须 inert。
-- `zlc_neutral_atom` 的 Calibration/Occupancy capability 独占 SiteMap 领域事实（site axis/centers/validity/coordinate frame 与 calibration/source identity），并在 publication 前验证 source revision/event、same-shot inputs、join digest 与 sibling outputs 的原子 causal closure。`zlc_frontend/` 独占由这些已闭合事实建立的 SiteMap view、Area materialization、render、selector 与 linked-front revision gating；不得替领域拼 latest/latest。`zlc_workbench/` 只做 Qt composition/layout，不证明物理 same-shot，也不对独立 producer 作 board-wide coherence 声明。
-- 通用 signal、run、processor 与 live-dataset 生命周期的唯一 owner 分别是 neutral 的 `SignalDataPlane`、`HostedRun`、`HostedProcessor` 与 `LiveDatasetHost`；Figure 的 Qt surface、派生输出 authority 与 render lane 的唯一 owner 分别是 frontend 的 `FigureSurfaceHost`、`FigureOutputAuthority` 与 `FigureSurfaceLane`。Workbench 只组合这些能力并拥有 Qt 产品布局，不复制其数据、生命周期、selector、Fit 或 renderer 规则。
-- `Zou_lab_control/api/` 是唯一稳定 public Experiment API，供脚本、notebook 与 desktop 共用；它同时拥有 installation/repository/runtime binding，`Zou_lab_control/workbench/` 只做 desktop composition。每个 Logic-node leaf 通过固定 `zlc_neutral_atom.logic_nodes` namespace 下唯一冻结 `package.py` 自述 declaration、API 与通用 TaskConsole attachment；`Experiment.nodes.<capability>` 和 Workbench 都从同一 tuple 投影。禁止中央 capability import 表、mutable registry、service locator、entry-point plugin、兼容 alias 或第二套窗口实现。
-- 领域类型、canonical codec、digest、数据 shape/validity、生命周期、硬件 I/O、Figure/selector/Fit 和 Qt composition 各有且只有一个 owner。跨包嵌值对象时调用 owner 的公开 API，不复制字段表、validator、shape 规则或算法。
-- 数据内核永久保留 `(R, P, *data_shape)`；标量物理表示固定为 `(R,P,1)`。禁止按 rank/singleton 猜语义，禁止隐式 first/flatten/trailing mean，禁止把多维 `data_shape` 压成一个 item。
+## 3. 协作、文件与 Git
 
-## 实现方法
+13. subagent 只用于范围互不重叠、可独立交付并能实质提高速度或质量的工作。不要让多名 agent 反复审查同一小改动；共享树内先声明文件范围并避免覆盖。
+14. 文件修改统一使用 `apply_patch`；格式化或机械生成可使用正式工具。不得用临时脚本、shell 重定向或 Python 偷写源码。
+15. 保留用户及其他 agent 的不相关改动。发现重叠时先检查 diff，能绕开就绕开；不能安全绕开才报告阻塞。
+16. 搜索优先 `rg` / `rg --files`。不要运行破坏性 Git 命令，不要 `git add -A`，不要未经用户要求 push。
+17. 每个主题只逐文件 stage 自己的闭包，先运行 `git diff --check`、死符号/反向边扫描和最窄证据，再 commit。commit message 描述被闭合的系统边界，不描述临时症状。
+18. commit 后更新 Maintainer checkpoint；不要把活动审查台账、GUI evidence、截图、cache、临时 output 或本机路径加入 Git。
+19. 普通只读、构建和测试命令直接运行，不向用户请求手动批准。若环境本身拒绝命令，先核实当前权限/命令用法，不重复弹出相同请求。
 
-- 先问产生现象的机制是否应该存在，再修代码。每个非 `main` 新机制必须能点名真实需求、唯一 owner、现有 consumer 和相对直接方案的必要收益；答不出就删除完整依赖闭包。
-- “两个消费者”绝不是进入骨架的充分条件。一个共享 owner 只有同时满足三项才可离开 `logic_nodes`：消费者跨越彼此独立的领域族；公开 vocabulary 不含某一实验的物理语义；删除任一具体 capability 后它仍有完整独立职责。任一项失败就属于 domain family。移动前必须记录语义、消费者集合、删除测试与依赖方向；不得用目录对称、避免 sibling import 或代码行数作为升层理由。
-- 不打局部补丁，不留 alias、wrapper、兼容 reader、迁移态、历史 archive、零消费者抽象、第二套实现或改名残余。删除必须覆盖生产者、消费者、导出、文档与已经失去意义的测试。
-- bitstream/RTL 冻结。只有证据证明现有 RTL 有真实 bug 或违背既定设计时才单独评估修改；不能为了架构偏好要求重烧。精密 pulse/trigger 时序由现有 FPGA、qCMOS 等硬件执行，host 只冻结计划、验证 envelope、排空数据和做末端对账。
-- calibration/readout 以当前物理合同、已验证算法与独立 oracle 为权威；只有追查某个具体旧物理行为时才按需对照 `main@6c337d49c7086fa0ff21f879cd159bdf0e753f51`，不得把整棵 main 实现或 UI 当默认模板。
-- Calibration Task 的 operator folder 不是 artifact repository：相对路径锚定项目根，默认是 `_output/calibrations`，显式绝对路径按用户选择使用；机器消费者只能解析最后替换的 `calibration_ref.json`，再向canonical repositories admit其中的typed refs，`report/frames`不是authority。当前 writer 只提供同进程异常回滚和 pointer-last 可见顺序，没有目录 fsync/recovery journal，禁止把 `report/frames/pointer` 整体描述成 crash-atomic 或 durable transaction。
-- 普通 Qt 编辑只修改稳定 widget/editor draft；不得构造全应用 snapshot、周期轮询或重建控件树。只有真实 worker、连接、Run、数据 revision 或 presentation-coherent board front 边界可发布 immutable snapshot；最后一种只冻结GUI展示revision，不证明物理same-shot。
-- UI 的正式界面、操作与美术由当前 frontend/workbench 的共享 owner 和已验收产品合同决定。只有调查一个明确旧行为时才按需运行 `ZLC_main` 作 oracle；不得从 main 批量复制实现。通用 widget、Figure/Divider、selector、Setting/Edit 和 renderer 必须复用唯一实现。
-- 软件不得设置内存预算、retention quota、max-inflight/backlog 或因预测内存而拒绝合法采集；只验证设备/transport 的真实物理容量。分配失败应作为真实运行失败暴露，不能再叠一层软件预算政策。
+## 4. 验证与性能
 
-## 工作与验证纪律
+20. 迁移期间只运行能证明当前边界的最窄 current test、public API 流或真实 product flow。历史测试失败先判断其物理/public contract 是否仍有效；不得改实现去迎合已删除架构。
+21. broad suite 留到 M7/最终清理。反复运行同一历史测试、为了绿灯恢复私有方法/调用次数或在每个微改后跑全仓，均不构成验证。
+22. 性能问题先阅读调用链并 profiling，交叉验证 copy、algorithm、compose、lock、I/O 与线程边界。修正复杂度和 owner 后再选择 executor/process；不得用假缩放、旧 raster stretch、任意 debounce 或预算拒绝掩盖。
+23. 每个 dependency cut 对照旧树同等物理/产品能力报告生产行数、frozen dataclass/class/enum 数量和主要复杂度来源。超过约三倍必须压缩或逐项说明不可替代的 consumer/invariant；行数不是单独删除依据。
+24. 每个文件审查都必须进入 change-impact 清单：它拥有何种事实、由谁调用、又调用谁、是否重述别处合同、增加同类能力要修改哪些文件、能否删除。仅“逐文件读过”不算架构审查完成。
 
-- 可以并鼓励使用 subagent 并行完成真实、互不重叠的文件切片或产品流；agent 可在明确文件范围内修改。禁止用 agent 反复复审同一个小改动、重复已闭合工作或制造审查仪式。
-- 修改文件使用 `apply_patch`；保留用户及其它 agent 的无关改动。只在主题闭合后逐文件 stage；禁 `git add -A`，禁 push，禁破坏性回退。
-- 迁移期间不为历史测试适配架构。先阅读测试所表达的物理/产品原理，只有它仍是 current contract 才更新或运行；普通改动不跑宽测试。关键边界用最窄的 `py_compile`、静态残余搜索、`git diff --check` 和一个真实产品流证明，全部迁移完成后再做合并验证。
-- GUI 快轨：先设 `QT_QPA_PLATFORM=offscreen`，再由唯一 `ensure_qt_app()` 经正式 composition root 打开窗口，使用真实 Qt input 和 outer-window `grab()`；不得另造窗口、DPI、尺寸或样式。慢轨从正式 `.py/.bat` launcher 按人类流程运行，只用于最终或争议复核。
-- 每个最终审查切片必须建立实际文件清单并逐文件读完，报告文件数、真实问题、保留抽象的 consumer 和删除内容。上下文压缩后从该 checkpoint 继续，不能把“文件不在”或某个测试通过当作审查完成。
+## 5. GUI 证据
+
+25. 快轨：`QT_QPA_PLATFORM=offscreen -> ensure_qt_app() -> 正式 composition root/launcher entry -> 真实 Qt input -> outer grab`。不得手工造另一套 QWidget、尺寸、DPI、style 或直接调用 controller 代替用户交互。
+26. 慢轨：从正式 `.bat/.py` launcher 按人类流程运行，用真实桌面鼠标、输入与截图做最终或争议复核。用户正在操作电脑时不要占用桌面；优先快轨。
+27. 快轨和慢轨必须共享同一个 QApplication owner、composition、window sizing/style、数据路径和交互步骤；offscreen 行为测试若没有正式 composition 或文字/DPR 不可信，不能作为视觉验收。
+28. GUI 验收同时检查用户可见结果、时序、不中断项、selector/Fit 发布、resize/DPR、close/cancel 和真实 signal flow。静态截图不能替代行为证据。
+
+## 6. 完成条件
+
+29. 当前 cut 完成前不得跳到下一 cut。完成意味着公开合同、全部生产/消费路径、删除闭包、最窄 product evidence、复杂度说明、diff 和 commit 同时闭合。
+30. 最终完成必须逐项通过 System Architecture 的验收门，并证明所有 tracked 文件均已计数和审查、无错层 owner、平行真相源、历史残余、零消费者机制或已知 P0/P1。
