@@ -5,11 +5,11 @@ This file is a current hand-off note, not an architecture authority. Normative d
 ## Repository state
 
 - Branch: `codex/system-architecture-migration`
-- Current normative HEAD/tree: `1d1235143f6978d44133ad009eeb31d6a97a4b50` / `8e4c3c1a01ec3701ed8174020d523ef940d33bdb`
+- Normative design commit/tree: `aaaa063ca5a8535c4f316df95e62574edce46cd3` / `e0cec1255bd58206412cdc8b7208dcbc30028a96`
 - Last code checkpoint before the normative freeze: `09fad53 Fix live Figure transactions and restore plot fits`
 - Completed architecture cut in this checkpoint: **M0 second convergence — the public point/source/resolver vocabulary is now minimal as well as the transaction/Fit/milestone wording**
 - Active next cut: **M1 — minimal PointTable/GridTopology/source-binding replacement**
-- Active worktree state: M1 is deliberately uncommitted and not a checkpoint. The core/data and early Camera/runtime readers are mid-replacement; no further product edit is allowed until the M0-only documentation correction is verified and committed separately.
+- Active worktree state: M1 is deliberately uncommitted and not a checkpoint. The core/data and early Camera/runtime readers are mid-replacement; M0 is closed by the normative design commit above, so work resumes only inside the recorded M1 deletion contract.
 - Expected worktree exception: untracked user file `pulses/scan_test.json`; never read, modify, stage or commit it.
 - External temporary audit ledger: `../ARCHITECTURE_AUDIT_CURRENT.md`; it is not a product/design authority and is deleted only after M0–M7 evidence is fully merged and all implementation cuts finish.
 
