@@ -5,7 +5,7 @@ This file is a current hand-off note, not an architecture authority. Normative d
 ## Repository state
 
 - Branch: `codex/system-architecture-migration`
-- Normative design commit/tree: `aaaa063ca5a8535c4f316df95e62574edce46cd3` / `e0cec1255bd58206412cdc8b7208dcbc30028a96`
+- M0 normative design baseline: `aaaa063ca5a8535c4f316df95e62574edce46cd3`; canonical observation-address clarification: `0af9354`.
 - Last code checkpoint before the normative freeze: `09fad53 Fix live Figure transactions and restore plot fits`
 - Completed architecture cut in this checkpoint: **M0 second convergence — the public point/source/resolver vocabulary is now minimal as well as the transaction/Fit/milestone wording**
 - Active next cut: **M1 — minimal PointTable/GridTopology/source-binding replacement**
