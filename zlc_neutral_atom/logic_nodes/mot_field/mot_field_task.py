@@ -367,10 +367,8 @@ def write_mot_field_report(
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / "mot_field_scan.npz"
     axes = tuple(
-        np.asarray(
-            tuple(axis.coordinate_at(index) for index in range(axis.size))
-        )
-        for axis in result.point_axes
+        np.asarray(domain)
+        for domain in result.grid_topology.coordinate_domains
     )
     temporary = directory / f".{target.name}.{uuid.uuid4().hex}.tmp"
     try:

@@ -45,53 +45,6 @@ MOT_FIELD_LIVE_OUTPUT_DECLARATIONS = (
 )
 
 
-def _source_to_output_points(
-    source: DatasetSchema,
-    output: DatasetSchema,
-) -> tuple[int, ...]:
-    """Map a singleton readout selection without guessing or flattening axes."""
-
-    if source.repeat_axis != output.repeat_axis:
-        raise ValueError("MOT preview transform changed the repeat axis")
-    source_ids = tuple(axis.axis_id for axis in source.point_axes)
-    output_ids = tuple(axis.axis_id for axis in output.point_axes)
-    try:
-        selected_positions = tuple(source_ids.index(axis_id) for axis_id in output_ids)
-    except ValueError as error:
-        raise ValueError("MOT output introduced a point axis") from error
-    if tuple(source.point_axes[position] for position in selected_positions) != (
-        output.point_axes
-    ):
-        raise ValueError("MOT output point axes differ from their source axes")
-    omitted = tuple(
-        position
-        for position in range(len(source.point_axes))
-        if position not in selected_positions
-    )
-    if not omitted or any(
-        source.point_axes[position].size != 1 for position in omitted
-    ):
-        raise ValueError(
-            "MOT live projection requires only singleton source point selections"
-        )
-
-    mapping: list[int] = []
-    for storage_index in range(source.point_layout.storage_size):
-        source_multi = source.point_layout.multi_index(storage_index)
-        if any(source_multi[position] != 0 for position in omitted):
-            raise ValueError(
-                "MOT selected source point is not the singleton coordinate"
-            )
-        output_multi = tuple(source_multi[position] for position in selected_positions)
-        mapping.append(output.point_layout.storage_index(output_multi))
-    result = tuple(mapping)
-    if len(result) != output.point_layout.storage_size or set(result) != set(
-        range(output.point_layout.storage_size)
-    ):
-        raise ValueError("MOT source-to-output point mapping is not lossless")
-    return result
-
-
 class MotFieldLiveProjection:
     """Atomically accumulate exact camera deltas into one scalar MOT grid.
 
@@ -113,10 +66,6 @@ front unchanged, so the application live-output owner can publish only data whos
         self._source_schema = source_schema
         self._output_schema = mot_intensity_schema(request, source_schema)
         self._output_block_id = BlockId("mot-field-live-grid")
-        self._source_to_output_points = _source_to_output_points(
-            source_schema,
-            self._output_schema,
-        )
         self._projector: MotRoiProjector = build_mot_intensity_projector(
             request,
             source_schema,
@@ -151,14 +100,11 @@ front unchanged, so the application live-output owner can publish only data whos
             address = cell.address
             if address.repeat_index >= self._valid.shape[0]:
                 raise ValueError("MOT delta repeat address exceeds output schema")
-            try:
-                output_point = self._source_to_output_points[
-                    address.point_storage_index
-                ]
-            except IndexError as error:
+            output_point = address.point_ordinal
+            if output_point >= self._output_schema.point_table.row_count:
                 raise ValueError(
                     "MOT delta point address exceeds the source schema"
-                ) from error
+                )
             projected.append(
                 (
                     (address.repeat_index, output_point),

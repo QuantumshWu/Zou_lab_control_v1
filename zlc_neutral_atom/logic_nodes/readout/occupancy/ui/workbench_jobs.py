@@ -8,6 +8,7 @@ import threading
 from zlc_frontend.site_map_render import SiteMapComposer
 from zlc_frontend.site_map_view import SiteMapView
 from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import OccupancyCellDomain
+from .view_projection import _occupancy_cell_coherence_identity
 
 
 _PANEL_ID = "sites"
@@ -33,7 +34,7 @@ def _load_navigation(loader, reference, cancelled):
 def _cell_job(
     loader,
     reference,
-    selection,
+    address,
     navigation,
     loaded_view,
     display,
@@ -47,16 +48,19 @@ def _cell_job(
     if loaded_view is None:
         loaded_view = loader(
             reference,
-            selection,
+            address,
             expected_navigation=navigation,
         )
-    repeat, _storage, logical = navigation.resolve_selection(selection)
-    expected_selection = navigation.selection_for_indices(repeat, logical)
+    navigation.resolve_address(address)
     if (
         not isinstance(loaded_view, SiteMapView)
-        or loaded_view.cell_selection != expected_selection
+        or loaded_view.coherence_identity
+        != _occupancy_cell_coherence_identity(
+            navigation.artifact_identity,
+            address,
+        )
     ):
-        raise ValueError("cell loader returned a different exact selection")
+        raise ValueError("cell loader returned a different exact address")
     if not isinstance(composer, SiteMapComposer):
         raise TypeError("occupancy cell renderer requires SiteMapComposer")
     _cancel_point(cancelled)
@@ -70,7 +74,7 @@ def _cell_job(
     _cancel_point(cancelled)
     return (
         navigation.identity,
-        selection,
+        address,
         cell_revision,
         display.revision,
         surface_revision,

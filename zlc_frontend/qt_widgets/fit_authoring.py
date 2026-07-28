@@ -291,7 +291,8 @@ class FitAuthoringPane(QtWidgets.QWidget):
         ):
             raise ValueError("Fit authoring requires FitAuthoringOption values")
         schema_fingerprints = {
-            option.spec.input_schema_fingerprint for option in prepared
+            option.spec.committed_transform.source_schema_fingerprint
+            for option in prepared
         }
         models = tuple(option.spec.model_id for option in prepared)
         if len(schema_fingerprints) != 1 or len(models) != len(set(models)):

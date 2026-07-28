@@ -27,8 +27,8 @@ def _format_dims(dims) -> str:
 def _contract_shape_label(repeat, point_count, data_shape) -> str:
     """Spell the physical ``R × P × (*data_shape)`` tensor contract.
 
-    ``P`` is one storage dimension even when ``PointLayout`` maps its rows to
-    several logical scan axes.  Logical topology is presented separately; it
+    ``P`` is the one authored PointTable row dimension.  Logical grid topology
+    is presented separately; it
     must never make an ``(R, P, 1)`` scalar look like a higher-rank ndarray.
     """
 
@@ -44,8 +44,8 @@ def _contract_shape_label(repeat, point_count, data_shape) -> str:
 def describe_dataset_shape(schema, value=None) -> str:
     """Return the exact physical ``R × P × (*data_shape)`` display text.
 
-    ``P`` is ``PointLayout.storage_size`` even when several logical scan axes
-    describe those rows.  A scalar therefore reads ``R × P × (1)`` through its
+    ``P`` is ``PointTable.row_count`` regardless of its coordinate columns or
+    optional GridTopology.  A scalar therefore reads ``R × P × (1)`` through its
     declared singleton carrier; a two-dimensional image reads
     ``R × P × (H×W)``.  When a value is supplied, its full ndarray shape is
     checked against the same schema before any text is returned.  ``None`` is
@@ -68,7 +68,7 @@ def describe_dataset_shape(schema, value=None) -> str:
             )
     return _contract_shape_label(
         schema.repeat_axis.size,
-        schema.point_layout.storage_size,
+        schema.point_table.row_count,
         schema.cell_schema.data_shape,
     )
 

@@ -2,30 +2,21 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 import math
 from typing import Callable
 
 import numpy as np
 
-from .axis import AxisId, AxisSpec, SCALAR
-from .fit_contract import (
-    BoundFit,
-    FitCoordinateSource,
-    FitProblem,
-    FitResultBatch,
-    FitSpec,
-)
+from .axis import AxisSourceRef, AxisSpec, SCALAR
+from .fit_contract import BoundFit, FitProblem, FitResultBatch, FitSpec
 from .layout import AxisLayout, AxisLayoutMode
 from .schema import DatasetSchema
-from .transform import (
-    TransformedSchema,
-    apply_transform,
-)
-from .value import DatasetRevisionRef, OwnedSnapshot, expand_dataset_validity
+from .transform import apply_transform
+from .value import DatasetRevisionRef, OwnedSnapshot
 
 
 _CANONICAL_TRAVERSAL_CHUNK_SIZE = 65_536
+_POINT_TOKEN = object()
 
 
 def bind_fit(spec: FitSpec, expected_schema: DatasetSchema) -> BoundFit:
@@ -40,12 +31,7 @@ def build_fit_problem(
     *,
     abort_check: Callable[[], None] | None = None,
 ) -> FitProblem:
-    """Pack valid observations once into a compact ragged solver problem.
-
-    Missing logical batch coordinates are absent from ``batch_layout``.  A present
-    batch with no valid observations remains a row with a zero-length packed slice,
-    so the solver can report a cell failure without densifying sparse input.
-    """
+    """Pack valid observations without flattening or reinterpreting R/P authority."""
 
     if type(bound) is not BoundFit:
         raise TypeError("bound must be BoundFit")
@@ -54,124 +40,87 @@ def build_fit_problem(
     if abort_check is not None and not callable(abort_check):
         raise TypeError("abort_check must be callable or None")
     _check_abort(abort_check)
-    if snapshot.ref.schema_fingerprint != bound.spec.input_schema_fingerprint:
+    source_fingerprint = bound.spec.committed_transform.source_schema_fingerprint
+    if snapshot.ref.schema_fingerprint != source_fingerprint:
         raise ValueError("snapshot schema fingerprint disagrees with BoundFit")
     if snapshot.block.schema != bound.expected_schema:
         raise ValueError("snapshot schema value disagrees with BoundFit expected schema")
-    if bound.effective_schema.dtype.kind not in "biuf":
-        raise TypeError("fit packing refuses complex observations; select a real component explicitly")
 
-    if bound.spec.committed_transform is None:
-        schema = bound.effective_schema
-        values = snapshot.block.values.reshape(schema.physical_shape)
-        validity = expand_dataset_validity(
-            snapshot.block.validity,
-            snapshot.block.schema,
-        ).reshape(schema.physical_shape)
-    else:
-        transformed = apply_transform(snapshot, bound.spec.committed_transform)
-        schema = transformed.schema
-        if schema != bound.effective_schema:
-            raise RuntimeError("fit binding and transform execution schemas disagree")
-        values = transformed.values
-        validity = transformed.expanded_validity()
+    transformed = apply_transform(snapshot, bound.spec.committed_transform)
+    schema = transformed.schema
+    if schema != bound.effective_schema:
+        raise RuntimeError("fit binding and transform execution schemas disagree")
+    values = transformed.values
+    validity = transformed.expanded_validity()
     _check_abort(abort_check)
 
-    (
-        fit_axes,
-        batch_axes,
-        cell_ids,
-        data_ids,
-        cell_batch_positions,
-        data_batch_positions,
-        data_fit_positions,
-        scalar_data_positions,
-        axis_indices,
-        row_groups,
-        data_batch_shape,
-        batch_layout,
-        present_counts,
-    ) = _schema_batch_plan(bound, abort_check)
-    coordinate_sources = bound.coordinate_sources
-    coordinate_source_by_id = dict(zip(bound.spec.fit_axis_ids, coordinate_sources))
-    data_dimension_indices = _data_fit_dimension_indices(
-        schema,
-        data_fit_positions,
-        coordinate_source_by_id,
-    )
+    entries, batch_layout = _batch_plan(bound)
     observations_parts: list[np.ndarray] = []
-    coordinate_parts: list[list[np.ndarray]] = [list() for _ in fit_axes]
+    coordinate_parts: list[list[np.ndarray]] = [
+        [] for _ in bound.spec.independent_sources
+    ]
+    present_counts: list[int] = []
     valid_counts: list[int] = []
     used_counts: list[int] = []
 
-    for row_list in row_groups.values():
+    point_groups = bound._effective_point_groups
+    for point_group_index, tensor_batch_indices in entries:
         _check_abort(abort_check)
-        row_ids = np.asarray(row_list, dtype=np.int64)
-        row_selector = _compact_row_selector(row_ids)
-        (
-            dimension_order,
-            dimension_indices,
-        ) = _canonical_observation_order(
-            schema,
-            row_ids,
-            axis_indices,
-            bound.spec.fit_axis_ids,
-            coordinate_source_by_id,
-            data_dimension_indices,
+        row_ids = np.asarray(
+            point_groups.group_member_ordinals[point_group_index],
+            dtype=np.int64,
         )
-        for data_multi in np.ndindex(data_batch_shape):
-            _check_abort(abort_check)
-            data_batch_values = {
-                data_ids[position]: int(data_multi[index])
-                for index, position in enumerate(data_batch_positions)
-            }
-            data_selectors = tuple(
+        batch_by_source = dict(
+            zip(
                 (
-                    data_batch_values[axis_id]
-                    if axis_id in data_batch_values
-                    else 0
-                    if position in scalar_data_positions
-                    else slice(None)
-                )
-                for position, axis_id in enumerate(data_ids)
+                    source
+                    for source in bound.spec.batch_sources
+                    if source.kind == AxisSourceRef.TENSOR
+                ),
+                tensor_batch_indices,
             )
-            selection = (row_selector, *data_selectors)
-            observation_view = values[selection]
-            validity_view = validity[selection]
-            selected, valid_count = _all_valid_positions(
-                observation_view,
-                validity_view,
-                dimension_order,
-                dimension_indices,
-                abort_check,
+        )
+        observation_view, validity_view, view_tokens = _observation_view(
+            bound,
+            values,
+            validity,
+            row_ids,
+            batch_by_source,
+        )
+        dimension_order = _canonical_dimension_order(bound, view_tokens)
+        selected = _valid_positions(
+            validity_view,
+            dimension_order,
+            abort_check,
+        )
+        valid_count = int(selected.size)
+        physical_multi = np.unravel_index(
+            selected,
+            observation_view.shape,
+            order="C",
+        )
+        coordinates = tuple(
+            _independent_coordinates(
+                bound,
+                source,
+                row_ids,
+                view_tokens,
+                physical_multi,
             )
-            _check_abort(abort_check)
-            used_count = int(selected.size)
-            observations_parts.append(
-                _float64_observations(np.take(observation_view, selected))
-            )
-            valid_counts.append(valid_count)
-            used_counts.append(used_count)
-
-            packed_indices = np.unravel_index(
-                selected,
-                observation_view.shape,
-                order="C",
-            )
-            selected_row_offsets = packed_indices[0]
-            selected_rows = row_ids[selected_row_offsets]
-            for fit_position, (axis, source) in enumerate(
-                zip(fit_axes, coordinate_sources)
-            ):
-                if axis.axis_id in cell_ids:
-                    logical = axis_indices[cell_ids.index(axis.axis_id)][selected_rows]
-                else:
-                    data_position = data_ids.index(axis.axis_id)
-                    fit_data_offset = data_fit_positions.index(data_position)
-                    logical = packed_indices[1 + fit_data_offset]
-                coordinate_parts[fit_position].append(
-                    _coordinates_for_indices(axis, source, logical)
-                )
+            for source in bound.spec.independent_sources
+        )
+        usable = np.ones(valid_count, dtype=bool)
+        for coordinate in coordinates:
+            usable &= np.isfinite(coordinate)
+        used = selected[usable]
+        observations_parts.append(
+            _float64_observations(np.take(observation_view, used))
+        )
+        for destination, coordinate in zip(coordinate_parts, coordinates):
+            destination.append(np.asarray(coordinate[usable], dtype=np.dtype("<f8")))
+        present_counts.append(int(observation_view.size))
+        valid_counts.append(valid_count)
+        used_counts.append(int(used.size))
 
     packed_observations = _concatenate_float64(observations_parts)
     packed_coordinates = tuple(
@@ -185,10 +134,11 @@ def build_fit_problem(
     return FitProblem(
         source_ref=snapshot.ref,
         spec=bound.spec,
-        fit_axis_specs=fit_axes,
-        batch_axis_specs=batch_axes,
+        fit_axis_specs=bound.fit_axis_specs,
+        batch_axis_specs=bound.batch_axis_specs,
+        point_groups=bound.point_groups,
         batch_layout=batch_layout,
-        value_unit=schema.value_unit,
+        value_unit=schema.cell_schema.value_unit,
         batch_offsets=offsets,
         independent_values=packed_coordinates,
         observations=packed_observations,
@@ -212,30 +162,22 @@ def validate_fit_result_source_binding(
     if not isinstance(source_schema, DatasetSchema):
         raise TypeError("source_schema must be DatasetSchema")
     bound = bind_fit(result.spec, source_schema)
-    (
-        fit_axes,
-        batch_axes,
-        _cell_ids,
-        _data_ids,
-        _cell_batch_positions,
-        _data_batch_positions,
-        _data_fit_positions,
-        _scalar_data_positions,
-        _axis_indices,
-        _row_groups,
-        _data_batch_shape,
-        batch_layout,
-        present_counts,
-    ) = _schema_batch_plan(bound, None)
+    entries, batch_layout = _batch_plan(bound)
+    present_counts = tuple(
+        _present_observation_count(bound, point_group_index)
+        for point_group_index, _tensor_indices in entries
+    )
     if result.source_ref != source_ref:
         raise ValueError("fit result source reference differs from source capture")
-    if result.fit_axis_specs != fit_axes:
+    if result.fit_axis_specs != bound.fit_axis_specs:
         raise ValueError("fit result axis specifications differ from source schema")
-    if result.batch_axis_specs != batch_axes:
+    if result.batch_axis_specs != bound.batch_axis_specs:
         raise ValueError("fit result batch axes differ from source schema")
+    if result.point_groups != bound.point_groups:
+        raise ValueError("fit result point groups differ from source schema")
     if result.batch_layout != batch_layout:
         raise ValueError("fit result batch layout differs from source schema")
-    if result.value_unit != bound.effective_schema.value_unit:
+    if result.value_unit != bound.effective_schema.cell_schema.value_unit:
         raise ValueError("fit result value unit differs from source schema")
     if not np.array_equal(
         result.present_observation_counts,
@@ -246,101 +188,67 @@ def validate_fit_result_source_binding(
         )
 
 
-def _schema_batch_plan(
+def _batch_plan(
     bound: BoundFit,
-    abort_check: Callable[[], None] | None,
-):
-    """Return the one schema-derived batch partition used by pack and load."""
-
-    schema = bound.effective_schema
-    fit_axes = tuple(schema.axis(axis_id) for axis_id in bound.spec.fit_axis_ids)
-    batch_axes = tuple(schema.axis(axis_id) for axis_id in bound.spec.batch_axis_ids)
-    cell_ids = tuple(axis.axis_id for axis in schema.cell_axes)
-    data_ids = tuple(axis.axis_id for axis in schema.data_axes)
-    cell_batch_positions = tuple(
-        position
-        for position, axis_id in enumerate(cell_ids)
-        if axis_id in bound.spec.batch_axis_ids
+) -> tuple[tuple[tuple[int, tuple[int, ...]], ...], AxisLayout]:
+    point_groups = bound._effective_point_groups
+    point_sources = point_groups.group_sources
+    tensor_sources = tuple(
+        source
+        for source in bound.spec.batch_sources
+        if source.kind == AxisSourceRef.TENSOR
     )
-    data_batch_positions = tuple(
-        position
-        for position, axis_id in enumerate(data_ids)
-        if axis_id in bound.spec.batch_axis_ids
+    tensor_axes = tuple(
+        bound.batch_axis_specs[bound.spec.batch_sources.index(source)]
+        for source in tensor_sources
     )
-    data_fit_positions = tuple(
-        position
-        for position, axis_id in enumerate(data_ids)
-        if axis_id in bound.spec.fit_axis_ids
-    )
-    scalar_data_positions = tuple(
-        position
-        for position, axis in enumerate(schema.data_axes)
-        if axis.role == SCALAR
-    )
-    axis_indices = tuple(
-        schema.cell_layout.axis_indices(position)
-        for position in range(len(schema.cell_axes))
-    )
-    data_batch_shape = tuple(
-        schema.data_axes[position].size for position in data_batch_positions
-    )
-    row_groups: OrderedDict[tuple[int, ...], list[int]] = OrderedDict()
-    for row in range(schema.cell_layout.storage_size):
-        if row % 1024 == 0:
-            _check_abort(abort_check)
-        key = tuple(
-            int(axis_indices[position][row])
-            for position in cell_batch_positions
-        )
-        row_groups.setdefault(key, []).append(row)
-
+    tensor_shape = tuple(axis.size for axis in tensor_axes)
+    tensor_combinations = tuple(np.ndindex(tensor_shape))
+    entries: list[tuple[int, tuple[int, ...]]] = []
     mapping: list[tuple[int, ...]] = []
-    present_counts: list[int] = []
-    fit_data_count = math.prod(
-        schema.data_axes[position].size for position in data_fit_positions
-    )
-    for cell_batch_key, row_list in row_groups.items():
-        cell_batch_values = {
-            cell_ids[position]: cell_batch_key[index]
-            for index, position in enumerate(cell_batch_positions)
-        }
-        for data_multi in np.ndindex(data_batch_shape):
-            data_batch_values = {
-                data_ids[position]: int(data_multi[index])
-                for index, position in enumerate(data_batch_positions)
-            }
+    for group_index in range(len(point_groups.group_member_ordinals)):
+        point_multi = _point_batch_multi(bound, group_index)
+        point_by_source = dict(zip(point_sources, point_multi))
+        for tensor_multi in tensor_combinations:
+            tensor_by_source = dict(zip(tensor_sources, tensor_multi))
             batch_multi = tuple(
-                cell_batch_values.get(axis_id, data_batch_values.get(axis_id))
-                for axis_id in bound.spec.batch_axis_ids
+                int(
+                    tensor_by_source[source]
+                    if source.kind == AxisSourceRef.TENSOR
+                    else point_by_source[source]
+                )
+                for source in bound.spec.batch_sources
             )
-            if any(value is None for value in batch_multi):
-                raise RuntimeError("batch axis partition failed")
-            mapping.append(tuple(int(value) for value in batch_multi))
-            present_counts.append(len(row_list) * fit_data_count)
-    batch_shape = tuple(axis.size for axis in batch_axes)
-    batch_layout = _batch_layout_from_mapping(batch_shape, tuple(mapping))
-    return (
-        fit_axes,
-        batch_axes,
-        cell_ids,
-        data_ids,
-        cell_batch_positions,
-        data_batch_positions,
-        data_fit_positions,
-        scalar_data_positions,
-        axis_indices,
-        row_groups,
-        data_batch_shape,
-        batch_layout,
-        tuple(present_counts),
-    )
+            entries.append((group_index, tuple(int(item) for item in tensor_multi)))
+            mapping.append(batch_multi)
+    logical_shape = tuple(axis.size for axis in bound.batch_axis_specs)
+    return tuple(entries), _batch_layout_from_mapping(logical_shape, tuple(mapping))
+
+
+def _point_batch_multi(bound: BoundFit, group_index: int) -> tuple[int, ...]:
+    groups = bound._effective_point_groups
+    if not groups.group_sources:
+        return ()
+    result: list[int] = []
+    for position, source in enumerate(groups.group_sources):
+        if source.kind == AxisSourceRef.POINT_ROWS:
+            result.append(group_index)
+            continue
+        if source.kind == AxisSourceRef.GRID_DIMENSION:
+            result.append(int(groups.group_addresses[group_index][position]))
+            continue
+        axis = bound.batch_axis_specs[bound.spec.batch_sources.index(source)]
+        assert axis.coordinates is not None
+        value = groups.group_values[group_index][position]
+        result.append(axis.coordinates.index(value))
+    return tuple(result)
 
 
 def _batch_layout_from_mapping(
     logical_shape: tuple[int, ...],
     mapping: tuple[tuple[int, ...], ...],
 ) -> AxisLayout:
-    """Retain C/F/product structure while preserving truly sparse holes."""
+    """Retain product structure while preserving genuinely sparse holes."""
 
     direct = AxisLayout.from_mapping(logical_shape, mapping)
     if direct.mode is not AxisLayoutMode.EXPLICIT or not mapping or len(logical_shape) < 2:
@@ -348,187 +256,183 @@ def _batch_layout_from_mapping(
     for split in range(1, len(logical_shape)):
         left_mapping = tuple(dict.fromkeys(multi[:split] for multi in mapping))
         right_mapping = tuple(dict.fromkeys(multi[split:] for multi in mapping))
-        product_mapping = tuple(
-            left + right for left in left_mapping for right in right_mapping
-        )
-        if product_mapping != mapping:
+        if tuple(left + right for left in left_mapping for right in right_mapping) != mapping:
             continue
-        left = _batch_layout_from_mapping(logical_shape[:split], left_mapping)
-        right = _batch_layout_from_mapping(logical_shape[split:], right_mapping)
-        return AxisLayout.product(left, right)
+        return AxisLayout.product(
+            _batch_layout_from_mapping(logical_shape[:split], left_mapping),
+            _batch_layout_from_mapping(logical_shape[split:], right_mapping),
+        )
     return direct
 
 
-def _coordinates_for_indices(
-    axis: AxisSpec,
-    source: FitCoordinateSource,
-    logical_indices: np.ndarray,
-) -> np.ndarray:
-    indices = np.asarray(logical_indices, dtype=np.int64)
-    if source is FitCoordinateSource.LOGICAL_INDEX:
-        return np.asarray(indices, dtype=np.float64) + axis.index_origin
-    assert axis.coordinates is not None
-    # Axis coordinates are validated once when the fit is bound.  Convert that
-    # axis-sized vector once and gather in NumPy; iterating millions of repeated
-    # camera indices in Python made coordinate packing slower than the fit.
-    declared = np.asarray(axis.coordinates, dtype=np.dtype("<f8"))
-    return np.take(
-        declared,
-        indices,
-    )
+def _observation_view(
+    bound: BoundFit,
+    values: np.ndarray,
+    validity: np.ndarray,
+    row_ids: np.ndarray,
+    batch_by_source: dict[AxisSourceRef, int],
+) -> tuple[np.ndarray, np.ndarray, tuple[object, ...]]:
+    values = _take_rows(values, row_ids)
+    validity = _take_rows(validity, row_ids)
+    schema = bound.effective_schema
+    requested_sources = {
+        *bound.spec.independent_sources,
+        *bound.spec.batch_sources,
+    }
+    repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+    selectors: list[int | slice] = []
+    tokens: list[object] = []
+    if repeat_source in batch_by_source:
+        selectors.append(batch_by_source[repeat_source])
+    elif schema.repeat_axis.size == 1 and repeat_source not in requested_sources:
+        selectors.append(0)
+    else:
+        selectors.append(slice(None))
+        tokens.append(repeat_source)
+    selectors.append(slice(None))
+    tokens.append(_POINT_TOKEN)
+    for axis in schema.cell_schema.data_axes:
+        source = AxisSourceRef.tensor(axis.axis_id)
+        if axis.role == SCALAR:
+            selectors.append(0)
+        elif source in batch_by_source:
+            selectors.append(batch_by_source[source])
+        elif axis.size == 1 and source not in requested_sources:
+            selectors.append(0)
+        else:
+            selectors.append(slice(None))
+            tokens.append(source)
+    selection = tuple(selectors)
+    return values[selection], validity[selection], tuple(tokens)
 
 
-def _compact_row_selector(row_ids: np.ndarray) -> slice | np.ndarray:
+def _take_rows(array: np.ndarray, row_ids: np.ndarray) -> np.ndarray:
     if row_ids.size and np.array_equal(
         row_ids,
         np.arange(int(row_ids[0]), int(row_ids[0]) + row_ids.size, dtype=np.int64),
     ):
-        return slice(int(row_ids[0]), int(row_ids[-1]) + 1)
-    return row_ids
+        return array[:, int(row_ids[0]) : int(row_ids[-1]) + 1, ...]
+    return np.take(array, row_ids, axis=1)
 
 
-def _all_valid_positions(
-    observations: np.ndarray,
+def _canonical_dimension_order(
+    bound: BoundFit,
+    view_tokens: tuple[object, ...],
+) -> tuple[int, ...]:
+    desired: list[object] = []
+    point_inserted = False
+    for source in bound.spec.independent_sources:
+        if source.kind == AxisSourceRef.TENSOR:
+            desired.append(source)
+        elif not point_inserted:
+            desired.append(_POINT_TOKEN)
+            point_inserted = True
+    if not point_inserted:
+        desired.insert(0, _POINT_TOKEN)
+    if len(desired) != len(view_tokens) or set(desired) != set(view_tokens):
+        raise RuntimeError("Fit source coverage disagrees with the physical Dataset carrier")
+    return tuple(view_tokens.index(token) for token in desired)
+
+
+def _valid_positions(
     validity: np.ndarray,
     dimension_order: tuple[int, ...],
-    dimension_indices: tuple[np.ndarray | None, ...],
     abort_check: Callable[[], None] | None,
-) -> tuple[np.ndarray, int]:
+) -> np.ndarray:
     selected_parts: list[np.ndarray] = []
-    for start in range(0, observations.size, _CANONICAL_TRAVERSAL_CHUNK_SIZE):
+    for start in range(0, validity.size, _CANONICAL_TRAVERSAL_CHUNK_SIZE):
         _check_abort(abort_check)
-        stop = min(observations.size, start + _CANONICAL_TRAVERSAL_CHUNK_SIZE)
+        stop = min(validity.size, start + _CANONICAL_TRAVERSAL_CHUNK_SIZE)
         canonical_ranks = np.arange(start, stop, dtype=np.int64)
         physical_ranks = _canonical_ranks_to_physical(
             canonical_ranks,
-            observations.shape,
+            validity.shape,
             dimension_order,
-            dimension_indices,
         )
-        local_validity = np.asarray(np.take(validity, physical_ranks), dtype=bool)
-        if np.any(local_validity):
-            selected_parts.append(physical_ranks[local_validity])
-    selected = (
-        np.concatenate(selected_parts).astype(np.int64, copy=False)
-        if selected_parts
-        else np.empty(0, dtype=np.int64)
-    )
-    return selected, int(selected.size)
-
-
-def _canonical_observation_order(
-    schema: TransformedSchema,
-    row_ids: np.ndarray,
-    axis_indices: tuple[np.ndarray, ...],
-    fit_axis_ids: tuple[AxisId, ...],
-    coordinate_source_by_id: dict[AxisId, FitCoordinateSource],
-    data_dimension_indices: dict[AxisId, np.ndarray | None],
-) -> tuple[
-    tuple[int, ...],
-    tuple[np.ndarray | None, ...],
-]:
-    """Describe logical fit-axis order without allocating full coordinate grids."""
-
-    cell_ids = tuple(axis.axis_id for axis in schema.cell_axes)
-    data_ids = tuple(axis.axis_id for axis in schema.data_axes)
-    cell_fit_ids = tuple(axis_id for axis_id in fit_axis_ids if axis_id in cell_ids)
-    row_keys = tuple(
-        _coordinates_for_indices(
-            schema.axis(axis_id),
-            coordinate_source_by_id[axis_id],
-            axis_indices[cell_ids.index(axis_id)][row_ids],
-        )
-        for axis_id in cell_fit_ids
-    )
-    logical_row_keys = tuple(
-        axis_indices[cell_ids.index(axis_id)][row_ids]
-        for axis_id in cell_fit_ids
-    )
-    if not row_keys:
-        row_order = np.arange(row_ids.size, dtype=np.int64)
-    else:
-        # Declared coordinates define the physical ordering; logical indices are
-        # the deterministic tie-break when coordinates repeat.  Physical storage
-        # row order must never influence the packed observation order.
-        row_order = np.lexsort(
-            tuple(reversed((*row_keys, *logical_row_keys)))
-        ).astype(np.int64, copy=False)
-
-    row_token = "__fit_cell_rows__"
-    current_tokens: list[AxisId | str] = [row_token]
-    current_tokens.extend(axis_id for axis_id in data_ids if axis_id in fit_axis_ids)
-    if cell_fit_ids:
-        desired_tokens: list[AxisId | str] = []
-        inserted_rows = False
-        for axis_id in fit_axis_ids:
-            if axis_id in cell_ids:
-                if not inserted_rows:
-                    desired_tokens.append(row_token)
-                    inserted_rows = True
-            else:
-                desired_tokens.append(axis_id)
-    else:
-        desired_tokens = [row_token, *fit_axis_ids]
-    dimension_order = tuple(current_tokens.index(token) for token in desired_tokens)
-    dimension_indices: list[np.ndarray | None] = []
-    for token in desired_tokens:
-        if token == row_token:
-            dimension_indices.append(row_order)
-        else:
-            dimension_indices.append(data_dimension_indices[token])
-    return dimension_order, tuple(dimension_indices)
-
-
-def _data_fit_dimension_indices(
-    schema: TransformedSchema,
-    data_fit_positions: tuple[int, ...],
-    coordinate_source_by_id: dict[AxisId, FitCoordinateSource],
-) -> dict[AxisId, np.ndarray | None]:
-    """Resolve dense data-axis order once per packing operation."""
-
-    resolved: dict[AxisId, np.ndarray | None] = {}
-    for position in data_fit_positions:
-        axis = schema.data_axes[position]
-        source = coordinate_source_by_id[axis.axis_id]
-        if source is FitCoordinateSource.LOGICAL_INDEX:
-            resolved[axis.axis_id] = None
-            continue
-        values = _coordinates_for_indices(
-            axis,
-            source,
-            np.arange(axis.size, dtype=np.int64),
-        )
-        resolved[axis.axis_id] = (
-            None
-            if values.size < 2 or np.all(values[:-1] <= values[1:])
-            else np.argsort(values, kind="stable").astype(np.int64, copy=False)
-        )
-    return resolved
+        local = np.asarray(np.take(validity, physical_ranks), dtype=bool)
+        if np.any(local):
+            selected_parts.append(physical_ranks[local])
+    if not selected_parts:
+        return np.empty(0, dtype=np.int64)
+    return np.concatenate(selected_parts).astype(np.int64, copy=False)
 
 
 def _canonical_ranks_to_physical(
     canonical_ranks: np.ndarray,
     physical_shape: tuple[int, ...],
     dimension_order: tuple[int, ...],
-    dimension_indices: tuple[np.ndarray | None, ...],
 ) -> np.ndarray:
-    if canonical_ranks.size == 0:
-        return np.empty(0, dtype=np.int64)
     canonical_shape = tuple(physical_shape[axis] for axis in dimension_order)
     canonical_multi = np.unravel_index(canonical_ranks, canonical_shape, order="C")
     physical_multi: list[np.ndarray | None] = [None] * len(physical_shape)
     for canonical_axis, physical_axis in enumerate(dimension_order):
-        index_order = dimension_indices[canonical_axis]
-        physical_multi[physical_axis] = (
-            canonical_multi[canonical_axis]
-            if index_order is None
-            else index_order[canonical_multi[canonical_axis]]
-        )
+        physical_multi[physical_axis] = canonical_multi[canonical_axis]
     assert all(value is not None for value in physical_multi)
     return np.asarray(
         np.ravel_multi_index(tuple(physical_multi), physical_shape, order="C"),
         dtype=np.int64,
     )
+
+
+def _independent_coordinates(
+    bound: BoundFit,
+    source: AxisSourceRef,
+    row_ids: np.ndarray,
+    view_tokens: tuple[object, ...],
+    physical_multi: tuple[np.ndarray, ...],
+) -> np.ndarray:
+    if source.kind == AxisSourceRef.TENSOR:
+        axis = bound.fit_axis_specs[bound.spec.independent_sources.index(source)]
+        logical = physical_multi[view_tokens.index(source)]
+        return _axis_coordinates(axis, logical)
+    row_offsets = physical_multi[view_tokens.index(_POINT_TOKEN)]
+    effective_rows = row_ids[row_offsets]
+    schema = bound.effective_schema
+    if source.kind == AxisSourceRef.POINT_ORDINAL:
+        return np.asarray(
+            [bound._source_row_members[int(row)][0] for row in effective_rows],
+            dtype=np.dtype("<f8"),
+        )
+    if source.kind == AxisSourceRef.POINT_COORDINATE:
+        column = schema.point_table.column(source.axis_id)
+        return _optional_float64(column.values, effective_rows)
+    if source.kind == AxisSourceRef.GRID_DIMENSION:
+        topology = schema.grid_topology
+        assert topology is not None and source.axis_id in topology.dimension_ids
+        position = topology.dimension_ids.index(source.axis_id)
+        values = tuple(
+            topology.coordinate_domains[position][topology.row_to_cell[int(row)][position]]
+            for row in effective_rows
+        )
+        return _optional_float64(values, np.arange(len(values), dtype=np.int64))
+    raise RuntimeError(f"unsupported Fit independent source {source.kind}")
+
+
+def _axis_coordinates(axis: AxisSpec, logical_indices: np.ndarray) -> np.ndarray:
+    indices = np.asarray(logical_indices, dtype=np.int64)
+    if axis.coordinates is None:
+        return np.asarray(indices, dtype=np.dtype("<f8")) + axis.index_origin
+    return _optional_float64(axis.coordinates, indices)
+
+
+def _optional_float64(values, indices: np.ndarray) -> np.ndarray:
+    declared = np.asarray(
+        [np.nan if value is None else float(value) for value in values],
+        dtype=np.dtype("<f8"),
+    )
+    return np.take(declared, indices)
+
+
+def _present_observation_count(bound: BoundFit, point_group_index: int) -> int:
+    point_count = len(
+        bound._effective_point_groups.group_member_ordinals[point_group_index]
+    )
+    tensor_count = math.prod(
+        bound.fit_axis_specs[position].size
+        for position, source in enumerate(bound.spec.independent_sources)
+        if source.kind == AxisSourceRef.TENSOR
+    )
+    return point_count * tensor_count
 
 
 def _concatenate_float64(parts: list[np.ndarray]) -> np.ndarray:
@@ -539,11 +443,12 @@ def _concatenate_float64(parts: list[np.ndarray]) -> np.ndarray:
 
 def _float64_observations(values: np.ndarray) -> np.ndarray:
     source = np.asarray(values)
-    converted = np.asarray(source, dtype=np.float64)
-    if source.dtype.kind in "iu" and any(
-        int(float(value)) != int(value) for value in source.reshape(-1)
-    ):
-        raise ValueError("fit observation is not exactly float64-representable")
+    converted = np.asarray(source, dtype=np.dtype("<f8"))
+    if source.dtype.kind in "iu" and np.iinfo(source.dtype).bits > 53:
+        with np.errstate(invalid="ignore", over="ignore"):
+            round_trip = converted.astype(source.dtype)
+        if not np.array_equal(round_trip, source):
+            raise ValueError("fit observation is not exactly float64-representable")
     return converted
 
 

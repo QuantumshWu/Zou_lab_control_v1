@@ -21,7 +21,8 @@ from zlc_data import (
     DatasetRevision,
     DatasetSchema,
     OwnedSnapshot,
-    PointLayout,
+    PointColumn,
+    PointTable,
     StreamGenerationId,
     ValueSchema,
     dataset_cell_value,
@@ -100,7 +101,7 @@ class ReadoutDurationFidelityResult:
         if not isinstance(self.model_kind, ReadoutModelKind):
             raise TypeError("model_kind must be ReadoutModelKind")
         sha256_text(self.program_fingerprint, "program_fingerprint")
-        point_count = self.snapshot.block.schema.point_layout.storage_size
+        point_count = self.snapshot.block.schema.point_table.row_count
         values = (tuple(self.capture_terminals), tuple(self.pulse_terminals))
         if any(len(value) != point_count for value in values):
             raise ValueError("result evidence does not cover every duration point")
@@ -260,7 +261,7 @@ def _point_samples(model, site: int | None, block: DataBlock) -> np.ndarray:
 
     samples: list[np.ndarray] = []
     usable_sites = np.asarray(model.usable_sites.mask, dtype=bool)
-    if block.schema.point_layout.storage_size != 1:
+    if block.schema.point_table.row_count != 1:
         raise ValueError("readout-duration point capture must have one point cell")
     for repeat_index in range(block.schema.repeat_axis.size):
         frame = dataset_cell_value(block, repeat_index, 0)
@@ -283,18 +284,18 @@ def _result_snapshot(
     fidelities: tuple[float, ...],
     validity: tuple[bool, ...],
 ) -> OwnedSnapshot:
-    point_axis = AxisSpec(
+    duration_column = PointColumn(
         AxisId("readout_duration.duration"),
         "Detection time",
         SCAN_POINT,
-        len(durations),
+        PointColumn.NUMERIC,
         durations,
         "s",
     )
     schema = DatasetSchema(
         AxisSpec(AxisId("readout_duration.repeat"), "repeat", REPEAT, 1, (0,)),
-        (point_axis,),
-        PointLayout.rect_c((len(durations),)),
+        PointTable(len(durations), (duration_column,)),
+        None,
         ValueSchema.scalar(np.dtype("<f8"), "fidelity"),
     )
     identity = canonical_digest(

@@ -7,7 +7,7 @@ from PyQt5 import QtCore, QtWidgets
 from zlc_data import AxisLayout, AxisSpec
 from zlc_storage import canonical_text
 
-from ..fit_grid import coordinate_label
+from ..fit_projection import coordinate_label
 
 from .fluent import (
     FluentButton,

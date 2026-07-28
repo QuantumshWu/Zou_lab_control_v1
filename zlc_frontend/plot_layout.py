@@ -421,14 +421,13 @@ def optimal_grid_size_for_view(schema, view) -> str:
     initial recommendation has been consumed.
     """
 
-    from zlc_data import DatasetSchema
+    from zlc_data import AxisSourceRef, DatasetSchema, resolve_point_rows
     from .figure import (
         ViewSpec,
-        dataset_axes,
-        display_axis_indices,
-        grid_facet_axis,
+        grid_facet_source,
         validate_view_spec,
     )
+    from .figure.contract import _resolve_selected_point_ordinals
 
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
@@ -437,14 +436,23 @@ def optimal_grid_size_for_view(schema, view) -> str:
     if view.schema_fingerprint != schema.fingerprint:
         raise ValueError("Grid view belongs to another Dataset schema")
     validate_view_spec(schema, view)
-    facet_axis_id = grid_facet_axis(view)
-    facet_axis = next(
-        (axis for axis in dataset_axes(schema) if axis.axis_id == facet_axis_id),
-        None,
-    )
-    if facet_axis is None:  # validate_view_spec normally closes this invariant.
-        raise ValueError("Grid facet axis is absent from the Dataset schema")
-    cell_count = len(tuple(display_axis_indices(facet_axis, view.display_selections)))
+    source = grid_facet_source(view)
+    if source.kind == AxisSourceRef.TENSOR:
+        axis = next(
+            axis
+            for axis in (schema.repeat_axis, *schema.cell_schema.data_axes)
+            if axis.axis_id == source.axis_id
+        )
+        cell_count = axis.size
+    else:
+        cell_count = len(
+            resolve_point_rows(
+                schema.point_table,
+                schema.grid_topology,
+                point_ordinals=_resolve_selected_point_ordinals(schema, view),
+                group_sources=(source,),
+            ).group_member_ordinals
+        )
     if cell_count <= 0:
         raise ValueError("Grid facet selection must contain at least one cell")
     return optimal_grid_size_for_cells(cell_count)

@@ -333,7 +333,7 @@ def _validate_capture_metadata_contract(
         }
     ) != 1:
         raise ValueError("camera source lineage is inconsistent")
-    physical_cells = schema.repeat_axis.size * schema.point_layout.storage_size
+    physical_cells = schema.repeat_axis.size * schema.point_table.row_count
     if count != physical_cells:
         raise ValueError("capture metadata cardinality differs from DataBlock cells")
     if decoded_arm_spec.expected_frames != count:

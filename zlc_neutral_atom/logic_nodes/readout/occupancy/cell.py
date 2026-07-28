@@ -13,19 +13,14 @@ from dataclasses import dataclass
 import numpy as np
 
 from zlc_data import (
-    AxisLayout,
-    AxisSpec,
     ComponentValidity,
     DatasetRevisionRef,
     DatasetSchema,
     SPATIAL_X,
     SPATIAL_Y,
-    Selection,
     StreamGenerationId,
     Value,
     dataset_cell_value,
-    resolve_outer_cell_selection,
-    selection_for_outer_cell,
 )
 from zlc_storage import canonical_text
 
@@ -121,59 +116,52 @@ class OccupancyCellDomain:
         )
 
     @property
-    def axes(self) -> tuple[AxisSpec, ...]:
-        schema = self.occupancy_schema
-        return (schema.repeat_axis, *schema.point_axes)
+    def repeat_count(self) -> int:
+        return self.occupancy_schema.repeat_axis.size
 
     @property
-    def cell_layout(self) -> AxisLayout:
-        return self.occupancy_schema.cell_layout
+    def point_count(self) -> int:
+        return self.occupancy_schema.point_table.row_count
 
     @property
     def linear_cell_count(self) -> int:
-        return self.cell_layout.storage_size
+        return self.repeat_count * self.point_count
 
-    def resolve_selection(
+    def logical_point(self, point_ordinal: int) -> tuple[int, ...]:
+        if not 0 <= point_ordinal < self.point_count:
+            raise IndexError("occupancy point ordinal is out of range")
+        topology = self.occupancy_schema.grid_topology
+        return (
+            topology.row_to_cell[point_ordinal]
+            if topology is not None
+            else (point_ordinal,)
+        )
+
+    def resolve_address(
         self,
-        selection: Selection | None,
+        address: DatasetCellAddress,
     ) -> tuple[int, int, tuple[int, ...]]:
-        schema = self.occupancy_schema
-        return resolve_outer_cell_selection(
-            schema.repeat_axis,
-            schema.point_axes,
-            schema.point_layout,
-            selection,
-        )
+        if not isinstance(address, DatasetCellAddress):
+            raise TypeError("occupancy cell address must be DatasetCellAddress")
+        repeat_index = address.repeat_index
+        point_ordinal = address.point_ordinal
+        if not 0 <= repeat_index < self.repeat_count:
+            raise IndexError("occupancy repeat index is out of range")
+        return repeat_index, point_ordinal, self.logical_point(point_ordinal)
 
-    def selection_for_indices(
-        self,
-        repeat_index: int,
-        logical_point: tuple[int, ...],
-    ) -> Selection:
-        schema = self.occupancy_schema
-        selection = selection_for_outer_cell(
-            schema.repeat_axis,
-            schema.point_axes,
-            schema.point_layout,
-            repeat_index,
-            tuple(logical_point),
-        )
-        self.resolve_selection(selection)
-        return selection
-
-    def selection_at_linear(self, linear_index: int) -> Selection:
+    def address_at_linear(self, linear_index: int) -> DatasetCellAddress:
         if (
             isinstance(linear_index, bool)
             or not isinstance(linear_index, int)
             or not 0 <= linear_index < self.linear_cell_count
         ):
             raise IndexError("occupancy cell index is out of range")
-        multi = self.cell_layout.multi_index(linear_index)
-        return self.selection_for_indices(multi[0], tuple(multi[1:]))
+        repeat_index, point_ordinal = divmod(linear_index, self.point_count)
+        return DatasetCellAddress(repeat_index, point_ordinal)
 
-    def linear_index(self, selection: Selection) -> int:
-        repeat_index, _point_storage, logical = self.resolve_selection(selection)
-        return self.cell_layout.storage_index((repeat_index, *logical))
+    def linear_index(self, address: DatasetCellAddress) -> int:
+        repeat_index, point_ordinal, _logical = self.resolve_address(address)
+        return repeat_index * self.point_count + point_ordinal
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +169,6 @@ class ExactOccupancyCellSource:
     """One exact same-shot Camera value and classified SITE value."""
 
     domain: OccupancyCellDomain
-    selection: Selection
     address: DatasetCellAddress
     logical_point: tuple[int, ...]
     image: Value
@@ -191,23 +178,18 @@ class ExactOccupancyCellSource:
     def __post_init__(self) -> None:
         if not isinstance(self.domain, OccupancyCellDomain):
             raise TypeError("domain must be OccupancyCellDomain")
-        if not isinstance(self.selection, Selection):
-            raise TypeError("selection must be Selection")
         if not isinstance(self.address, DatasetCellAddress):
             raise TypeError("address must be DatasetCellAddress")
         logical = tuple(self.logical_point)
-        repeat, point_storage, resolved_logical = resolve_outer_cell_selection(
-            self.domain.occupancy_schema.repeat_axis,
-            self.domain.occupancy_schema.point_axes,
-            self.domain.occupancy_schema.point_layout,
-            self.selection,
+        repeat, point_ordinal, resolved_logical = self.domain.resolve_address(
+            self.address
         )
         if (
             repeat != self.address.repeat_index
-            or point_storage != self.address.point_storage_index
+            or point_ordinal != self.address.point_ordinal
             or resolved_logical != logical
         ):
-            raise ValueError("cell selection, logical point, and address differ")
+            raise ValueError("cell logical point and address differ")
         if not isinstance(self.image, Value) or (
             self.image.schema != self.domain.source_schema.cell_schema
         ):
@@ -252,8 +234,8 @@ def _admit_cell_domain(
     occupancy_schema = artifact.occupied.schema
     if (
         source_schema.repeat_axis != occupancy_schema.repeat_axis
-        or source_schema.point_axes != occupancy_schema.point_axes
-        or source_schema.point_layout != occupancy_schema.point_layout
+        or source_schema.point_table != occupancy_schema.point_table
+        or source_schema.grid_topology != occupancy_schema.grid_topology
     ):
         raise ValueError("occupancy outer axes differ from the source capture")
     if source.frame_source.revision != artifact.occupied.revision:
@@ -324,7 +306,7 @@ def load_exact_occupancy_cell_source(
     occupancy_repository: OccupancyRepository,
     capture_repository: CaptureRepository,
     calibration_repository: CalibrationRepository,
-    selection: Selection | None,
+    address: DatasetCellAddress | None,
     *,
     expected_domain_identity: (
         tuple[str, str, StreamGenerationId, StreamGenerationId] | None
@@ -342,22 +324,11 @@ def load_exact_occupancy_cell_source(
         expected = tuple(expected_domain_identity)
         if expected != domain.identity:
             raise ValueError("occupancy artifact changed after navigation inspection")
-    repeat_index, point_storage_index, logical_point = (
-        resolve_outer_cell_selection(
-            domain.occupancy_schema.repeat_axis,
-            domain.occupancy_schema.point_axes,
-            domain.occupancy_schema.point_layout,
-            selection,
-        )
-    )
-    canonical_selection = selection_for_outer_cell(
-        domain.occupancy_schema.repeat_axis,
-        domain.occupancy_schema.point_axes,
-        domain.occupancy_schema.point_layout,
-        repeat_index,
-        logical_point,
-    )
-    address = DatasetCellAddress(repeat_index, point_storage_index)
+    if address is None:
+        if domain.linear_cell_count != 1:
+            raise ValueError("occupancy cell address is required for a multi-cell Dataset")
+        address = domain.address_at_linear(0)
+    repeat_index, point_ordinal, logical_point = domain.resolve_address(address)
     sample = source.frame_source.read(address)
     if sample.image.schema != domain.source_schema.cell_schema:
         raise ValueError("exact source frame differs from the admitted frame schema")
@@ -366,7 +337,7 @@ def load_exact_occupancy_cell_source(
     occupied = dataset_cell_value(
         artifact.occupied,
         repeat_index,
-        point_storage_index,
+        point_ordinal,
     )
     if not isinstance(occupied.validity, ComponentValidity) or (
         occupied.validity.axis_ids != (site_axis.axis_id,)
@@ -376,7 +347,6 @@ def load_exact_occupancy_cell_source(
         raise ValueError("occupancy marks a calibration-invalid site as valid")
     return ExactOccupancyCellSource(
         domain,
-        canonical_selection,
         address,
         logical_point,
         sample.image,

@@ -18,7 +18,8 @@ from zlc_data import (
     BlockId,
     DatasetSchema,
     MONITOR_HISTORY,
-    PointLayout,
+    PointColumn,
+    PointTable,
     READOUT_EVENT,
     REPEAT,
     ValueSchema,
@@ -100,20 +101,6 @@ class CameraMonitorViewSpec:
             raise TypeError("dataset_edge must be FrozenDatasetEdge")
         if self.dataset_edge.cell_schedule is not None:
             raise ValueError("camera monitor view requires a schedule-free dataset edge")
-        schema = self.dataset_edge.schema
-        if (
-            schema.repeat_axis.size != 1
-            or len(schema.point_axes) != 2
-            or schema.point_axes[0].role != MONITOR_HISTORY
-            or schema.point_axes[1].role != READOUT_EVENT
-            or schema.point_layout
-            != PointLayout.rect_c(
-                (schema.point_axes[0].size, schema.point_axes[1].size)
-            )
-        ):
-            raise ValueError(
-                "camera monitor requires (R=1, MONITOR_HISTORY, READOUT_EVENT) storage"
-            )
 
 
 class CameraMonitorViewPort(Protocol):
@@ -410,6 +397,16 @@ class PreparedLiveCameraMeasurement:
             raise ValueError(
                 "camera monitor capability source differs from requested role"
             )
+        history_values = tuple(
+            history
+            for history in range(request.history_cycles)
+            for _event in range(request.frames_per_cycle)
+        )
+        event_values = tuple(
+            event
+            for _history in range(request.history_cycles)
+            for event in range(request.frames_per_cycle)
+        )
         schema = DatasetSchema(
             AxisSpec(
                 _MONITOR_REPEAT_AXIS_ID,
@@ -418,24 +415,26 @@ class PreparedLiveCameraMeasurement:
                 1,
                 (0,),
             ),
-            (
-                AxisSpec(
-                    _MONITOR_HISTORY_AXIS_ID,
-                    "newest-first monitor history",
-                    MONITOR_HISTORY,
-                    request.history_cycles,
-                ),
-                AxisSpec(
-                    _MONITOR_READOUT_EVENT_AXIS_ID,
-                    "readout event within monitor cycle",
-                    READOUT_EVENT,
-                    request.frames_per_cycle,
-                    tuple(range(request.frames_per_cycle)),
+            PointTable(
+                len(history_values),
+                (
+                    PointColumn(
+                        _MONITOR_HISTORY_AXIS_ID,
+                        "newest-first monitor history",
+                        MONITOR_HISTORY,
+                        PointColumn.NUMERIC,
+                        history_values,
+                    ),
+                    PointColumn(
+                        _MONITOR_READOUT_EVENT_AXIS_ID,
+                        "readout event within monitor cycle",
+                        READOUT_EVENT,
+                        PointColumn.NUMERIC,
+                        event_values,
+                    ),
                 ),
             ),
-            PointLayout.rect_c(
-                (request.history_cycles, request.frames_per_cycle)
-            ),
+            None,
             capability.payload_contract.value_schema,
         )
         self._edge = FrozenDatasetEdge(

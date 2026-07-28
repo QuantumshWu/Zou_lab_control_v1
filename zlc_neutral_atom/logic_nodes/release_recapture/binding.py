@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from zlc_data import AxisId, AxisSpec, PointLayout
+from zlc_data import AxisId, AxisSpec, GridTopology, PointTable
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import CalibrationArtifact, ResolvedCalibration
 from zlc_neutral_atom.logic_nodes.readout.measurement_values import scale_authored_value
 from zlc_neutral_atom.logic_nodes.readout.physical_context import (
@@ -211,8 +211,8 @@ def bind_release_recapture_camera(
     trigger_channel: str | None,
     repeat_axis: AxisSpec,
     readout_event_axis_id: AxisId,
-    scan_axes: tuple[AxisSpec, ...],
-    point_layout: PointLayout,
+    scan_point_table: PointTable,
+    scan_grid_topology: GridTopology | None,
     calibration: ResolvedCalibration,
 ) -> tuple[PulseDocument, TriggeredCameraBinding]:
     """Bind the shared two-image physical acquisition, once, for both domains."""
@@ -235,8 +235,8 @@ def bind_release_recapture_camera(
             repeat_axis=repeat_axis,
             readout_event_axis_id=readout_event_axis_id,
             readout_events_per_repeat=2,
-            scan_axes=scan_axes,
-            scan_point_layout=point_layout,
+            scan_point_table=scan_point_table,
+            scan_grid_topology=scan_grid_topology,
         ),
     )
     validate_live_release_recapture_calibration(binding, calibration)

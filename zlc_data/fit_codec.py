@@ -12,15 +12,18 @@ from zlc_storage.canonical import (
     exact_mapping as _exact_map,
 )
 
-from .axis import AxisId
 from .codec import (
     _require_typed_canonical,
+    axis_source_ref_from_tree,
+    axis_source_ref_to_tree,
     axis_from_tree,
     axis_layout_from_tree,
     axis_layout_to_tree,
     axis_to_tree,
     dataset_revision_ref_from_tree,
     dataset_revision_ref_to_tree,
+    resolved_point_rows_from_tree,
+    resolved_point_rows_to_tree,
 )
 from .fit_contract import (
     FitBatchStatus,
@@ -40,12 +43,13 @@ def fit_spec_to_tree(spec: FitSpec) -> dict[str, Any]:
         raise TypeError("spec must be FitSpec")
     return {
         "schema": FIT_SPEC_SCHEMA,
-        "input_schema_fingerprint": spec.input_schema_fingerprint,
-        "committed_transform": None
-        if spec.committed_transform is None
-        else committed_transform_to_tree(spec.committed_transform),
-        "fit_axis_ids": [axis_id.value for axis_id in spec.fit_axis_ids],
-        "batch_axis_ids": [axis_id.value for axis_id in spec.batch_axis_ids],
+        "committed_transform": committed_transform_to_tree(spec.committed_transform),
+        "independent_sources": [
+            axis_source_ref_to_tree(source) for source in spec.independent_sources
+        ],
+        "batch_sources": [
+            axis_source_ref_to_tree(source) for source in spec.batch_sources
+        ],
         "model_id": spec.model_id,
         "constraints": [_constraint_to_tree(item) for item in spec.constraints],
         "numeric_policy": _numeric_policy_to_tree(spec.numeric_policy),
@@ -57,29 +61,26 @@ def fit_spec_from_tree(tree: Any) -> FitSpec:
         tree,
         {
             "schema",
-            "input_schema_fingerprint",
             "committed_transform",
-            "fit_axis_ids",
-            "batch_axis_ids",
+            "independent_sources",
+            "batch_sources",
             "model_id",
             "constraints",
             "numeric_policy",
         },
         FIT_SPEC_SCHEMA,
     )
-    fit_axes = data["fit_axis_ids"]
-    batch_axes = data["batch_axis_ids"]
+    independent = data["independent_sources"]
+    batch = data["batch_sources"]
     constraints = data["constraints"]
-    if not isinstance(fit_axes, list) or not isinstance(batch_axes, list) or not isinstance(constraints, list):
-        raise ValueError("FitSpec axes and constraints must be lists")
-    transform = data["committed_transform"]
+    if not isinstance(independent, list) or not isinstance(batch, list) or not isinstance(constraints, list):
+        raise ValueError("FitSpec sources and constraints must be lists")
     spec = FitSpec(
-        input_schema_fingerprint=data["input_schema_fingerprint"],
-        committed_transform=(
-            None if transform is None else committed_transform_from_tree(transform)
+        committed_transform=committed_transform_from_tree(data["committed_transform"]),
+        independent_sources=tuple(
+            axis_source_ref_from_tree(value) for value in independent
         ),
-        fit_axis_ids=tuple(AxisId(value) for value in fit_axes),
-        batch_axis_ids=tuple(AxisId(value) for value in batch_axes),
+        batch_sources=tuple(axis_source_ref_from_tree(value) for value in batch),
         model_id=data["model_id"],
         constraints=tuple(_constraint_from_tree(value) for value in constraints),
         numeric_policy=_numeric_policy_from_tree(data["numeric_policy"]),
@@ -108,6 +109,7 @@ def _fit_result_batch_to_tree(result: FitResultBatch) -> dict[str, Any]:
         "fit_spec": fit_spec_to_tree(result.spec),
         "fit_axis_specs": [axis_to_tree(axis) for axis in result.fit_axis_specs],
         "batch_axis_specs": [axis_to_tree(axis) for axis in result.batch_axis_specs],
+        "point_groups": resolved_point_rows_to_tree(result.point_groups),
         "batch_layout": axis_layout_to_tree(result.batch_layout),
         "value_unit": result.value_unit,
         "parameter_values": result.parameter_values,
@@ -133,6 +135,7 @@ def _fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
         "fit_spec",
         "fit_axis_specs",
         "batch_axis_specs",
+        "point_groups",
         "batch_layout",
         "value_unit",
         "parameter_values",
@@ -177,6 +180,7 @@ def _fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
         spec=fit_spec_from_tree(data["fit_spec"]),
         fit_axis_specs=tuple(axis_from_tree(value) for value in data["fit_axis_specs"]),
         batch_axis_specs=tuple(axis_from_tree(value) for value in data["batch_axis_specs"]),
+        point_groups=resolved_point_rows_from_tree(data["point_groups"]),
         batch_layout=axis_layout_from_tree(data["batch_layout"]),
         value_unit=data["value_unit"],
         parameter_values=data["parameter_values"],

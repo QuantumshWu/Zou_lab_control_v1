@@ -192,15 +192,9 @@ ViewSpec:
 - Curve/Histogram/Image evaluator 消费同一 SourceViewBinding 语义。trailing spatial data axes 可直接形成 Image；普通 finite 非网格多维 scan、相关 `(x_i,y_i,z_i)` trajectory、重复点和 hysteresis 由 PointTable 原样支持。
 - adaptive/growing scan table 不属于当前 frozen finite baseline：bind 后增长明确拒绝，不隐含支持。
 
-`FitSpec` 复用同一个 source vocabulary，但不是 ViewSpec 的别名。Histogram 等 committed transform 会生成输入 schema 不存在的 effective axis，因此再增加一个只供 Fit independent coordinate 使用的精确引用：
+`FitSpec` 复用同一个 source vocabulary，但不是 ViewSpec 的别名。所有 source 都只相对同一个 `CommittedTransform.effective_output_schema` 解释；因此 Histogram 等 transform 生成的 axis 仍直接使用 `AxisSourceRef.tensor(axis_id)`，不得再增加一个重复携带 transform digest 的 wrapper：
 
 ```text
-TransformOutputAxisRef:
-  committed_transform_digest
-  effective_axis_id
-
-FitIndependentSource = AxisSourceRef | TransformOutputAxisRef
-
 CommittedTransform:
   source_schema_fingerprint
   exact_point_ordinals                     # 唯一 point-row selection payload
@@ -212,16 +206,16 @@ CommittedTransform:
 
 FitSpec:
   committed_transform
-  independent_sources: ordered tuple[FitIndependentSource, ...]  # model arity order
+  independent_sources: ordered tuple[AxisSourceRef, ...]  # model arity order
   batch_sources
   model + arguments
 ```
 
 - 多元模型可显式选择多个 `POINT_COORDINATE` source；它们共享同一批 rows，不产生 P²/P³。
-- Fit independent source 只允许 numeric `TENSOR`、`POINT_ORDINAL`、NUMERIC `POINT_COORDINATE`、NUMERIC `GRID_DIMENSION`，或严格绑定同一 committed transform digest/effective schema 的 numeric TransformOutputAxisRef；`POINT_ROWS`、TEXT/missing coordinate 不能当模型自变量。ordered tuple 严格保持 model arity 顺序，绝不 canonical-sort。
-- Histogram Fit 冻结 exact sample projection 与 HistogramSpec/actual bins 为 CommittedTransform；X 明确使用 `TransformOutputAxisRef(transform_digest, HISTOGRAM_BIN axis id)`，不能按名字、当前 renderer bins 或 input schema 猜。该 ref 目前只允许 independent_sources，不预建通用 transform-axis binding 系统。
+- Fit independent source 只允许 effective schema 中的 numeric `TENSOR`、`POINT_ORDINAL`、NUMERIC `POINT_COORDINATE` 或 NUMERIC `GRID_DIMENSION`；`POINT_ROWS`、TEXT/missing coordinate 不能当模型自变量。ordered tuple 严格保持 model arity 顺序，绝不 canonical-sort。
+- Histogram Fit 冻结 exact sample projection 与 HistogramSpec/actual bins 为唯一 CommittedTransform；X 明确使用相对其 effective schema 的 `AxisSourceRef.tensor(HISTOGRAM_BIN axis id)`，不能按名字、renderer 当前 bins 或 input schema 猜。FitSpec 已内嵌该 transform，故 source 不重复保存 digest。
 - Fit authority 只存一份：point-row filter 只在 `CommittedTransform.exact_point_ordinals`；tensor/grid selector、reducer 与 sample operation 只在它的 typed ordered operations；`CommittedTransform` 不再嵌套第二份 ViewSpec 或 row-selection object。`FitSpec` 只增加 model arity 与 batch grouping，不复制 transform payload。codec/bind 对重复或矛盾声明直接拒绝。
-- Fit role 闭集固定：`batch_sources`只允许`TENSOR`、`POINT_ROWS`（逐surviving row）、`POINT_COORDINATE`（按值分组）或`GRID_DIMENSION`。transform中TENSOR可SELECTED/REDUCED/SAMPLE，GRID_DIMENSION只可SELECTED/REDUCED，POINT_ROWS只可SAMPLE/REDUCED；POINT_ROWS SELECTED永远非法，P-row filter只在exact_point_ordinals。一个source不能同时属于independent/batch/sample/reduction/selection，raw/topology coordinate也不能双绑；POINT_ROWS SAMPLE/REDUCED与raw POINT_COORDINATE independent互斥，Histogram只能由其TransformOutputAxisRef作X。Fit bind只调用data-owned resolve_point_rows；来自Figure的Fit由frontend私有resolver翻译成该data plan。
+- Fit role 闭集固定：`batch_sources`只允许`TENSOR`、`POINT_ROWS`（逐surviving row）、`POINT_COORDINATE`（按值分组）或`GRID_DIMENSION`。transform中TENSOR可SELECTED/REDUCED/SAMPLE，GRID_DIMENSION只可SELECTED/REDUCED，POINT_ROWS只可SAMPLE/REDUCED；POINT_ROWS SELECTED永远非法，P-row filter只在exact_point_ordinals。一个source不能同时属于independent/batch/sample/reduction/selection，raw/topology coordinate也不能双绑；POINT_ROWS SAMPLE/REDUCED与raw POINT_COORDINATE independent互斥，Histogram X只能引用同一 committed effective schema 中的HISTOGRAM_BIN tensor source。Fit bind只调用data-owned resolve_point_rows；来自Figure的Fit由frontend私有resolver翻译成该data plan。
 - 未选择的 coordinate columns 只是 metadata，绝不自动变成 batch。用户选择 coordinate 为 group/batch 或 GridDimension 为 BATCH 时，Fit commit 冻结 exact group membership、batch address 和 row ordinals；重复值可包含多个 rows，稀疏组合写入 sparse batch layout。FitResultBatch 的 batch descriptor 保存 typed AxisSourceRef，而不是退化成 AxisId/string。
 - Fit translator 可由当前可见 View 预填，但点击时必须重新验证并冻结上述独立 authority；View 的动态 selector、latest 或 display reduction 不能直接进入 solver。
 
@@ -591,7 +585,7 @@ atomic publish exact canonical manifest + durability barrier
 
 - 先在现有data owner内原位替换point truth：P row ordinal是identity，coordinate是相关column，GridTopology只作可选metadata；不得在旧`point_axes/PointLayout`旁新增第二套resolver/descriptor/codec。
 - 在同一未完成cut内先用一个真实非grid producer→Dataset→Figure/Fit和一个真实grid producer证明同一模型；核心owner闭合后，其它producer/consumer只做机械call-site迁移，不再各自增加source wrapper。
-- 最后一个reader迁走时，同一cut删除被替代的Dataset point writer/reader/test。上述纵切只是实现顺序，不是可提交的兼容阶段；Git checkpoint/commit与产品验收点均不得有新旧public模型并存，也不得增加migration adapter。
+- 最后一个生产reader迁走时，同一cut删除被替代的Dataset point writer/reader；不得为了历史/phase tests保留compatibility。历史测试只在M7按当前物理/public contract重写或删除。上述纵切只是实现顺序，不是可提交的兼容阶段；Git checkpoint/commit与产品验收点均不得有新旧public模型并存，也不得增加migration adapter。
 
 ### M2：Signal transaction
 
@@ -603,7 +597,7 @@ atomic publish exact canonical manifest + durability barrier
 ### M3：Figure/View/Fit 收敛
 
 - 删除legacy repeat enum，建立直接SourceViewBinding、§4可执行default policy、EvaluatedProjectionFront+RenderedGeometry与唯一selector engine。
-- 建立single-authority CommittedTransform/FitSpec/TransformOutputAxisRef translator；Fit结果publication与overlay currentness分离。
+- 建立single-authority CommittedTransform/FitSpec translator；Fit source统一为相对effective schema解释的AxisSourceRef，Fit结果publication与overlay currentness分离。
 - 删除grid-specific renderer/preferences、frontend FigureFitLane、DataFigure第二executor与card-global Fit runtime；只保留composition-owned窄compute submit/cancel/completion seam及现有serial render owner。Monitor live/latest与Edit snapshot按surface私有状态分离，删除Fit隐式Hold。regular raster dispatch留在现有fit_problem/fit_solver内部，不新增public problem/lane/session类；overlay painter/blit不重画base。
 - 收敛typed PlotKind、字体、public barrel与Calibration/FigureViewer共用的frontend FigureIntent入口；每kind只留一个已有frontend canonical display FormSpec，不新增包装DTO，删除Workbench第二套relim/limits。bool/choice/nullable numeric按§6.4统一投影，leaf ui反向Workbench imports同切片清除。
 

@@ -22,6 +22,7 @@ from zlc_data import (
     AxisSpec,
     CoordinateFrameId,
     DatasetSchema,
+    PointColumn,
     ValueSchema,
 )
 from zlc_storage import (
@@ -168,55 +169,75 @@ class CalibrationCaptureLayout:
         object.__setattr__(self, "reference_event_indices", references)
         object.__setattr__(self, "readout_event_index", readout)
 
-    def _axis_position(self, schema: DatasetSchema) -> tuple[int, AxisSpec]:
+    def _event_column(self, schema: DatasetSchema) -> PointColumn:
         if not isinstance(schema, DatasetSchema):
             raise TypeError("schema must be DatasetSchema")
-        readout_axes = tuple(
-            (position, axis)
-            for position, axis in enumerate(schema.point_axes)
-            if axis.role == READOUT_EVENT
+        readout_columns = tuple(
+            column
+            for column in schema.point_table.columns
+            if column.role == READOUT_EVENT
         )
-        if len(readout_axes) != 1:
-            raise ValueError("calibration schema must have exactly one READOUT_EVENT point axis")
-        position, axis = readout_axes[0]
-        if axis.axis_id != self.readout_event_axis_id:
+        if len(readout_columns) != 1:
+            raise ValueError(
+                "calibration schema must have exactly one READOUT_EVENT point column"
+            )
+        column = readout_columns[0]
+        if column.coordinate_id != self.readout_event_axis_id:
             raise ValueError("calibration layout names a different READOUT_EVENT AxisId")
         selected = self.reference_event_indices + (self.readout_event_index,)
-        if any(index >= axis.size for index in selected):
-            raise ValueError("calibration event index is outside the READOUT_EVENT axis")
-        return position, axis
+        if any(index not in column.values for index in selected):
+            raise ValueError("calibration event index is absent from the PointTable")
+        return column
 
     def _resolve(self, schema: DatasetSchema) -> _CalibrationCaptureJoin:
         """Join selected events by named context, never by filtered row position."""
 
-        event_position, _event_axis = self._axis_position(schema)
-        context_positions = tuple(
-            position
-            for position in range(len(schema.point_axes))
-            if position != event_position
+        event_column = self._event_column(schema)
+        context_columns = tuple(
+            column
+            for column in schema.point_table.columns
+            if column.coordinate_id != event_column.coordinate_id
         )
-        context_axis_ids = tuple(
-            schema.point_axes[position].axis_id for position in context_positions
+        context_axis_ids = tuple(column.coordinate_id for column in context_columns)
+        context_domains: tuple[dict[object, int], ...] = tuple(
+            {
+                value: index
+                for index, value in enumerate(dict.fromkeys(column.values))
+                if value is not None
+            }
+            for column in context_columns
         )
+        if any(None in column.values for column in context_columns):
+            raise ValueError("calibration context columns cannot contain missing values")
         selected_events = self.reference_event_indices + (self.readout_event_index,)
         event_slots = {
             event_index: slot for slot, event_index in enumerate(selected_events)
         }
         rows_by_context: dict[tuple[int, ...], list[int | None]] = {}
-        for storage_row in range(schema.point_layout.storage_size):
-            logical = schema.point_layout.multi_index(storage_row)
-            slot = event_slots.get(logical[event_position])
+        for point_ordinal in range(schema.point_table.row_count):
+            slot = event_slots.get(event_column.values[point_ordinal])
             if slot is None:
                 continue
-            context = tuple(logical[position] for position in context_positions)
+            context = tuple(
+                domain[column.values[point_ordinal]]
+                for column, domain in zip(
+                    context_columns,
+                    context_domains,
+                    strict=True,
+                )
+            )
             rows = rows_by_context.get(context)
             if rows is None:
                 rows = [None] * len(selected_events)
                 rows_by_context[context] = rows
-            rows[slot] = storage_row
+            if rows[slot] is not None:
+                raise ValueError(
+                    "calibration context contains a duplicate selected event"
+                )
+            rows[slot] = point_ordinal
         if not rows_by_context:
             raise ValueError("calibration selected events have no physical context rows")
-        context_indices = tuple(sorted(rows_by_context))
+        context_indices = tuple(rows_by_context)
         selected_rows = []
         for context in context_indices:
             rows = rows_by_context[context]
@@ -376,17 +397,15 @@ class FrameContract:
             readout_event_index,
             "readout_event_index",
         )
-        event_axis = descriptor._event_axis(schema)
-        if event_axis is None:
+        event_column = descriptor._event_column(schema)
+        if event_column is None:
             if index != 0:
                 raise ValueError("a capture without READOUT_EVENT axis only has event index 0")
         else:
-            if index >= event_axis[1].size:
-                raise ValueError("readout_event_index is outside the READOUT_EVENT axis")
-            if require_physical_event_witness and not np.any(
-                schema.point_layout.axis_indices(event_axis[0]) == index
-            ):
-                raise ValueError("selected readout event is absent from the physical PointLayout")
+            if require_physical_event_witness and index not in event_column[1].values:
+                raise ValueError(
+                    "selected readout event is absent from the physical PointTable"
+                )
         setting = descriptor.setting(index)
         return cls(
             binding=binding,

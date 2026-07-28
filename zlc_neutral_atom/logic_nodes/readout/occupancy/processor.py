@@ -229,12 +229,12 @@ def _require_occupancy_output_schemas(
         raise TypeError("occupancy output schemas must be DatasetSchema")
     if (
         counts_schema.repeat_axis,
-        counts_schema.point_axes,
-        counts_schema.point_layout,
+        counts_schema.point_table,
+        counts_schema.grid_topology,
     ) != (
         occupied_schema.repeat_axis,
-        occupied_schema.point_axes,
-        occupied_schema.point_layout,
+        occupied_schema.point_table,
+        occupied_schema.grid_topology,
     ):
         raise ValueError("occupancy outputs do not share one sampling domain")
     return _require_output_value_schemas(
@@ -352,15 +352,15 @@ def _resolve_occupancy_processor_schema_parts(
         raise ValueError("selected model differs from the frozen calibration choice")
     outer_axis_ids = {
         source_schema.repeat_axis.axis_id,
-        *(axis.axis_id for axis in source_schema.point_axes),
+        *(column.coordinate_id for column in source_schema.point_table.columns),
     }
     if site_axis.axis_id in outer_axis_ids:
         raise ValueError("SITE AxisId collides with a capture outer AxisId")
     counts_value, occupied_value = _output_schemas(frame_contract, site_axis)
     outer = (
         source_schema.repeat_axis,
-        source_schema.point_axes,
-        source_schema.point_layout,
+        source_schema.point_table,
+        source_schema.grid_topology,
     )
     return ResolvedOccupancyProcessorSchema(
         model,
@@ -430,16 +430,18 @@ def _resolve_committed_occupancy_structure(
     except AttributeError as error:
         raise TypeError("capture must be a raw CaptureArtifact") from error
     schema = source.schema
-    event_axes = tuple(
-        axis for axis in schema.point_axes if axis.role == READOUT_EVENT
+    event_columns = tuple(
+        column
+        for column in schema.point_table.columns
+        if column.role == READOUT_EVENT
     )
-    if len(event_axes) != 1 or event_axes[0].size != 1:
+    if len(event_columns) != 1 or tuple(dict.fromkeys(event_columns[0].values)) != (0,):
         raise ValueError(
-            "committed occupancy requires one singleton READOUT_EVENT axis"
+            "committed occupancy requires one singleton READOUT_EVENT point column"
         )
-    event_axis = event_axes[0]
-    if event_axis.axis_id != readout_event_axis_id or (
-        provenance.descriptor.readout_event_axis_id != event_axis.axis_id
+    event_column = event_columns[0]
+    if event_column.coordinate_id != readout_event_axis_id or (
+        provenance.descriptor.readout_event_axis_id != event_column.coordinate_id
     ):
         raise ValueError("capture and request name different READOUT_EVENT axes")
     artifact = calibration.artifact
@@ -452,7 +454,7 @@ def _resolve_committed_occupancy_structure(
         readout_event_index=0,
     )
     return _CommittedOccupancyBinding(
-        event_axis.axis_id,
+        event_column.coordinate_id,
         _resolve_occupancy_processor_schema_parts(
             calibration,
             schema,
@@ -750,7 +752,7 @@ def _analyze_committed_occupancy_resolved(
         schema,
         frame_source.revision,
         (
-            (cell.repeat_index, cell.point_storage_index, sample.image)
+            (cell.repeat_index, cell.point_ordinal, sample.image)
             for cell, sample in frame_source.iter_event_order()
         ),
         checkpoint=checkpoint,
@@ -797,7 +799,7 @@ def _apply_occupancy_snapshot(
                 point_index,
             ))
             for repeat_index in range(schema.repeat_axis.size)
-            for point_index in range(schema.point_layout.storage_size)
+            for point_index in range(schema.point_table.row_count)
         ),
     )
     reference = calibration.reference
@@ -845,8 +847,8 @@ def occupancy_rate_snapshot(occupied: OwnedSnapshot) -> OwnedSnapshot:
     )
     rate_schema = DatasetSchema(
         schema.repeat_axis,
-        schema.point_axes,
-        schema.point_layout,
+        schema.point_table,
+        schema.grid_topology,
         ValueSchema.scalar(np.dtype("<f8"), None),
     )
     block = DataBlock(
@@ -995,23 +997,17 @@ def _evaluate_occupancy_processor(
     if coverage.written_cells != 1 or coverage.total_cells != 1:
         raise ValueError("Occupancy requires one committed public Camera frame cell")
     if source_schema.repeat_axis.size != 1 or (
-        source_schema.point_layout.storage_size != 1
+        source_schema.point_table.row_count != 1
     ):
         raise ValueError("Occupancy requires a public Camera frame with R=1 and P=1")
     point_index = 0
-    logical_point = source_schema.point_layout.multi_index(point_index)
+    logical_point = (
+        source_schema.grid_topology.row_to_cell[point_index]
+        if source_schema.grid_topology is not None
+        else (point_index,)
+    )
     selection = Selection(
-        (
-            IndexSelection(source_schema.repeat_axis.axis_id, 0),
-            *(
-                IndexSelection(axis.axis_id, index)
-                for axis, index in zip(
-                    source_schema.point_axes,
-                    logical_point,
-                    strict=True,
-                )
-            ),
-        )
+        (IndexSelection(source_schema.repeat_axis.axis_id, 0),)
     )
     reference = calibration.reference
     join_digest = canonical_digest(

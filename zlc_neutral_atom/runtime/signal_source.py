@@ -16,10 +16,10 @@ from zlc_data import (
     INVALID,
     VALID,
     REPEAT,
-    SCAN_POINT,
     AxisId,
     AxisSpec,
     BlockId,
+    CellValidity,
     CommittedTransform,
     ComponentValidity,
     DataBlock,
@@ -30,11 +30,9 @@ from zlc_data import (
     DatasetSchema,
     Invalid,
     OwnedSnapshot,
-    PointLayout,
-    RowComponentValidity,
+    PointTable,
     Selection,
     Valid,
-    ValidityContract,
     Value,
     ValueSchema,
     apply_transform,
@@ -77,13 +75,7 @@ _SIGNAL_REPEAT_AXIS = AxisSpec(
     1,
     (0,),
 )
-_SIGNAL_POINT_AXIS = AxisSpec(
-    AxisId("zlc_neutral_atom.signal-event.point"),
-    "signal event point",
-    SCAN_POINT,
-    1,
-    (0,),
-)
+_SIGNAL_POINT_AXIS_ID = AxisId("zlc_neutral_atom.signal-event.point")
 
 
 class SignalAssociationUnavailable(RuntimeError):
@@ -932,13 +924,17 @@ def authoritative_signal_event_source(
 def _reject_outer_axis_transform(spec: DataTransformSpec) -> None:
     protected = {
         _SIGNAL_REPEAT_AXIS.axis_id,
-        _SIGNAL_POINT_AXIS.axis_id,
+        _SIGNAL_POINT_AXIS_ID,
     }
     for operation in spec.operations:
         axis_ids = (
             tuple(term.axis_id for term in operation.terms)
             if isinstance(operation, Selection)
-            else operation.axis_ids
+            else tuple(
+                source.axis_id
+                for source in operation.sources
+                if source.axis_id is not None
+            )
         )
         if any(axis_id in protected for axis_id in axis_ids):
             raise ValueError(
@@ -949,14 +945,14 @@ def _reject_outer_axis_transform(spec: DataTransformSpec) -> None:
 def _signal_dataset_schema(value_schema: ValueSchema) -> DatasetSchema:
     if any(
         axis.axis_id
-        in {_SIGNAL_REPEAT_AXIS.axis_id, _SIGNAL_POINT_AXIS.axis_id}
+        in {_SIGNAL_REPEAT_AXIS.axis_id, _SIGNAL_POINT_AXIS_ID}
         for axis in value_schema.data_axes
     ):
         raise ValueError("signal ValueSchema uses a reserved carrier AxisId")
     return DatasetSchema(
         _SIGNAL_REPEAT_AXIS,
-        (_SIGNAL_POINT_AXIS,),
-        PointLayout.rect_c((1,)),
+        PointTable(1),
+        None,
         value_schema,
     )
 
@@ -968,23 +964,14 @@ def _resolve_signal_projection_output(
     input_dataset_schema = _signal_dataset_schema(input_value_schema)
     transformed = resolve_transformed_schema(input_dataset_schema, transform)
     if (
-        transformed.cell_axes != (_SIGNAL_REPEAT_AXIS, _SIGNAL_POINT_AXIS)
-        or transformed.cell_layout != input_dataset_schema.cell_layout
+        transformed.repeat_axis != _SIGNAL_REPEAT_AXIS
+        or transformed.point_table != input_dataset_schema.point_table
+        or transformed.grid_topology is not None
     ):
         raise ValueError(
             "signal projection must preserve its synthetic repeat/point carrier"
         )
-    validity_contract = (
-        ValidityContract.components(*transformed.validity_axis_ids)
-        if transformed.validity_axis_ids
-        else ValidityContract.value()
-    )
-    return ValueSchema(
-        transformed.data_axes,
-        validity_contract,
-        transformed.dtype,
-        transformed.value_unit,
-    )
+    return transformed.cell_schema
 
 
 def _apply_signal_value_transform(
@@ -1026,19 +1013,19 @@ def _apply_signal_value_transform(
     transformed_validity = transformed.validity
     if isinstance(transformed_validity, (Valid, Invalid)):
         value_validity = transformed_validity
-    elif not isinstance(transformed_validity, RowComponentValidity):
-        raise TypeError("transformed signal validity has an unsupported type")
-    elif transformed_validity.axis_ids:
+    elif isinstance(transformed_validity, DatasetComponentValidity):
         value_validity = ComponentValidity(
             transformed_validity.axis_ids,
-            transformed_validity.mask[0],
+            transformed_validity.mask[0, 0],
         )
-    else:
+    elif isinstance(transformed_validity, CellValidity):
         value_validity = (
-            VALID if bool(transformed_validity.mask[0]) else INVALID
+            VALID if bool(transformed_validity.mask[0, 0]) else INVALID
         )
+    else:  # pragma: no cover - Dataset validity is closed above
+        raise TypeError("transformed signal validity has an unsupported type")
     return Value(
-        transformed.values[0],
+        transformed.values[0, 0],
         value_validity,
         output_value_schema,
     )

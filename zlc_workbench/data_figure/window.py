@@ -11,7 +11,7 @@ import time
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_data import (
-    AxisId,
+    AxisSourceRef,
     FitCancelled,
     FitDeadlineExceeded,
     FitResultBatch,
@@ -183,8 +183,8 @@ class DataFigureWindow(FrozenRasterWindow):
         self._setting_display: FluentRevisionedFormEditor | None = None
         self._export_commit_lock = threading.Lock()
         self._visible_transient_fit_result_owner: FitResultBatch | None = None
-        self._fit_axis_ids: tuple[AxisId, ...] = ()
-        self._fit_axis_roles: tuple[tuple[AxisId, AxisViewRole], ...] = ()
+        self._fit_sources: tuple[AxisSourceRef, ...] = ()
+        self._fit_axis_roles: tuple[tuple[AxisSourceRef, AxisViewRole], ...] = ()
         self._visible_fit_result_identity: str | None = None
         self._grid_overview: DataFigureGridOverview | None = None
         self._visible_figure: DataFigure | None = None
@@ -531,20 +531,18 @@ class DataFigureWindow(FrozenRasterWindow):
             )
             return
         panel_index, region = hits[0]
-        if region.focus_selection is None:
-            raise RuntimeError("typed grid region lost its exact selection")
         grid_display = overview.display_state
         if isinstance(grid_display, FacetedHistogramDisplayState):
-            display = grid_display.display_for(region.focus_selection)
+            display = grid_display.display_for(region.focus_address)
         elif isinstance(grid_display, MeterDisplayState):
             display = MeterDisplayState(
                 panel_index,
-                region.focus_selection,
+                region.focus_address,
                 grid_display.revision,
             )
         elif grid_display is None:
             display = (
-                MeterDisplayState(panel_index, region.focus_selection)
+                MeterDisplayState(panel_index, region.focus_address)
                 if overview.intent is ViewIntent.METER
                 else default_data_figure_display_state(overview.intent)
             )
@@ -552,7 +550,7 @@ class DataFigureWindow(FrozenRasterWindow):
             display = grid_display
         request = DataFigureGridFocusRequest(
             panel_index,
-            region.focus_selection,
+            region.focus_address,
             display,
             overview.histogram_home_x_limits,
         )
@@ -595,7 +593,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._typed_contract = None
         self._visible_fit_result_identity = None
         self._visible_transient_fit_result_owner = None
-        self._fit_axis_ids = ()
+        self._fit_sources = ()
         self._fit_axis_roles = ()
         self._fit_overlay_desired = None
         self._visible_figure = overview.figure
@@ -923,7 +921,6 @@ class DataFigureWindow(FrozenRasterWindow):
         self._fit_button.setEnabled(
             active
             and self._fit_bindings is not None
-            and self._grid_overview is None
             and self._view_family in ("curve", "image", "histogram")
         )
         self._interaction_switch.setEnabled(active)
@@ -950,11 +947,8 @@ class DataFigureWindow(FrozenRasterWindow):
         return pane is not None and self._tabs.indexOf(pane) >= 0
 
     def _fit_available_for_intent(self, intent: ViewIntent) -> bool:
-        """Keep display-faceted grid focus outside authority Fit preparation."""
-
         return bool(
             self._fit_bindings is not None
-            and self._grid_overview is None
             and intent in (ViewIntent.CURVE, ViewIntent.IMAGE, ViewIntent.HISTOGRAM)
         )
 
@@ -1033,7 +1027,7 @@ class DataFigureWindow(FrozenRasterWindow):
             bindings is None
             or pane is None
             or self._closing
-            or not self._fit_axis_ids
+            or not self._fit_sources
             or not self._fit_pane_is_open()
         ):
             return
@@ -1064,7 +1058,7 @@ class DataFigureWindow(FrozenRasterWindow):
             _prepare_fit_options,
             bindings.prepare,
             visible_figure,
-            self._fit_axis_ids,
+            self._fit_sources,
             self._fit_axis_roles,
             self._fit_selection_candidate,
             histogram_projection,
@@ -1147,11 +1141,9 @@ class DataFigureWindow(FrozenRasterWindow):
                 raise TypeError("Fit pane emitted another request type")
             if (
                 spec.model_id != current.spec.model_id
-                or spec.input_schema_fingerprint
-                != current.spec.input_schema_fingerprint
                 or spec.committed_transform != current.spec.committed_transform
-                or spec.fit_axis_ids != current.spec.fit_axis_ids
-                or spec.batch_axis_ids != current.spec.batch_axis_ids
+                or spec.independent_sources != current.spec.independent_sources
+                or spec.batch_sources != current.spec.batch_sources
                 or spec.numeric_policy != current.spec.numeric_policy
             ):
                 raise ValueError("Fit request differs from the prepared authority draft")
@@ -1705,7 +1697,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._display = expected_state
         self._visible_figure = front.figure
         self._view_family = front.intent.value.lower()
-        self._fit_axis_ids = front.fit_axis_ids
+        self._fit_sources = front.fit_sources
         self._fit_axis_roles = front.axis_roles
         self._visible_fit_result_identity = front.fit_result_identity
         self._visible_transient_fit_result_owner = (
@@ -2105,12 +2097,9 @@ class DataFigureWindow(FrozenRasterWindow):
                         or "initial encoded figure could not be presented"
                     )
             elif isinstance(result, DataFigureFront):
-                initial_display = self._initial_display
-                if initial_display is None:
-                    initial_display = default_data_figure_display_state(result.intent)
                 self._present_typed_front(
                     result,
-                    expected_state=initial_display,
+                    expected_state=result.state,
                     request_revision=self._request_revision,
                 )
                 if (

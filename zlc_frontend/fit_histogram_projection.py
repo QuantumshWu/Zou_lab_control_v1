@@ -1,12 +1,14 @@
-"""Exact formal Fit projections for one frozen HISTOGRAM Figure."""
+"""Exact formal Fit projection for one frozen HISTOGRAM Figure."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 
 import numpy as np
 
 from zlc_data import (
+    AxisSourceRef,
     FitBatchStatus,
     FitResultBatch,
     HISTOGRAM_BIN,
@@ -19,35 +21,93 @@ from zlc_data import (
 from zlc_storage import canonical_text
 
 from .figure import AxisViewRole, EvaluatedHistogram, ViewIntent
-from .fit_projection import fit_batch_storage_index
-from .histogram_display import HistogramBinProjection
 from .fit_editor import histogram_fit_transform
+from .fit_projection import fit_batch_storage_index
+from .histogram_display import (
+    FacetedHistogramDisplayState,
+    HistogramBinProjection,
+    HistogramDisplayState,
+)
 from .render import HistogramFitOverlay
 
 
-def transient_single_panel_histogram_fit_overlays(
+def _histogram_fit_display_state(
     figure,
-    projection: HistogramBinProjection,
+    state: HistogramDisplayState | FacetedHistogramDisplayState,
+    result: FitResultBatch,
+) -> tuple[
+    HistogramDisplayState | FacetedHistogramDisplayState,
+    tuple[float, float],
+]:
+    """Seed exact saved bins into the canonical Histogram display state."""
+
+    from .data_figure import DataFigure
+
+    if not isinstance(figure, DataFigure):
+        raise TypeError("histogram Fit display requires DataFigure")
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("histogram Fit display requires FitResultBatch")
+    operations = tuple(result.spec.committed_transform.spec.operations)
+    if not operations or not isinstance(operations[-1], HistogramSpec):
+        raise ValueError("histogram Fit result lacks an authoritative bin projection")
+    edges = np.asarray(operations[-1].bin_edges, dtype=np.dtype("<f8"))
+    cells = figure.evaluated.layers[0].cells
+    samples = tuple(
+        series.data.samples
+        for cell in cells
+        for series in cell.series
+        if isinstance(series.data, EvaluatedHistogram)
+    )
+    if not samples or len(samples) != sum(len(cell.series) for cell in cells):
+        raise ValueError("histogram Fit Figure contains another evaluated data kind")
+    all_boolean = all(values.dtype.kind == "b" for values in samples)
+    if all_boolean:
+        if not np.array_equal(
+            edges,
+            np.asarray((-0.5, 0.5, 1.5), dtype=np.dtype("<f8")),
+        ):
+            raise ValueError("boolean histogram Fit has noncanonical bin edges")
+        bin_count = (
+            state.display.bin_count
+            if isinstance(state, FacetedHistogramDisplayState)
+            else state.bin_count
+        )
+    else:
+        bin_count = len(edges) - 1
+    if isinstance(state, FacetedHistogramDisplayState):
+        state = replace(state, display=replace(state.display, bin_count=bin_count))
+    elif isinstance(state, HistogramDisplayState):
+        state = replace(state, bin_count=bin_count)
+    else:
+        raise TypeError("histogram Fit requires HistogramDisplayState")
+    return state, (float(edges[0]), float(edges[-1]))
+
+
+def _histogram_fit_presentation(
+    figure,
     result: FitResultBatch,
     *,
     result_identity: str,
+    display_state: HistogramDisplayState | FacetedHistogramDisplayState,
     check_cancelled: Callable[[], None] | None = None,
-) -> tuple[HistogramFitOverlay, ...]:
-    """Project a standard exact-source Fit result onto the painted histogram."""
+) -> tuple[
+    HistogramDisplayState | FacetedHistogramDisplayState,
+    HistogramBinProjection,
+    tuple[tuple[HistogramFitOverlay, ...], ...],
+]:
+    """Materialize exact saved bins and overlays for every canonical cell."""
 
     from .data_figure import DataFigure
 
     if not isinstance(figure, DataFigure):
         raise TypeError("histogram Fit projection requires DataFigure")
-    document = figure.document
-    evaluated = figure.evaluated
-    if not isinstance(projection, HistogramBinProjection):
-        raise TypeError("histogram Fit projection requires HistogramBinProjection")
     if not isinstance(result, FitResultBatch):
         raise TypeError("histogram Fit projection requires FitResultBatch")
     if check_cancelled is not None and not callable(check_cancelled):
         raise TypeError("check_cancelled must be callable or None")
     identity = canonical_text(result_identity, "histogram Fit result identity")
+    document = figure.document
+    evaluated = figure.evaluated
     if (
         document.document_id != evaluated.document_id
         or document.revision != evaluated.document_revision
@@ -62,112 +122,145 @@ def transient_single_panel_histogram_fit_overlays(
         document_layer.view.intent is not ViewIntent.HISTOGRAM
         or layer.layer_id != document_layer.layer_id
         or layer.dataset_id != document_layer.dataset_id
-        or len(layer.cells) != 1
+        or not layer.cells
     ):
         raise ValueError("histogram Fit layer differs from its document")
     evaluated_input = evaluated.inputs[0]
-    if evaluated_input.dataset_id != layer.dataset_id or result.source_ref != evaluated_input.ref:
+    if (
+        evaluated_input.dataset_id != layer.dataset_id
+        or result.source_ref != evaluated_input.ref
+    ):
         raise ValueError("histogram Fit result belongs to another source revision")
     source_schema = figure.datasets.resolve(document_layer.dataset_id).block.schema
     validate_fit_result_source_binding(result, evaluated_input.ref, source_schema)
     if len(result.fit_axis_specs) != 1 or result.fit_axis_specs[0].role != HISTOGRAM_BIN:
         raise ValueError("histogram Fit requires one declared HISTOGRAM_BIN axis")
-    transform = result.spec.committed_transform
-    operations = () if transform is None else tuple(transform.spec.operations)
+    operations = tuple(result.spec.committed_transform.spec.operations)
     if not operations or not isinstance(operations[-1], HistogramSpec):
         raise ValueError("histogram Fit result lacks an authoritative bin projection")
     histogram = operations[-1]
-    expected_transform = histogram_fit_transform(figure, projection)
-    if result.spec.committed_transform != expected_transform:
+    display_state, _home = _histogram_fit_display_state(
+        figure,
+        display_state,
+        result,
+    )
+    display = (
+        display_state.display
+        if isinstance(display_state, FacetedHistogramDisplayState)
+        else display_state
+    )
+    samples = tuple(
+        series.data.samples
+        for cell in layer.cells
+        for series in cell.series
+        if isinstance(series.data, EvaluatedHistogram)
+    )
+    projection = HistogramBinProjection._from_committed_edges(
+        samples,
+        bins=display.bin_count,
+        bin_edges=histogram.bin_edges,
+    )
+    painted_transform = histogram_fit_transform(figure, projection)
+    authority = result.spec.committed_transform
+    if (
+        painted_transform.source_schema_fingerprint
+        != authority.source_schema_fingerprint
+        or painted_transform.spec != authority.spec
+        or not set(painted_transform.exact_point_ordinals).issubset(
+            authority.exact_point_ordinals
+        )
+    ):
         raise ValueError(
             "histogram Fit authority differs from the exact painted Figure view"
         )
-    if histogram.bin_axis_id != result.fit_axis_specs[0].axis_id:
-        raise ValueError("histogram Fit axis differs from its committed projection")
-    if not np.array_equal(
-        np.asarray(histogram.bin_edges, dtype=np.float64),
-        np.asarray(projection.bin_edges, dtype=np.float64),
-    ):
-        raise ValueError("histogram Fit bin edges differ from the painted bars")
-    sample_ids = {
-        binding.axis_id
-        for binding in document_layer.view.axis_bindings
-        if binding.role is AxisViewRole.SAMPLE
-    }
-    if set(histogram.axis_ids) != sample_ids:
-        raise ValueError("histogram Fit sample axes differ from the painted Figure")
-    centers = (projection.bin_edges[:-1] + projection.bin_edges[1:]) * 0.5
     fit_axis = result.fit_axis_specs[0]
+    if histogram.bin_axis_id != fit_axis.axis_id:
+        raise ValueError("histogram Fit axis differs from its committed projection")
+    centers = (projection.bin_edges[:-1] + projection.bin_edges[1:]) * 0.5
     if fit_axis.size != len(centers) or any(
         fit_axis.coordinate_at(index) != float(value)
         for index, value in enumerate(centers)
     ):
         raise ValueError("histogram Fit coordinates differ from painted bin centres")
-
-    cell = layer.cells[0]
-    if len(cell.series) != len(projection.bin_counts):
+    sample_sources = {
+        binding.source
+        for binding in document_layer.view.source_bindings
+        if binding.role is AxisViewRole.SAMPLE
+    }
+    if set(histogram.sources) != sample_sources:
+        raise ValueError("histogram Fit sample axes differ from the painted Figure")
+    if sum(len(cell.series) for cell in layer.cells) != len(projection.bin_counts):
         raise ValueError("histogram Fit series differ from painted bars")
+
     coordinates = np.linspace(
         float(projection.bin_edges[0]),
         float(projection.bin_edges[-1]),
         400,
         dtype=np.dtype("<f8"),
     )
-    overlays = []
-    projected_axis_ids = set(histogram.axis_ids)
+    projected_sources = set(histogram.sources)
     for operation in operations[:-1]:
         if isinstance(operation, Selection):
-            projected_axis_ids.update(term.axis_id for term in operation.terms)
+            projected_sources.update(
+                AxisSourceRef.tensor(term.axis_id) for term in operation.terms
+            )
         elif isinstance(operation, ReductionSpec):
-            projected_axis_ids.update(operation.axis_ids)
-    for series in cell.series:
-        if check_cancelled is not None:
-            check_cancelled()
-        if not isinstance(series.data, EvaluatedHistogram):
-            raise ValueError("histogram Fit projection found a non-histogram series")
-        storage_index = fit_batch_storage_index(
-            result,
-            layer,
-            cell,
-            series,
-            projected_axis_ids=tuple(
-                sorted(projected_axis_ids, key=lambda item: item.value)
-            ),
-        )
-        if storage_index is None:
-            status = None
-            diagnostic = "NOT_PRESENT"
-            overlay_coordinates = np.empty((0,), dtype=np.dtype("<f8"))
-            components = ()
-        else:
-            status = result.statuses[storage_index]
-            diagnostic = status.value
-            if result.errors[storage_index]:
-                diagnostic = f"{diagnostic}: {result.errors[storage_index]}"
-            if status is FitBatchStatus.CONVERGED:
-                overlay_coordinates = coordinates
-                components = evaluate_fit_model_components(
-                    result.spec.model_id,
-                    (coordinates,),
-                    result.parameter_values[storage_index],
-                )
-                diagnostic = ""
-            else:
+            projected_sources.update(operation.sources)
+
+    used_storage: set[int] = set()
+    overlays_by_cell = []
+    for cell in layer.cells:
+        cell_overlays = []
+        for series in cell.series:
+            if check_cancelled is not None:
+                check_cancelled()
+            if not isinstance(series.data, EvaluatedHistogram):
+                raise ValueError("histogram Fit projection found a non-histogram series")
+            storage_index = fit_batch_storage_index(
+                result,
+                layer,
+                cell,
+                series,
+                projected_sources=tuple(sorted(projected_sources)),
+            )
+            if storage_index is None:
+                status = None
+                diagnostic = "NOT_PRESENT"
                 overlay_coordinates = np.empty((0,), dtype=np.dtype("<f8"))
                 components = ()
-        overlays.append(
-            HistogramFitOverlay(
-                result.source_ref,
-                identity,
-                series.batch_address,
-                storage_index,
-                status,
-                diagnostic,
-                overlay_coordinates,
-                components,
+            else:
+                if storage_index in used_storage:
+                    raise ValueError("two histogram series map to one Fit storage row")
+                used_storage.add(storage_index)
+                status = result.statuses[storage_index]
+                diagnostic = status.value
+                if result.errors[storage_index]:
+                    diagnostic = f"{diagnostic}: {result.errors[storage_index]}"
+                if status is FitBatchStatus.CONVERGED:
+                    overlay_coordinates = coordinates
+                    components = evaluate_fit_model_components(
+                        result.spec.model_id,
+                        (coordinates,),
+                        result.parameter_values[storage_index],
+                    )
+                    diagnostic = ""
+                else:
+                    overlay_coordinates = np.empty((0,), dtype=np.dtype("<f8"))
+                    components = ()
+            cell_overlays.append(
+                HistogramFitOverlay(
+                    result.source_ref,
+                    identity,
+                    series.batch_address,
+                    storage_index,
+                    status,
+                    diagnostic,
+                    overlay_coordinates,
+                    components,
+                )
             )
-        )
-    return tuple(overlays)
+        overlays_by_cell.append(tuple(cell_overlays))
+    return display_state, projection, tuple(overlays_by_cell)
 
 
-__all__ = ["transient_single_panel_histogram_fit_overlays"]
+__all__: list[str] = []

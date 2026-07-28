@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from bisect import bisect_left
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 import math
@@ -16,7 +15,6 @@ from zlc_data import (
     FitBatchStatus,
     FitResultBatch,
     immutable_array,
-    resolve_selection_indices,
     validate_fit_result_source_binding,
 )
 from zlc_storage import canonical_text
@@ -30,7 +28,7 @@ from .figure import (
     FigureDocument,
     ViewIntent,
 )
-from .figure.contract import _selection_fit_projection, dataset_axes
+from .figure.contract import _fit_display_selection_indices
 from .fit_projection import fit_batch_storage_index
 from .render import CurveFitOverlay
 
@@ -145,7 +143,7 @@ def transient_single_panel_curve_fit_overlay_plan(
         raise ValueError("typed CURVE projection requires exactly one fitted axis")
     if (
         document_layer.view.intent is not ViewIntent.CURVE
-        or document_layer.view.binding(result.fit_axis_specs[0].axis_id).role
+        or document_layer.view.binding(result.spec.independent_sources[0]).role
         is not AxisViewRole.X
     ):
         raise ValueError("cached CURVE view does not bind the fitted x axis")
@@ -153,16 +151,19 @@ def transient_single_panel_curve_fit_overlay_plan(
         AxisViewRole.BATCH,
         AxisViewRole.FACET,
         AxisViewRole.SELECTED,
-        AxisViewRole.SLIDER,
     }
     if any(
-        document_layer.view.binding(axis.axis_id).role not in allowed_batch_roles
+        document_layer.view.binding(source).role not in allowed_batch_roles
         and not (
             axis.size == 1
-            and document_layer.view.binding(axis.axis_id).role
+            and document_layer.view.binding(source).role
             is AxisViewRole.REDUCED
         )
-        for axis in result.batch_axis_specs
+        for source, axis in zip(
+            result.spec.batch_sources,
+            result.batch_axis_specs,
+            strict=True,
+        )
     ):
         raise ValueError("cached CURVE view does not uniquely bind fit batch axes")
 
@@ -172,7 +173,7 @@ def transient_single_panel_curve_fit_overlay_plan(
         curve = series.data
         if not isinstance(curve, EvaluatedCurve):
             raise ValueError("typed curve fit projection requires only CURVE series")
-        if curve.x_axis.axis_id != result.fit_axis_specs[0].axis_id:
+        if curve.x_axis.source != result.spec.independent_sources[0]:
             raise ValueError("evaluated curve x axis differs from fitted axis")
         source_span = _curve_source_span(source_schema, result, curve)
         storage_index = fit_batch_storage_index(result, layer, cell, series)
@@ -286,63 +287,33 @@ def _curve_source_span(
 ) -> tuple[int, int]:
     """Resolve the authority ROI into one contiguous cached-curve span."""
 
-    transform = result.spec.committed_transform
-    if transform is None:
-        return (0, curve.values.size)
-    _effective_schema, authority_selection = _selection_fit_projection(
-        source_schema,
-        result,
-    )
-    fit_axis_id = result.fit_axis_specs[0].axis_id
-    terms = tuple(
-        term for term in authority_selection.terms if term.axis_id == fit_axis_id
-    )
-    if len(terms) != 1:
-        raise ValueError("transient CURVE fit requires one authority range on x")
-    source_axis = next(
-        axis for axis in dataset_axes(source_schema) if axis.axis_id == fit_axis_id
-    )
-    selected, _drop = resolve_selection_indices(source_axis, terms[0])
-    selected_count = len(selected)
-    first_selected = selected[0]
-    start: int | None = None
-    matched = 0
-
-    def is_selected(raw_index: int) -> bool:
-        if isinstance(selected, range):
-            return raw_index in selected
-        position = bisect_left(selected, raw_index)
-        return position < selected_count and selected[position] == raw_index
-
-    for position, raw_index in enumerate(curve.x_axis.indices):
-        if start is None:
-            if raw_index == first_selected:
-                start = position
-                matched = 1
-            elif is_selected(raw_index):
-                raise ValueError(
-                    "committed fit range is not contiguous in cached CURVE view"
-                )
-            continue
-        if matched < selected_count:
-            if raw_index != selected[matched]:
-                raise ValueError(
-                    "committed fit range is not contiguous in cached CURVE view"
-                )
-            matched += 1
-        elif is_selected(raw_index):
-            raise ValueError("cached CURVE fit-range indices are not unique")
-    if start is None or matched != selected_count:
+    source = result.spec.independent_sources[0]
+    selected = dict(_fit_display_selection_indices(source_schema, result)).get(source)
+    if selected is None:
+        positions = tuple(range(curve.values.size))
+    else:
+        position_by_index = {
+            source_index: position
+            for position, source_index in enumerate(curve.x_axis.indices)
+        }
+        try:
+            positions = tuple(position_by_index[index] for index in selected)
+        except KeyError as exc:
+            raise ValueError(
+                "CURVE Figure does not contain every selected Fit sample"
+            ) from exc
+    if not positions or positions != tuple(range(positions[0], positions[-1] + 1)):
         raise ValueError(
-            "cached CURVE view does not contain the complete committed fit range"
+            "CURVE Fit Selection is not one contiguous span in the displayed axis"
         )
-    stop = start + selected_count
+    start, stop = positions[0], positions[-1] + 1
     fit_axis = result.fit_axis_specs[0]
-    if fit_axis.size != selected_count or any(
-        curve.x_axis.coordinates[start + offset] != fit_axis.coordinate_at(offset)
-        for offset in range(selected_count)
+    coordinates = curve.x_axis.coordinates[start:stop]
+    if len(coordinates) != fit_axis.size or any(
+        coordinate != fit_axis.coordinate_at(index)
+        for index, coordinate in enumerate(coordinates)
     ):
-        raise ValueError("cached CURVE fit-range coordinates differ from FitResult")
+        raise ValueError("CURVE Fit coordinates differ from the displayed source span")
     return (start, stop)
 
 

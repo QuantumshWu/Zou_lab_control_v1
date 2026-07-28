@@ -250,7 +250,7 @@ class AutonomousScanExecution:
         validate_pulse_terminal_for_artifact(self.terminal, self.artifact)
         if not isinstance(self.source, SignalEventSequence):
             raise TypeError("source must be SignalEventSequence")
-        expected = self.program.repeat_count * self.program.point_table.point_layout.storage_size
+        expected = self.program.repeat_count * self.program.point_table.row_count
         if self.source.count != expected:
             raise ValueError("source event count differs from autonomous R by P")
 

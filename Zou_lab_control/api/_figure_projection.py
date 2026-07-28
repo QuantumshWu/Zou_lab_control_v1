@@ -52,7 +52,7 @@ def project_figure(
     source: object,
     *,
     intent,
-    selection,
+    point_ordinals,
     preferences,
     artifact_output: str | None,
     materialize: bool,
@@ -180,14 +180,14 @@ def project_figure(
         document = build_frozen_figure_document(
             frontend_source,
             intent=resolved_intent,
-            selection=selection,
+            point_ordinals=point_ordinals,
             preferences=resolved_preferences,
         )
         return document, None, fit_result
     figure = build_frozen_data_figure(
         frontend_source,
         intent=resolved_intent,
-        selection=selection,
+        point_ordinals=point_ordinals,
         preferences=resolved_preferences,
     )
     return figure.document, figure, fit_result
@@ -199,7 +199,7 @@ def data_figure_for_services(
     source: object,
     *,
     intent,
-    selection,
+    point_ordinals,
     preferences,
     artifact_output: str | None,
     draft_fit_result: FitResultBatch | None = None,
@@ -212,7 +212,7 @@ def data_figure_for_services(
         artifacts,
         source,
         intent=intent,
-        selection=selection,
+        point_ordinals=point_ordinals,
         preferences=preferences,
         artifact_output=artifact_output,
         materialize=True,

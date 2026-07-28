@@ -25,6 +25,7 @@ from zlc_data import (
     CoordinateFrameId,
     DatasetSchema,
     Invalid,
+    PointColumn,
     Valid,
     Value,
     ValuePayloadContract,
@@ -329,33 +330,33 @@ class CameraCaptureDescriptor:
                 return setting
         raise ValueError(f"capture descriptor has no setting for event index {index}")
 
-    def _event_axis(self, schema: DatasetSchema) -> tuple[int, AxisSpec] | None:
+    def _event_column(self, schema: DatasetSchema) -> tuple[int, PointColumn] | None:
         if not isinstance(schema, DatasetSchema):
             raise TypeError("schema must be DatasetSchema")
-        readout_axes = tuple(
-            (position, axis)
-            for position, axis in enumerate(schema.point_axes)
-            if axis.role == READOUT_EVENT
+        readout_columns = tuple(
+            (position, column)
+            for position, column in enumerate(schema.point_table.columns)
+            if column.role == READOUT_EVENT
         )
-        if len(readout_axes) > 1:
-            raise ValueError("DatasetSchema must not contain multiple READOUT_EVENT axes")
+        if len(readout_columns) > 1:
+            raise ValueError("DatasetSchema must not contain multiple READOUT_EVENT columns")
         if self.readout_event_axis_id is None:
-            if readout_axes:
-                raise ValueError("descriptor and schema disagree about a READOUT_EVENT axis")
+            if readout_columns:
+                raise ValueError("descriptor and schema disagree about a READOUT_EVENT column")
             return None
         matching = tuple(
-            (position, axis)
-            for position, axis in enumerate(schema.point_axes)
-            if axis.axis_id == self.readout_event_axis_id
+            (position, column)
+            for position, column in enumerate(schema.point_table.columns)
+            if column.coordinate_id == self.readout_event_axis_id
         )
         if len(matching) != 1 or matching[0][1].role != READOUT_EVENT:
-            raise ValueError("descriptor READOUT_EVENT AxisId is absent or has the wrong role")
-        if readout_axes != matching:
-            raise ValueError("schema contains a different READOUT_EVENT axis")
+            raise ValueError("descriptor READOUT_EVENT id is absent or has the wrong role")
+        if readout_columns != matching:
+            raise ValueError("schema contains a different READOUT_EVENT column")
         return matching[0]
 
     def validate_schema(self, schema: DatasetSchema) -> None:
-        event_axis = self._event_axis(schema)
+        event_column = self._event_column(schema)
         validate_camera_frame_schema_facts(
             spatial_y_axis_id=self.spatial_y_axis_id,
             spatial_x_axis_id=self.spatial_x_axis_id,
@@ -365,10 +366,15 @@ class CameraCaptureDescriptor:
             count_unit=self.count_unit,
             frame_schema=schema.cell_schema,
         )
-        if event_axis is None:
+        if event_column is None:
             expected_indices = (0,)
         else:
-            expected_indices = tuple(range(event_axis[1].size))
+            declared = tuple(dict.fromkeys(event_column[1].values))
+            expected_indices = tuple(range(len(declared)))
+            if declared != expected_indices:
+                raise ValueError(
+                    "READOUT_EVENT values must be canonical zero-based indices"
+                )
         if tuple(item.event_index for item in self.event_settings) != expected_indices:
             raise ValueError("event_settings must cover every READOUT_EVENT index exactly once")
 

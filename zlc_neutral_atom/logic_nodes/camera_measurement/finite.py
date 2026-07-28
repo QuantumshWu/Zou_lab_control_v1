@@ -6,7 +6,16 @@ from dataclasses import dataclass
 from typing import Callable
 import uuid
 
-from zlc_data import AxisId, AxisSpec, BlockId, DatasetSchema, PointLayout, READOUT_EVENT, REPEAT
+from zlc_data import (
+    AxisId,
+    AxisSpec,
+    BlockId,
+    DatasetSchema,
+    PointColumn,
+    PointTable,
+    READOUT_EVENT,
+    REPEAT,
+)
 from zlc_neutral_atom.capture.artifact import (
     CaptureRepository,
     compile_capture_artifact_pipeline,
@@ -301,11 +310,21 @@ def bind_finite_camera_measurement(
         events,
         tuple(range(events)),
     )
-    point_layout = PointLayout.rect_c((events,))
     schema = DatasetSchema(
         repeat_axis,
-        (event_axis,),
-        point_layout,
+        PointTable(
+            events,
+            (
+                PointColumn(
+                    event_axis.axis_id,
+                    event_axis.name,
+                    event_axis.role,
+                    PointColumn.NUMERIC,
+                    event_axis.coordinates or (),
+                ),
+            ),
+        ),
+        None,
         capability.payload_contract.value_schema,
     )
     schedule = DatasetCellSchedule.from_cells(

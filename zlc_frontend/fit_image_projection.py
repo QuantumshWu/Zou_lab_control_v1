@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 from numbers import Integral
 from typing import Callable
@@ -11,8 +10,6 @@ from zlc_data import (
     DatasetSchema,
     FitBatchStatus,
     FitResultBatch,
-    Selection,
-    resolve_selection_indices,
     validate_fit_result_source_binding,
 )
 from zlc_storage import canonical_text
@@ -23,22 +20,14 @@ from .figure import (
     EvaluatedImage,
     EvaluatedInput,
     FigureDocument,
-    FigureLayer,
     ViewIntent,
 )
-from .figure.contract import _selection_fit_projection, dataset_axes
+from .figure.contract import _fit_display_selection_indices
 from .fit_projection import (
     figure_panel_title,
     fit_batch_multi_index,
     fit_batch_storage_index,
-    fit_panel_selection,
-    iter_evaluated_figure_panels,
 )
-from .fit_grid import (
-    _fit_cell_address,
-    _fit_cell_summary_text,
-)
-from .image_view import ImageViewportTransform
 from .render import RadialGaussianImageFitOverlay
 
 
@@ -52,91 +41,6 @@ _RADIAL_GAUSSIAN_PARAMETERS = frozenset(
         "center_y",
     }
 )
-
-
-def _sorted_indices_contain_all(
-    available,
-    required,
-    *,
-    check_cancelled: Callable[[], None] | None = None,
-) -> bool:
-    """Prove ordered-index containment without allocating integer sets."""
-
-    if isinstance(available, range) and isinstance(required, range):
-        if len(required) == 0:
-            return True
-        if required[0] not in available or required[-1] not in available:
-            return False
-        return len(required) == 1 or required.step % available.step == 0
-    if isinstance(available, range):
-        for position, index in enumerate(required):
-            if check_cancelled is not None and position % 4096 == 0:
-                check_cancelled()
-            if index not in available:
-                return False
-        return True
-    available_iter = iter(available)
-    try:
-        current = next(available_iter)
-    except StopIteration:
-        return len(required) == 0
-    for position, target in enumerate(required):
-        if check_cancelled is not None and position % 4096 == 0:
-            check_cancelled()
-        while current < target:
-            try:
-                current = next(available_iter)
-            except StopIteration:
-                return False
-        if current != target:
-            return False
-    return True
-
-
-@dataclass(frozen=True, slots=True, eq=False)
-class RadialGaussianImageFitPanel:
-    """One exact evaluated IMAGE cell plus its bounded saved-fit projection."""
-
-    selection: Selection | None
-    image: EvaluatedImage
-    evaluated_input: EvaluatedInput
-    home_viewport: ImageViewportTransform
-    summary: str
-    fit_overlay: RadialGaussianImageFitOverlay
-
-    def __post_init__(self) -> None:
-        if self.selection is not None and not isinstance(self.selection, Selection):
-            raise TypeError("radial fit panel selection must be Selection or None")
-        if not isinstance(self.image, EvaluatedImage):
-            raise TypeError("radial fit panel image must be EvaluatedImage")
-        if not isinstance(self.evaluated_input, EvaluatedInput):
-            raise TypeError("radial fit panel input must be EvaluatedInput")
-        if not isinstance(self.home_viewport, ImageViewportTransform):
-            raise TypeError("radial fit panel home_viewport must be ImageViewportTransform")
-        if self.home_viewport.viewport_revision != 0:
-            raise ValueError("radial fit panel home_viewport must have revision zero")
-        if self.home_viewport.raster_shape != self.image.values.shape:
-            raise ValueError("radial fit panel home viewport differs from image geometry")
-        if (
-            self.home_viewport.x_axis.axis_id != self.image.x_axis.axis_id
-            or self.home_viewport.y_axis.axis_id != self.image.y_axis.axis_id
-        ):
-            raise ValueError("radial fit panel home axes differ from evaluated image axes")
-        canonical_text(self.summary, "radial fit panel summary")
-        if not isinstance(self.fit_overlay, RadialGaussianImageFitOverlay):
-            raise TypeError("radial fit panel overlay has the wrong type")
-        if self.fit_overlay.source_ref != self.evaluated_input.ref:
-            raise ValueError("radial fit panel overlay belongs to another input")
-        if self.fit_overlay.coordinate_frame != self.home_viewport.coordinate_frame:
-            raise ValueError("radial fit panel overlay belongs to another coordinate frame")
-
-    @property
-    def fit_storage_index(self) -> int | None:
-        return self.fit_overlay.batch_storage_index
-
-    @property
-    def caption(self) -> str:
-        return self.fit_overlay.caption
 
 
 def radial_gaussian_fit_geometry(
@@ -290,9 +194,9 @@ def transient_single_panel_radial_fit_overlay(
         raise ValueError("typed radial image projection requires two fitted axes")
     if (
         document_layer.view.intent is not ViewIntent.IMAGE
-        or document_layer.view.binding(result.fit_axis_specs[0].axis_id).role
+        or document_layer.view.binding(result.spec.independent_sources[0]).role
         is not AxisViewRole.IMAGE_X
-        or document_layer.view.binding(result.fit_axis_specs[1].axis_id).role
+        or document_layer.view.binding(result.spec.independent_sources[1]).role
         is not AxisViewRole.IMAGE_Y
     ):
         raise ValueError("cached IMAGE view does not bind the fitted x/y axes")
@@ -300,16 +204,19 @@ def transient_single_panel_radial_fit_overlay(
         AxisViewRole.BATCH,
         AxisViewRole.FACET,
         AxisViewRole.SELECTED,
-        AxisViewRole.SLIDER,
     }
     if any(
-        document_layer.view.binding(axis.axis_id).role not in allowed_batch_roles
+        document_layer.view.binding(source).role not in allowed_batch_roles
         and not (
             axis.size == 1
-            and document_layer.view.binding(axis.axis_id).role
+            and document_layer.view.binding(source).role
             is AxisViewRole.REDUCED
         )
-        for axis in result.batch_axis_specs
+        for source, axis in zip(
+            result.spec.batch_sources,
+            result.batch_axis_specs,
+            strict=True,
+        )
     ):
         raise ValueError("cached IMAGE view does not uniquely bind fit batch axes")
     if len(layer.cells) != 1 or len(layer.cells[0].series) != 1:
@@ -320,44 +227,36 @@ def transient_single_panel_radial_fit_overlay(
     if not isinstance(image, EvaluatedImage):
         raise ValueError("transient radial projection requires EvaluatedImage")
     if (
-        image.x_axis.axis_id != result.fit_axis_specs[0].axis_id
-        or image.y_axis.axis_id != result.fit_axis_specs[1].axis_id
+        image.x_axis.source != result.spec.independent_sources[0]
+        or image.y_axis.source != result.spec.independent_sources[1]
     ):
         raise ValueError("cached IMAGE axes differ from radial fit axes")
 
-    if result.spec.committed_transform is not None:
-        _effective, authority_selection = _selection_fit_projection(
-            source_schema,
-            result,
-        )
-        terms = {term.axis_id: term for term in authority_selection.terms}
-        for fit_axis, evaluated_axis in zip(
-            result.fit_axis_specs,
-            (image.x_axis, image.y_axis),
-            strict=True,
-        ):
+    selected_by_source = dict(_fit_display_selection_indices(source_schema, result))
+    for evaluated_axis, fit_axis, source in zip(
+        (image.x_axis, image.y_axis),
+        result.fit_axis_specs,
+        result.spec.independent_sources,
+        strict=True,
+    ):
+        selected = selected_by_source.get(source)
+        if selected is None:
+            coordinates = evaluated_axis.coordinates
+        else:
+            coordinate_by_index = dict(
+                zip(evaluated_axis.indices, evaluated_axis.coordinates, strict=True)
+            )
             try:
-                term = terms[fit_axis.axis_id]
+                coordinates = tuple(coordinate_by_index[index] for index in selected)
             except KeyError as exc:
                 raise ValueError(
-                    "transient radial fit requires an authority box on x/y"
+                    "IMAGE Figure does not contain every selected Fit sample"
                 ) from exc
-            selected, _drop = resolve_selection_indices(
-                next(
-                    axis
-                    for axis in dataset_axes(source_schema)
-                    if axis.axis_id == fit_axis.axis_id
-                ),
-                term,
-            )
-            if not _sorted_indices_contain_all(
-                evaluated_axis.indices,
-                selected,
-                check_cancelled=check_cancelled,
-            ):
-                raise ValueError(
-                    "cached IMAGE view does not contain the complete committed box"
-                )
+        if len(coordinates) != fit_axis.size or any(
+            coordinate != fit_axis.coordinate_at(index)
+            for index, coordinate in enumerate(coordinates)
+        ):
+            raise ValueError("IMAGE Fit coordinates differ from the displayed source")
 
     storage = fit_batch_storage_index(result, layer, cell, series)
     return radial_gaussian_fit_overlay(
@@ -369,137 +268,8 @@ def transient_single_panel_radial_fit_overlay(
     )
 
 
-def _radial_image_projection_context(
-    document: FigureDocument,
-    evaluated: EvaluatedFigureData,
-    result: FitResultBatch,
-    layer_id: str,
-    *,
-    artifact_identity: str,
-) -> tuple[FigureLayer, EvaluatedInput]:
-    """Validate and resolve the immutable owners shared by projection passes."""
-
-    if not isinstance(document, FigureDocument):
-        raise TypeError("document must be FigureDocument")
-    if not isinstance(evaluated, EvaluatedFigureData):
-        raise TypeError("evaluated must be EvaluatedFigureData")
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("result must be FitResultBatch")
-    layer_id = canonical_text(layer_id, "fit image layer_id")
-    identity = canonical_text(artifact_identity, "fit artifact identity")
-    if (
-        document.document_id != evaluated.document_id
-        or document.revision != evaluated.document_revision
-    ):
-        raise ValueError("document and evaluated data identities differ")
-    if result.spec.model_id != _RADIAL_GAUSSIAN_MODEL_ID:
-        raise ValueError("typed radial image panels require radial_gaussian_center")
-    document_layer = next(
-        (layer for layer in document.layers if layer.layer_id == layer_id),
-        None,
-    )
-    if document_layer is None:
-        raise ValueError(f"unknown figure layer {layer_id!r}")
-    evaluated_input = next(
-        (
-            item
-            for item in evaluated.inputs
-            if item.dataset_id == document_layer.dataset_id
-        ),
-        None,
-    )
-    if evaluated_input is None:
-        raise ValueError("evaluated figure omitted the fitted layer input")
-    if result.source_ref != evaluated_input.ref:
-        raise ValueError("saved fit and evaluated image input revisions differ")
-    if len(result.fit_axis_specs) != 2:
-        raise ValueError("radial image projection requires two fitted axes")
-    frames = tuple(axis.coordinate_frame for axis in result.fit_axis_specs)
-    if frames[0] is None or frames[0] != frames[1]:
-        raise ValueError("radial image fit axes require one coordinate frame")
-    return document_layer, evaluated_input
-
-
-def radial_gaussian_image_fit_panels(
-    document: FigureDocument,
-    evaluated: EvaluatedFigureData,
-    result: FitResultBatch,
-    layer_id: str,
-    *,
-    artifact_identity: str,
-) -> tuple[RadialGaussianImageFitPanel, ...]:
-    """Project every logical IMAGE panel, including sparse fit holes."""
-
-    document_layer, evaluated_input = _radial_image_projection_context(
-        document,
-        evaluated,
-        result,
-        layer_id,
-        artifact_identity=artifact_identity,
-    )
-
-    home_viewport = ImageViewportTransform(result.fit_axis_specs)
-    projected = []
-    for layer, cell, series_group in iter_evaluated_figure_panels(evaluated):
-        if layer.layer_id != layer_id:
-            continue
-        if layer.dataset_id != document_layer.dataset_id:
-            raise ValueError("evaluated fit layer belongs to another dataset")
-        if len(series_group) != 1 or not isinstance(
-            series_group[0].data,
-            EvaluatedImage,
-        ):
-            raise ValueError("radial saved-fit layer must contain only IMAGE panels")
-        series = series_group[0]
-        image = series.data
-        if (
-            home_viewport.x_axis.axis_id != image.x_axis.axis_id
-            or home_viewport.y_axis.axis_id != image.y_axis.axis_id
-        ):
-            raise ValueError(
-                "role-resolved radial fit axes differ from evaluated image x/y axes"
-            )
-        if home_viewport.raster_shape != image.values.shape:
-            raise ValueError("radial fit axes differ from evaluated image geometry")
-        multi_index = fit_batch_multi_index(result, layer, cell, series)
-        storage = fit_batch_storage_index(result, layer, cell, series)
-        selection = fit_panel_selection(layer, cell, series_group, result)
-        caption = figure_panel_title(document, layer, cell, series_group)
-        address = _fit_cell_address(result.batch_axis_specs, multi_index)
-        summary = (
-            _fit_cell_summary_text(result, storage, address)
-            if storage is not None
-            else (
-                f"{address}\n"
-                "storage row NOT_PRESENT · status NOT_PRESENT\n"
-                "observations present/valid/used N/A · evaluations N/A\n"
-                "parameters: N/A\n"
-                "Sparse logical cell has no saved fit row; no neighbouring row "
-                "was substituted."
-            )
-        )
-        overlay = radial_gaussian_fit_overlay(
-            result,
-            storage,
-            artifact_identity=artifact_identity,
-            caption=caption,
-            evaluated_input=evaluated_input,
-        )
-        projected.append(
-            RadialGaussianImageFitPanel(
-                selection,
-                image,
-                evaluated_input,
-                home_viewport,
-                summary,
-                overlay,
-            )
-        )
-    if not projected:
-        raise ValueError(f"layer {layer_id!r} produced no IMAGE panels")
-    return tuple(projected)
-
-
 __all__ = [
-    "RadialGaussianImageFitPanel",
+    "radial_gaussian_fit_geometry",
+    "radial_gaussian_fit_overlay",
+    "transient_single_panel_radial_fit_overlay",
 ]

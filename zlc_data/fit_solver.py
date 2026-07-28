@@ -175,6 +175,7 @@ def _fit_analysis(
         spec=problem.spec,
         fit_axis_specs=problem.fit_axis_specs,
         batch_axis_specs=problem.batch_axis_specs,
+        point_groups=problem.point_groups,
         batch_layout=problem.batch_layout,
         value_unit=problem.value_unit,
         parameter_values=parameter_values,

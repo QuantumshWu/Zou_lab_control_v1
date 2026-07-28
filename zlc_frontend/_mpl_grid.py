@@ -15,8 +15,7 @@ from .figure import (
 )
 from .fit_projection import (
     evaluated_figure_panels as _panels,
-    fit_panel_selection as _fit_panel_selection,
-    panel_focus_selection as _panel_focus_selection,
+    panel_focus_address as _panel_focus_address,
     fit_batch_storage_index as _batch_storage_index,
 )
 from .data_figure import FigurePanelRegion
@@ -51,20 +50,10 @@ def _figure_panel_regions(
     ):
         bounds = axis.get_position()
         fit_result = fit_results.get(layer.layer_id)
-        focus_selection = _panel_focus_selection(
+        focus_address = _panel_focus_address(
             layer,
             cell,
             series_group,
-        )
-        fit_selection = (
-            None
-            if fit_result is None
-            else _fit_panel_selection(
-                layer,
-                cell,
-                series_group,
-                fit_result,
-            )
         )
         fit_storage_index = None
         if fit_result is not None and len(series_group) == 1:
@@ -77,8 +66,7 @@ def _figure_panel_regions(
         regions.append(
             FigurePanelRegion(
                 f"panel-{index}",
-                focus_selection,
-                fit_selection,
+                focus_address,
                 fit_storage_index,
                 float(bounds.x0),
                 float(1.0 - bounds.y1),

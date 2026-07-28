@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 from zlc_storage.canonical import (
@@ -17,10 +17,17 @@ from zlc_storage.canonical import (
 from ._diagnostic import exact_integer_text
 
 
-def _canonical_numeric_coordinate(value: Any, field: str) -> int | float:
-    """Give numerically equal coordinates one in-memory and wire identity."""
+CoordinateScalar = None | str | int | float
+
+
+def canonical_coordinate_scalar(value: Any, field: str = "coordinate") -> CoordinateScalar:
+    """Return the sole canonical scalar vocabulary used by named coordinates."""
 
     scalar = value.item() if isinstance(value, np.generic) else value
+    if scalar is None or isinstance(scalar, str):
+        return scalar
+    if isinstance(scalar, bool):
+        raise TypeError(f"{field} must be null, text, or a finite number")
     if isinstance(scalar, int):
         result = integer(scalar, field)
         assert result is not None
@@ -74,6 +81,88 @@ SITE = AxisRoleId("site")
 COMPONENT = AxisRoleId("component")
 SCALAR = AxisRoleId("scalar")
 
+_POINT_ORDINAL_AXIS_ID = AxisId("zlc_data.point-ordinal")
+
+
+def point_ordinal_axis(
+    size: int,
+    coordinates: tuple[int, ...] | None = None,
+) -> "AxisSpec":
+    """Return the sole Axis metadata for authored point-row ordinals."""
+
+    normalized_size = positive_integer(size, "point ordinal axis size")
+    if coordinates is None:
+        return AxisSpec(
+            _POINT_ORDINAL_AXIS_ID,
+            "point",
+            SCAN_POINT,
+            normalized_size,
+        )
+    normalized = tuple(
+        nonnegative_integer(value, "point ordinal") for value in coordinates
+    )
+    if len(normalized) != normalized_size:
+        raise ValueError("point ordinal coordinates must match axis size")
+    if tuple(sorted(set(normalized))) != normalized:
+        raise ValueError("point ordinal coordinates must be unique and increasing")
+    return AxisSpec(
+        _POINT_ORDINAL_AXIS_ID,
+        "point",
+        SCAN_POINT,
+        normalized_size,
+        normalized,
+    )
+
+
+@dataclass(frozen=True, order=True)
+class AxisSourceRef:
+    """One closed reference to a tensor axis or the shared point-row domain."""
+
+    kind: str
+    axis_id: AxisId | None = None
+
+    TENSOR: ClassVar[str] = "TENSOR"
+    POINT_ROWS: ClassVar[str] = "POINT_ROWS"
+    POINT_ORDINAL: ClassVar[str] = "POINT_ORDINAL"
+    POINT_COORDINATE: ClassVar[str] = "POINT_COORDINATE"
+    GRID_DIMENSION: ClassVar[str] = "GRID_DIMENSION"
+
+    def __post_init__(self) -> None:
+        with_id = {
+            self.TENSOR,
+            self.POINT_COORDINATE,
+            self.GRID_DIMENSION,
+        }
+        without_id = {self.POINT_ROWS, self.POINT_ORDINAL}
+        if self.kind in with_id:
+            if not isinstance(self.axis_id, AxisId):
+                raise TypeError(f"{self.kind} source requires an AxisId")
+        elif self.kind in without_id:
+            if self.axis_id is not None:
+                raise ValueError(f"{self.kind} source cannot carry an AxisId")
+        else:
+            raise ValueError(f"unsupported axis source kind {self.kind!r}")
+
+    @classmethod
+    def tensor(cls, axis_id: AxisId) -> "AxisSourceRef":
+        return cls(cls.TENSOR, axis_id)
+
+    @classmethod
+    def point_rows(cls) -> "AxisSourceRef":
+        return cls(cls.POINT_ROWS)
+
+    @classmethod
+    def point_ordinal(cls) -> "AxisSourceRef":
+        return cls(cls.POINT_ORDINAL)
+
+    @classmethod
+    def point_coordinate(cls, coordinate_id: AxisId) -> "AxisSourceRef":
+        return cls(cls.POINT_COORDINATE, coordinate_id)
+
+    @classmethod
+    def grid_dimension(cls, coordinate_id: AxisId) -> "AxisSourceRef":
+        return cls(cls.GRID_DIMENSION, coordinate_id)
+
 
 @dataclass(frozen=True)
 class AxisSpec:
@@ -96,10 +185,9 @@ class AxisSpec:
         if self.coordinates is not None:
             coordinates = []
             for coordinate in self.coordinates:
-                scalar = coordinate.item() if isinstance(coordinate, np.generic) else coordinate
-                if scalar is not None and not isinstance(scalar, str):
-                    scalar = _canonical_numeric_coordinate(scalar, "axis coordinate")
-                coordinates.append(scalar)
+                coordinates.append(
+                    canonical_coordinate_scalar(coordinate, "axis coordinate")
+                )
             coordinates = tuple(coordinates)
             if len(coordinates) != self.size:
                 raise ValueError(

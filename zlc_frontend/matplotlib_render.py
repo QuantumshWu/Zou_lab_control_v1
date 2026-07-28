@@ -11,9 +11,7 @@ from ._mpl_document import (
     render_evaluated_figure,
 )
 from ._mpl_image import (
-    encode_radial_gaussian_image_fit_panels,
     ImagePanelAggRenderer,
-    render_radial_gaussian_image_fit_panels,
 )
 from ._mpl_live import SinglePanelAggRenderer
 from ._mpl_pulse import (
@@ -26,9 +24,7 @@ __all__ = [
     "encode_evaluated_figure_with_panel_regions",
     "encode_evaluated_panel_with_regions",
     "FacetedPanelAggRenderer",
-    "encode_radial_gaussian_image_fit_panels",
     "ImagePanelAggRenderer",
-    "render_radial_gaussian_image_fit_panels",
     "render_evaluated_figure",
     "release_agg_figure",
     "SinglePanelAggRenderer",

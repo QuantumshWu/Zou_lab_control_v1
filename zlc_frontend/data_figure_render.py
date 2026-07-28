@@ -30,6 +30,7 @@ from .data_figure_presentation import (
 from .encoded_raster import EncodedRasterDocument, EncodedRasterPage
 from .encoded_raster import encode_raster_buffer_png
 from .fit_editor import fit_projection_metadata
+from .fit_histogram_projection import _histogram_fit_display_state
 from .figure import ViewIntent
 from .figure_source import FigureSource
 from .histogram_display import histogram_projection_home_x_limits
@@ -142,16 +143,6 @@ def render_data_figure_grid_overview(
             + ("" if reason is None else f": {reason}")
         )
     _check(check_cancelled)
-    histogram_home = None
-    if intent is ViewIntent.HISTOGRAM:
-        histogram_home = histogram_projection_home_x_limits(
-            tuple(
-                series.data.samples
-                for cell in figure.evaluated.layers[0].cells
-                for series in cell.series
-            )
-        )
-    _check(check_cancelled)
     if display_state is None:
         display_state = default_data_figure_display_state(intent)
     elif grid_display_state_intent(display_state) is not intent:
@@ -193,6 +184,25 @@ def render_data_figure_grid_overview(
             raise ValueError("typed grid requires one exact Fit result")
         overlay_result = results[0]
         base_figure = figure.with_fit_results(None)
+    histogram_home = None
+    if intent is ViewIntent.HISTOGRAM:
+        if overlay_result is not None:
+            display_state, histogram_home = _histogram_fit_display_state(
+                figure,
+                display_state,
+                overlay_result,
+            )
+        else:
+            histogram_display = getattr(display_state, "display", display_state)
+            histogram_home = histogram_projection_home_x_limits(
+                tuple(
+                    series.data.samples
+                    for cell in figure.evaluated.layers[0].cells
+                    for series in cell.series
+                ),
+                bins=histogram_display.bin_count,
+            )
+    _check(check_cancelled)
     layer = base_figure.document.layers[0]
     snapshot = base_figure.datasets.resolve(layer.dataset_id)
     contract = PlotPanelContract(
@@ -336,6 +346,21 @@ def render_data_figure_front(
         overlay_result = results[0]
         base_figure = figure.with_fit_results(None)
 
+    if intent is ViewIntent.HISTOGRAM and overlay_result is not None:
+        state, committed_range = _histogram_fit_display_state(
+            figure,
+            state,
+            overlay_result,
+        )
+        if (
+            histogram_projection_value_range is not None
+            and histogram_projection_value_range != committed_range
+        ):
+            raise ValueError(
+                "histogram projection value range differs from committed Fit bins"
+            )
+        histogram_projection_value_range = committed_range
+
     layer = base_figure.document.layers[0]
     snapshot = base_figure.datasets.resolve(layer.dataset_id)
     kind = {
@@ -383,11 +408,17 @@ def render_data_figure_front(
     _check(check_cancelled)
     if result.frame is None or result.figure is None:
         raise RuntimeError("single-panel PlotPanel returned a faceted front")
-    visible_figure = (
-        result.figure
-        if overlay_result is None
-        else result.figure.with_fit_results({layer.layer_id: overlay_result})
-    )
+    if overlay_result is None:
+        visible_figure = result.figure
+    elif figure.has_fit_overlays:
+        # Saved/focused replay already owns the exact immutable result.  Keep
+        # that authority instead of rebuilding it from the display-only
+        # focused point subset returned by the base renderer.
+        visible_figure = figure
+    else:
+        visible_figure = result.figure.with_fit_results(
+            {layer.layer_id: overlay_result}
+        )
     raw_frame = result.frame
     frame = BoardFrame(
         raw_frame.board_id,
@@ -397,7 +428,7 @@ def render_data_figure_front(
     )
     payload = frame.panels[0].display_payload
     validate_rendered_data_figure_payload(payload, state, fit_result_identity)
-    fit_axis_ids, axis_roles = fit_projection_metadata(visible_figure, intent)
+    fit_sources, axis_roles = fit_projection_metadata(visible_figure, intent)
     data_contract = data_figure_front_contract(
         intent,
         frame,
@@ -409,7 +440,7 @@ def render_data_figure_front(
         summary=data_figure_summary(visible_figure),
         frame=frame,
         data_contract=data_contract,
-        fit_axis_ids=fit_axis_ids,
+        fit_sources=fit_sources,
         axis_roles=axis_roles,
         fit_result_identity=fit_result_identity,
         transient_fit_result_owner=fit_result,

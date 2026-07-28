@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from zlc_data import AxisId, selection_from_tree, selection_to_tree
+from zlc_data import (
+    axis_source_ref_from_tree,
+    axis_source_ref_to_tree,
+    selection_from_tree,
+    selection_to_tree,
+)
 from zlc_storage.canonical import (
     decode,
     encode,
@@ -12,7 +17,6 @@ from zlc_storage.canonical import (
 )
 
 from .model import (
-    AxisViewBinding,
     AxisViewRole,
     DatasetDescriptor,
     DatasetId,
@@ -23,6 +27,7 @@ from .model import (
     FigureSelection,
     FixedIndex,
     LatestNonempty,
+    SourceViewBinding,
     ViewIntent,
     ViewSpec,
 )
@@ -82,18 +87,18 @@ def view_spec_to_tree(spec: ViewSpec) -> dict[str, Any]:
         "schema": VIEW_SPEC_SCHEMA,
         "schema_fingerprint": spec.schema_fingerprint,
         "intent": spec.intent.value,
-        "axis_bindings": [
+        "source_bindings": [
             {
-                "axis_id": binding.axis_id.value,
+                "source": axis_source_ref_to_tree(binding.source),
                 "role": binding.role.value,
                 "selector": _selector_to_tree(binding.selector),
                 "reduction": _reduction_to_tree(binding.reduction),
             }
-            for binding in spec.axis_bindings
+            for binding in spec.source_bindings
         ],
-        "display_selections": [
-            selection_to_tree(selection) for selection in spec.display_selections
-        ],
+        "point_ordinals": None
+        if spec.point_ordinals is None
+        else list(spec.point_ordinals),
     }
 
 
@@ -104,28 +109,28 @@ def view_spec_from_tree(tree: Any) -> ViewSpec:
             "schema",
             "schema_fingerprint",
             "intent",
-            "axis_bindings",
-            "display_selections",
+            "source_bindings",
+            "point_ordinals",
         },
         VIEW_SPEC_SCHEMA,
     )
-    raw_bindings = data["axis_bindings"]
+    raw_bindings = data["source_bindings"]
     if not isinstance(raw_bindings, list):
-        raise ValueError("ViewSpec axis_bindings must be a list")
-    raw_selections = data["display_selections"]
-    if not isinstance(raw_selections, list):
-        raise ValueError("ViewSpec display_selections must be a list")
+        raise ValueError("ViewSpec source_bindings must be a list")
+    raw_ordinals = data["point_ordinals"]
+    if raw_ordinals is not None and not isinstance(raw_ordinals, list):
+        raise ValueError("ViewSpec point_ordinals must be a list or null")
     bindings = []
     for raw in raw_bindings:
         item = exact_mapping(
             raw,
-            {"axis_id", "role", "selector", "reduction"},
-            "AxisViewBinding",
+            {"source", "role", "selector", "reduction"},
+            "SourceViewBinding",
             discriminator=None,
         )
         bindings.append(
-            AxisViewBinding(
-                AxisId(item["axis_id"]),
+            SourceViewBinding(
+                axis_source_ref_from_tree(item["source"]),
                 AxisViewRole(item["role"]),
                 _selector_from_tree(item["selector"]),
                 _reduction_from_tree(item["reduction"]),
@@ -135,7 +140,7 @@ def view_spec_from_tree(tree: Any) -> ViewSpec:
         data["schema_fingerprint"],
         ViewIntent(data["intent"]),
         tuple(bindings),
-        tuple(selection_from_tree(item) for item in raw_selections),
+        None if raw_ordinals is None else tuple(raw_ordinals),
     )
 
 

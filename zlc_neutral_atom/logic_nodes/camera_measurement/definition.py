@@ -9,13 +9,16 @@ from zlc_data import (
     MONITOR_HISTORY,
     READOUT_EVENT,
     BlockId,
+    DataBlock,
+    DataTransformSpec,
     DatasetRevisionRef,
     DatasetSchema,
-    IndexSelection,
     OwnedSnapshot,
-    Selection,
+    PointColumn,
+    PointTable,
+    apply_transform,
+    commit_transform,
     dataset_revision_ref_to_tree,
-    materialize_dataset_selection,
 )
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
@@ -263,6 +266,62 @@ def _camera_frame_ref(
     )
 
 
+def _materialize_camera_frame(
+    source: OwnedSnapshot,
+    event_column: PointColumn,
+    event_index: int,
+    point_ordinal: int,
+) -> OwnedSnapshot:
+    """Select one physical frame row and remove private cycle coordinates."""
+
+    source_schema = source.block.schema
+    selected = apply_transform(
+        source,
+        commit_transform(
+            source_schema,
+            DataTransformSpec(),
+            point_ordinals=(point_ordinal,),
+        ),
+    )
+    output_schema = DatasetSchema(
+        source_schema.repeat_axis,
+        PointTable(1),
+        None,
+        source_schema.cell_schema,
+    )
+    ref = _camera_frame_ref(
+        source,
+        event_column.coordinate_id.value,
+        event_index,
+        output_schema,
+    )
+    return OwnedSnapshot(
+        ref,
+        DataBlock(
+            ref.block_id,
+            ref.revision,
+            selected.values,
+            selected.validity,
+            output_schema,
+        ),
+    )
+
+
+def _unique_camera_point_ordinal(
+    schema: DatasetSchema,
+    **coordinates: tuple[PointColumn, int],
+) -> int:
+    matches = tuple(
+        ordinal
+        for ordinal in range(schema.point_table.row_count)
+        if all(column.values[ordinal] == value for column, value in coordinates.values())
+    )
+    if len(matches) != 1:
+        names = ", ".join(coordinates)
+        raise ValueError(f"Camera Dataset requires one point row for {names}")
+    return matches[0]
+
+
 def project_camera_measurement_outputs(
     source: OwnedSnapshot,
     request: "CameraMeasurementRequest",
@@ -280,41 +339,41 @@ def project_camera_measurement_outputs(
     if not isinstance(request, CameraMeasurementRequest):
         raise TypeError("camera output projection requires CameraMeasurementRequest")
     schema = source.block.schema
-    event_axes = tuple(
-        axis for axis in schema.point_axes if axis.role == READOUT_EVENT
+    event_columns = tuple(
+        column
+        for column in schema.point_table.columns
+        if column.role == READOUT_EVENT
     )
-    if len(event_axes) != 1:
+    if len(event_columns) != 1:
         raise ValueError(
-            "camera Dataset must contain exactly one READOUT_EVENT point axis"
+            "camera Dataset must contain exactly one READOUT_EVENT column"
         )
+    event_column = event_columns[0]
+    if schema.point_table.columns != (event_column,):
+        raise ValueError("Camera Measurement source contains non-event point columns")
     if any(axis.role == READOUT_EVENT for axis in schema.cell_schema.data_axes):
         raise ValueError("READOUT_EVENT cannot be a trailing camera data axis")
-    event_axis = event_axes[0]
-    if event_axis.size != request.frames_per_cycle:
+    if tuple(event_column.values) != tuple(range(request.frames_per_cycle)):
         raise ValueError(
-            "camera Dataset READOUT_EVENT size differs from frames_per_cycle"
+            "camera Dataset READOUT_EVENT rows differ from frames_per_cycle"
         )
 
-    expected_point_axes = tuple(
-        axis for axis in schema.point_axes if axis.axis_id != event_axis.axis_id
-    )
     projected: dict[str, OwnedSnapshot] = {}
     for event_index, output_name in enumerate(request.output_names):
-        snapshot = materialize_dataset_selection(
+        snapshot = _materialize_camera_frame(
             source,
-            Selection.index(event_axis.axis_id, event_index),
-            reference_for=lambda output_schema, index=event_index: _camera_frame_ref(
-                source,
-                event_axis.axis_id.value,
-                index,
-                output_schema,
+            event_column,
+            event_index,
+            _unique_camera_point_ordinal(
+                schema,
+                readout_event=(event_column, event_index),
             ),
         )
         output_schema = snapshot.block.schema
         if output_schema.repeat_axis != schema.repeat_axis:
             raise RuntimeError("camera output projection changed the repeat axis")
-        if output_schema.point_axes != expected_point_axes:
-            raise RuntimeError("camera output projection changed another point axis")
+        if output_schema.point_table != PointTable(1):
+            raise RuntimeError("camera cycle coordinates leaked into a public frame")
         if output_schema.cell_schema != schema.cell_schema:
             raise RuntimeError("camera output projection changed trailing data axes")
         if snapshot.ref.stream_generation != source.ref.stream_generation:
@@ -374,67 +433,60 @@ def project_camera_monitor_outputs(
     if not isinstance(source, MonitorDatasetSnapshot):
         raise TypeError("source must be MonitorDatasetSnapshot")
     source_schema = source.snapshot.block.schema
-    history_axes = tuple(
-        axis for axis in source_schema.point_axes if axis.role == MONITOR_HISTORY
+    history_columns = tuple(
+        column
+        for column in source_schema.point_table.columns
+        if column.role == MONITOR_HISTORY
     )
-    event_axes = tuple(
-        axis for axis in source_schema.point_axes if axis.role == READOUT_EVENT
+    event_columns = tuple(
+        column
+        for column in source_schema.point_table.columns
+        if column.role == READOUT_EVENT
     )
-    if len(history_axes) != 1:
-        raise ValueError("Camera monitor must contain one MONITOR_HISTORY axis")
-    if len(event_axes) != 1:
-        raise ValueError("Camera monitor must contain one READOUT_EVENT axis")
+    if len(history_columns) != 1:
+        raise ValueError("Camera monitor must contain one MONITOR_HISTORY column")
+    if len(event_columns) != 1:
+        raise ValueError("Camera monitor must contain one READOUT_EVENT column")
     if any(
-        axis.role not in {MONITOR_HISTORY, READOUT_EVENT}
-        for axis in source_schema.point_axes
+        column.role not in {MONITOR_HISTORY, READOUT_EVENT}
+        for column in source_schema.point_table.columns
     ):
-        raise ValueError("Camera monitor contains an unsupported public point axis")
-    history_axis = history_axes[0]
-    event_axis = event_axes[0]
-    if event_axis.size != request.frames_per_cycle:
+        raise ValueError("Camera monitor contains an unsupported point column")
+    history_column = history_columns[0]
+    event_column = event_columns[0]
+    if set(event_column.values) != set(range(request.frames_per_cycle)):
         raise ValueError(
-            "Camera monitor READOUT_EVENT size differs from frames_per_cycle"
+            "Camera monitor READOUT_EVENT rows differ from frames_per_cycle"
         )
 
     projected: dict[str, LiveDatasetOutput] = {}
     for declaration in request.output_declarations:
         output_name = declaration.name
         event_index = camera_frame_output_index(output_name)
-        snapshot = materialize_dataset_selection(
+        point_ordinal = _unique_camera_point_ordinal(
+            source_schema,
+            history=(history_column, 0),
+            readout_event=(event_column, event_index),
+        )
+        snapshot = _materialize_camera_frame(
             source.snapshot,
-            Selection(
-                (
-                    IndexSelection(history_axis.axis_id, 0),
-                    IndexSelection(event_axis.axis_id, event_index),
-                )
-            ),
-            reference_for=lambda output_schema, index=event_index: _camera_frame_ref(
-                source.snapshot,
-                event_axis.axis_id.value,
-                index,
-                output_schema,
-            ),
+            event_column,
+            event_index,
+            point_ordinal,
         )
         output_schema = snapshot.block.schema
-        if output_schema.point_axes:
+        if output_schema.point_table != PointTable(1):
             raise RuntimeError("Camera monitor storage axes leaked into a public frame")
-        source_logical_point = tuple(
-            0 if axis.role == MONITOR_HISTORY else event_index
-            for axis in source_schema.point_axes
-        )
-        source_storage_index = source_schema.point_layout.storage_index(
-            source_logical_point
-        )
         selected_refs = tuple(
             source.event_refs[
-                repeat_index * source_schema.point_layout.storage_size
-                + source_storage_index
+                repeat_index * source_schema.point_table.row_count
+                + point_ordinal
             ]
             for repeat_index in range(output_schema.repeat_axis.size)
         )
         total = (
             output_schema.repeat_axis.size
-            * output_schema.point_layout.storage_size
+            * output_schema.point_table.row_count
         )
         if len(selected_refs) != total:
             raise RuntimeError("Camera monitor projection lost output cells")

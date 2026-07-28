@@ -557,8 +557,8 @@ def prepare_exact_scan(
     )
     source_schema = DatasetSchema(
         repeat_axis,
-        point_table.point_axes,
-        point_table.point_layout,
+        point_table,
+        None,
         value_schema,
     )
     output_contract = bind_scan_output_contract(source_schema, point_table, None)
@@ -606,7 +606,7 @@ def prepare_exact_scan(
             else PulseExecutionForm.STATIC_ONCE
         ),
         program.repeat_count,
-        point_table.point_layout.storage_size,
+        point_table.row_count,
         request.signal.producer_definition.stable_definition_id,
         output_name,
         source_schema,
@@ -693,7 +693,7 @@ def _cell_schedule(schema: DatasetSchema) -> DatasetCellSchedule:
         (
             DatasetCellAddress(repeat, point)
             for repeat in range(schema.repeat_axis.size)
-            for point in range(schema.point_layout.storage_size)
+            for point in range(schema.point_table.row_count)
         ),
     )
 
@@ -712,7 +712,7 @@ def _open_collector(
         payload_contract,
         join_key_contract=DatasetCellKeyContract.from_schema(schema),
     )
-    total = schema.repeat_axis.size * schema.point_layout.storage_size
+    total = schema.repeat_axis.size * schema.point_table.row_count
     reservation = stream.reserve(
         total_events=total,
         trace_binding=TraceBinding(context.run_id.value, _COLLECTOR_SOURCE_ID),

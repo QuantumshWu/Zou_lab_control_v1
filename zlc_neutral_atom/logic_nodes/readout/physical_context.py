@@ -243,16 +243,18 @@ def _derive_readout_physical_context_from_evidence(
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
     edges = evidence.trigger_schedule.iter_edges()
-    event_axes = tuple(
-        (index, axis)
-        for index, axis in enumerate(schema.point_axes)
-        if axis.role == READOUT_EVENT
+    event_columns = tuple(
+        column
+        for column in schema.point_table.columns
+        if column.role == READOUT_EVENT
     )
-    if len(event_axes) != 1:
-        raise ValueError("persisted triggered capture requires one READOUT_EVENT axis")
-    event_position, event_axis = event_axes[0]
+    if len(event_columns) != 1:
+        raise ValueError(
+            "persisted triggered capture requires one READOUT_EVENT column"
+        )
+    event_column = event_columns[0]
     event_index = nonnegative_integer(readout_event_index, "readout_event_index")
-    if event_index >= event_axis.size:
+    if event_index not in event_column.values:
         raise ValueError("readout_event_index is outside DatasetSchema")
     if checkpoint is not None and not callable(checkpoint):
         raise TypeError("checkpoint must be callable or None")
@@ -269,10 +271,7 @@ def _derive_readout_physical_context_from_evidence(
                 )
             if edge.trigger_ordinal != ordinal:
                 raise ValueError("pulse trigger ordinals are not contiguous")
-            point_multi = schema.point_layout.multi_index(
-                cell.point_storage_index
-            )
-            if point_multi[event_position] == event_index:
+            if event_column.values[cell.point_ordinal] == event_index:
                 yield edge.tick_from_run_start
 
     return _derive_readout_context(

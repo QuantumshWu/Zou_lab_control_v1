@@ -18,7 +18,7 @@ import numpy as np
 from zlc_storage.canonical import finite_real
 
 from ._arrays import immutable_array
-from .axis import HISTOGRAM_BIN, REPEAT, AxisId, AxisSpec
+from .axis import HISTOGRAM_BIN, REPEAT, AxisId, AxisSourceRef, AxisSpec
 from .fit_contract import (
     BoundFit,
     FitBatchStatus,
@@ -28,8 +28,8 @@ from .fit_contract import (
 )
 from .fit_model import evaluate_fit_model_components
 from .fit_problem import bind_fit
-from .layout import PointLayout
-from .schema import DatasetSchema, ValueSchema
+from .schema import DatasetSchema, PointColumn, PointTable, ValueSchema
+from .transform import DataTransformSpec, commit_transform
 
 
 _FLOAT64 = np.dtype("<f8")
@@ -241,17 +241,31 @@ def _bind_bimodal_histogram(coordinates: np.ndarray) -> BoundFit:
     )
     schema = DatasetSchema(
         repeat_axis,
-        (bin_axis,),
-        PointLayout.rect_c((bin_axis.size,)),
+        PointTable(
+            bin_axis.size,
+            (
+                PointColumn(
+                    bin_axis.axis_id,
+                    bin_axis.name,
+                    bin_axis.role,
+                    PointColumn.NUMERIC,
+                    bin_axis.coordinates or (),
+                    bin_axis.unit,
+                    bin_axis.coordinate_frame,
+                ),
+            ),
+        ),
+        None,
         ValueSchema.scalar(_FLOAT64, "count"),
     )
     return bind_fit(
         FitSpec(
-            schema.fingerprint,
-            None,
-            (bin_axis.axis_id,),
-            (repeat_axis.axis_id,),
-            "bimodal_gaussian",
+            committed_transform=commit_transform(schema, DataTransformSpec()),
+            independent_sources=(
+                AxisSourceRef.point_coordinate(bin_axis.axis_id),
+            ),
+            batch_sources=(),
+            model_id="bimodal_gaussian",
         ),
         schema,
     )

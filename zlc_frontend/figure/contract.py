@@ -1,20 +1,13 @@
-"""Declarative contracts and validation for headless presentation views."""
+"""Declarative contracts and source-aware validation for headless views."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from numbers import Integral, Real
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
-from typing import Sequence
 
 from zlc_data import (
     COMPONENT,
-    AxisId,
-    CommittedTransform,
-    CoordinateRangeSelection,
-    FitResultBatch,
-    IndexRangeSelection,
     MONITOR_HISTORY,
     READOUT_EVENT,
     REPEAT,
@@ -24,110 +17,35 @@ from zlc_data import (
     SPATIAL_X,
     SPATIAL_Y,
     SPECTRAL,
+    AxisId,
+    AxisRoleId,
+    AxisSourceRef,
     AxisSpec,
     DatasetSchema,
-    PointLayout,
+    FitResultBatch,
+    PointColumn,
+    ResolvedPointRows,
     Selection,
-    TransformedSchema,
-    ValidityContract,
-    ValueSchema,
+    resolve_point_rows,
     resolve_selection_indices,
-    resolve_transformed_schema,
 )
+from zlc_data.axis import point_ordinal_axis
 from zlc_storage import canonical_text
 
 from .model import (
     DATASET_VIEW_INTENTS,
+    AxisAddress,
     AxisRolePolicy,
     AxisViewRole,
     DisplayReductionMethod,
     DisplaySlot,
     FixedIndex,
     LatestNonempty,
-    RepeatViewMode,
+    SourceViewBinding,
     ViewContract,
     ViewIntent,
-    ViewPreferences,
     ViewSpec,
 )
-
-
-class _CoordinateSelectionIndices(Sequence[int]):
-    """Lazy non-contiguous display indices; materialization belongs to evaluation."""
-
-    __slots__ = ("_coordinates", "_lower", "_upper", "_count")
-
-    def __init__(self, coordinates, lower: float, upper: float, count: int) -> None:
-        self._coordinates = coordinates
-        self._lower = lower
-        self._upper = upper
-        self._count = count
-
-    def __len__(self) -> int:
-        return self._count
-
-    def __iter__(self):
-        for index, value in enumerate(self._coordinates):
-            if self._lower <= value <= self._upper:
-                yield index
-
-    def __reversed__(self):
-        for index in range(len(self._coordinates) - 1, -1, -1):
-            value = self._coordinates[index]
-            if self._lower <= value <= self._upper:
-                yield index
-
-    def __contains__(self, item: object) -> bool:
-        if isinstance(item, bool) or not isinstance(item, Integral):
-            return False
-        index = int(item)
-        if index < 0 or index >= len(self._coordinates):
-            return False
-        value = self._coordinates[index]
-        return bool(self._lower <= value <= self._upper)
-
-    def __getitem__(self, item):
-        if isinstance(item, slice):
-            return tuple(self)[item]
-        index = int(item)
-        if index < 0:
-            index += self._count
-        if index < 0 or index >= self._count:
-            raise IndexError(index)
-        for position, resolved in enumerate(self):
-            if position == index:
-                return resolved
-        raise IndexError(index)
-
-
-def _coordinate_display_indices(
-    axis: AxisSpec,
-    term: CoordinateRangeSelection,
-) -> Sequence[int]:
-    coordinates = axis.coordinates
-    if coordinates is None:
-        raise ValueError(f"axis {axis.axis_id} has no coordinates for coordinate selection")
-    if axis.coordinate_frame != term.coordinate_frame:
-        raise ValueError(f"coordinate frame mismatch for axis {axis.axis_id}")
-    first = -1
-    last = -1
-    count = 0
-    contiguous = True
-    for index, value in enumerate(coordinates):
-        if value is None or isinstance(value, (bool, str)) or not isinstance(value, Real):
-            raise TypeError(f"axis {axis.axis_id} coordinates are not entirely numeric")
-        if term.lower <= value <= term.upper:
-            if first < 0:
-                first = index
-            elif index != last + 1:
-                contiguous = False
-            last = index
-            count += 1
-    if count == 0:
-        raise ValueError(f"coordinate selection is empty on axis {axis.axis_id}")
-    if contiguous:
-        return range(first, last + 1)
-    return _CoordinateSelectionIndices(coordinates, term.lower, term.upper, count)
 
 
 IMAGE_CONTRACT = ViewContract(
@@ -137,22 +55,15 @@ IMAGE_CONTRACT = ViewContract(
         DisplaySlot(AxisViewRole.IMAGE_Y, (SPATIAL_Y, SCAN_POINT)),
     ),
     (
-        AxisRolePolicy(SCAN_POINT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SPECTRAL, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SITE, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(COMPONENT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SPATIAL_X, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SPATIAL_Y, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SCAN_POINT, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
+        AxisRolePolicy(SPECTRAL, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
+        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
+        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
+        AxisRolePolicy(SITE, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
+        AxisRolePolicy(COMPONENT, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
+        AxisRolePolicy(SPATIAL_X, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
+        AxisRolePolicy(SPATIAL_Y, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
     ),
-    (
-        RepeatViewMode.MEAN,
-        RepeatViewMode.LATEST,
-        RepeatViewMode.SUM,
-        RepeatViewMode.FACET,
-    ),
-    RepeatViewMode.MEAN,
     (REPEAT,),
 )
 
@@ -173,26 +84,15 @@ CURVE_CONTRACT = ViewContract(
         ),
     ),
     (
-        AxisRolePolicy(SCAN_POINT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SPECTRAL, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SCAN_POINT, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
+        AxisRolePolicy(SPECTRAL, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
         AxisRolePolicy(READOUT_EVENT, (AxisViewRole.BATCH, AxisViewRole.FACET)),
-        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
         AxisRolePolicy(SITE, (AxisViewRole.BATCH, AxisViewRole.FACET)),
         AxisRolePolicy(COMPONENT, (AxisViewRole.BATCH, AxisViewRole.FACET)),
-        # A spatial curve is a named lineout: one declared spatial axis is X
-        # and every other spatial axis is an explicit, visible slider.  No
-        # spatial axis is silently averaged or flattened.
-        AxisRolePolicy(SPATIAL_X, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SPATIAL_Y, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SPATIAL_X, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
+        AxisRolePolicy(SPATIAL_Y, (AxisViewRole.SELECTED, AxisViewRole.FACET, AxisViewRole.BATCH)),
     ),
-    (
-        RepeatViewMode.MEAN,
-        RepeatViewMode.LATEST,
-        RepeatViewMode.SUM,
-        RepeatViewMode.BATCH,
-        RepeatViewMode.FACET,
-    ),
-    RepeatViewMode.MEAN,
     (REPEAT, SPATIAL_X, SPATIAL_Y),
 )
 
@@ -203,11 +103,11 @@ HISTOGRAM_CONTRACT = ViewContract(
     (
         AxisRolePolicy(
             READOUT_EVENT,
-            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+            (AxisViewRole.SAMPLE, AxisViewRole.SELECTED, AxisViewRole.FACET),
         ),
         AxisRolePolicy(
             MONITOR_HISTORY,
-            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+            (AxisViewRole.SAMPLE, AxisViewRole.SELECTED, AxisViewRole.FACET),
         ),
         AxisRolePolicy(
             SITE,
@@ -219,30 +119,21 @@ HISTOGRAM_CONTRACT = ViewContract(
         ),
         AxisRolePolicy(
             SCAN_POINT,
-            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+            (AxisViewRole.SAMPLE, AxisViewRole.SELECTED, AxisViewRole.FACET),
         ),
         AxisRolePolicy(
             SPECTRAL,
-            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+            (AxisViewRole.SAMPLE, AxisViewRole.SELECTED, AxisViewRole.FACET),
         ),
         AxisRolePolicy(
             SPATIAL_X,
-            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+            (AxisViewRole.SAMPLE, AxisViewRole.SELECTED, AxisViewRole.FACET),
         ),
         AxisRolePolicy(
             SPATIAL_Y,
-            (AxisViewRole.SAMPLE, AxisViewRole.SLIDER, AxisViewRole.FACET),
+            (AxisViewRole.SAMPLE, AxisViewRole.SELECTED, AxisViewRole.FACET),
         ),
     ),
-    (
-        RepeatViewMode.SAMPLE,
-        RepeatViewMode.BATCH,
-        RepeatViewMode.MEAN,
-        RepeatViewMode.SUM,
-        RepeatViewMode.LATEST,
-        RepeatViewMode.FACET,
-    ),
-    RepeatViewMode.SAMPLE,
     (REPEAT,),
 )
 
@@ -251,30 +142,22 @@ METER_CONTRACT = ViewContract(
     ViewIntent.METER,
     (),
     (
-        AxisRolePolicy(SCAN_POINT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SPECTRAL, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SITE, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(COMPONENT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SPATIAL_X, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
-        AxisRolePolicy(SPATIAL_Y, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SCAN_POINT, (AxisViewRole.SELECTED, AxisViewRole.FACET)),
+        AxisRolePolicy(SPECTRAL, (AxisViewRole.SELECTED, AxisViewRole.FACET)),
+        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.SELECTED, AxisViewRole.FACET)),
+        AxisRolePolicy(MONITOR_HISTORY, (AxisViewRole.SELECTED, AxisViewRole.FACET)),
+        AxisRolePolicy(SITE, (AxisViewRole.SELECTED, AxisViewRole.FACET)),
+        AxisRolePolicy(COMPONENT, (AxisViewRole.SELECTED, AxisViewRole.FACET)),
+        AxisRolePolicy(SPATIAL_X, (AxisViewRole.SELECTED, AxisViewRole.FACET)),
+        AxisRolePolicy(SPATIAL_Y, (AxisViewRole.SELECTED, AxisViewRole.FACET)),
     ),
-    (RepeatViewMode.LATEST, RepeatViewMode.MEAN, RepeatViewMode.SUM),
-    RepeatViewMode.LATEST,
     (REPEAT, SPATIAL_X, SPATIAL_Y),
 )
 
 
 @dataclass(frozen=True, slots=True)
 class DocumentViewContract:
-    """A view fed by an authored document rather than a DatasetSchema.
-
-    The separate type is the firewall: document views have no repeat policy,
-    axis-role suggestion, batch capacity, or facet capacity to fill with inert
-    values. ``source_schema`` is an opaque owner-qualified identity; frontend
-    neither imports that owner nor decodes its document.
-    """
+    """A view fed by an authored document rather than a DatasetSchema."""
 
     intent: ViewIntent
     source_schema: str
@@ -299,13 +182,15 @@ PULSE_CONTRACT = DocumentViewContract(
 VIEW_CONTRACTS: Mapping[
     ViewIntent,
     ViewContract | DocumentViewContract,
-] = MappingProxyType({
-    ViewIntent.IMAGE: IMAGE_CONTRACT,
-    ViewIntent.CURVE: CURVE_CONTRACT,
-    ViewIntent.HISTOGRAM: HISTOGRAM_CONTRACT,
-    ViewIntent.METER: METER_CONTRACT,
-    ViewIntent.PULSE: PULSE_CONTRACT,
-})
+] = MappingProxyType(
+    {
+        ViewIntent.IMAGE: IMAGE_CONTRACT,
+        ViewIntent.CURVE: CURVE_CONTRACT,
+        ViewIntent.HISTOGRAM: HISTOGRAM_CONTRACT,
+        ViewIntent.METER: METER_CONTRACT,
+        ViewIntent.PULSE: PULSE_CONTRACT,
+    }
+)
 
 
 def contract_for(intent: ViewIntent) -> ViewContract | DocumentViewContract:
@@ -315,8 +200,6 @@ def contract_for(intent: ViewIntent) -> ViewContract | DocumentViewContract:
 
 
 def dataset_contract_for(intent: ViewIntent) -> ViewContract:
-    """Return a DatasetSchema contract or reject a document-fed intent."""
-
     contract = contract_for(intent)
     if not isinstance(contract, ViewContract):
         raise ValueError(
@@ -326,368 +209,485 @@ def dataset_contract_for(intent: ViewIntent) -> ViewContract:
     return contract
 
 
-def dataset_axes(schema: DatasetSchema):
+def _source_key(source: AxisSourceRef) -> tuple[str, str]:
+    return (
+        source.kind,
+        "" if source.axis_id is None else source.axis_id.value,
+    )
+
+
+def _tensor_axes(schema: DatasetSchema) -> tuple[AxisSpec, ...]:
+    return (schema.repeat_axis, *schema.cell_schema.data_axes)
+
+
+def _dataset_sources(schema: DatasetSchema) -> tuple[AxisSourceRef, ...]:
+    """Return the declared source vocabulary in producer-owned order."""
+
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
-    return (schema.repeat_axis, *schema.point_axes, *schema.cell_schema.data_axes)
+    result = [AxisSourceRef.tensor(schema.repeat_axis.axis_id)]
+    result.append(AxisSourceRef.point_rows())
+    result.extend(
+        AxisSourceRef.point_coordinate(column.coordinate_id)
+        for column in schema.point_table.columns
+    )
+    # The synthetic ordinal is a stable fallback after authored coordinates,
+    # never a competitor that hides the producer's declared X column.
+    result.append(AxisSourceRef.point_ordinal())
+    if schema.grid_topology is not None:
+        result.extend(
+            AxisSourceRef.grid_dimension(dimension_id)
+            for dimension_id in schema.grid_topology.dimension_ids
+        )
+    result.extend(
+        AxisSourceRef.tensor(axis.axis_id)
+        for axis in schema.cell_schema.data_axes
+    )
+    return tuple(result)
 
 
-def _selection_transform_projection(
-    source_schema: DatasetSchema,
-    transform: CommittedTransform,
-    fit_axis_ids: tuple[AxisId, ...],
-) -> tuple[TransformedSchema, DatasetSchema, Selection]:
-    """Validate and project the one displayable committed Fit ROI.
+def _tensor_axis(schema: DatasetSchema, source: AxisSourceRef) -> AxisSpec:
+    if source.kind != AxisSourceRef.TENSOR or source.axis_id is None:
+        raise KeyError(source)
+    for axis in _tensor_axes(schema):
+        if axis.axis_id == source.axis_id:
+            return axis
+    raise KeyError(source)
 
-    This is a narrow authority-to-presentation contract, not a second transform
-    engine.  It accepts exactly one range-preserving Selection over scan or
-    spectral point fit axes and/or spatial data fit axes.  FigureEvaluator can
-    then read the raw snapshot through the identical selection without
-    inventing a derived ref.
+
+def _fit_display_selection_indices(
+    schema: DatasetSchema,
+    result: FitResultBatch,
+) -> tuple[tuple[AxisSourceRef, tuple[int, ...]], ...]:
+    """Validate the sole range-preserving Fit selection against source axes.
+
+    A saved Curve/Image Fit is displayed over the unchanged source Figure; the
+    committed selection limits only its overlay.  This private contract owner
+    resolves that authority once so suggestion, immutable Figure validation,
+    and both render projections cannot drift into separate interpretations.
+    Histogram transforms have their own exact sample/bin projection and never
+    pass through this path.
     """
 
-    if not isinstance(source_schema, DatasetSchema):
-        raise TypeError("source_schema must be DatasetSchema")
-    if not isinstance(transform, CommittedTransform):
-        raise TypeError("transform must be CommittedTransform")
-    fit_axis_ids = tuple(fit_axis_ids)
-    if any(not isinstance(axis_id, AxisId) for axis_id in fit_axis_ids):
-        raise TypeError("fit_axis_ids must contain AxisId values")
-    operations = transform.spec.operations
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("result must be FitResultBatch")
+    transform = result.spec.committed_transform
+    if transform.source_schema_fingerprint != schema.fingerprint:
+        raise ValueError("Fit transform belongs to another source schema")
+    operations = tuple(transform.spec.operations)
+    if not operations:
+        return ()
     if len(operations) != 1 or not isinstance(operations[0], Selection):
         raise ValueError(
-            "transformed fit display requires exactly one range Selection"
+            "Curve/Image Fit display supports identity or one range-preserving "
+            "Selection authority"
         )
-    authority_selection = operations[0]
-    if any(
-        not isinstance(term, (IndexRangeSelection, CoordinateRangeSelection))
-        for term in authority_selection.terms
-    ):
-        raise ValueError(
-            "transformed fit display supports only range-preserving selections"
-        )
-    source_points = {
-        axis.axis_id: axis for axis in source_schema.point_axes
-    }
-    source_data = {
-        axis.axis_id: axis for axis in source_schema.cell_schema.data_axes
-    }
-    selected_ids = {term.axis_id for term in authority_selection.terms}
-    if not selected_ids <= set(fit_axis_ids):
-        raise ValueError(
-            "every selected axis must remain an explicit fit axis"
-        )
-    for axis_id in selected_ids:
-        point_axis = source_points.get(axis_id)
-        data_axis = source_data.get(axis_id)
-        if point_axis is not None and point_axis.role in (SCAN_POINT, SPECTRAL):
+
+    selection = operations[0]
+    independent = tuple(result.spec.independent_sources)
+    fit_axes = dict(zip(independent, result.fit_axis_specs, strict=True))
+    terms = {term.axis_id: term for term in selection.terms}
+    resolved = []
+    for source in independent:
+        if source.axis_id not in terms:
             continue
-        if data_axis is not None and data_axis.role in (SPATIAL_X, SPATIAL_Y):
-            continue
-        raise ValueError(
-            "transformed fit display range selections support only scan/spectral "
-            "point fit axes and spatial data fit axes"
-        )
+        if source.kind != AxisSourceRef.TENSOR:
+            raise ValueError("Fit Selection may name only tensor independent sources")
+        axis = _tensor_axis(schema, source)
+        indices, drops_axis = resolve_selection_indices(axis, terms[source.axis_id])
+        if drops_axis:
+            raise ValueError("Fit display cannot replay an axis-collapsing Selection")
+        exact_indices = tuple(indices)
+        fit_axis = fit_axes[source]
+        if len(exact_indices) != fit_axis.size or any(
+            axis.coordinate_at(source_index) != fit_axis.coordinate_at(output_index)
+            for output_index, source_index in enumerate(exact_indices)
+        ):
+            raise ValueError("Fit Selection coordinates differ from its fitted axis")
+        resolved.append((source, exact_indices))
+    if len(resolved) != len(selection.terms):
+        raise ValueError("Fit Selection names a non-independent source")
+    return tuple(resolved)
 
-    resolved = resolve_transformed_schema(source_schema, transform)
-    source_cell_ids = tuple(
-        axis.axis_id
-        for axis in (source_schema.repeat_axis, *source_schema.point_axes)
+
+def _point_column(schema: DatasetSchema, source: AxisSourceRef) -> PointColumn:
+    if source.kind not in {
+        AxisSourceRef.POINT_COORDINATE,
+        AxisSourceRef.GRID_DIMENSION,
+    } or source.axis_id is None:
+        raise KeyError(source)
+    return schema.point_table.column(source.axis_id)
+
+
+def _source_role(schema: DatasetSchema, source: AxisSourceRef) -> AxisRoleId:
+    if source.kind == AxisSourceRef.TENSOR:
+        return _tensor_axis(schema, source).role
+    if source.kind == AxisSourceRef.POINT_ROWS:
+        return SCAN_POINT
+    if source.kind == AxisSourceRef.POINT_ORDINAL:
+        return point_ordinal_axis(schema.point_table.row_count).role
+    return _point_column(schema, source).role
+
+
+def _source_name(schema: DatasetSchema, source: AxisSourceRef) -> str:
+    if source.kind == AxisSourceRef.TENSOR:
+        return _tensor_axis(schema, source).name
+    if source.kind == AxisSourceRef.POINT_ROWS:
+        return "points"
+    if source.kind == AxisSourceRef.POINT_ORDINAL:
+        return point_ordinal_axis(schema.point_table.row_count).name
+    return _point_column(schema, source).name
+
+
+def _source_unit(schema: DatasetSchema, source: AxisSourceRef) -> str | None:
+    if source.kind == AxisSourceRef.TENSOR:
+        return _tensor_axis(schema, source).unit
+    if source.kind == AxisSourceRef.POINT_ROWS:
+        return None
+    if source.kind == AxisSourceRef.POINT_ORDINAL:
+        return point_ordinal_axis(schema.point_table.row_count).unit
+    return _point_column(schema, source).unit
+
+
+def _source_coordinate_frame(schema: DatasetSchema, source: AxisSourceRef):
+    if source.kind == AxisSourceRef.TENSOR:
+        return _tensor_axis(schema, source).coordinate_frame
+    if source.kind == AxisSourceRef.POINT_ROWS:
+        return None
+    if source.kind == AxisSourceRef.POINT_ORDINAL:
+        return point_ordinal_axis(schema.point_table.row_count).coordinate_frame
+    return _point_column(schema, source).coordinate_frame
+
+
+def _source_cardinality(schema: DatasetSchema, source: AxisSourceRef) -> int:
+    if source.kind == AxisSourceRef.TENSOR:
+        return _tensor_axis(schema, source).size
+    if source.kind == AxisSourceRef.POINT_ORDINAL:
+        return point_ordinal_axis(schema.point_table.row_count).size
+    if source.kind in {
+        AxisSourceRef.POINT_ROWS,
+        AxisSourceRef.POINT_COORDINATE,
+    }:
+        return schema.point_table.row_count
+    topology = schema.grid_topology
+    if topology is None or source.axis_id not in topology.dimension_ids:
+        raise KeyError(source)
+    position = topology.dimension_ids.index(source.axis_id)
+    return len(topology.coordinate_domains[position])
+
+
+def _source_coordinate(
+    schema: DatasetSchema,
+    source: AxisSourceRef,
+    index: int,
+):
+    if source.kind == AxisSourceRef.TENSOR:
+        return _tensor_axis(schema, source).coordinate_at(index)
+    if source.kind == AxisSourceRef.POINT_ROWS:
+        if not 0 <= index < schema.point_table.row_count:
+            raise IndexError("point ordinal is outside PointTable")
+        return index
+    if source.kind == AxisSourceRef.POINT_ORDINAL:
+        return point_ordinal_axis(schema.point_table.row_count).coordinate_at(index)
+    if source.kind == AxisSourceRef.POINT_COORDINATE:
+        return _point_column(schema, source).values[index]
+    topology = schema.grid_topology
+    if topology is None or source.axis_id not in topology.dimension_ids:
+        raise KeyError(source)
+    position = topology.dimension_ids.index(source.axis_id)
+    return topology.coordinate_domains[position][index]
+
+
+def _point_bindings(view: ViewSpec) -> tuple[SourceViewBinding, ...]:
+    return tuple(
+        binding
+        for binding in view.source_bindings
+        if binding.source.kind != AxisSourceRef.TENSOR
     )
-    if tuple(axis.axis_id for axis in resolved.cell_axes) != source_cell_ids:
-        raise ValueError(
-            "transformed fit display range selection changed cell-axis identity"
-        )
-    repeat_axis = resolved.cell_axes[0]
-    point_axes = resolved.cell_axes[1:]
-    if repeat_axis.role != REPEAT:
-        raise ValueError("transformed fit display lost the logical repeat axis")
-    if resolved.cell_layout.storage_size == 0:
-        raise ValueError("transformed fit display selection contains no physical point")
-    if resolved.cell_layout.storage_size % repeat_axis.size:
-        raise ValueError("transformed fit display cell layout is not repeat-factorable")
-    point_storage_size = resolved.cell_layout.storage_size // repeat_axis.size
-    point_mapping = []
-    for storage_index in range(point_storage_size):
-        multi = resolved.cell_layout.multi_index(storage_index)
-        if multi[0] != 0:
-            raise ValueError(
-                "transformed fit display cell layout is not repeat-major"
-            )
-        point_mapping.append(multi[1:])
-    point_layout = PointLayout.from_mapping(
-        tuple(axis.size for axis in point_axes),
-        tuple(point_mapping),
-    )
-    validity_contract = (
-        ValidityContract.components(*resolved.validity_axis_ids)
-        if resolved.validity_axis_ids
-        else ValidityContract.value()
-    )
-    effective_schema = DatasetSchema(
-        repeat_axis,
-        point_axes,
-        point_layout,
-        ValueSchema(
-            resolved.data_axes,
-            validity_contract,
-            resolved.dtype,
-            resolved.value_unit,
-        ),
-    )
-    if effective_schema.cell_layout != resolved.cell_layout:
-        raise ValueError(
-            "transformed fit display cannot faithfully represent the resolved cell layout"
-        )
-    return resolved, effective_schema, authority_selection
 
 
-def _selection_fit_projection(
-    source_schema: DatasetSchema,
-    result: FitResultBatch,
-) -> tuple[DatasetSchema, Selection]:
-    """Return the exact effective schema for one displayable Fit result."""
-
-    transform = result.spec.committed_transform
-    if transform is None:
-        raise ValueError("fit result has no committed transform")
-    resolved, effective_schema, authority_selection = (
-        _selection_transform_projection(
-            source_schema,
-            transform,
-            result.spec.fit_axis_ids,
-        )
-    )
-    if result.effective_schema_fingerprint != resolved.fingerprint:
-        raise ValueError("fit result effective schema differs from its transform")
-    if result.fit_axis_specs != tuple(
-        resolved.axis(axis_id) for axis_id in result.spec.fit_axis_ids
-    ) or result.batch_axis_specs != tuple(
-        resolved.axis(axis_id) for axis_id in result.spec.batch_axis_ids
-    ):
-        raise ValueError("fit result axes differ from its transformed schema")
-    return effective_schema, authority_selection
-
-
-def display_axis_indices(
-    axis: AxisSpec,
-    selections: Sequence[Selection],
-) -> Sequence[int]:
-    """Resolve the one optional display selection for an axis."""
-
-    if not isinstance(axis, AxisSpec):
-        raise TypeError("axis must be zlc_data.AxisSpec")
-    selections = tuple(selections)
-    if any(not isinstance(selection, Selection) for selection in selections):
-        raise TypeError("selections must contain zlc_data.Selection values")
-    terms = tuple(
-        term
-        for selection in selections
-        for term in selection.terms
-        if term.axis_id == axis.axis_id
-    )
-    if len(terms) > 1:
-        raise ValueError(f"axis {axis.axis_id} has multiple display selection terms")
-    term = terms[0] if terms else None
-    if term is None:
-        return range(axis.size)
-    if isinstance(term, CoordinateRangeSelection):
-        return _coordinate_display_indices(axis, term)
-    indices, _drop = resolve_selection_indices(axis, term)
-    return indices
-
-
-def fit_single_panel_presentation(
+def _resolve_view_point_rows(
     schema: DatasetSchema,
     view: ViewSpec,
-    preferences: ViewPreferences | None = None,
-) -> tuple[Selection | None, ViewPreferences]:
-    """Freeze one labelled display cell for direct Figure-owned Fit authoring.
+) -> ResolvedPointRows:
+    """Validate point-source roles and resolve their one shared row domain."""
 
-    The returned ``Selection`` is presentation state only.  It collapses every
-    visible FACET/BATCH axis to one explicit logical index and replaces a
-    multi-element repeat display reduction with the same explicit cell.  It
-    never invents an X/IMAGE-axis selection (an existing display range is
-    preserved) and therefore must never be copied into a
-    :class:`zlc_data.FitSpec`.
+    bindings = _point_bindings(view)
+    raw = tuple(
+        binding
+        for binding in bindings
+        if binding.source.kind
+        in {
+            AxisSourceRef.POINT_ROWS,
+            AxisSourceRef.POINT_ORDINAL,
+            AxisSourceRef.POINT_COORDINATE,
+        }
+    )
+    topology_bindings = tuple(
+        binding
+        for binding in bindings
+        if binding.source.kind == AxisSourceRef.GRID_DIMENSION
+    )
+    if raw and topology_bindings:
+        raise ValueError("raw point sources and GridDimension sources cannot be mixed")
 
-    Sparse point layouts are resolved as one physical tuple.  Choosing each
-    point axis independently (or assuming logical index zero exists) would
-    create a display cell that the source never published.
+    point_rows_bindings = tuple(
+        binding
+        for binding in raw
+        if binding.source.kind == AxisSourceRef.POINT_ROWS
+    )
+    if len(point_rows_bindings) > 1:
+        raise ValueError("a ViewSpec may consume PointRows only once")
+
+    raw_image = tuple(
+        binding
+        for binding in raw
+        if binding.role in (AxisViewRole.IMAGE_X, AxisViewRole.IMAGE_Y)
+    )
+    if len(raw_image) > 1:
+        raise ValueError("two correlated raw point sources cannot form an image plane")
+
+    point_facets = tuple(
+        binding for binding in bindings if binding.role is AxisViewRole.FACET
+    )
+    if len(point_facets) > 1:
+        raise ValueError("the point domain may have at most one FACET source")
+
+    for binding in bindings:
+        source = binding.source
+        role = binding.role
+        if source.kind == AxisSourceRef.POINT_ROWS:
+            allowed = {
+                AxisViewRole.SAMPLE,
+                AxisViewRole.BATCH,
+                AxisViewRole.FACET,
+                AxisViewRole.REDUCED,
+            }
+        elif source.kind == AxisSourceRef.POINT_ORDINAL:
+            allowed = {
+                AxisViewRole.X,
+                AxisViewRole.IMAGE_X,
+                AxisViewRole.IMAGE_Y,
+            }
+        elif source.kind == AxisSourceRef.POINT_COORDINATE:
+            column = _point_column(schema, source)
+            allowed = {AxisViewRole.BATCH, AxisViewRole.FACET}
+            if column.value_kind == PointColumn.NUMERIC:
+                allowed |= {
+                    AxisViewRole.X,
+                    AxisViewRole.IMAGE_X,
+                    AxisViewRole.IMAGE_Y,
+                }
+        else:
+            topology = schema.grid_topology
+            if topology is None or source.axis_id not in topology.dimension_ids:
+                raise ValueError("GridDimension source is absent from GridTopology")
+            allowed = {
+                AxisViewRole.X,
+                AxisViewRole.IMAGE_X,
+                AxisViewRole.IMAGE_Y,
+                AxisViewRole.BATCH,
+                AxisViewRole.FACET,
+                AxisViewRole.SELECTED,
+                AxisViewRole.REDUCED,
+            }
+        if role not in allowed:
+            raise ValueError(f"{source.kind} cannot use {role.value}")
+
+    if point_rows_bindings:
+        point_rows_role = point_rows_bindings[0].role
+        coordinate_x = any(
+            binding.source.kind == AxisSourceRef.POINT_COORDINATE
+            and binding.role in (AxisViewRole.X, AxisViewRole.IMAGE_X, AxisViewRole.IMAGE_Y)
+            for binding in raw
+        )
+        if coordinate_x and point_rows_role in {
+            AxisViewRole.BATCH,
+            AxisViewRole.FACET,
+            AxisViewRole.REDUCED,
+        }:
+            raise ValueError("PointRows consumption conflicts with a point coordinate axis")
+        if point_rows_role is AxisViewRole.SAMPLE and view.intent is not ViewIntent.HISTOGRAM:
+            raise ValueError("PointRows SAMPLE is valid only for HISTOGRAM")
+
+    group_sources = tuple(
+        binding.source
+        for binding in bindings
+        if binding.role in (AxisViewRole.BATCH, AxisViewRole.FACET)
+    )
+    selected_ordinals = _resolve_selected_point_ordinals(schema, view)
+    resolved = resolve_point_rows(
+        schema.point_table,
+        schema.grid_topology,
+        point_ordinals=selected_ordinals,
+        group_sources=group_sources,
+    )
+
+    if topology_bindings:
+        topology = schema.grid_topology
+        assert topology is not None
+        bound_ids = {binding.source.axis_id for binding in topology_bindings}
+        if (
+            len(resolved.surviving_ordinals) > 1
+            and bound_ids != set(topology.dimension_ids)
+        ):
+            raise ValueError(
+                "every GridTopology dimension must be bound unless one row survives"
+            )
+
+    if len(resolved.surviving_ordinals) > 1 and not bindings:
+        raise ValueError("multiple point rows require an explicit point source binding")
+
+    consumes_group_members = any(
+        binding.role
+        in {
+            AxisViewRole.X,
+            AxisViewRole.IMAGE_X,
+            AxisViewRole.IMAGE_Y,
+            AxisViewRole.SAMPLE,
+            AxisViewRole.REDUCED,
+        }
+        for binding in bindings
+    ) or bool(topology_bindings)
+    if not consumes_group_members and any(
+        len(members) > 1 for members in resolved.group_member_ordinals
+    ):
+        raise ValueError("point grouping leaves multiple rows unresolved")
+    return resolved
+
+
+def _resolve_selected_point_ordinals(
+    schema: DatasetSchema,
+    view: ViewSpec,
+    *,
+    ignore_selected_sources: tuple[AxisSourceRef, ...] = (),
+) -> tuple[int, ...]:
+    """Resolve the exact physical rows surviving every point-domain choice.
+
+    ``resolve_point_rows`` owns the authored row filter and point grouping.
+    Grid ``SELECTED`` bindings are a frontend view concern, so this existing
+    Figure-contract owner applies them once for validation, evaluation, and
+    editor candidate checks.  Keeping this here prevents each surface from
+    inventing a subtly different sparse-grid rule.
     """
 
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    if not isinstance(view, ViewSpec):
-        raise TypeError("view must be ViewSpec")
-    if view.schema_fingerprint != schema.fingerprint:
-        raise ValueError("ViewSpec schema fingerprint is stale")
-    preferences = ViewPreferences() if preferences is None else preferences
-    if not isinstance(preferences, ViewPreferences):
-        raise TypeError("preferences must be ViewPreferences or None")
-    validate_view_spec(schema, view, dataset_contract_for(view.intent))
-
-    axes = dataset_axes(schema)
-    axis_by_id = {axis.axis_id: axis for axis in axes}
-    terms = tuple(
-        term
-        for selection in view.display_selections
-        for term in selection.terms
-    )
-    existing_by_axis = {term.axis_id: term for term in terms}
-    if len(existing_by_axis) != len(terms):
-        raise ValueError("display selections constrain one axis more than once")
-    allowed = {
-        axis.axis_id: display_axis_indices(axis, view.display_selections)
-        for axis in axes
-    }
-    if any(len(indices) == 0 for indices in allowed.values()):
-        raise ValueError("display selection contains an empty axis")
-
-    collapse_ids = {
-        binding.axis_id
-        for binding in view.axis_bindings
-        if binding.role in (AxisViewRole.BATCH, AxisViewRole.FACET)
-        or (
-            binding.role is AxisViewRole.REDUCED
-            and axis_by_id[binding.axis_id].size > 1
+    ignored = tuple(ignore_selected_sources)
+    if any(not isinstance(source, AxisSourceRef) for source in ignored):
+        raise TypeError("ignore_selected_sources must contain AxisSourceRef values")
+    if len(set(ignored)) != len(ignored):
+        raise ValueError("ignore_selected_sources must be unique")
+    ordinals = resolve_point_rows(
+        schema.point_table,
+        schema.grid_topology,
+        point_ordinals=view.point_ordinals,
+    ).surviving_ordinals
+    topology = schema.grid_topology
+    for binding in view.source_bindings:
+        if (
+            binding.source.kind != AxisSourceRef.GRID_DIMENSION
+            or binding.role is not AxisViewRole.SELECTED
+            or binding.source in ignored
+        ):
+            continue
+        if not isinstance(binding.selector, FixedIndex):
+            raise TypeError("GridDimension SELECTED requires FixedIndex")
+        if topology is None or binding.source.axis_id not in topology.dimension_ids:
+            raise ValueError("selected GridDimension is absent from GridTopology")
+        position = topology.dimension_ids.index(binding.source.axis_id)
+        ordinals = tuple(
+            ordinal
+            for ordinal in ordinals
+            if topology.row_to_cell[ordinal][position] == binding.selector.index
         )
-    }
-    reduced_ids = {
-        binding.axis_id
-        for binding in view.axis_bindings
-        if binding.role is AxisViewRole.REDUCED
-        and axis_by_id[binding.axis_id].size > 1
-    }
-    nonrepeat_reduced = reduced_ids - {schema.repeat_axis.axis_id}
-    if nonrepeat_reduced:
-        raise ValueError(
-            "direct Fit single-panel presentation cannot rewrite a non-repeat "
-            "display reduction"
-        )
-
-    fixed_indices = {
-        binding.axis_id: binding.selector.index
-        for binding in view.axis_bindings
-        if isinstance(binding.selector, FixedIndex)
-    }
-    point_tuple = _first_visible_point_tuple(schema, allowed, fixed_indices)
-    if point_tuple is None:
-        raise ValueError(
-            "display selections and selectors contain no physical point tuple"
-        )
-    point_index = {
-        axis.axis_id: index
-        for axis, index in zip(schema.point_axes, point_tuple)
-    }
-
-    merged_terms = {
-        axis_id: term
-        for axis_id, term in existing_by_axis.items()
-        if axis_id not in collapse_ids
-    }
-    for axis_id in sorted(collapse_ids, key=lambda value: value.value):
-        index = point_index.get(axis_id, allowed[axis_id][0])
-        if index not in allowed[axis_id]:
-            raise ValueError(
-                f"single-panel index {index} conflicts with display selection on {axis_id}"
-            )
-        merged_terms[axis_id] = Selection.index(axis_id, index).terms[0]
-
-    selection = (
-        None
-        if not merged_terms
-        else Selection(tuple(merged_terms.values()))
-    )
-    adjusted_preferences = replace(
-        preferences,
-        repeat_mode=(
-            RepeatViewMode.LATEST
-            if schema.repeat_axis.axis_id in reduced_ids
-            else preferences.repeat_mode
-        ),
-        batch_axis_ids=tuple(
-            axis_id
-            for axis_id in preferences.batch_axis_ids
-            if axis_id not in collapse_ids
-        ),
-        facet_axis_ids=tuple(
-            axis_id
-            for axis_id in preferences.facet_axis_ids
-            if axis_id not in collapse_ids
-        ),
-        sample_axis_ids=tuple(
-            axis_id
-            for axis_id in preferences.sample_axis_ids
-            if axis_id not in collapse_ids
-        ),
-    )
-    return selection, adjusted_preferences
+    if not ordinals:
+        raise ValueError("point selection contains no physical row")
+    return ordinals
 
 
-def _first_visible_point_tuple(
+def _resolved_point_group_records(
     schema: DatasetSchema,
-    allowed_indices,
-    fixed_indices=None,
-) -> tuple[int, ...] | None:
-    """Return one physically present point tuple inside the visible selections."""
+    view: ViewSpec,
+) -> tuple[
+    tuple[
+        tuple[AxisAddress, ...],
+        tuple[AxisAddress, ...],
+        tuple[int, ...],
+        int,
+    ],
+    ...,
+]:
+    """Project canonical point groups into the addresses used by Figure cells.
 
-    fixed_indices = {} if fixed_indices is None else fixed_indices
-    point_axes = schema.point_axes
-    if not point_axes:
-        return ()
-    allowed_membership = {}
-    for axis in point_axes:
-        indices = allowed_indices[axis.axis_id]
-        allowed_membership[axis.axis_id] = (
-            indices
-            if isinstance(indices, (range, _CoordinateSelectionIndices))
-            else frozenset(indices)
+    This is the sole owner of the logical per-source indices for correlated
+    point groups.  Evaluation and focused-panel reconstruction must consume the
+    same records; a logical group index is not a physical point ordinal.
+    """
+
+    resolved = _resolve_view_point_rows(schema, view)
+    binding_by_source = {
+        binding.source: binding for binding in view.source_bindings
+    }
+    value_indices: dict[AxisSourceRef, dict[object, int]] = {
+        source: {} for source in resolved.group_sources
+    }
+    records = []
+    for group_index, (address, values, members) in enumerate(
+        zip(
+            resolved.group_addresses,
+            resolved.group_values,
+            resolved.group_member_ordinals,
+            strict=True,
         )
-    layout = schema.point_layout
-    if layout.storage_to_multi is None:
-        candidate = tuple(
-            fixed_indices.get(axis.axis_id, allowed_indices[axis.axis_id][0])
-            for axis in point_axes
-        )
-        if all(
-            index in allowed_membership[axis.axis_id]
-            for axis, index in zip(point_axes, candidate)
-        ):
-            return candidate
-        return None
-    for candidate in layout.storage_to_multi:
-        if all(
-            index in allowed_membership[axis.axis_id]
-            and fixed_indices.get(axis.axis_id, index) == index
-            for axis, index in zip(point_axes, candidate)
-        ):
-            return candidate
-    return None
+    ):
+        facet = []
+        batch = []
+        for position, source in enumerate(resolved.group_sources):
+            coordinate = values[position]
+            indices = value_indices[source]
+            logical_index = indices.setdefault(coordinate, len(indices))
+            if source.kind == AxisSourceRef.GRID_DIMENSION:
+                logical_index = int(address[position])
+            item = AxisAddress(
+                source,
+                _source_name(schema, source),
+                _source_role(schema, source),
+                logical_index,
+                coordinate,
+            )
+            role = binding_by_source[source].role
+            if role is AxisViewRole.FACET:
+                facet.append(item)
+            elif role is AxisViewRole.BATCH:
+                batch.append(item)
+        records.append((tuple(facet), tuple(batch), members, group_index))
+    return tuple(records)
 
 
-def _repeat_mode_for_binding(binding) -> RepeatViewMode:
-    if binding.role is AxisViewRole.REDUCED:
-        assert binding.reduction is not None
-        return (
-            RepeatViewMode.MEAN
-            if binding.reduction.method is DisplayReductionMethod.MEAN
-            else RepeatViewMode.SUM
-        )
-    if binding.role is AxisViewRole.BATCH:
-        return RepeatViewMode.BATCH
-    if binding.role is AxisViewRole.FACET:
-        return RepeatViewMode.FACET
-    if binding.role is AxisViewRole.SAMPLE:
-        return RepeatViewMode.SAMPLE
-    if binding.role is AxisViewRole.SELECTED:
-        return RepeatViewMode.LATEST
-    raise ValueError("repeat axis has an unsupported presentation binding")
+def _repeat_binding_allowed(intent: ViewIntent, binding: SourceViewBinding) -> bool:
+    role = binding.role
+    if intent is ViewIntent.IMAGE:
+        return role in {AxisViewRole.REDUCED, AxisViewRole.SELECTED, AxisViewRole.FACET}
+    if intent is ViewIntent.CURVE:
+        return role in {
+            AxisViewRole.REDUCED,
+            AxisViewRole.SELECTED,
+            AxisViewRole.BATCH,
+            AxisViewRole.FACET,
+        }
+    if intent is ViewIntent.HISTOGRAM:
+        return role in {
+            AxisViewRole.SAMPLE,
+            AxisViewRole.BATCH,
+            AxisViewRole.REDUCED,
+            AxisViewRole.SELECTED,
+            AxisViewRole.FACET,
+        }
+    return role in {AxisViewRole.SELECTED, AxisViewRole.REDUCED}
 
 
 def _display_dtype_issue(schema: DatasetSchema, intent: ViewIntent) -> str | None:
-    """Return the one value-domain issue the current ViewSpec cannot express."""
-
     if schema.cell_schema.dtype.kind == "c" and intent is not ViewIntent.METER:
         return (
             f"{intent.value} does not define a complex-value projection; "
@@ -701,7 +701,7 @@ def validate_view_spec(
     spec: ViewSpec,
     contract: ViewContract | None = None,
 ) -> None:
-    """Validate total axis coverage and intent-specific presentation safety."""
+    """Validate total tensor coverage and source-aware presentation safety."""
 
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
@@ -715,67 +715,60 @@ def validate_view_spec(
     dtype_issue = _display_dtype_issue(schema, spec.intent)
     if dtype_issue is not None:
         raise ValueError(dtype_issue)
-    axes = dataset_axes(schema)
-    expected_ids = tuple(axis.axis_id for axis in axes)
-    actual_ids = tuple(binding.axis_id for binding in spec.axis_bindings)
-    if set(actual_ids) != set(expected_ids):
-        missing = tuple(axis_id for axis_id in expected_ids if axis_id not in actual_ids)
-        extra = tuple(axis_id for axis_id in actual_ids if axis_id not in expected_ids)
-        raise ValueError(
-            "ViewSpec must bind every dataset AxisId exactly once; "
-            f"missing={missing}, extra={extra}"
-        )
-    axis_by_id = {axis.axis_id: axis for axis in axes}
-    selected_axis_ids = {
-        term.axis_id
-        for selection in spec.display_selections
-        for term in selection.terms
-    }
-    unknown_selection_axes = selected_axis_ids - set(axis_by_id)
-    if unknown_selection_axes:
-        raise ValueError(
-            f"display selection references absent axes: {tuple(sorted(unknown_selection_axes))}"
-        )
-    allowed_indices = {
-        axis.axis_id: display_axis_indices(axis, spec.display_selections)
-        for axis in axes
-    }
-    fixed_indices = {
-        binding.axis_id: binding.selector.index
-        for binding in spec.axis_bindings
-        if isinstance(binding.selector, FixedIndex)
-    }
-    for axis_id, index in fixed_indices.items():
-        if index not in allowed_indices[axis_id]:
-            raise IndexError(
-                f"selector index is outside the display selection on axis {axis_id}"
-            )
-    if _first_visible_point_tuple(schema, allowed_indices, fixed_indices) is None:
-        raise ValueError(
-            "point selections and fixed selectors do not identify a physical point"
-        )
-    roles = tuple(binding.role for binding in spec.axis_bindings)
-    expected_display = tuple(slot.binding_role for slot in contract.display_slots)
-    actual_display = tuple(role for role in roles if role in {
-        AxisViewRole.X, AxisViewRole.IMAGE_X, AxisViewRole.IMAGE_Y
-    })
-    if sorted(role.value for role in actual_display) != sorted(role.value for role in expected_display):
-        raise ValueError("ViewSpec display axes do not satisfy its ViewContract")
-    for slot in contract.display_slots:
-        binding = next(item for item in spec.axis_bindings if item.role is slot.binding_role)
-        axis = axis_by_id[binding.axis_id]
-        if axis.role not in slot.preferred_axis_roles:
-            raise ValueError(
-                f"axis {axis.axis_id} role {axis.role} is not allowed for {slot.binding_role.value}"
-            )
-    if spec.intent is ViewIntent.HISTOGRAM and AxisViewRole.SAMPLE not in roles:
-        raise ValueError("HISTOGRAM ViewSpec requires at least one SAMPLE axis")
-    if spec.intent is not ViewIntent.HISTOGRAM and AxisViewRole.SAMPLE in roles:
-        raise ValueError("SAMPLE axes are valid only for HISTOGRAM")
 
-    for binding in spec.axis_bindings:
-        axis = axis_by_id[binding.axis_id]
-        if axis.role == SCALAR:
+    declared = set(_dataset_sources(schema))
+    actual = {binding.source for binding in spec.source_bindings}
+    unknown = actual - declared
+    if unknown:
+        raise ValueError(f"ViewSpec references absent sources: {tuple(sorted(unknown))}")
+    required_tensor = {
+        AxisSourceRef.tensor(axis.axis_id) for axis in _tensor_axes(schema)
+    }
+    missing_tensor = required_tensor - actual
+    if missing_tensor:
+        raise ValueError(
+            f"ViewSpec must bind every tensor source exactly once; missing={missing_tensor}"
+        )
+
+    resolved_points = _resolve_view_point_rows(schema, spec)
+    roles = tuple(binding.role for binding in spec.source_bindings)
+    expected_display = tuple(slot.binding_role for slot in contract.display_slots)
+    actual_display = tuple(
+        role
+        for role in roles
+        if role in {AxisViewRole.X, AxisViewRole.IMAGE_X, AxisViewRole.IMAGE_Y}
+    )
+    if sorted(role.value for role in actual_display) != sorted(
+        role.value for role in expected_display
+    ):
+        raise ValueError("ViewSpec display sources do not satisfy its ViewContract")
+    for slot in contract.display_slots:
+        binding = next(
+            item for item in spec.source_bindings if item.role is slot.binding_role
+        )
+        if _source_role(schema, binding.source) not in slot.preferred_axis_roles:
+            raise ValueError(
+                f"source {_source_name(schema, binding.source)} cannot fill "
+                f"{slot.binding_role.value}"
+            )
+
+    if spec.intent is ViewIntent.HISTOGRAM and AxisViewRole.SAMPLE not in roles:
+        raise ValueError("HISTOGRAM ViewSpec requires at least one SAMPLE source")
+    if spec.intent is not ViewIntent.HISTOGRAM and AxisViewRole.SAMPLE in roles:
+        raise ValueError("SAMPLE sources are valid only for HISTOGRAM")
+    if sum(role is AxisViewRole.FACET for role in roles) > 1:
+        raise ValueError("a ViewSpec may contain at most one FACET source")
+
+    repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+    repeat_binding = spec.binding(repeat_source)
+    if not _repeat_binding_allowed(spec.intent, repeat_binding):
+        raise ValueError("repeat source has an unsupported presentation binding")
+
+    latest_count = 0
+    for binding in spec.source_bindings:
+        source = binding.source
+        role = _source_role(schema, source)
+        if role == SCALAR:
             if (
                 binding.role is not AxisViewRole.SELECTED
                 or not isinstance(binding.selector, FixedIndex)
@@ -785,126 +778,65 @@ def validate_view_spec(
                     "the scalar carrier must select its sole physical item"
                 )
             continue
-        policy = contract.policy_for(axis.role)
-        if axis.role == REPEAT:
-            repeat_mode = _repeat_mode_for_binding(binding)
-            if repeat_mode not in contract.repeat_modes:
-                raise ValueError(
-                    f"repeat mode {repeat_mode.value} is not allowed by this ViewContract"
-                )
         if isinstance(binding.selector, LatestNonempty):
-            if axis.axis_id != schema.repeat_axis.axis_id:
-                raise ValueError(
-                    "LatestNonempty is valid only for the logical repeat axis"
-                )
+            latest_count += 1
+            if source != repeat_source:
+                raise ValueError("LatestNonempty is valid only for repeat")
+        if isinstance(binding.selector, FixedIndex):
+            if binding.selector.index >= _source_cardinality(schema, source):
+                raise IndexError(f"selector index is outside source {source}")
         if binding.role is AxisViewRole.REDUCED:
             assert binding.reduction is not None
-            if axis.role not in contract.reducible_axis_roles:
-                raise ValueError(f"axis role {axis.role} cannot be display-reduced by this contract")
-            if axis.role != REPEAT and axis.axis_id not in selected_axis_ids:
-                raise ValueError(
-                    f"axis {axis.axis_id} may be display-reduced only after an explicit selection"
-                )
-            if binding.reduction.method not in (
+            if source.kind == AxisSourceRef.TENSOR and role not in contract.reducible_axis_roles:
+                raise ValueError(f"source role {role} cannot be display-reduced")
+            if binding.reduction.method not in {
                 DisplayReductionMethod.MEAN,
                 DisplayReductionMethod.SUM,
-            ):
+            }:
                 raise ValueError("unsupported display reduction method")
-        elif binding.role in (AxisViewRole.BATCH, AxisViewRole.FACET, AxisViewRole.SLIDER, AxisViewRole.SAMPLE):
-            if axis.role == REPEAT:
-                pass
-            elif policy is None or binding.role not in policy.automatic_roles:
-                explicit_spatial_curve_page = (
-                    spec.intent is ViewIntent.CURVE
-                    and axis.role in (SPATIAL_X, SPATIAL_Y)
-                    and binding.role is AxisViewRole.FACET
-                    and axis.axis_id in selected_axis_ids
+        elif source.kind == AxisSourceRef.TENSOR and binding.role in {
+            AxisViewRole.BATCH,
+            AxisViewRole.FACET,
+            AxisViewRole.SELECTED,
+            AxisViewRole.SAMPLE,
+        }:
+            if role == REPEAT:
+                continue
+            policy = contract.policy_for(role)
+            if policy is None or (
+                binding.role is not AxisViewRole.SELECTED
+                and binding.role not in policy.automatic_roles
+            ):
+                raise ValueError(
+                    f"{binding.role.value} is not allowed for source role {role}"
                 )
-                # Explicit SAMPLE is permitted for histogram axes only; it is
-                # review-required at suggestion time but still a valid spec.
-                if not (
-                    spec.intent is ViewIntent.HISTOGRAM
-                    and binding.role is AxisViewRole.SAMPLE
-                ) and not explicit_spatial_curve_page:
-                    raise ValueError(
-                        f"{binding.role.value} is not allowed for axis role {axis.role}"
-                    )
-    reduction_methods = {
+    if latest_count > 1:
+        raise ValueError("a ViewSpec may contain only one LatestNonempty selector")
+
+    methods = {
         binding.reduction.method
-        for binding in spec.axis_bindings
+        for binding in spec.source_bindings
         if binding.role is AxisViewRole.REDUCED
     }
-    if len(reduction_methods) > 1:
+    if len(methods) > 1:
         raise ValueError("joint display reductions must use one common method")
     if spec.intent is ViewIntent.METER:
         unresolved = tuple(
-            binding.axis_id
-            for binding in spec.axis_bindings
-            if binding.role not in (
+            binding.source
+            for binding in spec.source_bindings
+            if binding.role
+            not in {
                 AxisViewRole.FACET,
                 AxisViewRole.BATCH,
                 AxisViewRole.SELECTED,
-                AxisViewRole.SLIDER,
                 AxisViewRole.REDUCED,
-            )
+            }
         )
         if unresolved:
-            raise ValueError(f"METER has unresolved axes: {unresolved}")
+            raise ValueError(f"METER has unresolved sources: {unresolved}")
 
-
-def _validate_selection_fit_view(
-    schema: DatasetSchema,
-    result: FitResultBatch,
-    view: ViewSpec,
-) -> None:
-    """Prove that a raw view reproduces one selection-only Fit authority.
-
-    Figure evaluation still reads the immutable raw snapshot.  Therefore the
-    committed selection must appear byte-for-byte in the display selection,
-    and the only additional selection terms may identify saved batch cells.
-    Any display reduction would change the observations and is rejected.
-    """
-
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("result must be FitResultBatch")
-    if not isinstance(view, ViewSpec):
-        raise TypeError("view must be ViewSpec")
-    if result.spec.committed_transform is None:
-        return
-
-    _effective_schema, authority_selection = _selection_fit_projection(
-        schema,
-        result,
-    )
-    terms = tuple(
-        term
-        for selection in view.display_selections
-        for term in selection.terms
-    )
-    actual_terms = {term.axis_id: term for term in terms}
-    if len(actual_terms) != len(terms):
-        raise ValueError("figure selection repeats an axis")
-    authority_terms = {
-        term.axis_id: term for term in authority_selection.terms
-    }
-    if any(
-        actual_terms.get(axis_id) != term
-        for axis_id, term in authority_terms.items()
-    ):
-        raise ValueError("figure ROI differs from the fit committed transform")
-    batch_ids = {axis.axis_id for axis in result.batch_axis_specs}
-    if set(actual_terms) - set(authority_terms) - batch_ids:
-        raise ValueError(
-            "figure selection outside fit batch axes differs from the committed transform"
-        )
-    if any(
-        binding.role is AxisViewRole.REDUCED
-        for binding in view.axis_bindings
-    ):
-        raise ValueError("selection-only transformed fit display cannot reduce axes")
-    validate_view_spec(schema, view, dataset_contract_for(view.intent))
+    if not resolved_points.group_member_ordinals:
+        raise ValueError("point projection resolved no groups")
 
 
 __all__ = [
@@ -917,8 +849,5 @@ __all__ = [
     "VIEW_CONTRACTS",
     "contract_for",
     "dataset_contract_for",
-    "dataset_axes",
-    "display_axis_indices",
-    "fit_single_panel_presentation",
     "validate_view_spec",
 ]

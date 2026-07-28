@@ -37,14 +37,44 @@ def _axis_text(axis) -> str:
     )
 
 
+def _binding_text(binding) -> str:
+    """Describe one source-owned display binding and its visible operation."""
+
+    source = binding.source
+    source_text = source.kind.lower()
+    if source.axis_id is not None:
+        source_text = f"{source_text}:{source.axis_id}"
+    operation = ""
+    if binding.selector is not None:
+        operation = f"({binding.selector})"
+    elif binding.reduction is not None:
+        operation = f"({binding.reduction.method.value.lower()})"
+    return f"{source_text}={binding.role.value}{operation}"
+
+
 def _view_text(view) -> str:
     bindings = ", ".join(
-        f"{binding.axis_id}={binding.role.value}"
-        for binding in view.axis_bindings
+        _binding_text(binding) for binding in view.source_bindings
     )
-    selections = len(view.display_selections)
-    suffix = "" if selections == 0 else f"; selections={selections}"
-    return f"intent={view.intent.value}; {bindings or 'no axis bindings'}{suffix}"
+    points = (
+        "all point rows"
+        if view.point_ordinals is None
+        else f"point rows={view.point_ordinals}"
+    )
+    return (
+        f"intent={view.intent.value}; "
+        f"{bindings or 'no source bindings'}; {points}"
+    )
+
+
+def _point_column_text(column) -> str:
+    """Describe one correlated PointTable column without axis-shaped fiction."""
+
+    unit = "" if column.unit is None else f" [{column.unit}]"
+    return (
+        f"{column.name} ({column.coordinate_id}; role={column.role}; "
+        f"kind={column.value_kind}{unit})"
+    )
 
 
 def _dataset_projection(figure) -> InfoRows:
@@ -58,16 +88,32 @@ def _dataset_projection(figure) -> InfoRows:
         schema = snapshot.block.schema
         cell = schema.cell_schema
         prefix = descriptor.label
+        topology = schema.grid_topology
+        topology_text = "(none; ordered point sequence)"
+        if topology is not None:
+            dimensions = ", ".join(str(item) for item in topology.dimension_ids)
+            topology_text = (
+                f"dimensions=({dimensions}); shape={topology.logical_shape}; "
+                f"mapped_rows={len(topology.row_to_cell)}"
+            )
         rows.extend(
             (
                 (f"{prefix} id", descriptor.dataset_id),
                 (f"{prefix} revision", snapshot.ref),
                 (f"{prefix} shape", schema.physical_shape),
                 (f"{prefix} repeat", _axis_text(schema.repeat_axis)),
+                (f"{prefix} point rows", schema.point_table.row_count),
                 (
-                    f"{prefix} points",
-                    ", ".join(_axis_text(axis) for axis in schema.point_axes)
+                    f"{prefix} point columns",
+                    ", ".join(
+                        _point_column_text(column)
+                        for column in schema.point_table.columns
+                    )
                     or "(none)",
+                ),
+                (
+                    f"{prefix} grid topology",
+                    topology_text,
                 ),
                 (
                     f"{prefix} data",

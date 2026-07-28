@@ -7,7 +7,6 @@ from dataclasses import replace
 
 from PyQt5 import QtCore, QtWidgets
 
-from zlc_data import Selection
 from zlc_frontend.display_range import RelimMode
 from zlc_frontend.image_display import (
     ImageDisplayState, image_display_for_viewport, image_display_form_spec,
@@ -16,7 +15,8 @@ from zlc_frontend.image_display import (
 )
 from zlc_frontend.plot_layout import panel_surface_geometry
 from zlc_frontend.qt_widgets import (
-    AxisLayoutNavigator, FluentButton, FluentLabel, FluentPopup, FluentSwitch,
+    FluentButton, FluentFormGrid, FluentLabel, FluentPopup, FluentSpinBox,
+    FluentSwitch,
     FluentRevisionedFormEditor, FluentTabWidget, GREY,
     RasterPixelRatioObserver, RectangleGesture, SinglePanelHost,
     FluentSettingsPopupAnchor, runtime_range_placeholders, signals_blocked,
@@ -28,6 +28,7 @@ from zlc_frontend.selector import (
     ImageColorLimitsCommit, ImageInteractionCommit, ImageViewportCommit,
 )
 from zlc_neutral_atom.logic_nodes.readout.occupancy.reference import OccupancyArtifactRef
+from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 
 from zlc_workbench.window_runtime import (
     RASTER_WORK_EXECUTOR,
@@ -45,13 +46,21 @@ def _label(parent, name, text, *, wrap=False):
     return result
 
 
-def _cell_label(navigation, repeat_index, logical_point) -> str:
-    indices = (repeat_index, *tuple(logical_point))
-    labels = []
-    for axis, index in zip(navigation.axes, indices, strict=True):
-        coordinate = axis.coordinate_at(index)
-        unit = "" if axis.unit is None else f" {axis.unit}"
-        labels.append(f"{axis.name}={coordinate}{unit} [index {index}]")
+def _cell_label(navigation, repeat_index, point_ordinal, logical_point) -> str:
+    repeat_axis = navigation.occupancy_schema.repeat_axis
+    repeat_coordinate = repeat_axis.coordinate_at(repeat_index)
+    repeat_unit = "" if repeat_axis.unit is None else f" {repeat_axis.unit}"
+    labels = [
+        f"{repeat_axis.name}={repeat_coordinate}{repeat_unit} "
+        f"[index {repeat_index}]",
+        f"point row={point_ordinal}",
+    ]
+    for column in navigation.occupancy_schema.point_table.columns:
+        value = column.values[point_ordinal]
+        unit = "" if column.unit is None else f" {column.unit}"
+        labels.append(f"{column.name}={value}{unit}")
+    if navigation.occupancy_schema.grid_topology is not None:
+        labels.append(f"grid cell={tuple(logical_point)}")
     return " | ".join(labels)
 
 
@@ -59,21 +68,23 @@ class OccupancyCellWindow(SerialWorkerWindow):
     """Navigate exact cells and interact with one worker-rasterized SiteMap."""
 
     def __init__(
-        self, navigation_loader, cell_loader, reference, *, selection,
+        self, navigation_loader, cell_loader, reference, *, address,
     ) -> None:
         super().__init__(executor=RASTER_WORK_EXECUTOR)
         if not callable(navigation_loader) or not callable(cell_loader):
             raise TypeError("occupancy loaders must be callable")
         if not isinstance(reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
-        if selection is not None and not isinstance(selection, Selection):
-            raise TypeError("selection must be Selection or None")
+        if address is not None and not isinstance(address, DatasetCellAddress):
+            raise TypeError("address must be DatasetCellAddress or None")
         self._cell_loader = cell_loader
-        self._reference, self._initial_selection = reference, selection
+        self._reference, self._initial_address = reference, address
         self._navigation = self._navigator = None
+        self._repeat_control = self._point_control = None
+        self._previous_cell = self._load_cell_button = self._next_cell = None
         self._display = ImageDisplayState()
-        self._loaded_view = self._loaded_selection = None
-        self._requested_selection = self._presented_selection = None
+        self._loaded_view = self._loaded_address = None
+        self._requested_address = self._presented_address = None
         self._presented_key = None
         self._rectangle_candidate = None
         self._request_revision = 0
@@ -221,7 +232,7 @@ class OccupancyCellWindow(SerialWorkerWindow):
             self._discard_front()
         if (
             self._loaded_view is not None
-            and self._loaded_selection == self._requested_selection
+            and self._loaded_address == self._requested_address
         ):
             self._render_requested = True
             self._status.setText(
@@ -248,70 +259,143 @@ class OccupancyCellWindow(SerialWorkerWindow):
 
     def _build_navigator(self):
         navigation = self._navigation
-        navigator = AxisLayoutNavigator(
-            navigation.axes, navigation.cell_layout, object_prefix="occupancyCell",
-            action_text="Load exact cell", parent=self,
-        )
-        navigator.candidateChanged.connect(self._refresh_candidate)
-        navigator.activated.connect(self._activate_indices)
-        navigator.action_button.setObjectName("occupancyCellLoad")
+        if max(navigation.repeat_count, navigation.point_count) > (1 << 31):
+            raise OverflowError("occupancy cell navigator exceeds Qt integer range")
+        navigator = QtWidgets.QWidget(self)
+        outer = QtWidgets.QVBoxLayout(navigator)
+        outer.setContentsMargins(0, 0, 0, 0)
+        form = FluentFormGrid(navigator)
+        form.setObjectName("occupancyCellAxisForm")
+        self._repeat_control = FluentSpinBox(form)
+        self._point_control = FluentSpinBox(form)
+        for control, count, name in (
+            (self._repeat_control, navigation.repeat_count, "occupancyCellRepeat"),
+            (self._point_control, navigation.point_count, "occupancyCellPointRow"),
+        ):
+            control.setObjectName(name)
+            if count == 1:
+                control.setRange(0, 0)
+                control.setValue(0)
+            else:
+                control.setRange(-1, count - 1)
+                control.setSpecialValueText("Select…")
+                control.setValue(-1)
+            control.valueChanged.connect(self._refresh_candidate)
+        form.add_row("Repeat index", self._repeat_control)
+        form.add_row("Point row", self._point_control)
+        outer.addWidget(form)
+        self._previous_cell = FluentButton("Previous", navigator, color=GREY)
+        self._load_cell_button = FluentButton("Load exact cell", navigator)
+        self._next_cell = FluentButton("Next", navigator, color=GREY)
+        buttons = QtWidgets.QHBoxLayout()
+        for button, name in (
+            (self._previous_cell, "occupancyCellPrevious"),
+            (self._load_cell_button, "occupancyCellLoad"),
+            (self._next_cell, "occupancyCellNext"),
+        ):
+            button.setObjectName(name)
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        outer.addLayout(buttons)
+        self._previous_cell.clicked.connect(lambda: self._move_cell(-1))
+        self._load_cell_button.clicked.connect(self._activate_address)
+        self._next_cell.clicked.connect(lambda: self._move_cell(1))
         self._navigator = navigator
         self._layout.insertWidget(3, navigator)
+        self._refresh_candidate()
 
-    def _control_selection(self):
+    def _control_address(self):
         if self._navigation is None or self._navigator is None:
             return None
-        indices = self._navigator.indices
-        if indices is None:
+        indices = (self._repeat_control.value(), self._point_control.value())
+        if any(index < 0 for index in indices):
             return None
-        return self._navigation.selection_for_indices(indices[0], tuple(indices[1:]))
+        return DatasetCellAddress(*indices)
 
-    def _set_controls(self, selection):
-        repeat, _storage, logical = self._navigation.resolve_selection(selection)
-        with signals_blocked(self._navigator):
-            self._navigator.set_indices((repeat, *logical))
+    def _set_controls(self, address):
+        repeat, point_ordinal, _logical = self._navigation.resolve_address(address)
+        with signals_blocked(self._repeat_control, self._point_control):
+            self._repeat_control.setValue(repeat)
+            self._point_control.setValue(point_ordinal)
+        self._refresh_navigation_controls()
 
     def _refresh_candidate(self):
         if self._closing:
             return
         try:
-            selection = self._control_selection()
+            address = self._control_address()
         except BaseException as error:
             self._status.setText("POINT NOT ACQUIRED")
             self._diagnostic.setText(error_summary(error))
             return
-        if selection is None:
+        if address is None:
             self._status.setText("NEEDS CELL SELECTION")
             self._summary.setText("Choose every non-singleton repeat / point index")
-        elif selection != self._presented_selection:
-            repeat, _storage, logical = self._navigation.resolve_selection(selection)
-            label = _cell_label(self._navigation, repeat, logical)
+        elif address != self._presented_address:
+            repeat, point_ordinal, logical = self._navigation.resolve_address(address)
+            label = _cell_label(
+                self._navigation,
+                repeat,
+                point_ordinal,
+                logical,
+            )
             self._status.setText("EXACT CELL READY TO LOAD")
             self._summary.setText(label)
         self._diagnostic.setText("")
+        self._refresh_navigation_controls()
 
-    def _activate_indices(self, indices):
-        indices = tuple(indices)
-        self._queue_cell(
-            self._navigation.selection_for_indices(indices[0], tuple(indices[1:]))
+    def _activate_address(self):
+        address = self._control_address()
+        if address is not None:
+            self._queue_cell(address)
+
+    def _refresh_navigation_controls(self):
+        if self._navigator is None:
+            return
+        address = self._control_address()
+        linear = None if address is None else self._navigation.linear_index(address)
+        enabled = not self._closing
+        self._repeat_control.setEnabled(enabled and self._navigation.repeat_count > 1)
+        self._point_control.setEnabled(enabled and self._navigation.point_count > 1)
+        self._load_cell_button.setEnabled(enabled and address is not None)
+        self._previous_cell.setEnabled(enabled and linear is not None and linear > 0)
+        self._next_cell.setEnabled(
+            enabled
+            and linear is not None
+            and linear + 1 < self._navigation.linear_cell_count
         )
 
-    def _queue_cell(self, selection):
+    def _move_cell(self, delta):
+        address = self._control_address()
+        if delta not in (-1, 1) or address is None:
+            return
+        target = self._navigation.linear_index(address) + delta
+        if not 0 <= target < self._navigation.linear_cell_count:
+            return
+        address = self._navigation.address_at_linear(target)
+        self._queue_cell(address)
+
+    def _queue_cell(self, address):
         if self._closing:
             return
-        repeat, storage, logical = self._navigation.resolve_selection(selection)
-        label = _cell_label(self._navigation, repeat, logical)
-        selection = self._navigation.selection_for_indices(repeat, logical)
+        repeat, point_ordinal, logical = self._navigation.resolve_address(address)
+        label = _cell_label(
+            self._navigation,
+            repeat,
+            point_ordinal,
+            logical,
+        )
+        address = DatasetCellAddress(repeat, point_ordinal)
         self._request_revision += 1
-        self._requested_selection = selection
-        self._pending_cell = (self._request_revision, selection)
+        self._requested_address = address
+        self._pending_cell = (self._request_revision, address)
         self._render_requested = False
-        self._loaded_view = self._loaded_selection = None
-        self._set_controls(selection)
+        self._loaded_view = self._loaded_address = None
+        self._set_controls(address)
         self._discard_front()
         self._status.setText("BUILDING OCCUPANCY CELL")
         self._summary.setText(
-            f"{label} | physical point row {storage} | request {self._request_revision}"
+            f"{label} | request {self._request_revision}"
         )
         self._diagnostic.setText("")
         self._start_next()
@@ -321,13 +405,13 @@ class OccupancyCellWindow(SerialWorkerWindow):
             return
         load = self._pending_cell is not None
         if load:
-            revision, selection = self._pending_cell
+            revision, address = self._pending_cell
             self._pending_cell = None
             view = None
         elif self._render_requested:
-            revision, selection = self._request_revision, self._loaded_selection
+            revision, address = self._request_revision, self._loaded_address
             view = self._loaded_view
-            if view is None or selection != self._requested_selection:
+            if view is None or address != self._requested_address:
                 return
             self._render_requested = False
         else:
@@ -335,8 +419,8 @@ class OccupancyCellWindow(SerialWorkerWindow):
         display = self._display
         surface_revision = self._surface_revision
         self._submit(
-            "cell", (revision, selection, surface_revision), _cell_job,
-            self._cell_loader if load else None, self._reference, selection,
+            "cell", (revision, address, surface_revision), _cell_job,
+            self._cell_loader if load else None, self._reference, address,
             self._navigation, view, display, self._composer,
             revision, self._surface_geometry, surface_revision,
             self._cancelled,
@@ -345,38 +429,38 @@ class OccupancyCellWindow(SerialWorkerWindow):
     def _accept_navigation(self, navigation):
         self._navigation = navigation
         self._build_navigator()
-        initial, self._initial_selection = self._initial_selection, None
-        if initial is None and all(axis.size == 1 for axis in navigation.axes):
-            initial = navigation.selection_at_linear(0)
+        initial, self._initial_address = self._initial_address, None
+        if initial is None and navigation.linear_cell_count == 1:
+            initial = navigation.address_at_linear(0)
         if initial is None:
             self._refresh_candidate()
             return
         try:
-            repeat, _storage, logical = navigation.resolve_selection(initial)
-            self._queue_cell(navigation.selection_for_indices(repeat, logical))
+            navigation.resolve_address(initial)
+            self._queue_cell(initial)
         except BaseException as error:
-            self._status.setText("INITIAL CELL SELECTION INVALID")
+            self._status.setText("INITIAL CELL ADDRESS INVALID")
             self._diagnostic.setText(error_summary(error))
 
     def _accept_cell(self, result):
         (
-            nav_id, selection, revision, display_revision, surface_revision,
+            nav_id, address, revision, display_revision, surface_revision,
             view, frame,
         ) = result
         if (
             self._navigation.identity != nav_id or revision != self._request_revision
-            or selection != self._requested_selection
+            or address != self._requested_address
         ):
             return
         self._loaded_view = view
-        self._loaded_selection = selection
+        self._loaded_address = address
         if (
             display_revision == self._display.revision
             and surface_revision == self._surface_revision
         ):
             self._present(
                 revision,
-                selection,
+                address,
                 display_revision,
                 surface_revision,
                 frame,
@@ -385,13 +469,13 @@ class OccupancyCellWindow(SerialWorkerWindow):
             self._render_requested = True
 
     def _present(
-        self, revision, selection, display_revision, surface_revision, frame,
+        self, revision, address, display_revision, surface_revision, frame,
     ):
         self._panel_host.present_frame(frame, logical_size=self._logical_size)
         payload = frame.panels[0].display_payload
         if not isinstance(payload, SiteMapPanelPayload):
             raise TypeError("occupancy worker returned a non-SiteMap payload")
-        self._presented_selection = selection
+        self._presented_address = address
         self._presented_key = (revision, display_revision, surface_revision)
         self._status.setText("READY")
         self._diagnostic.setText("")
@@ -407,7 +491,7 @@ class OccupancyCellWindow(SerialWorkerWindow):
                 self._display.revision,
                 self._surface_revision,
             )
-            or self._presented_selection != self._requested_selection
+            or self._presented_address != self._requested_address
         ):
             return False
         origin = self._panel_host.visible_interaction_origin()
@@ -588,7 +672,7 @@ class OccupancyCellWindow(SerialWorkerWindow):
         self._selector_switch.setChecked(False)
         del blocker
         self._panel_host.clear()
-        self._presented_selection = self._presented_key = None
+        self._presented_address = self._presented_key = None
         self._rectangle_candidate = None
         self._update_controls()
 
@@ -602,7 +686,7 @@ class OccupancyCellWindow(SerialWorkerWindow):
         return self._navigation is None if kind == "navigation" else (
             isinstance(key, tuple) and key == (
                 self._request_revision,
-                self._requested_selection,
+                self._requested_address,
                 self._surface_revision,
             )
         )
@@ -638,7 +722,7 @@ class OccupancyCellWindow(SerialWorkerWindow):
         self._settings_popup.hide()
         self._close_button.setEnabled(False)
         if self._navigator is not None:
-            self._navigator.set_interaction_enabled(False)
+            self._navigator.setEnabled(False)
         self._discard_front()
         self._status.setText("CLOSING")
         self._cell_loader = self._navigation = None

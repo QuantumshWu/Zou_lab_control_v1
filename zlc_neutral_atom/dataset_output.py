@@ -84,7 +84,7 @@ class LiveDatasetOutput:
             raise TypeError("coverage must be DatasetCoverage or MonitorCoverage")
         total = (
             self.snapshot.block.schema.repeat_axis.size
-            * self.snapshot.block.schema.point_layout.storage_size
+            * self.snapshot.block.schema.point_table.row_count
         )
         if self.coverage.total_cells != total:
             raise ValueError("live coverage differs from projected Dataset geometry")

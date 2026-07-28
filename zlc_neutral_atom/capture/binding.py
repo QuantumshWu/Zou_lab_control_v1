@@ -14,7 +14,9 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     DatasetSchema,
-    PointLayout,
+    GridTopology,
+    PointColumn,
+    PointTable,
     READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
@@ -96,28 +98,36 @@ def _source_group_sizes(
     """Derive the sole frame-group truth from the frozen Dataset schedule."""
 
     dataset_schema = request.dataset_schema
-    event_positions = tuple(
-        index
-        for index, axis in enumerate(dataset_schema.point_axes)
-        if axis.role == READOUT_EVENT
+    event_columns = tuple(
+        column
+        for column in dataset_schema.point_table.columns
+        if column.role == READOUT_EVENT
     )
-    if not event_positions:
+    if not event_columns:
         return (1,) * len(request.cell_schedule)
-    if len(event_positions) != 1:
-        raise ValueError("camera Dataset has multiple READOUT_EVENT axes")
-    event_position = event_positions[0]
-    event_count = dataset_schema.point_axes[event_position].size
+    if len(event_columns) != 1:
+        raise ValueError("camera Dataset has multiple READOUT_EVENT columns")
+    event_column = event_columns[0]
+    event_values = tuple(dict.fromkeys(event_column.values))
+    if event_values != tuple(range(len(event_values))):
+        raise ValueError("READOUT_EVENT values must be canonical zero-based indices")
+    event_count = len(event_values)
     groups: list[int] = []
     current_identity: tuple[int, tuple[int, ...]] | None = None
     expected_event_index = 0
     for address in request.cell_schedule:
-        multi_index = dataset_schema.point_layout.multi_index(
-            address.point_storage_index
+        event_index = event_column.values[address.point_ordinal]
+        if not isinstance(event_index, int):
+            raise TypeError("READOUT_EVENT value must be an integer")
+        base_point_ordinal, event_remainder = divmod(
+            address.point_ordinal,
+            event_count,
         )
-        event_index = multi_index[event_position]
+        if event_index != event_remainder:
+            raise ValueError("camera Dataset rows are not base-major/event-minor")
         identity = (
             address.repeat_index,
-            multi_index[:event_position] + multi_index[event_position + 1 :],
+            (base_point_ordinal,),
         )
         if identity != current_identity:
             if current_identity is not None and expected_event_index != event_count:
@@ -171,12 +181,18 @@ def bind_camera_capture(
             evidence.settings_fingerprint,
         )
     )
-    readout_axes = tuple(
-        axis for axis in dataset_schema.point_axes if axis.role == READOUT_EVENT
+    readout_columns = tuple(
+        column
+        for column in dataset_schema.point_table.columns
+        if column.role == READOUT_EVENT
     )
-    if len(readout_axes) > 1:
-        raise ValueError("camera Dataset has multiple READOUT_EVENT axes")
-    event_count = 1 if not readout_axes else readout_axes[0].size
+    if len(readout_columns) > 1:
+        raise ValueError("camera Dataset has multiple READOUT_EVENT columns")
+    event_count = (
+        1
+        if not readout_columns
+        else len(tuple(dict.fromkeys(readout_columns[0].values)))
+    )
     if request.event_settings is None:
         if event_count != 1:
             raise ValueError(
@@ -185,7 +201,7 @@ def bind_camera_capture(
         event_settings = (facts.event_setting(0),)
     else:
         event_settings = request.event_settings
-    expected_indices = (0,) if not readout_axes else tuple(range(event_count))
+    expected_indices = (0,) if not readout_columns else tuple(range(event_count))
     if tuple(item.event_index for item in event_settings) != expected_indices:
         raise ValueError(
             "event_settings must explicitly cover every READOUT_EVENT index"
@@ -209,7 +225,7 @@ def bind_camera_capture(
         dtype=facts.dtype,
         count_unit=facts.count_unit,
         readout_event_axis_id=(
-            None if not readout_axes else readout_axes[0].axis_id
+            None if not readout_columns else readout_columns[0].coordinate_id
         ),
         event_settings=event_settings,
         camera_arm_spec_fingerprint=_sha256(
@@ -267,21 +283,15 @@ def _canonical_grouping(
 
 @dataclass(frozen=True, slots=True)
 class TriggeredCameraLayout:
-    """Named sampling intent; the compiled schedule supplies scan cardinality.
-
-    Ordinary captures may leave ``scan_axes`` absent and receive one explicit
-    ordinal axis.  A scan authority instead supplies its physical axes and
-    sparse/rectangular row mapping together; this binding never infers those
-    semantics from the numeric table shape.
-    """
+    """Named sampling intent; PointTable is the sole authored scan-row truth."""
 
     repeat_axis: AxisSpec
     readout_event_axis_id: AxisId
     ordinal_scan_axis_id: AxisId | None = None
     readout_events_per_repeat: int | None = None
     within_point_grouping: tuple[tuple[int, int], ...] | None = None
-    scan_axes: tuple[AxisSpec, ...] | None = None
-    scan_point_layout: PointLayout | None = None
+    scan_point_table: PointTable | None = None
+    scan_grid_topology: GridTopology | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -305,9 +315,9 @@ class TriggeredCameraLayout:
             "within_point_grouping",
             _canonical_grouping(self.within_point_grouping),
         )
-        if self.scan_axes is None:
-            if self.scan_point_layout is not None:
-                raise ValueError("scan_point_layout requires declared scan_axes")
+        if self.scan_point_table is None:
+            if self.scan_grid_topology is not None:
+                raise ValueError("GridTopology requires a declared PointTable")
             if not isinstance(self.ordinal_scan_axis_id, AxisId):
                 raise TypeError(
                     "ordinary capture requires one ordinal_scan_axis_id"
@@ -322,31 +332,26 @@ class TriggeredCameraLayout:
         else:
             if self.ordinal_scan_axis_id is not None:
                 raise ValueError(
-                    "physical scan_axes replace the ordinal scan axis identity"
+                    "a declared PointTable replaces the ordinal scan identity"
                 )
-            axes = tuple(self.scan_axes)
-            if not axes or any(
-                not isinstance(axis, AxisSpec) or axis.role != SCAN_POINT
-                for axis in axes
-            ):
-                raise ValueError("scan_axes must contain SCAN_POINT AxisSpec values")
-            if len({axis.axis_id for axis in axes}) != len(axes):
-                raise ValueError("scan_axes must have unique AxisIds")
+            if not isinstance(self.scan_point_table, PointTable):
+                raise TypeError("scan_point_table must be PointTable or None")
+            columns = self.scan_point_table.columns
+            if any(column.role != SCAN_POINT for column in columns):
+                raise ValueError("scan PointTable columns must use SCAN_POINT")
             if len(
                 {
                     self.repeat_axis.axis_id,
                     self.readout_event_axis_id,
-                    *(axis.axis_id for axis in axes),
+                    *(column.coordinate_id for column in columns),
                 }
-            ) != len(axes) + 2:
+            ) != len(columns) + 2:
                 raise ValueError("triggered-camera sampling AxisIds must be distinct")
-            if not isinstance(self.scan_point_layout, PointLayout):
-                raise TypeError("declared scan_axes require a PointLayout")
-            if self.scan_point_layout.logical_shape != tuple(
-                axis.size for axis in axes
+            if self.scan_grid_topology is not None and not isinstance(
+                self.scan_grid_topology,
+                GridTopology,
             ):
-                raise ValueError("scan PointLayout shape differs from scan_axes")
-            object.__setattr__(self, "scan_axes", axes)
+                raise TypeError("scan_grid_topology must be GridTopology or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,8 +375,72 @@ class TriggeredCameraBinding:
 
 
 
-def _axis(axis_id: AxisId, role, size: int) -> AxisSpec:
-    return AxisSpec(axis_id, axis_id.value, role, size, tuple(range(size)))
+def _ordinary_point_table(axis_id: AxisId, count: int) -> PointTable:
+    if count == 1:
+        return PointTable(1)
+    return PointTable(
+        count,
+        (
+            PointColumn(
+                axis_id,
+                axis_id.value,
+                SCAN_POINT,
+                PointColumn.NUMERIC,
+                tuple(range(count)),
+            ),
+        ),
+    )
+
+
+def _expand_readout_events(
+    point_table: PointTable,
+    topology: GridTopology | None,
+    event_axis_id: AxisId,
+    event_count: int,
+) -> tuple[PointTable, GridTopology | None]:
+    columns = tuple(
+        PointColumn(
+            column.coordinate_id,
+            column.name,
+            column.role,
+            column.value_kind,
+            tuple(
+                value
+                for value in column.values
+                for _event in range(event_count)
+            ),
+            column.unit,
+            column.coordinate_frame,
+        )
+        for column in point_table.columns
+    )
+    event_column = PointColumn(
+        event_axis_id,
+        event_axis_id.value,
+        READOUT_EVENT,
+        PointColumn.NUMERIC,
+        tuple(
+            event
+            for _point in range(point_table.row_count)
+            for event in range(event_count)
+        ),
+    )
+    expanded_table = PointTable(
+        point_table.row_count * event_count,
+        (*columns, event_column),
+    )
+    if topology is None:
+        return expanded_table, None
+    expanded_topology = GridTopology(
+        (*topology.dimension_ids, event_axis_id),
+        (*topology.coordinate_domains, tuple(range(event_count))),
+        tuple(
+            (*cell, event)
+            for cell in topology.row_to_cell
+            for event in range(event_count)
+        ),
+    )
+    return expanded_table, expanded_topology
 
 
 
@@ -444,7 +513,7 @@ def bind_triggered_camera_acquisition(
     per_point = per_point_counts[0]
     repeat_major_points = (
         execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_ONCE
-        and layout.scan_axes is not None
+        and layout.scan_point_table is not None
     )
     events_per_repeat = layout.readout_events_per_repeat
     if events_per_repeat is None:
@@ -464,24 +533,20 @@ def bind_triggered_camera_acquisition(
         )
 
     repeat_axis = layout.repeat_axis
-    if layout.scan_axes is None:
+    if layout.scan_point_table is None:
         assert layout.ordinal_scan_axis_id is not None
-        scan_axes = (
-            (_axis(layout.ordinal_scan_axis_id, SCAN_POINT, schedule.point_count),)
-            if schedule.point_count > 1
-            else ()
+        base_point_table = _ordinary_point_table(
+            layout.ordinal_scan_axis_id,
+            schedule.point_count,
         )
-        scan_point_layout = PointLayout.rect_c(
-            tuple(axis.size for axis in scan_axes)
-        )
+        base_topology = None
     else:
-        scan_axes = layout.scan_axes
-        assert layout.scan_point_layout is not None
-        scan_point_layout = layout.scan_point_layout
+        base_point_table = layout.scan_point_table
+        base_topology = layout.scan_grid_topology
         expected_execution_points = (
-            layout.repeat_axis.size * scan_point_layout.storage_size
+            layout.repeat_axis.size * base_point_table.row_count
             if repeat_major_points
-            else scan_point_layout.storage_size
+            else base_point_table.row_count
         )
         if repeat_major_points and (
             schedule.loop_count != 1 or not schedule.full_point_loop
@@ -491,34 +556,26 @@ def bind_triggered_camera_acquisition(
             )
         if expected_execution_points != schedule.point_count:
             raise ValueError(
-                "declared scan PointLayout rows differ from compiled pulse points"
+                "declared PointTable rows differ from compiled pulse points"
             )
-    event_axis = _axis(
+    point_table, topology = _expand_readout_events(
+        base_point_table,
+        base_topology,
         layout.readout_event_axis_id,
-        READOUT_EVENT,
         events_per_repeat,
-    )
-    point_axes = (*scan_axes, event_axis)
-    point_layout = PointLayout.from_mapping(
-        tuple(axis.size for axis in point_axes),
-        tuple(
-            (*scan_point_layout.multi_index(scan_row), event_index)
-            for scan_row in range(scan_point_layout.storage_size)
-            for event_index in range(event_axis.size)
-        ),
     )
     dataset_schema = DatasetSchema(
         repeat_axis,
-        point_axes,
-        point_layout,
+        point_table,
+        topology,
         camera_payload_contract.value_schema,
     )
     cell_plan = compile_capture_cell_plan(
         artifact,
         selected_trigger,
         dataset_schema,
-        readout_event_axis_id=event_axis.axis_id,
-        scan_point_layout=scan_point_layout,
+        readout_event_axis_id=layout.readout_event_axis_id,
+        base_point_count=base_point_table.row_count,
         within_point_grouping=layout.within_point_grouping,
     )
     camera_capture = bind_camera_capture(

@@ -561,7 +561,7 @@ class PanelCard(FluentGroupBox):
         seed = self._fit_active_spec
         if (
             seed is not None
-            and seed.input_schema_fingerprint
+            and seed.committed_transform.source_schema_fingerprint
             != value.snapshot.ref.schema_fingerprint
         ):
             seed = None
@@ -704,7 +704,8 @@ class PanelCard(FluentGroupBox):
         seed = self._fit_active_spec
         if (
             seed is not None
-            and seed.input_schema_fingerprint != snapshot.ref.schema_fingerprint
+            and seed.committed_transform.source_schema_fingerprint
+            != snapshot.ref.schema_fingerprint
         ):
             seed = None
 
@@ -772,8 +773,8 @@ class PanelCard(FluentGroupBox):
             draft_context = tuple(
                 (
                     option.spec.model_id,
-                    option.spec.input_schema_fingerprint,
-                    option.spec.fit_axis_ids,
+                    option.spec.committed_transform.source_schema_fingerprint,
+                    option.spec.independent_sources,
                     option.parameter_names,
                 )
                 for option in options
@@ -874,7 +875,10 @@ class PanelCard(FluentGroupBox):
         snapshot = None if source is None else getattr(source, "snapshot", None)
         if spec is None or snapshot is None:
             return
-        if spec.input_schema_fingerprint != snapshot.ref.schema_fingerprint:
+        if (
+            spec.committed_transform.source_schema_fingerprint
+            != snapshot.ref.schema_fingerprint
+        ):
             return
         if self._fit_result is not None and self._fit_result.source_ref == snapshot.ref:
             return
@@ -892,7 +896,10 @@ class PanelCard(FluentGroupBox):
         snapshot = None if source is None else getattr(source, "snapshot", None)
         if spec is None or snapshot is None:
             return None
-        if spec.input_schema_fingerprint != snapshot.ref.schema_fingerprint:
+        if (
+            spec.committed_transform.source_schema_fingerprint
+            != snapshot.ref.schema_fingerprint
+        ):
             return None
         self._fit_request_revision += 1
         request = FigureFitRequest(
@@ -1439,14 +1446,14 @@ class PanelCard(FluentGroupBox):
             or self._figure_output_authority.cross_commit is not None
         )
 
-    def _focus_grid_cell(self, panel_index: int, selection) -> None:
+    def _focus_grid_cell(self, panel_index: int, address) -> None:
         """Show one exact cell from the currently painted coherent overview."""
 
         if self.config.kind != "grid":
             return
         from zlc_frontend.panel_render import FacetedPanelFocus
 
-        focus = FacetedPanelFocus(int(panel_index), selection)
+        focus = FacetedPanelFocus(int(panel_index), address)
         if focus == self._grid_focus:
             return
         self._grid_focus = focus
@@ -1977,7 +1984,7 @@ class PanelCard(FluentGroupBox):
 
                 if isinstance(pending_display, FacetedHistogramDisplayState):
                     pending_display = pending_display.display_for(
-                        faceted_result.focus.selection
+                        faceted_result.focus.address
                     )
         elif frame is None or (
             self.config.kind != "sites" and figure is None
@@ -2427,7 +2434,7 @@ class PanelCard(FluentGroupBox):
                     )
                 selector_figure = pending_figure.focused_typed_panel(
                     faceted.focus.panel_index,
-                    expected_selection=faceted.focus.selection,
+                    expected_address=faceted.focus.address,
                     expected_intent=intent,
                 )
             if faceted is not None:
@@ -3384,7 +3391,7 @@ class PanelCard(FluentGroupBox):
         combo.setEnabled(len(modes) > 1)
 
     def _make_repeat_mode_row(self, apply, label_w, *, parent):
-        from zlc_frontend.figure import RepeatViewMode
+        from zlc_frontend.figure import SourceViewBinding
 
         combo = FluentComboBox()
         combo.setToolTip(
@@ -3396,9 +3403,9 @@ class PanelCard(FluentGroupBox):
         )
 
         def commit(index: int) -> None:
-            mode = combo.itemData(int(index))
-            if isinstance(mode, RepeatViewMode):
-                apply(mode)
+            binding = combo.itemData(int(index))
+            if isinstance(binding, SourceViewBinding):
+                apply(binding)
 
         combo.currentIndexChanged.connect(commit)
         row = FluentSettingRow(
@@ -3416,18 +3423,18 @@ class PanelCard(FluentGroupBox):
         if combo is not None and row is not None:
             self._seed_repeat_mode_control(combo, row)
 
-    def _commit_repeat_mode(self, mode) -> bool:
+    def _commit_repeat_mode(self, binding) -> bool:
         """Resolve one typed preference to the sole persistent ViewSpec."""
 
         from zlc_frontend.figure import (
-            RepeatViewMode,
+            SourceViewBinding,
             SuggestionStatus,
             view_spec_to_tree,
         )
         from zlc_frontend.plot_panel import plot_panel_view_with_repeat_mode
 
-        if not isinstance(mode, RepeatViewMode):
-            raise TypeError("repeat mode must be RepeatViewMode")
+        if not isinstance(binding, SourceViewBinding):
+            raise TypeError("repeat choice must be a SourceViewBinding")
         schema = self._current_schema()
         if schema is None:
             return False
@@ -3440,7 +3447,7 @@ class PanelCard(FluentGroupBox):
             schema,
             intent,
             saved,
-            mode,
+            binding,
         )
         if suggestion.status is SuggestionStatus.NEEDS_INPUT or suggestion.spec is None:
             self.set_status(
@@ -3673,7 +3680,7 @@ class PanelCard(FluentGroupBox):
                 return
             candidate = faceted_histogram_display_with_thresholds(
                 display,
-                focus.selection,
+                focus.address,
                 commit.thresholds,
             )
             if candidate == display:

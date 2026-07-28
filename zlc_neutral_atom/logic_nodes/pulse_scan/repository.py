@@ -417,14 +417,14 @@ def _require_scan_facts(
     repeat_count = program.repeat_count
     if source_schema.repeat_axis.size != repeat_count:
         raise ValueError("source repeat axis differs from logical scan repeats")
-    if source_schema.point_axes != point_table.point_axes:
-        raise ValueError("source scan axes differ from the logical ScanPointTable")
+    if source_schema.point_table != point_table:
+        raise ValueError("source PointTable differs from the frozen pulse rows")
     if not isinstance(
         execution,
         (AutonomousScanExecution, ApiSegmentedScanExecution),
     ):
         raise TypeError("execution must be a PulseScanExecution")
-    expected_events = repeat_count * point_table.point_layout.storage_size
+    expected_events = repeat_count * point_table.row_count
     event_count = provenance.end_sequence - provenance.start_sequence
     if event_count != expected_events:
         raise ValueError("collected Dataset count differs from logical R by P")

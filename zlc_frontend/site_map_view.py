@@ -14,6 +14,7 @@ from zlc_data import (
     CoordinateFrameId,
     CoordinateRangeSelection,
     DatasetRevisionRef,
+    IndexSelection,
     OwnedSnapshot,
     SITE,
     SPATIAL_X,
@@ -25,7 +26,6 @@ from zlc_data import (
     dataset_revision_ref_to_tree,
     expand_value_validity,
     materialize_component_dataset,
-    selection_for_outer_cell,
     selection_to_tree,
 )
 from zlc_storage import canonical_digest, canonical_text, positive_real
@@ -285,7 +285,7 @@ def build_site_map_snapshot_view(
     """Build one state-free SiteMap from an already-selected Dataset cell."""
 
     schema = snapshot.block.schema
-    if schema.repeat_axis.size != 1 or schema.point_layout.storage_size != 1:
+    if schema.repeat_axis.size != 1 or schema.point_table.row_count != 1:
         raise ValueError("snapshot SiteMap background must contain one cell")
     background, viewport, x_axis, y_axis = _image_cell(snapshot, 0, 0)
     if (
@@ -303,13 +303,7 @@ def build_site_map_snapshot_view(
             "coherence_identity": coherence_identity,
         }
     )
-    selection = selection_for_outer_cell(
-        schema.repeat_axis,
-        schema.point_axes,
-        schema.point_layout,
-        0,
-        tuple(0 for _axis in schema.point_axes),
-    )
+    selection = Selection((IndexSelection(schema.repeat_axis.axis_id, 0),))
     return SiteMapView(
         background=background,
         background_input=EvaluatedInput(

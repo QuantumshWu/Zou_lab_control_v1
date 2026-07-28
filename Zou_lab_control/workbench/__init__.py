@@ -8,7 +8,7 @@ def open_figure_workbench(
     source,
     *,
     intent=None,
-    selection=None,
+    point_ordinals=None,
     preferences=None,
     fit_preparer=None,
     fit_executor=None,
@@ -26,7 +26,7 @@ def open_figure_workbench(
 
     options = {
         "intent": intent,
-        "selection": selection,
+        "point_ordinals": point_ordinals,
         "preferences": preferences,
     }
     for name, value in (
@@ -45,20 +45,6 @@ def open_figure_workbench(
     if fit_timeout_seconds is not None:
         options["fit_timeout_seconds"] = fit_timeout_seconds
     return _open(figure_factory, source, **options)
-
-
-def open_saved_fit_grid_workbench(
-    view_loader,
-    refit_opener,
-    reference,
-):
-    """Open one exact saved-fit GridPlot without eager Qt imports."""
-
-    from zlc_workbench.fit_grid.app import (
-        open_saved_fit_grid_workbench as _open,
-    )
-
-    return _open(view_loader, refit_opener, reference)
 
 
 def open_pulse_editor(
@@ -212,6 +198,5 @@ __all__ = [
     "open_figure_workbench",
     "open_device_manager",
     "open_pulse_editor",
-    "open_saved_fit_grid_workbench",
     "open_task_console",
 ]

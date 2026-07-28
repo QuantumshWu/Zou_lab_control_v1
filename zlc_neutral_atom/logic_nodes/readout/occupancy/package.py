@@ -53,7 +53,7 @@ def _bind_api(host: object, dependencies: tuple[object, ...]) -> OccupancyApi:
     def load_cell(
         reference,
         occupancy_repository,
-        selection,
+        address,
         *,
         expected_domain_identity,
     ):
@@ -62,7 +62,7 @@ def _bind_api(host: object, dependencies: tuple[object, ...]) -> OccupancyApi:
             occupancy_repository,
             capture_repository,
             calibration_repository(),
-            selection,
+            address,
             expected_domain_identity=expected_domain_identity,
         )
 

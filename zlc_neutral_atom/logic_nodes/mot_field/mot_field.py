@@ -32,8 +32,10 @@ from zlc_data import (
     DataBlock,
     DatasetRevision,
     DatasetSchema,
+    GridTopology,
     OwnedSnapshot,
-    PointLayout,
+    PointColumn,
+    PointTable,
     READOUT_EVENT,
     SCAN_POINT,
     StreamGenerationId,
@@ -41,7 +43,9 @@ from zlc_data import (
     ValidityContract,
     ValueSchema,
     expand_dataset_validity,
+    grid_topology_to_tree,
     immutable_array,
+    point_table_to_tree,
 )
 from zlc_neutral_atom.catalog import DefinitionKey, TaskDefinition
 from zlc_neutral_atom.dataset_output import (
@@ -149,21 +153,35 @@ def build_mot_scan_program(
     if not isinstance(frozen, FrozenScanTable):
         raise TypeError("pulse owner returned a non-FrozenScanTable")
     committed = replace(document, scan_table=frozen, scan_recipe=None)
-    point_axes = tuple(
-        AxisSpec(
-            AxisId(f"mot-field.{parameter_id}"),
-            parameters[parameter_id].label or parameter_id,
-            SCAN_POINT,
-            len(axis),
-            axis,
-            parameters[parameter_id].unit,
-        )
-        for parameter_id, axis in zip(MOT_SCAN_PARAMETER_IDS, axes, strict=True)
+    coordinate_ids = tuple(
+        AxisId(f"mot-field.{parameter_id}")
+        for parameter_id in MOT_SCAN_PARAMETER_IDS
+    )
+    point_table = PointTable(
+        len(rows),
+        tuple(
+            PointColumn(
+                coordinate_id,
+                parameters[parameter_id].label or parameter_id,
+                SCAN_POINT,
+                PointColumn.NUMERIC,
+                tuple(row[position] for row in rows),
+                parameters[parameter_id].unit,
+            )
+            for position, (parameter_id, coordinate_id) in enumerate(
+                zip(MOT_SCAN_PARAMETER_IDS, coordinate_ids, strict=True)
+            )
+        ),
+    )
+    topology = GridTopology(
+        coordinate_ids,
+        axes,
+        tuple(product(*(range(len(axis)) for axis in axes))),
     )
     return MotFieldProgram(
         committed,
-        point_axes,
-        PointLayout.rect_c(tuple(len(axis) for axis in axes)),
+        point_table,
+        topology,
     )
 
 
@@ -172,43 +190,49 @@ class MotFieldProgram:
     """The complete three-axis pulse table owned by the MOT task."""
 
     document: PulseDocument
-    point_axes: tuple[AxisSpec, AxisSpec, AxisSpec]
-    point_layout: PointLayout
+    point_table: PointTable
+    grid_topology: GridTopology
 
     def __post_init__(self) -> None:
         if not isinstance(self.document, PulseDocument):
             raise TypeError("document must be PulseDocument")
-        axes = tuple(self.point_axes)
-        if len(axes) != 3 or any(
-            not isinstance(axis, AxisSpec) or axis.role != SCAN_POINT
-            for axis in axes
-        ):
-            raise ValueError("MOT program requires three SCAN_POINT axes")
-        if tuple(axis.axis_id.value for axis in axes) != tuple(
+        if not isinstance(self.point_table, PointTable):
+            raise TypeError("point_table must be PointTable")
+        if not isinstance(self.grid_topology, GridTopology):
+            raise TypeError("grid_topology must be GridTopology")
+        columns = self.point_table.columns
+        if len(columns) != 3 or any(column.role != SCAN_POINT for column in columns):
+            raise ValueError("MOT program requires three SCAN_POINT columns")
+        if tuple(column.coordinate_id.value for column in columns) != tuple(
             f"mot-field.{parameter_id}" for parameter_id in MOT_SCAN_PARAMETER_IDS
         ):
-            raise ValueError("MOT program axis identities differ from da_x/da_y/da_z")
-        if not isinstance(self.point_layout, PointLayout):
-            raise TypeError("point_layout must be PointLayout")
-        if self.point_layout.logical_shape != tuple(axis.size for axis in axes):
-            raise ValueError("MOT point layout differs from its three axes")
+            raise ValueError("MOT coordinate identities differ from da_x/da_y/da_z")
+        if self.grid_topology.dimension_ids != tuple(
+            column.coordinate_id for column in columns
+        ):
+            raise ValueError("MOT topology dimensions differ from its PointTable")
         table = self.document.scan_table
         if table is None or table.columns != MOT_SCAN_PARAMETER_IDS:
             raise ValueError("MOT program must freeze da_x, da_y, da_z")
         reconstructed = tuple(
-            tuple(
-                axis.coordinate_at(index)
-                for axis, index in zip(
-                    axes,
-                    self.point_layout.multi_index(storage_index),
-                    strict=True,
-                )
-            )
-            for storage_index in range(self.point_layout.storage_size)
+            tuple(column.values[row] for column in columns)
+            for row in range(self.point_table.row_count)
         )
         if reconstructed != table.rows:
-            raise ValueError("MOT axes/layout do not reproduce the frozen pulse table")
-        object.__setattr__(self, "point_axes", axes)
+            raise ValueError("MOT PointTable does not reproduce the frozen pulse table")
+        if self.point_table.row_count != math.prod(self.grid_topology.logical_shape):
+            raise ValueError("MOT scan requires the complete Cartesian coil grid")
+        if len(self.grid_topology.row_to_cell) != self.point_table.row_count:
+            raise ValueError("MOT topology must map every frozen point row")
+        for ordinal, cell in enumerate(self.grid_topology.row_to_cell):
+            if any(
+                self.point_table.column(dimension_id).values[ordinal]
+                != self.grid_topology.coordinate_domains[position][cell[position]]
+                for position, dimension_id in enumerate(
+                    self.grid_topology.dimension_ids
+                )
+            ):
+                raise ValueError("MOT topology coordinates differ from its PointTable")
 
     @property
     def fingerprint(self) -> str:
@@ -216,18 +240,8 @@ class MotFieldProgram:
             {
                 "owner": "zlc_neutral_atom.mot-field-program",
                 "pulse_document": self.document.fingerprint,
-                "axes": tuple(
-                    {
-                        "axis_id": axis.axis_id.value,
-                        "coordinates": axis.coordinates,
-                        "unit": axis.unit,
-                    }
-                    for axis in self.point_axes
-                ),
-                "layout": tuple(
-                    self.point_layout.multi_index(index)
-                    for index in range(self.point_layout.storage_size)
-                ),
+                "point_table": point_table_to_tree(self.point_table),
+                "grid_topology": grid_topology_to_tree(self.grid_topology),
             }
         )
 
@@ -319,7 +333,7 @@ class MotFieldAcquisitionResult:
         if self.snapshot.ref.stream_generation != self.provenance.generation:
             raise ValueError("MOT source snapshot and provenance generations differ")
         schema = self.snapshot.block.schema
-        expected = schema.repeat_axis.size * schema.point_layout.storage_size
+        expected = schema.repeat_axis.size * schema.point_table.row_count
         if self.provenance.end_sequence - self.provenance.start_sequence != expected:
             raise ValueError("MOT source provenance does not cover every dataset cell")
         if self.snapshot.ref.revision.value != expected:
@@ -336,7 +350,8 @@ class MotFieldResult:
     """Computed MOT optimum retaining the exact source scan and full 3-D block."""
 
     source_identity: str
-    point_axes: tuple[AxisSpec, AxisSpec, AxisSpec]
+    point_table: PointTable
+    grid_topology: GridTopology
     intensity: np.ndarray
     best_field: tuple[float, float, float]
     best_intensity: float
@@ -344,10 +359,19 @@ class MotFieldResult:
 
     def __post_init__(self) -> None:
         canonical_text(self.source_identity, "source_identity")
-        axes = tuple(self.point_axes)
-        if len(axes) != 3 or any(not isinstance(axis, AxisSpec) for axis in axes):
-            raise ValueError("point_axes must contain the three MOT AxisSpec values")
-        shape = tuple(axis.size for axis in axes)
+        if not isinstance(self.point_table, PointTable):
+            raise TypeError("point_table must be PointTable")
+        if not isinstance(self.grid_topology, GridTopology):
+            raise TypeError("grid_topology must be GridTopology")
+        if (
+            len(self.point_table.columns) != 3
+            or self.grid_topology.dimension_ids
+            != tuple(column.coordinate_id for column in self.point_table.columns)
+            or len(self.grid_topology.row_to_cell) != self.point_table.row_count
+            or self.point_table.row_count != math.prod(self.grid_topology.logical_shape)
+        ):
+            raise ValueError("MOT result requires one complete three-dimensional grid")
+        shape = self.grid_topology.logical_shape
         block = immutable_array(self.intensity, dtype=np.float64, shape=shape)
         if not np.isfinite(block).all():
             raise ValueError("MOT intensity block must be fully finite")
@@ -357,7 +381,6 @@ class MotFieldResult:
         peak = float(self.best_intensity)
         if not math.isfinite(peak):
             raise ValueError("best_intensity must be finite")
-        object.__setattr__(self, "point_axes", axes)
         object.__setattr__(self, "intensity", block)
         object.__setattr__(self, "best_field", best)
         object.__setattr__(self, "best_intensity", peak)
@@ -507,8 +530,8 @@ def mot_intensity_schema(
     _validate_mot_source_schema(request, source_schema)
     return DatasetSchema(
         source_schema.repeat_axis,
-        request.program.point_axes,
-        request.program.point_layout,
+        request.program.point_table,
+        request.program.grid_topology,
         ValueSchema.scalar(
             np.dtype("<f8"),
             source_schema.cell_schema.value_unit,
@@ -525,26 +548,30 @@ def _validate_mot_source_schema(
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
     program = request.program
-    if schema.point_axes[:3] != program.point_axes:
-        raise ValueError("MOT scan axes differ from the frozen MOT program")
-    trailing = schema.point_axes[3:]
+    columns = schema.point_table.columns
     if (
-        len(trailing) != 1
-        or trailing[0].role != READOUT_EVENT
-        or trailing[0].size != 1
+        schema.point_table.row_count != program.point_table.row_count
+        or len(columns) != len(program.point_table.columns) + 1
+        or columns[:-1] != program.point_table.columns
+    ):
+        raise ValueError("MOT source rows differ from the frozen MOT program")
+    event_column = columns[-1]
+    if (
+        event_column.role != READOUT_EVENT
+        or event_column.value_kind != PointColumn.NUMERIC
+        or event_column.values != (0,) * schema.point_table.row_count
     ):
         raise ValueError("MOT camera acquisition requires one singleton readout event")
-    if schema.point_layout.logical_shape != (*program.point_layout.logical_shape, 1):
-        raise ValueError("MOT source point layout differs from the frozen grid")
-    expected_mapping = tuple(
-        (*program.point_layout.multi_index(index), 0)
-        for index in range(program.point_layout.storage_size)
-    )
-    if tuple(
-        schema.point_layout.multi_index(index)
-        for index in range(schema.point_layout.storage_size)
-    ) != expected_mapping:
-        raise ValueError("MOT source storage order differs from the frozen grid")
+    topology = schema.grid_topology
+    if topology is None or (
+        topology.dimension_ids
+        != (*program.grid_topology.dimension_ids, event_column.coordinate_id)
+        or topology.coordinate_domains
+        != (*program.grid_topology.coordinate_domains, (0,))
+        or topology.row_to_cell
+        != tuple((*cell, 0) for cell in program.grid_topology.row_to_cell)
+    ):
+        raise ValueError("MOT source topology differs from the frozen grid")
     if schema.repeat_axis.size != 1:
         raise ValueError(
             "MOT optimization requires exactly one repeat; it never auto-reduces repeat"
@@ -552,8 +579,6 @@ def _validate_mot_source_schema(
     data_axes = schema.cell_schema.data_axes
     if tuple(axis.role for axis in data_axes) != (SPATIAL_Y, SPATIAL_X):
         raise ValueError("MOT scan output must preserve one spatial-y/x camera frame")
-    if program.point_layout.storage_size != math.prod(program.point_layout.logical_shape):
-        raise ValueError("MOT scan requires the complete Cartesian coil grid")
 
 
 def _mot_storage_intensities(
@@ -569,24 +594,24 @@ def _mot_storage_intensities(
         isinstance(written_cells, bool)
         or not isinstance(written_cells, Integral)
         or written_cells < 0
-        or written_cells > schema.point_layout.storage_size
+        or written_cells > schema.point_table.row_count
     ):
-        raise ValueError("written_cells differs from the MOT point layout")
+        raise ValueError("written_cells differs from the MOT PointTable")
     array = np.asarray(values)
     expanded_validity = expand_dataset_validity(validity, schema)
     if array.shape != schema.physical_shape or expanded_validity.shape != array.shape:
         raise ValueError("MOT values/validity differ from their schema")
     projector = build_mot_intensity_projector(request, schema)
-    intensities = np.zeros(schema.point_layout.storage_size, dtype=np.float64)
-    present = np.zeros(schema.point_layout.storage_size, dtype=bool)
-    for storage_index in range(int(written_cells)):
-        frame = array[0, storage_index]
-        frame_validity = expanded_validity[0, storage_index]
-        intensities[storage_index] = projector.intensity(
+    intensities = np.zeros(schema.point_table.row_count, dtype=np.float64)
+    present = np.zeros(schema.point_table.row_count, dtype=bool)
+    for point_ordinal in range(int(written_cells)):
+        frame = array[0, point_ordinal]
+        frame_validity = expanded_validity[0, point_ordinal]
+        intensities[point_ordinal] = projector.intensity(
             frame,
             validity=frame_validity,
         )
-        present[storage_index] = True
+        present[point_ordinal] = True
     return intensities, present
 
 
@@ -641,24 +666,20 @@ def analyze_mot_scan(
         source.values,
         source.validity,
         schema,
-        written_cells=schema.point_layout.storage_size,
+        written_cells=schema.point_table.row_count,
     )
     if not present.all():
         raise RuntimeError("FINAL MOT scan is missing intensity cells")
-    logical = np.empty(program.point_layout.logical_shape, dtype=np.float64)
-    for storage_index in range(program.point_layout.storage_size):
-        logical[program.point_layout.multi_index(storage_index)] = storage_values[
-            storage_index
-        ]
+    logical = np.empty(program.grid_topology.logical_shape, dtype=np.float64)
+    for point_ordinal, cell in enumerate(program.grid_topology.row_to_cell):
+        logical[cell] = storage_values[point_ordinal]
 
-    axes = tuple(
-        tuple(axis.coordinates or tuple(range(axis.size)))
-        for axis in program.point_axes
-    )
+    axes = program.grid_topology.coordinate_domains
     best, peak = refine_mot_optimum(logical, axes)
     return MotFieldResult(
         acquisition.source_identity,
-        program.point_axes,
+        program.point_table,
+        program.grid_topology,
         logical,
         best,
         peak,
@@ -670,26 +691,6 @@ def materialize_mot_field_snapshot(result: MotFieldResult) -> OwnedSnapshot:
 
     if not isinstance(result, MotFieldResult):
         raise TypeError("result must be MotFieldResult")
-    axes = tuple(result.point_axes)
-    layout = PointLayout.rect_c(tuple(axis.size for axis in axes))
-    physical = np.empty((1, layout.storage_size, 1), dtype="<f8")
-    for storage_index in range(layout.storage_size):
-        physical[0, storage_index, 0] = result.intensity[
-            layout.multi_index(storage_index)
-        ]
-    identity = canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.mot-field-result",
-            "source_identity": result.source_identity,
-            "axes": tuple(
-                tuple(axis.coordinate_at(index) for index in range(axis.size))
-                for axis in result.point_axes
-            ),
-            "intensity": np.asarray(result.intensity).tolist(),
-            "best_field": result.best_field,
-            "best_intensity": result.best_intensity,
-        }
-    )
     schema = DatasetSchema(
         AxisSpec(
             AxisId("mot-field.repeat"),
@@ -698,9 +699,22 @@ def materialize_mot_field_snapshot(result: MotFieldResult) -> OwnedSnapshot:
             1,
             (0,),
         ),
-        axes,
-        layout,
+        result.point_table,
+        result.grid_topology,
         ValueSchema.scalar(np.dtype("<f8"), "counts"),
+    )
+    physical = np.empty(schema.physical_shape, dtype="<f8")
+    for point_ordinal, cell in enumerate(result.grid_topology.row_to_cell):
+        physical[0, point_ordinal, 0] = result.intensity[cell]
+    identity = canonical_digest(
+        {
+            "owner": "zlc_neutral_atom.mot-field-result",
+            "source_identity": result.source_identity,
+            "schema": schema.fingerprint,
+            "intensity": np.asarray(result.intensity).tolist(),
+            "best_field": result.best_field,
+            "best_intensity": result.best_intensity,
+        }
     )
     block = DataBlock(
         BlockId(f"mot-field-intensity-{identity[:20]}"),

@@ -84,13 +84,16 @@ class PreparedExactCapture:
             if self._preview_schema is not None:
                 return self._preview_schema
             schema = self._pipeline.capture.capture_contract.dataset_schema
-            readout_axes = tuple(
-                axis for axis in schema.point_axes if axis.role == READOUT_EVENT
+            readout_columns = tuple(
+                column
+                for column in schema.point_table.columns
+                if column.role == READOUT_EVENT
             )
             if (
-                len(readout_axes) != 1
-                or len(schema.point_axes) != 1
-                or schema.point_layout.storage_size != readout_axes[0].size
+                len(readout_columns) != 1
+                or len(schema.point_table.columns) != 1
+                or readout_columns[0].values
+                != tuple(range(schema.point_table.row_count))
             ):
                 raise ValueError(
                     "finite Camera preview requires one explicit READOUT_EVENT "

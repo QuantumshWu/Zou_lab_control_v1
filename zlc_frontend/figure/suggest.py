@@ -1,36 +1,45 @@
-"""Deterministic, metadata-only ViewSpec suggestions."""
+"""Deterministic, metadata-only typed-source ViewSpec suggestions."""
 
 from __future__ import annotations
 
 from dataclasses import replace
 
 from zlc_data import (
+    SCALAR,
+    AxisSourceRef,
     DatasetSchema,
     FitResultBatch,
-    REPEAT,
-    SCALAR,
+    HistogramSpec,
+    IndexSelection,
+    MissingPolicy,
+    PointColumn,
+    ReductionMethod,
+    ReductionSpec,
     Selection,
+    ValidityPolicy,
 )
 
 from .contract import (
     CURVE_CONTRACT,
+    HISTOGRAM_CONTRACT,
     IMAGE_CONTRACT,
-    _first_visible_point_tuple,
-    _selection_fit_projection,
+    _fit_display_selection_indices,
+    _source_cardinality,
+    _source_name,
+    _source_role,
+    _tensor_axis,
+    _dataset_sources,
     dataset_contract_for,
-    dataset_axes,
-    display_axis_indices,
     validate_view_spec,
 )
 from .model import (
-    AxisViewBinding,
     AxisViewRole,
     DecisionReason,
     DisplayReduction,
     DisplayReductionMethod,
     FixedIndex,
     LatestNonempty,
-    RepeatViewMode,
+    SourceViewBinding,
     SuggestionStatus,
     ViewAlternative,
     ViewIntent,
@@ -44,102 +53,94 @@ def _needs(
     code: str,
     message: str,
     *,
-    axis_id=None,
+    source: AxisSourceRef | None = None,
     alternatives=(),
 ) -> ViewSuggestion:
     return ViewSuggestion(
         None,
         SuggestionStatus.NEEDS_INPUT,
-        (DecisionReason(code, message, axis_id),),
+        (DecisionReason(code, message, source),),
         tuple(alternatives),
     )
 
 
-def _preferred_display_axis(preferences: ViewPreferences, role: AxisViewRole):
+def _preferred_display_source(
+    preferences: ViewPreferences,
+    role: AxisViewRole,
+) -> AxisSourceRef | None:
     return {
-        AxisViewRole.X: preferences.x_axis_id,
-        AxisViewRole.IMAGE_X: preferences.image_x_axis_id,
-        AxisViewRole.IMAGE_Y: preferences.image_y_axis_id,
+        AxisViewRole.X: preferences.x_source,
+        AxisViewRole.IMAGE_X: preferences.image_x_source,
+        AxisViewRole.IMAGE_Y: preferences.image_y_source,
     }[role]
 
 
-def _repeat_binding(axis_id, mode: RepeatViewMode, allowed_indices) -> AxisViewBinding:
-    if mode is RepeatViewMode.MEAN:
-        return AxisViewBinding(
-            axis_id,
+def _default_repeat_binding(
+    schema: DatasetSchema,
+    intent: ViewIntent,
+) -> SourceViewBinding:
+    source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+    if intent in {ViewIntent.IMAGE, ViewIntent.CURVE}:
+        return SourceViewBinding(
+            source,
             AxisViewRole.REDUCED,
             reduction=DisplayReduction(DisplayReductionMethod.MEAN),
         )
-    if mode is RepeatViewMode.SUM:
-        return AxisViewBinding(
-            axis_id,
-            AxisViewRole.REDUCED,
-            reduction=DisplayReduction(DisplayReductionMethod.SUM),
-        )
-    if mode is RepeatViewMode.LATEST:
-        if len(allowed_indices) == 1:
-            return AxisViewBinding(
-                axis_id,
-                AxisViewRole.SELECTED,
-                selector=FixedIndex(allowed_indices[0]),
-            )
-        return AxisViewBinding(axis_id, AxisViewRole.SELECTED, selector=LatestNonempty())
-    if mode is RepeatViewMode.BATCH:
-        return AxisViewBinding(axis_id, AxisViewRole.BATCH)
-    if mode is RepeatViewMode.FACET:
-        return AxisViewBinding(axis_id, AxisViewRole.FACET)
-    return AxisViewBinding(axis_id, AxisViewRole.SAMPLE)
+    if intent is ViewIntent.HISTOGRAM:
+        return SourceViewBinding(source, AxisViewRole.SAMPLE)
+    selector = FixedIndex(0) if schema.repeat_axis.size == 1 else LatestNonempty()
+    return SourceViewBinding(source, AxisViewRole.SELECTED, selector=selector)
 
 
-def _plan_automatic_bindings(
-    axes,
-    contract,
-    allowed,
-    point_defaults,
-):
-    """Choose each declared axis' first legal role in schema order.
+def _display_source_allowed(
+    schema: DatasetSchema,
+    source: AxisSourceRef,
+    role: AxisViewRole,
+    chosen: tuple[AxisSourceRef, ...],
+) -> bool:
+    if source.kind == AxisSourceRef.POINT_ROWS:
+        return False
+    if source.kind == AxisSourceRef.POINT_COORDINATE:
+        assert source.axis_id is not None
+        if schema.point_table.column(source.axis_id).value_kind != PointColumn.NUMERIC:
+            return False
+    if role in {AxisViewRole.IMAGE_X, AxisViewRole.IMAGE_Y}:
+        raw = {
+            AxisSourceRef.POINT_ORDINAL,
+            AxisSourceRef.POINT_COORDINATE,
+        }
+        if source.kind in raw and any(item.kind in raw for item in chosen):
+            return False
+        if source.kind == AxisSourceRef.GRID_DIMENSION and any(
+            item.kind in raw for item in chosen
+        ):
+            return False
+        if source.kind in raw and any(
+            item.kind == AxisSourceRef.GRID_DIMENSION for item in chosen
+        ):
+            return False
+    return True
 
-    Schema order is authored metadata.  AxisId spelling, ndarray rank, axis
-    length, and live values are deliberately absent from this decision.
-    """
 
-    planned = {}
-    for axis in axes:
-        policy = contract.policy_for(axis.role)
-        if policy is None or not policy.automatic_roles:
-            return None
-        role = policy.automatic_roles[0]
-        if role is AxisViewRole.SLIDER:
-            binding = AxisViewBinding(
-                axis.axis_id,
-                role,
-                selector=FixedIndex(
-                    point_defaults.get(
-                        axis.axis_id,
-                        allowed[axis.axis_id][0],
-                    )
-                ),
-            )
-        else:
-            binding = AxisViewBinding(axis.axis_id, role)
-        planned[axis.axis_id] = binding
-    return planned
+def _automatic_tensor_binding(schema, source, contract):
+    axis = _tensor_axis(schema, source)
+    policy = contract.policy_for(axis.role)
+    if policy is None or not policy.automatic_roles:
+        return None
+    role = policy.automatic_roles[0]
+    if role is AxisViewRole.SELECTED:
+        return SourceViewBinding(source, role, selector=FixedIndex(0))
+    return SourceViewBinding(source, role)
 
 
 def _suggest_view(
     schema: DatasetSchema,
     intent: ViewIntent,
-    selection: Selection | None = None,
+    point_ordinals: tuple[int, ...] | None = None,
     preferences: ViewPreferences | None = None,
     *,
     contract,
 ) -> ViewSuggestion:
-    """Suggest one safe presentation using schema metadata only.
-
-    The function never receives or reads values.  Its output therefore cannot
-    vary with signal magnitude, singleton accidents, NaNs, or array ordering.
-    """
-
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
     if not isinstance(intent, ViewIntent):
@@ -147,265 +148,228 @@ def _suggest_view(
     preferences = ViewPreferences() if preferences is None else preferences
     if not isinstance(preferences, ViewPreferences):
         raise TypeError("preferences must be ViewPreferences or None")
-    axes = dataset_axes(schema)
-    axis_by_id = {axis.axis_id: axis for axis in axes}
-    if selection is not None:
-        if not isinstance(selection, Selection):
-            raise TypeError("selection must be zlc_data.Selection or None")
-        unknown_selection_axes = tuple(
-            term.axis_id for term in selection.terms if term.axis_id not in axis_by_id
+
+    available = _dataset_sources(schema)
+    preferred_sources = (
+        preferences.x_source,
+        preferences.image_x_source,
+        preferences.image_y_source,
+        *preferences.batch_sources,
+        *preferences.facet_sources,
+        *preferences.sample_sources,
+    )
+    topology_mode = any(
+        source is not None and source.kind == AxisSourceRef.GRID_DIMENSION
+        for source in preferred_sources
+    )
+    if topology_mode:
+        available = tuple(
+            source
+            for source in available
+            if source.kind
+            not in {
+                AxisSourceRef.POINT_ROWS,
+                AxisSourceRef.POINT_ORDINAL,
+                AxisSourceRef.POINT_COORDINATE,
+            }
         )
-        if unknown_selection_axes:
-            return _needs(
-                "STALE_SELECTION_AXIS",
-                f"selection references absent axes: {unknown_selection_axes}",
-            )
-    display_selections = () if selection is None else (selection,)
-    allowed = {}
-    for axis in axes:
-        try:
-            allowed[axis.axis_id] = display_axis_indices(axis, display_selections)
-        except IndexError as exc:
-            return _needs(
-                "SELECTION_OUT_OF_RANGE",
-                str(exc),
-                axis_id=axis.axis_id,
-            )
-        except (TypeError, ValueError) as exc:
-            return _needs(
-                "SELECTION_INVALID",
-                str(exc),
-                axis_id=axis.axis_id,
-            )
-    selected_axis_ids = {
-        term.axis_id for term in (() if selection is None else selection.terms)
+    available_set = set(available)
+    reserved = {
+        *preferences.batch_sources,
+        *preferences.facet_sources,
+        *preferences.sample_sources,
     }
-    selected = {
-        axis_id: allowed[axis_id][0]
-        for axis_id in selected_axis_ids
-        if len(allowed[axis_id]) == 1
-    }
-    point_tuple = _first_visible_point_tuple(schema, allowed)
-    if point_tuple is None:
-        return _needs(
-            "EMPTY_POINT_SELECTION",
-            "the display selection contains no physical point-layout row",
-        )
-    point_defaults = {
-        axis.axis_id: index
-        for axis, index in zip(schema.point_axes, point_tuple)
-    }
-    unbound = set(axis_by_id)
-    bindings: dict = {}
+    bindings: dict[AxisSourceRef, SourceViewBinding] = {}
     reasons: list[DecisionReason] = []
     alternatives: list[ViewAlternative] = []
-    review_required = False
+    chosen_display: list[AxisSourceRef] = []
 
     for slot in contract.display_slots:
-        preferred = _preferred_display_axis(preferences, slot.binding_role)
+        preferred = _preferred_display_source(preferences, slot.binding_role)
         if preferred is not None:
-            axis = axis_by_id.get(preferred)
-            if axis is None or preferred not in unbound:
+            if (
+                preferred not in available_set
+                or preferred in bindings
+                or preferred in reserved
+            ):
                 return _needs(
-                    "INVALID_DISPLAY_AXIS",
-                    f"preferred {slot.binding_role.value} axis is absent or already bound",
-                    axis_id=preferred,
+                    "INVALID_DISPLAY_SOURCE",
+                    f"preferred {slot.binding_role.value} source is absent or already bound",
+                    source=preferred,
                 )
-            if axis.role not in slot.preferred_axis_roles:
+            if (
+                _source_role(schema, preferred) not in slot.preferred_axis_roles
+                or not _display_source_allowed(
+                    schema, preferred, slot.binding_role, tuple(chosen_display)
+                )
+            ):
                 return _needs(
                     "DISPLAY_ROLE_MISMATCH",
-                    f"axis {axis.name} cannot fill {slot.binding_role.value}",
-                    axis_id=preferred,
+                    f"{_source_name(schema, preferred)} cannot fill {slot.binding_role.value}",
+                    source=preferred,
                 )
-            chosen = axis
+            chosen = preferred
         else:
             chosen = None
-            role_candidates = tuple(
-                (
-                    role,
-                    tuple(
-                        axis
-                        for axis in axes
-                        if axis.axis_id in unbound and axis.role == role
-                    ),
+            for preferred_role in slot.preferred_axis_roles:
+                candidates = tuple(
+                    source
+                    for source in available
+                    if source not in bindings
+                    and source not in reserved
+                    and _source_role(schema, source) == preferred_role
+                    and _display_source_allowed(
+                        schema,
+                        source,
+                        slot.binding_role,
+                        tuple(chosen_display),
+                    )
                 )
-                for role in slot.preferred_axis_roles
-            )
-            unselected_candidates = tuple(
-                (
-                    role,
-                    tuple(
-                        axis
-                        for axis in candidates
-                        if axis.axis_id not in selected
-                    ),
-                )
-                for role, candidates in role_candidates
-            )
-            candidate_groups = (
-                unselected_candidates
-                if any(candidates for _, candidates in unselected_candidates)
-                else role_candidates
-            )
-            for role, candidates in candidate_groups:
-                if candidates:
-                    chosen = candidates[0]
-                    if len(candidates) > 1:
-                        alternatives.extend(
-                            ViewAlternative(
-                                axis.axis_id,
-                                slot.binding_role,
-                                axis.name,
-                            )
-                            for axis in candidates
+                if not candidates:
+                    continue
+                chosen = candidates[0]
+                if len(candidates) > 1:
+                    alternatives.extend(
+                        ViewAlternative(source, slot.binding_role, _source_name(schema, source))
+                        for source in candidates
+                    )
+                    reasons.append(
+                        DecisionReason(
+                            "DISPLAY_SOURCE_DEFAULT",
+                            f"{_source_name(schema, chosen)} is the first declared "
+                            f"source eligible for {slot.binding_role.value}",
+                            chosen,
                         )
-                        reasons.append(
-                            DecisionReason(
-                                "DISPLAY_AXIS_DEFAULT",
-                                (
-                                    f"{chosen.name} is the first declared {role.value} "
-                                    f"axis eligible for {slot.binding_role.value}; "
-                                    "the ViewSpec records the choice explicitly"
-                                ),
-                                chosen.axis_id,
-                            )
-                        )
-                    break
+                    )
+                break
             if chosen is None:
                 return _needs(
-                    "MISSING_DISPLAY_AXIS",
-                    f"no declared axis can fill {slot.binding_role.value}",
+                    "MISSING_DISPLAY_SOURCE",
+                    f"no declared source can fill {slot.binding_role.value}",
                 )
-        bindings[chosen.axis_id] = AxisViewBinding(chosen.axis_id, slot.binding_role)
-        unbound.remove(chosen.axis_id)
+        bindings[chosen] = SourceViewBinding(chosen, slot.binding_role)
+        chosen_display.append(chosen)
         reasons.append(
             DecisionReason(
-                "DISPLAY_AXIS",
-                f"{chosen.name} is the {slot.binding_role.value} axis by declared role",
-                chosen.axis_id,
+                "DISPLAY_SOURCE",
+                f"{_source_name(schema, chosen)} is the {slot.binding_role.value} source",
+                chosen,
             )
         )
 
-    # The scalar carrier is a physical singleton required by the data
-    # contract, not information for the operator to facet or reduce.  Consume
-    # it by its declared role; never infer the same rule from axis size.
-    for axis in axes:
-        if axis.axis_id in unbound and axis.role == SCALAR:
-            bindings[axis.axis_id] = AxisViewBinding(
-                axis.axis_id,
-                AxisViewRole.SELECTED,
-                selector=FixedIndex(0),
+    for axis in schema.cell_schema.data_axes:
+        source = AxisSourceRef.tensor(axis.axis_id)
+        if source in bindings or axis.role != SCALAR:
+            continue
+        bindings[source] = SourceViewBinding(
+            source,
+            AxisViewRole.SELECTED,
+            selector=FixedIndex(0),
+        )
+        reasons.append(
+            DecisionReason(
+                "SCALAR_CARRIER",
+                "the declared scalar carrier resolves to its sole physical item",
+                source,
             )
-            unbound.remove(axis.axis_id)
-            reasons.append(
-                DecisionReason(
-                    "SCALAR_CARRIER",
-                    "the declared scalar carrier resolves to its sole physical item",
-                    axis.axis_id,
-                )
-            )
+        )
 
-    repeat_axis = schema.repeat_axis
-    if repeat_axis.axis_id in unbound:
-        repeat_mode = preferences.repeat_mode or contract.default_repeat_mode
-        if repeat_mode not in contract.repeat_modes:
+    repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+    explicit_repeat_role = next(
+        (
+            role
+            for sources, role in (
+                (preferences.sample_sources, AxisViewRole.SAMPLE),
+                (preferences.batch_sources, AxisViewRole.BATCH),
+                (preferences.facet_sources, AxisViewRole.FACET),
+            )
+            if repeat_source in sources
+        ),
+        None,
+    )
+    if repeat_source not in bindings and explicit_repeat_role is not None:
+        bindings[repeat_source] = SourceViewBinding(
+            repeat_source,
+            explicit_repeat_role,
+        )
+        reasons.append(
+            DecisionReason(
+                "EXPLICIT_REPEAT_ROLE",
+                f"repeat uses {explicit_repeat_role.value}",
+                repeat_source,
+            )
+        )
+    elif repeat_source not in bindings:
+        repeat_binding = preferences.repeat_binding or _default_repeat_binding(
+            schema, intent
+        )
+        if repeat_binding.source != repeat_source:
             return _needs(
-                "REPEAT_MODE_NOT_ALLOWED",
-                f"{repeat_mode.value} is not allowed for {intent.value}",
-                axis_id=repeat_axis.axis_id,
+                "INVALID_REPEAT_SOURCE",
+                "repeat_binding must bind the declared repeat tensor source",
+                source=repeat_binding.source,
             )
-        bindings[repeat_axis.axis_id] = _repeat_binding(
-            repeat_axis.axis_id,
-            repeat_mode,
-            allowed[repeat_axis.axis_id],
-        )
-        unbound.remove(repeat_axis.axis_id)
+        bindings[repeat_source] = repeat_binding
         reasons.append(
             DecisionReason(
                 "REPEAT_POLICY",
-                f"repeat uses the {repeat_mode.value} presentation policy",
-                repeat_axis.axis_id,
+                f"repeat uses {repeat_binding.role.value}",
+                repeat_source,
             )
         )
-
-    for axis_id, index in sorted(selected.items(), key=lambda item: item[0].value):
-        if axis_id not in unbound:
-            reasons.append(
-                DecisionReason(
-                    "BOUND_AXIS_SELECTION",
-                    f"{axis_by_id[axis_id].name} keeps its visible role inside the explicit selection",
-                    axis_id,
-                )
-            )
-        else:
-            axis = axis_by_id[axis_id]
-            bindings[axis_id] = AxisViewBinding(
-                axis_id, AxisViewRole.SELECTED, selector=FixedIndex(index)
-            )
-            unbound.remove(axis_id)
-            reasons.append(
-                DecisionReason(
-                    "EXPLICIT_SELECTION",
-                    f"{axis.name} uses an explicit selection",
-                    axis_id,
-                )
-            )
 
     explicit_roles = (
-        (preferences.sample_axis_ids, AxisViewRole.SAMPLE),
-        (preferences.batch_axis_ids, AxisViewRole.BATCH),
-        (preferences.facet_axis_ids, AxisViewRole.FACET),
+        (preferences.sample_sources, AxisViewRole.SAMPLE),
+        (preferences.batch_sources, AxisViewRole.BATCH),
+        (preferences.facet_sources, AxisViewRole.FACET),
     )
-    for axis_ids, view_role in explicit_roles:
-        for axis_id in axis_ids:
-            axis = axis_by_id.get(axis_id)
-            if axis is None:
-                return _needs("UNKNOWN_AXIS", "preferred axis is absent", axis_id=axis_id)
-            if axis_id not in unbound:
+    for sources, role in explicit_roles:
+        for source in sources:
+            if source == repeat_source and bindings.get(source) == SourceViewBinding(
+                source,
+                role,
+            ):
+                continue
+            if source not in available_set:
+                return _needs("UNKNOWN_SOURCE", "preferred source is absent", source=source)
+            if source in bindings:
                 return _needs(
                     "EXPLICIT_ROLE_CONFLICT",
-                    f"axis cannot also be {view_role.value}",
-                    axis_id=axis_id,
+                    f"source cannot also be {role.value}",
+                    source=source,
                 )
-            if view_role is AxisViewRole.SAMPLE and intent is not ViewIntent.HISTOGRAM:
-                return _needs("SAMPLE_REQUIRES_HISTOGRAM", "SAMPLE is histogram-only", axis_id=axis_id)
-            bindings[axis_id] = AxisViewBinding(axis_id, view_role)
-            unbound.remove(axis_id)
-            if view_role is AxisViewRole.SAMPLE and axis.role not in (REPEAT,):
-                review_required = True
+            if role is AxisViewRole.SAMPLE and intent is not ViewIntent.HISTOGRAM:
+                return _needs(
+                    "SAMPLE_REQUIRES_HISTOGRAM",
+                    "SAMPLE is histogram-only",
+                    source=source,
+                )
+            bindings[source] = SourceViewBinding(source, role)
             reasons.append(
-                DecisionReason("EXPLICIT_AXIS_ROLE", f"{axis.name} uses {view_role.value}", axis_id)
+                DecisionReason(
+                    "EXPLICIT_SOURCE_ROLE",
+                    f"{_source_name(schema, source)} uses {role.value}",
+                    source,
+                )
             )
 
-    automatic_axes = tuple(axis for axis in axes if axis.axis_id in unbound)
-    for axis in automatic_axes:
-        policy = contract.policy_for(axis.role)
-        if policy is None or not policy.automatic_roles:
+    for axis in (schema.repeat_axis, *schema.cell_schema.data_axes):
+        source = AxisSourceRef.tensor(axis.axis_id)
+        if source in bindings:
+            continue
+        binding = _automatic_tensor_binding(schema, source, contract)
+        if binding is None:
             return _needs(
-                "UNRESOLVED_INFORMATION_AXIS",
-                f"{axis.name} requires an explicit selection, facet, batch, or reducer",
-                axis_id=axis.axis_id,
+                "UNRESOLVED_TENSOR_SOURCE",
+                f"{axis.name} requires an explicit role",
+                source=source,
             )
-    planned = _plan_automatic_bindings(
-        automatic_axes,
-        contract,
-        allowed,
-        point_defaults,
-    )
-    if planned is None:
-        return _needs(
-            "UNRESOLVED_INFORMATION_AXIS",
-            "no declared automatic role can display every remaining axis",
-        )
-    for axis in automatic_axes:
-        binding = planned[axis.axis_id]
-        bindings[axis.axis_id] = binding
-        unbound.remove(axis.axis_id)
+        bindings[source] = binding
         reasons.append(
             DecisionReason(
                 "AUTOMATIC_VISIBLE_ROLE",
                 f"{axis.name} remains visible as {binding.role.value}",
-                axis.axis_id,
+                source,
             )
         )
 
@@ -413,15 +377,15 @@ def _suggest_view(
         schema.fingerprint,
         intent,
         tuple(bindings.values()),
-        display_selections,
+        point_ordinals,
     )
     try:
         validate_view_spec(schema, spec, contract)
-    except (TypeError, ValueError, IndexError) as exc:
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
         return _needs("CONTRACT_REJECTED", str(exc))
     return ViewSuggestion(
         spec,
-        SuggestionStatus.REVIEW_REQUIRED if review_required else SuggestionStatus.RESOLVED,
+        SuggestionStatus.RESOLVED,
         tuple(reasons),
         tuple(alternatives),
     )
@@ -430,124 +394,222 @@ def _suggest_view(
 def suggest_view(
     schema: DatasetSchema,
     intent: ViewIntent,
-    selection: Selection | None = None,
+    point_ordinals: tuple[int, ...] | None = None,
     preferences: ViewPreferences | None = None,
 ) -> ViewSuggestion:
     """Suggest one safe presentation using the ordinary public contract."""
 
-    contract = dataset_contract_for(intent)
     return _suggest_view(
         schema,
         intent,
-        selection,
+        point_ordinals,
         preferences,
-        contract=contract,
+        contract=dataset_contract_for(intent),
     )
 
 
-def _suggest_fit_view_for_effective_schema(
+def _suggest_histogram_fit_view(
     schema: DatasetSchema,
     result: FitResultBatch,
-    selection: Selection | None = None,
-    preferences: ViewPreferences | None = None,
+    preferences: ViewPreferences,
 ) -> ViewSuggestion:
-    """Suggest against the exact schema consumed by one fit."""
+    """Rebuild one raw HISTOGRAM view from its committed sample authority."""
 
-    arity = len(result.fit_axis_specs)
-    if arity not in (1, 2):
+    transform = result.spec.committed_transform
+    operations = tuple(transform.spec.operations)
+    histogram = operations[-1]
+    assert isinstance(histogram, HistogramSpec)
+    if (
+        len(result.spec.independent_sources) != 1
+        or result.spec.independent_sources[0]
+        != AxisSourceRef.tensor(histogram.bin_axis_id)
+        or len(result.fit_axis_specs) != 1
+        or result.fit_axis_specs[0].axis_id != histogram.bin_axis_id
+    ):
         return _needs(
-            "FIT_ARITY_UNSUPPORTED",
-            "the current figure surface supports one- and two-axis fit models",
-        )
-    preferences = ViewPreferences() if preferences is None else preferences
-    if not isinstance(preferences, ViewPreferences):
-        raise TypeError("preferences must be ViewPreferences or None")
-
-    repeat_axis = schema.repeat_axis
-    batch_ids = {axis.axis_id for axis in result.batch_axis_specs}
-    if repeat_axis.axis_id in batch_ids and preferences.repeat_mode is None:
-        # Fit replay must expose every authoritative repeat batch by default.
-        # Selecting index zero / LATEST here used to hide valid fit cells and
-        # made replay depend on a presentation-time accident.  Curves can carry
-        # repeat as series; images carry it as visible facets.  Rendering all
-        # authoritative cells is preferable to silently sampling one cell.
-        preferences = replace(
-            preferences,
-            repeat_mode=(
-                RepeatViewMode.BATCH
-                if arity == 1
-                else RepeatViewMode.FACET
-            ),
+            "HISTOGRAM_FIT_AXIS_MISMATCH",
+            "Histogram Fit result does not use its committed bin axis",
         )
 
-    if arity == 1:
-        fit_axis_id = result.fit_axis_specs[0].axis_id
-        if preferences.x_axis_id not in (None, fit_axis_id):
+    selection = None
+    reduction = None
+    for operation in operations[:-1]:
+        if isinstance(operation, Selection) and selection is None and reduction is None:
+            selection = operation
+        elif isinstance(operation, ReductionSpec) and reduction is None:
+            reduction = operation
+        else:
             return _needs(
-                "FIT_AXIS_VIEW_MISMATCH",
-                "the requested x axis differs from the fitted axis",
-                axis_id=preferences.x_axis_id,
+                "HISTOGRAM_TRANSFORM_UNREPRESENTABLE",
+                "Histogram Fit transform is outside the canonical Figure view",
             )
-        preferences = replace(preferences, x_axis_id=fit_axis_id)
-        intent = ViewIntent.CURVE
-    else:
-        x_axis_id = result.fit_axis_specs[0].axis_id
-        y_axis_id = result.fit_axis_specs[1].axis_id
-        if preferences.image_x_axis_id not in (None, x_axis_id):
-            return _needs(
-                "FIT_X_AXIS_VIEW_MISMATCH",
-                "the requested image x axis differs from the first fitted axis",
-                axis_id=preferences.image_x_axis_id,
-            )
-        if preferences.image_y_axis_id not in (None, y_axis_id):
-            return _needs(
-                "FIT_Y_AXIS_VIEW_MISMATCH",
-                "the requested image y axis differs from the second fitted axis",
-                axis_id=preferences.image_y_axis_id,
-            )
-        preferences = replace(
-            preferences,
-            image_x_axis_id=x_axis_id,
-            image_y_axis_id=y_axis_id,
-        )
-        intent = ViewIntent.IMAGE
 
-    suggestion = _suggest_view(
-        schema,
-        intent,
-        selection,
-        preferences,
-        contract=(
-            CURVE_CONTRACT
-            if arity == 1
-            else IMAGE_CONTRACT
-        ),
+    bindings: dict[AxisSourceRef, SourceViewBinding] = {}
+    if selection is not None:
+        for term in selection.terms:
+            if not isinstance(term, IndexSelection):
+                return _needs(
+                    "HISTOGRAM_SELECTION_UNREPRESENTABLE",
+                    "Histogram Figure can replay only committed fixed-index selectors",
+                )
+            source = AxisSourceRef.tensor(term.axis_id)
+            try:
+                axis = _tensor_axis(schema, source)
+            except KeyError:
+                return _needs(
+                    "HISTOGRAM_SELECTION_SOURCE_MISSING",
+                    "Histogram Fit selected a source absent from the Dataset",
+                    source=source,
+                )
+            if term.index >= axis.size:
+                return _needs(
+                    "HISTOGRAM_SELECTION_INDEX_INVALID",
+                    "Histogram Fit selector lies outside the Dataset source",
+                    source=source,
+                )
+            bindings[source] = SourceViewBinding(
+                source,
+                AxisViewRole.SELECTED,
+                selector=FixedIndex(term.index),
+            )
+
+    if reduction is not None:
+        if (
+            reduction.method not in {ReductionMethod.MEAN, ReductionMethod.SUM}
+            or reduction.missing_policy is not MissingPolicy.OMIT_MISSING
+            or reduction.validity_policy is not ValidityPolicy.OMIT_INVALID
+            or reduction.minimum_valid_count is not None
+        ):
+            return _needs(
+                "HISTOGRAM_REDUCTION_UNREPRESENTABLE",
+                "Histogram Fit reduction differs from the canonical display reduction",
+            )
+        display_method = (
+            DisplayReductionMethod.MEAN
+            if reduction.method is ReductionMethod.MEAN
+            else DisplayReductionMethod.SUM
+        )
+        for source in reduction.sources:
+            if source in bindings:
+                return _needs(
+                    "HISTOGRAM_TRANSFORM_SOURCE_CONFLICT",
+                    "Histogram Fit selects and reduces the same source",
+                    source=source,
+                )
+            bindings[source] = SourceViewBinding(
+                source,
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(display_method),
+            )
+
+    available = set(_dataset_sources(schema))
+    for source in histogram.sources:
+        if source not in available or source in bindings:
+            return _needs(
+                "HISTOGRAM_SAMPLE_SOURCE_INVALID",
+                "Histogram Fit sample source is absent or already transformed",
+                source=source,
+            )
+        bindings[source] = SourceViewBinding(source, AxisViewRole.SAMPLE)
+
+    if any(
+        value is not None
+        for value in (
+            preferences.x_source,
+            preferences.image_x_source,
+            preferences.image_y_source,
+        )
+    ) or (
+        preferences.sample_sources
+        and tuple(preferences.sample_sources) != tuple(sorted(histogram.sources))
+    ):
+        return _needs(
+            "HISTOGRAM_VIEW_PREFERENCE_MISMATCH",
+            "saved Histogram Fit fixes its sample sources",
+        )
+
+    group_sources = tuple(
+        source for source in result.spec.batch_sources if source not in bindings
     )
-    if suggestion.spec is None:
-        return suggestion
-    allowed_batch_roles = {
-        AxisViewRole.BATCH,
-        AxisViewRole.FACET,
-        AxisViewRole.SELECTED,
-        AxisViewRole.SLIDER,
-    }
-    for axis in result.batch_axis_specs:
-        if suggestion.spec.binding(axis.axis_id).role not in allowed_batch_roles:
+    requested_groups = (
+        *preferences.facet_sources,
+        *preferences.batch_sources,
+    )
+    if requested_groups:
+        if set(requested_groups) != set(group_sources):
             return _needs(
-                "FIT_BATCH_AXIS_NOT_IDENTIFIED",
-                f"fit batch axis {axis.name} is not visible or explicitly selected",
-                axis_id=axis.axis_id,
+                "FIT_BATCH_VIEW_MISMATCH",
+                "Fit batch presentation must cover every unfixed batch source",
             )
-    return suggestion
+        facet_sources = preferences.facet_sources
+        batch_sources = preferences.batch_sources
+    elif group_sources:
+        repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+        facet = repeat_source if repeat_source in group_sources else group_sources[0]
+        facet_sources = (facet,)
+        batch_sources = tuple(source for source in group_sources if source != facet)
+    else:
+        facet_sources = ()
+        batch_sources = ()
+    for source in facet_sources:
+        bindings[source] = SourceViewBinding(source, AxisViewRole.FACET)
+    for source in batch_sources:
+        bindings[source] = SourceViewBinding(source, AxisViewRole.BATCH)
+
+    if preferences.repeat_binding is not None:
+        repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+        if bindings.get(repeat_source) != preferences.repeat_binding:
+            return _needs(
+                "HISTOGRAM_REPEAT_VIEW_MISMATCH",
+                "saved Histogram Fit fixes the repeat source role",
+                source=repeat_source,
+            )
+
+    for axis in (schema.repeat_axis, *schema.cell_schema.data_axes):
+        source = AxisSourceRef.tensor(axis.axis_id)
+        if source in bindings:
+            continue
+        if axis.role != SCALAR:
+            return _needs(
+                "HISTOGRAM_SOURCE_UNRESOLVED",
+                "Histogram Fit left an informative tensor source unbound",
+                source=source,
+            )
+        bindings[source] = SourceViewBinding(
+            source,
+            AxisViewRole.SELECTED,
+            selector=FixedIndex(0),
+        )
+
+    spec = ViewSpec(
+        schema.fingerprint,
+        ViewIntent.HISTOGRAM,
+        tuple(bindings.values()),
+        transform.exact_point_ordinals,
+    )
+    try:
+        validate_view_spec(schema, spec, HISTOGRAM_CONTRACT)
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        return _needs("CONTRACT_REJECTED", str(exc))
+    return ViewSuggestion(
+        spec,
+        SuggestionStatus.RESOLVED,
+        (
+            DecisionReason(
+                "FIT_HISTOGRAM_AUTHORITY",
+                "Histogram view is derived from its committed samples and bins",
+            ),
+        ),
+        (),
+    )
 
 
 def suggest_fit_view(
     schema: DatasetSchema,
     result: FitResultBatch,
-    selection: Selection | None = None,
     preferences: ViewPreferences | None = None,
 ) -> ViewSuggestion:
-    """Suggest one faithful display for raw or explicitly transformed fit data."""
+    """Suggest the raw Figure projection for an already bound Fit result."""
 
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
@@ -558,72 +620,133 @@ def suggest_fit_view(
             "FIT_SOURCE_SCHEMA_MISMATCH",
             "fit result and displayed source use different schemas",
         )
-    if result.spec.committed_transform is None:
-        return _suggest_fit_view_for_effective_schema(
-            schema,
-            result,
-            selection,
-            preferences,
-        )
-    if selection is not None:
-        if not isinstance(selection, Selection):
-            raise TypeError("selection must be zlc_data.Selection or None")
-        batch_ids = {axis.axis_id for axis in result.batch_axis_specs}
-        if any(term.axis_id not in batch_ids for term in selection.terms):
-            return _needs(
-                "TRANSFORMED_FIT_SELECTION_CONFLICT",
-                "additional transformed-fit display selection may name batch axes only",
-            )
+    transform = result.spec.committed_transform
+    preferences = ViewPreferences() if preferences is None else preferences
+    if not isinstance(preferences, ViewPreferences):
+        raise TypeError("preferences must be ViewPreferences or None")
+    if transform.spec.operations and isinstance(
+        transform.spec.operations[-1],
+        HistogramSpec,
+    ):
+        return _suggest_histogram_fit_view(schema, result, preferences)
     try:
-        effective_schema, authority_selection = _selection_fit_projection(
-            schema,
-            result,
-        )
+        _fit_display_selection_indices(schema, result)
     except (KeyError, TypeError, ValueError, IndexError) as exc:
-        return _needs("TRANSFORMED_FIT_DISPLAY_UNAVAILABLE", str(exc))
-    effective = _suggest_fit_view_for_effective_schema(
-        effective_schema,
-        result,
-        selection,
-        preferences,
-    )
-    if effective.spec is None:
-        return effective
-    try:
-        display_selection = Selection(
-            (
-                *authority_selection.terms,
-                *(
-                    term
-                    for display in effective.spec.display_selections
-                    for term in display.terms
-                ),
-            )
-        )
-        lifted = ViewSpec(
-            schema.fingerprint,
-            effective.spec.intent,
-            effective.spec.axis_bindings,
-            (display_selection,),
-        )
-        validate_view_spec(schema, lifted, dataset_contract_for(lifted.intent))
-    except (TypeError, ValueError, IndexError) as exc:
         return _needs(
-            "TRANSFORMED_FIT_VIEW_REJECTED",
-            f"committed ROI and display selection cannot be composed: {exc}",
+            "TRANSFORMED_FIT_REQUIRES_AUTHORITY_TRANSLATOR",
+            str(exc),
         )
-    return ViewSuggestion(
-        lifted,
-        effective.status,
+    available = set(_dataset_sources(schema))
+    fit_sources = result.spec.independent_sources
+    if any(source not in available for source in fit_sources):
+        return _needs(
+            "FIT_SOURCE_UNAVAILABLE",
+            "a fitted source is absent from the DatasetSchema source vocabulary",
+        )
+    if len(fit_sources) not in (1, 2):
+        return _needs(
+            "FIT_ARITY_UNSUPPORTED",
+            "the current figure surface supports one- and two-source fit models",
+        )
+    batch_sources = result.spec.batch_sources
+    repeated_point_group = next(
         (
-            DecisionReason(
-                "COMMITTED_TRANSFORM_DISPLAY",
-                "the visible ROI is copied exactly from the committed FitSpec",
-            ),
-            *effective.reasons,
+            source
+            for source in batch_sources
+            if source.kind == AxisSourceRef.POINT_COORDINATE
+            and any(
+                len(members) > 1
+                for members in result.point_groups.group_member_ordinals
+            )
         ),
-        (),
+        None,
     )
+    if repeated_point_group is not None and any(
+        source.kind == AxisSourceRef.TENSOR for source in fit_sources
+    ):
+        return _needs(
+            "FIT_POINT_GROUP_REDUCTION_REQUIRED",
+            "a repeated point-coordinate batch needs an explicit PointRows "
+            "reduction before it can be shown as one Figure cell",
+            source=repeated_point_group,
+        )
+    requested_groups = {
+        *preferences.batch_sources,
+        *preferences.facet_sources,
+    }
+    if requested_groups and requested_groups != set(batch_sources):
+        return _needs(
+            "FIT_BATCH_VIEW_MISMATCH",
+            "Fit batch presentation must cover every authoritative batch source",
+        )
+    if not requested_groups and batch_sources:
+        repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+        facet_source = (
+            repeat_source if repeat_source in batch_sources else batch_sources[0]
+        )
+        preferences = replace(
+            preferences,
+            facet_sources=(facet_source,),
+            batch_sources=tuple(
+                source for source in batch_sources if source != facet_source
+            ),
+        )
+    if len(fit_sources) == 1:
+        if preferences.x_source not in (None, fit_sources[0]):
+            return _needs(
+                "FIT_SOURCE_VIEW_MISMATCH",
+                "the requested X source differs from the fitted source",
+                source=preferences.x_source,
+            )
+        preferences = replace(preferences, x_source=fit_sources[0])
+        intent = ViewIntent.CURVE
+        contract = CURVE_CONTRACT
+    else:
+        if preferences.image_x_source not in (None, fit_sources[0]):
+            return _needs(
+                "FIT_X_SOURCE_VIEW_MISMATCH",
+                "the requested IMAGE_X source differs from the fitted source",
+                source=preferences.image_x_source,
+            )
+        if preferences.image_y_source not in (None, fit_sources[1]):
+            return _needs(
+                "FIT_Y_SOURCE_VIEW_MISMATCH",
+                "the requested IMAGE_Y source differs from the fitted source",
+                source=preferences.image_y_source,
+            )
+        preferences = replace(
+            preferences,
+            image_x_source=fit_sources[0],
+            image_y_source=fit_sources[1],
+        )
+        intent = ViewIntent.IMAGE
+        contract = IMAGE_CONTRACT
+    suggestion = _suggest_view(
+        schema,
+        intent,
+        transform.exact_point_ordinals,
+        preferences,
+        contract=contract,
+    )
+    if suggestion.spec is None:
+        return suggestion
+    allowed_batch_roles = {
+        AxisViewRole.BATCH,
+        AxisViewRole.FACET,
+        AxisViewRole.SELECTED,
+    }
+    for source, axis in zip(
+        result.spec.batch_sources,
+        result.batch_axis_specs,
+        strict=True,
+    ):
+        if suggestion.spec.binding(source).role not in allowed_batch_roles:
+            return _needs(
+                "FIT_BATCH_SOURCE_NOT_IDENTIFIED",
+                f"fit batch source {axis.name} is not visible or selected",
+                source=source,
+            )
+    return suggestion
 
 
 __all__ = ["suggest_fit_view", "suggest_view"]

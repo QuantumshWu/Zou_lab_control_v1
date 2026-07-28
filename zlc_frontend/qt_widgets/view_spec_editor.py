@@ -6,26 +6,43 @@ from dataclasses import replace
 
 from PyQt5 import QtCore, QtWidgets
 
+from zlc_data import AxisSourceRef
 from zlc_frontend.figure import (
-    AxisViewBinding,
     AxisViewRole,
     FixedIndex,
     ViewSpec,
-    dataset_axes,
+    evaluate_axis,
     validate_view_spec,
 )
+from zlc_frontend.figure.contract import _resolve_selected_point_ordinals
 
 from .fluent import FluentComboBox, FluentSettingRow, signals_blocked
 
 __all__ = ["ViewSpecEditor"]
 
 
-def _coordinate_text(axis, index: int) -> str:
-    coordinate = axis.coordinate_at(int(index))
+def _coordinate_text(axis, position: int) -> str:
+    coordinate = axis.coordinates[int(position)]
+    source_index = axis.indices[int(position)]
     text = str(coordinate)
     if axis.unit:
         text = f"{text} {axis.unit}"
-    return f"{int(index)}: {text}"
+    return f"{int(source_index)}: {text}"
+
+
+def _grid_choice_text(schema, sources, indices) -> str:
+    topology = schema.grid_topology
+    assert topology is not None
+    labels = []
+    for source, index in zip(sources, indices, strict=True):
+        assert source.axis_id is not None
+        position = topology.dimension_ids.index(source.axis_id)
+        column = schema.point_table.column(source.axis_id)
+        text = str(topology.coordinate_domains[position][index])
+        if column.unit:
+            text = f"{text} {column.unit}"
+        labels.append(f"{column.name}={text}")
+    return ", ".join(labels)
 
 
 class ViewSpecEditor(QtWidgets.QWidget):
@@ -36,10 +53,10 @@ class ViewSpecEditor(QtWidgets.QWidget):
     made an internal ``ViewSpec`` look like a broken form (for example
     ``Reduce``, ``ROI X`` and ``ROI Y`` rows that could not be edited).  Repeat
     and Grid facet have their own explicit controls; this editor owns only a
-    finite ``FixedIndex`` choice on a ``SELECTED``/``SLIDER`` axis.
+    finite ``FixedIndex`` choice on a ``SELECTED`` source.
 
     The owner supplies the exact effective ``ViewSpec`` produced by frontend
-    policy.  Rows are reconciled by AxisId: ordinary data revisions update
+    policy.  Rows are reconciled by AxisSourceRef: ordinary data revisions update
     nothing, while a true schema change adds, removes, or reorders only the
     affected editable rows.
     """
@@ -51,7 +68,10 @@ class ViewSpecEditor(QtWidgets.QWidget):
         self._label_width = label_width
         self._schema = None
         self._view = None
-        self._rows: dict[object, tuple[FluentSettingRow, FluentComboBox]] = {}
+        self._rows: dict[
+            tuple[AxisSourceRef, ...],
+            tuple[FluentSettingRow, FluentComboBox],
+        ] = {}
         self._updating = False
         self._layout = QtWidgets.QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -69,93 +89,192 @@ class ViewSpecEditor(QtWidgets.QWidget):
         if not isinstance(view, ViewSpec):
             raise TypeError("view editor requires ViewSpec or None")
         validate_view_spec(schema, view)
-        axes = tuple(
-            axis
-            for axis in dataset_axes(schema)
-            if (
-                (binding := view.binding(axis.axis_id)).role
-                in (AxisViewRole.SLIDER, AxisViewRole.SELECTED)
-                and isinstance(binding.selector, FixedIndex)
-                and axis.size > 1
-            )
+        editable = []
+        grid_bindings = tuple(
+            binding
+            for binding in view.source_bindings
+            if binding.source.kind == AxisSourceRef.GRID_DIMENSION
+            and binding.role is AxisViewRole.SELECTED
+            and isinstance(binding.selector, FixedIndex)
         )
-        axis_ids = {axis.axis_id for axis in axes}
+        if grid_bindings:
+            topology = schema.grid_topology
+            if topology is None:
+                raise ValueError("selected Grid source is absent from GridTopology")
+            selected = {binding.source: binding for binding in grid_bindings}
+            grid_sources = tuple(
+                AxisSourceRef.grid_dimension(dimension_id)
+                for dimension_id in topology.dimension_ids
+                if AxisSourceRef.grid_dimension(dimension_id) in selected
+            )
+            base_ordinals = _resolve_selected_point_ordinals(
+                schema,
+                view,
+                ignore_selected_sources=grid_sources,
+            )
+            positions = tuple(
+                topology.dimension_ids.index(source.axis_id)
+                for source in grid_sources
+            )
+            choices = tuple(
+                dict.fromkeys(
+                    tuple(
+                        topology.row_to_cell[ordinal][position]
+                        for position in positions
+                    )
+                    for ordinal in base_ordinals
+                )
+            )
+            current = tuple(
+                selected[source].selector.index for source in grid_sources
+            )
+            if current not in choices:
+                raise ValueError("current Grid selection has no physical row")
+            if len(choices) > 1:
+                label = (
+                    schema.point_table.column(grid_sources[0].axis_id).name
+                    if len(grid_sources) == 1
+                    else "Grid cell"
+                )
+                editable.append(
+                    (
+                        grid_sources,
+                        label,
+                        tuple(
+                            (_grid_choice_text(schema, grid_sources, choice), choice)
+                            for choice in choices
+                        ),
+                        current,
+                        "Choose one physical Grid cell; sparse holes are not offered.",
+                    )
+                )
+        for binding in view.source_bindings:
+            if (
+                binding.role is not AxisViewRole.SELECTED
+                or not isinstance(binding.selector, FixedIndex)
+            ):
+                continue
+            source = binding.source
+            if source.kind != AxisSourceRef.TENSOR:
+                continue
+            axes = (schema.repeat_axis, *schema.cell_schema.data_axes)
+            declared = next(
+                axis for axis in axes if axis.axis_id == source.axis_id
+            )
+            size = declared.size
+            if size > 1:
+                axis = evaluate_axis(schema, source, tuple(range(size)))
+                editable.append(
+                    (
+                        (source,),
+                        axis.name,
+                        tuple(
+                            (_coordinate_text(axis, position), (index,))
+                            for position, index in enumerate(axis.indices)
+                        ),
+                        (binding.selector.index,),
+                        f"Choose which {axis.name} coordinate this panel displays.",
+                    )
+                )
+        row_keys = {sources for sources, _label, _choices, _current, _tip in editable}
         self._updating = True
         try:
-            for axis_id in tuple(self._rows):
-                if axis_id in axis_ids:
+            for sources in tuple(self._rows):
+                if sources in row_keys:
                     continue
-                row, _combo = self._rows.pop(axis_id)
+                row, _combo = self._rows.pop(sources)
                 self._layout.removeWidget(row)
                 row.hide()
                 row.deleteLater()
-            for position, axis in enumerate(axes):
-                pair = self._rows.get(axis.axis_id)
+            for position, (sources, label, choices, current, tooltip) in enumerate(editable):
+                pair = self._rows.get(sources)
                 if pair is None:
                     combo = FluentComboBox()
                     row = FluentSettingRow(
-                        axis.name,
+                        label,
                         combo,
                         label_width=self._label_width,
                         parent=self,
                     )
                     combo.currentIndexChanged.connect(
-                        lambda index, axis_id=axis.axis_id: self._commit_index(
-                            axis_id,
+                        lambda index, sources=sources: self._commit_choice(
+                            sources,
                             index,
                         )
                     )
-                    self._rows[axis.axis_id] = (row, combo)
+                    self._rows[sources] = (row, combo)
                 else:
                     row, combo = pair
-                    row.set_label(axis.name, width=self._label_width)
+                    row.set_label(label, width=self._label_width)
                 self._layout.insertWidget(position, row)
-                self._seed_combo(axis, view.binding(axis.axis_id), combo)
-                row.setToolTip(
-                    f"Choose which {axis.name} coordinate this panel displays."
-                )
+                self._seed_combo(choices, current, combo)
+                row.setToolTip(tooltip)
                 row.show()
         finally:
             self._updating = False
         self._schema = schema
         self._view = view
-        self.setVisible(bool(axes))
+        self.setVisible(bool(editable))
 
-    def _seed_combo(self, axis, binding: AxisViewBinding, combo) -> None:
-        if (
-            binding.role not in (AxisViewRole.SLIDER, AxisViewRole.SELECTED)
-            or not isinstance(binding.selector, FixedIndex)
-            or axis.size <= 1
-        ):
-            raise ValueError("view editor received a non-editable axis binding")
+    @staticmethod
+    def _seed_combo(choices, current, combo) -> None:
+        if len(choices) <= 1:
+            raise ValueError("view editor received a non-editable choice set")
         with signals_blocked(combo):
             combo.clear()
-            for index in range(axis.size):
-                combo.addItem(_coordinate_text(axis, index), index)
-            combo.setCurrentIndex(int(binding.selector.index))
+            for label, value in choices:
+                combo.addItem(label, value)
+            position = next(
+                (
+                    index
+                    for index in range(combo.count())
+                    if combo.itemData(index) == current
+                ),
+                -1,
+            )
+            if position < 0:
+                raise ValueError("current selection is absent from its physical choices")
+            combo.setCurrentIndex(position)
             combo.setEnabled(True)
 
-    def _commit_index(self, axis_id, combo_index: int) -> None:
+    def _commit_choice(
+        self,
+        sources: tuple[AxisSourceRef, ...],
+        combo_index: int,
+    ) -> None:
         if self._updating or self._schema is None or self._view is None:
             return
-        pair = self._rows.get(axis_id)
+        pair = self._rows.get(sources)
         if pair is None:
             return
         _row, combo = pair
         selected = combo.itemData(int(combo_index))
-        if isinstance(selected, bool) or not isinstance(selected, int):
+        if (
+            not isinstance(selected, tuple)
+            or len(selected) != len(sources)
+            or any(
+                isinstance(index, bool) or not isinstance(index, int)
+                for index in selected
+            )
+        ):
             return
-        binding = self._view.binding(axis_id)
-        if binding.role not in (AxisViewRole.SLIDER, AxisViewRole.SELECTED):
-            return
-        if isinstance(binding.selector, FixedIndex) and binding.selector.index == selected:
-            return
-        replacement = replace(binding, selector=FixedIndex(selected))
-        bindings = tuple(
-            replacement if item.axis_id == axis_id else item
-            for item in self._view.axis_bindings
+        current = tuple(
+            self._view.binding(source).selector.index for source in sources
         )
-        candidate = replace(self._view, axis_bindings=bindings)
+        if current == selected:
+            return
+        replacements = {
+            source: replace(
+                self._view.binding(source),
+                selector=FixedIndex(index),
+            )
+            for source, index in zip(sources, selected, strict=True)
+        }
+        bindings = tuple(
+            replacements.get(item.source, item)
+            for item in self._view.source_bindings
+        )
+        candidate = replace(self._view, source_bindings=bindings)
         validate_view_spec(self._schema, candidate)
         self._view = candidate
         self.viewChanged.emit(candidate)

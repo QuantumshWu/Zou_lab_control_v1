@@ -169,10 +169,12 @@ def validate_plot_panel_schema(kind: str, schema: DatasetSchema) -> None:
         raise TypeError("plot panel schema must be DatasetSchema")
     if key != "monitor":
         return
-    history_axes = tuple(
-        axis for axis in schema.point_axes if axis.role == MONITOR_HISTORY
+    history_columns = tuple(
+        column
+        for column in schema.point_table.columns
+        if column.role == MONITOR_HISTORY
     )
-    if len(history_axes) != 1:
+    if len(history_columns) != 1:
         raise ValueError(
             "rolling monitor requires exactly one explicit MONITOR_HISTORY "
             "point axis; use Meter for a scalar dataset"
@@ -284,9 +286,9 @@ def plot_panel_intent(kind: str, view: ViewSpec | None = None) -> ViewIntent | N
     if key == "grid":
         if not isinstance(view, ViewSpec) or view.intent not in GRID_INTENTS:
             raise ValueError("grid plot requires an explicit faceted ViewSpec")
-        from .figure import grid_facet_axis
+        from .figure import grid_facet_source
 
-        grid_facet_axis(view)
+        grid_facet_source(view)
         return view.intent
     try:
         intent = panel_view_intents()[key]
@@ -359,52 +361,20 @@ def plot_panel_value_label(
     return key.rsplit("/", 1)[-1].strip() or "Signal"
 
 
-def _display_selection(view: ViewSpec):
-    """Merge every persisted display-only term for a safe re-suggestion."""
-
-    if not isinstance(view, ViewSpec):
-        raise TypeError("view must be ViewSpec")
-    from zlc_data import Selection
-
-    terms = tuple(
-        term
-        for selection in view.display_selections
-        for term in selection.terms
-    )
-    return None if not terms else Selection(terms)
-
-
 def _repeat_mode_from_view(view: ViewSpec, schema):
-    """Read the authored repeat policy from one typed ViewSpec."""
+    """Return the authored repeat source binding itself."""
 
-    from .figure import AxisViewRole, DisplayReductionMethod, RepeatViewMode
+    from zlc_data import AxisSourceRef
 
-    binding = view.binding(schema.repeat_axis.axis_id)
-    if binding.role is AxisViewRole.REDUCED:
-        return (
-            RepeatViewMode.MEAN
-            if binding.reduction.method is DisplayReductionMethod.MEAN
-            else RepeatViewMode.SUM
-        )
-    try:
-        return {
-            AxisViewRole.BATCH: RepeatViewMode.BATCH,
-            AxisViewRole.FACET: RepeatViewMode.FACET,
-            AxisViewRole.SAMPLE: RepeatViewMode.SAMPLE,
-            AxisViewRole.SELECTED: RepeatViewMode.LATEST,
-        }[binding.role]
-    except KeyError as error:
-        raise ValueError(
-            f"unsupported repeat binding {binding.role.value}"
-        ) from error
+    return view.binding(AxisSourceRef.tensor(schema.repeat_axis.axis_id))
 
 
 def _view_preferences(
     view: ViewSpec,
     schema,
     *,
-    repeat_mode=None,
-    facet_axis_ids=None,
+    repeat_binding=None,
+    facet_sources=None,
 ):
     """Re-author view preferences without treating a ViewSpec as authority."""
 
@@ -412,7 +382,9 @@ def _view_preferences(
 
     by_role = {
         role: tuple(
-            binding.axis_id for binding in view.axis_bindings if binding.role is role
+            binding.source
+            for binding in view.source_bindings
+            if binding.role is role
         )
         for role in (
             AxisViewRole.X,
@@ -423,36 +395,98 @@ def _view_preferences(
             AxisViewRole.SAMPLE,
         )
     }
-    repeat_id = schema.repeat_axis.axis_id
+    from zlc_data import AxisSourceRef
+
+    repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
     facets = (
-        tuple(facet_axis_ids)
-        if facet_axis_ids is not None
+        tuple(facet_sources)
+        if facet_sources is not None
         else tuple(
-            axis_id
-            for axis_id in by_role[AxisViewRole.FACET]
-            if axis_id != repeat_id
+            source
+            for source in by_role[AxisViewRole.FACET]
+            if source != repeat_source
         )
     )
     return ViewPreferences(
-        repeat_mode=(
-            repeat_mode
-            if repeat_mode is not None
+        repeat_binding=(
+            repeat_binding
+            if repeat_binding is not None
             else _repeat_mode_from_view(view, schema)
         ),
-        x_axis_id=next(iter(by_role[AxisViewRole.X]), None),
-        image_x_axis_id=next(iter(by_role[AxisViewRole.IMAGE_X]), None),
-        image_y_axis_id=next(iter(by_role[AxisViewRole.IMAGE_Y]), None),
-        batch_axis_ids=tuple(
-            axis_id
-            for axis_id in by_role[AxisViewRole.BATCH]
-            if axis_id != repeat_id
+        x_source=next(iter(by_role[AxisViewRole.X]), None),
+        image_x_source=next(iter(by_role[AxisViewRole.IMAGE_X]), None),
+        image_y_source=next(iter(by_role[AxisViewRole.IMAGE_Y]), None),
+        batch_sources=tuple(
+            source
+            for source in by_role[AxisViewRole.BATCH]
+            if source != repeat_source
         ),
-        facet_axis_ids=facets,
-        sample_axis_ids=tuple(
-            axis_id
-            for axis_id in by_role[AxisViewRole.SAMPLE]
-            if axis_id != repeat_id
+        facet_sources=facets,
+        sample_sources=tuple(
+            source
+            for source in by_role[AxisViewRole.SAMPLE]
+            if source != repeat_source
         ),
+    )
+
+
+def _repeat_binding_candidates(schema):
+    from zlc_data import AxisSourceRef
+    from .figure import (
+        AxisViewRole,
+        DisplayReduction,
+        DisplayReductionMethod,
+        LatestNonempty,
+        SourceViewBinding,
+    )
+
+    source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+    return (
+        SourceViewBinding(
+            source,
+            AxisViewRole.REDUCED,
+            reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+        ),
+        SourceViewBinding(
+            source,
+            AxisViewRole.REDUCED,
+            reduction=DisplayReduction(DisplayReductionMethod.SUM),
+        ),
+        SourceViewBinding(source, AxisViewRole.SELECTED, selector=LatestNonempty()),
+        SourceViewBinding(source, AxisViewRole.BATCH),
+        SourceViewBinding(source, AxisViewRole.SAMPLE),
+        SourceViewBinding(source, AxisViewRole.FACET),
+    )
+
+
+def _view_with_repeat_binding(kind, schema, intent, current_view, repeat_binding):
+    from .figure import (
+        ViewPreferences,
+        grid_facet_source,
+        resolve_grid_view,
+        suggest_view,
+    )
+
+    if str(kind) == "grid":
+        if current_view is None:
+            raise ValueError("Grid repeat policy needs a committed facet view")
+        return resolve_grid_view(
+            schema,
+            intent,
+            grid_facet_source(current_view),
+            current_view=current_view,
+            repeat_binding=repeat_binding,
+        )
+    preferences = (
+        _view_preferences(current_view, schema, repeat_binding=repeat_binding)
+        if current_view is not None
+        else ViewPreferences(repeat_binding=repeat_binding)
+    )
+    return suggest_view(
+        schema,
+        intent,
+        None if current_view is None else current_view.point_ordinals,
+        preferences=preferences,
     )
 
 
@@ -464,18 +498,42 @@ def plot_panel_repeat_modes(
 ):
     """Return repeat policies renderable by this exact panel host."""
 
-    from .figure import RepeatViewMode, dataset_contract_for, grid_facet_axis
-
     if str(kind) == "sites":
         return ()
-    modes = dataset_contract_for(intent).repeat_modes
-    ordinary = tuple(mode for mode in modes if mode is not RepeatViewMode.FACET)
-    if str(kind) != "grid" or current_view is None:
-        return ordinary
-    return (
-        (RepeatViewMode.FACET,)
-        if grid_facet_axis(current_view) == schema.repeat_axis.axis_id
-        else ordinary
+    candidates = _repeat_binding_candidates(schema)
+    probe_view = current_view
+    if str(kind) == "grid" and probe_view is None:
+        from .figure import grid_facet_sources, resolve_grid_view
+
+        for source in grid_facet_sources(schema, intent):
+            suggestion = resolve_grid_view(schema, intent, source)
+            if suggestion.spec is not None:
+                probe_view = suggestion.spec
+                break
+        if probe_view is None:
+            return ()
+    if str(kind) == "grid" and current_view is not None:
+        from zlc_data import AxisSourceRef
+        from .figure import AxisViewRole, grid_facet_source
+
+        repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+        if grid_facet_source(current_view) == repeat_source:
+            return tuple(
+                binding
+                for binding in candidates
+                if binding.role is AxisViewRole.FACET
+            )
+    return tuple(
+        binding
+        for binding in candidates
+        if _view_with_repeat_binding(
+            kind,
+            schema,
+            intent,
+            probe_view,
+            binding,
+        ).spec
+        is not None
     )
 
 
@@ -487,7 +545,7 @@ def plot_panel_selected_repeat_mode(
 ):
     """Resolve the control selection from authored or visible Figure state."""
 
-    from .figure import dataset_contract_for
+    from .figure import suggest_view
 
     view = current_view
     if (
@@ -498,7 +556,10 @@ def plot_panel_selected_repeat_mode(
         view = presented_view
     if view is not None:
         return _repeat_mode_from_view(view, schema)
-    return dataset_contract_for(intent).default_repeat_mode
+    suggestion = suggest_view(schema, intent)
+    if suggestion.spec is None:
+        raise ValueError("schema does not determine a default repeat presentation")
+    return _repeat_mode_from_view(suggestion.spec, schema)
 
 
 def plot_panel_view_with_repeat_mode(
@@ -510,13 +571,6 @@ def plot_panel_view_with_repeat_mode(
 ):
     """Re-resolve a panel view after one explicit repeat-policy edit."""
 
-    from .figure import (
-        ViewPreferences,
-        grid_facet_axis,
-        resolve_grid_view,
-        suggest_view,
-    )
-
     if repeat_mode not in plot_panel_repeat_modes(
         kind,
         schema,
@@ -524,37 +578,14 @@ def plot_panel_view_with_repeat_mode(
         current_view,
     ):
         raise ValueError(
-            f"repeat mode {repeat_mode.value} is not renderable by this panel"
+            "repeat binding is not renderable by this panel"
         )
-    if str(kind) == "grid":
-        if current_view is None:
-            raise ValueError("Grid repeat policy needs a committed facet view")
-        return resolve_grid_view(
-            schema,
-            intent,
-            grid_facet_axis(current_view),
-            current_view=current_view,
-            repeat_mode=repeat_mode,
-        )
-    preferences = (
-        ViewPreferences(repeat_mode=repeat_mode)
-        if current_view is None
-        else _view_preferences(
-            current_view,
-            schema,
-            repeat_mode=repeat_mode,
-        )
-    )
-    selection = (
-        None
-        if current_view is None
-        else _display_selection(current_view)
-    )
-    return suggest_view(
+    return _view_with_repeat_binding(
+        kind,
         schema,
         intent,
-        selection,
-        preferences=preferences,
+        current_view,
+        repeat_mode,
     )
 
 
@@ -613,7 +644,7 @@ def plot_panel_display_state(
     if intent is ViewIntent.METER:
         return MeterDisplayState(
             0 if focus is None else int(focus.panel_index),
-            None if focus is None else focus.selection,
+            None if focus is None else focus.address,
             revision,
         )
     param_kind = "2d" if contract.faceted else contract.kind

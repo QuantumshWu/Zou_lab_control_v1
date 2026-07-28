@@ -564,7 +564,7 @@ class PanelEditor(QtWidgets.QWidget):
                     )
                 selector_figure = figure.focused_typed_panel(
                     faceted.focus.panel_index,
-                    expected_selection=faceted.focus.selection,
+                    expected_address=faceted.focus.address,
                     expected_intent=intent,
                 )
             board.present_faceted(
@@ -682,8 +682,8 @@ class PanelEditor(QtWidgets.QWidget):
     def _forward_thresholds(self, commit) -> None:
         self.card.accept_thresholds_from(self._board, commit)
 
-    def _forward_grid_focus(self, panel_index: int, selection) -> None:
-        self.card._focus_grid_cell(panel_index, selection)
+    def _forward_grid_focus(self, panel_index: int, address) -> None:
+        self.card._focus_grid_cell(panel_index, address)
         self._request_snapshot_render()
 
     def _forward_grid_overview(self) -> None:

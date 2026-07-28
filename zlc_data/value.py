@@ -279,7 +279,7 @@ class OwnedSnapshot:
 def dataset_cell_value(
     block: DataBlock,
     repeat_index: int,
-    point_storage_index: int,
+    point_ordinal: int,
 ) -> Value:
     """Extract one exact physical Dataset cell as its declared ``Value``.
 
@@ -291,16 +291,16 @@ def dataset_cell_value(
     if not isinstance(block, DataBlock):
         raise TypeError("block must be DataBlock")
     normalized_repeat = integer(repeat_index, "repeat_index")
-    normalized_point = integer(point_storage_index, "point_storage_index")
+    normalized_point = integer(point_ordinal, "point_ordinal")
     assert normalized_repeat is not None and normalized_point is not None
     repeat_index = normalized_repeat
-    point_storage_index = normalized_point
+    point_ordinal = normalized_point
     for name, index, size in (
         ("repeat_index", repeat_index, block.schema.repeat_axis.size),
         (
-            "point_storage_index",
-            point_storage_index,
-            block.schema.point_layout.storage_size,
+            "point_ordinal",
+            point_ordinal,
+            block.schema.point_table.row_count,
         ),
     ):
         if not 0 <= index < size:
@@ -312,18 +312,18 @@ def dataset_cell_value(
     elif isinstance(validity, CellValidity):
         cell_validity = (
             VALID
-            if bool(validity.mask[repeat_index, point_storage_index])
+            if bool(validity.mask[repeat_index, point_ordinal])
             else INVALID
         )
     elif isinstance(validity, DatasetComponentValidity):
         cell_validity = ComponentValidity(
             validity.axis_ids,
-            validity.mask[repeat_index, point_storage_index],
+            validity.mask[repeat_index, point_ordinal],
         )
     else:  # pragma: no cover - DataBlock validation closes the union
         raise TypeError("DataBlock validity has an unsupported type")
     return Value(
-        block.values[repeat_index, point_storage_index],
+        block.values[repeat_index, point_ordinal],
         cell_validity,
         block.schema.cell_schema,
     )
@@ -384,11 +384,49 @@ def expand_dataset_validity(
         shape = validity.mask.shape + (1,) * len(schema.cell_schema.data_axes)
         return np.broadcast_to(validity.mask.reshape(shape), schema.physical_shape)
     positions = _axis_positions(validity.axis_ids, schema.cell_schema)
-    broadcast_shape = [schema.repeat_axis.size, schema.point_layout.storage_size]
+    broadcast_shape = [schema.repeat_axis.size, schema.point_table.row_count]
     broadcast_shape.extend([1] * len(schema.cell_schema.data_axes))
     for mask_index, axis_position in enumerate(positions):
         broadcast_shape[2 + axis_position] = validity.mask.shape[2 + mask_index]
     return np.broadcast_to(validity.mask.reshape(tuple(broadcast_shape)), schema.physical_shape)
+
+
+def compact_dataset_validity(
+    mask: np.ndarray,
+    schema: DatasetSchema,
+) -> Valid | Invalid | CellValidity | DatasetComponentValidity:
+    """Compact one full physical validity mask under its Dataset contract."""
+
+    array = np.asarray(mask, dtype=np.bool_)
+    if array.shape != schema.physical_shape:
+        raise ValueError("dataset validity mask shape disagrees with schema")
+    if bool(np.all(array)):
+        return VALID
+    if not bool(np.any(array)):
+        return INVALID
+    component_ids = (
+        schema.cell_schema.validity_contract.component_axis_ids
+        if schema.cell_schema.validity_contract.mode is ValidityMode.COMPONENTS
+        else ()
+    )
+    compact = array
+    for position in range(len(schema.cell_schema.data_axes) - 1, -1, -1):
+        axis = schema.cell_schema.data_axes[position]
+        if axis.axis_id in component_ids:
+            continue
+        array_axis = 2 + position
+        first = np.take(compact, 0, axis=array_axis)
+        if not np.array_equal(
+            compact,
+            np.broadcast_to(np.expand_dims(first, array_axis), compact.shape),
+        ):
+            raise RuntimeError(
+                "validity varies along an axis absent from its declared contract"
+            )
+        compact = first
+    if component_ids:
+        return DatasetComponentValidity(component_ids, compact)
+    return CellValidity(compact)
 
 
 def _axis_positions(axis_ids: tuple[AxisId, ...], schema: ValueSchema) -> tuple[int, ...]:
@@ -434,7 +472,7 @@ def _validate_dataset_validity(
     validity: Valid | Invalid | CellValidity | DatasetComponentValidity,
     schema: DatasetSchema,
 ) -> None:
-    leading = (schema.repeat_axis.size, schema.point_layout.storage_size)
+    leading = (schema.repeat_axis.size, schema.point_table.row_count)
     if isinstance(validity, (Valid, Invalid)):
         return
     if isinstance(validity, CellValidity):
@@ -465,6 +503,7 @@ __all__ = [
     "Value",
     "ValuePayloadContract",
     "canonical_value_array",
+    "compact_dataset_validity",
     "dataset_cell_value",
     "expand_dataset_validity",
     "expand_value_validity",

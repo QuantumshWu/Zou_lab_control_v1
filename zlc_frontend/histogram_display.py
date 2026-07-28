@@ -15,11 +15,10 @@ import math
 import numpy as np
 
 from zlc_data import (
-    IndexSelection,
-    Selection,
+    AxisSourceRef,
+    axis_source_ref_from_tree,
+    axis_source_ref_to_tree,
     immutable_array,
-    selection_from_tree,
-    selection_to_tree,
 )
 from zlc_storage import exact_mapping, finite_real, nonnegative_integer
 
@@ -32,6 +31,7 @@ from .display_range import (
     validated_display_range,
 )
 from .form import FormChoice, FormFieldProps, FormSpec
+from .fit_projection import canonical_panel_focus_address
 from .numeric_viewport import (
     data_x_to_normalized_widget,
     normalized_plot_bounds,
@@ -139,23 +139,19 @@ class HistogramDisplayState:
 class HistogramCellThresholds:
     """One Grid cell's display-only threshold set.
 
-    ``selection`` is the sparse logical cell identity painted in the overview,
+    ``address`` is the sparse source-aware cell identity painted in the overview,
     not a dense storage row and not a transient ``LatestNonempty`` resolution.
     """
 
-    selection: Selection
+    address: tuple[tuple[AxisSourceRef, int], ...]
     thresholds: tuple[float, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.selection, Selection):
-            raise TypeError("histogram cell threshold selection must be Selection")
-        if any(
-            not isinstance(term, IndexSelection)
-            for term in self.selection.terms
-        ):
-            raise TypeError(
-                "histogram cell threshold selection must use logical indices"
-            )
+        object.__setattr__(
+            self,
+            "address",
+            canonical_panel_focus_address(self.address),
+        )
         object.__setattr__(
             self,
             "thresholds",
@@ -174,15 +170,12 @@ def _validated_cell_thresholds(
         raise TypeError(
             "cell_thresholds must contain HistogramCellThresholds values"
         )
-    if len({item.selection for item in entries}) != len(entries):
-        raise ValueError("histogram cell threshold selections must be unique")
+    if len({item.address for item in entries}) != len(entries):
+        raise ValueError("histogram cell threshold addresses must be unique")
     return tuple(
         sorted(
             entries,
-            key=lambda item: tuple(
-                (term.axis_id.value, getattr(term, "index", -1))
-                for term in item.selection.terms
-            ),
+            key=lambda item: item.address,
         )
     )
 
@@ -211,14 +204,16 @@ class FacetedHistogramDisplayState:
     def revision(self) -> int:
         return self.display.revision
 
-    def display_for(self, selection: Selection) -> HistogramDisplayState:
-        if not isinstance(selection, Selection):
-            raise TypeError("histogram cell selection must be Selection")
+    def display_for(
+        self,
+        address: tuple[tuple[AxisSourceRef, int], ...],
+    ) -> HistogramDisplayState:
+        resolved = canonical_panel_focus_address(address)
         thresholds = next(
             (
                 item.thresholds
                 for item in self.cell_thresholds
-                if item.selection == selection
+                if item.address == resolved
             ),
             (),
         )
@@ -226,6 +221,40 @@ class FacetedHistogramDisplayState:
 
 
 _HISTOGRAM_CELL_THRESHOLDS_SCHEMA = "zlc_frontend.HistogramCellThresholds"
+
+
+def _focus_address_to_tree(
+    value: tuple[tuple[AxisSourceRef, int], ...],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "source": axis_source_ref_to_tree(source),
+            "index": index,
+        }
+        for source, index in canonical_panel_focus_address(value)
+    ]
+
+
+def _focus_address_from_tree(
+    value: object,
+) -> tuple[tuple[AxisSourceRef, int], ...]:
+    if not isinstance(value, list):
+        raise ValueError("histogram cell threshold address must be a list")
+    entries = []
+    for raw in value:
+        item = exact_mapping(
+            raw,
+            {"source", "index"},
+            "histogram cell threshold address entry",
+            discriminator=None,
+        )
+        entries.append(
+            (
+                axis_source_ref_from_tree(item["source"]),
+                item["index"],
+            )
+        )
+    return canonical_panel_focus_address(entries)
 
 
 def histogram_cell_thresholds_to_tree(
@@ -238,7 +267,7 @@ def histogram_cell_thresholds_to_tree(
         "schema": _HISTOGRAM_CELL_THRESHOLDS_SCHEMA,
         "entries": [
             {
-                "selection": selection_to_tree(item.selection),
+                "address": _focus_address_to_tree(item.address),
                 "thresholds": list(item.thresholds),
             }
             for item in resolved
@@ -263,7 +292,7 @@ def histogram_cell_thresholds_from_tree(
     for raw in raw_entries:
         item = exact_mapping(
             raw,
-            {"selection", "thresholds"},
+            {"address", "thresholds"},
             "histogram cell threshold entry",
             discriminator=None,
         )
@@ -272,7 +301,7 @@ def histogram_cell_thresholds_from_tree(
             raise ValueError("histogram cell thresholds must be a list")
         entries.append(
             HistogramCellThresholds(
-                selection_from_tree(item["selection"]),
+                _focus_address_from_tree(item["address"]),
                 tuple(raw_thresholds),
             )
         )
@@ -281,22 +310,22 @@ def histogram_cell_thresholds_from_tree(
 
 def faceted_histogram_display_with_thresholds(
     base: FacetedHistogramDisplayState,
-    selection: Selection,
+    address: tuple[tuple[AxisSourceRef, int], ...],
     thresholds: tuple[float, ...],
 ) -> FacetedHistogramDisplayState:
     """Return one-cell candidate state; the host CAS-checks its painted origin."""
 
     if not isinstance(base, FacetedHistogramDisplayState):
         raise TypeError("base must be FacetedHistogramDisplayState")
-    candidate = HistogramCellThresholds(selection, tuple(thresholds))
-    by_selection = {
-        item.selection: item for item in base.cell_thresholds
+    candidate = HistogramCellThresholds(address, tuple(thresholds))
+    by_address = {
+        item.address: item for item in base.cell_thresholds
     }
     if candidate.thresholds:
-        by_selection[candidate.selection] = candidate
+        by_address[candidate.address] = candidate
     else:
-        by_selection.pop(candidate.selection, None)
-    entries = _validated_cell_thresholds(by_selection.values())
+        by_address.pop(candidate.address, None)
+    entries = _validated_cell_thresholds(by_address.values())
     if entries == base.cell_thresholds:
         return base
     return FacetedHistogramDisplayState(
@@ -825,6 +854,51 @@ class HistogramBinProjection:
         object.__setattr__(self, "bin_counts", tuple(counts))
         object.__setattr__(self, "bin_edges", immutable_edges)
         object.__setattr__(self, "requested_bin_count", bins)
+
+    @classmethod
+    def _from_committed_edges(
+        cls,
+        series_samples: tuple[np.ndarray, ...],
+        *,
+        bins: int,
+        bin_edges: tuple[float, ...] | np.ndarray,
+    ) -> HistogramBinProjection:
+        """Rebuild exact saved-Fit bars from their committed boundaries."""
+
+        values_by_series = _histogram_series(series_samples)
+        requested = _histogram_bin_count(bins)
+        immutable_edges = _immutable_histogram_array(
+            np.asarray(bin_edges, dtype=np.float64),
+            np.dtype(np.float64),
+        )
+        histogram_home_x_limits(immutable_edges)
+        counts = []
+        for values in values_by_series:
+            histogram_values = (
+                values.astype(np.uint8, copy=False)
+                if values.dtype.kind == "b"
+                else values
+            )
+            series_counts = np.histogram(
+                histogram_values,
+                bins=immutable_edges,
+            )[0]
+            if int(np.sum(series_counts, dtype=np.int64)) != int(values.size):
+                raise ValueError(
+                    "committed histogram edges did not retain every exact sample"
+                )
+            counts.append(
+                _immutable_histogram_array(
+                    np.asarray(series_counts, dtype=np.int64),
+                    np.dtype(np.int64),
+                )
+            )
+        projection = object.__new__(cls)
+        object.__setattr__(projection, "series_samples", values_by_series)
+        object.__setattr__(projection, "bin_counts", tuple(counts))
+        object.__setattr__(projection, "bin_edges", immutable_edges)
+        object.__setattr__(projection, "requested_bin_count", requested)
+        return projection
 
 
 def _windowed_histogram_projection(

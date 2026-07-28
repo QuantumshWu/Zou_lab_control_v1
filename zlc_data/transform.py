@@ -1,56 +1,40 @@
-"""Axis-total, sparse-preserving authoritative data transforms."""
+"""Authoritative transforms over the fixed ``(R, P, *data_shape)`` carrier."""
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 import math
-import numpy as np
 
-from zlc_storage.canonical import (
-    canonical_digest,
-    canonical_text,
-    positive_integer,
-    sha256_text,
-)
+import numpy as np
+from zlc_storage.canonical import positive_integer, sha256_text
 
 from ._arrays import canonical_dtype, immutable_array
-from .axis import HISTOGRAM_BIN, AxisId, AxisSpec, SCALAR_AXIS
-from .layout import AxisLayout, AxisLayoutMode
-from .numeric import (
-    canonical_mean_dtype,
-    canonical_sum_dtype,
-    checked_numeric_sum,
-)
-from .schema import DatasetSchema
-from .selection import (
-    IndexRangeSelection,
-    IndexSelection,
-    Selection,
-    resolve_selection_indices,
-)
+from .axis import HISTOGRAM_BIN, AxisId, AxisSourceRef, AxisSpec, SCALAR_AXIS
+from .numeric import canonical_mean_dtype, canonical_sum_dtype, checked_numeric_sum
+from .schema import DatasetSchema, GridTopology, PointColumn, PointTable, resolve_point_rows
+from .selection import Selection, resolve_selection_indices
 from .validity import (
-    INVALID,
-    VALID,
     CellValidity,
     DatasetComponentValidity,
     Invalid,
-    RowComponentValidity,
     Valid,
+    ValidityContract,
     ValidityMode,
 )
 from .value import (
-    DataBlock,
     DatasetRevisionRef,
     OwnedSnapshot,
+    compact_dataset_validity,
+    expand_dataset_validity,
 )
 
 
 TRANSFORM_SPEC_SCHEMA = "zlc_data.DataTransformSpec"
 COMMITTED_TRANSFORM_SCHEMA = "zlc_data.CommittedTransform"
-TRANSFORMED_SCHEMA_SCHEMA = "zlc_data.TransformedSchema"
 HISTOGRAM_BIN_AXIS_ID = AxisId("zlc_data.histogram-bin")
+
+DatasetValidity = Valid | Invalid | CellValidity | DatasetComponentValidity
 
 
 class ReductionMethod(str, Enum):
@@ -61,7 +45,7 @@ class ReductionMethod(str, Enum):
 
 
 class MissingPolicy(str, Enum):
-    """How absent logical contributors affect a reduction output row."""
+    """How absent topology contributors affect a reduction output row."""
 
     REQUIRE_ALL = "REQUIRE_ALL"
     OMIT_MISSING = "OMIT_MISSING"
@@ -77,18 +61,18 @@ class ValidityPolicy(str, Enum):
 
 @dataclass(frozen=True)
 class ReductionSpec:
-    axis_ids: tuple[AxisId, ...]
+    sources: tuple[AxisSourceRef, ...]
     method: ReductionMethod
     missing_policy: MissingPolicy = MissingPolicy.REQUIRE_ALL
     validity_policy: ValidityPolicy = ValidityPolicy.REQUIRE_ALL
     minimum_valid_count: int | None = None
 
     def __post_init__(self) -> None:
-        axis_ids = tuple(self.axis_ids)
-        if not axis_ids or any(not isinstance(axis_id, AxisId) for axis_id in axis_ids):
-            raise ValueError("ReductionSpec axis_ids must contain at least one AxisId")
-        if len(set(axis_ids)) != len(axis_ids):
-            raise ValueError("ReductionSpec axis_ids must be unique")
+        sources = tuple(self.sources)
+        if not sources or any(not isinstance(source, AxisSourceRef) for source in sources):
+            raise ValueError("ReductionSpec sources must contain AxisSourceRef values")
+        if len(set(sources)) != len(sources):
+            raise ValueError("ReductionSpec sources must be unique")
         if not isinstance(self.method, ReductionMethod):
             raise TypeError("method must be ReductionMethod")
         if not isinstance(self.missing_policy, MissingPolicy):
@@ -99,59 +83,42 @@ class ReductionSpec:
             object.__setattr__(
                 self,
                 "minimum_valid_count",
-                positive_integer(
-                    self.minimum_valid_count,
-                    "MIN_COUNT minimum_valid_count",
-                ),
+                positive_integer(self.minimum_valid_count, "MIN_COUNT minimum_valid_count"),
             )
         elif self.minimum_valid_count is not None:
             raise ValueError("minimum_valid_count is only valid with MIN_COUNT")
-        object.__setattr__(self, "axis_ids", tuple(sorted(axis_ids, key=lambda item: item.value)))
+        object.__setattr__(self, "sources", sources)
 
 
 @dataclass(frozen=True)
 class HistogramSpec:
-    """Freeze one value-distribution projection as analysis authority.
+    """Freeze exact sample sources and bin edges as analysis authority."""
 
-    A histogram shown by a Figure is presentation-only.  Pressing Fit commits
-    the exact visible bin edges and the named SAMPLE axes through this value;
-    the ordinary transform/Fit pipeline then fits counts on a declared
-    ``HISTOGRAM_BIN`` axis.  No renderer-side micro-fit may become authority.
-    """
-
-    axis_ids: tuple[AxisId, ...]
+    sources: tuple[AxisSourceRef, ...]
     bin_edges: tuple[float, ...]
 
     def __post_init__(self) -> None:
-        axis_ids = tuple(self.axis_ids)
-        if not axis_ids or any(not isinstance(axis_id, AxisId) for axis_id in axis_ids):
-            raise ValueError("HistogramSpec axis_ids must contain named sample axes")
-        if len(set(axis_ids)) != len(axis_ids):
-            raise ValueError("HistogramSpec axis_ids must be unique")
-        if HISTOGRAM_BIN_AXIS_ID in axis_ids:
-            raise ValueError("histogram bin axis cannot also be a sample axis")
+        sources = tuple(self.sources)
+        if not sources or any(not isinstance(source, AxisSourceRef) for source in sources):
+            raise ValueError("HistogramSpec sources must contain AxisSourceRef values")
+        if len(set(sources)) != len(sources):
+            raise ValueError("HistogramSpec sources must be unique")
         edges = tuple(float(value) for value in self.bin_edges)
         if len(edges) < 2 or not all(math.isfinite(value) for value in edges):
             raise ValueError("HistogramSpec bin_edges must be finite boundaries")
         if any(right <= left for left, right in zip(edges, edges[1:])):
             raise ValueError("HistogramSpec bin_edges must be strictly increasing")
-        object.__setattr__(
-            self,
-            "axis_ids",
-            tuple(sorted(axis_ids, key=lambda item: item.value)),
-        )
+        object.__setattr__(self, "sources", sources)
         object.__setattr__(self, "bin_edges", edges)
 
     @property
     def bin_axis_id(self) -> AxisId:
-        """Return the one canonical derived distribution axis identity."""
-
         return HISTOGRAM_BIN_AXIS_ID
 
 
 @dataclass(frozen=True)
 class DataTransformSpec:
-    operations: tuple[Selection | ReductionSpec | HistogramSpec, ...]
+    operations: tuple[Selection | ReductionSpec | HistogramSpec, ...] = ()
 
     def __post_init__(self) -> None:
         operations = tuple(self.operations)
@@ -173,91 +140,28 @@ class DataTransformSpec:
 
 
 @dataclass(frozen=True)
-class TransformedSchema:
-    cell_axes: tuple[AxisSpec, ...]
-    cell_layout: AxisLayout
-    data_axes: tuple[AxisSpec, ...]
-    validity_axis_ids: tuple[AxisId, ...]
-    dtype: np.dtype
-    value_unit: str | None
-    _fingerprint: str | None = field(
-        init=False,
-        repr=False,
-        compare=False,
-        default=None,
-    )
-
-    def __post_init__(self) -> None:
-        cell_axes = tuple(self.cell_axes)
-        data_axes = tuple(self.data_axes)
-        validity_axis_ids = tuple(self.validity_axis_ids)
-        if len(set(validity_axis_ids)) != len(validity_axis_ids):
-            raise ValueError("transformed validity axis ids must be unique")
-        if any(not isinstance(axis, AxisSpec) for axis in cell_axes + data_axes):
-            raise TypeError("transformed axes must contain AxisSpec values")
-        axis_ids = tuple(axis.axis_id for axis in cell_axes + data_axes)
-        if len(set(axis_ids)) != len(axis_ids):
-            raise ValueError("transformed axis ids must be unique")
-        if not isinstance(self.cell_layout, AxisLayout):
-            raise TypeError("cell_layout must be AxisLayout")
-        if self.cell_layout.logical_shape != tuple(axis.size for axis in cell_axes):
-            raise ValueError("cell layout shape does not match cell axes")
-        available_data_ids = tuple(axis.axis_id for axis in data_axes)
-        try:
-            validity_positions = tuple(
-                available_data_ids.index(axis_id) for axis_id in validity_axis_ids
-            )
-        except ValueError as exc:
-            raise ValueError("validity axis is absent from transformed data axes") from exc
-        if validity_positions != tuple(sorted(validity_positions)):
-            raise ValueError("validity axes must follow transformed data-axis order")
-        if self.value_unit is not None:
-            canonical_text(self.value_unit, "value_unit")
-        object.__setattr__(self, "cell_axes", cell_axes)
-        object.__setattr__(self, "data_axes", data_axes)
-        object.__setattr__(self, "validity_axis_ids", validity_axis_ids)
-        object.__setattr__(self, "dtype", canonical_dtype(self.dtype))
-
-    @property
-    def data_shape(self) -> tuple[int, ...]:
-        return tuple(axis.size for axis in self.data_axes)
-
-    @property
-    def physical_shape(self) -> tuple[int, ...]:
-        return (self.cell_layout.storage_size, *self.data_shape)
-
-    @property
-    def axes(self) -> tuple[AxisSpec, ...]:
-        return self.cell_axes + self.data_axes
-
-    @property
-    def fingerprint(self) -> str:
-        fingerprint = self._fingerprint
-        if fingerprint is None:
-            from .transform_codec import transformed_schema_to_tree
-
-            fingerprint = canonical_digest(transformed_schema_to_tree(self))
-            object.__setattr__(self, "_fingerprint", fingerprint)
-        return fingerprint
-
-    def axis(self, axis_id: AxisId) -> AxisSpec:
-        for axis in self.axes:
-            if axis.axis_id == axis_id:
-                return axis
-        raise KeyError(axis_id)
-
-
-@dataclass(frozen=True)
 class CommittedTransform:
-    input_schema_fingerprint: str
+    source_schema_fingerprint: str
+    exact_point_ordinals: tuple[int, ...]
     spec: DataTransformSpec
-    output_schema_fingerprint: str
+    effective_output_schema: DatasetSchema
 
     def __post_init__(self) -> None:
-        sha256_text(self.input_schema_fingerprint, "input_schema_fingerprint")
-        sha256_text(self.output_schema_fingerprint, "output_schema_fingerprint")
-        if not isinstance(self.spec, DataTransformSpec) or not self.spec.operations:
-            raise ValueError("CommittedTransform requires a non-empty DataTransformSpec")
+        sha256_text(self.source_schema_fingerprint, "source_schema_fingerprint")
+        ordinals = tuple(self.exact_point_ordinals)
+        if not ordinals or tuple(sorted(set(ordinals))) != ordinals:
+            raise ValueError("exact_point_ordinals must be non-empty, unique, and increasing")
+        if any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in ordinals):
+            raise TypeError("exact_point_ordinals must contain nonnegative integers")
+        if not isinstance(self.spec, DataTransformSpec):
+            raise TypeError("spec must be DataTransformSpec")
+        if not isinstance(self.effective_output_schema, DatasetSchema):
+            raise TypeError("effective_output_schema must be DatasetSchema")
+        object.__setattr__(self, "exact_point_ordinals", ordinals)
+
+    @property
+    def output_schema_fingerprint(self) -> str:
+        return self.effective_output_schema.fingerprint
 
 
 @dataclass(frozen=True, eq=False)
@@ -265,8 +169,7 @@ class TransformedData:
     source_ref: DatasetRevisionRef
     transform: CommittedTransform
     values: np.ndarray
-    validity: Valid | Invalid | RowComponentValidity
-    schema: TransformedSchema
+    validity: DatasetValidity
     __hash__ = None
 
     def __post_init__(self) -> None:
@@ -274,262 +177,224 @@ class TransformedData:
             raise TypeError("source_ref must be DatasetRevisionRef")
         if not isinstance(self.transform, CommittedTransform):
             raise TypeError("transform must be CommittedTransform")
-        if not isinstance(self.schema, TransformedSchema):
-            raise TypeError("schema must be TransformedSchema")
-        if self.source_ref.schema_fingerprint != self.transform.input_schema_fingerprint:
-            raise ValueError(
-                "source_ref schema fingerprint differs from the committed transform input"
-            )
-        if self.schema.fingerprint != self.transform.output_schema_fingerprint:
-            raise ValueError(
-                "transformed schema fingerprint differs from the committed transform output"
-            )
+        if self.source_ref.schema_fingerprint != self.transform.source_schema_fingerprint:
+            raise ValueError("source_ref schema differs from the committed transform source")
+        expand_dataset_validity(self.validity, self.schema)
         object.__setattr__(
             self,
             "values",
-            immutable_array(self.values, dtype=self.schema.dtype, shape=self.schema.physical_shape),
+            immutable_array(
+                self.values,
+                dtype=self.schema.cell_schema.dtype,
+                shape=self.schema.physical_shape,
+            ),
         )
-        _validate_transformed_validity(self.validity, self.schema)
+
+    @property
+    def schema(self) -> DatasetSchema:
+        return self.transform.effective_output_schema
 
     def expanded_validity(self) -> np.ndarray:
-        """Return a read-only broadcast view aligned to ``values``."""
-
-        return _expand_transformed_validity(self.validity, self.schema)
+        return expand_dataset_validity(self.validity, self.schema)
 
 
 @dataclass
 class _State:
-    schema: TransformedSchema
+    schema: DatasetSchema
     values: np.ndarray | None
-    validity: Valid | Invalid | RowComponentValidity | None
-
-
-def _source_validity(
-    block: DataBlock,
-) -> Valid | Invalid | RowComponentValidity:
-    validity = block.validity
-    if isinstance(validity, (Valid, Invalid)):
-        return validity
-    if isinstance(validity, CellValidity):
-        return RowComponentValidity((), validity.mask.reshape(-1))
-    if isinstance(validity, DatasetComponentValidity):
-        return RowComponentValidity(
-            validity.axis_ids,
-            validity.mask.reshape((-1, *validity.mask.shape[2:])),
-        )
-    raise TypeError(f"unsupported dataset validity {type(validity).__name__}")
-
-
-def _validate_transformed_validity(
-    validity: Valid | Invalid | RowComponentValidity,
-    schema: TransformedSchema,
-) -> None:
-    if isinstance(validity, (Valid, Invalid)):
-        return
-    if not isinstance(validity, RowComponentValidity):
-        raise TypeError("transformed validity must be Valid, Invalid, or RowComponentValidity")
-    available = tuple(axis.axis_id for axis in schema.data_axes)
-    try:
-        positions = tuple(available.index(axis_id) for axis_id in validity.axis_ids)
-    except ValueError as exc:
-        raise ValueError("row validity axis is absent from transformed schema") from exc
-    if positions != tuple(sorted(positions)):
-        raise ValueError("row validity axes must follow transformed data-axis order")
-    if any(axis_id not in schema.validity_axis_ids for axis_id in validity.axis_ids):
-        raise ValueError("row validity exceeds the transformed validity contract")
-    expected = (schema.cell_layout.storage_size,) + tuple(
-        schema.data_axes[position].size for position in positions
-    )
-    if validity.mask.shape != expected:
-        raise ValueError(
-            f"row validity shape {validity.mask.shape} does not match named axes {expected}"
-        )
-
-
-def _expand_transformed_validity(
-    validity: Valid | Invalid | RowComponentValidity,
-    schema: TransformedSchema,
-) -> np.ndarray:
-    _validate_transformed_validity(validity, schema)
-    if isinstance(validity, (Valid, Invalid)):
-        return np.broadcast_to(isinstance(validity, Valid), schema.physical_shape)
-    available = tuple(axis.axis_id for axis in schema.data_axes)
-    shape = [schema.cell_layout.storage_size] + [1] * len(schema.data_axes)
-    for mask_position, axis_id in enumerate(validity.axis_ids):
-        shape[1 + available.index(axis_id)] = validity.mask.shape[1 + mask_position]
-    return np.broadcast_to(validity.mask.reshape(tuple(shape)), schema.physical_shape)
-
-
-def _select_validity_rows(
-    validity: Valid | Invalid | RowComponentValidity,
-    selected: np.ndarray,
-) -> Valid | Invalid | RowComponentValidity:
-    if isinstance(validity, (Valid, Invalid)):
-        return validity
-    return RowComponentValidity(validity.axis_ids, validity.mask[selected])
-
-
-def _select_validity_data(
-    validity: Valid | Invalid | RowComponentValidity,
-    axis_id: AxisId,
-    indices: range | tuple[int, ...],
-    drop: bool,
-) -> Valid | Invalid | RowComponentValidity:
-    if isinstance(validity, (Valid, Invalid)) or axis_id not in validity.axis_ids:
-        return validity
-    position = validity.axis_ids.index(axis_id)
-    array_axis = 1 + position
-    if drop:
-        mask = np.take(validity.mask, indices[0], axis=array_axis)
-        axis_ids = validity.axis_ids[:position] + validity.axis_ids[position + 1 :]
-    else:
-        if isinstance(indices, range):
-            selection = [slice(None)] * validity.mask.ndim
-            selection[array_axis] = slice(indices.start, indices.stop)
-            mask = validity.mask[tuple(selection)]
-        else:
-            mask = np.take(validity.mask, indices, axis=array_axis)
-        axis_ids = validity.axis_ids
-    return RowComponentValidity(axis_ids, mask)
-
-
-def _compact_transformed_validity(
-    mask: np.ndarray,
-    schema: TransformedSchema,
-) -> Valid | Invalid | RowComponentValidity:
-    mask = np.asarray(mask, dtype=bool)
-    if mask.shape != schema.physical_shape:
-        raise ValueError("expanded transformed validity shape disagrees with schema")
-    if mask.size and np.all(mask):
-        return VALID
-    if mask.size and not np.any(mask):
-        return INVALID
-    current_axis_ids = [axis.axis_id for axis in schema.data_axes]
-    compact = mask
-    contract = set(schema.validity_axis_ids)
-    for position in range(len(current_axis_ids) - 1, -1, -1):
-        axis_id = current_axis_ids[position]
-        if axis_id in contract:
-            continue
-        array_axis = 1 + position
-        first = np.take(compact, 0, axis=array_axis)
-        if not np.array_equal(
-            compact, np.broadcast_to(np.expand_dims(first, array_axis), compact.shape)
-        ):
-            raise RuntimeError("validity varies along an axis absent from its contract")
-        compact = first
-        current_axis_ids.pop(position)
-    return RowComponentValidity(tuple(current_axis_ids), compact)
+    validity: DatasetValidity | None
+    source_row_members: tuple[tuple[int, ...], ...]
 
 
 def commit_transform(
     schema: DatasetSchema,
     authoritative_spec: DataTransformSpec,
+    *,
+    point_ordinals: tuple[int, ...] | None = None,
 ) -> CommittedTransform:
-    """Validate and freeze an authoritative transform without touching dataset values."""
+    """Validate and freeze one transform without touching source values."""
 
-    if not isinstance(authoritative_spec, DataTransformSpec):
-        raise TypeError("authoritative_spec must be DataTransformSpec")
-    if not authoritative_spec.operations:
-        raise ValueError("identity input uses None; an empty transform cannot be committed")
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
-    output_schema = _compile_transform_schema(schema, authoritative_spec)
-    return CommittedTransform(
-        schema.fingerprint,
-        authoritative_spec,
-        output_schema.fingerprint,
-    )
+    if not isinstance(authoritative_spec, DataTransformSpec):
+        raise TypeError("authoritative_spec must be DataTransformSpec")
+    exact = resolve_point_rows(
+        schema.point_table,
+        schema.grid_topology,
+        point_ordinals=point_ordinals,
+    ).surviving_ordinals
+    source = _source_state(schema, exact, values=None, validity=None)
+    canonical_spec = _canonicalize_spec(source.schema, authoritative_spec)
+    output = _run_operations(source, canonical_spec)
+    return CommittedTransform(schema.fingerprint, exact, canonical_spec, output.schema)
 
 
 def resolve_transformed_schema(
     schema: DatasetSchema,
     transform: CommittedTransform,
-) -> TransformedSchema:
-    """Resolve and verify a committed transform without allocating dataset values."""
+) -> DatasetSchema:
+    """Recompile and verify one committed effective Dataset schema."""
 
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    if not isinstance(transform, CommittedTransform):
-        raise TypeError("transform must be CommittedTransform")
-    if transform.input_schema_fingerprint != schema.fingerprint:
-        raise ValueError("CommittedTransform input schema fingerprint is stale")
-    output = _compile_transform_schema(schema, transform.spec)
-    if output.fingerprint != transform.output_schema_fingerprint:
-        raise ValueError("CommittedTransform output schema fingerprint is inconsistent")
-    return output
-
-
-def _compile_transform_schema(
-    schema: DatasetSchema,
-    spec: DataTransformSpec,
-) -> TransformedSchema:
-    return _run_operations(
-        _source_state(schema, values=None, validity=None), spec
-    ).schema
+    state = _resolve_transform_state(schema, transform)
+    return state.schema
 
 
 def apply_transform(
     snapshot: OwnedSnapshot,
     transform: CommittedTransform,
 ) -> TransformedData:
-    """Execute one committed authority transform against an identified snapshot."""
+    """Execute one committed transform against an identified snapshot."""
 
     if not isinstance(snapshot, OwnedSnapshot):
         raise TypeError("snapshot must be OwnedSnapshot")
     if not isinstance(transform, CommittedTransform):
         raise TypeError("transform must be CommittedTransform")
     block = snapshot.block
-    if transform.input_schema_fingerprint != block.schema.fingerprint:
-        raise ValueError("CommittedTransform input schema fingerprint is stale")
-    state = _execute_transform(block, transform.spec)
-    if state.schema.fingerprint != transform.output_schema_fingerprint:
-        raise RuntimeError("transform execution disagrees with its committed output schema")
-    assert state.values is not None and state.validity is not None
-    return TransformedData(
-        snapshot.ref,
-        transform,
-        state.values,
-        state.validity,
-        state.schema,
-    )
-
-
-def _execute_transform(block: DataBlock, spec: DataTransformSpec) -> _State:
+    if block.schema.fingerprint != transform.source_schema_fingerprint:
+        raise ValueError("CommittedTransform source schema fingerprint is stale")
     state = _source_state(
         block.schema,
-        values=block.values.reshape((-1, *block.schema.cell_schema.data_shape)),
-        validity=_source_validity(block),
+        transform.exact_point_ordinals,
+        values=block.values,
+        validity=block.validity,
     )
-    return _run_operations(state, spec)
+    state = _run_operations(state, transform.spec)
+    if state.schema != transform.effective_output_schema:
+        raise RuntimeError("transform execution disagrees with its committed output schema")
+    assert state.values is not None and state.validity is not None
+    return TransformedData(snapshot.ref, transform, state.values, state.validity)
+
+
+def _resolve_transform_state(
+    schema: DatasetSchema,
+    transform: CommittedTransform,
+) -> _State:
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(transform, CommittedTransform):
+        raise TypeError("transform must be CommittedTransform")
+    if schema.fingerprint != transform.source_schema_fingerprint:
+        raise ValueError("CommittedTransform source schema fingerprint is stale")
+    source = _source_state(
+        schema,
+        transform.exact_point_ordinals,
+        values=None,
+        validity=None,
+    )
+    canonical_spec = _canonicalize_spec(source.schema, transform.spec)
+    if canonical_spec != transform.spec:
+        raise ValueError("CommittedTransform operation sources are non-canonical")
+    output = _run_operations(source, transform.spec)
+    if output.schema != transform.effective_output_schema:
+        raise ValueError("CommittedTransform effective schema is inconsistent")
+    return output
 
 
 def _source_state(
     schema: DatasetSchema,
+    ordinals: tuple[int, ...],
     *,
     values: np.ndarray | None,
-    validity: Valid | Invalid | RowComponentValidity | None,
+    validity: DatasetValidity | None,
 ) -> _State:
-    return _State(_source_transformed_schema(schema), values, validity)
-
-
-def _source_transformed_schema(schema: DatasetSchema) -> TransformedSchema:
-    """Project one DatasetSchema into the transform domain exactly once."""
-
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    cell_axes = (schema.repeat_axis, *schema.point_axes)
-    transformed_schema = TransformedSchema(
-        cell_axes,
-        schema.cell_layout,
-        schema.cell_schema.data_axes,
-        schema.cell_schema.validity_contract.component_axis_ids
-        if schema.cell_schema.validity_contract.mode is ValidityMode.COMPONENTS
-        else (),
-        schema.cell_schema.dtype,
-        schema.cell_schema.value_unit,
+    selected_schema = _subset_point_schema(schema, ordinals)
+    full = ordinals == tuple(range(schema.point_table.row_count))
+    if values is None:
+        selected_values = None
+        selected_validity = None
+    elif full:
+        selected_values = values
+        selected_validity = validity
+    else:
+        selected_values = np.take(values, ordinals, axis=1)
+        assert validity is not None
+        selected_validity = _select_validity(validity, axis=1, indices=ordinals)
+    return _State(
+        selected_schema,
+        selected_values,
+        selected_validity,
+        tuple((ordinal,) for ordinal in ordinals),
     )
-    return transformed_schema
+
+
+def _subset_point_schema(
+    schema: DatasetSchema,
+    ordinals: tuple[int, ...],
+) -> DatasetSchema:
+    if ordinals == tuple(range(schema.point_table.row_count)):
+        return schema
+    columns = tuple(
+        PointColumn(
+            column.coordinate_id,
+            column.name,
+            column.role,
+            column.value_kind,
+            tuple(column.values[index] for index in ordinals),
+            column.unit,
+            column.coordinate_frame,
+        )
+        for column in schema.point_table.columns
+    )
+    topology = schema.grid_topology
+    selected_topology = (
+        None
+        if topology is None
+        else GridTopology(
+            topology.dimension_ids,
+            topology.coordinate_domains,
+            tuple(topology.row_to_cell[index] for index in ordinals),
+        )
+    )
+    return DatasetSchema(
+        schema.repeat_axis,
+        PointTable(len(ordinals), columns),
+        selected_topology,
+        schema.cell_schema,
+    )
+
+
+def _canonicalize_spec(schema: DatasetSchema, spec: DataTransformSpec) -> DataTransformSpec:
+    operations: list[Selection | ReductionSpec | HistogramSpec] = []
+    for operation in spec.operations:
+        if isinstance(operation, Selection):
+            operations.append(operation)
+            continue
+        sources = tuple(sorted(operation.sources, key=lambda item: _source_order(schema, item)))
+        if isinstance(operation, ReductionSpec):
+            operations.append(
+                ReductionSpec(
+                    sources,
+                    operation.method,
+                    operation.missing_policy,
+                    operation.validity_policy,
+                    operation.minimum_valid_count,
+                )
+            )
+        else:
+            operations.append(HistogramSpec(sources, operation.bin_edges))
+    return DataTransformSpec(tuple(operations))
+
+
+def _source_order(schema: DatasetSchema, source: AxisSourceRef) -> tuple[int, int]:
+    if source.kind == AxisSourceRef.TENSOR:
+        if source.axis_id == schema.repeat_axis.axis_id:
+            return (0, 0)
+        data_ids = tuple(axis.axis_id for axis in schema.cell_schema.data_axes)
+        try:
+            return (2, data_ids.index(source.axis_id))
+        except ValueError as exc:
+            raise KeyError(f"tensor source {source.axis_id} is absent from Dataset") from exc
+    if source.kind == AxisSourceRef.POINT_ROWS:
+        return (1, 0)
+    if source.kind == AxisSourceRef.GRID_DIMENSION:
+        topology = schema.grid_topology
+        if topology is None:
+            raise ValueError("GRID_DIMENSION source requires GridTopology")
+        try:
+            return (1, topology.dimension_ids.index(source.axis_id))
+        except ValueError as exc:
+            raise KeyError(f"grid source {source.axis_id} is absent from GridTopology") from exc
+    raise ValueError(f"{source.kind} is not a transform operation source")
 
 
 def _run_operations(state: _State, spec: DataTransformSpec) -> _State:
@@ -540,45 +405,20 @@ def _run_operations(state: _State, spec: DataTransformSpec) -> _State:
             state = _apply_reduction(state, operation)
         else:
             state = _apply_histogram(state, operation)
-    return _ensure_scalar_carrier(state)
-
-
-def _ensure_scalar_carrier(state: _State) -> _State:
-    """Keep the public trailing-data contract non-empty after a total transform.
-
-    Selecting or reducing the last information axis produces one scalar per
-    remaining cell.  The canonical singleton carrier records that physical
-    item without pretending that an information axis survived.
-    """
-
-    if state.schema.data_axes:
-        return state
-    schema = TransformedSchema(
-        state.schema.cell_axes,
-        state.schema.cell_layout,
-        (SCALAR_AXIS,),
-        (),
-        state.schema.dtype,
-        state.schema.value_unit,
-    )
-    values = (
-        None
-        if state.values is None
-        else np.expand_dims(state.values, axis=-1)
-    )
-    return _State(schema, values, state.validity)
+    return state
 
 
 def _apply_selection(state: _State, selection: Selection) -> _State:
     for term in selection.terms:
-        cell_ids = tuple(axis.axis_id for axis in state.schema.cell_axes)
-        data_ids = tuple(axis.axis_id for axis in state.schema.data_axes)
-        if term.axis_id in cell_ids:
-            state = _select_cell_axis(state, cell_ids.index(term.axis_id), term)
-        elif term.axis_id in data_ids:
-            state = _select_data_axis(state, data_ids.index(term.axis_id), term)
-        else:
-            raise KeyError(f"selection axis {term.axis_id} is absent from transformed schema")
+        if term.axis_id == state.schema.repeat_axis.axis_id:
+            state = _select_repeat(state, term)
+            continue
+        data_ids = tuple(axis.axis_id for axis in state.schema.cell_schema.data_axes)
+        if term.axis_id not in data_ids:
+            raise KeyError(
+                "transform Selection is tensor-only; point queries must commit exact_point_ordinals"
+            )
+        state = _select_data_axis(state, data_ids.index(term.axis_id), term)
     return state
 
 
@@ -589,7 +429,7 @@ def _selected_axis(
     if isinstance(indices, range) and indices.start == 0 and indices.stop == axis.size:
         return axis
     if axis.coordinates is None:
-        if not isinstance(indices, range):  # coordinate selections require declared coordinates
+        if not isinstance(indices, range):
             raise RuntimeError("implicit-coordinate selection is not contiguous")
         coordinates = None
         index_origin = axis.index_origin + indices.start
@@ -611,137 +451,450 @@ def _selected_axis(
     )
 
 
-def _select_cell_axis(state: _State, position: int, term) -> _State:
-    axis = state.schema.cell_axes[position]
-    indices, drop = resolve_selection_indices(axis, term)
-    if (
-        not drop
-        and isinstance(indices, range)
-        and indices.start == 0
-        and indices.stop == axis.size
-    ):
-        return state
-    axes = list(state.schema.cell_axes)
+def _reduced_axis(axis: AxisSpec) -> AxisSpec:
+    return AxisSpec(
+        axis.axis_id,
+        axis.name,
+        axis.role,
+        1,
+        None,
+        axis.unit,
+        axis.coordinate_frame,
+        0,
+    )
+
+
+def _take_indices(
+    array: np.ndarray,
+    indices: range | tuple[int, ...],
+    *,
+    axis: int,
+    drop: bool = False,
+) -> np.ndarray:
     if drop:
-        axes.pop(position)
-    else:
-        axes[position] = _selected_axis(axis, indices)
-    layout = _select_layout(state.schema.cell_layout, position, indices, drop)
-    schema = TransformedSchema(
-        tuple(axes),
-        layout,
-        state.schema.data_axes,
-        state.schema.validity_axis_ids,
-        state.schema.dtype,
-        state.schema.value_unit,
+        return np.take(array, indices[0], axis=axis)
+    if isinstance(indices, range):
+        selection = [slice(None)] * array.ndim
+        selection[axis] = slice(indices.start, indices.stop)
+        return array[tuple(selection)]
+    return np.take(array, indices, axis=axis)
+
+
+def _select_validity(
+    validity: DatasetValidity,
+    *,
+    axis: int,
+    indices: range | tuple[int, ...],
+    data_axis_id: AxisId | None = None,
+    drop: bool = False,
+) -> DatasetValidity:
+    if isinstance(validity, (Valid, Invalid)):
+        return validity
+    if axis < 2:
+        return type(validity)(
+            validity.axis_ids,
+            _take_indices(validity.mask, indices, axis=axis, drop=False),
+        ) if isinstance(validity, DatasetComponentValidity) else CellValidity(
+            _take_indices(validity.mask, indices, axis=axis, drop=False)
+        )
+    if not isinstance(validity, DatasetComponentValidity) or data_axis_id not in validity.axis_ids:
+        return validity
+    position = validity.axis_ids.index(data_axis_id)
+    mask = _take_indices(validity.mask, indices, axis=2 + position, drop=drop)
+    if not drop:
+        return DatasetComponentValidity(validity.axis_ids, mask)
+    axis_ids = validity.axis_ids[:position] + validity.axis_ids[position + 1 :]
+    return DatasetComponentValidity(axis_ids, mask) if axis_ids else CellValidity(mask)
+
+
+def _select_repeat(state: _State, term: object) -> _State:
+    indices, _drop = resolve_selection_indices(state.schema.repeat_axis, term)
+    if isinstance(indices, range) and indices.start == 0 and indices.stop == state.schema.repeat_axis.size:
+        return state
+    axis = _selected_axis(state.schema.repeat_axis, indices)
+    schema = DatasetSchema(
+        axis,
+        state.schema.point_table,
+        state.schema.grid_topology,
+        state.schema.cell_schema,
     )
     if state.values is None:
-        values = None
-        validity = None
-    elif drop and axis.size == 1:
-        # Removing a singleton logical cell axis changes only the schema.  Every
-        # physical row survives in the same order, so boolean indexing would be
-        # a full-array copy with no data-semantic effect.
-        values = state.values
-        validity = state.validity
-    else:
-        logical_indices = state.schema.cell_layout.axis_indices(position)
-        if isinstance(indices, range):
-            selected = logical_indices >= indices.start
-            np.logical_and(logical_indices < indices.stop, selected, out=selected)
-        else:
-            selected = np.isin(logical_indices, indices)
-        values = state.values[selected]
-        assert state.validity is not None
-        validity = _select_validity_rows(state.validity, selected)
-        if values.shape[0] != layout.storage_size:
-            raise RuntimeError("cell selection layout disagrees with selected physical rows")
-    return _State(schema, values, validity)
+        return _State(schema, None, None, state.source_row_members)
+    assert state.validity is not None
+    return _State(
+        schema,
+        _take_indices(state.values, indices, axis=0),
+        _select_validity(state.validity, axis=0, indices=indices),
+        state.source_row_members,
+    )
 
 
-def _select_data_axis(state: _State, position: int, term) -> _State:
-    axis = state.schema.data_axes[position]
+def _value_schema(
+    data_axes: tuple[AxisSpec, ...],
+    validity_axis_ids: tuple[AxisId, ...],
+    dtype: np.dtype,
+    value_unit: str | None,
+):
+    from .schema import ValueSchema
+
+    axes = data_axes or (SCALAR_AXIS,)
+    validity_ids = tuple(
+        axis.axis_id for axis in axes if axis.axis_id in validity_axis_ids
+    )
+    contract = (
+        ValidityContract.components(*validity_ids)
+        if validity_ids
+        else ValidityContract.value()
+    )
+    return ValueSchema(axes, contract, dtype, value_unit)
+
+
+def _select_data_axis(state: _State, position: int, term: object) -> _State:
+    axes = list(state.schema.cell_schema.data_axes)
+    axis = axes[position]
     indices, drop = resolve_selection_indices(axis, term)
-    if (
-        not drop
-        and isinstance(indices, range)
-        and indices.start == 0
-        and indices.stop == axis.size
-    ):
+    if not drop and isinstance(indices, range) and indices.start == 0 and indices.stop == axis.size:
         return state
-    array_axis = 1 + position
-    axes = list(state.schema.data_axes)
     if drop:
         axes.pop(position)
-        values = None if state.values is None else np.take(state.values, indices[0], axis=array_axis)
     else:
         axes[position] = _selected_axis(axis, indices)
-        if state.values is None:
-            values = None
-        elif isinstance(indices, range):
-            selection = [slice(None)] * state.values.ndim
-            selection[array_axis] = slice(indices.start, indices.stop)
-            values = state.values[tuple(selection)]
-        else:
-            values = np.take(state.values, indices, axis=array_axis)
-    validity_axis_ids = tuple(
-        axis_id
-        for axis_id in state.schema.validity_axis_ids
-        if not (drop and axis_id == axis.axis_id)
+    contract = state.schema.cell_schema.validity_contract
+    validity_ids = (
+        tuple(item for item in contract.component_axis_ids if not (drop and item == axis.axis_id))
+        if contract.mode is ValidityMode.COMPONENTS
+        else ()
     )
-    validity = (
-        None
-        if state.validity is None
-        else _select_validity_data(state.validity, axis.axis_id, indices, drop)
-    )
-    schema = TransformedSchema(
-        state.schema.cell_axes,
-        state.schema.cell_layout,
+    cell_schema = _value_schema(
         tuple(axes),
-        validity_axis_ids,
-        state.schema.dtype,
-        state.schema.value_unit,
+        validity_ids,
+        state.schema.cell_schema.dtype,
+        state.schema.cell_schema.value_unit,
     )
-    return _State(schema, values, validity)
+    schema = DatasetSchema(
+        state.schema.repeat_axis,
+        state.schema.point_table,
+        state.schema.grid_topology,
+        cell_schema,
+    )
+    if state.values is None:
+        return _State(schema, None, None, state.source_row_members)
+    values = _take_indices(state.values, indices, axis=2 + position, drop=drop)
+    if drop and not axes:
+        values = np.expand_dims(values, axis=-1)
+    assert state.validity is not None
+    validity = _select_validity(
+        state.validity,
+        axis=2 + position,
+        indices=indices,
+        data_axis_id=axis.axis_id,
+        drop=drop,
+    )
+    return _State(schema, values, validity, state.source_row_members)
+
+
+def _apply_reduction(state: _State, reduction: ReductionSpec) -> _State:
+    repeat_source = AxisSourceRef.tensor(state.schema.repeat_axis.axis_id)
+    reduce_repeat = repeat_source in reduction.sources
+    data_ids = tuple(axis.axis_id for axis in state.schema.cell_schema.data_axes)
+    reduced_data_ids = tuple(
+        source.axis_id
+        for source in reduction.sources
+        if source.kind == AxisSourceRef.TENSOR and source != repeat_source
+    )
+    if any(axis_id not in data_ids for axis_id in reduced_data_ids):
+        raise KeyError("reduction tensor source is absent from effective Dataset")
+    point_rows = tuple(
+        source for source in reduction.sources if source.kind == AxisSourceRef.POINT_ROWS
+    )
+    grid_sources = tuple(
+        source for source in reduction.sources if source.kind == AxisSourceRef.GRID_DIMENSION
+    )
+    if point_rows and grid_sources:
+        raise ValueError("POINT_ROWS and GRID_DIMENSION cannot share a reduction")
+    if len(point_rows) > 1:
+        raise ValueError("reduction accepts at most one POINT_ROWS source")
+    allowed_count = int(reduce_repeat) + len(reduced_data_ids) + len(point_rows) + len(grid_sources)
+    if allowed_count != len(reduction.sources):
+        raise ValueError("reduction contains an unsupported source kind")
+
+    groups: tuple[tuple[int, ...], ...] | None = None
+    source_members = state.source_row_members
+    point_table = state.schema.point_table
+    topology = state.schema.grid_topology
+    point_maximum = 1
+    if point_rows:
+        groups = (tuple(range(point_table.row_count)),)
+        point_table = PointTable(1)
+        topology = None
+        point_maximum = state.schema.point_table.row_count
+        source_members = (
+            tuple(item for group in state.source_row_members for item in group),
+        )
+    elif grid_sources:
+        point_table, topology, groups, source_members, point_maximum = _reduce_grid_domain(
+            state,
+            grid_sources,
+            reduction.missing_policy,
+        )
+
+    data_positions = tuple(data_ids.index(axis_id) for axis_id in reduced_data_ids)
+    maximum = (
+        (state.schema.repeat_axis.size if reduce_repeat else 1)
+        * point_maximum
+        * math.prod(state.schema.cell_schema.data_axes[index].size for index in data_positions)
+    )
+    if (
+        reduction.validity_policy is ValidityPolicy.MIN_COUNT
+        and reduction.minimum_valid_count is not None
+        and reduction.minimum_valid_count > maximum
+    ):
+        raise ValueError("minimum_valid_count exceeds the reduction maximum")
+    if reduction.method in (ReductionMethod.MIN, ReductionMethod.MAX) and state.schema.cell_schema.dtype.kind == "c":
+        raise TypeError("MIN/MAX reductions are undefined for complex values")
+
+    remaining_axes = tuple(
+        axis for axis in state.schema.cell_schema.data_axes if axis.axis_id not in reduced_data_ids
+    )
+    contract = state.schema.cell_schema.validity_contract
+    validity_ids = (
+        tuple(item for item in contract.component_axis_ids if item not in reduced_data_ids)
+        if contract.mode is ValidityMode.COMPONENTS
+        else ()
+    )
+    only_single_repeat = (
+        reduction.sources == (repeat_source,)
+        and state.schema.repeat_axis.size == 1
+    )
+    output_dtype = (
+        state.schema.cell_schema.dtype
+        if only_single_repeat
+        else _reduction_dtype(state.schema.cell_schema.dtype, reduction.method)
+    )
+    cell_schema = _value_schema(
+        remaining_axes,
+        validity_ids,
+        output_dtype,
+        state.schema.cell_schema.value_unit,
+    )
+    schema = DatasetSchema(
+        _reduced_axis(state.schema.repeat_axis) if reduce_repeat else state.schema.repeat_axis,
+        point_table,
+        topology,
+        cell_schema,
+    )
+    if state.values is None:
+        return _State(schema, None, None, source_members)
+    assert state.validity is not None
+    if only_single_repeat:
+        return _State(
+            schema,
+            state.values,
+            state.validity,
+            source_members,
+        )
+    expanded = expand_dataset_validity(state.validity, state.schema)
+    tensor_axes = tuple(
+        ([0] if reduce_repeat else []) + [2 + position for position in data_positions]
+    )
+    if groups is None:
+        values, validity = _reduce_arrays(
+            state.values,
+            expanded,
+            tensor_axes,
+            reduction.method,
+            reduction.validity_policy,
+            reduction.minimum_valid_count,
+            output_dtype,
+        )
+        if reduce_repeat:
+            values = np.expand_dims(values, axis=0)
+            validity = np.expand_dims(validity, axis=0)
+        if not remaining_axes:
+            values = np.expand_dims(values, axis=-1)
+            validity = np.expand_dims(validity, axis=-1)
+    else:
+        values, validity = _reduce_point_groups(
+            state.values,
+            expanded,
+            groups,
+            tensor_axes,
+            reduce_repeat,
+            bool(remaining_axes),
+            reduction,
+            output_dtype,
+        )
+    if values.shape != schema.physical_shape:
+        raise RuntimeError("reduction output shape disagrees with effective Dataset schema")
+    return _State(
+        schema,
+        values.astype(output_dtype, copy=False),
+        compact_dataset_validity(validity, schema),
+        source_members,
+    )
+
+
+def _reduce_grid_domain(
+    state: _State,
+    reduced_sources: tuple[AxisSourceRef, ...],
+    missing_policy: MissingPolicy,
+) -> tuple[
+    PointTable,
+    GridTopology | None,
+    tuple[tuple[int, ...], ...],
+    tuple[tuple[int, ...], ...],
+    int,
+]:
+    topology = state.schema.grid_topology
+    if topology is None:
+        raise ValueError("GRID_DIMENSION reduction requires GridTopology")
+    reduced_ids = {source.axis_id for source in reduced_sources}
+    if any(axis_id not in topology.dimension_ids for axis_id in reduced_ids):
+        raise KeyError("reduction grid source is absent from GridTopology")
+    remaining_positions = tuple(
+        index
+        for index, axis_id in enumerate(topology.dimension_ids)
+        if axis_id not in reduced_ids
+    )
+    remaining_sources = tuple(
+        AxisSourceRef.grid_dimension(topology.dimension_ids[index])
+        for index in remaining_positions
+    )
+    resolved = resolve_point_rows(
+        state.schema.point_table,
+        topology,
+        group_sources=remaining_sources,
+    )
+    expected = math.prod(
+        len(topology.coordinate_domains[index])
+        for index, axis_id in enumerate(topology.dimension_ids)
+        if axis_id in reduced_ids
+    )
+    retained = tuple(
+        index
+        for index, members in enumerate(resolved.group_member_ordinals)
+        if missing_policy is MissingPolicy.OMIT_MISSING or len(members) == expected
+    )
+    if not retained:
+        raise ValueError("Grid reduction has no complete output rows")
+    groups = tuple(resolved.group_member_ordinals[index] for index in retained)
+    addresses = tuple(resolved.group_addresses[index] for index in retained)
+    columns: list[PointColumn] = []
+    for column in state.schema.point_table.columns:
+        if column.coordinate_id in reduced_ids:
+            continue
+        values: list[object] = []
+        for members in groups:
+            first = column.values[members[0]]
+            if any(column.values[index] != first for index in members[1:]):
+                break
+            values.append(first)
+        else:
+            columns.append(
+                PointColumn(
+                    column.coordinate_id,
+                    column.name,
+                    column.role,
+                    column.value_kind,
+                    tuple(values),
+                    column.unit,
+                    column.coordinate_frame,
+                )
+            )
+    remaining_ids = tuple(topology.dimension_ids[index] for index in remaining_positions)
+    if any(axis_id not in {column.coordinate_id for column in columns} for axis_id in remaining_ids):
+        raise RuntimeError("Grid reduction lost an unconsumed topology column")
+    output_topology = (
+        GridTopology(
+            remaining_ids,
+            tuple(topology.coordinate_domains[index] for index in remaining_positions),
+            addresses,
+        )
+        if remaining_ids
+        else None
+    )
+    output_members = tuple(
+        tuple(
+            source_ordinal
+            for local_ordinal in members
+            for source_ordinal in state.source_row_members[local_ordinal]
+        )
+        for members in groups
+    )
+    return PointTable(len(groups), tuple(columns)), output_topology, groups, output_members, expected
+
+
+def _reduce_point_groups(
+    values: np.ndarray,
+    validity: np.ndarray,
+    groups: tuple[tuple[int, ...], ...],
+    tensor_axes: tuple[int, ...],
+    repeat_reduced: bool,
+    has_data_axes: bool,
+    reduction: ReductionSpec,
+    output_dtype: np.dtype,
+) -> tuple[np.ndarray, np.ndarray]:
+    output_values: list[np.ndarray] = []
+    output_validity: list[np.ndarray] = []
+    axes = tuple(sorted((1, *tensor_axes)))
+    for members in groups:
+        indices = np.asarray(members, dtype=np.intp)
+        reduced_values, reduced_validity = _reduce_arrays(
+            values[:, indices],
+            validity[:, indices],
+            axes,
+            reduction.method,
+            reduction.validity_policy,
+            reduction.minimum_valid_count,
+            output_dtype,
+        )
+        if repeat_reduced:
+            reduced_values = np.expand_dims(reduced_values, axis=0)
+            reduced_validity = np.expand_dims(reduced_validity, axis=0)
+        if not has_data_axes:
+            reduced_values = np.expand_dims(reduced_values, axis=-1)
+            reduced_validity = np.expand_dims(reduced_validity, axis=-1)
+        output_values.append(reduced_values)
+        output_validity.append(reduced_validity)
+    return (
+        np.stack(output_values, axis=1),
+        np.stack(output_validity, axis=1),
+    )
 
 
 def _apply_histogram(state: _State, histogram: HistogramSpec) -> _State:
-    """Materialize exact counts over named sample axes and frozen bin edges."""
-
-    cell_ids = tuple(axis.axis_id for axis in state.schema.cell_axes)
-    data_ids = tuple(axis.axis_id for axis in state.schema.data_axes)
-    available = cell_ids + data_ids
-    unknown = tuple(axis_id for axis_id in histogram.axis_ids if axis_id not in available)
-    if unknown:
-        raise KeyError(f"histogram sample axes are absent from transformed schema: {unknown}")
-    if histogram.bin_axis_id in available:
+    repeat_source = AxisSourceRef.tensor(state.schema.repeat_axis.axis_id)
+    sample_repeat = repeat_source in histogram.sources
+    sample_points = AxisSourceRef.point_rows() in histogram.sources
+    data_ids = tuple(axis.axis_id for axis in state.schema.cell_schema.data_axes)
+    sample_data_ids = tuple(
+        source.axis_id
+        for source in histogram.sources
+        if source.kind == AxisSourceRef.TENSOR and source != repeat_source
+    )
+    if any(axis_id not in data_ids for axis_id in sample_data_ids):
+        raise KeyError("histogram tensor source is absent from effective Dataset")
+    allowed = int(sample_repeat) + int(sample_points) + len(sample_data_ids)
+    if allowed != len(histogram.sources):
+        raise ValueError("Histogram supports only repeat/data TENSOR and POINT_ROWS sources")
+    if histogram.bin_axis_id in data_ids:
         raise ValueError("histogram bin axis collides with an input axis")
-    if state.schema.dtype.kind not in "biuf":
+    if state.schema.cell_schema.dtype.kind not in "biuf":
         raise TypeError("histogram projection requires real numeric or boolean values")
 
-    sample_ids = set(histogram.axis_ids)
-    cell_positions = tuple(
-        index for index, axis_id in enumerate(cell_ids) if axis_id in sample_ids
-    )
-    data_positions = tuple(
-        index for index, axis_id in enumerate(data_ids) if axis_id in sample_ids
-    )
-    remaining_cell_positions = tuple(
-        index for index in range(len(cell_ids)) if index not in cell_positions
-    )
-    remaining_data_positions = tuple(
-        index for index in range(len(data_ids)) if index not in data_positions
-    )
-    remaining_cell_axes = tuple(
-        state.schema.cell_axes[index] for index in remaining_cell_positions
-    )
-    remaining_data_axes = tuple(
-        state.schema.data_axes[index] for index in remaining_data_positions
-    )
-    output_layout = _reduce_layout(
-        state.schema.cell_layout,
-        cell_positions,
-        MissingPolicy.OMIT_MISSING,
+    # The canonical trailing scalar axis is a storage carrier, not an
+    # independent physical dimension.  Histogramming scalar observations must
+    # therefore consume that singleton automatically; otherwise a perfectly
+    # ordinary scalar Dataset would incorrectly produce ``scalar x bin`` and
+    # violate the scalar-carrier invariant.  Named size-one data axes remain
+    # real dimensions and still require an explicit sample source.
+    physical_sample_data_ids = sample_data_ids
+    if state.schema.cell_schema.data_axes == (SCALAR_AXIS,):
+        physical_sample_data_ids = (SCALAR_AXIS.axis_id,)
+    remaining_axes = tuple(
+        axis
+        for axis in state.schema.cell_schema.data_axes
+        if axis.axis_id not in physical_sample_data_ids
     )
     edges = np.asarray(histogram.bin_edges, dtype=np.dtype("<f8"))
     centers = tuple(((edges[:-1] + edges[1:]) * 0.5).tolist())
@@ -751,404 +904,85 @@ def _apply_histogram(state: _State, histogram: HistogramSpec) -> _State:
         HISTOGRAM_BIN,
         len(edges) - 1,
         centers,
-        state.schema.value_unit,
+        state.schema.cell_schema.value_unit,
     )
-    schema = TransformedSchema(
-        remaining_cell_axes,
-        output_layout,
-        (*remaining_data_axes, bin_axis),
-        tuple(axis.axis_id for axis in remaining_data_axes),
+    validity_ids = tuple(axis.axis_id for axis in remaining_axes)
+    cell_schema = _value_schema(
+        (*remaining_axes, bin_axis),
+        validity_ids,
         np.dtype("<i8"),
         "count",
     )
+    point_table = PointTable(1) if sample_points else state.schema.point_table
+    topology = None if sample_points else state.schema.grid_topology
+    source_members = (
+        (tuple(item for group in state.source_row_members for item in group),)
+        if sample_points
+        else state.source_row_members
+    )
+    schema = DatasetSchema(
+        _reduced_axis(state.schema.repeat_axis) if sample_repeat else state.schema.repeat_axis,
+        point_table,
+        topology,
+        cell_schema,
+    )
     if state.values is None:
-        return _State(schema, None, None)
+        return _State(schema, None, None, source_members)
     assert state.validity is not None
-
-    values = np.asarray(state.values)
-    expanded_validity = np.asarray(
-        _expand_transformed_validity(state.validity, state.schema),
-        dtype=bool,
-    )
-    output = np.zeros(schema.physical_shape, dtype=np.dtype("<i8"))
-    output_validity = np.zeros(schema.physical_shape, dtype=bool)
-
-    # Build the physical-row grouping once.  Re-scanning every source row for
-    # every output cell makes a multi-cell Histogram quadratic; the layout is
-    # the canonical mapping, so each source row can be assigned exactly once.
-    grouped_rows: list[list[int]] = [
-        [] for _ in range(output_layout.storage_size)
-    ]
-    if remaining_cell_positions:
-        source_columns = tuple(
-            state.schema.cell_layout.axis_indices(position)
-            for position in remaining_cell_positions
+    expanded = expand_dataset_validity(state.validity, state.schema)
+    sample_axes = tuple(
+        sorted(
+            ([0] if sample_repeat else [])
+            + ([1] if sample_points else [])
+            + [
+                2 + data_ids.index(axis_id)
+                for axis_id in physical_sample_data_ids
+            ]
         )
-        for source_row in range(state.schema.cell_layout.storage_size):
-            key = tuple(int(column[source_row]) for column in source_columns)
-            grouped_rows[output_layout.storage_index(key)].append(source_row)
-    elif grouped_rows:
-        grouped_rows[0].extend(range(state.schema.cell_layout.storage_size))
-    elif state.schema.cell_layout.storage_size:
-        raise RuntimeError("histogram output layout lost non-empty source rows")
-
-    remaining_data_shape = tuple(axis.size for axis in remaining_data_axes)
-    remaining_data_size = math.prod(remaining_data_shape)
-    sample_data_shape = tuple(
-        state.schema.data_axes[position].size for position in data_positions
     )
-    sample_data_size = math.prod(sample_data_shape)
-    permutation = (
-        0,
-        *(1 + position for position in remaining_data_positions),
-        *(1 + position for position in data_positions),
+    remaining_physical_axes = tuple(
+        index for index in range(state.values.ndim) if index not in sample_axes
     )
-    grouped_values = np.transpose(values, permutation).reshape(
-        state.schema.cell_layout.storage_size,
-        remaining_data_size,
-        sample_data_size,
-    )
-    grouped_validity = np.transpose(expanded_validity, permutation).reshape(
-        state.schema.cell_layout.storage_size,
-        remaining_data_size,
-        sample_data_size,
-    )
+    permutation = remaining_physical_axes + sample_axes
+    remaining_shape = tuple(state.values.shape[index] for index in remaining_physical_axes)
+    sample_size = math.prod(state.values.shape[index] for index in sample_axes)
+    rows = math.prod(remaining_shape)
+    grouped_values = np.transpose(state.values, permutation).reshape(rows, sample_size)
+    grouped_validity = np.transpose(expanded, permutation).reshape(rows, sample_size)
     bin_count = len(edges) - 1
-    output_by_remaining = output.reshape(
-        output_layout.storage_size,
-        remaining_data_size,
-        bin_count,
-    )
-    validity_by_remaining = output_validity.reshape(
-        output_layout.storage_size,
-        remaining_data_size,
-        bin_count,
-    )
-
-    for output_row, source_rows in enumerate(grouped_rows):
-        if not source_rows:
-            raise RuntimeError("histogram runtime layout produced an empty output group")
-        row_indices = np.asarray(source_rows, dtype=np.intp)
-        group_values = grouped_values[row_indices]
-        group_validity = grouped_validity[row_indices]
-        valid_flat = np.flatnonzero(group_validity)
-        if not valid_flat.size:
+    counts = np.zeros((rows, bin_count), dtype=np.dtype("<i8"))
+    valid_rows = np.zeros(rows, dtype=np.bool_)
+    for index in range(rows):
+        samples = grouped_values[index, grouped_validity[index]]
+        if not samples.size:
             continue
-        valid_values = group_values.reshape(-1)[valid_flat]
-        if not bool(np.all(np.isfinite(valid_values))):
+        if not bool(np.all(np.isfinite(samples))):
             raise ValueError("histogram projection received a valid non-finite value")
-
-        # The transposed group is (source row, remaining-data cell,
-        # sample-data cell), so integer arithmetic recovers the output data
-        # address without enumerating/storing every ndindex tuple.
-        remaining_indices = (
-            valid_flat // sample_data_size
-        ) % remaining_data_size
-        bin_indices = np.searchsorted(edges, valid_values, side="right") - 1
-        bin_indices[valid_values == edges[-1]] = bin_count - 1
-        retained = (bin_indices >= 0) & (bin_indices < bin_count)
-        if not bool(np.all(retained)):
-            raise ValueError(
-                "histogram bin edges do not retain every authoritative sample"
-            )
-        combined_indices = remaining_indices * bin_count + bin_indices
-        counts = np.bincount(
-            combined_indices,
-            minlength=remaining_data_size * bin_count,
-        ).reshape(remaining_data_size, bin_count)
-        output_by_remaining[output_row] = counts.astype(
-            np.dtype("<i8"),
-            copy=False,
-        )
-        has_samples = np.bincount(
-            remaining_indices,
-            minlength=remaining_data_size,
-        ) > 0
-        validity_by_remaining[output_row, has_samples, :] = True
-
+        bins = np.searchsorted(edges, samples, side="right") - 1
+        bins[samples == edges[-1]] = bin_count - 1
+        if not bool(np.all((bins >= 0) & (bins < bin_count))):
+            raise ValueError("histogram bin edges do not retain every authoritative sample")
+        counts[index] = np.bincount(bins, minlength=bin_count)
+        valid_rows[index] = True
+    values = counts.reshape((*remaining_shape, bin_count))
+    validity = np.broadcast_to(
+        valid_rows.reshape((*remaining_shape, 1)),
+        values.shape,
+    )
+    if sample_repeat:
+        values = np.expand_dims(values, axis=0)
+        validity = np.expand_dims(validity, axis=0)
+    if sample_points:
+        values = np.expand_dims(values, axis=1)
+        validity = np.expand_dims(validity, axis=1)
+    if values.shape != schema.physical_shape:
+        raise RuntimeError("histogram output shape disagrees with effective Dataset schema")
     return _State(
         schema,
-        output,
-        _compact_transformed_validity(output_validity, schema),
+        values,
+        compact_dataset_validity(validity, schema),
+        source_members,
     )
-
-
-def _apply_reduction(state: _State, reduction: ReductionSpec) -> _State:
-    cell_ids = tuple(axis.axis_id for axis in state.schema.cell_axes)
-    data_ids = tuple(axis.axis_id for axis in state.schema.data_axes)
-    unknown = tuple(axis_id for axis_id in reduction.axis_ids if axis_id not in cell_ids + data_ids)
-    if unknown:
-        raise KeyError(f"reduction axes are absent from transformed schema: {unknown}")
-    cell_positions = tuple(index for index, axis_id in enumerate(cell_ids) if axis_id in reduction.axis_ids)
-    data_positions = tuple(index for index, axis_id in enumerate(data_ids) if axis_id in reduction.axis_ids)
-    maximum_valid_contributors = math.prod(
-        state.schema.cell_axes[position].size for position in cell_positions
-    ) * math.prod(state.schema.data_axes[position].size for position in data_positions)
-    if (
-        reduction.validity_policy is ValidityPolicy.MIN_COUNT
-        and reduction.minimum_valid_count is not None
-        and reduction.minimum_valid_count > maximum_valid_contributors
-    ):
-        raise ValueError(
-            "minimum_valid_count exceeds the reduction's maximum contributor count"
-        )
-    if reduction.method in (ReductionMethod.MIN, ReductionMethod.MAX) and state.schema.dtype.kind == "c":
-        raise TypeError("MIN/MAX reductions are undefined for complex values")
-
-    remaining_cell_axes = tuple(
-        axis for index, axis in enumerate(state.schema.cell_axes) if index not in cell_positions
-    )
-    remaining_data_axes = tuple(
-        axis for index, axis in enumerate(state.schema.data_axes) if index not in data_positions
-    )
-    output_layout = _reduce_layout(
-        state.schema.cell_layout, cell_positions, reduction.missing_policy
-    )
-    output_dtype = _reduction_dtype(state.schema.dtype, reduction.method)
-    schema = TransformedSchema(
-        remaining_cell_axes,
-        output_layout,
-        remaining_data_axes,
-        tuple(
-            axis_id
-            for axis_id in state.schema.validity_axis_ids
-            if axis_id not in reduction.axis_ids
-        ),
-        output_dtype,
-        state.schema.value_unit,
-    )
-    if state.values is None:
-        return _State(schema, None, None)
-    assert state.validity is not None
-
-    if not cell_positions:
-        reduced_values, reduced_validity = _reduce_arrays(
-            state.values,
-            _expand_transformed_validity(state.validity, state.schema),
-            tuple(1 + position for position in data_positions),
-            reduction.method,
-            reduction.validity_policy,
-            reduction.minimum_valid_count,
-            output_dtype,
-        )
-        return _State(
-            schema,
-            reduced_values,
-            _compact_transformed_validity(reduced_validity, schema),
-        )
-
-    if _is_full_layout(state.schema.cell_layout):
-        logical_values = _full_rows_to_logical(state.values, state.schema.cell_layout)
-        logical_validity = _full_rows_to_logical(
-            _expand_transformed_validity(state.validity, state.schema),
-            state.schema.cell_layout,
-        )
-        axes = tuple(cell_positions) + tuple(
-            len(state.schema.cell_axes) + position for position in data_positions
-        )
-        reduced_values, reduced_validity = _reduce_arrays(
-            logical_values,
-            logical_validity,
-            axes,
-            reduction.method,
-            reduction.validity_policy,
-            reduction.minimum_valid_count,
-            output_dtype,
-        )
-        values_array = _logical_to_full_rows(reduced_values, output_layout)
-        validity_array = _logical_to_full_rows(reduced_validity, output_layout)
-        return _State(
-            schema,
-            values_array,
-            _compact_transformed_validity(validity_array, schema),
-        )
-
-    factor_axes = _factor_aligned_reduction_axes(
-        state.schema.cell_layout, cell_positions
-    )
-    if factor_axes is not None and state.schema.cell_layout.factors is not None and (
-        output_layout.storage_size
-        == math.prod(
-            factor.storage_size
-            for index, factor in enumerate(state.schema.cell_layout.factors)
-            if index not in factor_axes
-        )
-    ):
-        factor_shape = tuple(
-            factor.storage_size for factor in state.schema.cell_layout.factors
-        )
-        physical_values = state.values.reshape(
-            (*factor_shape, *state.schema.data_shape)
-        )
-        physical_validity = _expand_transformed_validity(
-            state.validity, state.schema
-        ).reshape((*factor_shape, *state.schema.data_shape))
-        axes = tuple(factor_axes) + tuple(
-            len(factor_shape) + position for position in data_positions
-        )
-        reduced_values, reduced_validity = _reduce_arrays(
-            physical_values,
-            physical_validity,
-            axes,
-            reduction.method,
-            reduction.validity_policy,
-            reduction.minimum_valid_count,
-            output_dtype,
-        )
-        values_array = reduced_values.reshape(schema.physical_shape)
-        validity_array = reduced_validity.reshape(schema.physical_shape)
-        return _State(
-            schema,
-            values_array,
-            _compact_transformed_validity(validity_array, schema),
-        )
-
-    groups: OrderedDict[tuple[int, ...], list[int]] = OrderedDict()
-    for row in range(state.schema.cell_layout.storage_size):
-        multi = state.schema.cell_layout.multi_index(row)
-        key = tuple(value for index, value in enumerate(multi) if index not in cell_positions)
-        groups.setdefault(key, []).append(row)
-    expected_contributors = math.prod(
-        state.schema.cell_axes[position].size for position in cell_positions
-    )
-    if not cell_positions:
-        expected_contributors = 1
-
-    output_mapping: list[tuple[int, ...]] = []
-    output_values: list[np.ndarray] = []
-    output_validity: list[np.ndarray] = []
-    for key, rows in groups.items():
-        if (
-            reduction.missing_policy is MissingPolicy.REQUIRE_ALL
-            and len(rows) != expected_contributors
-        ):
-            continue
-        output_mapping.append(key)
-        values = state.values[np.asarray(rows, dtype=np.intp)]
-        validity = _expand_transformed_validity(state.validity, state.schema)[
-            np.asarray(rows, dtype=np.intp)
-        ]
-        # ``values`` always has an artificial group-row dimension.  A data-only
-        # reduction groups one physical cell at a time, so that singleton must
-        # still be collapsed rather than leaking into the output shape.
-        reduction_axes = tuple([0] + [1 + position for position in data_positions])
-        if not reduction_axes:
-            raise RuntimeError("ReductionSpec did not resolve to a physical reduction axis")
-        reduced_values, reduced_validity = _reduce_arrays(
-            values,
-            validity,
-            reduction_axes,
-            reduction.method,
-            reduction.validity_policy,
-            reduction.minimum_valid_count,
-            output_dtype,
-        )
-        output_values.append(reduced_values)
-        output_validity.append(reduced_validity)
-
-    if len(output_mapping) != output_layout.storage_size or any(
-        multi != output_layout.multi_index(index)
-        for index, multi in enumerate(output_mapping)
-    ):
-        raise RuntimeError("reduction runtime layout disagrees with schema compilation")
-    if output_values:
-        values_array = np.stack(output_values, axis=0).astype(output_dtype, copy=False)
-        validity_array = np.stack(output_validity, axis=0).astype(bool, copy=False)
-    else:
-        values_array = np.empty(schema.physical_shape, dtype=output_dtype)
-        validity_array = np.empty(schema.physical_shape, dtype=bool)
-    return _State(
-        schema,
-        values_array,
-        _compact_transformed_validity(validity_array, schema),
-    )
-
-
-def _rect_rows_to_logical(values: np.ndarray, layout: AxisLayout) -> np.ndarray:
-    data_shape = values.shape[1:]
-    if layout.mode is AxisLayoutMode.RECT_C:
-        return values.reshape((*layout.logical_shape, *data_shape))
-    flat_data = math.prod(data_shape)
-    transposed = values.reshape(layout.storage_size, flat_data).T
-    logical = transposed.reshape((flat_data, *layout.logical_shape), order="F")
-    return np.moveaxis(logical, 0, -1).reshape((*layout.logical_shape, *data_shape))
-
-
-def _logical_to_rect_rows(values: np.ndarray, layout: AxisLayout) -> np.ndarray:
-    data_shape = values.shape[len(layout.logical_shape) :]
-    if layout.mode is AxisLayoutMode.RECT_C:
-        return values.reshape((layout.storage_size, *data_shape))
-    flat_data = math.prod(data_shape)
-    with_flat_data = values.reshape((*layout.logical_shape, flat_data))
-    transposed = np.moveaxis(with_flat_data, -1, 0)
-    rows = transposed.reshape((flat_data, layout.storage_size), order="F").T
-    return rows.reshape((layout.storage_size, *data_shape))
-
-
-def _is_full_layout(layout: AxisLayout) -> bool:
-    if layout.mode in (AxisLayoutMode.RECT_C, AxisLayoutMode.RECT_F):
-        return True
-    if layout.mode is AxisLayoutMode.EXPLICIT:
-        return layout.storage_size == math.prod(layout.logical_shape)
-    if layout.mode is AxisLayoutMode.PRODUCT:
-        assert layout.factors is not None
-        return all(_is_full_layout(factor) for factor in layout.factors)
-    return False
-
-
-def _factor_aligned_reduction_axes(
-    layout: AxisLayout,
-    cell_positions: tuple[int, ...],
-) -> tuple[int, ...] | None:
-    if layout.mode is not AxisLayoutMode.PRODUCT:
-        return None
-    assert layout.factors is not None
-    selected = set(cell_positions)
-    offset = 0
-    factor_axes: list[int] = []
-    for factor_index, factor in enumerate(layout.factors):
-        positions = set(range(offset, offset + len(factor.logical_shape)))
-        overlap = selected & positions
-        if overlap and overlap != positions:
-            return None
-        if overlap:
-            factor_axes.append(factor_index)
-        offset += len(factor.logical_shape)
-    return tuple(factor_axes) if factor_axes else None
-
-
-def _logical_c_indices(layout: AxisLayout) -> np.ndarray:
-    if layout.mode is AxisLayoutMode.RECT_C:
-        return np.arange(layout.storage_size, dtype=np.int64)
-    columns = tuple(
-        layout.axis_indices(position)
-        for position in range(len(layout.logical_shape))
-    )
-    if not columns:
-        return np.array([0], dtype=np.int64)
-    return np.ravel_multi_index(columns, layout.logical_shape, order="C").astype(
-        np.int64, copy=False
-    )
-
-
-def _full_rows_to_logical(values: np.ndarray, layout: AxisLayout) -> np.ndarray:
-    if layout.mode in (AxisLayoutMode.RECT_C, AxisLayoutMode.RECT_F):
-        return _rect_rows_to_logical(values, layout)
-    if not _is_full_layout(layout):
-        raise ValueError("layout is not a full Cartesian layout")
-    logical_rows = np.empty_like(values)
-    logical_rows[_logical_c_indices(layout)] = values
-    return logical_rows.reshape((*layout.logical_shape, *values.shape[1:]))
-
-
-def _logical_to_full_rows(values: np.ndarray, layout: AxisLayout) -> np.ndarray:
-    if layout.mode in (AxisLayoutMode.RECT_C, AxisLayoutMode.RECT_F):
-        return _logical_to_rect_rows(values, layout)
-    if not _is_full_layout(layout):
-        raise ValueError("layout is not a full Cartesian layout")
-    data_shape = values.shape[len(layout.logical_shape) :]
-    logical_rows = values.reshape((layout.storage_size, *data_shape))
-    return logical_rows[_logical_c_indices(layout)]
 
 
 def _reduce_arrays(
@@ -1160,14 +994,13 @@ def _reduce_arrays(
     minimum_valid_count: int | None,
     output_dtype: np.dtype,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if values.dtype.kind in "fc" and np.any(
-        np.logical_and(validity, ~np.isfinite(values))
-    ):
+    if not axes:
+        raise RuntimeError("ReductionSpec did not resolve to a physical axis")
+    if values.dtype.kind in "fc" and np.any(np.logical_and(validity, ~np.isfinite(values))):
         raise ValueError("reduction received a valid non-finite value")
     counts = np.sum(validity, axis=axes, dtype=np.int64)
     if policy is ValidityPolicy.REQUIRE_ALL:
-        total = math.prod(values.shape[axis] for axis in axes)
-        output_validity = counts == total
+        output_validity = counts == math.prod(values.shape[axis] for axis in axes)
     elif policy is ValidityPolicy.MIN_COUNT:
         assert minimum_valid_count is not None
         output_validity = counts >= minimum_valid_count
@@ -1176,11 +1009,7 @@ def _reduce_arrays(
     if method in (ReductionMethod.MEAN, ReductionMethod.SUM):
         safe = np.where(validity, values, 0)
         if method is ReductionMethod.SUM and values.dtype.kind in "biu":
-            summed = checked_numeric_sum(
-                safe,
-                axes,
-                output_dtype=output_dtype,
-            )
+            summed = checked_numeric_sum(safe, axes, output_dtype=output_dtype)
         else:
             with np.errstate(over="ignore", invalid="ignore"):
                 summed = np.sum(safe, axis=axes, dtype=output_dtype)
@@ -1209,114 +1038,6 @@ def _reduction_dtype(dtype: np.dtype, method: ReductionMethod) -> np.dtype:
     return dtype
 
 
-def _select_layout(
-    layout: AxisLayout,
-    position: int,
-    indices: range | tuple[int, ...],
-    drop: bool,
-) -> AxisLayout:
-    if layout.mode in (AxisLayoutMode.RECT_C, AxisLayoutMode.RECT_F):
-        shape = list(layout.logical_shape)
-        if drop:
-            shape.pop(position)
-        else:
-            shape[position] = len(indices)
-        factory = AxisLayout.rect_c if layout.mode is AxisLayoutMode.RECT_C else AxisLayout.rect_f
-        return factory(tuple(shape))
-    if layout.mode is AxisLayoutMode.EXPLICIT:
-        assert layout.storage_to_multi is not None
-        remap = (
-            None
-            if isinstance(indices, range)
-            else {old: new for new, old in enumerate(indices)}
-        )
-        mapping: list[tuple[int, ...]] = []
-        for multi in layout.storage_to_multi:
-            old = multi[position]
-            if remap is None:
-                if not indices.start <= old < indices.stop:
-                    continue
-                new = old - indices.start
-            else:
-                if old not in remap:
-                    continue
-                new = remap[old]
-            if drop:
-                mapping.append(multi[:position] + multi[position + 1 :])
-            else:
-                mapping.append(
-                    multi[:position]
-                    + (new,)
-                    + multi[position + 1 :]
-                )
-        shape = list(layout.logical_shape)
-        if drop:
-            shape.pop(position)
-        else:
-            shape[position] = len(indices)
-        return AxisLayout.from_mapping(tuple(shape), tuple(mapping))
-    assert layout.factors is not None
-    axis_offset = 0
-    factors = list(layout.factors)
-    for factor_index, factor in enumerate(factors):
-        next_offset = axis_offset + len(factor.logical_shape)
-        if position < next_offset:
-            factors[factor_index] = _select_layout(
-                factor, position - axis_offset, indices, drop
-            )
-            return AxisLayout.product(*factors)
-        axis_offset = next_offset
-    raise RuntimeError("PRODUCT selection axis resolution failed")
-
-
-def _reduce_layout(
-    layout: AxisLayout,
-    positions: tuple[int, ...],
-    missing_policy: MissingPolicy,
-) -> AxisLayout:
-    if not positions:
-        return layout
-    position_set = set(positions)
-    if layout.mode in (AxisLayoutMode.RECT_C, AxisLayoutMode.RECT_F):
-        shape = tuple(
-            size for index, size in enumerate(layout.logical_shape) if index not in position_set
-        )
-        factory = AxisLayout.rect_c if layout.mode is AxisLayoutMode.RECT_C else AxisLayout.rect_f
-        return factory(shape)
-    if layout.mode is AxisLayoutMode.EXPLICIT:
-        assert layout.storage_to_multi is not None
-        groups: OrderedDict[tuple[int, ...], int] = OrderedDict()
-        for multi in layout.storage_to_multi:
-            key = tuple(
-                value for index, value in enumerate(multi) if index not in position_set
-            )
-            groups[key] = groups.get(key, 0) + 1
-        expected = math.prod(layout.logical_shape[index] for index in positions)
-        if not positions:
-            expected = 1
-        mapping = tuple(
-            key
-            for key, count in groups.items()
-            if missing_policy is MissingPolicy.OMIT_MISSING or count == expected
-        )
-        shape = tuple(
-            size for index, size in enumerate(layout.logical_shape) if index not in position_set
-        )
-        return AxisLayout.from_mapping(shape, mapping)
-    assert layout.factors is not None
-    axis_offset = 0
-    output_factors: list[AxisLayout] = []
-    for factor in layout.factors:
-        local_positions = tuple(
-            position - axis_offset
-            for position in positions
-            if axis_offset <= position < axis_offset + len(factor.logical_shape)
-        )
-        output_factors.append(_reduce_layout(factor, local_positions, missing_policy))
-        axis_offset += len(factor.logical_shape)
-    return AxisLayout.product(*output_factors)
-
-
 __all__ = [
     "CommittedTransform",
     "DataTransformSpec",
@@ -1326,7 +1047,6 @@ __all__ = [
     "ReductionMethod",
     "ReductionSpec",
     "TransformedData",
-    "TransformedSchema",
     "ValidityPolicy",
     "apply_transform",
     "commit_transform",

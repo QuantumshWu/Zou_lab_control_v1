@@ -26,7 +26,7 @@ from .curve_display import (
 from .fit_projection import (
     evaluated_figure_panels as _panels,
     figure_panel_title as _panel_title,
-    panel_focus_selection as _panel_focus_selection,
+    panel_focus_address as _panel_focus_address,
     fit_batch_storage_index as _batch_storage_index,
 )
 from .fit_image_projection import radial_gaussian_fit_geometry
@@ -123,7 +123,7 @@ def _faceted_panel_topology(
 
     def axis_topology(axis: EvaluatedAxis) -> tuple[object, ...]:
         return (
-            axis.axis_id,
+            axis.source,
             axis.role,
             axis.unit,
             axis.coordinate_frame,
@@ -147,7 +147,7 @@ def _faceted_panel_topology(
         if isinstance(data, EvaluatedHistogram):
             return (
                 EvaluatedHistogram,
-                tuple(item.axis_id for item in data.sample_coordinates),
+                tuple(item.source for item in data.sample_coordinates),
                 data.value_unit,
             )
         if isinstance(data, EvaluatedMeter):
@@ -162,11 +162,11 @@ def _faceted_panel_topology(
             (
                 layer.layer_id,
                 layer.dataset_id,
-                tuple((item.axis_id, item.index) for item in cell.facet_address),
+                tuple((item.source, item.index) for item in cell.facet_address),
                 tuple(
                     (
                         tuple(
-                            (item.axis_id, item.index)
+                            (item.source, item.index)
                             for item in series.batch_address
                         ),
                         data_topology(series.data),
@@ -299,6 +299,8 @@ class FacetedPanelAggRenderer:
         fit_results: dict[str, FitResultBatch],
         *,
         display_state: object,
+        histogram_projection: HistogramBinProjection | None = None,
+        histogram_fit_overlays: tuple[tuple[object, ...], ...] = (),
     ) -> tuple[RasterBuffer, tuple[FigurePanelRegion, ...]]:
         self._require_owner()
         if self._closed:
@@ -311,7 +313,14 @@ class FacetedPanelAggRenderer:
                 if self._figure is None:
                     self._build(document, evaluated)
                     self._topology = topology
-                self._update(document, evaluated, fit_results, display_state)
+                self._update(
+                    document,
+                    evaluated,
+                    fit_results,
+                    display_state,
+                    histogram_projection=histogram_projection,
+                    histogram_fit_overlays=histogram_fit_overlays,
+                )
                 figure = self._figure
                 assert figure is not None
                 dynamic = tuple(
@@ -407,18 +416,33 @@ class FacetedPanelAggRenderer:
         evaluated: EvaluatedFigureData,
         fit_results: dict[str, FitResultBatch],
         display_state: object,
+        *,
+        histogram_projection: HistogramBinProjection | None,
+        histogram_fit_overlays: tuple[tuple[object, ...], ...],
     ) -> None:
         _require_evaluated_identity(document, evaluated)
         panels = _panels(evaluated)
         if len(panels) != len(self._cells):
             raise RuntimeError("faceted cell count changed between revisions")
         if self._kind is EvaluatedCurve:
+            if histogram_projection is not None or histogram_fit_overlays:
+                raise ValueError("curve grid cannot carry histogram projection state")
             self._update_curves(panels, fit_results, display_state)
         elif self._kind is EvaluatedHistogram:
-            self._update_histograms(panels, fit_results, display_state)
+            self._update_histograms(
+                panels,
+                fit_results,
+                display_state,
+                projection=histogram_projection,
+                fit_overlays=histogram_fit_overlays,
+            )
         elif self._kind is EvaluatedImage:
+            if histogram_projection is not None or histogram_fit_overlays:
+                raise ValueError("image grid cannot carry histogram projection state")
             self._update_images(evaluated, panels, fit_results, display_state)
         elif self._kind is EvaluatedMeter:
+            if histogram_projection is not None or histogram_fit_overlays:
+                raise ValueError("meter grid cannot carry histogram projection state")
             self._update_meters(panels, fit_results, display_state)
         else:  # pragma: no cover - _build closes the set
             raise RuntimeError("faceted renderer lost its data kind")
@@ -644,17 +668,83 @@ class FacetedPanelAggRenderer:
         self._histogram_count_scale = display.count_scale
         return faceted, display, counts, edges, x_limits, count_limits
 
-    def _update_histograms(self, panels, fit_results, display_state) -> None:
-        if fit_results:
-            raise ValueError("fit overlays require a curve or image view")
-        faceted, display, counts, edges, x_limits, count_limits = (
-            self._histogram_projection(panels, display_state)
-        )
+    def _update_histograms(
+        self,
+        panels,
+        fit_results,
+        display_state,
+        *,
+        projection: HistogramBinProjection | None,
+        fit_overlays: tuple[tuple[object, ...], ...],
+    ) -> None:
+        if projection is None:
+            if fit_results or fit_overlays:
+                raise ValueError(
+                    "histogram Fit requires its committed bin projection"
+                )
+            faceted, display, counts, edges, x_limits, count_limits = (
+                self._histogram_projection(panels, display_state)
+            )
+            fit_overlays = tuple(() for _panel in panels)
+        else:
+            if not isinstance(projection, HistogramBinProjection):
+                raise TypeError("histogram grid projection has another type")
+            if len(fit_results) != 1 or len(fit_overlays) != len(panels):
+                raise ValueError("histogram Fit grid requires one exact overlay per cell")
+            if isinstance(display_state, FacetedHistogramDisplayState):
+                faceted = display_state
+                display = display_state.display
+            elif (
+                isinstance(display_state, HistogramDisplayState)
+                and not display_state.thresholds
+            ):
+                display = display_state
+                faceted = FacetedHistogramDisplayState(display)
+            else:
+                raise TypeError("histogram grid requires per-cell display state")
+            samples = tuple(
+                series.data.samples
+                for _layer, _cell, series_group in panels
+                for series in series_group
+            )
+            if (
+                projection.requested_bin_count != display.bin_count
+                or len(projection.series_samples) != len(samples)
+                or any(
+                    projected is not sample
+                    for projected, sample in zip(
+                        projection.series_samples,
+                        samples,
+                        strict=True,
+                    )
+                )
+            ):
+                raise ValueError(
+                    "histogram Fit projection is not bound to this exact grid"
+                )
+            counts = projection.bin_counts
+            edges = projection.bin_edges
+            x_limits = display.x_view or histogram_home_x_limits(edges)
+            peak = max(
+                (int(np.max(item, initial=0)) for item in counts),
+                default=0,
+            )
+            count_limits = histogram_count_limits(
+                display,
+                peak,
+                current_count_limits=self._histogram_count_limits,
+                previous_relim_mode=self._histogram_relim_mode,
+                previous_count_scale=self._histogram_count_scale,
+            )
+            self._histogram_count_limits = count_limits
+            self._histogram_relim_mode = display.relim_mode
+            self._histogram_count_scale = display.count_scale
         offset = 0
-        for axis, state, (layer, cell, series_group) in zip(
+        for axis, state, (layer, cell, series_group), cell_fit_overlays in zip(
             self._axes,
             self._cells,
             panels,
+            fit_overlays,
             strict=True,
         ):
             if any(not isinstance(series.data, EvaluatedHistogram) for series in series_group):
@@ -674,10 +764,8 @@ class FacetedPanelAggRenderer:
                 raise RuntimeError("histogram grid artist topology changed")
             for artist, current in zip(state.source, panel_counts, strict=True):
                 _update_histogram_artist(artist, current, edges)
-            selection = _panel_focus_selection(layer, cell, series_group)
-            if selection is None:
-                raise RuntimeError("live histogram grid cell has no selection")
-            cell_display = faceted.display_for(selection)
+            address = _panel_focus_address(layer, cell, series_group)
+            cell_display = faceted.display_for(address)
             (
                 state.histogram_fit,
                 thresholds,
@@ -688,6 +776,7 @@ class FacetedPanelAggRenderer:
                 cell_display,
                 panel_counts,
                 edges,
+                fit_overlays=cell_fit_overlays,
                 fit_artists=state.histogram_fit,
                 threshold_artists=state.histogram_thresholds,
                 stats_text=None,
@@ -964,6 +1053,8 @@ def render_evaluated_figure(
     fit_results: dict[str, FitResultBatch],
     *,
     dpi: float = 100.0,
+    histogram_projection: HistogramBinProjection | None = None,
+    histogram_fit_overlays: tuple[tuple[object, ...], ...] = (),
 ):
     """Construct a caller-owned Figure with canonical artist styles frozen in.
 
@@ -974,7 +1065,14 @@ def render_evaluated_figure(
 
     dpi = _render_dpi(dpi)
     with render_style_context():
-        return _render_evaluated_figure(document, evaluated, fit_results, dpi=dpi)
+        return _render_evaluated_figure(
+            document,
+            evaluated,
+            fit_results,
+            dpi=dpi,
+            histogram_projection=histogram_projection,
+            histogram_fit_overlays=histogram_fit_overlays,
+        )
 
 def encode_evaluated_figure(
     document: FigureDocument,
@@ -983,6 +1081,8 @@ def encode_evaluated_figure(
     *,
     image_format: str,
     dpi: float,
+    histogram_projection: HistogramBinProjection | None = None,
+    histogram_fit_overlays: tuple[tuple[object, ...], ...] = (),
 ) -> bytes:
     """Encode one product figure into immutable bytes on the compose lane."""
 
@@ -993,6 +1093,8 @@ def encode_evaluated_figure(
         image_format=image_format,
         dpi=dpi,
         include_panel_regions=False,
+        histogram_projection=histogram_projection,
+        histogram_fit_overlays=histogram_fit_overlays,
     )
     return payload
 
@@ -1002,6 +1104,8 @@ def encode_evaluated_figure_with_panel_regions(
     fit_results: dict[str, FitResultBatch],
     *,
     dpi: float,
+    histogram_projection: HistogramBinProjection | None = None,
+    histogram_fit_overlays: tuple[tuple[object, ...], ...] = (),
 ) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
     """Encode a product PNG and the final Agg panel rectangles from one draw."""
 
@@ -1012,6 +1116,8 @@ def encode_evaluated_figure_with_panel_regions(
         image_format="png",
         dpi=dpi,
         include_panel_regions=True,
+        histogram_projection=histogram_projection,
+        histogram_fit_overlays=histogram_fit_overlays,
     )
 
 def encode_evaluated_panel_with_regions(
@@ -1026,6 +1132,8 @@ def encode_evaluated_panel_with_regions(
     display_state: object,
     title: str,
     value_label: str,
+    histogram_projection: HistogramBinProjection | None = None,
+    histogram_fit_overlays: tuple[tuple[object, ...], ...] = (),
 ) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
     """Encode one live faceted panel at its exact fixed Qt geometry."""
 
@@ -1045,6 +1153,8 @@ def encode_evaluated_panel_with_regions(
             evaluated,
             fit_results,
             display_state=display_state,
+            histogram_projection=histogram_projection,
+            histogram_fit_overlays=histogram_fit_overlays,
         )
         from .encoded_raster import encode_raster_buffer_png
 
@@ -1060,6 +1170,8 @@ def _encode_evaluated_figure(
     image_format: str,
     dpi: float,
     include_panel_regions: bool,
+    histogram_projection: HistogramBinProjection | None,
+    histogram_fit_overlays: tuple[tuple[object, ...], ...],
 ) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
     dpi = _render_dpi(dpi)
     regions: tuple[FigurePanelRegion, ...] = ()
@@ -1072,6 +1184,8 @@ def _encode_evaluated_figure(
                 evaluated,
                 fit_results,
                 dpi=dpi,
+                histogram_projection=histogram_projection,
+                histogram_fit_overlays=histogram_fit_overlays,
             )
             figure.savefig(output, format=image_format, dpi=dpi)
             if include_panel_regions:
@@ -1091,6 +1205,8 @@ def _render_evaluated_figure(
     fit_results: dict[str, FitResultBatch],
     *,
     dpi: float,
+    histogram_projection: HistogramBinProjection | None,
+    histogram_fit_overlays: tuple[tuple[object, ...], ...],
 ):
     """Render the generic one-shot figure used by archive/export surfaces.
 
@@ -1104,7 +1220,7 @@ def _render_evaluated_figure(
 
     _require_evaluated_identity(document, evaluated)
     panels = _panels(evaluated)
-    shared_histogram_projection = None
+    shared_histogram_projection = histogram_projection
     shared_histogram_counts = None
     shared_histogram_edges = None
     shared_histogram_x_limits = None
@@ -1118,16 +1234,47 @@ def _render_evaluated_figure(
             for series in series_group
         )
     ):
-        histogram_display = HistogramDisplayState()
         histogram_samples = tuple(
             series.data.samples
             for _layer, _cell, series_group in panels
             for series in series_group
         )
-        shared_histogram_projection = HistogramBinProjection(
-            histogram_samples,
-            bins=histogram_display.bin_count,
-        )
+        if shared_histogram_projection is None:
+            if any(
+                fit_results.get(layer.layer_id) is not None
+                for layer, _cell, _series_group in panels
+            ):
+                raise ValueError(
+                    "histogram Fit export requires its committed bin projection"
+                )
+            if histogram_fit_overlays:
+                raise ValueError("histogram overlays require a committed projection")
+            histogram_display = HistogramDisplayState()
+            shared_histogram_projection = HistogramBinProjection(
+                histogram_samples,
+                bins=histogram_display.bin_count,
+            )
+            histogram_fit_overlays = tuple(() for _panel in panels)
+        else:
+            if (
+                len(shared_histogram_projection.series_samples)
+                != len(histogram_samples)
+                or any(
+                    projected is not sample
+                    for projected, sample in zip(
+                        shared_histogram_projection.series_samples,
+                        histogram_samples,
+                        strict=True,
+                    )
+                )
+                or len(histogram_fit_overlays) != len(panels)
+            ):
+                raise ValueError(
+                    "histogram Fit export projection differs from its exact Figure"
+                )
+            histogram_display = HistogramDisplayState(
+                bin_count=shared_histogram_projection.requested_bin_count,
+            )
         shared_histogram_counts = shared_histogram_projection.bin_counts
         shared_histogram_edges = shared_histogram_projection.bin_edges
         shared_histogram_x_limits = (
@@ -1145,6 +1292,8 @@ def _render_evaluated_figure(
             histogram_display,
             peak_count,
         )
+    elif histogram_projection is not None or histogram_fit_overlays:
+        raise ValueError("histogram projection supplied for a non-histogram Figure")
     shared_curve_limits = _shared_curve_limits(
         panels,
         fit_results,
@@ -1167,7 +1316,9 @@ def _render_evaluated_figure(
         axes = figure.subplots(rows, columns, squeeze=False).reshape(-1)
 
         histogram_series_offset = 0
-        for target, (layer, cell, series_group) in zip(axes, panels):
+        for panel_index, (target, (layer, cell, series_group)) in enumerate(
+            zip(axes, panels)
+        ):
             fit_result = fit_results.get(layer.layer_id)
             kind = series_group[0].data
             if isinstance(kind, EvaluatedCurve):
@@ -1187,8 +1338,6 @@ def _render_evaluated_figure(
                     radial_color_limits=radial_color_limits.get(layer.layer_id),
                 )
             elif isinstance(kind, EvaluatedHistogram):
-                if fit_result is not None:
-                    raise ValueError("fit overlays require a curve or image view")
                 if shared_histogram_counts is None:
                     _histogram(target, series_group)
                 else:
@@ -1203,6 +1352,20 @@ def _render_evaluated_figure(
                         fill_alpha=HIST_FILL_ALPHA,
                     )
                     histogram_series_offset = next_offset
+                    cell_fit_overlays = histogram_fit_overlays[panel_index]
+                    if cell_fit_overlays:
+                        _update_histogram_presentation(
+                            target,
+                            histogram_display,
+                            shared_histogram_counts[
+                                histogram_series_offset - len(series_group):
+                                histogram_series_offset
+                            ],
+                            shared_histogram_edges,
+                            fit_overlays=cell_fit_overlays,
+                            show_stats=False,
+                            threshold_linewidth=1.4,
+                        )
                     assert shared_histogram_x_limits is not None
                     assert shared_histogram_count_limits is not None
                     assert histogram_display is not None

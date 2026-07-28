@@ -119,11 +119,11 @@ def prepare_mot_field_acquisition(
             repeat_axis=_MOT_REPEAT_AXIS,
             readout_event_axis_id=_MOT_READOUT_EVENT_AXIS_ID,
             readout_events_per_repeat=1,
-            scan_axes=program.point_axes,
-            scan_point_layout=program.point_layout,
+            scan_point_table=program.point_table,
+            scan_grid_topology=program.grid_topology,
         ),
     )
-    if binding.expected_frames != program.point_layout.storage_size:
+    if binding.expected_frames != program.point_table.row_count:
         raise RuntimeError("MOT pulse trigger count differs from its frozen grid")
     pipeline = MinimalPipelineSpec(
         "Optimize MOT field",

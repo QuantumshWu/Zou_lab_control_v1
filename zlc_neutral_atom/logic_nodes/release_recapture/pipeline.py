@@ -20,6 +20,9 @@ from zlc_data import (
     BlockId,
     ComponentValidity,
     DatasetSchema,
+    GridTopology,
+    PointColumn,
+    PointTable,
     ValidityContract,
     Value,
     ValuePayloadContract,
@@ -305,24 +308,105 @@ class _PairPlan:
     output_key: DatasetCellAddress
 
 
+def _readout_event_column(schema: DatasetSchema) -> PointColumn:
+    event_columns = tuple(
+        column
+        for column in schema.point_table.columns
+        if column.role == READOUT_EVENT
+    )
+    if len(event_columns) != 1:
+        raise ValueError("release-recapture source has no unique READOUT_EVENT column")
+    event_column = event_columns[0]
+    expected = tuple(
+        event
+        for _point in range(schema.point_table.row_count // 2)
+        for event in (0, 1)
+    )
+    if event_column.values != expected:
+        raise ValueError(
+            "release-recapture rows must be adjacent event-0/event-1 pairs"
+        )
+    return event_column
+
+
+def _remove_readout_event(
+    source_schema: DatasetSchema,
+    value_schema: ValueSchema,
+) -> DatasetSchema:
+    event_column = _readout_event_column(source_schema)
+    selected_ordinals = tuple(range(0, source_schema.point_table.row_count, 2))
+    point_table = PointTable(
+        len(selected_ordinals),
+        tuple(
+            PointColumn(
+                column.coordinate_id,
+                column.name,
+                column.role,
+                column.value_kind,
+                tuple(column.values[ordinal] for ordinal in selected_ordinals),
+                column.unit,
+                column.coordinate_frame,
+            )
+            for column in source_schema.point_table.columns
+            if column is not event_column
+        ),
+    )
+    source_topology = source_schema.grid_topology
+    topology = None
+    if source_topology is not None:
+        positions = tuple(
+            index
+            for index, dimension_id in enumerate(source_topology.dimension_ids)
+            if dimension_id == event_column.coordinate_id
+        )
+        if len(positions) != 1:
+            raise ValueError(
+                "release-recapture GridTopology must name its READOUT_EVENT dimension"
+            )
+        event_position = positions[0]
+        if source_topology.coordinate_domains[event_position] != (0, 1):
+            raise ValueError(
+                "release-recapture GridTopology event domain must be (0, 1)"
+            )
+        dimension_ids = tuple(
+            dimension_id
+            for position, dimension_id in enumerate(source_topology.dimension_ids)
+            if position != event_position
+        )
+        domains = tuple(
+            domain
+            for position, domain in enumerate(source_topology.coordinate_domains)
+            if position != event_position
+        )
+        cells = tuple(
+            tuple(
+                index
+                for position, index in enumerate(
+                    source_topology.row_to_cell[ordinal]
+                )
+                if position != event_position
+            )
+            for ordinal in selected_ordinals
+        )
+        if dimension_ids:
+            topology = GridTopology(dimension_ids, domains, cells)
+    return DatasetSchema(
+        source_schema.repeat_axis,
+        point_table,
+        topology,
+        value_schema,
+    )
+
+
 def _pair_plan(
     source_schema: DatasetSchema,
     source_schedule: DatasetCellSchedule,
     output_schema: DatasetSchema,
 ) -> tuple[_PairPlan, ...]:
-    event_axes = tuple(
-        (position, axis)
-        for position, axis in enumerate(source_schema.point_axes)
-        if axis.role == READOUT_EVENT
-    )
-    if len(event_axes) != 1 or event_axes[0][1].size != 2:
-        raise ValueError(
-            "release-recapture reducer requires exactly two READOUT_EVENT cells"
-        )
-    event_position, _event_axis = event_axes[0]
+    event_column = _readout_event_column(source_schema)
     if len(source_schedule) != (
         output_schema.repeat_axis.size
-        * output_schema.point_layout.storage_size
+        * output_schema.point_table.row_count
         * 2
     ):
         raise ValueError("release-recapture source cardinality is not exactly 2:1")
@@ -332,26 +416,19 @@ def _pair_plan(
         first, second = source_cells[offset : offset + 2]
         if first.repeat_index != second.repeat_index:
             raise ValueError("release-recapture pair crosses repeat cells")
-        first_multi = source_schema.point_layout.multi_index(
-            first.point_storage_index
-        )
-        second_multi = source_schema.point_layout.multi_index(
-            second.point_storage_index
-        )
-        first_scan = tuple(
-            value
-            for position, value in enumerate(first_multi)
-            if position != event_position
-        )
-        second_scan = tuple(
-            value
-            for position, value in enumerate(second_multi)
-            if position != event_position
-        )
+        first_ordinal = first.point_ordinal
+        second_ordinal = second.point_ordinal
+        output_ordinal = first_ordinal // 2
         if (
-            first_multi[event_position] != 0
-            or second_multi[event_position] != 1
-            or first_scan != second_scan
+            first_ordinal != output_ordinal * 2
+            or second_ordinal != first_ordinal + 1
+            or event_column.values[first_ordinal] != 0
+            or event_column.values[second_ordinal] != 1
+            or any(
+                column.values[first_ordinal] != column.values[second_ordinal]
+                for column in source_schema.point_table.columns
+                if column is not event_column
+            )
         ):
             raise ValueError(
                 "release-recapture source must be adjacent event-0/event-1 pairs"
@@ -362,7 +439,7 @@ def _pair_plan(
                 second,
                 DatasetCellAddress(
                     first.repeat_index,
-                    output_schema.point_layout.storage_index(first_scan),
+                    output_ordinal,
                 ),
             )
         )
@@ -383,21 +460,7 @@ def _output_contract(
 ]:
     source = spec.camera_capture.capture_contract
     source_schema = source.dataset_schema
-    event_axes = tuple(
-        (position, axis)
-        for position, axis in enumerate(source_schema.point_axes)
-        if axis.role == READOUT_EVENT
-    )
-    if len(event_axes) != 1:
-        raise ValueError("release-recapture source has no unique READOUT_EVENT axis")
-    event_position, event_axis = event_axes[0]
-    if event_axis.size != 2:
-        raise ValueError("release-recapture source requires two readout events")
-    point_axes = tuple(
-        axis
-        for position, axis in enumerate(source_schema.point_axes)
-        if position != event_position
-    )
+    _readout_event_column(source_schema)
     selected = spec.calibration.artifact.select_model(spec.model_kind)
     if selected.kind is not spec.model_kind:
         raise ValueError("release-recapture model selection changed")
@@ -412,34 +475,7 @@ def _output_contract(
         if spec.per_site
         else ValueSchema.scalar(np.dtype("<f8"), "survival")
     )
-    # Removing the one READOUT_EVENT axis leaves exactly the scan layout whose
-    # rows were frozen by the Measurement binder.
-    scan_multi = tuple(
-        tuple(
-            value
-            for position, value in enumerate(
-                source_schema.point_layout.multi_index(storage_index)
-            )
-            if position != event_position
-        )
-        for storage_index in range(
-            source_schema.point_layout.storage_size
-        )
-        if source_schema.point_layout.multi_index(storage_index)[event_position]
-        == 0
-    )
-    from zlc_data import PointLayout
-
-    output_layout = PointLayout.from_mapping(
-        tuple(axis.size for axis in point_axes),
-        scan_multi,
-    )
-    output_schema = DatasetSchema(
-        source_schema.repeat_axis,
-        point_axes,
-        output_layout,
-        value_schema,
-    )
+    output_schema = _remove_readout_event(source_schema, value_schema)
     plans = _pair_plan(source_schema, source.cell_schedule, output_schema)
     schedule = DatasetCellSchedule.from_cells(
         output_schema,

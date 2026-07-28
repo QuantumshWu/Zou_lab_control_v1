@@ -5,7 +5,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from zlc_data import REPEAT, SCAN_POINT, AxisId, AxisSpec
+from zlc_data import (
+    REPEAT,
+    SCAN_POINT,
+    AxisId,
+    AxisSpec,
+    GridTopology,
+    PointColumn,
+    PointTable,
+)
 from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema, MINIMUM_POSITIVE_FLOAT
 from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
@@ -258,7 +266,25 @@ def bind_temperature_release_recapture(
     """Bind the one honest current autonomous coupled Measurement."""
 
     program = build_temperature_release_recapture_program(request, calibration)
-    point_table = program.point_table
+    coordinate_id = AxisId("temperature.t_off")
+    coordinate = PointColumn(
+        coordinate_id,
+        "Trap-off time",
+        SCAN_POINT,
+        PointColumn.NUMERIC,
+        request.trap_off_seconds,
+        "s",
+    )
+    point_table = PointTable(len(coordinate.values), (coordinate,))
+    grid_topology = (
+        GridTopology(
+            (coordinate_id,),
+            (coordinate.values,),
+            tuple((ordinal,) for ordinal in range(point_table.row_count)),
+        )
+        if len(set(coordinate.values)) == point_table.row_count
+        else None
+    )
     logical_document, binding = bind_release_recapture_camera(
         program.execution_document,
         pulse_port=pulse_port,
@@ -272,20 +298,11 @@ def bind_temperature_release_recapture(
             tuple(range(request.shots)),
         ),
         readout_event_axis_id=AxisId("temperature.readout_event"),
-        # The scan table's physical rows remain in the pulse parameter's
-        # authoring unit.  The Measurement contract exposes the operator-facing
-        # physical quantity in SI as ``Trap-off time (s)``.
-        scan_axes=(
-            AxisSpec(
-                AxisId("temperature.t_off"),
-                "Trap-off time",
-                SCAN_POINT,
-                len(request.trap_off_seconds),
-                request.trap_off_seconds,
-                "s",
-            ),
-        ),
-        point_layout=point_table.point_layout,
+        # Pulse rows keep the parameter's authored unit.  Dataset point rows
+        # expose the operator-facing physical quantity in SI without changing
+        # row order or expanding correlated coordinates.
+        scan_point_table=point_table,
+        scan_grid_topology=grid_topology,
         calibration=calibration,
     )
     program = AutonomousScanSlotProgram(logical_document)

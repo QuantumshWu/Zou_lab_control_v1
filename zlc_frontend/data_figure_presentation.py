@@ -8,10 +8,9 @@ from dataclasses import dataclass
 import math
 
 from zlc_data import (
-    AxisId,
+    AxisSourceRef,
     FitBatchStatus,
     FitResultBatch,
-    Selection,
     dataset_revision_ref_to_tree,
 )
 from .data_figure import DataFigure, FigurePanelRegion
@@ -51,6 +50,7 @@ from .histogram_display import (
     histogram_display_from_form,
     histogram_display_with_x_view,
 )
+from .fit_projection import canonical_panel_focus_address
 from .image_display import (
     ImageDisplayState,
     image_display_form_spec,
@@ -201,9 +201,13 @@ def classify_faceted_data_figure(
     if data_type is None:
         return None, None, "figure intent has no current typed grid consumer"
     if figure.has_fit_overlays:
-        if intent not in (ViewIntent.IMAGE, ViewIntent.CURVE):
+        if intent not in (
+            ViewIntent.IMAGE,
+            ViewIntent.CURVE,
+            ViewIntent.HISTOGRAM,
+        ):
             return None, None, (
-                "typed fit grids require IMAGE or CURVE intent"
+                "typed fit grids require IMAGE, CURVE, or HISTOGRAM intent"
             )
         fit_results = tuple(figure.fit_results.values())
         if len(fit_results) != 1:
@@ -323,11 +327,9 @@ class DataFigureGridOverview:
             raise ValueError("typed grid overview region keys must be unique")
         if len(regions) != panel_count:
             raise ValueError("typed grid overview regions do not cover its figure")
-        selections = tuple(region.focus_selection for region in regions)
-        if any(selection is None for selection in selections):
-            raise ValueError("typed grid regions require exact selections")
-        if len(set(selections)) != len(selections):
-            raise ValueError("typed grid selections must identify unique panels")
+        addresses = tuple(region.focus_address for region in regions)
+        if len(set(addresses)) != len(addresses):
+            raise ValueError("typed grid addresses must identify unique panels")
         display = self.display_state
         if display is not None and grid_display_state_intent(display) is not self.intent:
             raise ValueError("typed grid display state does not match its intent")
@@ -363,7 +365,7 @@ DataFigurePanelPayload = (
 @dataclass(frozen=True, slots=True)
 class DataFigureGridFocusRequest:
     panel_index: int
-    expected_selection: Selection
+    expected_address: tuple[tuple[AxisSourceRef, int], ...]
     display: DataFigureDisplayState
     histogram_home_x_limits: tuple[float, float] | None
 
@@ -372,8 +374,11 @@ class DataFigureGridFocusRequest:
             raise TypeError("grid focus panel_index must be a non-negative integer")
         if self.panel_index < 0:
             raise ValueError("grid focus panel_index must be a non-negative integer")
-        if not isinstance(self.expected_selection, Selection):
-            raise TypeError("grid focus requires one exact Selection")
+        object.__setattr__(
+            self,
+            "expected_address",
+            canonical_panel_focus_address(self.expected_address),
+        )
         if display_state_intent(self.display) not in (
             ViewIntent.IMAGE,
             ViewIntent.CURVE,
@@ -503,8 +508,8 @@ class DataFigureFront:
     summary: str
     frame: BoardFrame
     data_contract: tuple[tuple[object, ...], tuple[object, ...]]
-    fit_axis_ids: tuple[AxisId, ...]
-    axis_roles: tuple[tuple[AxisId, AxisViewRole], ...]
+    fit_sources: tuple[AxisSourceRef, ...]
+    axis_roles: tuple[tuple[AxisSourceRef, AxisViewRole], ...]
     fit_result_identity: str | None
     transient_fit_result_owner: FitResultBatch | None
     release_initial_canonical_on_commit: bool
@@ -558,19 +563,22 @@ class DataFigureFront:
             raise TypeError(
                 "typed figure data_contract must be identity/exact-owner tuples"
             )
-        fit_axis_ids = tuple(self.fit_axis_ids)
-        if any(not isinstance(axis_id, AxisId) for axis_id in fit_axis_ids):
-            raise TypeError("typed fit_axis_ids must contain AxisId values")
-        if len(set(fit_axis_ids)) != len(fit_axis_ids):
-            raise ValueError("typed fit_axis_ids must be unique")
+        fit_sources = tuple(self.fit_sources)
+        if any(not isinstance(source, AxisSourceRef) for source in fit_sources):
+            raise TypeError("typed fit_sources must contain AxisSourceRef values")
+        if len(set(fit_sources)) != len(fit_sources):
+            raise ValueError("typed fit_sources must be unique")
         roles = tuple(self.axis_roles)
         if any(
-            not isinstance(axis_id, AxisId) or not isinstance(role, AxisViewRole)
-            for axis_id, role in roles
+            not isinstance(source, AxisSourceRef)
+            or not isinstance(role, AxisViewRole)
+            for source, role in roles
         ):
-            raise TypeError("typed axis_roles must contain AxisId/AxisViewRole pairs")
-        if len({axis_id for axis_id, _role in roles}) != len(roles):
-            raise ValueError("typed axis_roles repeat an axis")
+            raise TypeError(
+                "typed axis_roles must contain AxisSourceRef/AxisViewRole pairs"
+            )
+        if len({source for source, _role in roles}) != len(roles):
+            raise ValueError("typed axis_roles repeat a source")
         if self.fit_result_identity is not None and (
             not isinstance(self.fit_result_identity, str)
             or not self.fit_result_identity.strip()
@@ -594,7 +602,7 @@ class DataFigureFront:
             )
         ):
             raise ValueError("typed figure raster_size must contain two positive integers")
-        object.__setattr__(self, "fit_axis_ids", fit_axis_ids)
+        object.__setattr__(self, "fit_sources", fit_sources)
         object.__setattr__(self, "axis_roles", roles)
         object.__setattr__(self, "raster_size", raster_size)
         panel = self.frame.panels[0]

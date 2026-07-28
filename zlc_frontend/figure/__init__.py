@@ -18,9 +18,6 @@ from .contract import (
     VIEW_CONTRACTS,
     contract_for,
     dataset_contract_for,
-    dataset_axes,
-    display_axis_indices,
-    fit_single_panel_presentation,
     validate_view_spec,
 )
 from .evaluate import (
@@ -34,8 +31,8 @@ from .evaluate import (
 )
 from .grid import (
     GRID_INTENTS,
-    grid_facet_axes,
-    grid_facet_axis,
+    grid_facet_source,
+    grid_facet_sources,
     resolve_grid_view,
     suggest_default_grid_view,
 )
@@ -44,7 +41,6 @@ from .model import (
     AxisAddress,
     AxisResolution,
     AxisRolePolicy,
-    AxisViewBinding,
     AxisViewRole,
     DatasetDescriptor,
     DatasetId,
@@ -69,8 +65,8 @@ from .model import (
     FixedIndex,
     LatestNonempty,
     ReductionResolution,
-    RepeatViewMode,
     SampleCoordinates,
+    SourceViewBinding,
     SuggestionStatus,
     ViewAlternative,
     ViewContract,
@@ -84,7 +80,7 @@ from .suggest import suggest_fit_view, suggest_view
 
 __all__ = [
     "AxisAddress", "AxisResolution", "AxisRolePolicy",
-    "AxisViewBinding", "AxisViewRole", "CURVE_CONTRACT", "DATASET_VIEW_INTENTS",
+    "AxisViewRole", "CURVE_CONTRACT", "DATASET_VIEW_INTENTS",
     "DatasetDescriptor", "DocumentViewContract",
     "DatasetId", "DecisionReason", "DisplayReduction", "DisplayReductionMethod",
     "DisplaySlot", "EvaluatedAxis", "EvaluatedCell", "EvaluatedCurve",
@@ -94,11 +90,11 @@ __all__ = [
     "FigureEvaluationError",
     "FigureEvaluator", "FigureLayer", "FigureSelection", "evaluate_axis",
     "FixedIndex", "HISTOGRAM_CONTRACT", "IMAGE_CONTRACT", "LatestNonempty",
-    "METER_CONTRACT", "PULSE_CONTRACT", "ReductionResolution", "RepeatViewMode", "ResolvedDataset",
+    "METER_CONTRACT", "PULSE_CONTRACT", "ReductionResolution", "ResolvedDataset",
     "ResolvedDatasetMap", "SampleCoordinates", "SuggestionStatus", "VIEW_CONTRACTS",
     "ViewAlternative", "ViewContract", "ViewIntent", "ViewPreferences", "ViewSpec",
-    "ViewSuggestion", "contract_for", "dataset_contract_for", "dataset_axes", "display_axis_indices", "fit_single_panel_presentation", "decode_figure_document",
+    "SourceViewBinding", "ViewSuggestion", "contract_for", "dataset_contract_for", "decode_figure_document",
     "encode_figure_document",
-    "GRID_INTENTS", "figure_document_from_tree", "figure_document_to_tree", "grid_facet_axes", "grid_facet_axis", "resolve_grid_view", "suggest_default_grid_view", "suggest_fit_view", "suggest_view",
+    "GRID_INTENTS", "figure_document_from_tree", "figure_document_to_tree", "grid_facet_source", "grid_facet_sources", "resolve_grid_view", "suggest_default_grid_view", "suggest_fit_view", "suggest_view",
     "validate_view_spec", "view_spec_from_tree", "view_spec_to_tree",
 ]

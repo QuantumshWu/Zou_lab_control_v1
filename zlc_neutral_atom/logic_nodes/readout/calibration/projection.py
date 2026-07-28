@@ -28,7 +28,8 @@ from zlc_data import (
     DatasetRevision,
     DatasetSchema,
     OwnedSnapshot,
-    PointLayout,
+    PointColumn,
+    PointTable,
     StreamGenerationId,
     ValidityContract,
     ValueSchema,
@@ -503,6 +504,33 @@ def _report_population_axis(key: str) -> AxisSpec:
     )
 
 
+def _point_table_for_axis(axis: AxisSpec) -> PointTable:
+    """Project one declared report coordinate onto the physical point rows."""
+
+    if not isinstance(axis, AxisSpec):
+        raise TypeError("report point coordinate must be an AxisSpec")
+    values = tuple(range(axis.size)) if axis.coordinates is None else axis.coordinates
+    value_kind = (
+        PointColumn.TEXT
+        if all(value is None or isinstance(value, str) for value in values)
+        else PointColumn.NUMERIC
+    )
+    return PointTable(
+        axis.size,
+        (
+            PointColumn(
+                axis.axis_id,
+                axis.name,
+                axis.role,
+                value_kind,
+                values,
+                axis.unit,
+                axis.coordinate_frame,
+            ),
+        ),
+    )
+
+
 def _report_population_values(
     view: CalibrationReportProjection,
     model: CalibrationModelReportProjection,
@@ -548,8 +576,8 @@ def materialize_calibration_report_datasets(
         raise ValueError("calibration reference report requires two declared frame axes")
     reference_schema = DatasetSchema(
         _report_repeat_axis("reference", 1),
-        (),
-        PointLayout.rect_c(()),
+        PointTable(1),
+        None,
         ValueSchema(
             frame_axes,
             ValidityContract.components(*(axis.axis_id for axis in frame_axes)),
@@ -602,8 +630,8 @@ def materialize_calibration_report_datasets(
     )
     fidelity_schema = DatasetSchema(
         _report_repeat_axis("fidelity", 1),
-        (site_index_axis,),
-        PointLayout.rect_c((site_index_axis.size,)),
+        _point_table_for_axis(site_index_axis),
+        None,
         ValueSchema(
             (model_axis,),
             ValidityContract.components(model_axis.axis_id),
@@ -632,8 +660,8 @@ def materialize_calibration_report_datasets(
         )
         histogram_schema = DatasetSchema(
             _report_repeat_axis(histogram_key, view.group_count),
-            (view.site_axis,),
-            PointLayout.rect_c((view.site_axis.size,)),
+            _point_table_for_axis(view.site_axis),
+            None,
             ValueSchema(
                 (population_axis,),
                 ValidityContract.components(population_axis.axis_id),
@@ -662,8 +690,8 @@ def materialize_calibration_report_datasets(
         sample_count = pooled_values.shape[0] * pooled_values.shape[1]
         pooled_schema = DatasetSchema(
             _report_repeat_axis(pooled_key, sample_count),
-            (),
-            PointLayout.rect_c(()),
+            PointTable(1),
+            None,
             ValueSchema(
                 (pooled_population_axis,),
                 ValidityContract.components(pooled_population_axis.axis_id),
@@ -710,8 +738,8 @@ def materialize_calibration_report_datasets(
         )
         psf_schema = DatasetSchema(
             _report_repeat_axis(key, 1),
-            (view.site_axis,),
-            PointLayout.rect_c((view.site_axis.size,)),
+            _point_table_for_axis(view.site_axis),
+            None,
             ValueSchema(
                 (y_axis, x_axis),
                 ValidityContract.components(y_axis.axis_id, x_axis.axis_id),
@@ -759,8 +787,8 @@ def materialize_calibration_reference_snapshot(
             1,
             (0,),
         ),
-        (),
-        PointLayout.rect_c(()),
+        PointTable(1),
+        None,
         ValueSchema(
             axes,
             ValidityContract.components(*(axis.axis_id for axis in axes)),
@@ -830,8 +858,8 @@ def _diagnostic_snapshot(
         value_schema = ValueSchema.scalar(np.dtype("<f8"), value_unit)
     schema = DatasetSchema(
         repeat_axis,
-        (),
-        PointLayout.rect_c(()),
+        PointTable(1),
+        None,
         value_schema,
     )
     if axis_ids:

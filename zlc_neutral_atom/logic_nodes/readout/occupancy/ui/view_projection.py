@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from zlc_data import IndexSelection, Selection
 from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 from zlc_frontend import automatic_figure_view
 from zlc_frontend.figure import ViewIntent, ViewPreferences
@@ -18,7 +19,24 @@ from zlc_frontend.site_map_view import (
     SiteMapView,
     build_site_map_cell_view,
 )
-from zlc_storage import canonical_text
+from zlc_storage import canonical_digest, canonical_text
+from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
+
+
+def _occupancy_cell_coherence_identity(
+    artifact_identity: str,
+    address: DatasetCellAddress,
+) -> str:
+    if not isinstance(address, DatasetCellAddress):
+        raise TypeError("address must be DatasetCellAddress")
+    return canonical_digest(
+        {
+            "owner": "zlc_neutral_atom.occupancy-cell",
+            "artifact": artifact_identity,
+            "repeat_index": address.repeat_index,
+            "point_ordinal": address.point_ordinal,
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +96,14 @@ def build_exact_occupancy_cell_view(
     site_map = domain.site_map
     metadata = source.frame_metadata
     address = source.address
+    cell_selection = Selection(
+        (
+            IndexSelection(
+                domain.occupancy_schema.repeat_axis.axis_id,
+                address.repeat_index,
+            ),
+        )
+    )
     summary = (
         f"{domain.artifact_identity} | "
         f"source={domain.source_capture_identity} | "
@@ -86,7 +112,7 @@ def build_exact_occupancy_cell_view(
         f"revision={domain.occupancy_ref.revision.value} | "
         f"source generation={domain.source_generation.value} | "
         f"occupancy generation={domain.occupancy_generation.value} | "
-        f"address=({address.repeat_index}, {address.point_storage_index}) | "
+        f"address=({address.repeat_index}, {address.point_ordinal}) | "
         f"logical_point={source.logical_point}\n"
         f"frame ordinal={metadata.source_ordinal} | "
         f"frame_stamp={metadata.frame_stamp} | "
@@ -99,12 +125,15 @@ def build_exact_occupancy_cell_view(
         domain.source_ref,
         source.occupied,
         domain.occupancy_ref,
-        source.selection,
+        cell_selection,
         site_axis=site_map.site_axis,
         coordinate_frame=site_map.coordinate_frame,
         centers_xy=site_map.coordinates_xy,
         site_geometry_identity=domain.calibration_identity,
-        coherence_identity=domain.artifact_identity,
+        coherence_identity=_occupancy_cell_coherence_identity(
+            domain.artifact_identity,
+            address,
+        ),
         run_id=domain.run_id,
         provenance_epoch_id=domain.provenance_epoch_id,
         summary=summary,

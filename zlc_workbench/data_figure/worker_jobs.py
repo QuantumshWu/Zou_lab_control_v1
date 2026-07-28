@@ -15,7 +15,7 @@ import threading
 import time
 
 from zlc_data import (
-    AxisId,
+    AxisSourceRef,
     FitDeadlineExceeded,
     FitSpec,
     Selection,
@@ -89,8 +89,8 @@ def _require_not_cancelled(cancelled: threading.Event) -> None:
 def _prepare_fit_options(
     prepare,
     figure: DataFigure,
-    fit_axis_ids: tuple[AxisId, ...],
-    axis_roles: tuple[tuple[AxisId, AxisViewRole], ...],
+    fit_sources: tuple[AxisSourceRef, ...],
+    axis_roles: tuple[tuple[AxisSourceRef, AxisViewRole], ...],
     selection: Selection | None,
     histogram_projection: HistogramBinProjection | None,
     allow_prepared_transform: bool = False,
@@ -107,11 +107,14 @@ def _prepare_fit_options(
         not isinstance(option, FitAuthoringOption) for option in options
     ):
         raise ValueError("Fit preparation produced no FitAuthoringOption")
-    schemas = {option.spec.input_schema_fingerprint for option in options}
+    schemas = {
+        option.spec.committed_transform.source_schema_fingerprint
+        for option in options
+    }
     models = tuple(option.spec.model_id for option in options)
     if len(schemas) != 1 or len(models) != len(set(models)):
         raise ValueError("Fit options require one source schema and unique models")
-    if any(option.spec.fit_axis_ids != fit_axis_ids for option in options):
+    if any(option.spec.independent_sources != fit_sources for option in options):
         raise ValueError("Fit option axes differ from the exact displayed axes")
     validated_allow_prepared_transform = bool(allow_prepared_transform)
     if histogram_projection is not None:
@@ -132,7 +135,7 @@ def _prepare_fit_options(
         validated_allow_prepared_transform = True
     return validate_fit_authoring_options(
         options,
-        fit_axis_ids=fit_axis_ids,
+        fit_sources=fit_sources,
         axis_roles=axis_roles,
         selection=selection,
         allow_prepared_transform=validated_allow_prepared_transform,

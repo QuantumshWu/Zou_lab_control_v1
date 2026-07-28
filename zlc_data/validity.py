@@ -99,7 +99,6 @@ class ComponentValidity:
         object.__setattr__(self, "axis_ids", axis_ids)
         object.__setattr__(self, "mask", immutable_bool_array(mask, shape=mask.shape))
 
-
 @dataclass(frozen=True, eq=False)
 class DatasetComponentValidity:
     """Physical dataset validity over ``(R, P, *named component axes)``.
@@ -130,26 +129,5 @@ class DatasetComponentValidity:
             raise ValueError(
                 "DatasetComponentValidity mask rank must be 2 + named-axis count"
             )
-        object.__setattr__(self, "axis_ids", axis_ids)
-        object.__setattr__(self, "mask", immutable_bool_array(mask, shape=mask.shape))
-
-
-@dataclass(frozen=True, eq=False)
-class RowComponentValidity:
-    """Compact validity over physical layout rows and named data axes."""
-
-    axis_ids: tuple[AxisId, ...]
-    mask: np.ndarray
-    __hash__ = None
-
-    def __post_init__(self) -> None:
-        axis_ids = tuple(self.axis_ids)
-        if any(not isinstance(axis_id, AxisId) for axis_id in axis_ids):
-            raise TypeError("RowComponentValidity axis_ids must contain AxisId values")
-        if len(set(axis_ids)) != len(axis_ids):
-            raise ValueError("RowComponentValidity axis_ids must be unique")
-        mask = np.asarray(self.mask)
-        if mask.ndim != 1 + len(axis_ids):
-            raise ValueError("row validity mask rank must be 1 + named data-axis count")
         object.__setattr__(self, "axis_ids", axis_ids)
         object.__setattr__(self, "mask", immutable_bool_array(mask, shape=mask.shape))

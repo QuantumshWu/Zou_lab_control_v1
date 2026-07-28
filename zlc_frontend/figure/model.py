@@ -17,6 +17,7 @@ import numpy as np
 from zlc_data import (
     AxisId,
     AxisRoleId,
+    AxisSourceRef,
     CoordinateFrameId,
     DatasetRevisionRef,
     Selection,
@@ -26,6 +27,11 @@ from zlc_storage.canonical import (
     canonical_text as _text,
     nonnegative_integer as _nonnegative,
     sha256_text as _digest,
+)
+
+
+_POINT_ORDINAL_INTERACTION_AXIS_ID = AxisId(
+    "zlc_frontend.point-ordinal-interaction"
 )
 
 
@@ -76,7 +82,6 @@ class AxisViewRole(str, Enum):
     SAMPLE = "SAMPLE"
     BATCH = "BATCH"
     FACET = "FACET"
-    SLIDER = "SLIDER"
     SELECTED = "SELECTED"
     REDUCED = "REDUCED"
 
@@ -84,15 +89,6 @@ class AxisViewRole(str, Enum):
 class DisplayReductionMethod(str, Enum):
     MEAN = "MEAN"
     SUM = "SUM"
-
-
-class RepeatViewMode(str, Enum):
-    MEAN = "MEAN"
-    SUM = "SUM"
-    LATEST = "LATEST"
-    BATCH = "BATCH"
-    FACET = "FACET"
-    SAMPLE = "SAMPLE"
 
 
 @dataclass(frozen=True)
@@ -121,22 +117,22 @@ class DisplayReduction:
 
 
 @dataclass(frozen=True)
-class AxisViewBinding:
-    axis_id: AxisId
+class SourceViewBinding:
+    source: AxisSourceRef
     role: AxisViewRole
     selector: DisplaySelector | None = None
     reduction: DisplayReduction | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.axis_id, AxisId):
-            raise TypeError("axis_id must be AxisId")
+        if not isinstance(self.source, AxisSourceRef):
+            raise TypeError("source must be AxisSourceRef")
         if not isinstance(self.role, AxisViewRole):
             raise TypeError("role must be AxisViewRole")
-        if self.role in (AxisViewRole.SELECTED, AxisViewRole.SLIDER):
+        if self.role is AxisViewRole.SELECTED:
             if not isinstance(self.selector, (FixedIndex, LatestNonempty)):
-                raise ValueError(f"{self.role.value} binding requires a display selector")
+                raise ValueError("SELECTED binding requires a display selector")
             if self.reduction is not None:
-                raise ValueError("selected/slider binding cannot carry a reduction")
+                raise ValueError("selected binding cannot carry a reduction")
         elif self.role is AxisViewRole.REDUCED:
             if not isinstance(self.reduction, DisplayReduction):
                 raise ValueError("REDUCED binding requires a display reduction")
@@ -152,8 +148,8 @@ class ViewSpec:
 
     schema_fingerprint: str
     intent: ViewIntent
-    axis_bindings: tuple[AxisViewBinding, ...]
-    display_selections: tuple[Selection, ...] = ()
+    source_bindings: tuple[SourceViewBinding, ...]
+    point_ordinals: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -167,41 +163,42 @@ class ViewSpec:
             raise ValueError(
                 f"{self.intent.value} is document-fed and cannot be stored in ViewSpec"
             )
-        bindings = tuple(self.axis_bindings)
-        if any(not isinstance(binding, AxisViewBinding) for binding in bindings):
-            raise TypeError("axis_bindings must contain AxisViewBinding values")
-        ids = tuple(binding.axis_id for binding in bindings)
-        if len(set(ids)) != len(ids):
-            raise ValueError("ViewSpec may bind each AxisId only once")
+        bindings = tuple(self.source_bindings)
+        if any(not isinstance(binding, SourceViewBinding) for binding in bindings):
+            raise TypeError("source_bindings must contain SourceViewBinding values")
+        sources = tuple(binding.source for binding in bindings)
+        if len(set(sources)) != len(sources):
+            raise ValueError("ViewSpec may bind each AxisSourceRef only once")
         object.__setattr__(
             self,
-            "axis_bindings",
-            tuple(sorted(bindings, key=lambda binding: binding.axis_id.value)),
-        )
-        selections = tuple(self.display_selections)
-        if any(not isinstance(selection, Selection) for selection in selections):
-            raise TypeError("display_selections must contain zlc_data.Selection values")
-        selected_ids = tuple(
-            term.axis_id for selection in selections for term in selection.terms
-        )
-        if len(set(selected_ids)) != len(selected_ids):
-            raise ValueError("display selections may constrain each AxisId only once")
-        object.__setattr__(
-            self,
-            "display_selections",
+            "source_bindings",
             tuple(
                 sorted(
-                    selections,
-                    key=lambda selection: tuple(term.axis_id.value for term in selection.terms),
+                    bindings,
+                    key=lambda binding: (
+                        binding.source.kind,
+                        "" if binding.source.axis_id is None else binding.source.axis_id.value,
+                    ),
                 )
             ),
         )
+        if self.point_ordinals is not None:
+            ordinals = tuple(
+                _nonnegative(item, "point ordinal") for item in self.point_ordinals
+            )
+            if not ordinals or tuple(sorted(set(ordinals))) != ordinals:
+                raise ValueError(
+                    "point_ordinals must be non-empty, unique, and increasing"
+                )
+            object.__setattr__(self, "point_ordinals", ordinals)
 
-    def binding(self, axis_id: AxisId) -> AxisViewBinding:
-        for binding in self.axis_bindings:
-            if binding.axis_id == axis_id:
+    def binding(self, source: AxisSourceRef) -> SourceViewBinding:
+        if not isinstance(source, AxisSourceRef):
+            raise TypeError("source must be AxisSourceRef")
+        for binding in self.source_bindings:
+            if binding.source == source:
                 return binding
-        raise KeyError(axis_id)
+        raise KeyError(source)
 
 
 @dataclass(frozen=True)
@@ -212,33 +209,49 @@ class ViewPreferences:
     not register reducers or create new axis capabilities.
     """
 
-    repeat_mode: RepeatViewMode | None = None
-    x_axis_id: AxisId | None = None
-    image_x_axis_id: AxisId | None = None
-    image_y_axis_id: AxisId | None = None
-    batch_axis_ids: tuple[AxisId, ...] = ()
-    facet_axis_ids: tuple[AxisId, ...] = ()
-    sample_axis_ids: tuple[AxisId, ...] = ()
+    repeat_binding: SourceViewBinding | None = None
+    x_source: AxisSourceRef | None = None
+    image_x_source: AxisSourceRef | None = None
+    image_y_source: AxisSourceRef | None = None
+    batch_sources: tuple[AxisSourceRef, ...] = ()
+    facet_sources: tuple[AxisSourceRef, ...] = ()
+    sample_sources: tuple[AxisSourceRef, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.repeat_mode is not None and not isinstance(self.repeat_mode, RepeatViewMode):
-            raise TypeError("repeat_mode must be RepeatViewMode or None")
-        for field in ("x_axis_id", "image_x_axis_id", "image_y_axis_id"):
+        if self.repeat_binding is not None and not isinstance(
+            self.repeat_binding, SourceViewBinding
+        ):
+            raise TypeError("repeat_binding must be SourceViewBinding or None")
+        for field in ("x_source", "image_x_source", "image_y_source"):
             value = getattr(self, field)
-            if value is not None and not isinstance(value, AxisId):
-                raise TypeError(f"{field} must be AxisId or None")
-        all_ids: list[AxisId] = []
-        for field in ("batch_axis_ids", "facet_axis_ids", "sample_axis_ids"):
+            if value is not None and not isinstance(value, AxisSourceRef):
+                raise TypeError(f"{field} must be AxisSourceRef or None")
+        all_sources: list[AxisSourceRef] = [
+            source
+            for source in (self.x_source, self.image_x_source, self.image_y_source)
+            if source is not None
+        ]
+        if self.repeat_binding is not None:
+            all_sources.append(self.repeat_binding.source)
+        for field in ("batch_sources", "facet_sources", "sample_sources"):
             values = tuple(getattr(self, field))
-            if any(not isinstance(axis_id, AxisId) for axis_id in values):
-                raise TypeError(f"{field} must contain AxisId values")
+            if any(not isinstance(source, AxisSourceRef) for source in values):
+                raise TypeError(f"{field} must contain AxisSourceRef values")
             if len(set(values)) != len(values):
-                raise ValueError(f"{field} cannot contain duplicate AxisId values")
-            values = tuple(sorted(values, key=lambda axis_id: axis_id.value))
+                raise ValueError(f"{field} cannot contain duplicate sources")
+            values = tuple(
+                sorted(
+                    values,
+                    key=lambda source: (
+                        source.kind,
+                        "" if source.axis_id is None else source.axis_id.value,
+                    ),
+                )
+            )
             object.__setattr__(self, field, values)
-            all_ids.extend(values)
-        if len(set(all_ids)) != len(all_ids):
-            raise ValueError("an axis cannot have multiple explicit preference roles")
+            all_sources.extend(values)
+        if len(set(all_sources)) != len(all_sources):
+            raise ValueError("a source cannot have multiple explicit preference roles")
 
 
 @dataclass(frozen=True)
@@ -272,7 +285,7 @@ class AxisRolePolicy:
             AxisViewRole.SAMPLE,
             AxisViewRole.BATCH,
             AxisViewRole.FACET,
-            AxisViewRole.SLIDER,
+            AxisViewRole.SELECTED,
         }
         if any(role not in allowed for role in roles):
             raise ValueError("automatic role policy contains an unsupported binding")
@@ -284,8 +297,6 @@ class ViewContract:
     intent: ViewIntent
     display_slots: tuple[DisplaySlot, ...]
     role_policies: tuple[AxisRolePolicy, ...]
-    repeat_modes: tuple[RepeatViewMode, ...]
-    default_repeat_mode: RepeatViewMode
     reducible_axis_roles: tuple[AxisRoleId, ...]
 
     def __post_init__(self) -> None:
@@ -295,7 +306,6 @@ class ViewContract:
             raise ValueError("document-fed intents cannot use dataset ViewContract")
         slots = tuple(self.display_slots)
         policies = tuple(self.role_policies)
-        repeat_modes = tuple(self.repeat_modes)
         reducible = tuple(self.reducible_axis_roles)
         if any(not isinstance(slot, DisplaySlot) for slot in slots):
             raise TypeError("display_slots must contain DisplaySlot values")
@@ -303,15 +313,10 @@ class ViewContract:
             raise TypeError("role_policies must contain AxisRolePolicy values")
         if len({policy.axis_role for policy in policies}) != len(policies):
             raise ValueError("ViewContract may define each axis role only once")
-        if not repeat_modes or any(not isinstance(mode, RepeatViewMode) for mode in repeat_modes):
-            raise ValueError("repeat_modes must contain RepeatViewMode values")
-        if self.default_repeat_mode not in repeat_modes:
-            raise ValueError("default repeat mode must be allowed by the contract")
         if any(not isinstance(role, AxisRoleId) for role in reducible):
             raise TypeError("reducible_axis_roles must contain AxisRoleId values")
         object.__setattr__(self, "display_slots", slots)
         object.__setattr__(self, "role_policies", policies)
-        object.__setattr__(self, "repeat_modes", repeat_modes)
         object.__setattr__(self, "reducible_axis_roles", reducible)
 
     def policy_for(self, role: AxisRoleId) -> AxisRolePolicy | None:
@@ -331,24 +336,24 @@ class SuggestionStatus(str, Enum):
 class DecisionReason:
     code: str
     message: str
-    axis_id: AxisId | None = None
+    source: AxisSourceRef | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "code", _text(self.code, "reason code"))
         object.__setattr__(self, "message", _text(self.message, "reason message"))
-        if self.axis_id is not None and not isinstance(self.axis_id, AxisId):
-            raise TypeError("reason axis_id must be AxisId or None")
+        if self.source is not None and not isinstance(self.source, AxisSourceRef):
+            raise TypeError("reason source must be AxisSourceRef or None")
 
 
 @dataclass(frozen=True)
 class ViewAlternative:
-    axis_id: AxisId
+    source: AxisSourceRef
     binding_role: AxisViewRole
     label: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.axis_id, AxisId):
-            raise TypeError("alternative axis_id must be AxisId")
+        if not isinstance(self.source, AxisSourceRef):
+            raise TypeError("alternative source must be AxisSourceRef")
         if not isinstance(self.binding_role, AxisViewRole):
             raise TypeError("alternative binding_role must be AxisViewRole")
         object.__setattr__(self, "label", _text(self.label, "alternative label"))
@@ -427,8 +432,9 @@ class FigureSelection:
     """A named selection-library/controller input.
 
     Merely storing this value in :class:`FigureDocument` never applies it to a
-    layer.  Presentation changes only when a controller copies the immutable
-    ``Selection`` into that layer's ``ViewSpec.display_selections``.
+    layer.  Point-row filtering is carried only by the layer's exact
+    ``ViewSpec.point_ordinals``; tensor display selection remains surface-local
+    state rather than a second ViewSpec authority.
     """
 
     selection_id: str
@@ -501,15 +507,15 @@ class FigureDocument:
 
 @dataclass(frozen=True)
 class AxisAddress:
-    axis_id: AxisId
+    source: AxisSourceRef
     axis_name: str
     axis_role: AxisRoleId
     index: int
     coordinate: Any
 
     def __post_init__(self) -> None:
-        if not isinstance(self.axis_id, AxisId):
-            raise TypeError("address axis_id must be AxisId")
+        if not isinstance(self.source, AxisSourceRef):
+            raise TypeError("address source must be AxisSourceRef")
         object.__setattr__(self, "axis_name", _text(self.axis_name, "address axis name"))
         if not isinstance(self.axis_role, AxisRoleId):
             raise TypeError("address axis_role must be AxisRoleId")
@@ -518,7 +524,7 @@ class AxisAddress:
 
 @dataclass(frozen=True)
 class EvaluatedAxis:
-    axis_id: AxisId
+    source: AxisSourceRef
     name: str
     role: AxisRoleId
     unit: str | None
@@ -527,8 +533,8 @@ class EvaluatedAxis:
     coordinate_frame: CoordinateFrameId | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.axis_id, AxisId):
-            raise TypeError("evaluated axis_id must be AxisId")
+        if not isinstance(self.source, AxisSourceRef):
+            raise TypeError("evaluated source must be AxisSourceRef")
         object.__setattr__(self, "name", _text(self.name, "evaluated axis name"))
         if not isinstance(self.role, AxisRoleId):
             raise TypeError("evaluated axis role must be AxisRoleId")
@@ -547,6 +553,23 @@ class EvaluatedAxis:
             )
         object.__setattr__(self, "indices", indices)
         object.__setattr__(self, "coordinates", coordinates)
+
+    @property
+    def axis_id(self) -> AxisId:
+        """Return the transient axis identity used by gesture geometry.
+
+        Persisted authority remains :attr:`source`. Tensor, point-coordinate,
+        and grid sources reuse their declared ``AxisId``. The synthetic point
+        ordinal has no persisted axis id, so it receives one private frontend
+        id solely for numeric viewport queries; gesture binding resolves that
+        query back to exact point ordinals before commit.
+        """
+
+        if self.source.axis_id is not None:
+            return self.source.axis_id
+        if self.source.kind == AxisSourceRef.POINT_ORDINAL:
+            return _POINT_ORDINAL_INTERACTION_AXIS_ID
+        raise AttributeError(f"{self.source.kind} is not an evaluated numeric axis")
 
 
 @dataclass(frozen=True, eq=False)
@@ -609,12 +632,12 @@ class EvaluatedCurve:
 
 @dataclass(frozen=True)
 class SampleCoordinates:
-    axis_id: AxisId
+    source: AxisSourceRef
     coordinates: tuple[Any, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.axis_id, AxisId):
-            raise TypeError("sample axis_id must be AxisId")
+        if not isinstance(self.source, AxisSourceRef):
+            raise TypeError("sample source must be AxisSourceRef")
         object.__setattr__(self, "coordinates", tuple(self.coordinates))
 
 
@@ -670,22 +693,24 @@ EvaluatedLayerData = EvaluatedImage | EvaluatedCurve | EvaluatedHistogram | Eval
 
 @dataclass(frozen=True)
 class ReductionResolution:
-    axis_ids: tuple[AxisId, ...]
+    sources: tuple[AxisSourceRef, ...]
     method: DisplayReductionMethod
     minimum_contributors: int
     maximum_contributors: int
 
     def __post_init__(self) -> None:
-        ids = tuple(self.axis_ids)
-        if not ids or any(not isinstance(axis_id, AxisId) for axis_id in ids):
-            raise ValueError("reduction resolution requires AxisId values")
+        sources = tuple(self.sources)
+        if not sources or any(
+            not isinstance(source, AxisSourceRef) for source in sources
+        ):
+            raise ValueError("reduction resolution requires AxisSourceRef values")
         if not isinstance(self.method, DisplayReductionMethod):
             raise TypeError("reduction resolution method is invalid")
         low = _nonnegative(self.minimum_contributors, "minimum contributors")
         high = _nonnegative(self.maximum_contributors, "maximum contributors")
         if high < low:
             raise ValueError("maximum contributors cannot be below minimum")
-        object.__setattr__(self, "axis_ids", ids)
+        object.__setattr__(self, "sources", sources)
         object.__setattr__(self, "minimum_contributors", low)
         object.__setattr__(self, "maximum_contributors", high)
 
@@ -727,14 +752,14 @@ class EvaluatedCell:
 
 @dataclass(frozen=True)
 class AxisResolution:
-    axis_id: AxisId
+    source: AxisSourceRef
     selector: str
     index: int
     coordinate: Any
 
     def __post_init__(self) -> None:
-        if not isinstance(self.axis_id, AxisId):
-            raise TypeError("resolution axis_id must be AxisId")
+        if not isinstance(self.source, AxisSourceRef):
+            raise TypeError("resolution source must be AxisSourceRef")
         object.__setattr__(self, "selector", _text(self.selector, "selector"))
         object.__setattr__(self, "index", _nonnegative(self.index, "resolution index"))
 
@@ -857,7 +882,7 @@ __all__ = [
     "AxisAddress",
     "AxisResolution",
     "AxisRolePolicy",
-    "AxisViewBinding",
+    "SourceViewBinding",
     "AxisViewRole",
     "DatasetDescriptor",
     "DatasetId",
@@ -884,7 +909,6 @@ __all__ = [
     "FixedIndex",
     "LatestNonempty",
     "ReductionResolution",
-    "RepeatViewMode",
     "SampleCoordinates",
     "SuggestionStatus",
     "ViewAlternative",

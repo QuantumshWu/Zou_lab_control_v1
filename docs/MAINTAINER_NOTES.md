@@ -7,9 +7,9 @@ This file is a current hand-off note, not an architecture authority. Normative d
 - Branch: `codex/system-architecture-migration`
 - M0 normative design baseline: `aaaa063ca5a8535c4f316df95e62574edce46cd3`; canonical observation-address clarification: `0af9354`.
 - Last code checkpoint before the normative freeze: `09fad53 Fix live Figure transactions and restore plot fits`
-- Completed architecture cut in this checkpoint: **M0 second convergence — the public point/source/resolver vocabulary is now minimal as well as the transaction/Fit/milestone wording**
-- Active next cut: **M1 — minimal PointTable/GridTopology/source-binding replacement**
-- Active worktree state: M1 is deliberately uncommitted and not a checkpoint. The core/data and early Camera/runtime readers are mid-replacement; M0 is closed by the normative design commit above, so work resumes only inside the recorded M1 deletion contract.
+- Completed architecture cut in this checkpoint: **M1 — minimal PointTable/GridTopology/source-binding replacement**
+- Active next cut: **M2 — Signal transaction**
+- Active worktree state: M1 has one point truth and no production compatibility model. After this checkpoint the only expected worktree exception is the untracked user file below; resume from M2 and do not replay M1.
 - Expected worktree exception: untracked user file `pulses/scan_test.json`; never read, modify, stage or commit it.
 - External temporary audit ledger: `../ARCHITECTURE_AUDIT_CURRENT.md`; it is not a product/design authority and is deleted only after M0–M7 evidence is fully merged and all implementation cuts finish.
 
@@ -45,13 +45,13 @@ The refreshed M0 authority closes all of the following together:
 
 Use the narrowest current test or product flow for the active boundary. Broad verification belongs to M7.
 
-## Active M1 cut contract
+## M1 closure evidence
 
-- Relevant authority: System Architecture §3, §8 M1 and §9; audit rows A01–A17, M1 and §9. A stale audit exception that mixed `PointRows SAMPLE` with `GridDimension BATCH/FACET` was removed; System Architecture's strict raw/topology separation governs.
-- Existing owner to replace in place: `zlc_data/schema.py`, with scalar normalization in `axis.py` and the sole wire representation in `codec.py`. Do not add point/resolver modules.
-- Fixed baseline before product edits: 52 production files contain the old Dataset point model, covering 32,791 physical lines and about 406 old `PointLayout`/`point_axes`/`point_layout` references. The cut must end net smaller; numeric deltas remain review triggers rather than automatic rollback.
-- Allowed new public values: `PointColumn`, `PointTable`, `GridTopology`, one discriminated `AxisSourceRef`, and one `ResolvedPointRows`. `SourceViewBinding` replaces `AxisViewBinding`; it is not an additional model. Point selection/group requests remain normalized tuples/fields, not public class families. No `GridDimension`, `PointCoordinateId`, five source-ref subclasses, point manager/registry, frontend resolved DTO or new module is authorized.
-- Required deletion closure: Dataset `PointLayout`; `DatasetSchema.point_axes`, `point_layout` and `_cell_layout/cell_layout`; point-layout codec/exports; leaf `ScanPointTable`; `TransformedSchema`; `FitCoordinateSource`; Cartesian point selection helpers; `AxisViewRole.SLIDER`; `RepeatViewMode`; point `display_selections`; AxisId-only View/Fit point bindings; `MotFieldProgram` axes/layout mirrors; and capture join's copied scan layout. Generic `AxisLayout` remains only for genuine FitResultBatch batch grids.
-- Non-grid witness: real PulseScan over three correlated authored columns with a repeated coordinate tuple. It must preserve ordinals `0,1,2`, P=3, exact rows and `grid_topology=None` through Dataset, artifact, Figure and Fit without Cartesian expansion.
-- Grid witness: real MOT Field 2×2×2 flow. The producer must freeze the same row-table model plus explicit topology; physical scalar shape is `(1,8,1)`, topology is `(2,2,2)`, and the formal Qt Grid figure must render non-empty data without frontend inference.
-- Next action: implement only the core `axis.py`/`schema.py`/`codec.py`/`layout.py` replacement, then carry those two witnesses through existing runtime/transform/frontend owners before mechanically migrating the remaining readers. No Git checkpoint or product acceptance may expose both models.
+- `zlc_data/schema.py` owns the sole `PointColumn`/`PointTable`/`GridTopology`/`ResolvedPointRows` model; `axis.py` owns canonical scalar/source normalization and `codec.py` owns its wire form. `SourceViewBinding` is the only frontend binding. No point manager, registry, second resolver result or new module was added.
+- Production references to Dataset `PointLayout`, `point_axes`, `point_layout`, `cell_layout`, `TransformedSchema`, `FitCoordinateSource`, `RowComponentValidity`, `AxisViewBinding`, `RepeatViewMode`, `display_selections`, `AxisViewRole.SLIDER`, `fit_axis_ids` and FitGrid are zero. The six obsolete FitGrid owner files are deleted.
+- A real non-grid PulseScan with correlated authored rows A/B/A preserves ordinals `0,1,2`, exact rows and `grid_topology=None` through Dataset, artifact, Figure and Fit without Cartesian expansion.
+- A real MOT Field 2×2×2 producer uses the same point table plus explicit topology; its scalar physical shape is `(1,8,1)`, topology is `(2,2,2)`, and the frontend renders non-empty faceted data without inferring topology.
+- Saved Curve and Histogram Fit results reopen through the canonical DataFigure/Figure renderer for overview, focus and export. Focus remains display-only and never rewrites the committed Fit authority.
+- Fixed-scope production Python changed from 174,687 to 172,061 physical lines: 421 to 415 modules, 1,025 to 1,016 classes, 602 to 598 dataclasses and 35 to 33 enums. The complete cut is `+8,464/-11,090`, net `-2,626`, with zero new production modules and six deletions.
+- Production compileall and `git diff --check` pass. No RTL/Tcl/XDC, tests, tutorials, fixtures or temporary evidence changed. Forty-nine historical tests still name the replaced model; per user direction and System Architecture M7 they must be rewritten or deleted there, never used to restore compatibility during M1.
+- Next action is M2 only. Recover its owner/deletion/public-concept contract from the Goal, audit M2/C rows and System Architecture §5/§8 M2 before touching product code.

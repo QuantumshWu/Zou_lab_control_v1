@@ -9,18 +9,18 @@ from numbers import Integral
 from typing import TYPE_CHECKING
 
 from zlc_data import (
+    AxisSourceRef,
     DatasetSchema,
     FitResultBatch,
     HISTOGRAM_BIN,
     HistogramSpec,
-    Selection,
+    axis_source_ref_to_tree,
     validate_fit_result_source_binding,
 )
 from zlc_storage import canonical_digest, canonical_text
 
 from .figure import (
     AxisResolution,
-    AxisViewBinding,
     AxisViewRole,
     DatasetId,
     EvaluatedCell,
@@ -35,32 +35,31 @@ from .figure import (
     FigureLayer,
     FixedIndex,
     ResolvedDatasetMap,
+    SourceViewBinding,
     ViewIntent,
+    validate_view_spec,
     view_spec_to_tree,
 )
-from .figure.contract import _validate_selection_fit_view
 from .curve_display import numeric_curve_coordinates
+from .figure.contract import _fit_display_selection_indices
 from .render import PanelPresentationIdentity, RasterBuffer
 
 if TYPE_CHECKING:
     from .fit_curve_projection import CurveFitOverlayPlan
-    from .fit_image_projection import RadialGaussianImageFitPanel
     from .render import RadialGaussianImageFitOverlay
 
 
 @dataclass(frozen=True, slots=True)
 class FigurePanelRegion:
-    """One panel hit target with separate live-focus and fit identities.
+    """One panel hit target with source-aware focus and Fit storage identity.
 
-    ``focus_selection`` excludes dynamic evaluation resolutions so the same
-    logical cell survives a newer live snapshot. ``fit_selection`` is the
-    complete batch selection required by saved-fit storage and is absent when
-    the rendered layer has no fit result.
+    ``focus_address`` excludes dynamic evaluation resolutions so the same
+    logical cell survives a newer live snapshot. ``fit_storage_index`` points
+    directly into the attached immutable Fit result when one exists.
     """
 
     key: str
-    focus_selection: Selection | None
-    fit_selection: Selection | None
+    focus_address: tuple[tuple[AxisSourceRef, int], ...]
     fit_storage_index: int | None
     left: float
     top: float
@@ -69,16 +68,13 @@ class FigurePanelRegion:
 
     def __post_init__(self) -> None:
         canonical_text(self.key, "figure panel key")
-        if self.focus_selection is not None and not isinstance(
-            self.focus_selection,
-            Selection,
-        ):
-            raise TypeError("panel focus_selection must be Selection or None")
-        if self.fit_selection is not None and not isinstance(
-            self.fit_selection,
-            Selection,
-        ):
-            raise TypeError("panel fit_selection must be Selection or None")
+        from .fit_projection import canonical_panel_focus_address
+
+        object.__setattr__(
+            self,
+            "focus_address",
+            canonical_panel_focus_address(self.focus_address),
+        )
         if self.fit_storage_index is not None and (
             isinstance(self.fit_storage_index, bool)
             or not isinstance(self.fit_storage_index, Integral)
@@ -160,35 +156,35 @@ def _validated_fit_result_mapping(
             raise ValueError("fit layer source metadata is absent") from exc
         if not source_and_view_validated:
             validate_fit_result_source_binding(result, source_ref, source_schema)
-        if result.spec.committed_transform is not None and not source_and_view_validated:
-            operations = tuple(result.spec.committed_transform.spec.operations)
+        if not source_and_view_validated:
+            transform = result.spec.committed_transform
+            operations = tuple(transform.spec.operations)
+            view_point_ordinals = tuple(
+                range(source_schema.point_table.row_count)
+                if layer.view.point_ordinals is None
+                else layer.view.point_ordinals
+            )
+            if view_point_ordinals != transform.exact_point_ordinals:
+                raise ValueError(
+                    "Fit authority and Figure view select different point rows"
+                )
             histogram = operations[-1] if operations else None
             if isinstance(histogram, HistogramSpec):
                 if layer.view.intent is not ViewIntent.HISTOGRAM:
                     raise ValueError(
                         "histogram Fit authority requires a HISTOGRAM Figure"
                     )
-                sample_axes = {
-                    binding.axis_id
-                    for binding in layer.view.axis_bindings
+                sample_sources = {
+                    binding.source
+                    for binding in layer.view.source_bindings
                     if binding.role is AxisViewRole.SAMPLE
                 }
-                if set(histogram.axis_ids) != sample_axes:
+                if set(histogram.sources) != sample_sources:
                     raise ValueError(
                         "histogram Fit sample axes differ from the Figure view"
                     )
             else:
-                try:
-                    _validate_selection_fit_view(
-                        source_schema,
-                        result,
-                        layer.view,
-                    )
-                except ValueError as exc:
-                    raise ValueError(
-                        "transformed fit overlay is not faithfully displayable: "
-                        f"{exc}"
-                    ) from exc
+                _fit_display_selection_indices(source_schema, result)
         fit_layers[layer_id] = (layer, result)
 
     if evaluated is None:
@@ -198,7 +194,6 @@ def _validated_fit_result_mapping(
         AxisViewRole.BATCH,
         AxisViewRole.FACET,
         AxisViewRole.SELECTED,
-        AxisViewRole.SLIDER,
     }
     for layer, result in fit_layers.values():
         fit_axes = result.fit_axis_specs
@@ -217,15 +212,16 @@ def _validated_fit_result_mapping(
                     )
             elif (
                 layer.view.intent is not ViewIntent.CURVE
-                or layer.view.binding(fit_axes[0].axis_id).role is not AxisViewRole.X
+                or layer.view.binding(result.spec.independent_sources[0]).role
+                is not AxisViewRole.X
             ):
                 raise ValueError("one-axis fit overlay requires its fitted axis as curve x")
         elif len(fit_axes) == 2:
             if (
                 layer.view.intent is not ViewIntent.IMAGE
-                or layer.view.binding(fit_axes[0].axis_id).role
+                or layer.view.binding(result.spec.independent_sources[0]).role
                 is not AxisViewRole.IMAGE_X
-                or layer.view.binding(fit_axes[1].axis_id).role
+                or layer.view.binding(result.spec.independent_sources[1]).role
                 is not AxisViewRole.IMAGE_Y
             ):
                 raise ValueError(
@@ -233,8 +229,12 @@ def _validated_fit_result_mapping(
                 )
         else:
             raise ValueError("only one- and two-axis fit overlays are supported")
-        for axis in result.batch_axis_specs:
-            role = layer.view.binding(axis.axis_id).role
+        for source, axis in zip(
+            result.spec.batch_sources,
+            result.batch_axis_specs,
+            strict=True,
+        ):
+            role = layer.view.binding(source).role
             if role not in allowed_batch_roles and not (
                 role is AxisViewRole.REDUCED and axis.size == 1
             ):
@@ -375,6 +375,7 @@ class DataFigure:
         self,
         panel_index: int,
         expected_intent: ViewIntent,
+        series_index: int | None = None,
     ):
         if isinstance(panel_index, bool) or not isinstance(panel_index, Integral):
             raise TypeError("panel_index must be a non-negative integer")
@@ -407,95 +408,154 @@ class DataFigure:
             or source_layer.view.intent is not expected_intent
         ):
             raise RuntimeError("document/evaluated typed layer identity differs")
-        if panel_index >= len(layer.cells):
+        from .fit_projection import evaluated_figure_panels
+
+        panels = evaluated_figure_panels(self._evaluated)
+        if panel_index >= len(panels):
             raise IndexError("panel_index is outside the frozen figure")
-        cell = layer.cells[panel_index]
-        if not cell.series or any(
-            not isinstance(series.data, data_type) for series in cell.series
+        panel_layer, cell, series_group = panels[panel_index]
+        if series_index is not None:
+            if isinstance(series_index, bool) or not isinstance(
+                series_index,
+                Integral,
+            ):
+                raise TypeError("series_index must be a non-negative integer or None")
+            series_index = int(series_index)
+            if not 0 <= series_index < len(series_group):
+                raise IndexError("series_index is outside the focused panel")
+            series_group = (series_group[series_index],)
+        if panel_layer is not layer:
+            raise RuntimeError("focused panel belongs to another evaluated layer")
+        if not series_group or any(
+            not isinstance(series.data, data_type) for series in series_group
         ):
             raise ValueError(
                 f"focused {expected_intent.value} display requires one homogeneous panel"
             )
-        value_units = {series.data.value_unit for series in cell.series}
+        value_units = {series.data.value_unit for series in series_group}
         if len(value_units) != 1:
             raise ValueError("focused typed panel mixes value units")
         if expected_intent is ViewIntent.CURVE:
-            first_axis = cell.series[0].data.x_axis
+            first_axis = series_group[0].data.x_axis
             numeric_curve_coordinates(first_axis)
-            if any(series.data.x_axis != first_axis for series in cell.series[1:]):
+            if any(series.data.x_axis != first_axis for series in series_group[1:]):
                 raise ValueError("focused CURVE series do not share one exact x axis")
-        if expected_intent is ViewIntent.IMAGE and len(cell.series) != 1:
+        if expected_intent is ViewIntent.IMAGE and len(series_group) != 1:
             raise ValueError("focused IMAGE display requires exactly one image")
         source_schemas = tuple(
             item for item in self._source_schemas if item[0] == layer.dataset_id
         )
         if len(source_schemas) != 1:
             raise RuntimeError("focused typed source schema is absent or ambiguous")
-        return panel_index, source_layer, layer, cell, source_schemas
+        return (
+            panel_index,
+            source_layer,
+            layer,
+            cell,
+            tuple(series_group),
+            source_schemas,
+        )
 
     def focused_typed_panel(
         self,
         panel_index: int,
         *,
-        expected_selection: Selection | None,
+        expected_address: tuple[tuple[AxisSourceRef, int], ...],
         expected_intent: ViewIntent,
+        series_index: int | None = None,
     ) -> DataFigure:
         """Derive one exact display-only typed panel from this frozen figure.
 
-        The panel order and selection are the same canonical facts used by the
+        The panel order and address are the same canonical facts used by the
         whole-figure renderer.  No dataset is resolved or evaluated again, and
         no display selection is promoted to an authority transform.
         """
 
-        if expected_selection is not None and not isinstance(
-            expected_selection,
-            Selection,
-        ):
-            raise TypeError("expected_selection must be Selection or None")
-        panel_index, source_layer, layer, cell, source_schemas = (
-            self._typed_focus_parts(panel_index, expected_intent)
+        from .fit_projection import (
+            canonical_panel_focus_address,
+            panel_focus_address,
         )
-        # Imported lazily because fit_image_projection also imports the public
-        # FigurePanelRegion DTO from this module.
-        from .fit_projection import panel_focus_selection
 
-        series_group = cell.series
-        actual_selection = panel_focus_selection(layer, cell, series_group)
-        if actual_selection != expected_selection:
-            raise ValueError("panel selection differs from the frozen overview region")
+        expected_address = canonical_panel_focus_address(expected_address)
+        panel_index, source_layer, layer, cell, series_group, source_schemas = (
+            self._typed_focus_parts(panel_index, expected_intent, series_index)
+        )
+        actual_address = panel_focus_address(layer, cell, series_group)
+        if actual_address != expected_address:
+            raise ValueError("panel address differs from the frozen overview region")
 
-        facet_by_axis = {address.axis_id: address for address in cell.facet_address}
-        if len(facet_by_axis) != len(cell.facet_address):
-            raise RuntimeError("focused typed facet address repeats an axis")
-        facet_bindings = {
-            binding.axis_id
-            for binding in source_layer.view.axis_bindings
+        focus_by_source = dict(actual_address)
+        expected_sources = {
+            binding.source
+            for binding in source_layer.view.source_bindings
             if binding.role is AxisViewRole.FACET
+            or (len(series_group) == 1 and binding.role is AxisViewRole.BATCH)
         }
-        if facet_bindings != set(facet_by_axis):
-            raise RuntimeError("focused typed facet addresses do not match its view")
-        bindings = tuple(
-            AxisViewBinding(
-                binding.axis_id,
-                AxisViewRole.SELECTED,
-                selector=FixedIndex(facet_by_axis[binding.axis_id].index),
-            )
-            if binding.role is AxisViewRole.FACET
-            else binding
-            for binding in source_layer.view.axis_bindings
-        )
+        if expected_sources != set(focus_by_source):
+            raise RuntimeError("focused panel address does not match its source view")
 
-        resolutions = {item.axis_id: item for item in layer.resolutions}
+        schema = source_schemas[0][1]
+        raw_focus = {
+            source: index
+            for source, index in actual_address
+            if source.kind
+            in {AxisSourceRef.POINT_ROWS, AxisSourceRef.POINT_COORDINATE}
+        }
+        point_ordinals = source_layer.view.point_ordinals
+        if raw_focus:
+            from .figure.contract import _resolved_point_group_records
+
+            members = []
+            for facet, batch, group_members, _group_index in (
+                _resolved_point_group_records(schema, source_layer.view)
+            ):
+                addresses = (*facet, *(batch if len(series_group) == 1 else ()))
+                record = {item.source: item.index for item in addresses}
+                if all(record.get(source) == index for source, index in raw_focus.items()):
+                    members.extend(group_members)
+            point_ordinals = tuple(sorted(set(members)))
+            if not point_ordinals:
+                raise RuntimeError("focused raw point address resolved no physical row")
+
+        selected_sources = {
+            source
+            for source in focus_by_source
+            if source.kind in {AxisSourceRef.TENSOR, AxisSourceRef.GRID_DIMENSION}
+        }
+        bindings = tuple(
+            replace(
+                binding,
+                role=AxisViewRole.SELECTED,
+                selector=FixedIndex(focus_by_source[binding.source]),
+                reduction=None,
+            )
+            if binding.source in selected_sources
+            else binding
+            for binding in source_layer.view.source_bindings
+        )
+        focused_view = replace(
+            source_layer.view,
+            source_bindings=bindings,
+            point_ordinals=point_ordinals,
+        )
+        validate_view_spec(schema, focused_view)
+
+        resolutions = {item.source: item for item in layer.resolutions}
         if len(resolutions) != len(layer.resolutions):
-            raise RuntimeError("focused typed layer repeats a resolution axis")
-        for address in cell.facet_address:
+            raise RuntimeError("focused typed layer repeats a resolution source")
+        focus_addresses = [*cell.facet_address]
+        if len(series_group) == 1:
+            focus_addresses.extend(series_group[0].batch_address)
+        for address in focus_addresses:
+            if address.source not in selected_sources:
+                continue
             candidate = AxisResolution(
-                address.axis_id,
+                address.source,
                 "FIXED_INDEX",
                 address.index,
                 address.coordinate,
             )
-            incumbent = resolutions.setdefault(address.axis_id, candidate)
+            incumbent = resolutions.setdefault(address.source, candidate)
             if incumbent != candidate:
                 raise RuntimeError("focused typed resolution conflicts with its facet")
 
@@ -509,14 +569,11 @@ class DataFigure:
                 "schema_fingerprint": descriptor.schema_fingerprint,
                 "intent": expected_intent.value,
                 "layer_id": layer.layer_id,
-                "view": view_spec_to_tree(source_layer.view),
+                "view": view_spec_to_tree(focused_view),
                 "panel_index": panel_index,
-                "facet_indices": tuple(
-                    (address.axis_id.value, address.index)
-                    for address in sorted(
-                        cell.facet_address,
-                        key=lambda item: item.axis_id.value,
-                    )
+                "focus_address": tuple(
+                    (axis_source_ref_to_tree(source), index)
+                    for source, index in actual_address
                 ),
             }
         )
@@ -529,7 +586,7 @@ class DataFigure:
                 FigureLayer(
                     source_layer.layer_id,
                     source_layer.dataset_id,
-                    replace(source_layer.view, axis_bindings=bindings),
+                    focused_view,
                 ),
             ),
         )
@@ -541,12 +598,30 @@ class DataFigure:
                 EvaluatedLayer(
                     layer.layer_id,
                     layer.dataset_id,
-                    (EvaluatedCell((), tuple(series_group)),),
+                    (
+                        EvaluatedCell(
+                            tuple(
+                                address
+                                for address in cell.facet_address
+                                if address.source not in selected_sources
+                            ),
+                            tuple(
+                                replace(
+                                    series,
+                                    batch_address=tuple(
+                                        address
+                                        for address in series.batch_address
+                                        if address.source not in selected_sources
+                                    ),
+                                )
+                                for series in series_group
+                            ),
+                        ),
+                    ),
                     tuple(
-                        resolutions[axis_id]
-                        for axis_id in sorted(
+                        resolutions[source]
+                        for source in sorted(
                             resolutions,
-                            key=lambda item: item.value,
                         )
                     ),
                 ),
@@ -578,12 +653,19 @@ class DataFigure:
         from .matplotlib_render import (
             render_evaluated_figure,
         )
+        from .histogram_display import HistogramDisplayState
+
+        _state, projection, overlays = self._histogram_render_values(
+            HistogramDisplayState()
+        )
 
         return render_evaluated_figure(
             self._document,
             self._evaluated,
             dict(self._fit_results),
             dpi=dpi,
+            histogram_projection=projection,
+            histogram_fit_overlays=overlays,
         )
 
     def to_png_bytes(
@@ -607,6 +689,11 @@ class DataFigure:
         if image_format not in {"png", "pdf", "svg", "jpg", "jpeg"}:
             raise ValueError("image_format must be png, pdf, svg, jpg, or jpeg")
         from .matplotlib_render import encode_evaluated_figure
+        from .histogram_display import HistogramDisplayState
+
+        _state, projection, overlays = self._histogram_render_values(
+            HistogramDisplayState()
+        )
 
         return encode_evaluated_figure(
             self._document,
@@ -614,6 +701,8 @@ class DataFigure:
             dict(self._fit_results),
             image_format=image_format,
             dpi=dpi,
+            histogram_projection=projection,
+            histogram_fit_overlays=overlays,
         )
 
     def to_png_bytes_with_panel_regions(
@@ -624,12 +713,19 @@ class DataFigure:
         """Encode the same frozen figure plus exact display-panel hit regions."""
 
         from .matplotlib_render import encode_evaluated_figure_with_panel_regions
+        from .histogram_display import HistogramDisplayState
+
+        _state, projection, overlays = self._histogram_render_values(
+            HistogramDisplayState()
+        )
 
         payload, regions = encode_evaluated_figure_with_panel_regions(
             self._document,
             self._evaluated,
             dict(self._fit_results),
             dpi=dpi,
+            histogram_projection=projection,
+            histogram_fit_overlays=overlays,
         )
         return payload, regions
 
@@ -655,6 +751,9 @@ class DataFigure:
         from .matplotlib_render import (
             encode_evaluated_panel_with_regions,
         )
+        display_state, projection, overlays = self._histogram_render_values(
+            display_state
+        )
 
         return encode_evaluated_panel_with_regions(
             self._document,
@@ -667,6 +766,8 @@ class DataFigure:
             display_state=display_state,
             title=title,
             value_label=value_label,
+            histogram_projection=projection,
+            histogram_fit_overlays=overlays,
         )
 
     def transient_fit_to_panel_png_bytes_with_panel_regions(
@@ -698,6 +799,15 @@ class DataFigure:
         )
         from .matplotlib_render import encode_evaluated_panel_with_regions
 
+        projection = None
+        overlays = ()
+        if self._document.layers[0].view.intent is ViewIntent.HISTOGRAM:
+            display_state, projection, overlays = self._histogram_fit_presentation(
+                result,
+                result_identity=f"transient-fit:{id(result):x}",
+                display_state=display_state,
+            )
+
         return encode_evaluated_panel_with_regions(
             self._document,
             self._evaluated,
@@ -709,35 +819,8 @@ class DataFigure:
             display_state=display_state,
             title=title,
             value_label=value_label,
-        )
-
-    def radial_gaussian_image_fit_panels(
-        self,
-        layer_id: str,
-        *,
-        artifact_identity: str,
-    ) -> tuple[RadialGaussianImageFitPanel, ...]:
-        """Return typed saved-fit IMAGE panels without exposing fit authority.
-
-        The immutable projections retain exact source/artifact identity, sparse
-        logical holes, authoritative axis metadata, focus summaries, and only
-        the published centre/radius annotation.  No solver or predicted image
-        is evaluated on this path.
-        """
-
-        from .fit_image_projection import radial_gaussian_image_fit_panels
-
-        resolved_layer_id = canonical_text(layer_id, "fit layer_id")
-        result = dict(self._fit_results).get(resolved_layer_id)
-        if result is None:
-            raise ValueError(f"layer {resolved_layer_id!r} has no saved fit result")
-
-        return radial_gaussian_image_fit_panels(
-            self._document,
-            self._evaluated,
-            result,
-            layer_id,
-            artifact_identity=artifact_identity,
+            histogram_projection=projection,
+            histogram_fit_overlays=overlays,
         )
 
     def single_panel_curve_fit_overlay_plan(
@@ -777,33 +860,6 @@ class DataFigure:
             result_identity=result_identity,
         )
 
-    def single_panel_radial_fit_overlay(
-        self,
-        *,
-        result_identity: str,
-    ) -> RadialGaussianImageFitOverlay:
-        """Return one exact radial IMAGE annotation for typed replay.
-
-        Generic two-dimensional model contours remain outside the typed IMAGE
-        contract.  This seam accepts only the existing named radial-Gaussian
-        projection and exactly one logical panel.
-        """
-
-        if len(self._document.layers) != 1 or len(self._evaluated.layers) != 1:
-            raise ValueError("typed radial fit projection requires exactly one layer")
-        if len(self._evaluated.inputs) != 1:
-            raise ValueError("typed radial fit projection requires exactly one input")
-        layer = self._document.layers[0]
-        if set(dict(self._fit_results)) != {layer.layer_id}:
-            raise ValueError("typed radial fit projection requires one exact layer result")
-        panels = self.radial_gaussian_image_fit_panels(
-            layer.layer_id,
-            artifact_identity=result_identity,
-        )
-        if len(panels) != 1:
-            raise ValueError("typed radial fit projection requires exactly one IMAGE panel")
-        return panels[0].fit_overlay
-
     def transient_single_panel_radial_fit_overlay(
         self,
         result: FitResultBatch,
@@ -824,26 +880,42 @@ class DataFigure:
             check_cancelled=check_cancelled,
         )
 
-    def transient_single_panel_histogram_fit_overlays(
+    def _histogram_fit_presentation(
         self,
-        projection,
         result: FitResultBatch,
         *,
         result_identity: str,
+        display_state,
         check_cancelled=None,
     ):
-        """Project one formal Fit result onto this exact histogram front."""
+        """Build the exact committed Histogram projection and cell overlays."""
 
         from .fit_histogram_projection import (
-            transient_single_panel_histogram_fit_overlays,
+            _histogram_fit_presentation,
         )
 
-        return transient_single_panel_histogram_fit_overlays(
+        return _histogram_fit_presentation(
             self,
-            projection,
             result,
             result_identity=result_identity,
+            display_state=display_state,
             check_cancelled=check_cancelled,
+        )
+
+    def _histogram_render_values(self, display_state):
+        """Return optional exact Histogram replay values for generic export."""
+
+        if (
+            not self._fit_results
+            or len(self._document.layers) != 1
+            or self._document.layers[0].view.intent is not ViewIntent.HISTOGRAM
+        ):
+            return display_state, None, ()
+        result = dict(self._fit_results)[self._document.layers[0].layer_id]
+        return self._histogram_fit_presentation(
+            result,
+            result_identity=f"embedded-fit:{id(result):x}",
+            display_state=display_state,
         )
 
     def _single_panel_source_schema(self) -> DatasetSchema:
@@ -883,8 +955,8 @@ class FacetedOverviewArtifact:
             )
         if len({item.key for item in regions}) != len(regions):
             raise ValueError("faceted overview region keys must be unique")
-        if any(item.focus_selection is None for item in regions):
-            raise ValueError("faceted overview regions require exact selections")
+        if len({item.focus_address for item in regions}) != len(regions):
+            raise ValueError("faceted overview regions require unique focus addresses")
         logical_size = tuple(self.logical_size)
         if len(logical_size) != 2 or any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0

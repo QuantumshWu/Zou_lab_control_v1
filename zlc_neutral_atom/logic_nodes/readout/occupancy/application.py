@@ -74,21 +74,21 @@ def build_detection_request(
         raise ValueError(
             "capture and calibration name different readout bindings"
         )
-    event_axes = tuple(
-        axis
-        for axis in artifact.frame_source.schema.point_axes
-        if axis.role == READOUT_EVENT
+    event_columns = tuple(
+        column
+        for column in artifact.frame_source.schema.point_table.columns
+        if column.role == READOUT_EVENT
     )
-    if len(event_axes) != 1 or event_axes[0].size != 1:
+    if len(event_columns) != 1 or set(event_columns[0].values) != {0}:
         raise ValueError(
-            "detection requires exactly one singleton READOUT_EVENT axis"
+            "detection requires exactly one singleton READOUT_EVENT point column"
         )
     selected_model = calibration_artifact.select_model(model_kind)
     return DetectionRequest(
         source.reference,
         calibration.reference,
         binding,
-        event_axes[0].axis_id,
+        event_columns[0].coordinate_id,
         selected_model.kind,
     )
 

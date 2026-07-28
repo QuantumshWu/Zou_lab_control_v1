@@ -64,7 +64,10 @@ class FigureFitRequest:
             raise TypeError("panel Fit source must own an immutable snapshot")
         if not isinstance(self.spec, FitSpec):
             raise TypeError("panel Fit request requires FitSpec")
-        if self.spec.input_schema_fingerprint != snapshot.ref.schema_fingerprint:
+        if (
+            self.spec.committed_transform.source_schema_fingerprint
+            != snapshot.ref.schema_fingerprint
+        ):
             raise ValueError("panel Fit spec belongs to another source schema")
 
 

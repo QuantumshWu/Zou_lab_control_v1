@@ -221,7 +221,7 @@ def _figure_window_factory(
             cached_base = None
             focused = grid.focused_typed_panel(
                 state.panel_index,
-                expected_selection=state.expected_selection,
+                expected_address=state.expected_address,
                 expected_intent=grid_intent,
             )
             front = render_session.render_front(
@@ -384,7 +384,7 @@ def open_figure_workbench(
     source,
     *,
     intent=None,
-    selection=None,
+    point_ordinals=None,
     preferences=None,
     fit_preparer=None,
     fit_executor=None,
@@ -441,7 +441,7 @@ def open_figure_workbench(
         )
     options = {
         "intent": intent,
-        "selection": selection,
+        "point_ordinals": point_ordinals,
         "preferences": preferences,
     }
     return open_workbench_window(

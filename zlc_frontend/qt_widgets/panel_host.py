@@ -29,7 +29,6 @@ from ..render import (
 from ..figure_outputs import (
     FigureAreaCommit,
     FigureCrossCommit,
-    HistogramValueRangeSelection,
     bind_area_data_commit,
     bind_cross_data_commit,
 )
@@ -258,7 +257,7 @@ class SinglePanelHost(QtWidgets.QWidget):
         if not isinstance(source_identity, SourceIdentity):
             raise TypeError("numeric Area requires a dataset source")
         selection = (
-            HistogramValueRangeSelection(*gesture.x_span)
+            gesture.x_span
             if isinstance(gesture, HistogramRangeGesture)
             else self.selection_for_curve_range_gesture(gesture)
         )

@@ -8,7 +8,7 @@ def open_occupancy_cell_workbench(
     cell_loader,
     reference,
     *,
-    selection=None,
+    address=None,
 ):
     from zlc_workbench.window_runtime import open_workbench_window
 
@@ -19,6 +19,6 @@ def open_occupancy_cell_workbench(
             navigation_loader,
             cell_loader,
             reference,
-            selection=selection,
+            address=address,
         )
     )

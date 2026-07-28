@@ -18,12 +18,13 @@ from zlc_neutral_atom.installation_config import (
     load_installation_config,
 )
 from zlc_data import (
-    AxisId,
+    AxisSourceRef,
     CommittedTransform,
     FitNumericPolicy,
     FitParameterConstraint,
     FitResultBatch,
     FitSpec,
+    HistogramSpec,
     Selection,
     fit_spec_for,
 )
@@ -86,6 +87,24 @@ if TYPE_CHECKING:
 
 
 _DEFAULT_FIT_GUI_TIMEOUT_SECONDS = 30.0
+
+
+def _fit_selection_authority(
+    transform: CommittedTransform,
+    *,
+    context: str,
+) -> Selection | None:
+    operations = tuple(transform.spec.operations)
+    if not operations:
+        return None
+    if len(operations) == 1 and isinstance(operations[0], Selection):
+        return operations[0]
+    if isinstance(operations[-1], HistogramSpec):
+        return None
+    raise ValueError(
+        f"{context} supports only identity or one range-preserving "
+        "Selection transform"
+    )
 
 
 class _ResourceCleanupError(RuntimeError):
@@ -388,7 +407,7 @@ class Experiment:
         *,
         model: str | None = None,
         committed_transform: CommittedTransform | None = None,
-        fit_axis_ids: tuple[AxisId, ...] | None = None,
+        independent_sources: tuple[AxisSourceRef, ...] | None = None,
         constraints: tuple[FitParameterConstraint, ...] = (),
         numeric_policy: FitNumericPolicy | None = None,
     ) -> FitExecution:
@@ -405,6 +424,10 @@ class Experiment:
 
             if spec is None:
                 assert model is not None
+                if independent_sources is None:
+                    raise ValueError(
+                        "model convenience Fit requires explicit independent_sources"
+                    )
                 schema = _project_final_dataset_source(
                     self._artifact_operations,
                     source,
@@ -414,7 +437,7 @@ class Experiment:
                     schema,
                     model,
                     committed_transform=committed_transform,
-                    fit_axis_ids=fit_axis_ids,
+                    independent_sources=tuple(independent_sources),
                     constraints=constraints,
                     numeric_policy=(
                         FitNumericPolicy()
@@ -427,7 +450,7 @@ class Experiment:
                 value is not None
                 for value in (
                     committed_transform,
-                    fit_axis_ids,
+                    independent_sources,
                     numeric_policy,
                 )
             ) or constraints:
@@ -457,7 +480,7 @@ class Experiment:
         fit_source: object,
         *,
         intent,
-        selection: Selection | None,
+        point_ordinals: tuple[int, ...] | None,
         preferences,
         artifact_output: str | None,
         selected_model: str | None = None,
@@ -486,7 +509,6 @@ class Experiment:
                 chosen_model = initial_fit_spec.model_id
             elif chosen_model != initial_fit_spec.model_id:
                 raise ValueError("selected model differs from the initial FitSpec")
-
         def source_schema(services):
             return _project_final_dataset_source(
                 self._artifact_operations,
@@ -503,7 +525,10 @@ class Experiment:
                 schema = source_schema(services)
             seed_spec = initial_fit_spec
             if seed_spec is not None:
-                if seed_spec.input_schema_fingerprint != schema.fingerprint:
+                if (
+                    seed_spec.committed_transform.source_schema_fingerprint
+                    != schema.fingerprint
+                ):
                     raise ValueError("initial FitSpec belongs to another source schema")
             from zlc_frontend import DataFigure, prepare_fit_authoring_options
 
@@ -576,11 +601,11 @@ class Experiment:
                 raise ValueError("saved Fit reopened against another source artifact")
             return admitted.result
 
-        def figure_factory(source, *, intent, selection, preferences):
+        def figure_factory(source, *, intent, point_ordinals, preferences):
             return self.figure(
                 source,
                 intent=intent,
-                selection=selection,
+                point_ordinals=point_ordinals,
                 preferences=preferences,
                 output=artifact_output,
             )
@@ -595,7 +620,7 @@ class Experiment:
                 source,
                 *,
                 intent,
-                selection,
+                point_ordinals,
                 preferences,
             ):
                 """Resolve the labelled display cell on the Figure worker."""
@@ -603,46 +628,33 @@ class Experiment:
                 if source != fit_source:
                     raise ValueError("direct Fit Figure loader received another source")
                 with _service_guard(self._services) as services:
-                    source_projection = _project_final_dataset_source(
-                        self._artifact_operations,
-                        fit_source,
-                        materialize=False,
-                    )
-                    schema = source_projection.schema
-                    seed_document, _datasets, _fit_result = (
-                        _project_figure(
-                            services,
-                            self._artifact_operations,
-                            source,
-                            intent=intent,
-                            selection=selection,
-                            preferences=preferences,
-                            artifact_output=None,
-                            materialize=False,
-                            preprojected_source=source_projection,
-                        )
-                    )
-                    from zlc_frontend.figure import (
-                        fit_single_panel_presentation,
-                    )
-
-                    display_selection, display_preferences = (
-                        fit_single_panel_presentation(
-                            schema,
-                            seed_document.layers[0].view,
-                            preferences,
-                        )
-                    )
-                    del schema, source_projection, seed_document
-                    return _data_figure_for_services(
+                    figure = _data_figure_for_services(
                         services,
                         self._artifact_operations,
                         source,
                         intent=intent,
-                        selection=display_selection,
-                        preferences=display_preferences,
+                        point_ordinals=point_ordinals,
+                        preferences=preferences,
                         artifact_output=None,
                     )
+                from zlc_frontend.fit_projection import (
+                    evaluated_figure_panels,
+                    panel_focus_address,
+                )
+
+                panels = evaluated_figure_panels(figure.evaluated)
+                if len(panels) <= 1:
+                    return figure
+                layer, cell, series_group = panels[0]
+                return figure.focused_typed_panel(
+                    0,
+                    expected_address=panel_focus_address(
+                        layer,
+                        cell,
+                        series_group,
+                    ),
+                    expected_intent=figure.document.layers[0].view.intent,
+                )
 
         from Zou_lab_control.workbench import open_figure_workbench
 
@@ -650,7 +662,7 @@ class Experiment:
             figure_factory,
             display_source,
             intent=intent,
-            selection=selection,
+            point_ordinals=point_ordinals,
             preferences=preferences,
             fit_preparer=prepare_fit,
             fit_executor=execute_fit,
@@ -681,17 +693,15 @@ class Experiment:
                 raise TypeError(
                     "committed_transform must be CommittedTransform or None"
                 )
-            operations = committed_transform.spec.operations
-            if len(operations) != 1 or not isinstance(operations[0], Selection):
-                raise ValueError(
-                    "fit_gui accepts only one range-preserving Selection transform"
-                )
-            initial_selection = operations[0]
+            initial_selection = _fit_selection_authority(
+                committed_transform,
+                context="fit_gui",
+            )
         return self._open_fit_capable_figure_gui(
             source,
             source,
             intent=None,
-            selection=None,
+            point_ordinals=None,
             preferences=None,
             artifact_output=None,
             selected_model=model,
@@ -706,7 +716,7 @@ class Experiment:
         source: object,
         *,
         intent: "ViewIntent | None" = None,
-        selection: Selection | None = None,
+        point_ordinals: tuple[int, ...] | None = None,
         preferences: "ViewPreferences | None" = None,
         output: str | None = None,
     ) -> "FigureDocument":
@@ -722,7 +732,7 @@ class Experiment:
                 self._artifact_operations,
                 source,
                 intent=intent,
-                selection=selection,
+                point_ordinals=point_ordinals,
                 preferences=preferences,
                 artifact_output=output,
                 materialize=False,
@@ -734,7 +744,7 @@ class Experiment:
         source: object,
         *,
         intent: "ViewIntent | None" = None,
-        selection: Selection | None = None,
+        point_ordinals: tuple[int, ...] | None = None,
         preferences: "ViewPreferences | None" = None,
         output: str | None = None,
     ) -> "DataFigure":
@@ -746,7 +756,7 @@ class Experiment:
                 self._artifact_operations,
                 source,
                 intent=intent,
-                selection=selection,
+                point_ordinals=point_ordinals,
                 preferences=preferences,
                 artifact_output=output,
             )
@@ -756,7 +766,7 @@ class Experiment:
         source: object | str | Path | None = None,
         *,
         intent: "ViewIntent | None" = None,
-        selection: Selection | None = None,
+        point_ordinals: tuple[int, ...] | None = None,
         preferences: "ViewPreferences | None" = None,
         output: str | None = None,
     ):
@@ -772,7 +782,7 @@ class Experiment:
                 name
                 for name, value in (
                     ("intent", intent),
-                    ("selection", selection),
+                    ("point_ordinals", point_ordinals),
                     ("preferences", preferences),
                     ("output", output),
                 )
@@ -787,143 +797,19 @@ class Experiment:
 
             return open_figure_viewer(path=source)
 
-        if (
-            isinstance(source, FitResultArtifactRef)
-            and intent is None
-            and selection is None
-            and preferences is None
-            and output is None
-        ):
-            experiment_services = self._services
-            session_thread_id = None
-            session_admitted = None
-            session_source = None
-            session_model = None
-
-            def load_saved_fit_grid_view(
-                reference,
-                *,
-                page_address,
-                cell_selection,
-            ):
-                nonlocal session_thread_id
-                nonlocal session_admitted
-                nonlocal session_source
-                nonlocal session_model
-                if reference != source:
-                    raise ValueError("saved-fit loader received another artifact ref")
-                worker_thread_id = threading.get_ident()
-                if session_thread_id is None:
-                    session_thread_id = worker_thread_id
-                elif session_thread_id != worker_thread_id:
-                    raise RuntimeError(
-                        "saved-fit view session changed worker thread"
-                    )
-                with _service_guard(experiment_services) as services:
-                    from zlc_frontend import FitGridModel
-
-                    if session_admitted is None:
-                        admitted = services.fit_repository.load(
-                            reference,
-                            artifacts=self._artifact_operations,
-                        )
-                        model = FitGridModel.from_result(
-                            reference.target_ref,
-                            admitted.result,
-                        )
-                        source_projection = _project_final_dataset_source(
-                            self._artifact_operations,
-                            admitted.source_artifact_ref,
-                            materialize=True,
-                        )
-                        session_admitted = admitted
-                        session_source = source_projection
-                        session_model = model
-                    else:
-                        admitted = session_admitted
-                        source_projection = session_source
-                        model = session_model
-                        assert source_projection is not None and model is not None
-                    if cell_selection is None:
-                        page = model.page(page_address)
-                        resolved_selection = page.selection
-                        resolved_preferences = page.preferences
-                        cell_summary = None
-                    else:
-                        if page_address is not None:
-                            raise ValueError(
-                                "saved-fit view cannot request a page and cell together"
-                            )
-                        model.resolve_selection(cell_selection)
-                        page = None
-                        resolved_selection = cell_selection
-                        resolved_preferences = model.focus_preferences()
-                        cell_summary = model.cell_summary(
-                            admitted.result,
-                            cell_selection,
-                        )
-                    figure = _data_figure_for_services(
-                        services,
-                        self._artifact_operations,
-                        admitted,
-                        intent=None,
-                        selection=resolved_selection,
-                        preferences=resolved_preferences,
-                        artifact_output=None,
-                        preprojected_source=source_projection,
-                    )
-                return figure, model, page, cell_summary
-
-            def open_saved_fit_refit(reference, cell_selection):
-                if reference != source:
-                    raise ValueError("saved-fit refit received another artifact ref")
-                admitted = session_admitted
-                model = session_model
-                if admitted is None or model is None:
-                    raise RuntimeError("saved-fit refit requires an admitted grid session")
-                model.resolve_selection(cell_selection)
-                result = admitted.result
-                fit_source = admitted.source_artifact_ref
-                transform = result.spec.committed_transform
-                authority_selection = None
-                if transform is not None:
-                    operations = transform.spec.operations
-                    if len(operations) != 1 or not isinstance(
-                        operations[0], Selection
-                    ):
-                        raise ValueError(
-                            "saved Fit refit requires its exact range-preserving "
-                            "Selection authority"
-                        )
-                    authority_selection = operations[0]
-                return self._open_fit_capable_figure_gui(
-                    fit_source,
-                    fit_source,
-                    intent=None,
-                    # The focused batch cell chooses only the displayed source panel.
-                    selection=cell_selection,
-                    preferences=model.focus_preferences(),
-                    artifact_output=None,
-                    selected_model=result.spec.model_id,
-                    initial_fit_spec=result.spec,
-                    initial_selection=authority_selection,
-                    open_fit=True,
+        if isinstance(source, FitResultArtifactRef):
+            with _service_guard(self._services) as services:
+                source = services.fit_repository.load(
+                    source,
+                    artifacts=self._artifact_operations,
                 )
-
-            from Zou_lab_control.workbench import open_saved_fit_grid_workbench
-
-            return open_saved_fit_grid_workbench(
-                load_saved_fit_grid_view,
-                open_saved_fit_refit,
-                source,
-            )
 
         if self._artifact_operations.can_project_dataset(source):
             return self._open_fit_capable_figure_gui(
                 source,
                 source,
                 intent=intent,
-                selection=selection,
+                point_ordinals=point_ordinals,
                 preferences=preferences,
                 artifact_output=output,
             )
@@ -931,17 +817,10 @@ class Experiment:
         if isinstance(source, (FitExecution, AdmittedFitResult)):
             result = source.result
             transform = result.spec.committed_transform
-            initial_authority_selection = None
-            if transform is not None:
-                operations = transform.spec.operations
-                if len(operations) != 1 or not isinstance(
-                    operations[0], Selection
-                ):
-                    raise ValueError(
-                        "Fit result analysis requires its exact range-preserving "
-                        "Selection authority"
-                    )
-                initial_authority_selection = operations[0]
+            initial_authority_selection = _fit_selection_authority(
+                transform,
+                context="Fit result analysis",
+            )
             if isinstance(source, AdmittedFitResult):
                 identity = (
                     f"{source.reference.repository_id}:"
@@ -955,7 +834,7 @@ class Experiment:
                 source,
                 fit_source,
                 intent=intent,
-                selection=selection,
+                point_ordinals=point_ordinals,
                 preferences=preferences,
                 artifact_output=output,
                 selected_model=result.spec.model_id,
@@ -966,17 +845,11 @@ class Experiment:
 
         from Zou_lab_control.workbench import open_figure_workbench
 
-        initial_identity = (
-            f"{source.repository_id}:{source.manifest_digest}"
-            if isinstance(source, FitResultArtifactRef)
-            else None
-        )
-
-        def figure_factory(current_source, *, intent, selection, preferences):
+        def figure_factory(current_source, *, intent, point_ordinals, preferences):
             return self.figure(
                 current_source,
                 intent=intent,
-                selection=selection,
+                point_ordinals=point_ordinals,
                 preferences=preferences,
                 output=output,
             )
@@ -985,9 +858,8 @@ class Experiment:
             figure_factory,
             source,
             intent=intent,
-            selection=selection,
+            point_ordinals=point_ordinals,
             preferences=preferences,
-            initial_fit_result_identity=initial_identity,
         )
 
     def close(self) -> None:

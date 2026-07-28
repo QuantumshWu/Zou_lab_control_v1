@@ -11,7 +11,8 @@ from zlc_data import (
     BlockId,
     DatasetSchema,
     MONITOR_HISTORY,
-    PointLayout,
+    PointColumn,
+    PointTable,
     REPEAT,
 )
 from zlc_storage import (
@@ -135,10 +136,10 @@ class CapturePreviewSpec:
         schema = self.dataset_edge.schema
         if (
             schema.repeat_axis.size != 1
-            or len(schema.point_axes) != 1
-            or schema.point_axes[0].role != MONITOR_HISTORY
-            or schema.point_axes[0].size != 1
-            or schema.point_layout != PointLayout.rect_c((1,))
+            or schema.point_table.row_count != 1
+            or len(schema.point_table.columns) != 1
+            or schema.point_table.columns[0].role != MONITOR_HISTORY
+            or schema.point_table.columns[0].values != (0,)
         ):
             raise ValueError(
                 "capture preview requires single-cell (R=1, MONITOR_HISTORY=1) storage"
@@ -172,16 +173,19 @@ class CapturePreviewSpec:
                 1,
                 (0,),
             ),
-            (
-                AxisSpec(
-                    AxisId("live-preview.history"),
-                    "Live preview history",
-                    MONITOR_HISTORY,
-                    1,
-                    (0,),
+            PointTable(
+                1,
+                (
+                    PointColumn(
+                        AxisId("live-preview.history"),
+                        "Live preview history",
+                        MONITOR_HISTORY,
+                        PointColumn.NUMERIC,
+                        (0,),
+                    ),
                 ),
             ),
-            PointLayout.rect_c((1,)),
+            None,
             contract.dataset_schema.cell_schema,
         )
         return FrozenDatasetEdge(schema, contract.dataset_edge.event_adapter)

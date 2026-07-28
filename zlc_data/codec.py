@@ -13,9 +13,16 @@ from zlc_storage.canonical import (
     exact_mapping as _exact_map,
 )
 
-from .axis import AxisId, AxisRoleId, AxisSpec, CoordinateFrameId
-from .layout import AxisLayout, AxisLayoutMode, PointLayout
-from .schema import DatasetSchema, ValueSchema
+from .axis import AxisId, AxisRoleId, AxisSourceRef, AxisSpec, CoordinateFrameId
+from .layout import AxisLayout, AxisLayoutMode
+from .schema import (
+    DatasetSchema,
+    GridTopology,
+    PointColumn,
+    PointTable,
+    ResolvedPointRows,
+    ValueSchema,
+)
 from .value import BlockId, DatasetRevision, DatasetRevisionRef, StreamGenerationId
 from .validity import (
     INVALID,
@@ -31,6 +38,11 @@ from .validity import (
 
 
 AXIS_SCHEMA = "zlc_data.AxisSpec"
+AXIS_SOURCE_REF_SCHEMA = "zlc_data.AxisSourceRef"
+POINT_COLUMN_SCHEMA = "zlc_data.PointColumn"
+POINT_TABLE_SCHEMA = "zlc_data.PointTable"
+GRID_TOPOLOGY_SCHEMA = "zlc_data.GridTopology"
+RESOLVED_POINT_ROWS_SCHEMA = "zlc_data.ResolvedPointRows"
 VALUE_SCHEMA = "zlc_data.ValueSchema"
 DATASET_SCHEMA = "zlc_data.DatasetSchema"
 DATASET_REVISION_REF_SCHEMA = "zlc_data.DatasetRevisionRef"
@@ -130,6 +142,206 @@ def axis_from_tree(tree: Any) -> AxisSpec:
     return axis
 
 
+def axis_source_ref_to_tree(source: AxisSourceRef) -> dict[str, Any]:
+    if not isinstance(source, AxisSourceRef):
+        raise TypeError("source must be AxisSourceRef")
+    return {
+        "schema": AXIS_SOURCE_REF_SCHEMA,
+        "kind": source.kind,
+        "axis_id": None if source.axis_id is None else source.axis_id.value,
+    }
+
+
+def axis_source_ref_from_tree(tree: Any) -> AxisSourceRef:
+    data = _exact_map(
+        tree,
+        {"schema", "kind", "axis_id"},
+        AXIS_SOURCE_REF_SCHEMA,
+    )
+    axis_id = data["axis_id"]
+    source = AxisSourceRef(
+        kind=data["kind"],
+        axis_id=None if axis_id is None else AxisId(axis_id),
+    )
+    if _encode(axis_source_ref_to_tree(source)) != _encode(tree):
+        raise ValueError("AxisSourceRef tree is typed but non-canonical")
+    return source
+
+
+def point_column_to_tree(column: PointColumn) -> dict[str, Any]:
+    if not isinstance(column, PointColumn):
+        raise TypeError("column must be PointColumn")
+    return {
+        "schema": POINT_COLUMN_SCHEMA,
+        "coordinate_id": column.coordinate_id.value,
+        "name": column.name,
+        "role": column.role.value,
+        "value_kind": column.value_kind,
+        "values": list(column.values),
+        "unit": column.unit,
+        "coordinate_frame": None
+        if column.coordinate_frame is None
+        else column.coordinate_frame.value,
+    }
+
+
+def point_column_from_tree(tree: Any) -> PointColumn:
+    data = _exact_map(
+        tree,
+        {
+            "schema",
+            "coordinate_id",
+            "name",
+            "role",
+            "value_kind",
+            "values",
+            "unit",
+            "coordinate_frame",
+        },
+        POINT_COLUMN_SCHEMA,
+    )
+    values = data["values"]
+    if not isinstance(values, list):
+        raise ValueError("PointColumn values must be a list")
+    frame = data["coordinate_frame"]
+    column = PointColumn(
+        coordinate_id=AxisId(data["coordinate_id"]),
+        name=data["name"],
+        role=AxisRoleId(data["role"]),
+        value_kind=data["value_kind"],
+        values=tuple(values),
+        unit=data["unit"],
+        coordinate_frame=None if frame is None else CoordinateFrameId(frame),
+    )
+    if _encode(point_column_to_tree(column)) != _encode(tree):
+        raise ValueError("PointColumn tree is typed but non-canonical")
+    return column
+
+
+def point_table_to_tree(table: PointTable) -> dict[str, Any]:
+    if not isinstance(table, PointTable):
+        raise TypeError("table must be PointTable")
+    return {
+        "schema": POINT_TABLE_SCHEMA,
+        "row_count": table.row_count,
+        "columns": [point_column_to_tree(column) for column in table.columns],
+    }
+
+
+def point_table_from_tree(tree: Any) -> PointTable:
+    data = _exact_map(
+        tree,
+        {"schema", "row_count", "columns"},
+        POINT_TABLE_SCHEMA,
+    )
+    columns = data["columns"]
+    if not isinstance(columns, list):
+        raise ValueError("PointTable columns must be a list")
+    table = PointTable(
+        row_count=data["row_count"],
+        columns=tuple(point_column_from_tree(column) for column in columns),
+    )
+    if _encode(point_table_to_tree(table)) != _encode(tree):
+        raise ValueError("PointTable tree is typed but non-canonical")
+    return table
+
+
+def grid_topology_to_tree(topology: GridTopology) -> dict[str, Any]:
+    if not isinstance(topology, GridTopology):
+        raise TypeError("topology must be GridTopology")
+    return {
+        "schema": GRID_TOPOLOGY_SCHEMA,
+        "dimension_ids": [axis_id.value for axis_id in topology.dimension_ids],
+        "coordinate_domains": [list(domain) for domain in topology.coordinate_domains],
+        "row_to_cell": [list(cell) for cell in topology.row_to_cell],
+    }
+
+
+def grid_topology_from_tree(tree: Any) -> GridTopology:
+    data = _exact_map(
+        tree,
+        {"schema", "dimension_ids", "coordinate_domains", "row_to_cell"},
+        GRID_TOPOLOGY_SCHEMA,
+    )
+    dimensions = data["dimension_ids"]
+    domains = data["coordinate_domains"]
+    mapping = data["row_to_cell"]
+    if not isinstance(dimensions, list):
+        raise ValueError("GridTopology dimension_ids must be a list")
+    if not isinstance(domains, list) or any(not isinstance(item, list) for item in domains):
+        raise ValueError("GridTopology coordinate_domains must be lists")
+    if not isinstance(mapping, list) or any(not isinstance(item, list) for item in mapping):
+        raise ValueError("GridTopology row_to_cell must be a list of lists")
+    topology = GridTopology(
+        dimension_ids=tuple(AxisId(item) for item in dimensions),
+        coordinate_domains=tuple(tuple(item) for item in domains),
+        row_to_cell=tuple(tuple(item) for item in mapping),
+    )
+    if _encode(grid_topology_to_tree(topology)) != _encode(tree):
+        raise ValueError("GridTopology tree is typed but non-canonical")
+    return topology
+
+
+def resolved_point_rows_to_tree(resolved: ResolvedPointRows) -> dict[str, Any]:
+    if not isinstance(resolved, ResolvedPointRows):
+        raise TypeError("resolved must be ResolvedPointRows")
+    return {
+        "schema": RESOLVED_POINT_ROWS_SCHEMA,
+        "surviving_ordinals": list(resolved.surviving_ordinals),
+        "group_sources": [axis_source_ref_to_tree(item) for item in resolved.group_sources],
+        "group_addresses": [list(item) for item in resolved.group_addresses],
+        "group_values": [list(item) for item in resolved.group_values],
+        "group_member_ordinals": [list(item) for item in resolved.group_member_ordinals],
+        "dropped_count": resolved.dropped_count,
+    }
+
+
+def resolved_point_rows_from_tree(tree: Any) -> ResolvedPointRows:
+    data = _exact_map(
+        tree,
+        {
+            "schema",
+            "surviving_ordinals",
+            "group_sources",
+            "group_addresses",
+            "group_values",
+            "group_member_ordinals",
+            "dropped_count",
+        },
+        RESOLVED_POINT_ROWS_SCHEMA,
+    )
+    sequence_fields = (
+        "surviving_ordinals",
+        "group_sources",
+        "group_addresses",
+        "group_values",
+        "group_member_ordinals",
+    )
+    if any(not isinstance(data[field], list) for field in sequence_fields):
+        raise ValueError("ResolvedPointRows sequence fields must be lists")
+    if any(
+        not isinstance(item, list)
+        for field in ("group_addresses", "group_values", "group_member_ordinals")
+        for item in data[field]
+    ):
+        raise ValueError("ResolvedPointRows group fields must be lists of lists")
+    resolved = ResolvedPointRows(
+        surviving_ordinals=tuple(data["surviving_ordinals"]),
+        group_sources=tuple(
+            axis_source_ref_from_tree(item) for item in data["group_sources"]
+        ),
+        group_addresses=tuple(tuple(item) for item in data["group_addresses"]),
+        group_values=tuple(tuple(item) for item in data["group_values"]),
+        group_member_ordinals=tuple(
+            tuple(item) for item in data["group_member_ordinals"]
+        ),
+        dropped_count=data["dropped_count"],
+    )
+    if _encode(resolved_point_rows_to_tree(resolved)) != _encode(tree):
+        raise ValueError("ResolvedPointRows tree is typed but non-canonical")
+    return resolved
+
+
 def value_schema_to_tree(schema: ValueSchema) -> dict[str, Any]:
     return {
         "schema": VALUE_SCHEMA,
@@ -178,8 +390,10 @@ def dataset_schema_to_tree(schema: DatasetSchema) -> dict[str, Any]:
     return {
         "schema": DATASET_SCHEMA,
         "repeat_axis": axis_to_tree(schema.repeat_axis),
-        "point_axes": [axis_to_tree(axis) for axis in schema.point_axes],
-        "point_layout": point_layout_to_tree(schema.point_layout),
+        "point_table": point_table_to_tree(schema.point_table),
+        "grid_topology": None
+        if schema.grid_topology is None
+        else grid_topology_to_tree(schema.grid_topology),
         "cell_schema": value_schema_to_tree(schema.cell_schema),
     }
 
@@ -187,17 +401,14 @@ def dataset_schema_to_tree(schema: DatasetSchema) -> dict[str, Any]:
 def dataset_schema_from_tree(tree: Any) -> DatasetSchema:
     data = _exact_map(
         tree,
-        {"schema", "repeat_axis", "point_axes", "point_layout", "cell_schema"},
+        {"schema", "repeat_axis", "point_table", "grid_topology", "cell_schema"},
         DATASET_SCHEMA,
     )
-    point_axes = data["point_axes"]
-    if not isinstance(point_axes, list):
-        raise ValueError("DatasetSchema point_axes must be a list")
-    layout = point_layout_from_tree(data["point_layout"])
+    topology = data["grid_topology"]
     schema = DatasetSchema(
         repeat_axis=axis_from_tree(data["repeat_axis"]),
-        point_axes=tuple(axis_from_tree(axis) for axis in point_axes),
-        point_layout=layout,
+        point_table=point_table_from_tree(data["point_table"]),
+        grid_topology=None if topology is None else grid_topology_from_tree(topology),
         cell_schema=value_schema_from_tree(data["cell_schema"]),
     )
     if _encode(dataset_schema_to_tree(schema)) != _encode(tree):
@@ -260,26 +471,6 @@ def axis_layout_from_tree(tree: Any) -> AxisLayout:
     return layout
 
 
-def point_layout_to_tree(layout: PointLayout) -> dict[str, Any]:
-    """Project a dataset PointLayout through the generic owner serializer."""
-
-    if not isinstance(layout, PointLayout):
-        raise TypeError("layout must be PointLayout")
-    return axis_layout_to_tree(layout)
-
-
-def point_layout_from_tree(tree: Any) -> PointLayout:
-    """Reconstruct the non-empty dataset specialization of AxisLayout."""
-
-    shape, mode, storage_size, mapping = _axis_layout_fields(tree)
-    if mode is AxisLayoutMode.PRODUCT:
-        raise ValueError("PointLayout cannot be PRODUCT")
-    layout = PointLayout(shape, mode, storage_size, mapping)
-    if _encode(point_layout_to_tree(layout)) != _encode(tree):
-        raise ValueError("PointLayout tree is non-canonical")
-    return layout
-
-
 def _axis_layout_fields(
     tree: Any,
 ) -> tuple[tuple[int, ...], AxisLayoutMode, int, tuple[tuple[int, ...], ...] | None]:
@@ -289,15 +480,15 @@ def _axis_layout_fields(
         "storage_size",
         "storage_to_multi",
     }:
-        raise ValueError("invalid PointLayout field set")
+        raise ValueError("invalid AxisLayout field set")
     shape_data = tree["logical_shape"]
     mapping_data = tree["storage_to_multi"]
     if not isinstance(shape_data, list):
-        raise ValueError("point layout logical_shape must be a list")
+        raise ValueError("axis layout logical_shape must be a list")
     if mapping_data is not None and not isinstance(mapping_data, list):
-        raise ValueError("point layout storage_to_multi must be a list or null")
+        raise ValueError("axis layout storage_to_multi must be a list or null")
     if mapping_data is not None and any(not isinstance(item, list) for item in mapping_data):
-        raise ValueError("point layout multi-indices must be lists")
+        raise ValueError("axis layout multi-indices must be lists")
     return (
         tuple(shape_data),
         AxisLayoutMode(tree["mode"]),

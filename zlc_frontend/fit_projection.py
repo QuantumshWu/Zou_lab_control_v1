@@ -1,14 +1,21 @@
 """Renderer-neutral Figure panel identity and Fit batch projection.
 
 This module owns the generic mapping from an evaluated Figure to logical
-panels, stable focus selections, titles, and sparse Fit rows.  Image-specific
+panels, stable source-aware focus addresses, titles, and sparse Fit rows.  Image-specific
 geometry remains in :mod:`fit_image_projection`; renderers consume this owner
 instead of importing an image module for generic Figure semantics.
 """
 
 from __future__ import annotations
 
-from zlc_data import AxisId, FitResultBatch, IndexSelection, SCALAR_AXIS, Selection
+from numbers import Integral
+
+from zlc_data import (
+    AxisSourceRef,
+    FitResultBatch,
+    SCALAR_AXIS,
+    exact_integer_text,
+)
 
 from .figure import (
     AxisAddress,
@@ -20,7 +27,13 @@ from .figure import (
     EvaluatedSeries,
     FigureDocument,
 )
-from .fit_grid import coordinate_label
+
+def coordinate_label(value: object) -> str:
+    """Return one stable human-readable coordinate value."""
+
+    if not isinstance(value, bool) and isinstance(value, Integral):
+        return exact_integer_text(value)
+    return str(value)
 
 
 def address_label(
@@ -32,14 +45,21 @@ def address_label(
         if isinstance(item, AxisAddress):
             labels.append(f"{item.axis_name}={coordinate}")
             continue
-        labels.append(f"{item.axis_id.value}={coordinate}")
+        source = item.source
+        label = source.kind.lower() if source.axis_id is None else source.axis_id.value
+        labels.append(f"{label}={coordinate}")
     return ", ".join(labels)
 
 
 def reduction_label(reductions) -> str:
     labels = []
     for reduction in reductions:
-        axes = ",".join(axis_id.value for axis_id in reduction.axis_ids)
+        axes = ",".join(
+            source.kind.lower()
+            if source.axis_id is None
+            else source.axis_id.value
+            for source in reduction.sources
+        )
         contributors = coordinate_label(reduction.minimum_contributors)
         if reduction.minimum_contributors != reduction.maximum_contributors:
             contributors = (
@@ -72,47 +92,38 @@ def evaluated_figure_panels(evaluated: EvaluatedFigureData):
     return tuple(iter_evaluated_figure_panels(evaluated))
 
 
-def fit_panel_selection(
+def canonical_panel_focus_address(
+    value: object,
+) -> tuple[tuple[AxisSourceRef, int], ...]:
+    """Validate a panel address; the empty tuple identifies the sole panel."""
+
+    entries = tuple(value)
+    prepared = []
+    for entry in entries:
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            raise TypeError("panel focus address entries must be (source, index) tuples")
+        source, index = entry
+        if not isinstance(source, AxisSourceRef):
+            raise TypeError("panel focus address source must be AxisSourceRef")
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise ValueError("panel focus address index must be non-negative")
+        prepared.append((source, index))
+    if len({source for source, _index in prepared}) != len(prepared):
+        raise ValueError("panel focus address cannot repeat a source")
+    return tuple(sorted(prepared, key=lambda item: item[0]))
+
+
+def panel_focus_address(
     layer: EvaluatedLayer,
     cell: EvaluatedCell,
     series_group: tuple[EvaluatedSeries, ...],
-    result: FitResultBatch | None,
-) -> Selection | None:
-    expected = (
-        set()
-        if result is None
-        else {axis.axis_id for axis in result.batch_axis_specs}
-    )
-    addresses = [*cell.facet_address]
-    if len(series_group) == 1:
-        addresses.extend(series_group[0].batch_address)
-    addresses.extend(layer.resolutions)
-    by_axis = {}
-    for address in addresses:
-        if expected and address.axis_id not in expected:
-            continue
-        incumbent = by_axis.setdefault(address.axis_id, address.index)
-        if incumbent != address.index:
-            raise RuntimeError("figure panel addresses disagree")
-    terms = tuple(
-        IndexSelection(axis_id, index)
-        for axis_id, index in sorted(
-            by_axis.items(),
-            key=lambda item: item[0].value,
-        )
-    )
-    return None if not terms else Selection(terms)
-
-
-def panel_focus_selection(
-    layer: EvaluatedLayer,
-    cell: EvaluatedCell,
-    series_group: tuple[EvaluatedSeries, ...],
-) -> Selection | None:
-    """Return stable logical cell identity for live overview focus.
+) -> tuple[tuple[AxisSourceRef, int], ...]:
+    """Return one canonical source-aware logical panel address.
 
     Dynamic resolution facts identify the evaluated snapshot, not the cell;
-    including them would make focus stale whenever a live source advanced.
+    including them would make focus stale whenever a live source advanced. A
+    source with no AxisId (notably POINT_ROWS) is still fully identified here;
+    exact physical row membership is resolved later by the Figure contract.
     """
 
     if not isinstance(layer, EvaluatedLayer):
@@ -126,19 +137,12 @@ def panel_focus_selection(
     addresses = [*cell.facet_address]
     if len(series_group) == 1:
         addresses.extend(series_group[0].batch_address)
-    by_axis = {}
+    by_source: dict[AxisSourceRef, int] = {}
     for address in addresses:
-        incumbent = by_axis.setdefault(address.axis_id, address.index)
+        incumbent = by_source.setdefault(address.source, address.index)
         if incumbent != address.index:
             raise RuntimeError("figure panel addresses disagree")
-    terms = tuple(
-        IndexSelection(axis_id, index)
-        for axis_id, index in sorted(
-            by_axis.items(),
-            key=lambda item: item[0].value,
-        )
-    )
-    return None if not terms else Selection(terms)
+    return canonical_panel_focus_address(by_source.items())
 
 
 def figure_panel_title(
@@ -170,36 +174,45 @@ def fit_batch_multi_index(
     cell: EvaluatedCell,
     series: EvaluatedSeries,
     *,
-    projected_axis_ids: tuple[AxisId, ...] = (),
+    projected_sources: tuple[AxisSourceRef, ...] = (),
 ) -> tuple[int, ...]:
     """Map one exact displayed series onto the Fit batch's logical address."""
 
     if not isinstance(result, FitResultBatch):
         raise TypeError("result must be FitResultBatch")
     addresses = (*cell.facet_address, *series.batch_address)
-    by_axis = {item.axis_id: item.index for item in addresses}
-    if len(by_axis) != len(addresses):
-        raise RuntimeError("figure batch/facet addresses contain a duplicate axis")
+    by_source = {item.source: item.index for item in addresses}
+    if len(by_source) != len(addresses):
+        raise RuntimeError("figure batch/facet addresses contain a duplicate source")
     for resolution in layer.resolutions:
-        incumbent = by_axis.setdefault(resolution.axis_id, resolution.index)
+        incumbent = by_source.setdefault(resolution.source, resolution.index)
         if incumbent != resolution.index:
             raise RuntimeError("figure address and resolution disagree")
-    expected = {axis.axis_id for axis in result.batch_axis_specs}
-    projected_axis_ids = tuple(projected_axis_ids)
-    projected = set(projected_axis_ids)
-    if len(projected) != len(projected_axis_ids) or any(
-        not isinstance(axis_id, AxisId) for axis_id in projected
+    expected = set(result.spec.batch_sources)
+    projected_sources = tuple(projected_sources)
+    projected = set(projected_sources)
+    if len(projected) != len(projected_sources) or any(
+        not isinstance(source, AxisSourceRef) for source in projected
     ):
-        raise ValueError("projected_axis_ids must contain unique AxisId values")
-    extras = set(by_axis) - expected - projected - {SCALAR_AXIS.axis_id}
+        raise ValueError("projected_sources must contain unique AxisSourceRef values")
+    extras = (
+        set(by_source)
+        - expected
+        - projected
+        - {AxisSourceRef.tensor(SCALAR_AXIS.axis_id)}
+    )
     if extras:
         raise RuntimeError(
             f"figure resolved non-batch fit axes: {sorted(map(str, extras))}"
         )
     multi = []
-    for axis in result.batch_axis_specs:
-        if axis.axis_id in by_axis:
-            multi.append(by_axis[axis.axis_id])
+    for source, axis in zip(
+        result.spec.batch_sources,
+        result.batch_axis_specs,
+        strict=True,
+    ):
+        if source in by_source:
+            multi.append(by_source[source])
         elif axis.size == 1:
             multi.append(0)
         else:
@@ -215,7 +228,7 @@ def fit_batch_storage_index(
     cell: EvaluatedCell,
     series: EvaluatedSeries,
     *,
-    projected_axis_ids: tuple[AxisId, ...] = (),
+    projected_sources: tuple[AxisSourceRef, ...] = (),
 ) -> int | None:
     """Resolve one displayed cell to its authoritative sparse Fit row."""
 
@@ -224,7 +237,7 @@ def fit_batch_storage_index(
         layer,
         cell,
         series,
-        projected_axis_ids=projected_axis_ids,
+        projected_sources=projected_sources,
     )
     try:
         return result.batch_layout.storage_index(multi)
@@ -234,12 +247,13 @@ def fit_batch_storage_index(
 
 __all__ = [
     "address_label",
+    "canonical_panel_focus_address",
+    "coordinate_label",
     "evaluated_figure_panels",
     "figure_panel_title",
     "fit_batch_multi_index",
     "fit_batch_storage_index",
-    "fit_panel_selection",
     "iter_evaluated_figure_panels",
-    "panel_focus_selection",
+    "panel_focus_address",
     "reduction_label",
 ]

@@ -23,7 +23,6 @@ from zlc_storage import (
 
 from zlc_data import (
     BlockId,
-    AxisLayoutMode,
     AxisSpec,
     CellValidity,
     ComponentValidity,
@@ -35,9 +34,9 @@ from zlc_data import (
     Invalid,
     OwnedSnapshot,
     MONITOR_HISTORY,
+    PointTable,
     READOUT_EVENT,
     StreamGenerationId,
-    PointLayout,
     REPEAT,
     Valid,
     ValidityMode,
@@ -45,7 +44,7 @@ from zlc_data import (
     ValueSchema,
     axis_to_tree,
     expand_component_validity,
-    point_layout_to_tree,
+    point_table_to_tree,
 )
 
 from ._failure import record_secondary_failure
@@ -197,10 +196,10 @@ def _is_deeply_immutable(
 @dataclass(frozen=True, order=True, slots=True)
 class DatasetCellAddress:
     repeat_index: int
-    point_storage_index: int
+    point_ordinal: int
 
     def __post_init__(self) -> None:
-        for field in ("repeat_index", "point_storage_index"):
+        for field in ("repeat_index", "point_ordinal"):
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
                 raise ValueError(f"{field} must be a non-negative integer")
@@ -237,8 +236,8 @@ def _validated_cell_permutation(
 ) -> Iterator[tuple[int, DatasetCellAddress, int]]:
     """Yield one complete typed permutation while holding only a one-byte seen map."""
 
-    total = schema.repeat_axis.size * schema.point_layout.storage_size
-    point_count = schema.point_layout.storage_size
+    total = schema.repeat_axis.size * schema.point_table.row_count
+    point_count = schema.point_table.row_count
     seen = bytearray(total)
     count = 0
     for cell in cells:
@@ -248,10 +247,10 @@ def _validated_cell_permutation(
             raise ValueError("cell permutation length differs from DatasetSchema")
         if (
             cell.repeat_index >= schema.repeat_axis.size
-            or cell.point_storage_index >= point_count
+            or cell.point_ordinal >= point_count
         ):
             raise ValueError("cell permutation contains an out-of-domain cell")
-        linear = cell.repeat_index * point_count + cell.point_storage_index
+        linear = cell.repeat_index * point_count + cell.point_ordinal
         if seen[linear]:
             raise ValueError("cell permutation repeats a dataset cell")
         seen[linear] = 1
@@ -276,7 +275,7 @@ def _update_ordered_cell_hasher(digest, cell: DatasetCellAddress) -> None:
         raise TypeError("cells must contain DatasetCellAddress values")
     digest.update(str(cell.repeat_index).encode("ascii"))
     digest.update(b",")
-    digest.update(str(cell.point_storage_index).encode("ascii"))
+    digest.update(str(cell.point_ordinal).encode("ascii"))
     digest.update(b";")
 
 
@@ -352,28 +351,21 @@ def _dataset_consumer_contract_digest_from_schedule(
 
 @dataclass(frozen=True)
 class DatasetCellKeyContract:
-    """Join-key domain containing sampling axes/layout, never cell values."""
+    """Join-key domain containing repeat and point rows, never cell values."""
 
     repeat_axis: AxisSpec
-    point_axes: tuple[AxisSpec, ...]
-    point_layout: PointLayout
+    point_table: PointTable
     _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.repeat_axis, AxisSpec) or self.repeat_axis.role != REPEAT:
             raise ValueError("repeat_axis must be an AxisSpec with role 'repeat'")
-        axes = tuple(self.point_axes)
-        if not axes or any(not isinstance(axis, AxisSpec) for axis in axes):
-            raise ValueError("point_axes must contain AxisSpec values")
-        if len({axis.axis_id for axis in axes}) != len(axes):
-            raise ValueError("point_axes must have unique AxisId values")
-        if self.repeat_axis.axis_id in {axis.axis_id for axis in axes}:
-            raise ValueError("repeat and point axes must be distinct")
-        if not isinstance(self.point_layout, PointLayout):
-            raise TypeError("point_layout must be PointLayout")
-        if self.point_layout.logical_shape != tuple(axis.size for axis in axes):
-            raise ValueError("point_layout shape differs from point_axes")
-        object.__setattr__(self, "point_axes", axes)
+        if not isinstance(self.point_table, PointTable):
+            raise TypeError("point_table must be PointTable")
+        if self.repeat_axis.axis_id in {
+            column.coordinate_id for column in self.point_table.columns
+        }:
+            raise ValueError("repeat and point coordinate ids must be distinct")
         object.__setattr__(
             self,
             "_fingerprint",
@@ -381,8 +373,7 @@ class DatasetCellKeyContract:
                 {
                     "contract": "zlc_neutral_atom.DatasetCellKeyContract",
                     "repeat_axis": axis_to_tree(self.repeat_axis),
-                    "point_axes": [axis_to_tree(axis) for axis in axes],
-                    "point_layout": point_layout_to_tree(self.point_layout),
+                    "point_table": point_table_to_tree(self.point_table),
                 }
             ),
         )
@@ -391,7 +382,7 @@ class DatasetCellKeyContract:
     def from_schema(cls, schema: DatasetSchema) -> "DatasetCellKeyContract":
         if not isinstance(schema, DatasetSchema):
             raise TypeError("schema must be DatasetSchema")
-        return cls(schema.repeat_axis, schema.point_axes, schema.point_layout)
+        return cls(schema.repeat_axis, schema.point_table)
 
     @property
     def fingerprint(self) -> str:
@@ -402,9 +393,53 @@ class DatasetCellKeyContract:
             raise TypeError("join key must be DatasetCellAddress")
         if key.repeat_index >= self.repeat_axis.size:
             raise IndexError("join key repeat index is outside DatasetSchema")
-        if key.point_storage_index >= self.point_layout.storage_size:
-            raise IndexError("join key point index is outside PointLayout")
-        return DatasetCellAddress(key.repeat_index, key.point_storage_index)
+        if key.point_ordinal >= self.point_table.row_count:
+            raise IndexError("join key point ordinal is outside PointTable")
+        return DatasetCellAddress(key.repeat_index, key.point_ordinal)
+
+
+def _append_window_geometry(point_table: PointTable) -> tuple[int, int]:
+    """Validate the explicit history/event row contract used by append windows."""
+
+    columns = point_table.columns
+    if len(columns) not in (1, 2) or columns[0].role != MONITOR_HISTORY:
+        raise DatasetError(
+            "append_window requires MONITOR_HISTORY rows, optionally paired "
+            "with one READOUT_EVENT column"
+        )
+    if len(columns) == 2 and columns[1].role != READOUT_EVENT:
+        raise DatasetError(
+            "append_window's second point column must be READOUT_EVENT"
+        )
+    history = columns[0].values
+    if len(columns) == 1:
+        if history != tuple(range(point_table.row_count)):
+            raise DatasetError(
+                "append_window MONITOR_HISTORY values must be authored slot ordinals"
+            )
+        return point_table.row_count, 1
+
+    group_size = 0
+    while group_size < len(history) and history[group_size] == 0:
+        group_size += 1
+    if group_size == 0 or point_table.row_count % group_size:
+        raise DatasetError("append_window history/event rows are not rectangular groups")
+    history_slots = point_table.row_count // group_size
+    expected_history = tuple(
+        slot for slot in range(history_slots) for _event in range(group_size)
+    )
+    event_template = columns[1].values[:group_size]
+    expected_events = event_template * history_slots
+    if (
+        history != expected_history
+        or any(value is None for value in event_template)
+        or len(set(event_template)) != group_size
+        or columns[1].values != expected_events
+    ):
+        raise DatasetError(
+            "append_window rows must be ordered history-slot by readout-event"
+        )
+    return history_slots, group_size
 
 
 _DATASET_CELL_SCHEDULE_TOKEN = object()
@@ -463,7 +498,7 @@ class DatasetCellSchedule:
             raise TypeError("schema must be DatasetSchema")
         key_fingerprint = DatasetCellKeyContract.from_schema(schema).fingerprint
         repeat_count = schema.repeat_axis.size
-        point_count = schema.point_layout.storage_size
+        point_count = schema.point_table.row_count
         total = repeat_count * point_count
         if total <= 0x1_0000_0000:
             integer_width = 4
@@ -535,7 +570,7 @@ class DatasetCellSchedule:
             DatasetCellKeyContract.from_schema(schema).fingerprint
             != self._key_contract_fingerprint
             or schema.repeat_axis.size != self._repeat_count
-            or schema.point_layout.storage_size != self._point_count
+            or schema.point_table.row_count != self._point_count
         ):
             raise DatasetError("cell schedule belongs to a different DatasetSchema")
 
@@ -910,7 +945,7 @@ class MonitorDatasetSnapshot:
             raise TypeError("coverage must be MonitorCoverage")
         total = (
             self.snapshot.block.schema.repeat_axis.size
-            * self.snapshot.block.schema.point_layout.storage_size
+            * self.snapshot.block.schema.point_table.row_count
         )
         metadata = tuple(self.cell_metadata)
         references = tuple(self.event_refs)
@@ -1416,7 +1451,7 @@ class DatasetBuilder(Generic[PayloadT]):
         self._cell_schedule = edge.cell_schedule
         self._join_plan_digest = edge.schedule_digest
         self._metadata_contract_fingerprint = edge.metadata_contract_fingerprint
-        total_cells = self.schema.repeat_axis.size * self.schema.point_layout.storage_size
+        total_cells = self.schema.repeat_axis.size * self.schema.point_table.row_count
         reserved_events = source.end_sequence - source.start_sequence
         if reserved_events != total_cells:
             raise DatasetError("exact reservation length must equal DatasetSchema cell count")
@@ -1501,7 +1536,7 @@ class DatasetBuilder(Generic[PayloadT]):
                     f"event join key {address} differs from frozen plan key "
                     f"{expected_address} at sequence {envelope.sequence}"
                 )
-            cell = (address.repeat_index, address.point_storage_index)
+            cell = (address.repeat_index, address.point_ordinal)
             _write_cell(
                 cell,
                 value,
@@ -1516,8 +1551,8 @@ class DatasetBuilder(Generic[PayloadT]):
             self._ordered_event_metadata[schedule_index] = metadata
             self._ordered_metadata_hasher.update(metadata_digest)
             flat_cell = (
-                address.repeat_index * self.schema.point_layout.storage_size
-                + address.point_storage_index
+                address.repeat_index * self.schema.point_table.row_count
+                + address.point_ordinal
             )
             self._cell_metadata[flat_cell] = metadata
             self._condition.notify_all()
@@ -1553,7 +1588,7 @@ class DatasetBuilder(Generic[PayloadT]):
             contract = self.schema.cell_schema.validity_contract
             for ordinal in range(after.value, self._revision):
                 address = self._cell_schedule.cell_at(ordinal)
-                cell = (address.repeat_index, address.point_storage_index)
+                cell = (address.repeat_index, address.point_ordinal)
                 validity = (
                     (Valid() if bool(self._validity[cell]) else Invalid())
                     if contract.mode is ValidityMode.VALUE
@@ -1875,57 +1910,17 @@ class MonitorDataset(Generic[PayloadT]):
             edge.validate_payload_stream(self._source)
             if self.schema.repeat_axis.size != 1:
                 raise DatasetError("append_window requires a single repeat storage row")
-            point_axes = self.schema.point_axes
-            history_axis = point_axes[0] if point_axes else None
-            event_axis = point_axes[1] if len(point_axes) == 2 else None
-            history_coordinates_are_slots = (
-                history_axis is not None
-                and (
-                    (
-                        history_axis.coordinates is None
-                        and history_axis.index_origin == 0
-                    )
-                    or (
-                        history_axis.coordinates is not None
-                        and all(
-                            coordinate == index
-                            for index, coordinate in enumerate(
-                                history_axis.coordinates
-                            )
-                        )
-                    )
-                )
-            )
-            if (
-                history_axis is None
-                or history_axis.role != MONITOR_HISTORY
-                or len(point_axes) not in (1, 2)
-                or (
-                    event_axis is not None
-                    and event_axis.role != READOUT_EVENT
-                )
-                or self.schema.point_layout.mode is not AxisLayoutMode.RECT_C
-                or self.schema.point_layout.logical_shape
-                != (
-                    (history_axis.size,)
-                    if event_axis is None
-                    else (history_axis.size, event_axis.size)
-                )
-                or not history_coordinates_are_slots
-            ):
-                raise DatasetError(
-                    "append_window requires dense MONITOR_HISTORY storage, "
-                    "optionally followed by one READOUT_EVENT axis"
-                )
-            self._append_history_slots = history_axis.size
-            self._append_group_size = 1 if event_axis is None else event_axis.size
+            (
+                self._append_history_slots,
+                self._append_group_size,
+            ) = _append_window_geometry(self.schema.point_table)
         else:
             edge.validate_stream(self._source)
             self._append_history_slots = 0
             self._append_group_size = 0
         self.stream_id = self._source.stream_id
         self.generation = self._source.generation
-        total_cells = self.schema.repeat_axis.size * self.schema.point_layout.storage_size
+        total_cells = self.schema.repeat_axis.size * self.schema.point_table.row_count
         source._claim_consumer(self)
         try:
             self._lock = threading.RLock()
@@ -2072,7 +2067,7 @@ class MonitorDataset(Generic[PayloadT]):
                 validity_mask = _value_validity_mask(self.schema, value.validity)
                 total_cells = (
                     self.schema.repeat_axis.size
-                    * self.schema.point_layout.storage_size
+                    * self.schema.point_table.row_count
                 )
                 values = np.zeros(
                     self.schema.physical_shape,
@@ -2289,7 +2284,7 @@ class MonitorDataset(Generic[PayloadT]):
                     self._clear_locked()
                 cell = (
                     expected_address.repeat_index,
-                    expected_address.point_storage_index,
+                    expected_address.point_ordinal,
                 )
                 values = self._values
                 written = self._written
@@ -2308,7 +2303,7 @@ class MonitorDataset(Generic[PayloadT]):
                 written,
                 validity,
             )
-            flat_cell = cell[0] * self.schema.point_layout.storage_size + cell[1]
+            flat_cell = cell[0] * self.schema.point_table.row_count + cell[1]
             cell_metadata[flat_cell] = metadata
             event_refs[flat_cell] = envelope.ref
             if self._cycle_schedule is None:
@@ -2336,7 +2331,7 @@ class MonitorDataset(Generic[PayloadT]):
             selected = self._select_current_ref_locked(ref)
             if self._cycle_schedule is None:
                 order = self._append_order_locked()
-                canonical = tuple(range(self.schema.point_layout.storage_size))
+                canonical = tuple(range(self.schema.point_table.row_count))
                 if order == canonical:
                     values = self._values
                     written = self._written

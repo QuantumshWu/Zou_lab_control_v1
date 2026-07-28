@@ -14,7 +14,7 @@ from functools import cached_property
 import math
 from typing import Any, Mapping
 
-from zlc_data import SCAN_POINT, AxisId, AxisSpec, PointLayout
+from zlc_data import SCAN_POINT, AxisId, PointColumn, PointTable
 from zlc_pulse import (
     PulseDocument,
     pulse_document_from_tree,
@@ -81,161 +81,79 @@ class ApiSegmentTable:
                     raise TypeError("API segment values must be numeric")
                 if isinstance(value, float) and not math.isfinite(value):
                     raise ValueError("API segment values must be finite")
-        if len(set(rows)) != len(rows):
-            raise ValueError("API segment rows must identify unique coordinates")
         object.__setattr__(self, "columns", columns)
         object.__setattr__(self, "rows", rows)
 
 
-@dataclass(frozen=True)
-class ScanPointTable:
-    """One lossless mapping from frozen pulse rows to named scan axes."""
+def _point_table_from_rows(
+    *,
+    columns: tuple[str, ...],
+    rows: tuple[tuple[int | float, ...], ...],
+    labels: dict[str, str],
+    units: dict[str, str],
+) -> PointTable:
+    """Freeze authored pulse rows directly; correlated columns never Cartesianize."""
 
-    point_axes: tuple[AxisSpec, ...]
-    point_layout: PointLayout
-
-    def __post_init__(self) -> None:
-        axes = tuple(self.point_axes)
-        if not axes or any(
-            not isinstance(axis, AxisSpec) or axis.role != SCAN_POINT
-            for axis in axes
-        ):
-            raise ValueError("point_axes must contain SCAN_POINT AxisSpec values")
-        if len({axis.axis_id for axis in axes}) != len(axes):
-            raise ValueError("scan point axis ids must be unique")
-        if any(axis.coordinates is None for axis in axes):
-            raise ValueError("scan point axes must freeze explicit physical coordinates")
-        if any(
-            not isinstance(value, (int, float))
-            for axis in axes
-            for value in axis.coordinates or ()
-        ):
-            raise TypeError("scan point coordinates must be numeric pulse values")
-        if not isinstance(self.point_layout, PointLayout):
-            raise TypeError("point_layout must be PointLayout")
-        if self.point_layout.logical_shape != tuple(axis.size for axis in axes):
-            raise ValueError("scan point layout shape differs from its named axes")
-        if len(set(self.rows)) != self.point_layout.storage_size:
-            raise ValueError("scan point rows must identify unique physical coordinates")
-        object.__setattr__(self, "point_axes", axes)
-
-    @property
-    def rows(self) -> tuple[tuple[int | float, ...], ...]:
-        """Reconstruct physical rows from the single axes/layout authority."""
-
-        return tuple(
-            tuple(
-                axis.coordinate_at(index)
-                for axis, index in zip(
-                    self.point_axes,
-                    self.point_layout.multi_index(storage_index),
-                )
+    if not rows or any(len(row) != len(columns) for row in rows):
+        raise ValueError("scan rows must be a non-empty rectangular table")
+    return PointTable(
+        len(rows),
+        tuple(
+            PointColumn(
+                _scan_axis_id(parameter_id),
+                labels[parameter_id],
+                SCAN_POINT,
+                PointColumn.NUMERIC,
+                tuple(row[position] for row in rows),
+                units[parameter_id],
             )
-            for storage_index in range(self.point_layout.storage_size)
-        )
+            for position, parameter_id in enumerate(columns)
+        ),
+    )
 
-    @classmethod
-    def from_pulse_document(cls, document: PulseDocument) -> "ScanPointTable":
-        """Derive axes and sparse/rectangular layout solely from declared rows."""
 
-        if not isinstance(document, PulseDocument):
-            raise TypeError("document must be PulseDocument")
-        table = document.scan_table
-        if table is None or not document.scan_parameters:
-            raise ValueError("a scan point table requires declared parameters and rows")
-        parameters = document.scan_parameter_by_id
-        return cls._from_physical_rows(
-            columns=table.columns,
-            rows=table.rows,
-            labels={
-                parameter_id: parameters[parameter_id].label or parameter_id
-                for parameter_id in table.columns
-            },
-            units={
-                parameter_id: parameters[parameter_id].unit
-                for parameter_id in table.columns
-            },
-        )
+def _point_table_from_pulse_document(document: PulseDocument) -> PointTable:
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    table = document.scan_table
+    if table is None or not document.scan_parameters:
+        raise ValueError("a scan point table requires declared parameters and rows")
+    parameters = document.scan_parameter_by_id
+    return _point_table_from_rows(
+        columns=table.columns,
+        rows=table.rows,
+        labels={
+            parameter_id: parameters[parameter_id].label or parameter_id
+            for parameter_id in table.columns
+        },
+        units={
+            parameter_id: parameters[parameter_id].unit
+            for parameter_id in table.columns
+        },
+    )
 
-    @classmethod
-    def from_api_segment_table(
-        cls,
-        document: PulseDocument,
-        table: ApiSegmentTable,
-    ) -> "ScanPointTable":
-        """Derive named axes from declared API roles and explicit physical rows."""
 
-        if not isinstance(document, PulseDocument):
-            raise TypeError("document must be PulseDocument")
-        if not isinstance(table, ApiSegmentTable):
-            raise TypeError("table must be ApiSegmentTable")
-        expected = tuple(
-            parameter.parameter_id for parameter in document.api_parameters
-        )
-        if table.columns != expected:
-            raise ValueError(
-                "API segment columns must match declared API parameter order"
-            )
-        parameters = document.api_parameter_by_id
-        return cls._from_physical_rows(
-            columns=table.columns,
-            rows=table.rows,
-            labels={parameter_id: parameter_id for parameter_id in table.columns},
-            units={
-                parameter_id: parameters[parameter_id].unit
-                for parameter_id in table.columns
-            },
-        )
-
-    @classmethod
-    def _from_physical_rows(
-        cls,
-        *,
-        columns: tuple[str, ...],
-        rows: tuple[tuple[int | float, ...], ...],
-        labels: dict[str, str],
-        units: dict[str, str],
-    ) -> "ScanPointTable":
-        physical_rows = rows
-        coordinates: list[tuple[int | float, ...]] = []
-        coordinate_indices: list[dict[int | float, int]] = []
-        for column_index, _parameter_id in enumerate(columns):
-            ordered: dict[int | float, int] = {}
-            for row in physical_rows:
-                value = row[column_index]
-                if value not in ordered:
-                    ordered[value] = len(ordered)
-            coordinate_indices.append(ordered)
-            coordinates.append(tuple(ordered))
-
-        logical_rows = tuple(
-            tuple(
-                coordinate_indices[column_index][value]
-                for column_index, value in enumerate(row)
-            )
-            for row in physical_rows
-        )
-        axes = tuple(
-            AxisSpec(
-                axis_id=_scan_axis_id(parameter_id),
-                name=labels[parameter_id],
-                role=SCAN_POINT,
-                size=len(coordinates[column_index]),
-                coordinates=coordinates[column_index],
-                unit=units[parameter_id],
-            )
-            for column_index, parameter_id in enumerate(columns)
-        )
-        result = cls(
-            axes,
-            PointLayout.from_mapping(
-                tuple(axis.size for axis in axes),
-                logical_rows,
-            ),
-        )
-        if result.rows != physical_rows:
-            raise ValueError("named scan axes/layout do not reproduce frozen pulse rows")
-        return result
+def _point_table_from_api_segments(
+    document: PulseDocument,
+    table: ApiSegmentTable,
+) -> PointTable:
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    if not isinstance(table, ApiSegmentTable):
+        raise TypeError("table must be ApiSegmentTable")
+    expected = tuple(parameter.parameter_id for parameter in document.api_parameters)
+    if table.columns != expected:
+        raise ValueError("API segment columns must match declared parameter order")
+    parameters = document.api_parameter_by_id
+    return _point_table_from_rows(
+        columns=table.columns,
+        rows=table.rows,
+        labels={parameter_id: parameter_id for parameter_id in table.columns},
+        units={
+            parameter_id: parameters[parameter_id].unit
+            for parameter_id in table.columns
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -248,7 +166,7 @@ class AutonomousScanSlotProgram:
     def __post_init__(self) -> None:
         if not isinstance(self.document, PulseDocument):
             raise TypeError("document must be PulseDocument")
-        ScanPointTable.from_pulse_document(self.document)
+        _point_table_from_pulse_document(self.document)
         _whole_document_repeat_count(
             self.document,
             execution_name="autonomous SCAN_SLOT",
@@ -306,8 +224,8 @@ class AutonomousScanSlotProgram:
         return resolve_api_parameters(self.document, dict(self.api_values))
 
     @property
-    def point_table(self) -> ScanPointTable:
-        return ScanPointTable.from_pulse_document(self.document)
+    def point_table(self) -> PointTable:
+        return _point_table_from_pulse_document(self.document)
 
     @property
     def repeat_count(self) -> int:
@@ -362,8 +280,8 @@ class ApiSlotSegmentedProgram:
             )
 
     @cached_property
-    def point_table(self) -> ScanPointTable:
-        return ScanPointTable.from_api_segment_table(self.document, self.table)
+    def point_table(self) -> PointTable:
+        return _point_table_from_api_segments(self.document, self.table)
 
     @property
     def point_count(self) -> int:
@@ -512,7 +430,6 @@ __all__ = [
     "AutonomousScanSlotProgram",
     "PULSE_PARAMETER_SCAN_PROGRAM_SCHEMA",
     "PulseParameterScanProgram",
-    "ScanPointTable",
     "pulse_parameter_scan_program_from_tree",
     "pulse_parameter_scan_program_to_tree",
 ]

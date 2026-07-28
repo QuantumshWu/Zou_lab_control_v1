@@ -11,9 +11,8 @@ import math
 
 import numpy as np
 
-from zlc_data import IndexSelection, OwnedSnapshot, Selection
+from zlc_data import AxisSourceRef, OwnedSnapshot
 from zlc_frontend import (
-    AxisViewBinding,
     AxisViewRole,
     CurveDisplayState,
     FacetedHistogramDisplayState,
@@ -25,6 +24,7 @@ from zlc_frontend import (
     FigureSource,
     PanelProvenance,
     PlotReportDocument,
+    SourceViewBinding,
     ViewIntent,
     ViewSpec,
     plot_report_page,
@@ -99,17 +99,26 @@ def _histogram_page(
     snapshot: OwnedSnapshot,
 ):
     schema = snapshot.block.schema
-    if len(schema.point_axes) != 1 or len(schema.cell_schema.data_axes) != 1:
+    if len(schema.point_table.columns) != 1 or len(schema.cell_schema.data_axes) != 1:
         raise ValueError("calibration histogram Dataset has an invalid declared shape")
-    site_axis = schema.point_axes[0]
+    site_column = schema.point_table.columns[0]
     population_axis = schema.cell_schema.data_axes[0]
     spec = ViewSpec(
         schema.fingerprint,
         ViewIntent.HISTOGRAM,
         (
-            AxisViewBinding(schema.repeat_axis.axis_id, AxisViewRole.SAMPLE),
-            AxisViewBinding(site_axis.axis_id, AxisViewRole.FACET),
-            AxisViewBinding(population_axis.axis_id, AxisViewRole.BATCH),
+            SourceViewBinding(
+                AxisSourceRef.tensor(schema.repeat_axis.axis_id),
+                AxisViewRole.SAMPLE,
+            ),
+            SourceViewBinding(
+                AxisSourceRef.point_coordinate(site_column.coordinate_id),
+                AxisViewRole.FACET,
+            ),
+            SourceViewBinding(
+                AxisSourceRef.tensor(population_axis.axis_id),
+                AxisViewRole.BATCH,
+            ),
         ),
     )
     base_display = HistogramDisplayState(
@@ -117,10 +126,11 @@ def _histogram_page(
     )
     cell_thresholds = tuple(
         HistogramCellThresholds(
-            Selection(
+            (
                 (
-                    IndexSelection(site_axis.axis_id, site),
-                )
+                    AxisSourceRef.point_coordinate(site_column.coordinate_id),
+                    site,
+                ),
             ),
             (
                 (float(model.runtime_thresholds[site]),)
@@ -128,7 +138,7 @@ def _histogram_page(
                 else ()
             ),
         )
-        for site in range(site_axis.size)
+        for site in range(schema.point_table.row_count)
     )
     faceted = len(view.site_labels) > 1
     display = (
@@ -157,15 +167,25 @@ def _pooled_page(
     snapshot: OwnedSnapshot,
 ):
     schema = snapshot.block.schema
-    if schema.point_axes or len(schema.cell_schema.data_axes) != 1:
+    if (
+        schema.point_table.row_count != 1
+        or schema.point_table.columns
+        or len(schema.cell_schema.data_axes) != 1
+    ):
         raise ValueError("calibration pooled Dataset has an invalid declared shape")
     population_axis = schema.cell_schema.data_axes[0]
     spec = ViewSpec(
         schema.fingerprint,
         ViewIntent.HISTOGRAM,
         (
-            AxisViewBinding(schema.repeat_axis.axis_id, AxisViewRole.SAMPLE),
-            AxisViewBinding(population_axis.axis_id, AxisViewRole.BATCH),
+            SourceViewBinding(
+                AxisSourceRef.tensor(schema.repeat_axis.axis_id),
+                AxisViewRole.SAMPLE,
+            ),
+            SourceViewBinding(
+                AxisSourceRef.tensor(population_axis.axis_id),
+                AxisViewRole.BATCH,
+            ),
         ),
     )
     return plot_report_page(
@@ -189,21 +209,27 @@ def _pooled_page(
 
 def _fidelity_page(view: CalibrationReportProjection, snapshot: OwnedSnapshot):
     schema = snapshot.block.schema
-    if len(schema.point_axes) != 1 or len(schema.cell_schema.data_axes) != 1:
+    if len(schema.point_table.columns) != 1 or len(schema.cell_schema.data_axes) != 1:
         raise ValueError("calibration fidelity Dataset has an invalid declared shape")
-    site_axis = schema.point_axes[0]
+    site_column = schema.point_table.columns[0]
     model_axis = schema.cell_schema.data_axes[0]
     spec = ViewSpec(
         schema.fingerprint,
         ViewIntent.CURVE,
         (
-            AxisViewBinding(
-                schema.repeat_axis.axis_id,
+            SourceViewBinding(
+                AxisSourceRef.tensor(schema.repeat_axis.axis_id),
                 AxisViewRole.SELECTED,
                 selector=FixedIndex(0),
             ),
-            AxisViewBinding(site_axis.axis_id, AxisViewRole.X),
-            AxisViewBinding(model_axis.axis_id, AxisViewRole.BATCH),
+            SourceViewBinding(
+                AxisSourceRef.point_coordinate(site_column.coordinate_id),
+                AxisViewRole.X,
+            ),
+            SourceViewBinding(
+                AxisSourceRef.tensor(model_axis.axis_id),
+                AxisViewRole.BATCH,
+            ),
         ),
     )
     return plot_report_page(
@@ -228,22 +254,31 @@ def _psf_page(
     if snapshot is None:
         return None
     schema = snapshot.block.schema
-    if len(schema.point_axes) != 1 or len(schema.cell_schema.data_axes) != 2:
+    if len(schema.point_table.columns) != 1 or len(schema.cell_schema.data_axes) != 2:
         raise ValueError("calibration PSF Dataset has an invalid declared shape")
-    site_axis = schema.point_axes[0]
+    site_column = schema.point_table.columns[0]
     y_axis, x_axis = schema.cell_schema.data_axes
     spec = ViewSpec(
         schema.fingerprint,
         ViewIntent.IMAGE,
         (
-            AxisViewBinding(
-                schema.repeat_axis.axis_id,
+            SourceViewBinding(
+                AxisSourceRef.tensor(schema.repeat_axis.axis_id),
                 AxisViewRole.SELECTED,
                 selector=FixedIndex(0),
             ),
-            AxisViewBinding(site_axis.axis_id, AxisViewRole.FACET),
-            AxisViewBinding(y_axis.axis_id, AxisViewRole.IMAGE_Y),
-            AxisViewBinding(x_axis.axis_id, AxisViewRole.IMAGE_X),
+            SourceViewBinding(
+                AxisSourceRef.point_coordinate(site_column.coordinate_id),
+                AxisViewRole.FACET,
+            ),
+            SourceViewBinding(
+                AxisSourceRef.tensor(y_axis.axis_id),
+                AxisViewRole.IMAGE_Y,
+            ),
+            SourceViewBinding(
+                AxisSourceRef.tensor(x_axis.axis_id),
+                AxisViewRole.IMAGE_X,
+            ),
         ),
     )
     return plot_report_page(

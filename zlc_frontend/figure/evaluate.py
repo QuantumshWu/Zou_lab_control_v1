@@ -1,4 +1,4 @@
-"""Headless ViewSpec evaluation over immutable zlc_data snapshots."""
+"""Headless ViewSpec evaluation over immutable ``(R, P, *data)`` snapshots."""
 
 from __future__ import annotations
 
@@ -13,17 +13,11 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 from zlc_data import (
-    AxisId,
-    AxisSpec,
-    CellValidity,
+    AxisSourceRef,
     DataBlock,
-    DatasetComponentValidity,
     DatasetSchema,
-    Invalid,
     OwnedSnapshot,
-    REPEAT,
-    Valid,
-    immutable_bool_broadcast,
+    expand_dataset_validity,
 )
 from zlc_data.numeric import (
     canonical_mean_dtype,
@@ -31,7 +25,20 @@ from zlc_data.numeric import (
     checked_numeric_sum,
 )
 
-from .contract import dataset_axes, display_axis_indices, validate_view_spec
+from .contract import (
+    _resolved_point_group_records,
+    _resolve_selected_point_ordinals,
+    _resolve_view_point_rows,
+    _source_cardinality,
+    _source_coordinate,
+    _source_coordinate_frame,
+    _source_key,
+    _source_name,
+    _source_role,
+    _source_unit,
+    _tensor_axis,
+    validate_view_spec,
+)
 from .model import (
     AxisAddress,
     AxisResolution,
@@ -53,6 +60,7 @@ from .model import (
     LatestNonempty,
     ReductionResolution,
     SampleCoordinates,
+    SourceViewBinding,
     ViewIntent,
     ViewSpec,
 )
@@ -82,7 +90,10 @@ class _EvaluationGuard:
             self.monotonic_deadline is not None
             and time.monotonic() >= self.monotonic_deadline
         ):
-            raise FigureEvaluationDeadlineExceeded("figure evaluation deadline exceeded")
+            raise FigureEvaluationDeadlineExceeded(
+                "figure evaluation deadline exceeded"
+            )
+
 
 @dataclass(frozen=True)
 class ResolvedDataset:
@@ -102,7 +113,9 @@ class ResolvedDatasetMap:
 
     def __post_init__(self) -> None:
         entries = tuple(self.entries)
-        if not entries or any(not isinstance(entry, ResolvedDataset) for entry in entries):
+        if not entries or any(
+            not isinstance(entry, ResolvedDataset) for entry in entries
+        ):
             raise ValueError("ResolvedDatasetMap requires ResolvedDataset values")
         ids = tuple(entry.dataset_id for entry in entries)
         if len(set(ids)) != len(ids):
@@ -120,549 +133,441 @@ class ResolvedDatasetMap:
 class _WorkingData:
     values: np.ndarray
     validity: np.ndarray
-    cell_axes: tuple[AxisSpec, ...]
-    cell_coordinates: dict[AxisId, np.ndarray]
-    data_axes: tuple[AxisSpec, ...]
-    data_indices: dict[AxisId, Sequence[int]]
+    row_indices: dict[AxisSourceRef, np.ndarray]
+    point_ordinals: np.ndarray
+    data_sources: tuple[AxisSourceRef, ...]
+    data_indices: dict[AxisSourceRef, tuple[int, ...]]
 
 
-def _axis_coordinate(axis: AxisSpec, index: int) -> Any:
-    return axis.coordinate_at(index)
+def evaluate_axis(
+    schema: DatasetSchema,
+    source: AxisSourceRef,
+    indices: tuple[int, ...],
+) -> EvaluatedAxis:
+    """Evaluate one typed source over an explicit ordered index set."""
 
-
-def evaluate_axis(axis: AxisSpec, indices: tuple[int, ...]) -> EvaluatedAxis:
-    """Evaluate declared coordinates for one explicit ordered index set."""
-
-    if not isinstance(axis, AxisSpec):
-        raise TypeError("axis must be AxisSpec")
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(source, AxisSourceRef):
+        raise TypeError("source must be AxisSourceRef")
     indices = tuple(indices)
     return EvaluatedAxis(
-        axis.axis_id,
-        axis.name,
-        axis.role,
-        axis.unit,
+        source,
+        _source_name(schema, source),
+        _source_role(schema, source),
+        _source_unit(schema, source),
         indices,
-        tuple(_axis_coordinate(axis, index) for index in indices),
-        axis.coordinate_frame,
+        tuple(_source_coordinate(schema, source, index) for index in indices),
+        _source_coordinate_frame(schema, source),
     )
 
 
-def _selection_index_sets(
-    schema: DatasetSchema,
+def _take_axis(array: np.ndarray, choice: Sequence[int] | int, axis: int) -> np.ndarray:
+    if isinstance(choice, int):
+        selection = [slice(None)] * array.ndim
+        selection[axis] = choice
+        return array[tuple(selection)]
+    indices = tuple(choice)
+    if not indices:
+        selection = [slice(None)] * array.ndim
+        selection[axis] = slice(0, 0)
+        return array[tuple(selection)]
+    if indices == tuple(range(indices[0], indices[0] + len(indices))):
+        selection = [slice(None)] * array.ndim
+        selection[axis] = slice(indices[0], indices[0] + len(indices))
+        return array[tuple(selection)]
+    return np.take(array, np.asarray(indices, dtype=np.intp), axis=axis)
+
+
+def _prepare_working(
+    block: DataBlock,
     view: ViewSpec,
-) -> dict[AxisId, Sequence[int]]:
-    return {
-        axis.axis_id: display_axis_indices(axis, view.display_selections)
-        for axis in dataset_axes(schema)
+    guard: _EvaluationGuard,
+) -> tuple[_WorkingData, tuple[AxisResolution, ...]]:
+    schema = block.schema
+    try:
+        point_ordinals = _resolve_selected_point_ordinals(schema, view)
+    except (TypeError, ValueError, IndexError, KeyError) as error:
+        raise FigureEvaluationError(str(error)) from error
+    values = block.values
+    validity = expand_dataset_validity(block.validity, schema)
+
+    repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+    repeat_binding = view.binding(repeat_source)
+    resolutions: list[AxisResolution] = []
+
+    data_sources = [
+        AxisSourceRef.tensor(axis.axis_id) for axis in schema.cell_schema.data_axes
+    ]
+    data_indices = {
+        source: tuple(range(_tensor_axis(schema, source).size))
+        for source in data_sources
     }
-
-
-def _sequence_indexer(indices: Sequence[int] | np.ndarray) -> slice | np.ndarray:
-    """Use a basic slice for a contiguous logical selection, else explicit indices."""
-
-    if isinstance(indices, range) and indices.step == 1:
-        return slice(indices.start, indices.stop)
-    explicit = (
-        np.asarray(indices, dtype=np.intp)
-        if isinstance(indices, np.ndarray)
-        else np.fromiter(indices, dtype=np.intp, count=len(indices))
-    )
-    if explicit.ndim != 1:
-        raise ValueError("axis indices must be one-dimensional")
-    if explicit.size == 0:
-        return slice(0, 0)
-    start = int(explicit[0])
-    if np.array_equal(
-        explicit,
-        np.arange(start, start + explicit.size, dtype=np.intp),
-    ):
-        return slice(start, start + explicit.size)
-    return explicit
-
-
-def _select_axis(
-    array: np.ndarray,
-    choice: Sequence[int] | np.ndarray | int,
-    *,
-    axis: int,
-) -> np.ndarray:
-    """Select without copying contiguous regions; copy only true gathers."""
-
-    indexer = choice if isinstance(choice, int) else _sequence_indexer(choice)
-    if isinstance(indexer, np.ndarray):
-        return np.take(array, indexer, axis=axis)
-    selection = [slice(None)] * array.ndim
-    selection[axis] = indexer
-    return array[tuple(selection)]
-
-
-def _ordered_selection_axes(
-    axes: Sequence[AxisSpec],
-    choices: dict[AxisId, Sequence[int] | int],
-) -> tuple[AxisSpec, ...]:
-    """Apply views first, then the narrowest gathers, without reordering axes."""
-
-    def key(axis: AxisSpec) -> tuple[int, float, str]:
-        choice = choices[axis.axis_id]
-        if isinstance(choice, int):
-            return (0, 1.0 / axis.size, axis.axis_id.value)
-        selected = len(choice)
-        kind = 1 if isinstance(choice, range) else 2
-        return (kind, selected / axis.size, axis.axis_id.value)
-
-    return tuple(sorted(axes, key=key))
-
-
-def _select_named_axes(
-    array: np.ndarray,
-    axes: Sequence[AxisSpec],
-    choices: dict[AxisId, Sequence[int] | int],
-) -> tuple[np.ndarray, tuple[AxisSpec, ...]]:
-    active = list(axes)
-    for axis in _ordered_selection_axes(axes, choices):
-        position = 1 + active.index(axis)
-        choice = choices[axis.axis_id]
-        array = _select_axis(array, choice, axis=position)
-        if isinstance(choice, int):
-            active.remove(axis)
-    return array, tuple(active)
-
-
-def _component_validity(
-    block: DataBlock,
-    row_ids: np.ndarray,
-    data_choices: dict[AxisId, Sequence[int] | int],
-    remaining_data_axes: tuple[AxisSpec, ...],
-    values_shape: tuple[int, ...],
-) -> np.ndarray:
-    validity = block.validity
-    if isinstance(validity, Valid):
-        return immutable_bool_broadcast(True, values_shape)
-    if isinstance(validity, Invalid):
-        return immutable_bool_broadcast(False, values_shape)
-    if isinstance(validity, CellValidity):
-        row_mask = _select_axis(validity.mask.reshape(-1), row_ids, axis=0)
-        return np.broadcast_to(
-            row_mask.reshape((len(row_ids),) + (1,) * len(remaining_data_axes)),
-            values_shape,
-        )
-    if not isinstance(validity, DatasetComponentValidity):
-        raise TypeError(f"unsupported dataset validity {type(validity).__name__}")
-    original_data = block.schema.cell_schema.data_axes
-    component_axes = tuple(
-        next(axis for axis in original_data if axis.axis_id == axis_id)
-        for axis_id in validity.axis_ids
-    )
-    mask = _select_axis(
-        validity.mask.reshape(
-            (block.schema.repeat_axis.size * block.schema.point_layout.storage_size,)
-            + tuple(axis.size for axis in component_axes)
-        ),
-        row_ids,
-        axis=0,
-    )
-    mask, current_component_axes = _select_named_axes(
-        mask,
-        component_axes,
-        data_choices,
-    )
-    compact_shape = [len(row_ids)]
-    current_ids = {axis.axis_id for axis in current_component_axes}
-    for axis in remaining_data_axes:
-        if axis.axis_id in current_ids:
-            compact_shape.append(len(data_choices[axis.axis_id]))
-        else:
-            compact_shape.append(1)
-    return np.broadcast_to(mask.reshape(tuple(compact_shape)), values_shape)
-
-
-def _extract(
-    block: DataBlock,
-    fixed_indices: dict[AxisId, int],
-    allowed_indices: dict[AxisId, Sequence[int]],
-) -> _WorkingData:
-    cell_axes = (block.schema.repeat_axis, *block.schema.point_axes)
-    layout = block.schema.cell_layout
-    coordinate_columns = {
-        axis.axis_id: layout.axis_indices(position)
-        for position, axis in enumerate(cell_axes)
-    }
-    row_mask = np.ones(layout.storage_size, dtype=bool)
-    for axis in cell_axes:
-        allowed = allowed_indices[axis.axis_id]
-        if axis.axis_id in fixed_indices:
-            index = fixed_indices[axis.axis_id]
-            if index not in allowed:
-                raise FigureEvaluationError(
-                    f"fixed index {index} is outside the display selection on {axis.axis_id}"
-                )
-            row_mask &= coordinate_columns[axis.axis_id] == index
-        else:
-            row_mask &= np.isin(coordinate_columns[axis.axis_id], allowed)
-    row_ids = np.flatnonzero(row_mask)
-    remaining_cell_axes = tuple(
-        axis for axis in cell_axes if axis.axis_id not in fixed_indices
-    )
-    remaining_cell_coordinates = {
-        axis.axis_id: _select_axis(coordinate_columns[axis.axis_id], row_ids, axis=0)
-        for axis in remaining_cell_axes
-    }
-
-    values = _select_axis(
-        block.values.reshape(
-            (layout.storage_size, *block.schema.cell_schema.data_shape)
-        ),
-        row_ids,
-        axis=0,
-    )
-    data_choices: dict[AxisId, Sequence[int] | int] = {}
-    remaining_data_axes: list[AxisSpec] = []
-    remaining_data_indices: dict[AxisId, Sequence[int]] = {}
-    for axis in block.schema.cell_schema.data_axes:
-        allowed = allowed_indices[axis.axis_id]
-        if axis.axis_id in fixed_indices:
-            index = fixed_indices[axis.axis_id]
-            if index not in allowed:
-                raise FigureEvaluationError(
-                    f"fixed index {index} is outside the display selection on {axis.axis_id}"
-                )
-            data_choices[axis.axis_id] = index
-        else:
-            data_choices[axis.axis_id] = allowed
-            remaining_data_axes.append(axis)
-            remaining_data_indices[axis.axis_id] = allowed
-    values, selected_data_axes = _select_named_axes(
-        values,
-        block.schema.cell_schema.data_axes,
-        data_choices,
-    )
-    assert selected_data_axes == tuple(remaining_data_axes)
-    validity = _component_validity(
-        block,
-        row_ids,
-        data_choices,
-        tuple(remaining_data_axes),
-        values.shape,
-    )
-    return _WorkingData(
-        np.asarray(values),
-        np.asarray(validity, dtype=bool),
-        remaining_cell_axes,
-        remaining_cell_coordinates,
-        tuple(remaining_data_axes),
-        remaining_data_indices,
-    )
-
-
-def _slice_working(
-    working: _WorkingData,
-    fixed_indices: dict[AxisId, int],
-) -> _WorkingData:
-    """Slice an already materialized layer without revisiting DataBlock layout/validity."""
-
-    known_ids = {
-        axis.axis_id for axis in working.cell_axes + working.data_axes
-    }
-    unknown = set(fixed_indices) - known_ids
-    if unknown:
-        raise FigureEvaluationError(f"slice references absent axes: {tuple(sorted(unknown))}")
-
-    fixed_cell_axes = tuple(
-        axis for axis in working.cell_axes if axis.axis_id in fixed_indices
-    )
-    if fixed_cell_axes:
-        row_mask = np.ones(len(working.values), dtype=bool)
-        for axis in fixed_cell_axes:
-            row_mask &= working.cell_coordinates[axis.axis_id] == fixed_indices[axis.axis_id]
-        row_ids = np.flatnonzero(row_mask)
-        values = _select_axis(working.values, row_ids, axis=0)
-        validity = _select_axis(working.validity, row_ids, axis=0)
-        cell_axes = tuple(
-            axis for axis in working.cell_axes if axis.axis_id not in fixed_indices
-        )
-        cell_coordinates = {
-            axis.axis_id: _select_axis(
-                working.cell_coordinates[axis.axis_id], row_ids, axis=0
-            )
-            for axis in cell_axes
-        }
-    else:
-        values = working.values
-        validity = working.validity
-        cell_axes = working.cell_axes
-        cell_coordinates = working.cell_coordinates
-
-    data_axes = list(working.data_axes)
-    data_indices = dict(working.data_indices)
-    for axis in tuple(working.data_axes):
-        if axis.axis_id not in fixed_indices:
+    for source in tuple(data_sources):
+        binding = view.binding(source)
+        if not isinstance(binding.selector, FixedIndex):
             continue
-        index = fixed_indices[axis.axis_id]
-        try:
-            local_position = data_indices[axis.axis_id].index(index)
-        except ValueError as exc:
-            raise FigureEvaluationError(
-                f"fixed index {index} is outside the materialized selection on {axis.axis_id}"
-            ) from exc
-        array_axis = 1 + next(
-            position
-            for position, current in enumerate(data_axes)
-            if current.axis_id == axis.axis_id
+        index = binding.selector.index
+        axis = 2 + data_sources.index(source)
+        values = _take_axis(values, index, axis)
+        validity = _take_axis(validity, index, axis)
+        data_sources.remove(source)
+        del data_indices[source]
+        resolutions.append(
+            AxisResolution(
+                source,
+                "FIXED_INDEX",
+                index,
+                _source_coordinate(schema, source, index),
+            )
         )
-        indexer = [slice(None)] * values.ndim
-        indexer[array_axis] = local_position
-        values = values[tuple(indexer)]
-        validity = validity[tuple(indexer)]
-        data_axes = [current for current in data_axes if current.axis_id != axis.axis_id]
-        del data_indices[axis.axis_id]
 
+    values = _take_axis(values, point_ordinals, 1)
+    validity = _take_axis(validity, point_ordinals, 1)
+    repeat_indices = tuple(range(schema.repeat_axis.size))
+    if isinstance(repeat_binding.selector, FixedIndex):
+        repeat_indices = (repeat_binding.selector.index,)
+        resolutions.append(
+            AxisResolution(
+                repeat_source,
+                "FIXED_INDEX",
+                repeat_binding.selector.index,
+                _source_coordinate(
+                    schema, repeat_source, repeat_binding.selector.index
+                ),
+            )
+        )
+    elif isinstance(repeat_binding.selector, LatestNonempty):
+        chosen = None
+        for index in reversed(repeat_indices):
+            guard.check()
+            if bool(np.any(validity[index])):
+                chosen = index
+                break
+        if chosen is None:
+            raise FigureEvaluationError("repeat has no non-empty display index")
+        repeat_indices = (chosen,)
+        resolutions.append(
+            AxisResolution(
+                repeat_source,
+                "LATEST_NONEMPTY",
+                chosen,
+                _source_coordinate(schema, repeat_source, chosen),
+            )
+        )
+    values = _take_axis(values, repeat_indices, 0)
+    validity = _take_axis(validity, repeat_indices, 0)
+
+    repeat_count = len(repeat_indices)
+    point_count = len(point_ordinals)
+    values = np.asarray(values).reshape(
+        (repeat_count * point_count, *np.shape(values)[2:])
+    )
+    validity = np.asarray(validity, dtype=bool).reshape(values.shape)
+    repeated = np.repeat(np.asarray(repeat_indices, dtype=np.int64), point_count)
+    tiled_points = np.tile(np.asarray(point_ordinals, dtype=np.int64), repeat_count)
+    row_indices: dict[AxisSourceRef, np.ndarray] = {}
+    if repeat_binding.role is not AxisViewRole.SELECTED:
+        row_indices[repeat_source] = repeated
+    topology = schema.grid_topology
+    for binding in view.source_bindings:
+        source = binding.source
+        if source.kind == AxisSourceRef.TENSOR or binding.role is AxisViewRole.SELECTED:
+            continue
+        if source.kind == AxisSourceRef.GRID_DIMENSION:
+            assert topology is not None and source.axis_id is not None
+            position = topology.dimension_ids.index(source.axis_id)
+            lookup = np.asarray(
+                tuple(cell[position] for cell in topology.row_to_cell),
+                dtype=np.int64,
+            )
+            row_indices[source] = lookup[tiled_points]
+        else:
+            # PointRows, PointOrdinal, and raw coordinates all retain ordinal
+            # identity.  Coordinate values are labels, never a Cartesian index.
+            row_indices[source] = tiled_points
+
+    for binding in view.source_bindings:
+        if (
+            binding.source.kind == AxisSourceRef.GRID_DIMENSION
+            and isinstance(binding.selector, FixedIndex)
+        ):
+            resolutions.append(
+                AxisResolution(
+                    binding.source,
+                    "FIXED_INDEX",
+                    binding.selector.index,
+                    _source_coordinate(
+                        schema, binding.source, binding.selector.index
+                    ),
+                )
+            )
+    return (
+        _WorkingData(
+            values,
+            validity,
+            row_indices,
+            tiled_points,
+            tuple(data_sources),
+            data_indices,
+        ),
+        tuple(resolutions),
+    )
+
+
+def _slice_rows(working: _WorkingData, mask: np.ndarray) -> _WorkingData:
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != (len(working.values),):
+        raise FigureEvaluationError("row mask does not align with working data")
     return _WorkingData(
-        np.asarray(values),
-        np.asarray(validity, dtype=bool),
-        cell_axes,
-        cell_coordinates,
-        tuple(data_axes),
-        data_indices,
+        working.values[mask],
+        working.validity[mask],
+        {source: values[mask] for source, values in working.row_indices.items()},
+        working.point_ordinals[mask],
+        working.data_sources,
+        working.data_indices,
     )
 
 
-def _reduction_output_dtype(
-    input_dtype: np.dtype,
-    method: DisplayReductionMethod,
-) -> np.dtype:
+def _without_row_sources(
+    working: _WorkingData,
+    sources: tuple[AxisSourceRef, ...],
+) -> _WorkingData:
+    consumed = frozenset(sources)
+    if not consumed:
+        return working
+    return _WorkingData(
+        working.values,
+        working.validity,
+        {
+            source: values
+            for source, values in working.row_indices.items()
+            if source not in consumed
+        },
+        working.point_ordinals,
+        working.data_sources,
+        working.data_indices,
+    )
+
+
+def _slice_data(
+    working: _WorkingData,
+    source: AxisSourceRef,
+    logical_index: int,
+) -> _WorkingData:
+    if source not in working.data_sources:
+        raise FigureEvaluationError(f"data source {source} is absent")
+    indices = working.data_indices[source]
+    try:
+        local_index = indices.index(logical_index)
+    except ValueError as exc:
+        raise FigureEvaluationError(
+            f"index {logical_index} is outside data source {source}"
+        ) from exc
+    axis = 1 + working.data_sources.index(source)
+    values = _take_axis(working.values, local_index, axis)
+    validity = _take_axis(working.validity, local_index, axis)
+    sources = tuple(item for item in working.data_sources if item != source)
+    return _WorkingData(
+        values,
+        validity,
+        working.row_indices,
+        working.point_ordinals,
+        sources,
+        {item: working.data_indices[item] for item in sources},
+    )
+
+
+def _slice_tensor_bindings(
+    working: _WorkingData,
+    schema: DatasetSchema,
+    choices: tuple[tuple[AxisSourceRef, int], ...],
+) -> _WorkingData:
+    result = working
+    repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+    for source, index in choices:
+        if source == repeat_source:
+            column = result.row_indices.get(source)
+            if column is None:
+                raise FigureEvaluationError("repeat source disappeared before slicing")
+            result = _slice_rows(result, column == index)
+            result = _without_row_sources(result, (source,))
+        else:
+            result = _slice_data(result, source, index)
+    return result
+
+
+def _reduction_dtype(dtype: np.dtype, method: DisplayReductionMethod) -> np.dtype:
     return (
-        canonical_mean_dtype(input_dtype)
+        canonical_mean_dtype(dtype)
         if method is DisplayReductionMethod.MEAN
-        else canonical_sum_dtype(input_dtype)
+        else canonical_sum_dtype(dtype)
     )
 
 
-def _single_contributor_reduction_dtype(
-    input_dtype: np.dtype,
-    reductions,
-    axis_by_id: dict[AxisId, AxisSpec],
-    maximum_contributors: int,
-) -> np.dtype | None:
-    """Select the one-contributor kernel by declared role, never by array rank."""
-
-    if len(reductions) != 1 or maximum_contributors > 1:
-        return None
-    binding = reductions[0]
-    if axis_by_id[binding.axis_id].role != REPEAT:
-        return None
-    assert binding.reduction is not None
-    if input_dtype.kind in "biu":
-        return input_dtype
-    return _reduction_output_dtype(input_dtype, binding.reduction.method)
-
-
-def _single_contributor_validity_extent(validity: np.ndarray) -> tuple[int, int]:
-    """Resolve 0/1 contributor bounds without scanning a uniform broadcast plane."""
-
-    validity = np.asarray(validity, dtype=bool)
-    if not validity.size:
-        return 0, 0
-    if all(stride == 0 for stride in validity.strides):
-        contributor = int(bool(validity.flat[0]))
-        return contributor, contributor
-    return (
-        1 if bool(np.all(validity)) else 0,
-        1 if bool(np.any(validity)) else 0,
-    )
+def _reduce_array(
+    values: np.ndarray,
+    validity: np.ndarray,
+    axes: tuple[int, ...],
+    method: DisplayReductionMethod,
+    output_dtype: np.dtype,
+):
+    counts = np.sum(validity, axis=axes, dtype=np.int64)
+    safe = np.where(validity, values, np.zeros((), dtype=values.dtype))
+    if method is DisplayReductionMethod.MEAN:
+        safe = safe.astype(output_dtype, copy=False)
+    summed = checked_numeric_sum(safe, axes, output_dtype=output_dtype)
+    if method is DisplayReductionMethod.MEAN:
+        result = np.zeros(np.shape(summed), dtype=output_dtype)
+        np.divide(summed, counts, out=result, where=counts > 0)
+    else:
+        result = np.asarray(summed, dtype=output_dtype)
+    valid = counts > 0
+    result = np.where(valid, result, np.zeros((), dtype=output_dtype))
+    return result, valid, counts
 
 
 def _reduce(
     working: _WorkingData,
-    reduction_bindings,
+    schema: DatasetSchema,
+    view: ViewSpec,
+    reduction_bindings: tuple[SourceViewBinding, ...],
     guard: _EvaluationGuard,
 ) -> tuple[_WorkingData, tuple[ReductionResolution, ...]]:
     if not reduction_bindings:
         return working, ()
     methods = {binding.reduction.method for binding in reduction_bindings}
     if len(methods) != 1:
-        raise FigureEvaluationError(
-            "baseline FigureEvaluator requires all jointly reduced axes to use one method"
-        )
+        raise FigureEvaluationError("joint reductions require one common method")
     method = next(iter(methods))
-    output_dtype = _reduction_output_dtype(working.values.dtype, method)
-    reduce_ids = {binding.axis_id for binding in reduction_bindings}
-    cell_ids = tuple(axis.axis_id for axis in working.cell_axes)
-    data_ids = tuple(axis.axis_id for axis in working.data_axes)
-    reduced_cell = tuple(axis_id for axis_id in cell_ids if axis_id in reduce_ids)
-    reduced_data_positions = tuple(
-        position for position, axis_id in enumerate(data_ids) if axis_id in reduce_ids
+    reduce_sources = {binding.source for binding in reduction_bindings}
+    data_reduce = tuple(
+        source for source in working.data_sources if source in reduce_sources
     )
-    if reduce_ids - set(cell_ids) - set(data_ids):
-        raise FigureEvaluationError("reduction axis disappeared before evaluation")
-    surviving_cell_axes = tuple(
-        axis for axis in working.cell_axes if axis.axis_id not in reduce_ids
+    row_reduce = tuple(
+        source for source in working.row_indices if source in reduce_sources
     )
-    surviving_data_axes = tuple(
-        axis for axis in working.data_axes if axis.axis_id not in reduce_ids
-    )
+    if reduce_sources - set(data_reduce) - set(row_reduce):
+        raise FigureEvaluationError("reduction source disappeared before evaluation")
 
+    surviving_data = tuple(
+        source for source in working.data_sources if source not in reduce_sources
+    )
+    surviving_rows = tuple(
+        binding.source
+        for binding in view.source_bindings
+        if binding.source in working.row_indices
+        and binding.source not in reduce_sources
+        and binding.role
+        in {
+            AxisViewRole.X,
+            AxisViewRole.IMAGE_X,
+            AxisViewRole.IMAGE_Y,
+            AxisViewRole.SAMPLE,
+        }
+    )
     groups: OrderedDict[tuple[int, ...], list[int]] = OrderedDict()
-    if reduced_cell:
+    if row_reduce:
         for row in range(len(working.values)):
             if row % 4096 == 0:
                 guard.check()
             key = tuple(
-                int(working.cell_coordinates[axis.axis_id][row])
-                for axis in surviving_cell_axes
+                int(working.row_indices[source][row]) for source in surviving_rows
             )
             groups.setdefault(key, []).append(row)
     else:
         for row in range(len(working.values)):
-            if row % 4096 == 0:
-                guard.check()
             key = tuple(
-                int(working.cell_coordinates[axis.axis_id][row])
-                for axis in surviving_cell_axes
+                int(working.row_indices[source][row]) for source in surviving_rows
             )
             groups[key] = [row]
 
-    maximum_cell_contributors = max(
-        (len(rows) for rows in groups.values()),
-        default=0,
-    )
+    maximum_row_contributors = max((len(rows) for rows in groups.values()), default=0)
     maximum_data_contributors = math.prod(
-        len(working.data_indices[working.data_axes[position].axis_id])
-        for position in reduced_data_positions
+        len(working.data_indices[source]) for source in data_reduce
     )
-    axis_by_id = {
-        axis.axis_id: axis for axis in working.cell_axes + working.data_axes
-    }
-    singleton_dtype = _single_contributor_reduction_dtype(
-        working.values.dtype,
-        reduction_bindings,
-        axis_by_id,
-        maximum_cell_contributors * maximum_data_contributors,
+    maximum_contributors = maximum_row_contributors * maximum_data_contributors
+    only_repeat = len(reduction_bindings) == 1 and (
+        reduction_bindings[0].source
+        == AxisSourceRef.tensor(schema.repeat_axis.axis_id)
     )
-    if singleton_dtype is not None:
+    output_dtype = (
+        working.values.dtype
+        if only_repeat and maximum_contributors <= 1
+        else _reduction_dtype(working.values.dtype, method)
+    )
+
+    data_axes = tuple(
+        1 + working.data_sources.index(source) for source in data_reduce
+    )
+    output_values = []
+    output_validity = []
+    output_counts = []
+    for rows in groups.values():
         guard.check()
-        # A one-contributor repeat reduction is mathematically an identity.
-        # Keep the immutable source view when its declared output dtype is also
-        # unchanged; validity remains an independent mask, so an invalid sample
-        # never requires rewriting its stored pixel to a sentinel value.  This
-        # is the common live-camera path and avoids copying an entire frame at
-        # the presentation boundary merely to remove a singleton repeat axis.
-        if np.dtype(singleton_dtype) == working.values.dtype:
-            values_array = working.values
-            validity_array = working.validity
+        row_indices = np.asarray(rows, dtype=np.intp)
+        values = working.values[row_indices]
+        validity = working.validity[row_indices]
+        axes = ((0,) if row_reduce else ()) + data_axes
+        if not axes:
+            result = values[0]
+            valid = validity[0]
+            counts = valid.astype(np.int64)
+        elif maximum_contributors <= 1 and output_dtype == working.values.dtype:
+            result = np.asarray(values)
+            valid = np.asarray(validity)
+            for axis in sorted(axes, reverse=True):
+                result = np.take(result, 0, axis=axis)
+                valid = np.take(valid, 0, axis=axis)
+            counts = valid.astype(np.int64)
         else:
-            values_array = np.asarray(working.values, dtype=singleton_dtype)
-            validity_array = working.validity
-        low, high = _single_contributor_validity_extent(validity_array)
-        resolution = ReductionResolution(
-            tuple(binding.axis_id for binding in reduction_bindings),
-            method,
-            low,
-            high,
-        )
-        return (
-            _WorkingData(
-                values_array,
-                validity_array,
-                surviving_cell_axes,
-                {
-                    axis.axis_id: working.cell_coordinates[axis.axis_id]
-                    for axis in surviving_cell_axes
-                },
-                surviving_data_axes,
-                {
-                    axis.axis_id: working.data_indices[axis.axis_id]
-                    for axis in surviving_data_axes
-                },
-            ),
-            (resolution,),
-        )
-
-    data_shape = tuple(
-        len(working.data_indices[axis.axis_id]) for axis in surviving_data_axes
-    )
-
-    def reduce_arrays(values, validity, reduction_axes):
-        counts = np.sum(validity, axis=reduction_axes, dtype=np.int64)
-        safe = np.where(validity, values, np.zeros((), dtype=values.dtype))
-        if method is DisplayReductionMethod.MEAN:
-            safe = safe.astype(output_dtype, copy=False)
-        summed = checked_numeric_sum(
-            safe, reduction_axes, output_dtype=output_dtype
-        )
-        if method is DisplayReductionMethod.MEAN:
-            result = np.zeros(np.shape(summed), dtype=output_dtype)
-            np.divide(summed, counts, out=result, where=counts > 0)
-        else:
-            result = np.asarray(summed, dtype=output_dtype)
-        valid = counts > 0
-        result = np.where(valid, result, np.zeros((), dtype=output_dtype))
-        return result, valid, counts
-
-    guard.check()
-    if groups:
-        if reduced_cell:
-            group_lengths = tuple(len(rows) for rows in groups.values())
-            if len(set(group_lengths)) == 1:
-                # A dense matrix is safe only when it contains exactly the
-                # existing rows.  Ragged EXPLICIT layouts must never be padded
-                # to num_groups * max_group_rows.
-                group_rows = np.asarray(tuple(groups.values()), dtype=np.intp)
-                values = working.values[group_rows]
-                validity = working.validity[group_rows]
-                reduction_axes = (1,) + tuple(
-                    2 + position for position in reduced_data_positions
-                )
-                values_array, validity_array, counts_array = reduce_arrays(
-                    values, validity, reduction_axes
-                )
-            else:
-                output_values = []
-                output_validity = []
-                output_counts = []
-                reduction_axes = (0,) + tuple(
-                    1 + position for position in reduced_data_positions
-                )
-                for rows in groups.values():
-                    guard.check()
-                    row_indices = np.asarray(rows, dtype=np.intp)
-                    result, valid, counts = reduce_arrays(
-                        working.values[row_indices],
-                        working.validity[row_indices],
-                        reduction_axes,
-                    )
-                    output_values.append(np.asarray(result))
-                    output_validity.append(np.asarray(valid, dtype=bool))
-                    output_counts.append(np.asarray(counts, dtype=np.int64))
-                values_array = np.stack(output_values, axis=0)
-                validity_array = np.stack(output_validity, axis=0)
-                counts_array = np.stack(output_counts, axis=0)
-        else:
-            values = working.values
-            validity = working.validity
-            reduction_axes = tuple(
-                1 + position for position in reduced_data_positions
+            result, valid, counts = _reduce_array(
+                values, validity, axes, method, output_dtype
             )
-            if not reduction_axes:
-                raise FigureEvaluationError(
-                    "REDUCED binding did not resolve to an array axis"
-                )
-            values_array, validity_array, counts_array = reduce_arrays(
-                values, validity, reduction_axes
-            )
+        output_values.append(np.asarray(result))
+        output_validity.append(np.asarray(valid, dtype=bool))
+        output_counts.append(np.asarray(counts, dtype=np.int64))
+
+    data_shape = tuple(len(working.data_indices[source]) for source in surviving_data)
+    if output_values:
+        values_array = np.stack(output_values, axis=0)
+        validity_array = np.stack(output_validity, axis=0)
+        counts_array = np.stack(output_counts, axis=0)
     else:
         values_array = np.empty((0, *data_shape), dtype=output_dtype)
         validity_array = np.empty((0, *data_shape), dtype=bool)
         counts_array = np.empty((0, *data_shape), dtype=np.int64)
     keys = tuple(groups)
-    coordinates = {
-        axis.axis_id: np.asarray([key[index] for key in keys], dtype=np.int64)
-        for index, axis in enumerate(surviving_cell_axes)
+    row_indices = {
+        source: np.asarray(
+            [key[position] for key in keys],
+            dtype=np.int64,
+        )
+        for position, source in enumerate(surviving_rows)
     }
-    nonempty_counts = counts_array.reshape(-1)
-    low = int(nonempty_counts.min()) if nonempty_counts.size else 0
-    high = int(nonempty_counts.max()) if nonempty_counts.size else 0
+    if AxisSourceRef.point_rows() in row_indices:
+        ordinals = row_indices[AxisSourceRef.point_rows()]
+    elif AxisSourceRef.point_ordinal() in row_indices:
+        ordinals = row_indices[AxisSourceRef.point_ordinal()]
+    else:
+        point_source = next(
+            (
+                source
+                for source in row_indices
+                if source.kind == AxisSourceRef.POINT_COORDINATE
+            ),
+            None,
+        )
+        ordinals = (
+            row_indices[point_source]
+            if point_source is not None
+            else np.zeros(len(values_array), dtype=np.int64)
+        )
+    flat_counts = counts_array.reshape(-1)
+    low = int(flat_counts.min()) if flat_counts.size else 0
+    high = int(flat_counts.max()) if flat_counts.size else 0
     resolution = ReductionResolution(
-        tuple(binding.axis_id for binding in reduction_bindings),
+        tuple(binding.source for binding in reduction_bindings),
         method,
         low,
         high,
@@ -671,128 +576,158 @@ def _reduce(
         _WorkingData(
             values_array,
             validity_array,
-            surviving_cell_axes,
-            coordinates,
-            surviving_data_axes,
-            {
-                axis.axis_id: working.data_indices[axis.axis_id]
-                for axis in surviving_data_axes
-            },
+            row_indices,
+            np.asarray(ordinals, dtype=np.int64),
+            surviving_data,
+            {source: working.data_indices[source] for source in surviving_data},
         ),
         (resolution,),
     )
 
 
+def _row_axis_indices(
+    working: _WorkingData,
+    source: AxisSourceRef,
+) -> tuple[int, ...]:
+    values = working.row_indices.get(source)
+    if values is None:
+        raise FigureEvaluationError(f"row source {source} is absent")
+    return tuple(int(value) for value in values)
+
+
 def _image(
     working: _WorkingData,
-    view,
-    allowed,
+    schema: DatasetSchema,
+    view: ViewSpec,
     *,
     value_unit: str | None,
 ) -> EvaluatedImage:
-    binding_x = next(binding for binding in view.axis_bindings if binding.role is AxisViewRole.IMAGE_X)
-    binding_y = next(binding for binding in view.axis_bindings if binding.role is AxisViewRole.IMAGE_Y)
-    axes = {axis.axis_id: axis for axis in working.cell_axes + working.data_axes}
-    x_axis, y_axis = axes[binding_x.axis_id], axes[binding_y.axis_id]
-    x_indices, y_indices = allowed[x_axis.axis_id], allowed[y_axis.axis_id]
-    x_out, y_out = evaluate_axis(x_axis, x_indices), evaluate_axis(y_axis, y_indices)
-    cell_ids = {axis.axis_id for axis in working.cell_axes}
-    data_ids = {axis.axis_id for axis in working.data_axes}
-    if {x_axis.axis_id, y_axis.axis_id} <= data_ids:
-        if (
-            len(working.cell_axes)
-            or len(working.values) > 1
-            or len(working.data_axes) != 2
-        ):
-            raise FigureEvaluationError("image data axes still have unresolved cell axes")
-        if len(working.values) == 1:
-            data_order = tuple(axis.axis_id for axis in working.data_axes)
-            row = working.values[0]
-            row_valid = working.validity[0]
-            permutation = (data_order.index(y_axis.axis_id), data_order.index(x_axis.axis_id))
-            return EvaluatedImage(
-                x_out,
-                y_out,
-                np.transpose(row, permutation),
-                np.transpose(row_valid, permutation),
-                value_unit,
-            )
+    binding_x = next(
+        binding
+        for binding in view.source_bindings
+        if binding.role is AxisViewRole.IMAGE_X
+    )
+    binding_y = next(
+        binding
+        for binding in view.source_bindings
+        if binding.role is AxisViewRole.IMAGE_Y
+    )
+    x_source, y_source = binding_x.source, binding_y.source
+    x_data = x_source in working.data_sources
+    y_data = y_source in working.data_sources
+    x_row = x_source in working.row_indices
+    y_row = y_source in working.row_indices
+
+    if x_data and y_data:
+        if len(working.values) != 1 or set(working.data_sources) != {
+            x_source,
+            y_source,
+        }:
+            raise FigureEvaluationError("image retains unrelated sources")
+        x_indices = working.data_indices[x_source]
+        y_indices = working.data_indices[y_source]
+        order = working.data_sources
+        row = working.values[0]
+        valid = working.validity[0]
+        permutation = (order.index(y_source), order.index(x_source))
         return EvaluatedImage(
-            x_out,
-            y_out,
-            np.zeros((len(y_indices), len(x_indices)), dtype=working.values.dtype),
-            np.zeros((len(y_indices), len(x_indices)), dtype=bool),
+            evaluate_axis(schema, x_source, x_indices),
+            evaluate_axis(schema, y_source, y_indices),
+            np.transpose(row, permutation),
+            np.transpose(valid, permutation),
             value_unit,
         )
 
-    output = np.zeros((len(y_indices), len(x_indices)), dtype=working.values.dtype)
-    valid = np.zeros(output.shape, dtype=bool)
-    x_pos = {index: position for position, index in enumerate(x_indices)}
-    y_pos = {index: position for position, index in enumerate(y_indices)}
-    if {x_axis.axis_id, y_axis.axis_id} <= cell_ids:
-        if working.data_axes:
-            raise FigureEvaluationError("image cell axes still have unresolved data axes")
+    if (x_row and y_data) or (y_row and x_data):
+        row_source = x_source if x_row else y_source
+        data_source = y_source if y_data else x_source
+        if working.data_sources != (data_source,):
+            raise FigureEvaluationError("mixed image retains unrelated data sources")
+        row_indices = _row_axis_indices(working, row_source)
+        data_indices = working.data_indices[data_source]
+        if row_source is x_source:
+            values = np.transpose(working.values, (1, 0))
+            validity = np.transpose(working.validity, (1, 0))
+            x_indices, y_indices = row_indices, data_indices
+        else:
+            values = working.values
+            validity = working.validity
+            x_indices, y_indices = data_indices, row_indices
+        return EvaluatedImage(
+            evaluate_axis(schema, x_source, x_indices),
+            evaluate_axis(schema, y_source, y_indices),
+            values,
+            validity,
+            value_unit,
+        )
+
+    if x_row and y_row:
+        if (
+            x_source.kind != AxisSourceRef.GRID_DIMENSION
+            or y_source.kind != AxisSourceRef.GRID_DIMENSION
+            or working.data_sources
+        ):
+            raise FigureEvaluationError(
+                "two row image sources require GridTopology dimensions"
+            )
+        x_indices = tuple(range(_source_cardinality(schema, x_source)))
+        y_indices = tuple(range(_source_cardinality(schema, y_source)))
+        output = np.zeros((len(y_indices), len(x_indices)), dtype=working.values.dtype)
+        valid = np.zeros(output.shape, dtype=bool)
+        if working.values.ndim != 1:
+            raise FigureEvaluationError("grid image cells must be scalar")
         for row in range(len(working.values)):
-            xi = int(working.cell_coordinates[x_axis.axis_id][row])
-            yi = int(working.cell_coordinates[y_axis.axis_id][row])
-            output[y_pos[yi], x_pos[xi]] = working.values[row]
-            valid[y_pos[yi], x_pos[xi]] = working.validity[row]
-    else:
-        cell_axis = x_axis if x_axis.axis_id in cell_ids else y_axis
-        data_axis = y_axis if cell_axis is x_axis else x_axis
-        if len(working.cell_axes) != 1 or len(working.data_axes) != 1:
-            raise FigureEvaluationError("mixed image axes retain unrelated axes")
-        for row in range(len(working.values)):
-            ci = int(working.cell_coordinates[cell_axis.axis_id][row])
-            if cell_axis is x_axis:
-                output[:, x_pos[ci]] = working.values[row]
-                valid[:, x_pos[ci]] = working.validity[row]
-            else:
-                output[y_pos[ci], :] = working.values[row]
-                valid[y_pos[ci], :] = working.validity[row]
-        if data_axis.axis_id not in working.data_indices:
-            raise FigureEvaluationError("mixed image data axis is absent")
-    return EvaluatedImage(x_out, y_out, output, valid, value_unit)
+            xi = int(working.row_indices[x_source][row])
+            yi = int(working.row_indices[y_source][row])
+            output[yi, xi] = working.values[row]
+            valid[yi, xi] = working.validity[row]
+        return EvaluatedImage(
+            evaluate_axis(schema, x_source, x_indices),
+            evaluate_axis(schema, y_source, y_indices),
+            output,
+            valid,
+            value_unit,
+        )
+    raise FigureEvaluationError("image display sources disappeared before evaluation")
 
 
 def _curve(
     working: _WorkingData,
-    view,
-    allowed,
+    schema: DatasetSchema,
+    view: ViewSpec,
     *,
     value_unit: str | None,
 ) -> EvaluatedCurve:
-    binding = next(binding for binding in view.axis_bindings if binding.role is AxisViewRole.X)
-    axes = {axis.axis_id: axis for axis in working.cell_axes + working.data_axes}
-    axis = axes[binding.axis_id]
-    indices = allowed[axis.axis_id]
-    out_axis = evaluate_axis(axis, indices)
-    output = np.zeros((len(indices),), dtype=working.values.dtype)
-    valid = np.zeros(output.shape, dtype=bool)
-    positions = {index: position for position, index in enumerate(indices)}
-    cell_ids = {item.axis_id for item in working.cell_axes}
-    if axis.axis_id in cell_ids:
-        if working.data_axes:
-            raise FigureEvaluationError("curve x axis retains unrelated data axes")
-        for row in range(len(working.values)):
-            index = int(working.cell_coordinates[axis.axis_id][row])
-            output[positions[index]] = working.values[row]
-            valid[positions[index]] = working.validity[row]
-    else:
-        if working.cell_axes or len(working.values) > 1 or len(working.data_axes) != 1:
-            raise FigureEvaluationError("curve x data axis retains unrelated axes")
-        if len(working.values) == 1:
-            return EvaluatedCurve(
-                out_axis,
-                value_unit,
-                working.values[0],
-                working.validity[0],
-            )
-    return EvaluatedCurve(out_axis, value_unit, output, valid)
+    binding = next(
+        binding for binding in view.source_bindings if binding.role is AxisViewRole.X
+    )
+    source = binding.source
+    if source in working.row_indices:
+        if working.data_sources or working.values.ndim != 1:
+            raise FigureEvaluationError("curve row source retains unrelated sources")
+        indices = _row_axis_indices(working, source)
+        return EvaluatedCurve(
+            evaluate_axis(schema, source, indices),
+            value_unit,
+            working.values,
+            working.validity,
+        )
+    if source in working.data_sources:
+        if len(working.values) != 1 or working.data_sources != (source,):
+            raise FigureEvaluationError("curve data source retains unrelated sources")
+        indices = working.data_indices[source]
+        return EvaluatedCurve(
+            evaluate_axis(schema, source, indices),
+            value_unit,
+            working.values[0],
+            working.validity[0],
+        )
+    raise FigureEvaluationError("curve X source disappeared before evaluation")
 
 
 def _sample_coordinate_values(
-    axis: AxisSpec,
+    schema: DatasetSchema,
+    source: AxisSourceRef,
     indices: np.ndarray,
     guard: _EvaluationGuard,
 ) -> tuple[Any, ...]:
@@ -800,7 +735,7 @@ def _sample_coordinate_values(
     for start in range(0, len(indices), 4096):
         guard.check()
         values.extend(
-            _axis_coordinate(axis, int(index))
+            _source_coordinate(schema, source, int(index))
             for index in indices[start : start + 4096]
         )
     return tuple(values)
@@ -808,49 +743,47 @@ def _sample_coordinate_values(
 
 def _histogram(
     working: _WorkingData,
-    view,
+    schema: DatasetSchema,
+    view: ViewSpec,
     guard: _EvaluationGuard,
     *,
     value_unit: str | None,
 ) -> EvaluatedHistogram:
-    sample_ids = {
-        binding.axis_id for binding in view.axis_bindings if binding.role is AxisViewRole.SAMPLE
+    sample_sources = {
+        binding.source
+        for binding in view.source_bindings
+        if binding.role is AxisViewRole.SAMPLE
     }
-    remaining_ids = {
-        axis.axis_id for axis in working.cell_axes + working.data_axes
-    }
-    if sample_ids != remaining_ids:
-        raise FigureEvaluationError("histogram retains a non-sample axis")
+    remaining = set(working.row_indices) | set(working.data_sources)
+    if sample_sources != remaining:
+        raise FigureEvaluationError("histogram retains a non-sample source")
     flat_values = working.values.reshape(-1)
     flat_validity = working.validity.reshape(-1)
     data_shape = working.values.shape[1:]
     data_items = int(np.prod(data_shape, dtype=np.int64)) if data_shape else 1
-    coordinate_columns: dict[AxisId, np.ndarray] = {}
-    for axis in working.cell_axes:
-        coordinate_columns[axis.axis_id] = np.repeat(
-            working.cell_coordinates[axis.axis_id], data_items
-        )
-    if working.data_axes:
+    coordinate_columns: dict[AxisSourceRef, np.ndarray] = {}
+    for source, indices in working.row_indices.items():
+        coordinate_columns[source] = np.repeat(indices, data_items)
+    if working.data_sources:
         grids = np.meshgrid(
-            *(working.data_indices[axis.axis_id] for axis in working.data_axes),
+            *(working.data_indices[source] for source in working.data_sources),
             indexing="ij",
         )
-        for axis, grid in zip(working.data_axes, grids):
-            coordinate_columns[axis.axis_id] = np.tile(
+        for source, grid in zip(working.data_sources, grids):
+            coordinate_columns[source] = np.tile(
                 np.asarray(grid).reshape(-1), len(working.values)
             )
     keep = np.asarray(flat_validity, dtype=bool)
     coordinates = []
-    axis_by_id = {axis.axis_id: axis for axis in working.cell_axes + working.data_axes}
-    for binding in view.axis_bindings:
+    for binding in view.source_bindings:
         if binding.role is not AxisViewRole.SAMPLE:
             continue
-        axis = axis_by_id[binding.axis_id]
-        indices = coordinate_columns[axis.axis_id][keep]
+        source = binding.source
+        indices = coordinate_columns[source][keep]
         coordinates.append(
             SampleCoordinates(
-                axis.axis_id,
-                _sample_coordinate_values(axis, indices, guard),
+                source,
+                _sample_coordinate_values(schema, source, indices, guard),
             )
         )
     return EvaluatedHistogram(
@@ -866,8 +799,8 @@ def _meter(
     *,
     value_unit: str | None,
 ) -> EvaluatedMeter:
-    if working.cell_axes or working.data_axes:
-        raise FigureEvaluationError("meter retains unresolved axes")
+    if working.row_indices or working.data_sources:
+        raise FigureEvaluationError("meter retains unresolved sources")
     if working.values.size == 0:
         return EvaluatedMeter(0.0, False, value_unit)
     if working.values.size != 1:
@@ -879,22 +812,42 @@ def _meter(
     )
 
 
-def _address(axis: AxisSpec, index: int) -> AxisAddress:
+def _address(
+    schema: DatasetSchema,
+    source: AxisSourceRef,
+    index: int,
+    coordinate: Any | None = None,
+) -> AxisAddress:
     return AxisAddress(
-        axis.axis_id,
-        axis.name,
-        axis.role,
+        source,
+        _source_name(schema, source),
+        _source_role(schema, source),
         index,
-        _axis_coordinate(axis, index),
+        _source_coordinate(schema, source, index)
+        if coordinate is None
+        else coordinate,
     )
 
 
-def _combinations(axes: tuple[AxisSpec, ...], allowed):
-    return product(*(allowed[axis.axis_id] for axis in axes))
+def _tensor_choices(
+    working: _WorkingData,
+    schema: DatasetSchema,
+    sources: tuple[AxisSourceRef, ...],
+) -> tuple[tuple[tuple[AxisSourceRef, int], ...], ...]:
+    repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+    domains = []
+    for source in sources:
+        if source == repeat_source:
+            indices = tuple(int(value) for value in working.row_indices[source])
+            indices = tuple(dict.fromkeys(indices))
+        else:
+            indices = working.data_indices[source]
+        domains.append(tuple((source, index) for index in indices))
+    return tuple(product(*domains)) if domains else ((),)
 
 
 class FigureEvaluator:
-    """Evaluate a FigureDocument without importing any renderer or authority transform."""
+    """Evaluate a FigureDocument without importing a renderer or transform owner."""
 
     def evaluate(
         self,
@@ -916,7 +869,9 @@ class FigureEvaluator:
                 or not isinstance(monotonic_deadline, Real)
                 or not math.isfinite(monotonic_deadline)
             ):
-                raise ValueError("monotonic_deadline must be finite numeric time or None")
+                raise ValueError(
+                    "monotonic_deadline must be finite numeric time or None"
+                )
             monotonic_deadline = float(monotonic_deadline)
         guard = _EvaluationGuard(cancel_requested, monotonic_deadline)
         guard.check()
@@ -932,7 +887,10 @@ class FigureEvaluator:
                     f"dataset {layer.dataset_id} descriptor/snapshot schema mismatch"
                 )
             validate_view_spec(block.schema, layer.view)
-            inputs.setdefault(layer.dataset_id, EvaluatedInput(layer.dataset_id, snapshot.ref))
+            inputs.setdefault(
+                layer.dataset_id,
+                EvaluatedInput(layer.dataset_id, snapshot.ref),
+            )
             evaluated_layers.append(self._evaluate_layer(layer, block, guard))
         return EvaluatedFigureData(
             document.document_id,
@@ -948,143 +906,135 @@ class FigureEvaluator:
         guard: _EvaluationGuard,
     ) -> EvaluatedLayer:
         guard.check()
+        schema = block.schema
         view = layer.view
-        axes = dataset_axes(block.schema)
-        axis_by_id = {axis.axis_id: axis for axis in axes}
-        allowed = _selection_index_sets(block.schema, view)
-        fixed = {
-            binding.axis_id: binding.selector.index
-            for binding in view.axis_bindings
-            if isinstance(binding.selector, FixedIndex)
-        }
-        dynamic = next(
-            (
-                binding
-                for binding in view.axis_bindings
-                if isinstance(binding.selector, LatestNonempty)
-            ),
-            None,
-        )
-        working_base = _extract(block, fixed, allowed)
-        guard.check()
-        resolutions = [
-            AxisResolution(
-                axis_id,
-                "FIXED_INDEX",
-                index,
-                _axis_coordinate(axis_by_id[axis_id], index),
-            )
-            for axis_id, index in fixed.items()
-        ]
-        if dynamic is not None:
-            binding = dynamic
-            axis = axis_by_id[binding.axis_id]
-            resolved = None
-            resolved_working = None
-            for index in reversed(allowed[axis.axis_id]):
-                guard.check()
-                candidate = _slice_working(working_base, {axis.axis_id: index})
-                if np.any(candidate.validity):
-                    resolved = index
-                    resolved_working = candidate
-                    break
-            if resolved is None:
-                raise FigureEvaluationError(f"axis {axis.axis_id} has no non-empty display index")
-            assert resolved_working is not None
-            working_base = resolved_working
-            resolutions.append(
-                AxisResolution(
-                    axis.axis_id,
-                    "LATEST_NONEMPTY",
-                    resolved,
-                    _axis_coordinate(axis, resolved),
-                )
-            )
+        working_base, resolutions = _prepare_working(block, view, guard)
+        repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
 
-        facet_axes = tuple(
-            axis_by_id[binding.axis_id]
-            for binding in view.axis_bindings
+        tensor_facets = tuple(
+            binding.source
+            for binding in view.source_bindings
             if binding.role is AxisViewRole.FACET
+            and binding.source.kind == AxisSourceRef.TENSOR
         )
-        batch_axes = tuple(
-            axis_by_id[binding.axis_id]
-            for binding in view.axis_bindings
+        tensor_batches = tuple(
+            binding.source
+            for binding in view.source_bindings
             if binding.role is AxisViewRole.BATCH
+            and binding.source.kind == AxisSourceRef.TENSOR
         )
         reduction_bindings = tuple(
-            binding for binding in view.axis_bindings if binding.role is AxisViewRole.REDUCED
+            binding
+            for binding in view.source_bindings
+            if binding.role is AxisViewRole.REDUCED
+        )
+        point_records = _resolved_point_group_records(schema, view)
+        point_group_sources = tuple(
+            binding.source
+            for binding in view.source_bindings
+            if binding.role in {AxisViewRole.FACET, AxisViewRole.BATCH}
+            and binding.source.kind != AxisSourceRef.TENSOR
+        )
+        point_facets: OrderedDict[tuple[AxisAddress, ...], list[tuple]] = OrderedDict()
+        for facet, batch, members, group_index in point_records:
+            point_facets.setdefault(facet, []).append(
+                (batch, members, group_index)
+            )
+
+        tensor_facet_choices = _tensor_choices(
+            working_base, schema, tensor_facets
+        )
+        tensor_batch_choices = _tensor_choices(
+            working_base, schema, tensor_batches
         )
         cells = []
-        for facet_indices in _combinations(facet_axes, allowed):
-            guard.check()
-            facet_fixed = dict(
-                (axis.axis_id, index) for axis, index in zip(facet_axes, facet_indices)
+        for tensor_facet in tensor_facet_choices:
+            facet_working = _slice_tensor_bindings(
+                working_base, schema, tensor_facet
             )
-            facet_working = _slice_working(working_base, facet_fixed)
-            series = []
-            for batch_indices in _combinations(batch_axes, allowed):
-                guard.check()
-                series_fixed = dict(
-                    (axis.axis_id, index) for axis, index in zip(batch_axes, batch_indices)
-                )
-                working = _slice_working(facet_working, series_fixed)
-                working, reduction_records = _reduce(
-                    working, reduction_bindings, guard
-                )
-                if view.intent is ViewIntent.IMAGE:
-                    data = _image(
-                        working,
-                        view,
-                        allowed,
-                        value_unit=block.schema.cell_schema.value_unit,
-                    )
-                elif view.intent is ViewIntent.CURVE:
-                    data = _curve(
-                        working,
-                        view,
-                        allowed,
-                        value_unit=block.schema.cell_schema.value_unit,
-                    )
-                elif view.intent is ViewIntent.HISTOGRAM:
-                    data = _histogram(
-                        working,
-                        view,
-                        guard,
-                        value_unit=block.schema.cell_schema.value_unit,
-                    )
-                elif view.intent is ViewIntent.METER:
-                    data = _meter(
-                        working,
-                        value_unit=block.schema.cell_schema.value_unit,
-                    )
-                else:
-                    raise FigureEvaluationError(
-                        f"{view.intent.value} has no DatasetSchema evaluation path"
-                    )
-                series.append(
-                    EvaluatedSeries(
-                        tuple(
-                            _address(axis, index)
-                            for axis, index in zip(batch_axes, batch_indices)
-                        ),
-                        data,
-                        reduction_records,
-                    )
-                )
-            cells.append(
-                EvaluatedCell(
-                    tuple(
-                        _address(axis, index)
-                        for axis, index in zip(facet_axes, facet_indices)
-                    ),
-                    tuple(series),
-                )
+            tensor_facet_address = tuple(
+                _address(schema, source, index)
+                for source, index in tensor_facet
             )
+            for point_facet_address, records in point_facets.items():
+                series = []
+                for point_batch_address, members, _group_index in records:
+                    member_set = np.asarray(members, dtype=np.int64)
+                    mask = np.isin(facet_working.point_ordinals, member_set)
+                    if not bool(np.any(mask)):
+                        continue
+                    point_working = _without_row_sources(
+                        _slice_rows(facet_working, mask),
+                        point_group_sources,
+                    )
+                    for tensor_batch in tensor_batch_choices:
+                        guard.check()
+                        working = _slice_tensor_bindings(
+                            point_working, schema, tensor_batch
+                        )
+                        working, reduction_records = _reduce(
+                            working,
+                            schema,
+                            view,
+                            reduction_bindings,
+                            guard,
+                        )
+                        if view.intent is ViewIntent.IMAGE:
+                            data = _image(
+                                working,
+                                schema,
+                                view,
+                                value_unit=schema.cell_schema.value_unit,
+                            )
+                        elif view.intent is ViewIntent.CURVE:
+                            data = _curve(
+                                working,
+                                schema,
+                                view,
+                                value_unit=schema.cell_schema.value_unit,
+                            )
+                        elif view.intent is ViewIntent.HISTOGRAM:
+                            data = _histogram(
+                                working,
+                                schema,
+                                view,
+                                guard,
+                                value_unit=schema.cell_schema.value_unit,
+                            )
+                        elif view.intent is ViewIntent.METER:
+                            data = _meter(
+                                working,
+                                value_unit=schema.cell_schema.value_unit,
+                            )
+                        else:
+                            raise FigureEvaluationError(
+                                f"{view.intent.value} has no DatasetSchema path"
+                            )
+                        tensor_batch_address = tuple(
+                            _address(schema, source, index)
+                            for source, index in tensor_batch
+                        )
+                        series.append(
+                            EvaluatedSeries(
+                                (*point_batch_address, *tensor_batch_address),
+                                data,
+                                reduction_records,
+                            )
+                        )
+                if series:
+                    cells.append(
+                        EvaluatedCell(
+                            (*point_facet_address, *tensor_facet_address),
+                            tuple(series),
+                        )
+                    )
+        if not cells:
+            raise FigureEvaluationError("view resolved no visible cell")
         return EvaluatedLayer(
             layer.layer_id,
             layer.dataset_id,
             tuple(cells),
-            tuple(sorted(resolutions, key=lambda item: item.axis_id.value)),
+            tuple(sorted(resolutions, key=lambda item: _source_key(item.source))),
         )
 
 
@@ -1095,4 +1045,5 @@ __all__ = [
     "FigureEvaluator",
     "ResolvedDataset",
     "ResolvedDatasetMap",
+    "evaluate_axis",
 ]

@@ -21,16 +21,17 @@ from typing import Any, TypeAlias
 import numpy as np
 
 from zlc_data import (
+    AxisSourceRef,
     DataBlock,
     OwnedSnapshot,
+    axis_source_ref_from_tree,
+    axis_source_ref_to_tree,
     dataset_revision_ref_from_tree,
     dataset_revision_ref_to_tree,
     dataset_schema_from_tree,
     dataset_schema_to_tree,
     decode_fit_result_batch,
     encode_fit_result_batch,
-    selection_from_tree,
-    selection_to_tree,
     validity_from_tree,
     validity_to_tree,
 )
@@ -61,6 +62,7 @@ from .histogram_display import (
     histogram_cell_thresholds_to_tree,
 )
 from .image_display import ImageColormap, ImageDisplayState
+from .fit_projection import canonical_panel_focus_address
 from .meter_display import MeterDisplayState
 from .panel_size import panel_size_cells
 
@@ -243,6 +245,40 @@ def _optional_range_from_tree(value: Any, field: str):
     return validated_display_range(tuple(value), field)
 
 
+def _focus_address_to_tree(
+    value: tuple[tuple[AxisSourceRef, int], ...],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "source": axis_source_ref_to_tree(source),
+            "index": index,
+        }
+        for source, index in canonical_panel_focus_address(value)
+    ]
+
+
+def _focus_address_from_tree(
+    value: object,
+) -> tuple[tuple[AxisSourceRef, int], ...]:
+    if not isinstance(value, list):
+        raise ValueError("meter expected_address must be a list")
+    entries = []
+    for raw in value:
+        item = exact_mapping(
+            raw,
+            {"source", "index"},
+            "meter expected_address entry",
+            discriminator=None,
+        )
+        entries.append(
+            (
+                axis_source_ref_from_tree(item["source"]),
+                item["index"],
+            )
+        )
+    return canonical_panel_focus_address(entries)
+
+
 def _display_state_to_tree(
     state: FigureDisplayState | None,
 ) -> dict[str, Any] | None:
@@ -294,9 +330,9 @@ def _display_state_to_tree(
             "kind": ViewIntent.METER.value,
             "revision": state.revision,
             "panel_index": state.panel_index,
-            "expected_selection": None
-            if state.expected_selection is None
-            else selection_to_tree(state.expected_selection),
+            "expected_address": None
+            if state.expected_address is None
+            else _focus_address_to_tree(state.expected_address),
         }
     raise TypeError(
         "display must be CurveDisplayState, ImageDisplayState, "
@@ -411,15 +447,15 @@ def _display_state_from_tree(tree: Any) -> FigureDisplayState | None:
     if kind == ViewIntent.METER.value:
         data = exact_mapping(
             tree,
-            {"kind", "revision", "panel_index", "expected_selection"},
+            {"kind", "revision", "panel_index", "expected_address"},
             ViewIntent.METER.value,
             discriminator="kind",
         )
-        selection = data["expected_selection"]
+        address = data["expected_address"]
         return MeterDisplayState(
             panel_index=data["panel_index"],
-            expected_selection=(
-                None if selection is None else selection_from_tree(selection)
+            expected_address=(
+                None if address is None else _focus_address_from_tree(address)
             ),
             revision=data["revision"],
         )

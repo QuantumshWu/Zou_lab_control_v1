@@ -19,9 +19,9 @@ the same way -- that shared step is what this module holds.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from zlc_data import Selection
+from zlc_data import AxisSourceRef
 from zlc_storage import sha256_text
 
 from .curve_display import CurveDisplayState
@@ -59,6 +59,7 @@ from .image_display import (
     image_viewport_for_display_state,
     resolve_image_color_limits,
 )
+from .fit_projection import canonical_panel_focus_address
 from .panel_size import DEFAULT_PANEL_SIZE
 from .plot_layout import panel_surface_geometry
 from .render import PanelPresentationIdentity
@@ -104,7 +105,7 @@ class FacetedPanelFocus:
     """One exact display cell chosen from a previously painted overview."""
 
     panel_index: int
-    selection: Selection
+    address: tuple[tuple[AxisSourceRef, int], ...]
 
     def __post_init__(self) -> None:
         if (
@@ -113,8 +114,11 @@ class FacetedPanelFocus:
             or self.panel_index < 0
         ):
             raise ValueError("faceted focus panel_index must be non-negative")
-        if not isinstance(self.selection, Selection):
-            raise TypeError("faceted focus selection must be Selection")
+        object.__setattr__(
+            self,
+            "address",
+            canonical_panel_focus_address(self.address),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,6 +463,21 @@ class PanelComposer:
             raise PanelRenderError(
                 "a grid requires one multi-cell CURVE, HISTOGRAM, IMAGE, or METER view"
             )
+        histogram_projection = None
+        histogram_fit_overlays = ()
+        if self._intent is ViewIntent.HISTOGRAM and fit_result is not None:
+            adjusted, histogram_projection, histogram_fit_overlays = (
+                source_figure._histogram_fit_presentation(
+                    fit_result,
+                    result_identity=fit_result_identity,
+                    display_state=display,
+                    check_cancelled=check_cancelled,
+                )
+            )
+            if adjusted != display:
+                raise PanelRenderError(
+                    "histogram Fit grid was not seeded from its committed bins"
+                )
         if focus is None:
             if check_cancelled is not None:
                 check_cancelled()
@@ -474,6 +493,8 @@ class PanelComposer:
                     rendered_figure.evaluated,
                     dict(rendered_figure.fit_results),
                     display_state=display,
+                    histogram_projection=histogram_projection,
+                    histogram_fit_overlays=histogram_fit_overlays,
                 )
             except BaseException:
                 if self._faceted_overview_renderer is renderer:
@@ -508,12 +529,18 @@ class PanelComposer:
                 raise PanelRenderError(
                     "histogram grid requires per-cell threshold state"
                 )
-            focused_display = display.display_for(focus.selection)
+            focused_display = display.display_for(focus.address)
         raster, payload = self._rasterize_focused(
             focused,
             focused_display,
             fit_result=fit_result,
             fit_result_identity=fit_result_identity,
+            histogram_projection=histogram_projection,
+            histogram_fit_overlays=(
+                ()
+                if not histogram_fit_overlays
+                else histogram_fit_overlays[focus.panel_index]
+            ),
             check_cancelled=check_cancelled,
         )
         frame = self._frame_for(
@@ -642,6 +669,21 @@ class PanelComposer:
             if overlay_result is None
             else base.with_fit_results({layer.layer_id: overlay_result})
         )
+        histogram_projection = None
+        histogram_fit_overlays = ()
+        if self._intent is ViewIntent.HISTOGRAM and overlay_result is not None:
+            adjusted, histogram_projection, histogram_fit_overlays = (
+                visible._histogram_fit_presentation(
+                    overlay_result,
+                    result_identity=fit_result_identity,
+                    display_state=display,
+                    check_cancelled=check_cancelled,
+                )
+            )
+            if adjusted != display:
+                raise PanelRenderError(
+                    "histogram Fit grid was not seeded from its committed bins"
+                )
         renderer = self._faceted_overview_agg()
         try:
             if check_cancelled is not None:
@@ -651,6 +693,8 @@ class PanelComposer:
                 evaluated,
                 dict(visible.fit_results),
                 display_state=display,
+                histogram_projection=histogram_projection,
+                histogram_fit_overlays=histogram_fit_overlays,
             )
         except BaseException:
             if self._faceted_overview_renderer is renderer:
@@ -779,7 +823,7 @@ class PanelComposer:
         try:
             focused = source_figure.focused_typed_panel(
                 focus.panel_index,
-                expected_selection=focus.selection,
+                expected_address=focus.address,
                 expected_intent=self._intent,
             )
         except (TypeError, ValueError, IndexError, RuntimeError) as error:
@@ -930,19 +974,35 @@ class PanelComposer:
         if self._intent is ViewIntent.HISTOGRAM:
             if not isinstance(data, EvaluatedHistogram):
                 raise PanelRenderError("this signal does not evaluate to a histogram")
-            projection = self._histogram_projection(
-                evaluated,
-                display,
-                value_range=histogram_projection_value_range,
-            )
             overlays = ()
-            if fit_result is not None:
-                overlays = figure.transient_single_panel_histogram_fit_overlays(
-                    projection,
-                    fit_result,
-                    result_identity=fit_result_identity,
-                    check_cancelled=check_cancelled,
+            if fit_result is None:
+                projection = self._histogram_projection(
+                    evaluated,
+                    display,
+                    value_range=histogram_projection_value_range,
                 )
+            else:
+                adjusted, projection, overlays_by_cell = (
+                    figure._histogram_fit_presentation(
+                        fit_result,
+                        result_identity=fit_result_identity,
+                        display_state=display,
+                        check_cancelled=check_cancelled,
+                    )
+                )
+                if adjusted != display or len(overlays_by_cell) != 1:
+                    raise PanelRenderError(
+                        "histogram Fit display was not seeded from its committed bins"
+                    )
+                overlays = overlays_by_cell[0]
+                if (
+                    histogram_projection_value_range is not None
+                    and histogram_projection_value_range
+                    != (float(projection.bin_edges[0]), float(projection.bin_edges[-1]))
+                ):
+                    raise PanelRenderError(
+                        "histogram Fit range differs from its committed bins"
+                    )
             return self._histogram_front(
                 evaluated,
                 display,
@@ -965,6 +1025,8 @@ class PanelComposer:
         *,
         fit_result=None,
         fit_result_identity: str | None = None,
+        histogram_projection=None,
+        histogram_fit_overlays=(),
         check_cancelled=None,
     ):
         """Use the existing single-panel renderer for one typed grid cell."""
@@ -1032,17 +1094,42 @@ class PanelComposer:
                 self._curve_relim_mode = display.relim_mode
                 return raster, payload
             if self._intent is ViewIntent.HISTOGRAM:
-                projection = self._histogram_projection(
-                    figure.evaluated,
-                    display,
-                )
-                overlays = ()
-                if fit_result is not None:
-                    overlays = figure.transient_single_panel_histogram_fit_overlays(
-                        projection,
-                        fit_result,
-                        result_identity=fit_result_identity,
-                        check_cancelled=check_cancelled,
+                if fit_result is None:
+                    if histogram_projection is not None or histogram_fit_overlays:
+                        raise PanelRenderError(
+                            "focused histogram projection has no Fit result"
+                        )
+                    projection = self._histogram_projection(
+                        figure.evaluated,
+                        display,
+                    )
+                    overlays = ()
+                else:
+                    if histogram_projection is None:
+                        raise PanelRenderError(
+                            "focused histogram Fit lacks its root projection"
+                        )
+                    series = figure.evaluated.layers[0].cells[0].series
+                    projection = HistogramBinProjection._from_committed_edges(
+                        tuple(item.data.samples for item in series),
+                        bins=display.bin_count,
+                        bin_edges=histogram_projection.bin_edges,
+                    )
+                    root_overlays = tuple(histogram_fit_overlays)
+                    if len(root_overlays) != len(series):
+                        raise PanelRenderError(
+                            "focused histogram Fit overlays differ from its series"
+                        )
+                    overlays = tuple(
+                        replace(
+                            overlay,
+                            series_batch_address=item.batch_address,
+                        )
+                        for overlay, item in zip(
+                            root_overlays,
+                            series,
+                            strict=True,
+                        )
                     )
                 raster, payload = renderer.render_interactive_histogram(
                     figure.evaluated,

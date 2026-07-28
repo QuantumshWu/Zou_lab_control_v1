@@ -384,21 +384,4 @@ class AxisLayout:
                 )
         return resolved
 
-
-@dataclass(frozen=True, eq=False)
-class PointLayout(AxisLayout):
-    """Dataset point-axis specialization of :class:`AxisLayout`."""
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if self.storage_size == 0:
-            raise ValueError("PointLayout storage_size must be positive")
-        if self.mode is AxisLayoutMode.PRODUCT:
-            raise ValueError("PointLayout cannot be PRODUCT")
-
-    @classmethod
-    def product(cls, *factors: AxisLayout) -> AxisLayout:
-        raise TypeError("PointLayout does not support PRODUCT composition")
-
-
-__all__ = ["AxisLayout", "AxisLayoutMode", "PointLayout"]
+__all__ = ["AxisLayout", "AxisLayoutMode"]

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gc
-from io import BytesIO
 import math
 import threading
 from numbers import Number
@@ -16,7 +15,6 @@ from .figure import (
     EvaluatedProjectionIdentity,
 )
 from .fit_image_projection import (
-    RadialGaussianImageFitPanel,
     radial_gaussian_fit_geometry,
 )
 from .fit_projection import (
@@ -26,13 +24,11 @@ from .fit_projection import (
 from .image_display import (
     ImageDisplayState,
     evaluated_image_data_range,
-    image_viewport_for_display_state,
 )
 from .image_view import ImageViewportTransform, image_viewport_for_evaluated_image
 from .display_range import (
     RelimMode,
     deadband_display_range,
-    validated_display_range,
 )
 from .render import (
     ImagePanelRasterGeometry,
@@ -355,150 +351,6 @@ def _radial_image_color_limits_by_layer(
             )
         )
     return limits
-
-def _radial_projected_image(
-    axis,
-    figure,
-    panel: RadialGaussianImageFitPanel,
-    display: ImageDisplayState,
-    color_limits: tuple[float, float],
-):
-    """Draw one already-projected saved-fit cell without fit authority."""
-
-    viewport = image_viewport_for_display_state(display, panel.home_viewport)
-    overlay = panel.fit_overlay
-    _draw_projected_image(
-        axis,
-        figure,
-        panel.image,
-        colormap=display.colormap.value,
-        color_limits=color_limits,
-        visible_bounds=viewport.visible_bounds,
-        regular_axis_contract=True,
-        center=overlay.center_xy,
-        radius=overlay.one_over_e_radius,
-        diagnostic=(
-            None
-            if overlay.status is FitBatchStatus.CONVERGED
-            else overlay.diagnostic
-        ),
-    )
-    status = "NOT_PRESENT" if overlay.status is None else overlay.status.value
-    # The canonical Helvetica face lacks U+00B7; mathtext preserves the same
-    # visual separator without dropping a glyph in PDF/SVG/JPEG export.
-    axis.set_title(f"{overlay.caption} $\\cdot$ {status}")
-
-def _validated_radial_panels(
-    panels: tuple[RadialGaussianImageFitPanel, ...],
-) -> tuple[RadialGaussianImageFitPanel, ...]:
-    if not isinstance(panels, tuple) or not panels or any(
-        not isinstance(panel, RadialGaussianImageFitPanel) for panel in panels
-    ):
-        raise TypeError("panels must be a non-empty radial panel tuple")
-    first = panels[0].fit_overlay
-    if any(
-        panel.fit_overlay.artifact_identity != first.artifact_identity
-        or panel.fit_overlay.source_ref != first.source_ref
-        for panel in panels[1:]
-    ):
-        raise ValueError("radial saved-fit export cannot mix artifact revisions")
-    return panels
-
-def _validated_radial_grid_columns(columns: int, panel_count: int) -> int:
-    columns = positive_integer(columns, "columns")
-    if columns > panel_count:
-        raise ValueError("columns cannot exceed the radial panel count")
-    return columns
-
-def render_radial_gaussian_image_fit_panels(
-    panels: tuple[RadialGaussianImageFitPanel, ...],
-    display: ImageDisplayState,
-    current_color_limits: tuple[float, float],
-    *,
-    columns: int,
-    dpi: float = 100.0,
-):
-    """Render the current typed saved-fit IMAGE view from immutable projections.
-
-    No dataset lookup, view evaluation, predicted image, or solver is reachable
-    from this path.  The caller owns the returned Figure and must release it
-    with :func:`release_agg_figure`.
-    """
-
-    prepared = _validated_radial_panels(panels)
-    if not isinstance(display, ImageDisplayState):
-        raise TypeError("display must be ImageDisplayState")
-    limits = validated_display_range(
-        current_color_limits,
-        "current_color_limits",
-    )
-    dpi = _render_dpi(dpi)
-    columns = _validated_radial_grid_columns(columns, len(prepared))
-
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from matplotlib.figure import Figure
-
-    rows = math.ceil(len(prepared) / columns)
-    with render_style_context():
-        figure = Figure(
-            figsize=(5.0 * columns, 4.0 * rows),
-            dpi=dpi,
-            constrained_layout=True,
-        )
-        axes = None
-        try:
-            FigureCanvasAgg(figure)
-            axes = figure.subplots(rows, columns, squeeze=False).reshape(-1)
-            for axis, panel in zip(axes, prepared, strict=False):
-                _radial_projected_image(axis, figure, panel, display, limits)
-            for unused in axes[len(prepared):]:
-                unused.set_visible(False)
-            return figure
-        except BaseException:
-            release_agg_figure(figure)
-            figure = axes = None
-            gc.collect()
-            raise
-
-def encode_radial_gaussian_image_fit_panels(
-    panels: tuple[RadialGaussianImageFitPanel, ...],
-    display: ImageDisplayState,
-    current_color_limits: tuple[float, float],
-    *,
-    image_format: str,
-    columns: int,
-    dpi: float = 100.0,
-) -> bytes:
-    """Encode the exact committed typed page/focus display.
-
-    Viewport, colormap, shared limits, saved-fit overlay, status, and frozen
-    board columns are preserved for PNG/PDF/SVG/JPEG.  A transient rectangle
-    selection candidate is intentionally absent: it is an uncommitted pointer
-    draft, not part of :class:`ImageDisplayState`.
-    """
-
-    if not isinstance(image_format, str):
-        raise TypeError("image_format must be str")
-    if image_format not in {"png", "pdf", "svg", "jpg", "jpeg"}:
-        raise ValueError("radial image export format must be png, pdf, svg, jpg, or jpeg")
-    figure = None
-    output = BytesIO()
-    try:
-        figure = render_radial_gaussian_image_fit_panels(
-            panels,
-            display,
-            current_color_limits,
-            columns=columns,
-            dpi=dpi,
-        )
-        with render_style_context():
-            figure.savefig(output, format=image_format, dpi=dpi)
-    finally:
-        if figure is not None:
-            release_agg_figure(figure)
-        figure = None
-        gc.collect()
-    return output.getvalue()
 
 def _decimate_image_view(
     grid: np.ndarray,
@@ -1425,7 +1277,5 @@ class ImagePanelAggRenderer:
             raise RuntimeError("image-panel Agg renderer is closed")
 
 __all__ = [
-    "encode_radial_gaussian_image_fit_panels",
-    "render_radial_gaussian_image_fit_panels",
     "ImagePanelAggRenderer",
 ]

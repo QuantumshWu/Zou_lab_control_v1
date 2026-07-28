@@ -248,9 +248,7 @@ class FacetedPanelHost(QtWidgets.QWidget):
         if len(hits) != 1:
             return
         index, region = hits[0]
-        if region.focus_selection is None:  # constructor/present closes this
-            raise RuntimeError("faceted overview region lost its selection")
-        self.focusRequested.emit(index, region.focus_selection)
+        self.focusRequested.emit(index, region.focus_address)
 
 
 __all__ = ["FacetedPanelHost"]

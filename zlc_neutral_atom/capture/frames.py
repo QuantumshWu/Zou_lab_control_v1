@@ -156,7 +156,7 @@ def _capture_frame_record_geometry(
 def _cell_address_to_tree(cell: DatasetCellAddress) -> list[int]:
     if not isinstance(cell, DatasetCellAddress):
         raise TypeError("cell must be DatasetCellAddress")
-    return [cell.repeat_index, cell.point_storage_index]
+    return [cell.repeat_index, cell.point_ordinal]
 
 
 def _cell_address_from_tree(tree: object) -> DatasetCellAddress:
@@ -164,7 +164,7 @@ def _cell_address_from_tree(tree: object) -> DatasetCellAddress:
         raise ValueError("frame-event cell address must contain two integers")
     return DatasetCellAddress(
         nonnegative_integer(tree[0], "repeat_index"),
-        nonnegative_integer(tree[1], "point_storage_index"),
+        nonnegative_integer(tree[1], "point_ordinal"),
     )
 
 
@@ -202,7 +202,7 @@ def _validate_frame_events(
 ) -> tuple[bytes, int, str, str]:
     """Validate staging events and derive the compact immutable load receipts."""
 
-    total = schema.repeat_axis.size * schema.point_layout.storage_size
+    total = schema.repeat_axis.size * schema.point_table.row_count
     if len(schedule) != total or len(metadata) != total:
         raise ValueError("frame source schedule/metadata do not cover the dataset")
     join_plan_digest = schedule.digest_for_schema(schema)
@@ -218,8 +218,8 @@ def _validate_frame_events(
             raise ValueError("frame source metadata ordinals are not contiguous")
         metadata_hasher.update(metadata_contract.digest(item))
         linear_cell = (
-            cell.repeat_index * schema.point_layout.storage_size
-            + cell.point_storage_index
+            cell.repeat_index * schema.point_table.row_count
+            + cell.point_ordinal
         )
         _write_inverse_ordinal(
             ordinal_by_linear_cell,
@@ -266,7 +266,7 @@ def _frame_validity(
     cell: DatasetCellAddress,
 ) -> tuple[Valid | Invalid | ComponentValidity, bytes]:
     validity = block.validity
-    location = (cell.repeat_index, cell.point_storage_index)
+    location = (cell.repeat_index, cell.point_ordinal)
     if isinstance(validity, (Valid, Invalid)):
         return validity, b""
     if isinstance(validity, CellValidity):
@@ -342,7 +342,7 @@ def _decode_frame_event_chunk(
         cell = _cell_address_from_tree(row["cell"])
         if (
             cell.repeat_index >= schema.repeat_axis.size
-            or cell.point_storage_index >= schema.point_layout.storage_size
+            or cell.point_ordinal >= schema.point_table.row_count
         ):
             raise ValueError("frame-event cell is outside DatasetSchema")
         records.append((cell, metadata))
@@ -411,7 +411,7 @@ class CaptureFrameSource:
         if store_authority.root != root_lease.root / "content":
             raise ValueError("frame source content store differs from repository lease")
         event_count = positive_integer(event_count, "event_count")
-        physical_cells = schema.repeat_axis.size * schema.point_layout.storage_size
+        physical_cells = schema.repeat_axis.size * schema.point_table.row_count
         if event_count != physical_cells:
             raise ValueError("frame source event count differs from DatasetSchema")
         event_refs = tuple(event_chunk_refs)
@@ -613,12 +613,12 @@ class CaptureFrameSource:
                     raise TypeError("iter_cells requires DatasetCellAddress values")
                 if (
                     cell.repeat_index >= self._schema.repeat_axis.size
-                    or cell.point_storage_index >= self._schema.point_layout.storage_size
+                    or cell.point_ordinal >= self._schema.point_table.row_count
                 ):
                     raise KeyError("cell is outside this capture frame source")
                 linear_cell = (
-                    cell.repeat_index * self._schema.point_layout.storage_size
-                    + cell.point_storage_index
+                    cell.repeat_index * self._schema.point_table.row_count
+                    + cell.point_ordinal
                 )
                 ordinal = _read_inverse_ordinal(
                     self._ordinal_by_linear_cell,
@@ -679,7 +679,7 @@ class CaptureFrameSource:
                 else np.empty(
                     (
                         self._schema.repeat_axis.size,
-                        self._schema.point_layout.storage_size,
+                        self._schema.point_table.row_count,
                     )
                     + (
                         ()
@@ -695,7 +695,7 @@ class CaptureFrameSource:
             for cell, sample in self.iter_event_order():
                 if abort_check is not None:
                     abort_check()
-                location = (cell.repeat_index, cell.point_storage_index)
+                location = (cell.repeat_index, cell.point_ordinal)
                 values[location] = sample.image.values
                 if self._validity_kind == "cell":
                     assert validity_values is not None
@@ -838,7 +838,7 @@ def _stage_capture_frame_source(
     buffer = bytearray()
     for ordinal, cell in enumerate(schedule):
         frame_validity, validity_bytes = _frame_validity(block, cell)
-        frame = block.values[cell.repeat_index, cell.point_storage_index]
+        frame = block.values[cell.repeat_index, cell.point_ordinal]
         buffer.extend(_canonical_frame_bytes(frame, frame_validity, block.schema.cell_schema))
         buffer.extend(validity_bytes)
         if (ordinal + 1) % geometry.frames_per_chunk == 0:
@@ -980,7 +980,7 @@ def _inspect_capture_frame_source(
         _FRAME_SCHEMA_SCHEMA,
     )
     schema = dataset_schema_from_tree(schema_tree["dataset_schema"])
-    physical_cells = schema.repeat_axis.size * schema.point_layout.storage_size
+    physical_cells = schema.repeat_axis.size * schema.point_table.row_count
     if event_count != physical_cells:
         raise ValueError("frame event count differs from DatasetSchema storage")
     validity_kind = validity["kind"]
@@ -1059,8 +1059,8 @@ def _capture_frame_source_from_payload(
                 ordinal = start + offset
                 metadata_hasher.update(metadata_contract.digest(item))
                 linear_cell = (
-                    cell.repeat_index * schema.point_layout.storage_size
-                    + cell.point_storage_index
+                    cell.repeat_index * schema.point_table.row_count
+                    + cell.point_ordinal
                 )
                 _write_inverse_ordinal(
                     ordinal_by_linear_cell,

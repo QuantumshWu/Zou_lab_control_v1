@@ -781,7 +781,7 @@ class SinglePanelAggRenderer:
             series_topology = tuple(
                 (
                     series.batch_address,
-                    series.data.x_axis.axis_id,
+                    series.data.x_axis.source,
                     series.data.x_axis.role,
                     len(series.data.x_axis.indices),
                     series.data.value_unit,
@@ -808,7 +808,7 @@ class SinglePanelAggRenderer:
             # number or kind of artists.  Only the structural selector roles
             # belong in the persistent Agg topology key.
             tuple(
-                (resolution.axis_id, resolution.selector)
+                (resolution.source, resolution.selector)
                 for resolution in layer.resolutions
             ),
             cell.facet_address,

@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from zlc_data import Selection
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.logic_nodes.camera_measurement.output_binding import (
@@ -19,6 +18,7 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
 )
 from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.runtime.run import RunHandle
+from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 
 from .application import (
     DetectionRequest,
@@ -225,14 +225,14 @@ class OccupancyApi:
     def _load_occupancy_cell_source(
         self,
         reference: OccupancyArtifactRef,
-        selection: Selection | None,
+        address: DatasetCellAddress | None,
         *,
         expected_navigation: OccupancyCellDomain | None = None,
     ):
         if not isinstance(reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
-        if selection is not None and not isinstance(selection, Selection):
-            raise TypeError("selection must be Selection or None")
+        if address is not None and not isinstance(address, DatasetCellAddress):
+            raise TypeError("address must be DatasetCellAddress or None")
         if expected_navigation is not None and not isinstance(
             expected_navigation,
             OccupancyCellDomain,
@@ -241,7 +241,7 @@ class OccupancyApi:
         source = self._load_cell(
             reference,
             self._occupancy_repository(),
-            selection,
+            address,
             expected_domain_identity=(
                 None
                 if expected_navigation is None
@@ -257,27 +257,27 @@ class OccupancyApi:
         self,
         reference: OccupancyArtifactRef,
         *,
-        selection: Selection | None = None,
+        address: DatasetCellAddress | None = None,
     ):
-        return self._load_occupancy_cell_source(reference, selection)
+        return self._load_occupancy_cell_source(reference, address)
 
     def occupancy_cell_gui(
         self,
         reference: OccupancyArtifactRef,
         *,
-        selection: Selection | None = None,
+        address: DatasetCellAddress | None = None,
     ):
         if not isinstance(reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
-        if selection is not None and not isinstance(selection, Selection):
-            raise TypeError("selection must be Selection or None")
+        if address is not None and not isinstance(address, DatasetCellAddress):
+            raise TypeError("address must be DatasetCellAddress or None")
         from .ui.workbench import open_occupancy_cell_workbench
 
         return open_occupancy_cell_workbench(
             self._inspect_occupancy_cell_navigation,
             self._load_occupancy_cell_source,
             reference,
-            selection=selection,
+            address=address,
         )
 
 

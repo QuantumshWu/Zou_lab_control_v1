@@ -16,18 +16,21 @@ from zlc_storage.canonical import (
     integer,
     positive_integer,
     positive_real,
-    sha256_text,
 )
 
 from ._arrays import immutable_array, immutable_bool_array
-from .axis import AxisId, AxisSpec, SCALAR
+from .axis import (
+    AxisId,
+    AxisSourceRef,
+    AxisSpec,
+    SCALAR,
+    point_ordinal_axis,
+)
 from .layout import AxisLayout
-from .schema import DatasetSchema
+from .schema import DatasetSchema, ResolvedPointRows, resolve_point_rows
 from .transform import (
     CommittedTransform,
-    TransformedSchema,
-    _source_transformed_schema,
-    resolve_transformed_schema,
+    _resolve_transform_state,
 )
 from .value import DatasetRevisionRef, OwnedSnapshot
 from .fit_model import (
@@ -38,14 +41,7 @@ from .fit_model import (
 )
 
 
-class FitCoordinateSource(str, Enum):
-    DECLARED = "DECLARED"
-    LOGICAL_INDEX = "LOGICAL_INDEX"
-
-
 _MAX_CONSECUTIVE_FLOAT64_INTEGER = 1 << 53
-
-
 class FitBatchStatus(str, Enum):
     CONVERGED = "CONVERGED"
     NO_VALID_DATA = "NO_VALID_DATA"
@@ -117,33 +113,39 @@ class FitNumericPolicy:
 
 @dataclass(frozen=True)
 class FitSpec:
-    input_schema_fingerprint: str
-    committed_transform: CommittedTransform | None
-    fit_axis_ids: tuple[AxisId, ...]
-    batch_axis_ids: tuple[AxisId, ...]
+    committed_transform: CommittedTransform
+    independent_sources: tuple[AxisSourceRef, ...]
+    batch_sources: tuple[AxisSourceRef, ...]
     model_id: str
     constraints: tuple[FitParameterConstraint, ...] = ()
     numeric_policy: FitNumericPolicy = FitNumericPolicy()
 
     def __post_init__(self) -> None:
-        sha256_text(self.input_schema_fingerprint, "input_schema_fingerprint")
-        if self.committed_transform is not None:
-            if not isinstance(self.committed_transform, CommittedTransform):
-                raise TypeError("committed_transform must be CommittedTransform or None")
-            if self.committed_transform.input_schema_fingerprint != self.input_schema_fingerprint:
-                raise ValueError("committed transform is bound to another input schema")
-        fit_axes = tuple(self.fit_axis_ids)
-        batch_axes = tuple(self.batch_axis_ids)
-        if not fit_axes or any(not isinstance(axis_id, AxisId) for axis_id in fit_axes):
-            raise ValueError("fit_axis_ids must contain named AxisId values")
-        if any(not isinstance(axis_id, AxisId) for axis_id in batch_axes):
-            raise TypeError("batch_axis_ids must contain AxisId values")
-        if len(set(fit_axes)) != len(fit_axes) or len(set(batch_axes)) != len(batch_axes):
-            raise ValueError("fit and batch axis ids must each be unique")
-        if set(fit_axes) & set(batch_axes):
-            raise ValueError("fit and batch axes cannot overlap")
+        if not isinstance(self.committed_transform, CommittedTransform):
+            raise TypeError("committed_transform must be CommittedTransform")
+        independent = tuple(self.independent_sources)
+        batch = tuple(self.batch_sources)
+        if not independent or any(
+            not isinstance(source, AxisSourceRef) for source in independent
+        ):
+            raise ValueError("independent_sources must contain AxisSourceRef values")
+        if any(not isinstance(source, AxisSourceRef) for source in batch):
+            raise TypeError("batch_sources must contain AxisSourceRef values")
+        if len(set(independent)) != len(independent) or len(set(batch)) != len(batch):
+            raise ValueError("independent and batch sources must each be unique")
+        if set(independent) & set(batch):
+            raise ValueError("independent and batch sources cannot overlap")
+        if any(source.kind == AxisSourceRef.POINT_ROWS for source in independent):
+            raise ValueError("POINT_ROWS cannot be a Fit independent source")
+        if any(source.kind == AxisSourceRef.POINT_ORDINAL for source in batch):
+            raise ValueError("POINT_ORDINAL cannot be a Fit batch source")
         canonical_text(self.model_id, "model_id")
         model = fit_model_definition(self.model_id)
+        if len(independent) != model.independent_arity:
+            raise ValueError(
+                f"model {model.model_id!r} requires "
+                f"{model.independent_arity} independent sources"
+            )
         constraints = tuple(self.constraints)
         if any(not isinstance(item, FitParameterConstraint) for item in constraints):
             raise TypeError("constraints must contain FitParameterConstraint values")
@@ -173,8 +175,8 @@ class FitSpec:
                     )
         if not isinstance(self.numeric_policy, FitNumericPolicy):
             raise TypeError("numeric_policy must be FitNumericPolicy")
-        object.__setattr__(self, "fit_axis_ids", fit_axes)
-        object.__setattr__(self, "batch_axis_ids", batch_axes)
+        object.__setattr__(self, "independent_sources", independent)
+        object.__setattr__(self, "batch_sources", batch)
         object.__setattr__(self, "constraints", tuple(sorted(constraints, key=lambda item: item.parameter_name)))
 
 
@@ -199,9 +201,17 @@ def _minimum_observation_count(spec: FitSpec, model: FitModelDefinition) -> int:
 class BoundFit:
     spec: FitSpec
     expected_schema: DatasetSchema
-    effective_schema: TransformedSchema = field(init=False)
+    effective_schema: DatasetSchema = field(init=False)
+    fit_axis_specs: tuple[AxisSpec, ...] = field(init=False)
+    batch_axis_specs: tuple[AxisSpec, ...] = field(init=False)
+    point_groups: ResolvedPointRows = field(init=False)
     model: FitModelDefinition = field(init=False)
-    _coordinate_sources: tuple[FitCoordinateSource, ...] = field(
+    _effective_point_groups: ResolvedPointRows = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _source_row_members: tuple[tuple[int, ...], ...] = field(
         init=False,
         repr=False,
         compare=False,
@@ -212,31 +222,44 @@ class BoundFit:
             raise TypeError("spec must be FitSpec")
         if not isinstance(self.expected_schema, DatasetSchema):
             raise TypeError("expected_schema must be DatasetSchema")
-        if self.expected_schema.fingerprint != self.spec.input_schema_fingerprint:
+        if (
+            self.expected_schema.fingerprint
+            != self.spec.committed_transform.source_schema_fingerprint
+        ):
             raise ValueError("BoundFit expected schema disagrees with FitSpec")
-        effective_schema = _resolve_fit_effective_schema(self.spec, self.expected_schema)
+        state = _resolve_transform_state(
+            self.expected_schema,
+            self.spec.committed_transform,
+        )
+        effective_schema = state.schema
         model = fit_model_definition(self.spec.model_id)
-        object.__setattr__(self, "effective_schema", effective_schema)
-        object.__setattr__(self, "model", model)
-        if effective_schema.dtype.kind not in "biuf":
+        if effective_schema.cell_schema.dtype.kind not in "biuf":
             raise TypeError("fit observations must use a real numeric dtype")
-        effective_ids = tuple(
-            axis.axis_id for axis in effective_schema.axes if axis.role != SCALAR
+        _validate_fit_source_coverage(effective_schema, self.spec)
+        point_batch_sources = tuple(
+            source
+            for source in self.spec.batch_sources
+            if source.kind != AxisSourceRef.TENSOR
         )
-        requested_ids = self.spec.fit_axis_ids + self.spec.batch_axis_ids
-        if len(requested_ids) != len(effective_ids) or set(requested_ids) != set(effective_ids):
-            raise ValueError(
-                "BoundFit axes do not cover every information axis exactly"
-            )
-        if len(self.spec.fit_axis_ids) != model.independent_arity:
-            raise ValueError(
-                f"model {model.model_id!r} requires "
-                f"{model.independent_arity} fit axes"
-            )
+        effective_groups = resolve_point_rows(
+            effective_schema.point_table,
+            effective_schema.grid_topology,
+            group_sources=point_batch_sources,
+        )
+        if effective_groups.group_sources != point_batch_sources:
+            raise ValueError("Fit point batch sources are not in canonical owner order")
         fit_axes = tuple(
-            effective_schema.axis(axis_id) for axis_id in self.spec.fit_axis_ids
+            _independent_axis_spec(effective_schema, state.source_row_members, source)
+            for source in self.spec.independent_sources
         )
-        sources = tuple(_coordinate_source_for_axis(axis) for axis in fit_axes)
+        source_groups = _source_point_groups(
+            effective_groups,
+            state.source_row_members,
+        )
+        batch_axes = tuple(
+            _batch_axis_spec(effective_schema, source_groups, source)
+            for source in self.spec.batch_sources
+        )
         for position, (axis, requirement) in enumerate(
             zip(fit_axes, model.axis_requirements)
         ):
@@ -247,17 +270,24 @@ class BoundFit:
                     f"does not satisfy model roles [{roles}]"
                 )
         if model.require_common_axis_unit:
-            units = tuple(
-                _coordinate_unit(axis, source)
-                for axis, source in zip(fit_axes, sources)
-            )
+            units = tuple(_coordinate_unit(axis) for axis in fit_axes)
             if len(set(units)) != 1:
                 raise ValueError("model fit axes require compatible coordinate units")
         if model.require_common_coordinate_frame and len(
             set(axis.coordinate_frame for axis in fit_axes)
         ) != 1:
             raise ValueError("model fit axes require the same coordinate frame")
-        object.__setattr__(self, "_coordinate_sources", sources)
+        object.__setattr__(self, "effective_schema", effective_schema)
+        object.__setattr__(self, "fit_axis_specs", fit_axes)
+        object.__setattr__(self, "batch_axis_specs", batch_axes)
+        object.__setattr__(
+            self,
+            "point_groups",
+            source_groups,
+        )
+        object.__setattr__(self, "model", model)
+        object.__setattr__(self, "_effective_point_groups", effective_groups)
+        object.__setattr__(self, "_source_row_members", state.source_row_members)
 
     def run(
         self,
@@ -284,20 +314,234 @@ class BoundFit:
         return self.model.parameters
 
     @property
-    def coordinate_sources(self) -> tuple[FitCoordinateSource, ...]:
-        return self._coordinate_sources
-
-    @property
     def parameter_units(self) -> tuple[str, ...]:
-        fit_axes = tuple(
-            self.effective_schema.axis(axis_id) for axis_id in self.spec.fit_axis_ids
-        )
         return resolve_parameter_units(
             self.parameter_definitions,
-            fit_axes,
-            self.coordinate_sources,
-            self.effective_schema.value_unit,
+            self.fit_axis_specs,
+            self.effective_schema.cell_schema.value_unit,
         )
+
+
+def _validate_fit_source_coverage(schema: DatasetSchema, spec: FitSpec) -> None:
+    requested = spec.independent_sources + spec.batch_sources
+    requested_tensor = tuple(
+        source for source in requested if source.kind == AxisSourceRef.TENSOR
+    )
+    expected_tensor = (
+        *(
+            (AxisSourceRef.tensor(schema.repeat_axis.axis_id),)
+            if schema.repeat_axis.size > 1
+            else ()
+        ),
+        *(
+            AxisSourceRef.tensor(axis.axis_id)
+            for axis in schema.cell_schema.data_axes
+            if axis.role != SCALAR and axis.size > 1
+        ),
+    )
+    if len(requested_tensor) != len(expected_tensor) or set(requested_tensor) != set(
+        expected_tensor
+    ):
+        raise ValueError(
+            "Fit tensor sources must cover every effective information axis exactly"
+        )
+
+    point_independent = tuple(
+        source
+        for source in spec.independent_sources
+        if source.kind != AxisSourceRef.TENSOR
+    )
+    point_batch = tuple(
+        source for source in spec.batch_sources if source.kind != AxisSourceRef.TENSOR
+    )
+    point_sources = point_independent + point_batch
+    if schema.point_table.row_count > 1 and not point_sources:
+        raise ValueError(
+            "Fit must explicitly use or batch a multi-row point domain"
+        )
+    if any(source.kind == AxisSourceRef.POINT_ROWS for source in point_batch) and point_independent:
+        raise ValueError("POINT_ROWS batch cannot also expose a point independent source")
+    if any(source.kind == AxisSourceRef.POINT_ROWS for source in point_batch) and len(
+        point_batch
+    ) != 1:
+        raise ValueError("POINT_ROWS is the sole point-domain batch source")
+    kinds = {source.kind for source in point_sources}
+    if AxisSourceRef.GRID_DIMENSION in kinds and kinds != {
+        AxisSourceRef.GRID_DIMENSION
+    }:
+        raise ValueError("raw point and GridTopology Fit sources cannot mix")
+    if AxisSourceRef.POINT_ROWS in kinds and AxisSourceRef.POINT_COORDINATE in kinds:
+        raise ValueError("POINT_ROWS and POINT_COORDINATE Fit sources cannot mix")
+
+
+def _tensor_axis(schema: DatasetSchema, axis_id: AxisId | None) -> AxisSpec:
+    if axis_id == schema.repeat_axis.axis_id:
+        return schema.repeat_axis
+    if axis_id is not None:
+        for axis in schema.cell_schema.data_axes:
+            if axis.axis_id == axis_id:
+                return axis
+    raise KeyError(f"tensor source {axis_id!r} is absent from effective Dataset")
+
+
+def _point_column(schema: DatasetSchema, axis_id: AxisId | None):
+    if axis_id is None:
+        raise TypeError("point coordinate source requires an AxisId")
+    return schema.point_table.column(axis_id)
+
+
+def _independent_axis_spec(
+    schema: DatasetSchema,
+    source_row_members: tuple[tuple[int, ...], ...],
+    source: AxisSourceRef,
+) -> AxisSpec:
+    if source.kind == AxisSourceRef.TENSOR:
+        axis = _tensor_axis(schema, source.axis_id)
+        if axis.role == SCALAR:
+            raise ValueError("the scalar carrier cannot be a Fit independent source")
+    elif source.kind == AxisSourceRef.POINT_ORDINAL:
+        if any(len(members) != 1 for members in source_row_members):
+            raise ValueError(
+                "POINT_ORDINAL cannot identify an output row aggregated from source rows"
+            )
+        coordinates = tuple(members[0] for members in source_row_members)
+        axis = point_ordinal_axis(len(coordinates), coordinates)
+    elif source.kind == AxisSourceRef.POINT_COORDINATE:
+        column = _point_column(schema, source.axis_id)
+        if column.value_kind != column.NUMERIC:
+            raise TypeError("Fit point-coordinate source must be numeric")
+        axis = AxisSpec(
+            column.coordinate_id,
+            column.name,
+            column.role,
+            schema.point_table.row_count,
+            column.values,
+            column.unit,
+            column.coordinate_frame,
+        )
+    elif source.kind == AxisSourceRef.GRID_DIMENSION:
+        topology = schema.grid_topology
+        if topology is None or source.axis_id not in topology.dimension_ids:
+            raise KeyError("Fit grid source is absent from GridTopology")
+        position = topology.dimension_ids.index(source.axis_id)
+        column = _point_column(schema, source.axis_id)
+        axis = AxisSpec(
+            column.coordinate_id,
+            column.name,
+            column.role,
+            len(topology.coordinate_domains[position]),
+            topology.coordinate_domains[position],
+            column.unit,
+            column.coordinate_frame,
+        )
+    else:
+        raise ValueError(f"{source.kind} is not a Fit independent source")
+    _validate_numeric_axis(axis)
+    return axis
+
+
+def _batch_axis_spec(
+    schema: DatasetSchema,
+    point_groups: ResolvedPointRows,
+    source: AxisSourceRef,
+) -> AxisSpec:
+    if source.kind == AxisSourceRef.TENSOR:
+        axis = _tensor_axis(schema, source.axis_id)
+        if axis.role == SCALAR:
+            raise ValueError("the scalar carrier cannot be a Fit batch source")
+        return axis
+    if source.kind == AxisSourceRef.POINT_ROWS:
+        coordinates = tuple(row[0] for row in point_groups.group_values)
+        return point_ordinal_axis(len(coordinates), coordinates)
+    try:
+        position = point_groups.group_sources.index(source)
+    except ValueError as exc:
+        raise KeyError("point batch source is absent from resolved groups") from exc
+    column = _point_column(schema, source.axis_id)
+    if source.kind == AxisSourceRef.POINT_COORDINATE:
+        domain = tuple(
+            dict.fromkeys(row[position] for row in point_groups.group_values)
+        )
+    elif source.kind == AxisSourceRef.GRID_DIMENSION:
+        topology = schema.grid_topology
+        if topology is None or source.axis_id not in topology.dimension_ids:
+            raise KeyError("Fit grid batch source is absent from GridTopology")
+        domain = topology.coordinate_domains[topology.dimension_ids.index(source.axis_id)]
+    else:
+        raise ValueError(f"{source.kind} is not a Fit batch source")
+    return AxisSpec(
+        column.coordinate_id,
+        column.name,
+        column.role,
+        len(domain),
+        domain,
+        column.unit,
+        column.coordinate_frame,
+    )
+
+
+def _source_point_groups(
+    effective: ResolvedPointRows,
+    source_row_members: tuple[tuple[int, ...], ...],
+) -> ResolvedPointRows:
+    surviving = tuple(
+        sorted(item for members in source_row_members for item in members)
+    )
+    mapped_groups = tuple(
+        tuple(
+            sorted(
+                source_ordinal
+                for effective_ordinal in group
+                for source_ordinal in source_row_members[effective_ordinal]
+            )
+        )
+        for group in effective.group_member_ordinals
+    )
+    grouped = {item for group in mapped_groups for item in group}
+    addresses = effective.group_addresses
+    values = effective.group_values
+    if effective.group_sources == (AxisSourceRef.point_rows(),):
+        if any(len(group) != 1 for group in mapped_groups):
+            raise ValueError(
+                "POINT_ROWS batch cannot identify an aggregated source row"
+            )
+        addresses = tuple((group[0],) for group in mapped_groups)
+        values = addresses
+    return ResolvedPointRows(
+        surviving,
+        effective.group_sources,
+        addresses,
+        values,
+        mapped_groups,
+        len(surviving) - len(grouped),
+    )
+
+
+def _validate_numeric_axis(axis: AxisSpec) -> None:
+    if axis.coordinates is None:
+        last = axis.index_origin + axis.size - 1
+        if axis.size > 1 and last > _MAX_CONSECUTIVE_FLOAT64_INTEGER:
+            raise ValueError(
+                "implicit fit coordinates are not consecutively float64-representable"
+            )
+        values = (axis.index_origin, last)
+    else:
+        values = tuple(value for value in axis.coordinates if value is not None)
+        if not values:
+            raise ValueError("fit axis has no numeric coordinates")
+        if any(isinstance(value, bool) or not isinstance(value, Real) for value in values):
+            raise TypeError(
+                f"declared coordinates for fit axis {axis.axis_id} must be numeric"
+            )
+    for value in values:
+        try:
+            converted = float(value)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("fit coordinate is not float64-representable") from exc
+        if not math.isfinite(converted) or (
+            isinstance(value, Integral) and int(converted) != int(value)
+        ):
+            raise ValueError("fit coordinate is not exactly float64-representable")
 
 
 @dataclass(frozen=True)
@@ -306,6 +550,7 @@ class FitProblem:
     spec: FitSpec
     fit_axis_specs: tuple[AxisSpec, ...]
     batch_axis_specs: tuple[AxisSpec, ...]
+    point_groups: ResolvedPointRows
     batch_layout: AxisLayout
     value_unit: str | None
     batch_offsets: np.ndarray
@@ -320,16 +565,28 @@ class FitProblem:
             raise TypeError("source_ref must be DatasetRevisionRef")
         if not isinstance(self.spec, FitSpec):
             raise TypeError("spec must be FitSpec")
-        if self.source_ref.schema_fingerprint != self.spec.input_schema_fingerprint:
+        if (
+            self.source_ref.schema_fingerprint
+            != self.spec.committed_transform.source_schema_fingerprint
+        ):
             raise ValueError("fit problem source lineage disagrees with FitSpec")
         fit_axes = tuple(self.fit_axis_specs)
         batch_axes = tuple(self.batch_axis_specs)
         if any(not isinstance(axis, AxisSpec) for axis in fit_axes + batch_axes):
             raise TypeError("fit problem axes must contain AxisSpec values")
-        if tuple(axis.axis_id for axis in fit_axes) != self.spec.fit_axis_ids:
-            raise ValueError("fit problem axis order disagrees with FitSpec")
-        if tuple(axis.axis_id for axis in batch_axes) != self.spec.batch_axis_ids:
-            raise ValueError("batch problem axis order disagrees with FitSpec")
+        if len(fit_axes) != len(self.spec.independent_sources):
+            raise ValueError("fit problem axis arity disagrees with FitSpec")
+        if len(batch_axes) != len(self.spec.batch_sources):
+            raise ValueError("batch problem axis arity disagrees with FitSpec")
+        if not isinstance(self.point_groups, ResolvedPointRows):
+            raise TypeError("point_groups must be ResolvedPointRows")
+        point_batch_sources = tuple(
+            source
+            for source in self.spec.batch_sources
+            if source.kind != AxisSourceRef.TENSOR
+        )
+        if self.point_groups.group_sources != point_batch_sources:
+            raise ValueError("fit problem point groups disagree with FitSpec")
         if not isinstance(self.batch_layout, AxisLayout):
             raise TypeError("batch_layout must be AxisLayout")
         if self.batch_layout.logical_shape != tuple(axis.size for axis in batch_axes):
@@ -372,8 +629,6 @@ class FitProblem:
 
     @property
     def effective_schema_fingerprint(self) -> str:
-        if self.spec.committed_transform is None:
-            return self.spec.input_schema_fingerprint
         return self.spec.committed_transform.output_schema_fingerprint
 
 @dataclass(frozen=True, eq=False)
@@ -382,6 +637,7 @@ class FitResultBatch:
     spec: FitSpec
     fit_axis_specs: tuple[AxisSpec, ...]
     batch_axis_specs: tuple[AxisSpec, ...]
+    point_groups: ResolvedPointRows
     batch_layout: AxisLayout
     value_unit: str | None
     parameter_values: np.ndarray
@@ -397,11 +653,6 @@ class FitResultBatch:
     r_squared: np.ndarray
     r_squared_valid: np.ndarray
     scipy_version: str
-    _coordinate_sources: tuple[FitCoordinateSource, ...] = field(
-        init=False,
-        repr=False,
-        compare=False,
-    )
     __hash__ = None
 
     def __post_init__(self) -> None:
@@ -409,19 +660,30 @@ class FitResultBatch:
             raise TypeError("source_ref must be DatasetRevisionRef")
         if not isinstance(self.spec, FitSpec):
             raise TypeError("spec must be FitSpec")
-        if self.source_ref.schema_fingerprint != self.spec.input_schema_fingerprint:
+        if (
+            self.source_ref.schema_fingerprint
+            != self.spec.committed_transform.source_schema_fingerprint
+        ):
             raise ValueError("fit result source lineage disagrees with FitSpec")
         fit_axes = tuple(self.fit_axis_specs)
         batch_axes = tuple(self.batch_axis_specs)
         if any(not isinstance(axis, AxisSpec) for axis in fit_axes + batch_axes):
             raise TypeError("fit result axes must contain AxisSpec values")
-        sources = tuple(_coordinate_source_for_axis(axis) for axis in fit_axes)
         model = fit_model_definition(self.spec.model_id)
         parameters = model.parameters
-        if tuple(axis.axis_id for axis in fit_axes) != self.spec.fit_axis_ids:
-            raise ValueError("fit result axis order disagrees with FitSpec")
-        if tuple(axis.axis_id for axis in batch_axes) != self.spec.batch_axis_ids:
-            raise ValueError("batch result axis order disagrees with FitSpec")
+        if len(fit_axes) != len(self.spec.independent_sources):
+            raise ValueError("fit result axis arity disagrees with FitSpec")
+        if len(batch_axes) != len(self.spec.batch_sources):
+            raise ValueError("batch result axis arity disagrees with FitSpec")
+        if not isinstance(self.point_groups, ResolvedPointRows):
+            raise TypeError("point_groups must be ResolvedPointRows")
+        point_batch_sources = tuple(
+            source
+            for source in self.spec.batch_sources
+            if source.kind != AxisSourceRef.TENSOR
+        )
+        if self.point_groups.group_sources != point_batch_sources:
+            raise ValueError("fit result point groups disagree with FitSpec")
         if not isinstance(self.batch_layout, AxisLayout):
             raise TypeError("batch_layout must be AxisLayout")
         if self.batch_layout.logical_shape != tuple(axis.size for axis in batch_axes):
@@ -593,7 +855,6 @@ class FitResultBatch:
         object.__setattr__(self, "batch_axis_specs", batch_axes)
         object.__setattr__(self, "statuses", statuses)
         object.__setattr__(self, "errors", errors)
-        object.__setattr__(self, "_coordinate_sources", sources)
 
     @property
     def rmse(self) -> np.ndarray:
@@ -613,13 +874,7 @@ class FitResultBatch:
 
     @property
     def effective_schema_fingerprint(self) -> str:
-        if self.spec.committed_transform is None:
-            return self.spec.input_schema_fingerprint
         return self.spec.committed_transform.output_schema_fingerprint
-
-    @property
-    def coordinate_sources(self) -> tuple[FitCoordinateSource, ...]:
-        return self._coordinate_sources
 
     @property
     def parameter_definitions(self) -> tuple[FitParameterDefinition, ...]:
@@ -630,7 +885,6 @@ class FitResultBatch:
         return resolve_parameter_units(
             self.parameter_definitions,
             self.fit_axis_specs,
-            self.coordinate_sources,
             self.value_unit,
         )
 
@@ -662,17 +916,11 @@ class FitResultBatch:
 def resolve_parameter_units(
     parameters: tuple[FitParameterDefinition, ...],
     fit_axes: tuple[AxisSpec, ...],
-    coordinate_sources: tuple[FitCoordinateSource, ...],
     value_unit: str | None,
 ) -> tuple[str, ...]:
     """Resolve model-relative units into self-contained artifact metadata."""
 
-    if len(coordinate_sources) != len(fit_axes):
-        raise ValueError("coordinate sources must describe the fit axes")
-    axis_units = tuple(
-        _coordinate_unit(axis, source)
-        for axis, source in zip(fit_axes, coordinate_sources)
-    )
+    axis_units = tuple(_coordinate_unit(axis) for axis in fit_axes)
     units: list[str] = []
     for parameter in parameters:
         relation = parameter.unit_relation
@@ -703,62 +951,16 @@ def _immutable_numeric(values, dtype: str, shape: tuple[int, ...]) -> np.ndarray
     return immutable_array(array, dtype=np.dtype(dtype), shape=shape)
 
 
-def _coordinate_source_for_axis(axis: AxisSpec) -> FitCoordinateSource:
-    if axis.coordinates is None:
-        last = axis.index_origin + axis.size - 1
-        if axis.size > 1 and last > _MAX_CONSECUTIVE_FLOAT64_INTEGER:
-            raise ValueError(
-                "implicit fit coordinates are not consecutively float64-representable"
-            )
-        for value in {axis.index_origin, last}:
-            try:
-                converted = float(value)
-            except OverflowError as exc:
-                raise ValueError(
-                    "implicit fit coordinate is not float64-representable"
-                ) from exc
-            if not math.isfinite(converted) or int(converted) != value:
-                raise ValueError("implicit fit coordinate is not exactly float64-representable")
-        return FitCoordinateSource.LOGICAL_INDEX
-    if not all(
-        not isinstance(value, bool) and isinstance(value, Real)
-        for value in axis.coordinates
-    ):
-        raise TypeError(
-            f"declared coordinates for fit axis {axis.axis_id} must be entirely numeric"
-        )
-    for value in axis.coordinates:
-        try:
-            converted = float(value)
-        except (OverflowError, ValueError) as exc:
-            raise ValueError("fit coordinate is not float64-representable") from exc
-        if not math.isfinite(converted) or (
-            isinstance(value, Integral) and int(converted) != int(value)
-        ):
-            raise ValueError("fit coordinate is not exactly float64-representable")
-    return FitCoordinateSource.DECLARED
-
-
-def _coordinate_unit(axis: AxisSpec, source: FitCoordinateSource) -> str:
+def _coordinate_unit(axis: AxisSpec) -> str:
     if axis.unit is not None:
         return axis.unit
-    return "index" if source is FitCoordinateSource.LOGICAL_INDEX else "1"
-
-
-def _resolve_fit_effective_schema(
-    spec: FitSpec,
-    expected_schema: DatasetSchema,
-) -> TransformedSchema:
-    if spec.committed_transform is not None:
-        return resolve_transformed_schema(expected_schema, spec.committed_transform)
-    return _source_transformed_schema(expected_schema)
+    return "index" if axis.coordinates is None else "1"
 
 
 __all__ = [
     "BoundFit",
     "FitBatchStatus",
     "FitCancelled",
-    "FitCoordinateSource",
     "FitDeadlineExceeded",
     "FitNumericPolicy",
     "FitParameterConstraint",

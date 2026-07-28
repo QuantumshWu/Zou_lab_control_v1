@@ -5,7 +5,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from zlc_data import REPEAT, SCAN_POINT, AxisId, AxisSpec, PointLayout
+from zlc_data import (
+    REPEAT,
+    SCAN_POINT,
+    AxisId,
+    AxisSpec,
+    GridTopology,
+    PointColumn,
+    PointTable,
+    grid_topology_to_tree,
+    point_table_to_tree,
+)
 from zlc_neutral_atom.authoring import AuthoringChoice, AuthoringField, AuthoringSchema, MINIMUM_POSITIVE_FLOAT
 from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
@@ -65,6 +75,9 @@ DEFAULT_GREY_MOLASSES_RF_ROLE = "rf"
 
 
 _MINIMUM_SHOTS = 1
+
+
+_DETUNING_COORDINATE_ID = AxisId("grey_molasses.detuning")
 
 
 _GREY_MOLASSES_AUTHORING_SCHEMA = AuthoringSchema(
@@ -285,33 +298,42 @@ class GreyMolassesDetuningRequest:
 
 @dataclass(frozen=True, slots=True)
 class _GreyMolassesDetuningProgram:
-    """Fixed release-recapture pulse rows plus the RF-owned logical scan axis."""
+    """Fixed pulse rows plus the RF-owned authored point-row coordinates."""
 
     document: PulseDocument
-    detuning_axis: AxisSpec
+    point_table: PointTable
+    grid_topology: GridTopology | None
     shots: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.document, PulseDocument):
             raise TypeError("document must be PulseDocument")
+        if not isinstance(self.point_table, PointTable):
+            raise TypeError("point_table must be PointTable")
+        columns = self.point_table.columns
         if (
-            not isinstance(self.detuning_axis, AxisSpec)
-            or self.detuning_axis.role != SCAN_POINT
+            len(columns) != 1
+            or columns[0].coordinate_id != _DETUNING_COORDINATE_ID
+            or columns[0].role != SCAN_POINT
+            or columns[0].value_kind != PointColumn.NUMERIC
+            or any(value is None for value in columns[0].values)
         ):
-            raise ValueError("detuning_axis must have SCAN_POINT role")
+            raise ValueError("point_table must contain the numeric detuning column")
+        if self.grid_topology is not None and not isinstance(
+            self.grid_topology,
+            GridTopology,
+        ):
+            raise TypeError("grid_topology must be GridTopology or None")
         object.__setattr__(self, "shots", positive_integer(self.shots, "shots"))
         table = self.document.scan_table
-        if table is None or len(table.rows) != self.detuning_axis.size:
-            raise ValueError("pulse scan rows must match the RF detuning axis")
-
-    @property
-    def point_layout(self) -> PointLayout:
-        return PointLayout.rect_c((self.detuning_axis.size,))
+        if table is None or len(table.rows) != self.point_table.row_count:
+            raise ValueError("pulse scan rows must match the RF detuning rows")
 
     @property
     def physical_detuning_gamma(self) -> tuple[float, ...]:
-        coordinates = self.detuning_axis.coordinates
-        assert coordinates is not None
+        coordinates = self.point_table.column(
+            _DETUNING_COORDINATE_ID
+        ).values
         return tuple(
             float(value)
             for _repeat in range(self.shots)
@@ -324,7 +346,12 @@ class _GreyMolassesDetuningProgram:
             {
                 "owner": "zlc_neutral_atom.grey-molasses-detuning-program",
                 "pulse_document": self.document.fingerprint,
-                "detuning_gamma": self.detuning_axis.coordinates,
+                "point_table": point_table_to_tree(self.point_table),
+                "grid_topology": (
+                    None
+                    if self.grid_topology is None
+                    else grid_topology_to_tree(self.grid_topology)
+                ),
                 "shots": self.shots,
             }
         )
@@ -348,17 +375,28 @@ def _build_grey_molasses_detuning_program(
         tuple(request.trap_off_seconds for _value in request.detuning_gamma),
         request.shots,
     )
-    axis = AxisSpec(
-        AxisId("grey_molasses.detuning"),
+    coordinate = PointColumn(
+        _DETUNING_COORDINATE_ID,
         "Two-photon detuning",
         SCAN_POINT,
-        len(request.detuning_gamma),
+        PointColumn.NUMERIC,
         request.detuning_gamma,
         "Γ",
     )
+    point_table = PointTable(len(coordinate.values), (coordinate,))
+    grid_topology = (
+        GridTopology(
+            (_DETUNING_COORDINATE_ID,),
+            (coordinate.values,),
+            tuple((ordinal,) for ordinal in range(point_table.row_count)),
+        )
+        if len(set(coordinate.values)) == point_table.row_count
+        else None
+    )
     return _GreyMolassesDetuningProgram(
         document,
-        axis,
+        point_table,
+        grid_topology,
         request.shots,
     )
 
@@ -413,13 +451,14 @@ def bind_grey_molasses_detuning(
             tuple(range(request.shots)),
         ),
         readout_event_axis_id=AxisId("grey_molasses.readout_event"),
-        scan_axes=(program.detuning_axis,),
-        point_layout=program.point_layout,
+        scan_point_table=program.point_table,
+        scan_grid_topology=program.grid_topology,
         calibration=calibration,
     )
     program = _GreyMolassesDetuningProgram(
         logical_document,
-        program.detuning_axis,
+        program.point_table,
+        program.grid_topology,
         program.shots,
     )
     table = RfDetuningTable(

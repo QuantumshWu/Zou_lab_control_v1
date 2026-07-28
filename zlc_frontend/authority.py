@@ -27,6 +27,14 @@ def describe_authoritative_transform(
         return "None · no user-authored Select/Reduce"
     if not isinstance(spec, DataTransformSpec):
         raise TypeError("spec must be DataTransformSpec or None")
+
+    def source_text(source) -> str:
+        return (
+            source.kind.lower()
+            if source.axis_id is None
+            else f"{source.kind.lower()}:{source.axis_id.value}"
+        )
+
     operations: list[str] = []
     for operation in spec.operations:
         if isinstance(operation, Selection):
@@ -50,7 +58,7 @@ def describe_authoritative_transform(
                     raise TypeError("Selection contains an unsupported term")
             operations.append("select(" + ", ".join(terms) + ")")
         elif isinstance(operation, ReductionSpec):
-            axes = ",".join(axis_id.value for axis_id in operation.axis_ids)
+            axes = ",".join(source_text(source) for source in operation.sources)
             minimum = (
                 ""
                 if operation.minimum_valid_count is None
@@ -63,7 +71,7 @@ def describe_authoritative_transform(
                 f"{minimum}"
             )
         elif isinstance(operation, HistogramSpec):
-            axes = ",".join(axis_id.value for axis_id in operation.axis_ids)
+            axes = ",".join(source_text(source) for source in operation.sources)
             operations.append(
                 f"histogram({axes})→{operation.bin_axis_id.value}"
                 f"[{len(operation.bin_edges) - 1} bins]"

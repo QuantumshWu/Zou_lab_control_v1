@@ -17,7 +17,6 @@ from zlc_data import (
     DatasetSchema,
     FitResultBatch,
     OwnedSnapshot,
-    Selection,
     validate_fit_result_source_binding,
 )
 
@@ -78,7 +77,7 @@ def build_frozen_figure_document(
     source: FrozenFigureSource,
     *,
     intent: ViewIntent | None = None,
-    selection: Selection | None = None,
+    point_ordinals: tuple[int, ...] | None = None,
     preferences: ViewPreferences | None = None,
     document_id: str | None = None,
 ) -> FigureDocument:
@@ -91,8 +90,8 @@ def build_frozen_figure_document(
 
     if not isinstance(source, FrozenFigureSource):
         raise TypeError("source must be FrozenFigureSource")
-    if selection is not None and not isinstance(selection, Selection):
-        raise TypeError("selection must be Selection or None")
+    if point_ordinals is not None:
+        point_ordinals = tuple(point_ordinals)
     if intent is not None and not isinstance(intent, ViewIntent):
         raise TypeError("intent must be ViewIntent or None")
     if preferences is not None and not isinstance(preferences, ViewPreferences):
@@ -107,14 +106,17 @@ def build_frozen_figure_document(
         suggestion = suggest_view(
             source.schema,
             resolved_intent,
-            selection,
+            point_ordinals,
             preferences,
         )
     else:
+        if point_ordinals is not None:
+            raise ValueError(
+                "saved Fit display derives its exact point rows from FitSpec"
+            )
         suggestion = suggest_fit_view(
             source.schema,
             source.fit_result,
-            selection,
             preferences,
         )
         if (
@@ -150,7 +152,7 @@ def build_frozen_data_figure(
     source: FrozenFigureSource,
     *,
     intent: ViewIntent | None = None,
-    selection: Selection | None = None,
+    point_ordinals: tuple[int, ...] | None = None,
     preferences: ViewPreferences | None = None,
     document_id: str | None = None,
 ) -> DataFigure:
@@ -163,7 +165,7 @@ def build_frozen_data_figure(
     document = build_frozen_figure_document(
         source,
         intent=intent,
-        selection=selection,
+        point_ordinals=point_ordinals,
         preferences=preferences,
         document_id=document_id,
     )

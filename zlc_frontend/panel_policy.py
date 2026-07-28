@@ -94,15 +94,19 @@ def automatic_panel_kind(schema) -> str | None:
     from zlc_data import SCAN_POINT, SPATIAL_X, SPATIAL_Y, SPECTRAL
     from zlc_frontend.figure import ViewIntent, suggest_view
 
-    axes = tuple(schema.point_axes) + tuple(schema.cell_schema.data_axes)
-    roles = tuple(axis.role for axis in axes)
+    point_columns = tuple(schema.point_table.columns)
+    roles = tuple(column.role for column in point_columns) + tuple(
+        axis.role for axis in schema.cell_schema.data_axes
+    )
     spatial_plane = roles.count(SPATIAL_X) == 1 and roles.count(SPATIAL_Y) == 1
-    scan_axes = tuple(
-        axis for axis in schema.point_axes if axis.role in (SCAN_POINT, SPECTRAL)
+    scan_columns = tuple(
+        column
+        for column in point_columns
+        if column.role in (SCAN_POINT, SPECTRAL)
     )
     preferred = (
         (("2d", ViewIntent.IMAGE), ("1d", ViewIntent.CURVE))
-        if spatial_plane or len(scan_axes) >= 2
+        if spatial_plane or len(scan_columns) >= 2
         else (("1d", ViewIntent.CURVE), ("2d", ViewIntent.IMAGE))
     )
     for kind, intent in preferred:
@@ -125,12 +129,25 @@ def automatic_figure_view(schema, *, prefer_meter: bool = False):
     axis.  Scan/history axes still win because they carry the visible x domain.
     """
 
-    from zlc_data import MONITOR_HISTORY, SCAN_POINT, SPATIAL_X, SPATIAL_Y, SPECTRAL
-    from zlc_frontend.figure import RepeatViewMode, ViewPreferences
+    from zlc_data import (
+        MONITOR_HISTORY,
+        SCAN_POINT,
+        SPATIAL_X,
+        SPATIAL_Y,
+        SPECTRAL,
+        AxisSourceRef,
+    )
+    from zlc_frontend.figure import (
+        AxisViewRole,
+        DisplayReduction,
+        DisplayReductionMethod,
+        SourceViewBinding,
+        ViewPreferences,
+    )
 
     axes = (
         schema.repeat_axis,
-        *schema.point_axes,
+        *schema.point_table.columns,
         *schema.cell_schema.data_axes,
     )
     roles = {axis.role for axis in axes}
@@ -141,24 +158,45 @@ def automatic_figure_view(schema, *, prefer_meter: bool = False):
     if bool(prefer_meter):
         return (
             ViewIntent.METER,
-            ViewPreferences(repeat_mode=RepeatViewMode.MEAN),
+            ViewPreferences(
+                repeat_binding=SourceViewBinding(
+                    AxisSourceRef.tensor(schema.repeat_axis.axis_id),
+                    AxisViewRole.REDUCED,
+                    reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+                )
+            ),
         )
     return ViewIntent.HISTOGRAM, None
 
 
-def repeat_mode_label(mode) -> str:
-    """Return the operator-facing label for a typed repeat view mode."""
+def repeat_mode_label(binding) -> str:
+    """Return the operator-facing label for one repeat source binding."""
 
-    from zlc_frontend.figure import RepeatViewMode
+    from zlc_frontend.figure import (
+        AxisViewRole,
+        DisplayReductionMethod,
+        LatestNonempty,
+        SourceViewBinding,
+    )
 
+    if not isinstance(binding, SourceViewBinding):
+        raise TypeError("repeat mode must be a SourceViewBinding")
+    if binding.role is AxisViewRole.REDUCED:
+        assert binding.reduction is not None
+        return (
+            "Mean"
+            if binding.reduction.method is DisplayReductionMethod.MEAN
+            else "Sum"
+        )
+    if binding.role is AxisViewRole.SELECTED:
+        if not isinstance(binding.selector, LatestNonempty):
+            raise ValueError("repeat SELECTED control requires LatestNonempty")
+        return "Latest repeat"
     return {
-        RepeatViewMode.MEAN: "Mean",
-        RepeatViewMode.SUM: "Sum",
-        RepeatViewMode.LATEST: "Latest repeat",
-        RepeatViewMode.BATCH: "Overlay repeats",
-        RepeatViewMode.SAMPLE: "Pool as samples",
-        RepeatViewMode.FACET: "Facet repeats",
-    }[mode]
+        AxisViewRole.BATCH: "Overlay repeats",
+        AxisViewRole.SAMPLE: "Pool as samples",
+        AxisViewRole.FACET: "Facet repeats",
+    }[binding.role]
 
 
 __all__ = [
