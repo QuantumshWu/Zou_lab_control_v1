@@ -15,7 +15,6 @@ from zlc_neutral_atom.logic_node_declaration import (
 )
 from zlc_neutral_atom.processing.signal_plane import SignalPublication
 from .input_binding import ResolvedArtifactInput, project_input_fields
-from .capability import ConsoleCapabilityAttachment
 from zlc_workbench.task_console.attachment_builders import (
     processor_attachment,
     run_attachment,
@@ -51,18 +50,16 @@ def _artifact_resolver(
 
 def _dynamic_choice_projection(
     declaration: LogicNodeDeclaration,
-    context: object | None,
+    values: tuple[DynamicChoicePresentation, ...],
 ) -> dict[str, DynamicChoicePresentation]:
+    resolved = tuple(values)
     resolver = declaration.resolve_dynamic_choices
     if resolver is None:
-        if context is not None:
-            raise ValueError("this Logic node declares no dynamic choice context")
+        if resolved:
+            raise ValueError("this Logic node declares no dynamic choices")
         return {}
-    if context is None:
-        raise ValueError("this Logic node requires its installation choice context")
-    resolved = tuple(resolver(context))
     if any(not isinstance(value, DynamicChoicePresentation) for value in resolved):
-        raise TypeError("dynamic choice resolver returned another value type")
+        raise TypeError("dynamic choices contain another value type")
     keys = tuple(value.field_key for value in resolved)
     expected = tuple(
         field.key
@@ -103,9 +100,11 @@ def _path_projection(values, path_roots=None) -> dict[str, PathPresentationHint]
 def project_declaration_spec(
     declaration: LogicNodeDeclaration,
     *,
-    dynamic_choice_context: object | None = None,
+    dynamic_choices: tuple[DynamicChoicePresentation, ...] = (),
     form: object | None = None,
     editor_factory: Callable[..., object] | None = None,
+    editor_builder: Callable[[object], tuple[object, Callable[..., object]]]
+    | None = None,
     path_roots=None,
 ) -> ConsoleNodeSpec:
     """Mechanically project one owner declaration into the generic host DTO."""
@@ -117,7 +116,7 @@ def project_declaration_spec(
             declaration.authoring_schema,
             dynamic_choices=_dynamic_choice_projection(
                 declaration,
-                dynamic_choice_context,
+                dynamic_choices,
             ),
             path_presentations=_path_projection(
                 declaration.path_presentations,
@@ -127,6 +126,17 @@ def project_declaration_spec(
         if form is None
         else form
     )
+    if editor_builder is not None:
+        if form is not None or editor_factory is not None:
+            raise ValueError(
+                "editor_builder cannot be combined with a prebuilt form/editor"
+            )
+        if not callable(editor_builder):
+            raise TypeError("editor_builder must be callable or None")
+        built = editor_builder(projected_form)
+        if not isinstance(built, tuple) or len(built) != 2:
+            raise TypeError("editor_builder must return (form, editor_factory)")
+        projected_form, editor_factory = built
 
     return ConsoleNodeSpec(
         declaration=declaration,
@@ -145,13 +155,15 @@ def project_declaration_spec(
 def project_run_declaration(
     declaration: LogicNodeDeclaration,
     *,
-    prepare: Callable[[object], object],
+    prepare: Callable[[object, object | None], object],
     bind_request: Callable[[object, object], object] | None = None,
-    dynamic_choice_context: object | None = None,
+    dynamic_choices: tuple[DynamicChoicePresentation, ...] = (),
     resolve_artifact_reference: Callable[[ResolvedArtifactInput], object]
     | None = None,
-    start: Callable[[object, object, object], object] | None = None,
-    start_with_live_output: Callable[[object, object], object] | None = None,
+    start_prepared: Callable[[object, object, Callable[[], bool]], object]
+    | None = None,
+    editor_builder: Callable[[object], tuple[object, Callable[..., object]]]
+    | None = None,
     path_roots=None,
     project_signal_presentation: Callable[
         [object, str, SignalPublication], object | None
@@ -166,7 +178,8 @@ def project_run_declaration(
         raise TypeError("bind_request must be callable or None")
     spec = project_declaration_spec(
         declaration,
-        dynamic_choice_context=dynamic_choice_context,
+        dynamic_choices=dynamic_choices,
+        editor_builder=editor_builder,
         path_roots=path_roots,
     )
     return run_attachment(
@@ -175,8 +188,7 @@ def project_run_declaration(
             declaration.bind_request if bind_request is None else bind_request
         ),
         prepare=prepare,
-        start=start,
-        start_with_live_output=start_with_live_output,
+        start_prepared=start_prepared,
         project_signal_presentation=project_signal_presentation,
         resolve_artifact_reference=_artifact_resolver(
             declaration,
@@ -193,7 +205,7 @@ def project_processor_declaration(
         [object, str, SignalPublication], object | None
     ]
     | None = None,
-    dynamic_choice_context: object | None = None,
+    dynamic_choices: tuple[DynamicChoicePresentation, ...] = (),
     resolve_artifact_reference: Callable[[ResolvedArtifactInput], object]
     | None = None,
     path_roots=None,
@@ -208,7 +220,7 @@ def project_processor_declaration(
         raise TypeError("project_signal_presentation must be callable or None")
     spec = project_declaration_spec(
         declaration,
-        dynamic_choice_context=dynamic_choice_context,
+        dynamic_choices=dynamic_choices,
         path_roots=path_roots,
     )
     return processor_attachment(
@@ -223,29 +235,7 @@ def project_processor_declaration(
     )
 
 
-def project_custom_declaration(
-    declaration: LogicNodeDeclaration,
-    *,
-    form: object,
-    editor_factory: Callable[..., object],
-    create_node: Callable[..., object],
-    path_roots=None,
-) -> ConsoleCapabilityAttachment:
-    """Admit one earned structured editor without exposing Workbench types."""
-
-    if not callable(editor_factory) or not callable(create_node):
-        raise TypeError("custom editor_factory and create_node must be callable")
-    spec = project_declaration_spec(
-        declaration,
-        form=form,
-        editor_factory=editor_factory,
-        path_roots=path_roots,
-    )
-    return ConsoleCapabilityAttachment(spec, create_node)
-
-
 __all__ = [
-    "project_custom_declaration",
     "project_declaration_spec",
     "project_processor_declaration",
     "project_run_declaration",

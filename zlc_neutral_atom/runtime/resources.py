@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import threading
+import time
+from math import isfinite
 from dataclasses import dataclass
 from enum import Enum
 
@@ -201,14 +203,14 @@ class ResourceLease:
             return True
 
 
-AcquireResult = ResourceLease | ResourceBusy
+AcquireResult = ResourceLease | tuple[ResourceBusy, ...]
 
 
 class ResourceArbiter:
     """One process's authoritative table of current resource owners."""
 
     def __init__(self) -> None:
-        self._lock = threading.RLock()
+        self._condition = threading.Condition(threading.RLock())
         self._active: dict[
             str,
             tuple[object, tuple[ResourceClaim, ...]],
@@ -216,7 +218,7 @@ class ResourceArbiter:
         self._closed = False
 
     def shutdown(self) -> None:
-        with self._lock:
+        with self._condition:
             if self._closed:
                 return
             if self._active:
@@ -224,6 +226,7 @@ class ResourceArbiter:
                     "cannot shut down ResourceArbiter with active ownership"
                 )
             self._closed = True
+            self._condition.notify_all()
 
     def acquire_all(
         self,
@@ -233,23 +236,61 @@ class ResourceArbiter:
         run_id = _canonical_text(run_id, "run_id")
         normalized = self._validate_claim_set(tuple(claims))
         capability = object()
-        with self._lock:
+        with self._condition:
             if self._closed:
                 raise RuntimeError("ResourceArbiter is shut down")
             if run_id in self._active:
                 raise RuntimeError(f"run {run_id!r} already owns a resource lease")
+            blockers: list[ResourceBusy] = []
             for requested in normalized:
-                for owner, (_token, held_claims) in self._active.items():
+                for owner in sorted(self._active):
+                    _token, held_claims = self._active[owner]
                     for held in held_claims:
                         if requested.key == held.key:
-                            return ResourceBusy(requested, owner, held)
+                            blockers.append(ResourceBusy(requested, owner, held))
+            if blockers:
+                return tuple(blockers)
             self._active[run_id] = (capability, normalized)
         return ResourceLease(self, capability, run_id)
 
+    def wait_until_released(
+        self,
+        run_ids: tuple[str, ...],
+        *,
+        timeout: float | None = None,
+    ) -> bool:
+        """Wait until none of the exact Run owners holds a hardware lease."""
+
+        if not isinstance(run_ids, tuple):
+            raise TypeError("run_ids must be a tuple")
+        owners = tuple(_canonical_text(value, "run_id") for value in run_ids)
+        if len(set(owners)) != len(owners):
+            raise ValueError("run_ids must be unique")
+        if not owners:
+            return True
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                raise TypeError("timeout must be a number or None")
+            timeout = float(timeout)
+            if not isfinite(timeout) or timeout < 0.0:
+                raise ValueError("timeout must be finite and non-negative")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while any(owner in self._active for owner in owners):
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
     def _release(self, capability: object, run_id: str) -> None:
-        with self._lock:
+        with self._condition:
             self._require_active(capability, run_id)
             del self._active[run_id]
+            self._condition.notify_all()
 
     def _require_active(
         self,

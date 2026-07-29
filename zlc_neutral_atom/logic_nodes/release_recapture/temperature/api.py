@@ -82,10 +82,12 @@ class TemperatureReleaseRecaptureApi:
     def start_temperature_release_recapture(
         self,
         request: TemperatureReleaseRecaptureRequest,
+        *,
+        lifecycle_owner: object | None = None,
     ) -> RunHandle:
         if not isinstance(request, TemperatureReleaseRecaptureRequest):
             raise TypeError("request must be TemperatureReleaseRecaptureRequest")
-        return self._bind(request).start()
+        return self._bind(request).start(lifecycle_owner=lifecycle_owner)
 
     def _bind(
         self,

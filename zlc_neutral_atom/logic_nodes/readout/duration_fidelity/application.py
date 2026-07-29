@@ -55,7 +55,6 @@ from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
 from zlc_neutral_atom.logic_nodes.readout.duration_fidelity.measurement import (
     BoundReadoutDurationFidelity,
-    CalibratedReadoutDurationFidelityIntent,
     ReadoutDurationFidelityIntent,
     READOUT_DURATION_FIDELITY_OUTPUT_DECLARATIONS,
     ReadoutDurationFidelityRequest,
@@ -163,6 +162,8 @@ class ReadoutDurationFidelityApplicationPort(Protocol):
     def start_readout_duration_fidelity(
         self,
         request: ReadoutDurationFidelityRequest,
+        *,
+        lifecycle_owner: object | None = None,
     ) -> RunHandle: ...
 
 
@@ -176,7 +177,10 @@ class ReadoutDurationFidelityApplicationCommand:
             raise TypeError("request must be ReadoutDurationFidelityRequest")
 
     def start(self) -> RunHandle:
-        return self._application.start_readout_duration_fidelity(self.request)
+        return self._application.start_readout_duration_fidelity(
+            self.request,
+            lifecycle_owner=self,
+        )
 
     def final_dataset_outputs(
         self,
@@ -208,22 +212,6 @@ def prepare_readout_duration_fidelity_application(
     return ReadoutDurationFidelityApplicationCommand(request, application)
 
 
-def prepare_bound_readout_duration_fidelity(
-    value: CalibratedReadoutDurationFidelityIntent,
-    *,
-    application: ReadoutDurationFidelityApplicationPort,
-) -> ReadoutDurationFidelityApplicationCommand:
-    """Prepare the exact request already bound by the Logic-node input owner."""
-
-    if not isinstance(value, CalibratedReadoutDurationFidelityIntent):
-        raise TypeError("value must be CalibratedReadoutDurationFidelityIntent")
-    return prepare_readout_duration_fidelity_application(
-        value.intent,
-        value.calibration_ref,
-        application,
-    )
-
-
 @dataclass(slots=True)
 class _PreparedReadoutDuration:
     exposure_lease_id: str
@@ -247,12 +235,17 @@ class PreparedReadoutDurationFidelity:
         self._started = False
         self._lock = threading.Lock()
 
-    def start(self) -> RunHandle:
+    def start(self, *, lifecycle_owner: object | None = None) -> RunHandle:
         with self._lock:
             if self._started:
                 raise RuntimeError("PreparedReadoutDurationFidelity is one-shot")
             self._started = True
-        return self._start_run(self._plan)
+        return self._start_run(
+            self._plan.with_lifecycle(
+                owner=self if lifecycle_owner is None else lifecycle_owner,
+                preemptible=False,
+            )
+        )
 
 
 def _point_samples(model, site: int | None, block: DataBlock) -> np.ndarray:
@@ -530,6 +523,5 @@ __all__ = [
     "ReadoutDurationFidelityResult",
     "prepare_readout_duration_fidelity",
     "prepare_readout_duration_fidelity_application",
-    "prepare_bound_readout_duration_fidelity",
     "readout_duration_fidelity_final_outputs",
 ]

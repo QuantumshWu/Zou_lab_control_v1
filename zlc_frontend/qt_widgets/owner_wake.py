@@ -153,7 +153,8 @@ class SerialWorkerWindow(QtWidgets.QWidget):
         self._future: Future | None = None
         self._cancelled = threading.Event()
         self._closing = False
-        self._closed = False
+        self._closed_event = threading.Event()
+        self._owner_close_requested = threading.Event()
         self._allow_close = False
         self._wake = QtOwnerWake(self)
         self._wake.bind(self._owner_cycle)
@@ -209,13 +210,24 @@ class SerialWorkerWindow(QtWidgets.QWidget):
 
     @QtCore.pyqtSlot()
     def _owner_cycle(self) -> None:
+        if self._owner_close_requested.is_set():
+            self.shutdown()
+        self._drain_owner_completions()
+        self._finish_close_if_ready()
+
+    def _drain_owner_completions(self) -> None:
+        """Consume ready worker results inside the invariant owner cycle.
+
+        Subclasses may extend completion handoff, but application close and
+        terminal acknowledgement remain sealed in :meth:`_owner_cycle`.
+        """
+
         future = self._future
         if future is not None and future.done():
             self._future = None
             if not self._consume_worker_release_future(future):
                 self._accept_finished_future(future)
                 self._after_worker_completion()
-        self._finish_close_if_ready()
 
     @property
     def worker_idle(self) -> bool:
@@ -223,13 +235,51 @@ class SerialWorkerWindow(QtWidgets.QWidget):
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        return self._closed_event.is_set()
+
+    @property
+    def permanently_closed(self) -> bool:
+        """Application-visible terminal owner acknowledgement."""
+
+        return self._closed_event.is_set()
+
+    def restore_window(self) -> None:
+        """Restore this still-owned window without creating another session."""
+
+        if self._closed_event.is_set() or self._closing:
+            raise RuntimeError("worker window is closing or permanently closed")
+        application = QtWidgets.QApplication.instance()
+        if application is None or QtCore.QThread.currentThread() != application.thread():
+            raise RuntimeError("worker window restore requires the Qt owner thread")
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def request_owner_close(self) -> None:
+        """Queue idempotent teardown on the window's Qt owner."""
+
+        if self._closed_event.is_set():
+            return
+        if QtCore.QThread.currentThread() is self.thread():
+            self.shutdown()
+            return
+        self._owner_close_requested.set()
+        self._wake.request_owner_wake()
+
+    def wait_owner_closed(self, timeout: float) -> bool:
+        """Wait while pumping the existing Qt owner when called from it."""
+
+        return wait_for_owner_retirement(
+            self,
+            self._closed_event,
+            timeout=timeout,
+        )
 
     def _before_worker_shutdown(self) -> None:
         """Clear subclass-owned fronts and disable UI after close linearizes."""
 
     def shutdown(self) -> None:
-        if self._closing or self._closed:
+        if self._closing or self._closed_event.is_set():
             return
         self._closing = True
         self._cancelled.set()
@@ -240,7 +290,11 @@ class SerialWorkerWindow(QtWidgets.QWidget):
         self._finish_close_if_ready()
 
     def _finish_close_if_ready(self) -> None:
-        if not self._closing or self._future is not None or self._closed:
+        if (
+            not self._closing
+            or self._future is not None
+            or self._closed_event.is_set()
+        ):
             return
         release, self._worker_release = self._worker_release, None
         if release is not None:
@@ -256,7 +310,7 @@ class SerialWorkerWindow(QtWidgets.QWidget):
                 )
                 return
         self._wake.detach()
-        self._closed = True
+        self._closed_event.set()
         self._allow_close = True
         QtCore.QTimer.singleShot(0, self.close)
 

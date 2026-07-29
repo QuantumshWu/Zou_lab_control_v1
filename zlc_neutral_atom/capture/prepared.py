@@ -102,19 +102,25 @@ class PreparedExactCapture:
             self._preview_schema = self._preview_edge.schema
             return self._preview_schema
 
-    def start(self) -> RunHandle:
+    def start(self, *, lifecycle_owner: object | None = None) -> RunHandle:
         self._claim_start()
         plan = compile_capture_artifact_pipeline(
             self._capture,
             self._repository,
         )
-        return self._start_run(plan)
+        return self._start_run(
+            plan.with_lifecycle(
+                owner=self if lifecycle_owner is None else lifecycle_owner,
+                preemptible=False,
+            )
+        )
 
     def start_with_preview(
         self,
         *,
         factory: Callable[[CapturePreviewSpec], CapturePreviewPort],
         source_ordinals: tuple[int, ...] | None = None,
+        lifecycle_owner: object | None = None,
     ) -> RunHandle:
         """Start once, optionally publishing only named physical frame ordinals."""
 
@@ -134,7 +140,12 @@ class PreparedExactCapture:
             preview=preview,
         )
         try:
-            return self._start_run(plan)
+            return self._start_run(
+                plan.with_lifecycle(
+                    owner=self if lifecycle_owner is None else lifecycle_owner,
+                    preemptible=False,
+                )
+            )
         except BaseException as error:
             notify_preview_failure(preview, error)
             raise

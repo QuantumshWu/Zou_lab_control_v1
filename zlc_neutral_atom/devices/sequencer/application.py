@@ -393,7 +393,12 @@ class PreparedPulseExecution:
             if self._started:
                 raise RuntimeError("PreparedPulseExecution is one-shot")
             self._started = True
-        return self._start_run(self._plan)
+        return self._start_run(
+            self._plan.with_lifecycle(
+                owner=self,
+                preemptible=self._request.execution_form in _CONTINUOUS_FORMS,
+            )
+        )
 
 
 class PulseApplicationOwner:
@@ -407,10 +412,16 @@ class PulseApplicationOwner:
         "_active_request",
         "_last_applied",
         "_lock",
+        "_pending_applied",
+        "_start_in_progress",
+        "_start_lock",
     )
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._start_lock = threading.Lock()
+        self._start_in_progress = False
+        self._pending_applied = None
         self._last_applied: AppliedPulseSnapshot | None = None
         self._active_handle: RunHandle | None = None
         self._active_request: PulseRunRequest | None = None
@@ -502,24 +513,42 @@ class PulseApplicationOwner:
     def start(self, prepared: PreparedPulseExecution) -> RunHandle:
         if not isinstance(prepared, PreparedPulseExecution):
             raise TypeError("prepared must be PreparedPulseExecution")
-        while True:
+        with self._start_lock:
             with self._lock:
-                previous = self._active_handle
-            if previous is not None and not previous.snapshot().state.terminal:
-                raise RuntimeError("another pulse Run is already active")
-            with self._lock:
-                if self._active_handle is not previous:
-                    continue
-                # Keep this lock through start: a very fast owner thread may reach
-                # session.prepare before start() returns, and its callback must not
-                # observe an unregistered Run.
+                self._start_in_progress = True
+                self._pending_applied = None
+            try:
                 handle = prepared.start()
-                self._active_handle = handle
-                self._active_request = prepared.request
-                self._active_applied = None
-                self._active_descriptor = prepared.descriptor
-                self._active_progress_reader = None
-                return handle
+            except BaseException:
+                with self._lock:
+                    self._start_in_progress = False
+                    self._pending_applied = None
+                raise
+            with self._lock:
+                pending = self._pending_applied
+                mismatch = (
+                    pending is not None
+                    and pending[0].run_id != handle.run_id.value
+                )
+                if mismatch:
+                    self._pending_applied = None
+                    self._start_in_progress = False
+                else:
+                    self._active_handle = handle
+                    self._active_request = prepared.request
+                    self._active_descriptor = prepared.descriptor
+                    self._active_applied = None if pending is None else pending[0]
+                    self._active_progress_reader = (
+                        None if pending is None else pending[1]
+                    )
+                    if pending is not None:
+                        self._last_applied = pending[0]
+                    self._pending_applied = None
+                    self._start_in_progress = False
+            if mismatch:
+                handle.cancel("applied pulse identity mismatch")
+                raise RuntimeError("applied pulse belongs to another starting Run")
+            return handle
 
     def _record_applied(
         self,
@@ -533,7 +562,14 @@ class PulseApplicationOwner:
         with self._lock:
             handle = self._active_handle
             if handle is None or handle.run_id.value != snapshot.run_id:
-                raise RuntimeError("prepared pulse Run is not owned by this application")
+                if not self._start_in_progress:
+                    raise RuntimeError(
+                        "prepared pulse Run is not owned by this application"
+                    )
+                if self._pending_applied is not None:
+                    raise RuntimeError("starting pulse produced more than one applied fact")
+                self._pending_applied = (snapshot, progress_reader)
+                return
             self._last_applied = snapshot
             self._active_applied = snapshot
             self._active_progress_reader = progress_reader

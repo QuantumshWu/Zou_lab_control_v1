@@ -2323,8 +2323,7 @@ class DataFigureWindow(FrozenRasterWindow):
         self._grid_focus_pending = None
         self._discard_grid_focus_sequence = None
 
-    @QtCore.pyqtSlot()
-    def _owner_cycle(self) -> None:
+    def _drain_owner_completions(self) -> None:
         # Raster owns the visible front, so accept it before a Fit completion;
         # the latter installs only already-materialized vector primitives.
         consumed_completion = False
@@ -2393,12 +2392,11 @@ class DataFigureWindow(FrozenRasterWindow):
             if self._fit_prepare_pending and self._fit_future is None:
                 self._start_fit_prepare()
             self._sync_fit_authoring_busy()
-        self._finish_close_if_ready()
 
     def _finish_close_if_ready(self) -> None:
         if self._fit_future is not None:
             return
-        if self._closing and self._future is None and not self._closed:
+        if self._closing and self._future is None and not self.closed:
             self._discard_snapshot_fit()
             self._fit_save_inflight = None
             self._saved_fit_receipt = None
@@ -2419,7 +2417,7 @@ class DataFigureWindow(FrozenRasterWindow):
         super()._finish_close_if_ready()
 
     def shutdown(self) -> None:
-        if self._closing or self._closed:
+        if self._closing or self.closed:
             return
         if self._fit_job_kind == "save" and self._fit_future is not None:
             self._close_deferred_during_fit_save = True

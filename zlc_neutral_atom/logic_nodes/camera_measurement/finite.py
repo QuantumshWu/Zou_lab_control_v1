@@ -136,7 +136,7 @@ class PreparedFiniteCameraMeasurement(PreparedExactCapture):
                 self._request,
                 self._pipeline.capture.capture_port,
                 self._repository,
-            )
+            ).with_lifecycle(owner=self, preemptible=False)
         )
 
     def start_with_preview(
@@ -167,7 +167,9 @@ class PreparedFiniteCameraMeasurement(PreparedExactCapture):
             preview=preview,
         )
         try:
-            return self._start_run(plan)
+            return self._start_run(
+                plan.with_lifecycle(owner=self, preemptible=False)
+            )
         except BaseException as error:
             notify_preview_failure(preview, error)
             raise

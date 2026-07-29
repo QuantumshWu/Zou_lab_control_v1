@@ -2,8 +2,7 @@
 
 This application boundary owns admission of the occupancy artifact, its source
 capture, and its calibration.  It reads exactly one chunk-backed Camera cell;
-frontend code receives the already-closed typed value and never joins artifacts
-or asks the capture repository to materialize the complete frame dataset.
+callers never join artifacts or materialize the complete frame dataset.
 """
 
 from __future__ import annotations
@@ -16,13 +15,14 @@ from zlc_data import (
     ComponentValidity,
     DatasetRevisionRef,
     DatasetSchema,
+    OwnedSnapshot,
     SPATIAL_X,
     SPATIAL_Y,
     StreamGenerationId,
     Value,
 )
 from zlc_data.value import dataset_cell_value
-from zlc_storage import canonical_text
+from zlc_storage import canonical_digest, canonical_text
 
 from zlc_neutral_atom.devices.camera.contract import CameraFrameMetadata
 from zlc_neutral_atom.capture.artifact import (
@@ -173,6 +173,7 @@ class ExactOccupancyCellSource:
     logical_point: tuple[int, ...]
     image: Value
     occupied: Value
+    occupied_snapshot: OwnedSnapshot
     frame_metadata: CameraFrameMetadata
 
     def __post_init__(self) -> None:
@@ -198,6 +199,13 @@ class ExactOccupancyCellSource:
             self.occupied.schema != self.domain.occupancy_schema.cell_schema
         ):
             raise ValueError("occupied must match the admitted SITE cell schema")
+        if not isinstance(self.occupied_snapshot, OwnedSnapshot) or (
+            self.occupied_snapshot.ref != self.domain.occupancy_ref
+            or self.occupied_snapshot.block.schema != self.domain.occupancy_schema
+        ):
+            raise ValueError(
+                "occupied_snapshot must match the admitted Occupancy Dataset"
+            )
         if not isinstance(self.frame_metadata, CameraFrameMetadata):
             raise TypeError("frame_metadata must be CameraFrameMetadata")
         object.__setattr__(self, "logical_point", logical)
@@ -351,7 +359,24 @@ def load_exact_occupancy_cell_source(
         logical_point,
         sample.image,
         occupied,
+        OwnedSnapshot(domain.occupancy_ref, artifact.occupied),
         sample.metadata,
+    )
+
+
+def _occupancy_cell_coherence_identity(
+    artifact_identity: str,
+    address: DatasetCellAddress,
+) -> str:
+    if not isinstance(address, DatasetCellAddress):
+        raise TypeError("address must be DatasetCellAddress")
+    return canonical_digest(
+        {
+            "owner": "zlc_neutral_atom.occupancy-cell",
+            "artifact": artifact_identity,
+            "repeat_index": address.repeat_index,
+            "point_ordinal": address.point_ordinal,
+        }
     )
 
 

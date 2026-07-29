@@ -454,7 +454,7 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
                 role=role,
                 domain=info.domain,
                 adapter_kind=info.adapter_kind,
-                detail=f"{info.availability} · {info.health}",
+                detail=info.resource_key,
             )
             self.loaded_layout.insertWidget(index, card)
         self.loaded_empty.setVisible(not rows)

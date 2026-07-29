@@ -1,3 +1,5 @@
-"""Private shared mechanics for the two release-recapture Measurements."""
+"""Shared release-recapture family facts."""
 
-__all__: tuple[str, ...] = ()
+DEFAULT_RELEASE_RECAPTURE_PULSE_PATH = "release_recapture.json"
+
+__all__ = ["DEFAULT_RELEASE_RECAPTURE_PULSE_PATH"]

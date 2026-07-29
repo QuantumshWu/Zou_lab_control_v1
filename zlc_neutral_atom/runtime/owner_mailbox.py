@@ -138,6 +138,8 @@ class RunOwnerMailbox:
     def shutdown(self) -> None:
         if self.has_pending_owner_work:
             raise RuntimeError("cannot close Run owner with pending work")
+        if not self._owner_reaped:
+            raise RuntimeError("cannot close Run owner before its handle is reaped")
         self._pool.shutdown(wait=False)
 
 

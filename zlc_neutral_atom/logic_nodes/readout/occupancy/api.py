@@ -6,7 +6,6 @@ from collections.abc import Callable
 from pathlib import Path
 
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
-from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.logic_nodes.camera_measurement.output_binding import (
     CameraFrameOutputBinding,
 )
@@ -44,9 +43,9 @@ class OccupancyApi:
         "_inspect_cell",
         "_load_cell",
         "_load_occupancy_operation",
+        "_open_ui",
         "_repository",
         "_repository_path",
-        "_require_binding_operation",
         "_start_detection_operation",
         "_wait_run",
     )
@@ -56,36 +55,36 @@ class OccupancyApi:
         calibration,
         *,
         repository_path: Path,
-        require_binding: Callable,
         wait_run: Callable,
         admit_capture: Callable,
         start_detection: Callable,
         load_occupancy: Callable,
         inspect_cell: Callable,
         load_cell: Callable,
+        open_ui: Callable,
     ) -> None:
         if not isinstance(repository_path, Path):
             raise TypeError("repository_path must be Path")
         operations = (
-            require_binding,
             wait_run,
             admit_capture,
             start_detection,
             load_occupancy,
             inspect_cell,
             load_cell,
+            open_ui,
         )
         if any(not callable(operation) for operation in operations):
             raise TypeError("Occupancy API operations must be callable")
         self._calibration = calibration
         self._repository_path = repository_path
-        self._require_binding_operation = require_binding
         self._wait_run = wait_run
         self._admit_capture = admit_capture
         self._start_detection_operation = start_detection
         self._load_occupancy_operation = load_occupancy
         self._inspect_cell = inspect_cell
         self._load_cell = load_cell
+        self._open_ui = open_ui
         self._repository: OccupancyRepository | None = None
 
     def _occupancy_repository(self) -> OccupancyRepository:
@@ -105,9 +104,6 @@ class OccupancyApi:
             return (error,)
         return ()
 
-    def _require_binding(self, binding: ReadoutBindingKey) -> None:
-        self._require_binding_operation(binding)
-
     def prepare_occupancy_processor_request(
         self,
         request: OccupancyProcessorRequest,
@@ -115,7 +111,6 @@ class OccupancyApi:
         if not isinstance(request, OccupancyProcessorRequest):
             raise TypeError("request must be OccupancyProcessorRequest")
         resolved = self._calibration.load_calibration(request.calibration_ref)
-        self._require_binding(resolved.artifact.frame_contract.binding)
         return prepare_occupancy_processor(request, resolved)
 
     def prepare_occupancy_processor(
@@ -166,13 +161,11 @@ class OccupancyApi:
             self._calibration.load_calibration(calibration),
             model_kind=model_kind,
         )
-        self._require_binding(request.readout_binding)
         return request
 
     def start_detection(self, request: DetectionRequest) -> RunHandle:
         if not isinstance(request, DetectionRequest):
             raise TypeError("request must be DetectionRequest")
-        self._require_binding(request.readout_binding)
         return self._start_detection_operation(
             request,
             self._occupancy_repository(),
@@ -181,7 +174,6 @@ class OccupancyApi:
     def detect(self, request: DetectionRequest) -> OccupancyArtifactRef:
         if not isinstance(request, DetectionRequest):
             raise TypeError("request must be DetectionRequest")
-        self._require_binding(request.readout_binding)
         return self._wait_run(self.start_detection(request))
 
     def load_occupancy(
@@ -192,7 +184,6 @@ class OccupancyApi:
             reference,
             self._occupancy_repository(),
         )
-        self._require_binding(resolved.readout_binding)
         return resolved
 
     def _project_figure(
@@ -202,7 +193,7 @@ class OccupancyApi:
         output: str | None,
         materialize: bool,
     ):
-        """Project an Occupancy artifact through its capability-owned UI leaf."""
+        """Project an Occupancy artifact through its leaf presentation owner."""
 
         from .ui.view_projection import project_occupancy_figure
 
@@ -219,7 +210,6 @@ class OccupancyApi:
         if not isinstance(reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
         domain = self._inspect_cell(reference, self._occupancy_repository())
-        self._require_binding(domain.readout_binding)
         return domain
 
     def _load_occupancy_cell_source(
@@ -248,10 +238,9 @@ class OccupancyApi:
                 else expected_navigation.identity
             ),
         )
-        self._require_binding(source.domain.readout_binding)
-        from .ui.view_projection import build_exact_occupancy_cell_view
+        from .ui.view_projection import project_exact_occupancy_cell
 
-        return build_exact_occupancy_cell_view(source)
+        return project_exact_occupancy_cell(source)
 
     def occupancy_cell_view(
         self,
@@ -259,7 +248,8 @@ class OccupancyApi:
         *,
         address: DatasetCellAddress | None = None,
     ):
-        return self._load_occupancy_cell_source(reference, address)
+        _figure, source = self._load_occupancy_cell_source(reference, address)
+        return source.site_map
 
     def occupancy_cell_gui(
         self,
@@ -271,9 +261,8 @@ class OccupancyApi:
             raise TypeError("reference must be OccupancyArtifactRef")
         if address is not None and not isinstance(address, DatasetCellAddress):
             raise TypeError("address must be DatasetCellAddress or None")
-        from .ui.workbench import open_occupancy_cell_workbench
-
-        return open_occupancy_cell_workbench(
+        return self._open_ui(
+            "cell",
             self._inspect_occupancy_cell_navigation,
             self._load_occupancy_cell_source,
             reference,

@@ -58,7 +58,7 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     calibration_artifact_ref_to_tree,
 )
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
-from zlc_neutral_atom.logic_nodes.camera_measurement import (
+from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
     CAMERA_FRAME_OUTPUT_CONTRACT_ID,
 )
 from zlc_neutral_atom.logic_nodes.readout.contracts import FrameContract

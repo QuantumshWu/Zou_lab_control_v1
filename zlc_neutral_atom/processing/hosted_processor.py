@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from itertools import count
 from types import MappingProxyType
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable
 import uuid
 
 from zlc_data import ValueSchema
@@ -22,12 +21,8 @@ from .signal_plane import SignalDataPlane, SignalPublication, SignalValue
 
 __all__ = [
     "HostedProcessor",
-    "HostedProcessorSource",
     "ProcessorPublication",
 ]
-
-
-_PROCESSOR_LIFECYCLE_GENERATIONS = count(1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,20 +45,6 @@ class ProcessorPublication:
         object.__setattr__(self, "outputs", MappingProxyType(outputs))
 
 
-@runtime_checkable
-class HostedProcessorSource(Protocol):
-    """Lifecycle facts required to pin a Processor to one producer run."""
-
-    @property
-    def lifecycle_generation(self) -> int: ...
-
-    @property
-    def running(self) -> bool: ...
-
-    @property
-    def handle(self) -> object: ...
-
-
 class HostedProcessor:
     """Domain-neutral Processor identity over one admitted live source.
 
@@ -81,7 +62,6 @@ class HostedProcessor:
         instance_id: str,
         dataset_output_declarations: tuple[DatasetOutputDeclaration, ...],
         source_signal: str,
-        source_node: HostedProcessorSource,
         initial_publication: SignalPublication,
         prepare_application: Callable[[], object],
         materialize_publication: Callable[
@@ -93,8 +73,6 @@ class HostedProcessor:
     ) -> None:
         if not isinstance(definition_key, DefinitionKey):
             raise TypeError("definition_key must be DefinitionKey")
-        if not isinstance(source_node, HostedProcessorSource):
-            raise TypeError("source_node must implement HostedProcessorSource")
         if not isinstance(initial_publication, SignalPublication):
             raise TypeError("initial_publication must be SignalPublication")
         source_signal = str(source_signal).strip()
@@ -109,17 +87,6 @@ class HostedProcessor:
             raise ValueError(
                 "latest-only Processor input requires typed monitor coverage"
             )
-        source_generation = source_node.lifecycle_generation
-        if (
-            isinstance(source_generation, bool)
-            or not isinstance(source_generation, int)
-            or source_generation <= 0
-        ):
-            raise ValueError("initial source has no accepted lifecycle generation")
-        source_handle = source_node.handle
-        source_run_id = getattr(getattr(source_handle, "run_id", None), "value", None)
-        if source_run_id is not None and source_run_id != initial_source.run_id:
-            raise ValueError("initial source belongs to another producer instance")
         if not callable(prepare_application):
             raise TypeError("prepare_application must be callable")
         if not callable(materialize_publication):
@@ -149,16 +116,13 @@ class HostedProcessor:
             raise ValueError("Processor must declare at least one Dataset output")
         self._definition_key = definition_key
         self.instance_id = identity
-        self._lifecycle_generation = next(_PROCESSOR_LIFECYCLE_GENERATIONS)
         self._request = request
         self._source_signal = source_signal
         self._dataset_output_declarations = declarations
         self._output_names = output_names
-        self._source_node = source_node
         self._signal_event_source: SignalEventSource | None = None
         self._signal_events_close_requested = False
         self._signal_events_closed = False
-        self._source_lifecycle_generation = source_generation
         self._source_signal_generation = initial_publication.generation
         self._initial_publication: SignalPublication | None = initial_publication
         self._source_run_id = initial_source.run_id
@@ -187,14 +151,6 @@ class HostedProcessor:
         return self._request
 
     @property
-    def input_nodes(self) -> tuple[object, ...]:
-        return (self._source_node,)
-
-    @property
-    def handle(self):
-        return None
-
-    @property
     def dataset_output_declarations(
         self,
     ) -> tuple[DatasetOutputDeclaration, ...]:
@@ -220,12 +176,6 @@ class HostedProcessor:
     @property
     def running(self) -> bool:
         return self._state is RunState.RUNNING
-
-    @property
-    def lifecycle_generation(self) -> int:
-        """Stable positive generation for this concrete node instance."""
-
-        return self._lifecycle_generation
 
     @property
     def last_error(self) -> str | None:
@@ -297,26 +247,6 @@ class HostedProcessor:
                 signal_error = RuntimeError(str(signal_error))
             self._fail(signal_error)
             return self._snapshot()
-        if (
-            self._source_node.lifecycle_generation
-            != self._source_lifecycle_generation
-            or not self._source_node.running
-        ):
-            self._fail(RuntimeError("selected producer instance has stopped"))
-            return self._snapshot()
-        source_handle = self._source_node.handle
-        handle_run_id = getattr(
-            getattr(source_handle, "run_id", None),
-            "value",
-            None,
-        )
-        if handle_run_id is not None and handle_run_id != self._source_run_id:
-            self._fail(
-                RuntimeError(
-                    "selected producer RunHandle differs from the bound lineage"
-                )
-            )
-            return self._snapshot()
         return self._snapshot()
 
     def shutdown(self) -> None:
@@ -341,11 +271,6 @@ class HostedProcessor:
                 "selected signal now belongs to another run or epoch; "
                 "restart the Processor to bind the new producer generation"
             )
-        if (
-            self._source_node.lifecycle_generation
-            != self._source_lifecycle_generation
-        ):
-            raise RuntimeError("selected producer generation changed")
 
     def processor_application_ready(self, application: object) -> None:
         if not callable(getattr(application, "evaluate", None)):
@@ -519,5 +444,5 @@ class HostedProcessor:
             None,
             self._error,
             (),
-            None,
+            (),
         )

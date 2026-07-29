@@ -75,11 +75,10 @@ class CalibrationApi:
         "_camera_roles",
         "_load_calibration",
         "_load_pulse",
+        "_open_ui",
         "_profiles",
-        "_readout_binding",
         "_repository",
         "_repository_path",
-        "_require_binding_operation",
         "_resolve_camera_ref",
         "_resolve_camera_role",
         "_resolve_sequencer_ref",
@@ -94,8 +93,6 @@ class CalibrationApi:
         repository_path: Path,
         profiles: Mapping[str, SitemapAcquisitionProfile],
         camera_roles: tuple[str, ...],
-        readout_binding: ReadoutBindingKey | None,
-        require_binding: Callable,
         resolve_camera_role: Callable,
         resolve_camera_ref: Callable,
         resolve_sequencer_ref: Callable,
@@ -108,11 +105,11 @@ class CalibrationApi:
         start_calibration: Callable,
         load_calibration: Callable,
         admit_saved_calibration: Callable,
+        open_ui: Callable,
     ) -> None:
         if not isinstance(repository_path, Path):
             raise TypeError("repository_path must be Path")
         operations = (
-            require_binding,
             resolve_camera_role,
             resolve_camera_ref,
             resolve_sequencer_ref,
@@ -125,14 +122,13 @@ class CalibrationApi:
             start_calibration,
             load_calibration,
             admit_saved_calibration,
+            open_ui,
         )
         if any(not callable(operation) for operation in operations):
             raise TypeError("Calibration API operations must be callable")
         self._repository_path = repository_path
         self._profiles = MappingProxyType(dict(profiles))
         self._camera_roles = tuple(camera_roles)
-        self._readout_binding = readout_binding
-        self._require_binding_operation = require_binding
         self._resolve_camera_role = resolve_camera_role
         self._resolve_camera_ref = resolve_camera_ref
         self._resolve_sequencer_ref = resolve_sequencer_ref
@@ -145,6 +141,7 @@ class CalibrationApi:
         self._start_calibration_operation = start_calibration
         self._load_calibration = load_calibration
         self._admit_saved_calibration = admit_saved_calibration
+        self._open_ui = open_ui
         self._repository: CalibrationRepository | None = None
 
     def _calibration_repository(self) -> CalibrationRepository:
@@ -168,9 +165,6 @@ class CalibrationApi:
         except Exception as error:
             return (error,)
         return ()
-
-    def _require_binding(self, binding: ReadoutBindingKey) -> None:
-        self._require_binding_operation(binding)
 
     def prepare_calibration_task(
         self,
@@ -277,7 +271,6 @@ class CalibrationApi:
         expected_camera_role: str,
     ) -> CaptureArtifactRef:
         binding = ReadoutBindingKey(expected_camera_role)
-        self._require_binding(binding)
         self._resolve_camera_ref(binding.value)
         return self._admit_saved_capture(source_path, binding.value)
 
@@ -291,12 +284,11 @@ class CalibrationApi:
         expected_camera_role: str | None = None,
     ) -> None:
         binding = (
-            self._readout_binding
+            None
             if expected_camera_role is None
             else ReadoutBindingKey(expected_camera_role)
         )
         if binding is not None:
-            self._require_binding(binding)
             self._resolve_camera_ref(binding.value)
         self._write_outputs(
             source,
@@ -316,27 +308,36 @@ class CalibrationApi:
             self._admit_calibration_capture(source),
             analysis,
         )
-        self._require_binding(request.readout_binding)
         return request
 
     def _admit_calibration_capture(self, source: CaptureArtifactRef):
         return self._admit_capture(source)
 
-    def start_calibration(self, request: CalibrationArtifactRequest) -> RunHandle:
+    def start_calibration(
+        self,
+        request: CalibrationArtifactRequest,
+        *,
+        lifecycle_owner: object | None = None,
+    ) -> RunHandle:
         if not isinstance(request, CalibrationArtifactRequest):
             raise TypeError("request must be CalibrationArtifactRequest")
-        self._require_binding(request.readout_binding)
         return self._start_calibration_operation(
             request,
             self._calibration_repository(),
+            lifecycle_owner,
         )
 
     def start_calibration_analysis(
         self,
         source: CaptureArtifactRef,
         analysis: CalibrationAnalysisRequest,
+        *,
+        lifecycle_owner: object | None = None,
     ) -> RunHandle:
-        return self.start_calibration(self.calibration_request(source, analysis))
+        return self.start_calibration(
+            self.calibration_request(source, analysis),
+            lifecycle_owner=lifecycle_owner,
+        )
 
     def calibrate(
         self,
@@ -344,16 +345,13 @@ class CalibrationApi:
     ) -> CalibrationArtifactRef:
         if not isinstance(request, CalibrationArtifactRequest):
             raise TypeError("request must be CalibrationArtifactRequest")
-        self._require_binding(request.readout_binding)
         return self._wait_run(self.start_calibration(request))
 
     def calibration_gui(self, request: CalibrationArtifactRequest):
         if not isinstance(request, CalibrationArtifactRequest):
             raise TypeError("request must be CalibrationArtifactRequest")
-        self._require_binding(request.readout_binding)
-        from .ui.workbench import open_calibration_workbench
-
-        return open_calibration_workbench(
+        return self._open_ui(
+            "create",
             self.load_calibration_computation,
             self.start_calibration,
             request=request,
@@ -362,9 +360,8 @@ class CalibrationApi:
     def calibration_edit_gui(self, reference: CalibrationArtifactRef):
         if not isinstance(reference, CalibrationArtifactRef):
             raise TypeError("reference must be CalibrationArtifactRef")
-        from .ui.workbench import open_calibration_workbench
-
-        return open_calibration_workbench(
+        return self._open_ui(
+            "create",
             self.load_calibration_computation,
             self.start_calibration,
             reference=reference,
@@ -378,7 +375,6 @@ class CalibrationApi:
             reference,
             self._calibration_repository(),
         )
-        self._require_binding(resolved.artifact.frame_contract.binding)
         return resolved
 
     def load_saved_calibration(
@@ -389,7 +385,6 @@ class CalibrationApi:
             calibration_ref_file,
             self._calibration_repository(),
         )
-        self._require_binding(resolved.artifact.frame_contract.binding)
         return resolved
 
     def load_calibration_computation(
@@ -397,7 +392,6 @@ class CalibrationApi:
         reference: CalibrationArtifactRef,
     ) -> CalibrationComputation:
         computation = self._calibration_repository().load_computation(reference)
-        self._require_binding(computation.artifact.frame_contract.binding)
         return computation
 
     def load_calibration_report(
@@ -409,9 +403,8 @@ class CalibrationApi:
     def calibration_report_gui(self, reference: CalibrationArtifactRef):
         if not isinstance(reference, CalibrationArtifactRef):
             raise TypeError("reference must be CalibrationArtifactRef")
-        from .ui.workbench import open_calibration_report_workbench
-
-        return open_calibration_report_workbench(
+        return self._open_ui(
+            "report",
             self.load_calibration_computation,
             reference,
         )

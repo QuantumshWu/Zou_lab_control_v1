@@ -216,6 +216,18 @@ class _InstallationRuntime:
             controller = self._controller
         return controller.wait(handle)
 
+    def wait_until_released(
+        self,
+        run_ids: tuple[str, ...],
+        *,
+        timeout: float | None = None,
+    ) -> bool:
+        """Wait for exact hardware leases without holding the runtime lock."""
+
+        with self._lock:
+            resources = self._resources
+        return resources.wait_until_released(run_ids, timeout=timeout)
+
     def _require_current_reference(self, reference: DeviceRef, domain: str) -> None:
         if not isinstance(reference, DeviceRef):
             raise TypeError("device reference must be DeviceRef")
@@ -398,7 +410,6 @@ def _catalog(
     return DeviceCatalogView(
         installation_id,
         runtime_instance_id,
-        0,
         tuple(
             DeviceInfo(
                 DeviceRef(installation_id, runtime_instance_id, item.role),

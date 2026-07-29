@@ -18,7 +18,7 @@ import Zou_lab_control.api as zlc
 from zlc_data.axis import AxisSourceRef, SPATIAL_X, SPATIAL_Y
 from zlc_data.fit_model import fit_model_catalog
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
-from zlc_neutral_atom.logic_nodes.mot_field import MotFieldTaskIntent
+from zlc_neutral_atom.logic_nodes.mot_field.mot_field_task import MotFieldTaskIntent
 import zlc_neutral_atom.logic_nodes.mot_field.mot_field_task as mot_task_impl
 
 ROOT = Path(__file__).resolve().parents[1]

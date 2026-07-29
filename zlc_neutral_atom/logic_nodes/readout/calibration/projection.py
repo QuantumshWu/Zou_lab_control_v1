@@ -1,8 +1,8 @@
 """Typed Dataset projections of one admitted FINAL calibration.
 
 Calibration owns the reference image, SITE diagnostics, validity and durable
-lineage.  Presentation packages may render these snapshots, but they must not
-reconstruct calibration arrays, infer axes, or repeat report mathematics.
+lineage.  This module exposes only physical calibration values; the optional UI
+adapter maps them into frontend's canonical Figure values.
 """
 
 from __future__ import annotations
@@ -102,8 +102,6 @@ CALIBRATION_FINAL_OUTPUT_DECLARATIONS = (
     ),
     *CALIBRATION_DIAGNOSTIC_OUTPUT_DECLARATIONS,
 )
-
-
 @dataclass(frozen=True, eq=False, slots=True)
 class CalibrationSiteMapContext:
     """Calibration-owned geometry required to compose a SiteMap presentation.

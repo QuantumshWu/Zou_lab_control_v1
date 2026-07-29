@@ -12,10 +12,11 @@ from __future__ import annotations
 import pathlib
 import subprocess
 import sys
+import time
 
 from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
-from zlc_neutral_atom.logic_nodes.pulse_scan import ScanArtifactRef
+from zlc_neutral_atom.logic_nodes.pulse_scan.reference import ScanArtifactRef
 from zlc_neutral_atom.runtime.hosted_run import HostedRun
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -40,18 +41,25 @@ def test_hosted_run_does_not_import_the_application_or_gui_layer():
 def test_successful_run_result_is_the_only_final_artifact_authority() -> None:
     reference = ScanArtifactRef("test-scan-repository", "b" * 64)
     terminal = RunSnapshot(
-        RunId("console-final-result"),
-        RunState.SUCCEEDED,
-        "complete",
-        True,
-        None,
-        None,
-        (),
-        None,
+        run_id=RunId("console-final-result"),
+        state=RunState.SUCCEEDED,
+        phase="complete",
+        final_committed=True,
+        commit_publication_warning=None,
+        primary_error=None,
+        cleanup_errors=(),
     )
 
     class Handle:
+        joined = False
+
         def snapshot(self):
+            return terminal
+
+        def wait(self, timeout=None):
+            assert timeout == 0.0
+            if not self.joined:
+                raise TimeoutError("owner thread has not exited")
             return terminal
 
         def result(self, *, timeout=None):
@@ -61,6 +69,7 @@ def test_successful_run_result_is_the_only_final_artifact_authority() -> None:
         def cancel(self, _reason=""):
             raise AssertionError("a successful Run must not be cancelled")
 
+    handle = Handle()
     node = HostedRun(
         definition_key=DefinitionKey("test", "final-result"),
         request={},
@@ -70,19 +79,31 @@ def test_successful_run_result_is_the_only_final_artifact_authority() -> None:
         qualify_output=lambda name: f"@logic/final-result-instance/{name}",
         request_owner_wake=lambda: None,
     )
-    node._handle = Handle()
     try:
-        assert node.poll() is terminal
+        node.start(lambda _prepared: handle)
+        deadline = time.monotonic() + 2.0
+        observed = None
+        while observed is None and time.monotonic() < deadline:
+            observed = node.poll()
+            time.sleep(0.002)
+        assert observed is terminal
+        assert not node.worker_idle
+        assert not node.final_result_resolved
+
+        handle.joined = True
+        deadline = time.monotonic() + 2.0
+        while not node.final_result_resolved and time.monotonic() < deadline:
+            observed = node.poll()
+            time.sleep(0.002)
+        assert observed is terminal
         assert node.final_result_resolved
         assert node.final_result == reference
     finally:
         node.shutdown()
 
 
-def test_run_attachment_calls_the_capability_live_output_starter() -> None:
-    """The generic host must not shadow the injected domain start adapter."""
-
-    import time
+def test_run_attachment_calls_the_leaf_owned_prepared_starter() -> None:
+    """The generic host must not shadow the injected leaf start capability."""
 
     from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
     from zlc_neutral_atom.catalog import MeasurementDefinition
@@ -131,14 +152,13 @@ def test_run_attachment_calls_the_capability_live_output_starter() -> None:
     )
     observed: list[tuple[object, object]] = []
     terminal = RunSnapshot(
-        RunId("live-output-start-run"),
-        RunState.SUCCEEDED,
-        "complete",
-        True,
-        None,
-        None,
-        (),
-        None,
+        run_id=RunId("live-output-start-run"),
+        state=RunState.SUCCEEDED,
+        phase="complete",
+        final_committed=True,
+        commit_publication_warning=None,
+        primary_error=None,
+        cleanup_errors=(),
     )
 
     class Handle:
@@ -146,6 +166,11 @@ def test_run_attachment_calls_the_capability_live_output_starter() -> None:
 
         @staticmethod
         def snapshot():
+            return terminal
+
+        @staticmethod
+        def wait(timeout=None):
+            assert timeout == 0.0
             return terminal
 
         @staticmethod
@@ -157,15 +182,16 @@ def test_run_attachment_calls_the_capability_live_output_starter() -> None:
         def cancel(_reason=""):
             raise AssertionError("completed handle must not be cancelled")
 
-    def capability_start(command, live_host):
+    def start_prepared(command, live_host, cancel_requested):
+        assert not cancel_requested()
         observed.append((command, live_host))
         return Handle()
 
     attachment = run_attachment(
         spec,
         bind_request=lambda request, _inputs: request,
-        prepare=lambda request: ("prepared", request),
-        start_with_live_output=capability_start,
+        prepare=lambda request, _event_source: ("prepared", request),
+        start_prepared=start_prepared,
     )
     node = attachment.create_node(
         host,
@@ -173,6 +199,7 @@ def test_run_attachment_calls_the_capability_live_output_starter() -> None:
         {"enabled": True},
         "live-output-instance",
     )
+    plane.reserve(node)
     try:
         node.start()
         deadline = time.monotonic() + 2.0

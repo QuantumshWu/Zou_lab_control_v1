@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from zlc_data import READOUT_EVENT, AxisId
@@ -27,7 +28,34 @@ __all__ = [
     "build_detection_request",
     "DetectionRequest",
     "prepare_detection_plan",
+    "resolve_occupancy_calibration_input",
 ]
+
+
+def resolve_occupancy_calibration_input(
+    binding,
+    *,
+    resolve_final_or_saved: Callable[..., object],
+    load_saved_calibration: Callable[[object], object],
+) -> CalibrationArtifactRef:
+    """Resolve one saved-or-FINAL Calibration reference exactly once."""
+
+    if not callable(resolve_final_or_saved) or not callable(load_saved_calibration):
+        raise TypeError("Occupancy artifact resolvers must be callable")
+
+    def extract_reference(loaded: object) -> CalibrationArtifactRef:
+        if type(loaded) is not ResolvedCalibration:
+            raise TypeError("saved Calibration loader returned another value type")
+        return loaded.reference
+
+    reference = resolve_final_or_saved(
+        binding,
+        load_saved=load_saved_calibration,
+        extract_reference=extract_reference,
+    )
+    if not isinstance(reference, CalibrationArtifactRef):
+        raise TypeError("Occupancy Calibration input resolved another artifact type")
+    return reference
 
 
 @dataclass(frozen=True)

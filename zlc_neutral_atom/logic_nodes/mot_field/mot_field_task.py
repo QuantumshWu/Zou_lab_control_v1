@@ -32,7 +32,6 @@ from zlc_neutral_atom.logic_node_declaration import (
     OutputPresentation,
     PathPresentationHint,
 )
-from zlc_neutral_atom.pulse_catalog import MOT_FIELD_PULSE_PATH
 from zlc_neutral_atom.node_input import bind_no_node_inputs
 from zlc_neutral_atom.authoring import (
     AuthoringChoice,
@@ -78,7 +77,7 @@ from zlc_storage.paths import resolve_under
 
 
 DEFAULT_MOT_FIELD_REPORT_FOLDER = "mot_field"
-DEFAULT_MOT_FIELD_PULSE_PATH = MOT_FIELD_PULSE_PATH
+DEFAULT_MOT_FIELD_PULSE_PATH = "mot_field_template.json"
 
 
 @dataclass(frozen=True)
@@ -675,7 +674,9 @@ class PreparedMotFieldTask:
                 raise RuntimeError("PreparedMotFieldTask is one-shot")
             self._started = True
         try:
-            handle = self._start_run(self._plan)
+            handle = self._start_run(
+                self._plan.with_lifecycle(owner=self, preemptible=False)
+            )
             if not isinstance(handle, RunHandle):
                 raise TypeError("MOT start_run returned another handle type")
             with self._lock:
@@ -719,6 +720,24 @@ class PreparedMotFieldTask:
 
         self._require_own_success(reference)
         return f"done; capture: {reference.target_ref}"
+
+
+def start_mot_field_task_command(
+    command: PreparedMotFieldTask,
+    live_output_host,
+    cancel_requested,
+):
+    """Attach MOT's declared live source before its one physical start."""
+
+    if not isinstance(command, PreparedMotFieldTask):
+        raise TypeError("MOT-field preparer returned another command type")
+    if not callable(cancel_requested):
+        raise TypeError("cancel_requested must be callable")
+    attach_live_output = getattr(live_output_host, "attach_live_output", None)
+    if not callable(attach_live_output):
+        raise TypeError("MOT-field start requires a live-output host")
+    attach_live_output(command.live_output)
+    return command.start()
 
 
 def prepare_mot_field_task(

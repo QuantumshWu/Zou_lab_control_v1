@@ -28,6 +28,7 @@ from zlc_frontend.qt_widgets import (
     FluentLineEdit,
     FluentSectionLabel,
     FluentSettingRow,
+    muted_note_label,
     scaled_px,
     setting_label_width,
     signals_blocked,
@@ -97,7 +98,6 @@ class PulseSlotsWidget(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("background: transparent;")
         self._scan_slot_kind = SWEEP_SCAN_SLOT
         self._api_slot_kind = SWEEP_API_SLOT
         self._program_id = ""
@@ -111,7 +111,7 @@ class PulseSlotsWidget(QtWidgets.QWidget):
 
         self._api_rows: dict[tuple[str, str], _ApiRow] = {}
         self._api_order: list[tuple[str, str]] = []
-        self._column_rows: dict[str, dict[tuple[str, str], FluentLabel]] = {
+        self._column_rows: dict[str, dict[tuple[str, str], QtWidgets.QLabel]] = {
             SWEEP_SCAN_SLOT: {},
             SWEEP_API_SLOT: {},
         }
@@ -140,11 +140,10 @@ class PulseSlotsWidget(QtWidgets.QWidget):
         self._api_box.setSpacing(scaled_px(6, minimum=4))
         self._box.addLayout(self._api_box)
         self._api_header = FluentSectionLabel("API parameters")
-        self._api_empty = FluentLabel("(this template has no API parameter)", self)
-        self._api_empty.setWordWrap(True)
-        self._api_empty.setStyleSheet(
-            f"color: {GREY}; background: transparent; border: none;"
+        self._api_empty = muted_note_label(
+            "(this template has no API parameter)"
         )
+        self._api_empty.setWordWrap(True)
         self._api_box.addWidget(self._api_header)
         self._api_box.addWidget(self._api_empty)
 
@@ -176,28 +175,20 @@ class PulseSlotsWidget(QtWidgets.QWidget):
         self._program_box.setSpacing(scaled_px(6, minimum=4))
         self._box.addLayout(self._program_box)
 
-        self._program_empty = FluentLabel(
-            "(bind at least one scan slot or API slot in the Pulse GUI)", self
+        self._program_empty = muted_note_label(
+            "(bind at least one scan slot or API slot in the Pulse GUI)"
         )
         self._program_empty.setWordWrap(True)
-        self._program_empty.setStyleSheet(
-            f"color: {GREY}; background: transparent; border: none;"
-        )
         self._program_title = FluentSectionLabel("")
-        self._columns_intro = FluentLabel(
-            "Columns of scan_table (one row = one point, columns advance in lockstep):",
-            self,
+        self._columns_intro = muted_note_label(
+            "Columns of scan_table (one row = one point, columns advance in lockstep):"
         )
         self._columns_intro.setWordWrap(True)
-        self._columns_intro.setStyleSheet(
-            f"color: {GREY}; background: transparent; border: none;"
-        )
 
         self._column_hosts: dict[str, QtWidgets.QWidget] = {}
         self._column_boxes: dict[str, QtWidgets.QVBoxLayout] = {}
         for kind in (self._scan_slot_kind, self._api_slot_kind):
             host = QtWidgets.QWidget(self)
-            host.setStyleSheet("background: transparent;")
             box = QtWidgets.QVBoxLayout(host)
             box.setContentsMargins(0, 0, 0, 0)
             box.setSpacing(scaled_px(2, minimum=1))
@@ -205,7 +196,6 @@ class PulseSlotsWidget(QtWidgets.QWidget):
             self._column_boxes[kind] = box
 
         self._template_host = QtWidgets.QWidget(self)
-        self._template_host.setStyleSheet("background: transparent;")
         btn_row = QtWidgets.QHBoxLayout(self._template_host)
         btn_row.setContentsMargins(0, 0, 0, 0)
         btn_row.setSpacing(scaled_px(6, minimum=4))
@@ -458,10 +448,7 @@ class PulseSlotsWidget(QtWidgets.QWidget):
             text = f"{coordinate}: {display}  [{unit}]"
             host = current.get(key)
             if host is None:
-                host = FluentLabel(text, self._column_hosts[kind])
-                host.setStyleSheet(
-                    f"color: {GREY}; background: transparent; border: none;"
-                )
+                host = muted_note_label(text)
                 current[key] = host
             elif host.text() != text:
                 host.setText(text)

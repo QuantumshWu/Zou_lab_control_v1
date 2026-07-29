@@ -209,7 +209,7 @@ class TaskConsole(QtWidgets.QWidget):
         state: TaskConsoleState | None = None,
         catalog_view: object | None = None,
         run_factory=None,
-        data_plane=None,
+        data_plane: SignalDataPlane,
         project_signal_presentation: Callable[
             [object, str, SignalPublication], object | None
         ]
@@ -239,6 +239,7 @@ class TaskConsole(QtWidgets.QWidget):
         self._lifecycle_wake_pending = False
         self._data_wake_pending = False
         self._fit_wake_pending = False
+        self._accept_data_wake = False
         self._fit_lock = threading.Lock()
         self._fit_active: dict[str, tuple[Future, object]] = {}
         self._fit_pending: dict[str, object] = {}
@@ -259,13 +260,15 @@ class TaskConsole(QtWidgets.QWidget):
         # each producer contributes its own latest atomic transaction.  Sharing
         # this front prevents intra-producer tearing but makes no same-shot claim
         # across independent runs.
-        self._data = data_plane if data_plane is not None else SignalDataPlane()
+        if not isinstance(data_plane, SignalDataPlane):
+            raise TypeError("TaskConsole requires the Experiment SignalDataPlane")
+        self._data = data_plane
         if project_signal_presentation is not None and not callable(
             project_signal_presentation
         ):
             raise TypeError("project_signal_presentation must be callable or None")
         self._project_signal_presentation = project_signal_presentation
-        self._data.bind_owner_wake(self._request_data_owner_wake)
+        self._data_wake_token = None
         self._tick_data = self._data.freeze()
         self._signal_metadata_front = self._tick_data
         self._signal_schema_fingerprints = self._front_schema_fingerprints(
@@ -315,10 +318,6 @@ class TaskConsole(QtWidgets.QWidget):
         # row removal.
         self._last_node: dict[int, _ConsoleNode] = {}
         self._logic_editors: dict[int, "LogicNodeEditor"] = {}  # id(row) -> Edit tab
-        # Exact in-console resource conflicts are retired and retried by RunId.
-        # This contains only transient GUI orchestration; the runtime arbiter
-        # remains the sole authority for resource admission.
-        self._conflict_start_waits: dict[int, str] = {}
         self._building = False
         self._address: str | None = None
         # The folder the LAST panel "Save Fig" wrote into -- so a panel's Edit-tab save
@@ -330,15 +329,11 @@ class TaskConsole(QtWidgets.QWidget):
         # Per-panel editors: one PanelEditor per opened PLOT panel, hosted as a
         # closable tab (keyed by id(card)).
         self._panel_editors: dict[int, "PanelEditor"] = {}
-        # A running TASK takes over the console: the status strip reports its
-        # lifecycle and all other actions remain locked until it finishes or is
-        # stopped.  Live task data belongs to the formal monitor seam; the console
-        # never invents an undeclared dataset or a blank transient plot for it.
-        self._running_task_row: "LogicNodeRow | None" = None
-        self._running_task_panels: list[PanelCard] = []
+        # Default live-result panels are ordinary signal consumers.  Their
+        # transient lifetime is tracked by panel identity, while each Logic row
+        # remains independently editable and stoppable.  Resource admission is
+        # owned exclusively by the Experiment application.
         self._transient_panel_ids: set[str] = set()
-        self._task_status_text: str | None = None
-        self._task_locked = False              # True while a task runs -> all other actions blocked
         self._raster_pixel_ratio = 1.0
         self._window = None
         self._pending_window_action: str | None = None
@@ -480,7 +475,7 @@ class TaskConsole(QtWidgets.QWidget):
         # Flip ON to arm the full selector layer (zoom/pan, area, cross,
         # draggable threshold/clim lines) on every dashboard panel IN PLACE -- no rebuild, and a
         # panel added while ON inherits it (see _attach_card).  A DISPLAY control like Pause, so
-        # it stays OUT of the running-task lockout.
+        # it remains independent of Run lifecycle.
         self.selectors_switch = FluentSwitch("Selectors")
         self.selectors_switch.setChecked(False)
         self.selectors_switch.setToolTip(
@@ -492,7 +487,7 @@ class TaskConsole(QtWidgets.QWidget):
         # freezes every plot at once (a display freeze -- acquisition keeps running); Save image grabs
         # the WHOLE board region to a PNG.  EMBEDDED (figure-viewer host) has nothing to acquire, freeze
         # or persist as a standalone layout, so all four are OMITTED -- set to None so every reference
-        # (``_lockable_header``, ``_mark_dirty``, ``_toggle_pause`` ...) guards on existence.
+        # (``_mark_dirty``, ``_toggle_pause`` ...) guards on existence.
         if self.embedded:
             self.save_button = None
             load_button = None
@@ -518,23 +513,14 @@ class TaskConsole(QtWidgets.QWidget):
                        self.pause_button, self.save_image_button, self.save_button, load_button):
             if widget is not None:
                 header.addWidget(widget)
-        # Header controls disabled while a task runs; kept as a group
-        # so ``_set_task_running`` flips them all at once.  Pause stays OUT of the lockout (you may
-        # want to freeze the display even mid-task); Save image is locked like the other mutators.
-        # None entries (embedded: the button was never made) are dropped so the lockout loop is safe.
-        self._lockable_header = tuple(w for w in (self.kind_combo, add_button, self.save_image_button,
-                                                  self.save_button, load_button, self.name_edit)
-                                      if w is not None)
         root.addWidget(header_frame)
 
         # PERSISTENT status strip -- the ONE always-visible line between the header and the
-        # tabs.  Its content switches by PRIORITY (node error > running task's progress >
-        # display-behind advisory; idle is empty, see _update_summary); the Stop-task
-        # action shows only while a task owns the console.  Its fixed height keeps
-        # status changes from moving the layout under the pointer.  Header
-        # telemetry remains visible independently above it.
-        self.status_strip = FluentStatusStrip(action_text="Stop task")
-        self.status_strip.action_clicked.connect(self._stop_running_task)
+        # tabs.  Its content switches by PRIORITY (node error > display-behind
+        # advisory; idle is empty, see _update_summary).  Run progress and Stop
+        # stay row-local, so the board never acquires a second admission mode.
+        # Its fixed height keeps status changes from moving the layout.
+        self.status_strip = FluentStatusStrip()
         root.addWidget(self.status_strip)
 
         # TWO permanent tabs:
@@ -1519,11 +1505,10 @@ class TaskConsole(QtWidgets.QWidget):
         for row in self.logic_nodes:
             if changed.intersection(self._declared_signal_keys(row)):
                 self._update_row_publishes(row)
-        if self._running_task_row is not None:
-            # A transient live panel appears on the first real typed value, not at
-            # Start.  Saved/offline task branches that expose no live route
-            # therefore never manufacture a blank transient viewer.
-            self._ensure_default_result_panels(self._running_task_row)
+                # A transient default panel appears on the first real typed
+                # value, not at Start.  This rule is per row and applies to any
+                # leaf declaration with a default view.
+                self._ensure_default_result_panels(row)
         for card in self.cards:
             card.refresh_open_signal_metadata()
         return changed
@@ -2107,14 +2092,13 @@ class TaskConsole(QtWidgets.QWidget):
         return True
 
     def _edit_card(self, card: "PanelCard") -> None:
-        """Open (or focus) this PLOT panel's OWN closable Edit tab (a PanelEditor); a
-        running task locks every other action, so this no-ops then.
+        """Open (or focus) this PLOT panel's OWN closable Edit tab.
 
         Opens even BEFORE the panel has data -- the panel's plot params /
         acquisition / fit / limits are editable straight away.  The snapshot
         section just shows "waiting for data" until a plot exists (the data is
         produced by a Logic-tab node, not by this Edit)."""
-        if card is None or self._task_locked:
+        if card is None:
             return
         existing = self._panel_editors.get(id(card))
         if existing is not None:
@@ -2297,8 +2281,6 @@ class TaskConsole(QtWidgets.QWidget):
     def _add_panel(self) -> None:
         """Header "Add Panel": add either a BLANK plot panel (a plot kind) or a
         STOPPED logic node (measurement / processor / task)."""
-        if self._task_locked:
-            return
         data = self.kind_combo.currentData()
         # A node LAYER -> a STOPPED logic node on the Logic tab.  It publishes
         # nothing until Started.
@@ -2364,9 +2346,6 @@ class TaskConsole(QtWidgets.QWidget):
         *,
         _state_change: bool = True,
     ) -> bool:
-        # User removal is blocked while a task owns the console.
-        if self._task_locked:
-            return False
         phases = self._panel_teardown_phases.setdefault(id(card), set())
         if "detached" in phases:
             return True
@@ -2475,8 +2454,6 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _edit_logic_node(self, row: "LogicNodeRow") -> None:
         """Open (or focus) a logic node's OWN closable Edit tab (param form + Start/Stop)."""
-        if self._task_locked:
-            return
         existing = self._logic_editors.get(id(row))
         if existing is not None:
             self.tabs.setCurrentWidget(existing)
@@ -2562,9 +2539,6 @@ class TaskConsole(QtWidgets.QWidget):
         Sets the node's status dot green; on build/run error -> red + the error
         on the status line.  Reuses the SAME node-build paths the real readout /
         notebook use."""
-        if self._task_locked:
-            return                                 # a task owns the console -- no other Start
-        self._conflict_start_waits.pop(id(row), None)
         editor = self._logic_editors.get(id(row))
         try:
             values = self._commit_logic_authored_values(row, editor=editor)
@@ -2598,10 +2572,8 @@ class TaskConsole(QtWidgets.QWidget):
             or self._last_node.get(id(row))
         )
         # A row never stacks two generations of itself.  Conflicts with another
-        # row are not guessed here from device fields: the runtime arbiter is the
-        # sole admission authority.  If start reports the exact owning RunId,
-        # _retire_conflict_and_retry stops only that row and retries this frozen
-        # request after the owner has actually gone terminal.
+        # row are not guessed or retried here: the Experiment application is the
+        # sole admission and retirement authority.
         if not self._stop_logic_node(row, _silent=True):
             row.set_state("running", status="restart blocked: previous owner still active")
             if editor is not None:
@@ -2638,14 +2610,9 @@ class TaskConsole(QtWidgets.QWidget):
         self.status_dot.set_color(GREEN)
         self._mark_dirty()
         self._ensure_default_result_panels(row)
-        # A TASK (one-shot orchestration) takes over the console while it runs.
-        # Status is honest lifecycle text; live plots appear only when a task
-        # exposes a formal monitor dataset through the ordinary data plane.
-        if row.node.kind == "task":
-            self._set_task_running(row)
 
     def _ensure_default_result_panels(self, row: "LogicNodeRow") -> None:
-        """Open a task's ordinary declared result panels exactly once.
+        """Open a leaf's ordinary declared result panels exactly once.
 
         The catalog chooses only an output and an existing plot kind.  This
         creates no task-specific viewer and does not publish data.  A
@@ -2688,69 +2655,28 @@ class TaskConsole(QtWidgets.QWidget):
             )
             self._attach_card(card)
             if value.transient:
-                self._running_task_panels.append(card)
                 self._transient_panel_ids.add(card.panel_id)
             self._arrange()
             if not value.transient:
                 self._mark_dirty()
 
-    def _set_task_running(self, row: "LogicNodeRow") -> None:
-        """Engage task-run mode without manufacturing a display dataset.
+    def _remove_transient_result_panels(self, row: "LogicNodeRow") -> None:
+        """Remove only transient default panels sourced by ``row``.
 
-        The Run lifecycle and its FINAL artifact are real; a mid-run plot exists
-        only when a formal monitor producer has been admitted to the ordinary
-        data plane.  Until then the persistent status strip is the complete,
-        truthful UI for a running task.
+        The panel id set records presentation lifetime, while the frozen signal
+        declarations identify ownership.  No board-global task/session state is
+        required.
         """
 
-        self._running_task_row = row
-        self._update_task_status_text()
-        self._apply_task_lock(True)
-
-    def _update_task_status_text(self) -> None:
-        """Assemble the running task's honest lifecycle status line."""
-
-        row = self._running_task_row
-        if row is None:
-            return
-        self._task_status_text = f"⏳  Task running: {row.node.title}"
-
-    def _apply_task_lock(self, locked: bool) -> None:
-        """Disable / re-enable every mutating control while a task runs.  The strip's Stop
-        action stays enabled (it lives outside the locked groups); the strip itself is
-        PERSISTENT -- only its content/action flip, so the layout never jumps."""
-        self._task_locked = bool(locked)
-        if not locked:
-            self._task_status_text = None
-        self.status_strip.set_action_visible(bool(locked))
-        for widget in self._lockable_header:
-            widget.setEnabled(not locked)
-        self._update_summary()                       # flip the strip's line NOW, not next tick
-
-    def _stop_running_task(self) -> None:
-        """Banner 'Stop task' button: cooperatively stop the running task."""
-        row = self._running_task_row
-        if row is not None:
-            self._stop_logic_node(row)
-
-    def _clear_task_running(self) -> None:
-        """Leave task-run mode after either completion or an explicit Stop."""
-
-        row = self._running_task_row
-        panels = tuple(self._running_task_panels)
-        node = None if row is None else self._logic_nodes.get(id(row))
-        self._running_task_row = None
-        self._running_task_panels.clear()
-        self._apply_task_lock(False)
-        if node is not None:
-            self._data.detach_live(node)
+        owned_signals = self._declared_signal_keys(row)
+        panels = tuple(
+            card
+            for card in self.cards
+            if card.panel_id in self._transient_panel_ids
+            and card.config.signal in owned_signals
+        )
         for panel in panels:
-            if panel in self.cards:
-                self._remove_panel(panel, _state_change=False)
-        # Detach is a real ownership boundary.  Promote its immutable result
-        # now so a rerun cannot briefly bind a newly-created transient panel to
-        # the previous generation's retained live value.
-        self._promote_data_front(self._data.freeze())
+            self._remove_panel(panel, _state_change=False)
 
     def _build_logic_node(self, node: LogicNodeConfig, values: dict):
         """Freeze this row into a HostedRun -- the RUN seam's unit of work.
@@ -3247,7 +3173,6 @@ class TaskConsole(QtWidgets.QWidget):
         _silent: bool = False,
     ) -> bool:
         """Cancel a logic row's Run and grey its dot."""
-        self._conflict_start_waits.pop(id(row), None)
         node = self._logic_nodes.get(id(row))
         if node is not None:
             if not self._stop_run(node):
@@ -3260,8 +3185,7 @@ class TaskConsole(QtWidgets.QWidget):
                             "stop pending: the run has not gone terminal", error=True
                         )
                 return False
-        if row is self._running_task_row:
-            self._clear_task_running()
+        self._remove_transient_result_panels(row)
         self._logic_nodes[id(row)] = None
         self._sync_terminal_poll_timer()
         # Running, retained FINAL/view, and declared-not-started are
@@ -3283,11 +3207,6 @@ class TaskConsole(QtWidgets.QWidget):
         _state_change: bool = True,
     ) -> bool:
         """Stop + remove a logic node (its node is stopped, its row + Edit drop)."""
-        # a running task locks the console: the per-row Remove button must no-op too
-        # (every other mutating entry guards on this).  Internal teardown (load_state)
-        # passes _state_change=False and is never reached while locked.
-        if self._task_locked and _state_change:
-            return False
         # Removing a row also retires its retained terminal display source.
         gone = (
             self._logic_nodes.get(id(row))
@@ -3339,8 +3258,6 @@ class TaskConsole(QtWidgets.QWidget):
             snapshot = node.poll()
             error = node.last_error
             if error:
-                if self._retire_conflict_and_retry(row, node):
-                    continue
                 row.set_state("error", status=f"error: {error}")
                 if editor is not None:
                     editor.set_running(False)
@@ -3372,8 +3289,6 @@ class TaskConsole(QtWidgets.QWidget):
                     editor.set_status("stop pending: run owner not terminal", error=False)
                 continue
             if snapshot.state.terminal:
-                if state == "FAILED" and self._retire_conflict_and_retry(row, node):
-                    continue
                 if state == "FAILED":
                     message = snapshot.primary_error or "run failed"
                     row.set_state("error", status=f"error: {message}")
@@ -3424,13 +3339,13 @@ class TaskConsole(QtWidgets.QWidget):
                     if editor is not None:
                         editor.set_running(False)
                         editor.set_status("stopped", error=False)
-                # A run that ended on its own releases the console exactly like Stop:
-                # one teardown path, so a finished task can never leave the lock on.
+                # A run that ended on its own uses the same row-local teardown
+                # path as Stop.
                 self._stop_logic_node(row, _silent=True)
                 if state == "SUCCEEDED":
                     # Default panels are optional presentation consumers of an
                     # already-committed FINAL value.  Construct them only after
-                    # the Run owner and task lock are released, so a frontend
+                    # the Run owner is released, so a frontend
                     # fault can never turn successful domain completion into a
                     # wedged resource/lifecycle owner.
                     self._ensure_default_result_panels(row)
@@ -3441,120 +3356,6 @@ class TaskConsole(QtWidgets.QWidget):
                 editor.set_status("running", error=False)
         self._sync_terminal_poll_timer()
         self._continue_pending_window_action()
-
-    def _retire_conflict_and_retry(
-        self,
-        row: "LogicNodeRow",
-        node: _ConsoleNode,
-    ) -> bool:
-        """Resolve an exact TaskConsole-internal resource conflict.
-
-        The runtime still rejects the first admission and identifies the real
-        owner by RunId.  If that owner is another Logic row in this console, the
-        shell requests its normal Stop, waits for actual terminal cleanup, then
-        retries the already-frozen requested node.  External-window/process
-        owners are never guessed or preempted and remain a visible rejection.
-        """
-
-        if not isinstance(node, HostedRun):
-            return False
-        conflict = node.resource_conflict
-        if conflict is None:
-            return False
-        # Some domain commands must create their typed preview port before
-        # runtime admission.  A rejected claim owns no Run, so that provisional
-        # live route must be retired before the same frozen request is retried.
-        # Direct-start commands already do this at their starter boundary;
-        # detach_live is intentionally idempotent for both paths.
-        self._data.detach_live(node)
-        row_id = id(row)
-        conflict_run_id = str(conflict.conflicting_run_id)
-        remembered = self._conflict_start_waits.get(row_id)
-        if remembered is not None and remembered != conflict_run_id:
-            return False
-
-        conflict_row = None
-        conflict_node = None
-        conflict_is_active = False
-        unresolved_local_start = False
-        for candidate in self.logic_nodes:
-            active = self._logic_nodes.get(id(candidate))
-            retained = self._last_node.get(id(candidate))
-            if (
-                candidate is not row
-                and active is not None
-                and active.running
-                and active.handle is None
-            ):
-                # RunController may already hold the lease while its start()
-                # call has not yet returned the RunHandle to this Qt owner.
-                unresolved_local_start = True
-            seen = set()
-            for other in (active, retained):
-                if other is None or id(other) in seen:
-                    continue
-                seen.add(id(other))
-                handle = other.handle
-                run_id = None if handle is None else handle.run_id
-                if run_id is not None and str(run_id) == conflict_run_id:
-                    conflict_row = candidate
-                    conflict_node = other
-                    conflict_is_active = active is other
-                    break
-            if conflict_node is not None:
-                break
-
-        if conflict_node is None:
-            if unresolved_local_start:
-                status = "resolving conflicting start"
-                row.set_state("running", status=status)
-                editor = self._logic_editors.get(row_id)
-                if editor is not None:
-                    editor.set_running(True)
-                    editor.set_status(status, error=False)
-                return True
-            if remembered is None:
-                return False
-            # The conflicting row reached terminal earlier in this same owner
-            # cycle and has already been detached.  Its resource lease is gone.
-            self._retry_after_conflict(row, node)
-            return True
-        if conflict_node is node:
-            return False
-
-        if not conflict_is_active:
-            # The exact owner reached terminal and was detached before this
-            # row's next poll.  _last_node keeps the RunId long enough to prove
-            # this is a local handoff; its lease is already released.
-            self._retry_after_conflict(row, node)
-            return True
-
-        self._conflict_start_waits[row_id] = conflict_run_id
-        conflict_node.cancel(
-            f"TaskConsole is handing the resource to {row.node.title}"
-        )
-        if not self._stop_logic_node(conflict_row, _silent=False):
-            status = f"stopping conflicting {conflict_row.node.title}"
-            row.set_state("running", status=status)
-            editor = self._logic_editors.get(row_id)
-            if editor is not None:
-                editor.set_running(True)
-                editor.set_status(status, error=False)
-            return True
-
-        self._retry_after_conflict(row, node)
-        return True
-
-    def _retry_after_conflict(self, row: "LogicNodeRow", node) -> None:
-        """Retry one frozen request after its exact local owner retired."""
-
-        self._conflict_start_waits.pop(id(row), None)
-        self._begin_run(node)
-        row.set_state("running", status="starting")
-        editor = self._logic_editors.get(id(row))
-        if editor is not None:
-            editor.set_running(True)
-            editor.set_status("starting", error=False)
 
     def _mark_dirty(self, *_args) -> None:
         if self._building:
@@ -3577,10 +3378,25 @@ class TaskConsole(QtWidgets.QWidget):
         """Wake reactive data routing without polling unrelated Run owners."""
 
         with self._owner_event_lock:
-            if self._permanently_closed:
+            if self._permanently_closed or not self._accept_data_wake:
                 return
             self._data_wake_pending = True
         self._owner_wake.request_owner_wake()
+
+    def _activate_data_owner_wake(self) -> None:
+        """Commit the shared-plane wake borrow after window composition succeeds."""
+
+        if self._data_wake_token is not None:
+            raise RuntimeError("TaskConsole data wake is already active")
+        with self._owner_event_lock:
+            self._accept_data_wake = True
+        try:
+            token = self._data.bind_owner_wake(self._request_data_owner_wake)
+        except BaseException:
+            with self._owner_event_lock:
+                self._accept_data_wake = False
+            raise
+        self._data_wake_token = token
 
     def _request_fit_owner_wake(self) -> None:
         """Wake only the owner path that accepts completed Fit compute."""
@@ -3607,7 +3423,11 @@ class TaskConsole(QtWidgets.QWidget):
             self._drain_fit_completions()
         if lifecycle:
             self._poll_logic_nodes()
-        if (lifecycle or data) and not getattr(self, "_shut", False):
+        if (
+            (lifecycle or data)
+            and not getattr(self, "_shut", False)
+            and not self._display_suspended
+        ):
             # A producer revision may have arrived with no visible panel.  Freeze
             # here so reactive Processors advance from the event itself; the
             # display timer still decides when a panel is actually recomposed.
@@ -3828,7 +3648,7 @@ class TaskConsole(QtWidgets.QWidget):
             self.summary.setText(telemetry)
         dropped = self._note_display_drops()
         # The persistent strip's ONE priority ladder (every tick): a wedged node must never fail
-        # silently, so a red node error outranks even the running task's progress line; the
+        # silently, so a red node error outranks the
         # display-behind advisory is amber (the RUN is unaffected -- acquisition is unthrottled
         # and always shows latest); idle shows the board summary.  The strip itself change-gates
         # text/style, so this per-tick call never repolishes an unchanged state.
@@ -3842,8 +3662,6 @@ class TaskConsole(QtWidgets.QWidget):
             who = self._node_label(node).rstrip("_:")
             self.status_strip.show_message(
                 f"⚠ NODE ERROR ({who}): {node.last_error}", severity="error")
-        elif getattr(self, "_task_status_text", None):
-            self.status_strip.show_message(self._task_status_text, severity="task")
         elif dropped:
             self.status_strip.show_message(
                 f"⚠ display behind: the monitor taps dropped {dropped} event(s) -- "
@@ -3855,8 +3673,6 @@ class TaskConsole(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ files
     def save_to_file(self) -> None:
-        if self._task_locked:
-            return
         try:
             state = self.read_state()
             start = self._address or str(
@@ -3874,8 +3690,6 @@ class TaskConsole(QtWidgets.QWidget):
             self._message(f"Save failed: {exc}")
 
     def load_from_file(self) -> None:
-        if self._task_locked:
-            return
         try:
             start = (
                 str(Path(self._address).parent)
@@ -4106,7 +3920,12 @@ class TaskConsole(QtWidgets.QWidget):
                     + "; ".join(failures),
                     severity="error",
                 )
-        self._data.close()
+        with self._owner_event_lock:
+            self._accept_data_wake = False
+            self._data_wake_pending = False
+        if self._data_wake_token is not None:
+            self._data.unbind_owner_wake(self._data_wake_token)
+            self._data_wake_token = None
         if not getattr(self, "_on_close_done", False):
             self._shutdown_state = "CLOSING_RESOURCES"
             on_close = getattr(self, "_on_close", None)
@@ -4174,7 +3993,7 @@ def show_task_console(
     task: str | None = None,
     catalog_view: object | None = None,
     run_factory=None,
-    data_plane=None,
+    data_plane: SignalDataPlane,
     project_signal_presentation: Callable[
         [object, str, SignalPublication], object | None
     ]
@@ -4234,4 +4053,10 @@ def show_task_console(
     # ONE launcher sequence (launch_fluent_window: wrap -> wire -> size -> centre -> show ->
     # retain), shared with every other show_* GUI so the steps cannot drift per-launcher.
     launch_fluent_window(console, title=title, hide_on_close=hide_on_close, wire=_wire_close)
+    try:
+        console._activate_data_owner_wake()
+    except BaseException:
+        if console.shutdown():
+            console._commit_permanent_close(delete_window=True)
+        raise
     return console

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 
 from zlc_neutral_atom.node_input import BoundNodeInputs
+from zlc_neutral_atom.input_spec import DatasetInputSpec
 from zlc_neutral_atom.processing.hosted_processor import (
     HostedProcessor,
     ProcessorPublication,
@@ -15,6 +16,7 @@ from zlc_workbench.task_console.capability import (
     ConsoleCapabilityAttachment,
     ConsoleNodeHost,
 )
+from zlc_workbench.task_console.input_binding import ResolvedDatasetInput
 from zlc_workbench.task_console.console_records import console_signal_key
 
 
@@ -22,9 +24,9 @@ def run_attachment(
     spec,
     *,
     bind_request: Callable[[object, BoundNodeInputs], object],
-    prepare: Callable[[object], object],
-    start: Callable[[object, HostedRun, ConsoleNodeHost], object] | None = None,
-    start_with_live_output: Callable[[object, object], object] | None = None,
+    prepare: Callable[[object, object | None], object],
+    start_prepared: Callable[[object, object, Callable[[], bool]], object]
+    | None = None,
     project_signal_presentation: Callable[
         [object, str, SignalPublication], object | None
     ]
@@ -37,13 +39,17 @@ def run_attachment(
         raise TypeError("bind_request must be callable")
     if not callable(prepare):
         raise TypeError("prepare must be callable")
-    if start is not None and not callable(start):
-        raise TypeError("start must be callable or None")
-    if start_with_live_output is not None and not callable(start_with_live_output):
-        raise TypeError("start_with_live_output must be callable or None")
-    if start is not None and start_with_live_output is not None:
-        raise ValueError("Run attachment accepts only one custom start seam")
-    live_output_starter = start_with_live_output
+    if start_prepared is not None and not callable(start_prepared):
+        raise TypeError("start_prepared must be callable or None")
+    association_specs = tuple(
+        value
+        for value in spec.input_specs
+        if isinstance(value, DatasetInputSpec) and value.requires_event_association
+    )
+    if len(association_specs) > 1:
+        raise ValueError(
+            "one hosted Run may consume at most one event-associated Dataset"
+        )
 
     def create_node(
         host: ConsoleNodeHost,
@@ -61,6 +67,73 @@ def run_attachment(
         authored = spec.build_request(values)
         request = bind_request(authored, inputs.bound)
         output_presentations = tuple(spec.outputs_for(request))
+
+        event_source = None
+        event_generation = None
+        event_signal = None
+        event_output = None
+        event_transform = None
+        event_producer = None
+        if association_specs:
+            association = inputs.resolved[association_specs[0].key]
+            if not isinstance(association, ResolvedDatasetInput):
+                raise TypeError("event-associated input resolved as another type")
+            event_producer = association.producer
+            if not event_producer.running:
+                raise RuntimeError(
+                    "start the selected Dataset producer before this Logic node"
+                )
+            event_signal = association.selection.signal_key
+            publication = host.current_publication(association)
+            event_generation = publication.generation
+            event_source, event_output, event_transform = (
+                host.data_plane.signal_event_binding(
+                    event_signal,
+                    expected_generation=event_generation,
+                )
+            )
+            if event_output != event_producer.output.name:
+                raise RuntimeError("event route exposes another Dataset output")
+            if event_transform != association.transform_spec:
+                raise RuntimeError("event route exposes another Dataset transform")
+
+        def prepare_owned(current):
+            if current != request:
+                raise RuntimeError("hosted request changed after request freeze")
+            parents = ()
+            if event_signal is None:
+                command = prepare(current, None)
+            else:
+                assert event_generation is not None
+                assert event_producer is not None
+                if not event_producer.running:
+                    raise RuntimeError(
+                        "selected Dataset producer stopped before prepare"
+                    )
+                source, output_name, transform = host.data_plane.signal_event_binding(
+                    event_signal,
+                    expected_generation=event_generation,
+                )
+                if (
+                    source is not event_source
+                    or output_name != event_output
+                    or transform != event_transform
+                ):
+                    raise RuntimeError("event-associated Dataset route changed")
+                command = prepare(current, event_source)
+                parent = event_producer.prepared_command
+                if parent is None:
+                    raise RuntimeError(
+                        "event-associated producer has no admitted command"
+                    )
+                parents = (parent,)
+            host.data_plane.bind_lifecycle_owner(
+                node,
+                command,
+                parent_owners=parents,
+            )
+            return command
+
         node = HostedRun(
             definition_key=spec.key,
             request=request,
@@ -71,12 +144,12 @@ def run_attachment(
             artifact_output_declarations=tuple(
                 output.declaration for output in spec.artifact_outputs
             ),
-            prepare=prepare,
+            prepare=prepare_owned,
             qualify_output=lambda name: console_signal_key(instance_id, name),
             request_owner_wake=host.request_owner_wake,
         )
         def start_prepared(command):
-            if live_output_starter is not None:
+            if start_prepared_owner is not None:
                 from zlc_neutral_atom.runtime.live_output_host import (
                     start_with_live_output as host_live_output,
                 )
@@ -85,18 +158,21 @@ def run_attachment(
                     command,
                     node,
                     host.data_plane,
-                    start=live_output_starter,
+                    start=lambda current, live_host: start_prepared_owner(
+                        current,
+                        live_host,
+                        lambda: node.cancel_requested,
+                    ),
                 )
-            if start is None:
-                starter = getattr(command, "start", None)
-                if not callable(starter):
-                    raise TypeError("prepared command exposes no start()")
-                return starter()
-            return start(command, node, host)
+            starter = getattr(command, "start", None)
+            if not callable(starter):
+                raise TypeError("prepared command exposes no start()")
+            return starter()
 
         node.bind_starter(start_prepared)
         return node
 
+    start_prepared_owner = start_prepared
     return ConsoleCapabilityAttachment(
         spec,
         create_node,
@@ -150,11 +226,6 @@ def processor_attachment(
         source_input = inputs.only_dataset()
         if source_input.transform_spec is not None:
             raise ValueError("latest-only Processor input must be a direct output")
-        source_node = source_input.producer.run_node
-        if source_node is None or not bool(getattr(source_node, "running", False)):
-            raise RuntimeError(
-                "start the selected Dataset producer before its Processor"
-            )
         initial_publication = host.current_publication(source_input)
 
         return HostedProcessor(
@@ -165,7 +236,6 @@ def processor_attachment(
                 output.declaration for output in spec.outputs_for(request)
             ),
             source_signal=source_input.selection.signal_key,
-            source_node=source_node,
             initial_publication=initial_publication,
             prepare_application=lambda: prepare(request),
             materialize_publication=materialize_publication,

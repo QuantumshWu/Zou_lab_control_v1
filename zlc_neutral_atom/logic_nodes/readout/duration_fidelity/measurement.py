@@ -31,7 +31,6 @@ from zlc_neutral_atom.logic_nodes.readout.physical_context import (
     digital_outputs_falling_after_period,
 )
 from zlc_neutral_atom.node_input import BoundNodeInputs
-from zlc_neutral_atom.pulse_catalog import PROBE_PULSE_PATH
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
 from zlc_neutral_atom.devices.sequencer.port import (
     BoundPulsePort,
@@ -64,6 +63,9 @@ DEFAULT_READOUT_DURATION_SHOTS = 60
 DEFAULT_READOUT_DURATION_SITE = None
 
 
+DEFAULT_READOUT_DURATION_FIDELITY_PULSE_PATH = "probe_template.json"
+
+
 _MINIMUM_SHOTS = 1
 
 
@@ -76,7 +78,7 @@ _READOUT_DURATION_AUTHORING_SCHEMA = AuthoringSchema(
             "pulse",
             "path",
             "Pulse template",
-            default=PROBE_PULSE_PATH,
+            default=DEFAULT_READOUT_DURATION_FIDELITY_PULSE_PATH,
             required=True,
         ),
         AuthoringField(
@@ -534,4 +536,4 @@ READOUT_DURATION_FIDELITY_LOGIC_NODE = LogicNodeDeclaration(
 
 
 
-__all__ = ["BoundReadoutDurationFidelity", "CalibratedReadoutDurationFidelityIntent", "DEFAULT_READOUT_DURATION_MICROSECONDS_RANGE", "DEFAULT_READOUT_DURATION_SHOTS", "DEFAULT_READOUT_DURATION_SITE", "READOUT_DURATION_FIDELITY_DEFINITION", "READOUT_DURATION_FIDELITY_KEY", "READOUT_DURATION_FIDELITY_LOGIC_NODE", "READOUT_DURATION_FIDELITY_OUTPUT_DECLARATIONS", "ReadoutDurationFidelityIntent", "ReadoutDurationFidelityRequest", "bind_readout_duration_fidelity", "bind_readout_duration_fidelity_inputs", "build_readout_duration_fidelity_intent", "build_readout_duration_intent_from_authoring", "readout_duration_fidelity_authoring_schema"]
+__all__ = ["BoundReadoutDurationFidelity", "CalibratedReadoutDurationFidelityIntent", "DEFAULT_READOUT_DURATION_FIDELITY_PULSE_PATH", "DEFAULT_READOUT_DURATION_MICROSECONDS_RANGE", "DEFAULT_READOUT_DURATION_SHOTS", "DEFAULT_READOUT_DURATION_SITE", "READOUT_DURATION_FIDELITY_DEFINITION", "READOUT_DURATION_FIDELITY_KEY", "READOUT_DURATION_FIDELITY_LOGIC_NODE", "READOUT_DURATION_FIDELITY_OUTPUT_DECLARATIONS", "ReadoutDurationFidelityIntent", "ReadoutDurationFidelityRequest", "bind_readout_duration_fidelity", "bind_readout_duration_fidelity_inputs", "build_readout_duration_fidelity_intent", "build_readout_duration_intent_from_authoring", "readout_duration_fidelity_authoring_schema"]

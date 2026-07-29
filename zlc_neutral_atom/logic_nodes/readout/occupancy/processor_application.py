@@ -87,7 +87,9 @@ def bind_occupancy_processor_request(
         raise TypeError("inputs must be BoundNodeInputs")
     camera = inputs.dataset(OCCUPANCY_CAMERA_INPUT_SPEC)
     calibration = inputs.artifact(OCCUPANCY_CALIBRATION_INPUT_SPEC)
-    from zlc_neutral_atom.logic_nodes.camera_measurement import CAMERA_MEASUREMENT_KEY
+    from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
+        CAMERA_MEASUREMENT_KEY,
+    )
 
     if camera.producer_definition != CAMERA_MEASUREMENT_KEY:
         raise ValueError("Occupancy source must be a Camera Measurement output")

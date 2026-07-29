@@ -28,9 +28,6 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
 from zlc_neutral_atom.runtime.run import RunCancelled, RunHandle
-from .view_projection import (
-    calibration_authority_summary,
-)
 from zlc_neutral_atom.runtime.owner_mailbox import RunOwnerMailbox
 
 from .report_window import CalibrationReportSurfaceWindow
@@ -38,6 +35,49 @@ from .workbench_jobs import (
     _load_calibration_report_document,
     _prepare_calibration_editor,
 )
+
+
+def _authority_summary(
+    request: CalibrationArtifactRequest,
+    previous_reference: CalibrationArtifactRef | None = None,
+) -> str:
+    """Describe frozen calibration authority for this editor only."""
+
+    if not isinstance(request, CalibrationArtifactRequest):
+        raise TypeError("request must be CalibrationArtifactRequest")
+    if previous_reference is not None and not isinstance(
+        previous_reference,
+        CalibrationArtifactRef,
+    ):
+        raise TypeError("previous_reference must be CalibrationArtifactRef or None")
+    analysis = request.analysis
+    layout = analysis.layout
+    centers = analysis.expected_centers_xy
+    center_text = (
+        "missing (formal Run will reject)"
+        if centers is None
+        else f"{analysis.site_count} independent centers"
+    )
+    residual_text = (
+        "none"
+        if analysis.maximum_site_residual_px is None
+        else f"{analysis.maximum_site_residual_px:.6g} px"
+    )
+    previous = (
+        "new calibration"
+        if previous_reference is None
+        else f"editing {previous_reference.target_ref} into a new artifact"
+    )
+    return (
+        f"source={request.source_capture_ref.target_ref} · "
+        f"binding={request.readout_binding.value} · {previous}\n"
+        f"READOUT_EVENT={layout.readout_event_axis_id.value} · "
+        f"reference={layout.reference_event_indices} · "
+        f"readout={layout.readout_event_index}\n"
+        f"grid={analysis.grid_shape_yx} {analysis.ordering.value} · "
+        f"sites={analysis.site_count} · {center_text} · max residual={residual_text}\n"
+        "Spatial authority is frozen; detector/display output cannot rewrite it."
+    )
 
 
 class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
@@ -48,8 +88,8 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
         computation_loader,
         run_starter,
         *,
-        request: CalibrationArtifactRequest | None,
-        reference: CalibrationArtifactRef | None,
+        request: CalibrationArtifactRequest | None = None,
+        reference: CalibrationArtifactRef | None = None,
     ) -> None:
         if not callable(computation_loader) or not callable(run_starter):
             raise TypeError("calibration Workbench callables must be callable")
@@ -134,7 +174,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
         if request is not None:
             self._install_request(request, previous_reference=None)
             self._status.setText("CALIBRATION REQUEST READY")
-            self._summary.setText(calibration_authority_summary(request))
+            self._summary.setText(_authority_summary(request))
             self._set_busy(None)
         else:
             assert reference is not None
@@ -208,7 +248,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
         self._request = request
         self._saved_reference = previous_reference
         self._authority.setText(
-            calibration_authority_summary(request, previous_reference)
+            _authority_summary(request, previous_reference)
         )
 
     def _editor_changed(self, *_args) -> None:
@@ -494,7 +534,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
                             previous_reference=self._opened_reference,
                         )
                         self._summary.setText(
-                            calibration_authority_summary(
+                            _authority_summary(
                                 request,
                                 self._opened_reference,
                             )
@@ -653,9 +693,8 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
             return
         super()._start_report_render_if_ready()
 
-    @QtCore.pyqtSlot()
-    def _owner_cycle(self) -> None:
-        super()._owner_cycle()
+    def _drain_owner_completions(self) -> None:
+        super()._drain_owner_completions()
         for completion in self._run_owner.drain_completions():
             if completion.generation != self._run_owner.generation:
                 continue
@@ -675,10 +714,9 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
                 )
         if not self._run_active:
             self._start_report_render_if_ready()
-        self._finish_close_if_ready()
 
     def shutdown(self) -> None:
-        if self._closing or self._closed:
+        if self._closing or self.closed:
             return
         if self._run_active or not self._run_owner.owner_reaped:
             self._close_requested = True

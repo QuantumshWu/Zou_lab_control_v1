@@ -9,7 +9,6 @@ from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
 from zlc_neutral_atom.input_spec import (
     DatasetInputSpec,
 )
-from zlc_neutral_atom.pulse_catalog import PROBE_PULSE_PATH
 from zlc_pulse import (
     commit_scan_table,
     evaluate_numeric_scan_program,
@@ -24,13 +23,16 @@ from zlc_neutral_atom.timing.pulse_parameter_scan import (
 )
 
 
+DEFAULT_PULSE_SCAN_PULSE_PATH = "probe_template.json"
+
+
 _PULSE_SCAN_AUTHORING_SCHEMA = AuthoringSchema(
     (
         AuthoringField(
             "pulse",
             "path",
             "Pulse template",
-            default=PROBE_PULSE_PATH,
+            default=DEFAULT_PULSE_SCAN_PULSE_PATH,
             required=True,
             description=(
                 "Current PulseDocument whose declared scan/API slots are edited below"
@@ -131,6 +133,7 @@ def build_pulse_scan_program(
 
 
 __all__ = [
+    "DEFAULT_PULSE_SCAN_PULSE_PATH",
     "PULSE_SCAN_SOURCE_INPUT_SPEC",
     "build_pulse_scan_program",
     "pulse_scan_authoring_schema",

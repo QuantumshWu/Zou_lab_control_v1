@@ -26,7 +26,9 @@ from zlc_neutral_atom.capture.reference import (
     capture_artifact_ref_to_tree,
 )
 
-from .projection import CalibrationReportProjection
+from .projection import (
+    CalibrationReportProjection,
+)
 from .reference import (
     CalibrationArtifactRef,
     calibration_artifact_ref_to_tree,

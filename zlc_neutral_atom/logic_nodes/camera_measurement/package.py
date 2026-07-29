@@ -2,24 +2,30 @@
 
 from __future__ import annotations
 
-from functools import partial
-
 from zlc_neutral_atom.logic_node_package import LogicNodePackage
 
 from .api import CameraMeasurementApi
-from .application import bind_camera_measurement_intent
+from .application import (
+    bind_camera_measurement_intent,
+    start_camera_measurement_command,
+)
 from .definition import CAMERA_MEASUREMENT_LOGIC_NODE
 from .finite import prepare_finite_camera_measurement
 from .monitor import prepare_live_camera_measurement
 
 
-def _bind_api(host: object, _dependencies: tuple[object, ...]) -> CameraMeasurementApi:
-    operations = host._logic_node_operations()
-    association_authorities = operations.camera_signal_association_authorities
-    capture_repository = operations.capture_repository
-    camera_monitor_port = operations.camera_monitor_port
-    camera_port = operations.camera_port
-    start_run = operations.start_run
+def _bind_api(
+    facts: tuple[object, ...],
+    _dependencies: tuple[object, ...],
+) -> CameraMeasurementApi:
+    (
+        resolve_camera_ref,
+        camera_port,
+        camera_monitor_port,
+        association_authorities,
+        capture_repository,
+        start_run,
+    ) = facts
 
     def prepare(request):
         if request.repeat == 0:
@@ -39,32 +45,46 @@ def _bind_api(host: object, _dependencies: tuple[object, ...]) -> CameraMeasurem
         )
 
     return CameraMeasurementApi(
-        resolve_camera_ref=host.resolve_readout_camera_ref,
+        resolve_camera_ref=resolve_camera_ref,
         prepare=prepare,
     )
 
 
-def _bind_task_console(api: CameraMeasurementApi, catalog: object, projection):
-    from .workbench_adapter import start_camera_measurement_command
-
-    return projection.run(
-        CAMERA_MEASUREMENT_LOGIC_NODE,
-        bind_request=partial(
-            bind_camera_measurement_intent,
-            request_builder=api.camera_measurement_request,
-        ),
-        prepare=api.prepare_camera_measurement,
-        dynamic_choice_context=catalog.roles("camera"),
-        start_with_live_output=start_camera_measurement_command,
+def _bind_hosted_request(api, intent, inputs):
+    return bind_camera_measurement_intent(
+        intent,
+        inputs,
+        request_builder=api.camera_measurement_request,
     )
+
+
+def _prepare_hosted(api, request, event_source):
+    if event_source is not None:
+        raise ValueError("Camera Measurement has no event-associated input")
+    return api.prepare_camera_measurement(request)
+
+
+def _availability(catalog, _apparatus):
+    return None if catalog.roles("camera") else "no installed Camera role"
 
 
 LOGIC_NODE_PACKAGE = LogicNodePackage(
     api_name="camera_measurement",
     declaration=CAMERA_MEASUREMENT_LOGIC_NODE,
+    api_requirements=(
+        "resolve_camera_ref",
+        "camera_port",
+        "camera_monitor_port",
+        "camera_signal_association_authorities",
+        "capture_repository",
+        "start_run",
+    ),
     bind_api=_bind_api,
-    bind_task_console=_bind_task_console,
-    task_console_order=10,
+    prepare_hosted=_prepare_hosted,
+    availability=_availability,
+    dynamic_choice_fact="camera_roles",
+    bind_hosted_request=_bind_hosted_request,
+    start_prepared=start_camera_measurement_command,
 )
 
 __all__ = ["LOGIC_NODE_PACKAGE"]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Callable, Generic, TypeVar
 
@@ -89,16 +89,17 @@ class RunSnapshot:
     # A synchronous ``RunController.start`` rejects with ``RunStartRejected``.
     # A composite run-like owner may encounter that same admission boundary on
     # its coordinator thread after its own handle has already been returned.
-    # Preserve the typed outcome across that async boundary; presentation must
-    # never parse ``primary_error`` to recover a conflicting RunId.
-    admission_rejection: ResourceBusy | None = None
+    # Preserve every typed blocker across that async boundary; presentation
+    # must never parse ``primary_error`` to recover conflicting RunIds.
+    admission_rejections: tuple[ResourceBusy, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.admission_rejection is not None and not isinstance(
-            self.admission_rejection,
-            ResourceBusy,
-        ):
-            raise TypeError("admission_rejection must be ResourceBusy or None")
+        if not isinstance(self.admission_rejections, tuple):
+            raise TypeError("admission_rejections must be a tuple")
+        blockers = self.admission_rejections
+        if any(not isinstance(value, ResourceBusy) for value in blockers):
+            raise TypeError("admission_rejections must contain ResourceBusy values")
+        object.__setattr__(self, "admission_rejections", blockers)
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,12 @@ class RunPlan(Generic[PreparedT, ExecutedT, FinalT]):
     timeout_seconds: float | None = None
     requires_final_commit: bool = False
     dispose_unfinalized: Callable[[ExecutedT], None] | None = None
+    lifecycle_owner: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    preemptible: bool = False
 
     def __post_init__(self) -> None:
         _canonical_text(self.name, "run plan name")
@@ -166,12 +173,34 @@ class RunPlan(Generic[PreparedT, ExecutedT, FinalT]):
             raise TypeError("dispose_unfinalized must be callable or None")
         if not isinstance(self.requires_final_commit, bool):
             raise TypeError("requires_final_commit must be bool")
+        if not isinstance(self.preemptible, bool):
+            raise TypeError("preemptible must be bool")
+        if self.preemptible and self.lifecycle_owner is None:
+            raise ValueError("a preemptible RunPlan requires a lifecycle owner")
         object.__setattr__(
             self,
             "timeout_seconds",
             None
             if self.timeout_seconds is None
             else finite_real(self.timeout_seconds, "timeout_seconds", minimum=0.0),
+        )
+
+    def with_lifecycle(
+        self,
+        owner: object,
+        *,
+        preemptible: bool,
+    ) -> "RunPlan[PreparedT, ExecutedT, FinalT]":
+        """Freeze one application lifecycle identity onto an unbound plan."""
+
+        if owner is None:
+            raise TypeError("lifecycle owner must not be None")
+        if self.lifecycle_owner is not None:
+            raise RuntimeError("RunPlan lifecycle facts are already bound")
+        return replace(
+            self,
+            lifecycle_owner=owner,
+            preemptible=preemptible,
         )
 
 
@@ -184,9 +213,15 @@ class _PermanentCommitRejection(CapabilityRevoked):
 
 
 class RunStartRejected(RuntimeError):
-    def __init__(self, outcome: ResourceBusy) -> None:
-        super().__init__(f"run start rejected: {outcome}")
-        self.outcome = outcome
+    def __init__(self, blockers: tuple[ResourceBusy, ...]) -> None:
+        if not isinstance(blockers, tuple):
+            raise TypeError("blockers must be a tuple")
+        if not blockers or any(
+            not isinstance(value, ResourceBusy) for value in blockers
+        ):
+            raise TypeError("blockers must be a non-empty ResourceBusy tuple")
+        super().__init__(f"run start rejected: {blockers}")
+        self.blockers = blockers
 
 
 class RunFailed(RuntimeError):
@@ -1014,7 +1049,7 @@ class RunController:
             if not self._accepting:
                 raise RuntimeError("RunController is shutting down and rejects new Runs")
             acquired = self._resources.acquire_all(run_id.value, plan.resource_claims)
-            if isinstance(acquired, ResourceBusy):
+            if not isinstance(acquired, ResourceLease):
                 raise RunStartRejected(acquired)
             source = _CancellationSource()
             handle: RunHandle[FinalT] = RunHandle(run_id, source, self._on_thread_joined)

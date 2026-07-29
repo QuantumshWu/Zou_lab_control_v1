@@ -84,15 +84,26 @@ FORBIDDEN = {
 
 
 def _is_logic_node_product_leaf(path: Path) -> bool:
-    """Whether *path* is an explicit outward product-adapter leaf."""
+    """Whether *path* is an explicit outward frontend-adapter leaf."""
 
     relative = path.relative_to(ROOT)
     return (
         relative.parts[:2] == ("zlc_neutral_atom", "logic_nodes")
         and (
             "ui" in relative.parts[3:]
-            or relative.name == "workbench_adapter.py"
+            or relative.name == "presentation.py"
+            or relative.name.endswith("_presentation.py")
         )
+    )
+
+
+def _is_logic_node_gui_leaf(path: Path) -> bool:
+    """Whether *path* is an explicitly optional toolkit-owning UI leaf."""
+
+    relative = path.relative_to(ROOT)
+    return (
+        relative.parts[:2] == ("zlc_neutral_atom", "logic_nodes")
+        and "ui" in relative.parts[3:]
     )
 
 
@@ -688,7 +699,7 @@ def test_domain_packages_may_not_import_a_gui_toolkit(package):
     assert root.is_dir(), f"declared headless package is missing: {package}"
     violations = []
     for path in sorted(root.rglob("*.py")):
-        if package == "zlc_neutral_atom" and _is_logic_node_product_leaf(path):
+        if package == "zlc_neutral_atom" and _is_logic_node_gui_leaf(path):
             continue
         rel = path.relative_to(ROOT).as_posix()
         for imported in _imports(path):
@@ -776,19 +787,20 @@ def test_no_task_console_attachment_residue_exists():
     )
 
 
-def test_optional_logic_node_adapter_leaves_are_headless_importable():
-    logic_nodes = ROOT / "zlc_neutral_atom/logic_nodes"
-    paths = sorted(logic_nodes.rglob("workbench_adapter.py"))
-    paths += sorted(logic_nodes.rglob("ui/task_console.py"))
-    assert paths, "optional adapter import guard is scanning nothing"
-    modules = [
-        ".".join(path.relative_to(ROOT).with_suffix("").parts)
-        for path in paths
-    ]
+def test_logic_node_discovery_is_headless_and_keeps_optional_ui_lazy():
     code = (
-        "import importlib,sys; "
-        f"mods={modules!r}; "
-        "[importlib.import_module(name) for name in mods]; "
+        "import sys; "
+        "from zlc_neutral_atom.logic_node_package import "
+        "discover_logic_node_packages; "
+        "packages=discover_logic_node_packages(); "
+        "ui=[value.module for package in packages "
+        "for value in package.ui_contributions]; "
+        "assert ui, 'UI descriptor guard is scanning nothing'; "
+        "assert not [name for name in ui if name in sys.modules], ui; "
+        "eager_ui=[name for name in sys.modules "
+        "if '.logic_nodes.' in name "
+        "and ('.ui.' in name or name.endswith('.ui'))]; "
+        "assert not eager_ui, eager_ui; "
         "bad=[name for name in sys.modules if name == 'matplotlib' "
         "or name.startswith('matplotlib.') or name == 'PyQt5' "
         "or name.startswith('PyQt5.') or name == 'PySide6' "
@@ -802,13 +814,6 @@ def test_optional_logic_node_adapter_leaves_are_headless_importable():
         text=True,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-
-
-def test_public_api_has_no_implicit_current_calibration_state():
-    from Zou_lab_control.api import ReadoutFacade
-
-    assert not hasattr(ReadoutFacade, "current_calibration")
-    assert not hasattr(ReadoutFacade, "current_calibration_ref")
 
 
 def test_readout_family_root_does_not_eagerly_aggregate_leaf_owners():

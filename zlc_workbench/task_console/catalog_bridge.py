@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 
 from zlc_neutral_atom.catalog import (
@@ -29,6 +30,27 @@ __all__ = [
     "ConsoleCatalogView",
     "ConsoleNodeSpec",
 ]
+
+
+def _resolve_projected_paths(
+    values: Mapping[str, object],
+    fields: tuple[object, ...],
+) -> dict[str, object]:
+    """Resolve authored relative paths against their frozen presentation root."""
+
+    resolved = dict(values)
+    for field in fields:
+        if getattr(field, "kind", None) != "path" or field.key not in resolved:
+            continue
+        value = resolved[field.key]
+        if not isinstance(value, str) or not value.strip():
+            continue
+        path = Path(value).expanduser()
+        base = str(getattr(field, "base_dir", "")).strip()
+        if not path.is_absolute() and base:
+            path = Path(base).expanduser() / path
+        resolved[field.key] = str(path.resolve()) if path.is_absolute() else str(path)
+    return resolved
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,18 +155,26 @@ class ConsoleNodeSpec:
                 f"{tuple(sorted(map(str, unknown)))}"
             )
         form_keys = tuple(self.form.keys)
+        authored = _resolve_projected_paths(
+            {key: values[key] for key in form_keys if key in values},
+            tuple(self.form.fields),
+        )
         return self.declaration.build_request(
-            {key: values[key] for key in form_keys if key in values}
+            authored
         )
 
     def freeze_input_selections(self, values: Mapping[str, object]):
-        return freeze_input_selections(
-            self.input_specs,
+        input_values = _resolve_projected_paths(
             {
                 key: values[key]
                 for field in self.input_fields
                 if (key := field.key) in values
             },
+            tuple(self.input_fields),
+        )
+        return freeze_input_selections(
+            self.input_specs,
+            input_values,
         )
 
     def input_spec_for_signal_field(self, field_key: str):

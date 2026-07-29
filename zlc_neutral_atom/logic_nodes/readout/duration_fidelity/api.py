@@ -82,10 +82,12 @@ class ReadoutDurationFidelityApi:
     def start_readout_duration_fidelity(
         self,
         request: ReadoutDurationFidelityRequest,
+        *,
+        lifecycle_owner: object | None = None,
     ) -> RunHandle:
         if not isinstance(request, ReadoutDurationFidelityRequest):
             raise TypeError("request must be ReadoutDurationFidelityRequest")
-        return self._bind(request).start()
+        return self._bind(request).start(lifecycle_owner=lifecycle_owner)
 
     def _bind(
         self,

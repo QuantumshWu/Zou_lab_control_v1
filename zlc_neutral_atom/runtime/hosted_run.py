@@ -14,7 +14,6 @@ free of domain and presentation authority.
 
 from __future__ import annotations
 
-from concurrent.futures import Future
 import threading
 from typing import Callable
 
@@ -106,10 +105,10 @@ class HostedRun:
         self._artifact_output_declarations = artifact_outputs
         self._prepared_command = None
         self._handle = None
-        self._start_future: Future | None = None
         self._start_pending = False
         self._cancelled_before_start = False
         self._stop_event = threading.Event()
+        self._start_gate_lock = threading.Lock()
         self._snapshot = None
         # A FINAL value belongs to exactly one started generation.  It is
         # deliberately not inferred from the terminal snapshot: only
@@ -121,7 +120,6 @@ class HostedRun:
         self._final_output_error: str | None = None
         self._error: str | None = None
         self._start_exception: BaseException | None = None
-        self._stop_requested = False
         self._stop_reason = "Host requested stop"
         self._starter = None
 
@@ -195,37 +193,11 @@ class HostedRun:
     def start_exception(self) -> BaseException | None:
         """Structured exception from the most recent start submission.
 
-        Normal host status uses :attr:`last_error`; typed resource admission
-        is normalized separately by :attr:`resource_conflict`.
+        Normal host status uses :attr:`last_error`; callers that need typed
+        failure details inspect this exact exception without a retry surface.
         """
 
         return self._start_exception
-
-    @property
-    def resource_conflict(self):
-        """Return one typed admission conflict across direct/composite starts.
-
-        ``RunStartRejected`` belongs to the synchronous controller start API.
-        A composite handle instead carries the same ``ResourceBusy`` outcome
-        on its immutable snapshot.  Normalizing both here keeps every host
-        independent of exception timing and forbids RunId parsing from text.
-        """
-
-        from zlc_neutral_atom.runtime.resources import ResourceBusy
-        from zlc_neutral_atom.runtime.run import RunStartRejected
-
-        direct = self._start_exception
-        if isinstance(direct, RunStartRejected):
-            return direct.outcome
-        snapshot = self._snapshot
-        conflict = (
-            None
-            if snapshot is None
-            else getattr(snapshot, "admission_rejection", None)
-        )
-        if conflict is not None and not isinstance(conflict, ResourceBusy):
-            raise TypeError("RunSnapshot admission_rejection must be ResourceBusy")
-        return conflict
 
     @property
     def final_result(self):
@@ -313,28 +285,22 @@ class HostedRun:
         return snapshot is None or not snapshot.state.terminal
 
     @property
-    def lifecycle_generation(self) -> int:
-        """Owner generation that identifies the currently accepted start.
-
-        This is deliberately distinct from a dataset stream generation.  It
-        lets a downstream reactive node pin the source Run even while its first
-        frame has arrived just before the corresponding RunHandle completion is
-        drained by the owner loop.
-        """
-
-        return self._owner.generation
-
-    @property
     def worker_idle(self) -> bool:
         """Whether this node has no pending prepare/start/output callback."""
 
-        return self._owner.worker_idle
+        return self._owner.worker_idle and self._owner.owner_reaped
 
     @property
     def cancelled_before_start(self) -> bool:
         """Whether Stop won before a domain RunHandle was created."""
 
         return self._cancelled_before_start
+
+    @property
+    def cancel_requested(self) -> bool:
+        """Whether this exact hosted generation has received Stop."""
+
+        return self._stop_event.is_set()
 
     # ------------------------------------------------------------ lifecycle
     def bind_starter(self, start: Callable[[object], object]) -> None:
@@ -373,10 +339,10 @@ class HostedRun:
             return
         self._error = None
         self._start_exception = None
-        self._stop_requested = False
-        self._cancelled_before_start = False
-        self._stop_event.clear()
-        self._stop_reason = "Host requested stop"
+        with self._start_gate_lock:
+            self._cancelled_before_start = False
+            self._stop_event.clear()
+            self._stop_reason = "Host requested stop"
         generation = self._owner.begin_generation()
         self._handle = None
         self._prepared_command = None
@@ -395,24 +361,33 @@ class HostedRun:
                 raise _StartSuppressed()
             return prepared, start(prepared)
 
-        future = self._owner.submit(
+        self._owner.submit(
             "start",
             start_owned,
             generation=generation,
         )
-        self._start_future = future
         self._start_pending = True
 
     def cancel(self, reason: str = "Host requested stop") -> None:
         """Ask the Run to stop.  Never waits for the worker to reap it."""
 
-        handle = self._handle
-        self._stop_requested = True
-        self._stop_event.set()
-        self._stop_reason = str(reason)
+        with self._start_gate_lock:
+            handle = self._handle
+            self._stop_event.set()
+            self._stop_reason = str(reason)
         if handle is None or handle.snapshot().state.terminal:
             return
         handle.cancel(reason)
+
+    def start_if_not_cancelled(self, starter: Callable[[], object]):
+        """Linearize one short runtime admission against this node's Stop."""
+
+        if not callable(starter):
+            raise TypeError("starter must be callable")
+        with self._start_gate_lock:
+            if self._stop_event.is_set():
+                raise _StartSuppressed()
+            return starter()
 
     def poll(self):
         """Drain worker completions and refresh the snapshot.  Call per tick.
@@ -472,25 +447,27 @@ class HostedRun:
                 prepared, self._handle = completion.future.result()
                 self._prepared_command = prepared
                 self._owner.set_handle(self._handle)
-                if self._stop_requested:
+                if self._stop_event.is_set():
                     self._handle.cancel(self._stop_reason)
         handle = self._handle
         if handle is not None:
             self._snapshot = handle.snapshot()
             if self._snapshot.state.terminal:
-                if (
-                    self._snapshot.state.name == "SUCCEEDED"
-                    and self._final_result is _UNRESOLVED_FINAL
-                ):
-                    try:
-                        # A Run publishes terminal state just before its owner
-                        # thread exits.  timeout=0 keeps observation
-                        # non-blocking; the next poll retries that narrow join.
+                try:
+                    # A Run publishes terminal state just before its owner
+                    # thread exits.  The mailbox may retire the handle only
+                    # after this non-blocking join succeeds; the next owner
+                    # turn retries the narrow gap.
+                    handle.wait(timeout=0.0)
+                except TimeoutError:
+                    pass
+                else:
+                    self._owner.mark_owner_reaped()
+                    if (
+                        self._snapshot.state.name == "SUCCEEDED"
+                        and self._final_result is _UNRESOLVED_FINAL
+                    ):
                         self._final_result = handle.result(timeout=0.0)
-                    except TimeoutError:
-                        pass
-                    else:
-                        self._owner.mark_owner_reaped()
                         command = self._prepared_command
                         summary_factory = getattr(
                             command,
@@ -529,9 +506,8 @@ class HostedRun:
                                 materialize_final_outputs,
                                 generation=self._owner.generation,
                             )
-                elif self._snapshot.state.name != "SUCCEEDED":
-                    self._final_result = _UNRESOLVED_FINAL
-                    self._owner.mark_owner_reaped()
+                    elif self._snapshot.state.name != "SUCCEEDED":
+                        self._final_result = _UNRESOLVED_FINAL
         return self._snapshot
 
     def shutdown(self) -> None:

@@ -45,15 +45,19 @@ class PreparedReleaseRecapture:
     def output_schema(self) -> DatasetSchema:
         return self._schema
 
-    def start(self) -> RunHandle:
+    def start(self, *, lifecycle_owner: object | None = None) -> RunHandle:
         with self._lock:
             if self._started:
                 raise RuntimeError(
                     "PreparedReleaseRecapture is one-shot"
                 )
             self._started = True
+        plan = compile_triggered_release_recapture_pipeline(self._spec)
         return self._start_run(
-            compile_triggered_release_recapture_pipeline(self._spec)
+            plan.with_lifecycle(
+                owner=self if lifecycle_owner is None else lifecycle_owner,
+                preemptible=False,
+            )
         )
 
 

@@ -39,7 +39,19 @@ def test_exact_device_claim_sets_are_atomic() -> None:
         "all-or-nothing",
         (ResourceClaim(camera), ResourceClaim(fpga)),
     )
-    assert isinstance(result, ResourceBusy)
+    assert result == (
+        ResourceBusy(ResourceClaim(camera), "writer", ResourceClaim(camera)),
+    )
+
+    # A rejected multi-resource request owns none of its otherwise-free
+    # prefix/suffix.  Admission is one table transition, never partial acquire
+    # plus rollback.
+    fpga_only = arbiter.acquire_all(
+        "fpga-only",
+        (ResourceClaim(fpga),),
+    )
+    assert isinstance(fpga_only, ResourceLease)
+    assert fpga_only.release()
     assert held.release()
 
     first = arbiter.acquire_all(
@@ -70,9 +82,43 @@ def test_concurrent_exclusive_acquire_has_one_winner() -> None:
         thread.join()
 
     winners = [result for result in results if isinstance(result, ResourceLease)]
+    blockers = [result for result in results if isinstance(result, tuple)]
     assert len(winners) == 1
-    assert sum(isinstance(result, ResourceBusy) for result in results) == 7
+    assert len(blockers) == 7
+    assert all(
+        len(result) == 1 and isinstance(result[0], ResourceBusy)
+        for result in blockers
+    )
     assert winners[0].release()
+    arbiter.shutdown()
+
+
+def test_rejection_reports_every_blocker_in_canonical_order() -> None:
+    arbiter = ResourceArbiter()
+    camera = key("device/camera")
+    fpga = key("device/fpga")
+    camera_lease = acquire(arbiter, "camera-owner", camera)
+    fpga_lease = acquire(arbiter, "fpga-owner", fpga)
+
+    result = arbiter.acquire_all(
+        "needs-both",
+        (ResourceClaim(fpga), ResourceClaim(camera)),
+    )
+    assert result == (
+        ResourceBusy(
+            ResourceClaim(camera),
+            "camera-owner",
+            ResourceClaim(camera),
+        ),
+        ResourceBusy(
+            ResourceClaim(fpga),
+            "fpga-owner",
+            ResourceClaim(fpga),
+        ),
+    )
+
+    assert camera_lease.release()
+    assert fpga_lease.release()
     arbiter.shutdown()
 
 

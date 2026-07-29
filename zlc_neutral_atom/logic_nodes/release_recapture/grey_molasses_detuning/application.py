@@ -11,7 +11,6 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import Resolve
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
 from zlc_neutral_atom.logic_nodes.release_recapture.grey_molasses_detuning.measurement import (
     BoundGreyMolassesDetuning,
-    CalibratedGreyMolassesDetuningIntent,
     GREY_MOLASSES_DETUNING_OUTPUT_DECLARATIONS,
     GreyMolassesDetuningIntent,
     GreyMolassesDetuningRequest,
@@ -95,6 +94,8 @@ class GreyMolassesDetuningApplicationPort(Protocol):
     def start_grey_molasses_detuning(
         self,
         request: GreyMolassesDetuningRequest,
+        *,
+        lifecycle_owner: object | None = None,
     ) -> RunHandle: ...
 
 
@@ -108,7 +109,10 @@ class GreyMolassesDetuningApplicationCommand:
             raise TypeError("request must be GreyMolassesDetuningRequest")
 
     def start(self) -> RunHandle:
-        return self._application.start_grey_molasses_detuning(self.request)
+        return self._application.start_grey_molasses_detuning(
+            self.request,
+            lifecycle_owner=self,
+        )
 
     def final_dataset_outputs(
         self,
@@ -140,22 +144,6 @@ def prepare_grey_molasses_detuning_application(
     return GreyMolassesDetuningApplicationCommand(request, application)
 
 
-def prepare_bound_grey_molasses_detuning(
-    value: CalibratedGreyMolassesDetuningIntent,
-    *,
-    application: GreyMolassesDetuningApplicationPort,
-) -> GreyMolassesDetuningApplicationCommand:
-    """Prepare the exact request already bound by the Logic-node input owner."""
-
-    if not isinstance(value, CalibratedGreyMolassesDetuningIntent):
-        raise TypeError("value must be CalibratedGreyMolassesDetuningIntent")
-    return prepare_grey_molasses_detuning_application(
-        value.intent,
-        value.calibration_ref,
-        application,
-    )
-
-
 __all__ = [
     "GreyMolassesDetuningApplicationCommand",
     "GreyMolassesDetuningApplicationPort",
@@ -163,5 +151,4 @@ __all__ = [
     "grey_molasses_final_outputs",
     "prepare_grey_molasses_detuning",
     "prepare_grey_molasses_detuning_application",
-    "prepare_bound_grey_molasses_detuning",
 ]

@@ -49,7 +49,6 @@ from zlc_neutral_atom.logic_nodes.readout.contracts import (
     CalibrationCaptureLayout,
     _minimum_coordinate_separation,
 )
-from zlc_neutral_atom.pulse_catalog import CALIBRATION_PULSE_PATH
 from zlc_neutral_atom.devices.camera.contract import (
     ReadoutBindingKey,
     validate_camera_spatial_axes,
@@ -60,6 +59,7 @@ _REFERENCE_BEFORE = "reference_probe_duration_before"
 _READOUT = "readout_probe_duration"
 _REFERENCE_AFTER = "reference_probe_duration_after"
 _EVENT_PARAMETER_IDS = (_REFERENCE_BEFORE, _READOUT, _REFERENCE_AFTER)
+DEFAULT_CALIBRATION_PULSE_PATH = "imaging_template.json"
 SITEMAP_CALIBRATION_TASK_KEY = DefinitionKey(
     "zlc_neutral_atom.logic_nodes.readout.calibration",
     "calibrate-readout",
@@ -468,12 +468,15 @@ def build_sitemap_calibration_request(
 
 
 def load_sitemap_pulse(pulses_root: Path) -> PulseDocument:
-    """Load the project-owned calibration pulse from the shared pulse catalog."""
+    """Load this leaf's project-owned default calibration pulse."""
 
-    return load_pulse_document(resolve_under(pulses_root, CALIBRATION_PULSE_PATH))
+    return load_pulse_document(
+        resolve_under(pulses_root, DEFAULT_CALIBRATION_PULSE_PATH)
+    )
 
 
 __all__ = [
+    "DEFAULT_CALIBRATION_PULSE_PATH",
     "ReadoutGridGeometry",
     "SITEMAP_CALIBRATION_TASK_DEFINITION",
     "SITEMAP_CALIBRATION_TASK_KEY",

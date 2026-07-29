@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping
 
 from PyQt5 import QtCore, QtWidgets
@@ -14,12 +15,40 @@ from zlc_frontend.qt_widgets import (
     scaled_px,
     signals_blocked,
 )
-from zlc_pulse import PulseTemplateDescription
+from zlc_pulse import (
+    PulseTemplateDescription,
+    describe_pulse_template,
+)
+from zlc_storage.paths import resolve_under
 
-from .task_console_form import PulseScanFormSpec
 from .pulse_slots_widget import PulseSlotsWidget
 
-__all__ = ["PulseScanParameterForm"]
+__all__ = ["task_console_editor"]
+
+
+@dataclass(frozen=True, slots=True)
+class PulseScanFormSpec:
+    """Ordinary pulse path plus the one structured slot/program value."""
+
+    pulse_field: FormFieldProps
+
+    def __post_init__(self) -> None:
+        if self.pulse_field.key != "pulse" or self.pulse_field.kind != "path":
+            raise ValueError("PulseScan pulse field must be the declared path")
+
+    @property
+    def fields(self) -> tuple[FormFieldProps]:
+        return (self.pulse_field,)
+
+    @property
+    def keys(self) -> tuple[str, str]:
+        return "pulse", "pulse_slots"
+
+    def default_values(self) -> dict[str, object]:
+        return {
+            "pulse": self.pulse_field.default,
+            "pulse_slots": {},
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,3 +270,31 @@ class PulseScanParameterForm(QtWidgets.QWidget):
             program_id=description.program_id,
         )
         self.changed.emit("pulse")
+
+
+def task_console_editor(base_form: FormSpec, *, pulses_root: str | Path):
+    """Augment the declared path field with PulseScan's structured editor."""
+
+    if not isinstance(base_form, FormSpec):
+        raise TypeError("base_form must be FormSpec")
+    if tuple(base_form.keys) != ("pulse",):
+        raise ValueError("PulseScan base form must contain only its pulse path")
+    root = Path(pulses_root).expanduser()
+    if not root.is_absolute():
+        raise ValueError("pulses_root must be absolute")
+    root = root.resolve()
+    spec = PulseScanFormSpec(base_form.fields[0])
+
+    def read_template(value):
+        return describe_pulse_template(resolve_under(root, value))
+
+    def editor_factory(*, runtime, input_fields, parent=None):
+        return PulseScanParameterForm(
+            spec,
+            input_fields=input_fields,
+            runtime=runtime,
+            pulse_template_reader=read_template,
+            parent=parent,
+        )
+
+    return spec, editor_factory

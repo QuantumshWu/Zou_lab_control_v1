@@ -125,14 +125,13 @@ def test_api_slot_edit_dirties_applied_intent_and_on_pulse_clears_it():
                 execution.fingerprint,
             )
             self._run = RunSnapshot(
-                run_id,
-                RunState.RUNNING,
-                "holding-pulse",
-                False,
-                None,
-                None,
-                (),
-                None,
+                run_id=run_id,
+                state=RunState.RUNNING,
+                phase="holding-pulse",
+                final_committed=False,
+                commit_publication_warning=None,
+                primary_error=None,
+                cleanup_errors=(),
             )
             return Handle(self, run_id)
 
@@ -218,14 +217,13 @@ def test_owner_wake_without_new_fact_is_silent_and_runtime_poll_stays_narrow():
 
     target = load_deployed_pulse_target()
     running = RunSnapshot(
-        RunId("narrow-runtime-update"),
-        RunState.RUNNING,
-        "execute",
-        False,
-        None,
-        None,
-        (),
-        None,
+        run_id=RunId("narrow-runtime-update"),
+        state=RunState.RUNNING,
+        phase="execute",
+        final_committed=False,
+        commit_publication_warning=None,
+        primary_error=None,
+        cleanup_errors=(),
     )
 
     class Pulse:
@@ -254,14 +252,13 @@ def test_owner_wake_without_new_fact_is_silent_and_runtime_poll_stays_narrow():
         initial_connection_mode="virtual",
     )
     controller._run_snapshot = RunSnapshot(
-        running.run_id,
-        RunState.RUNNING,
-        "queued",
-        False,
-        None,
-        None,
-        (),
-        None,
+        run_id=running.run_id,
+        state=RunState.RUNNING,
+        phase="queued",
+        final_committed=False,
+        commit_publication_warning=None,
+        primary_error=None,
+        cleanup_errors=(),
     )
     update = controller.poll_runtime_change()
     assert isinstance(update, PulseRuntimeUpdate)
@@ -451,14 +448,13 @@ def test_borrowed_experiment_retirement_detaches_before_runtime_timer_poll():
         initial_connection_mode="virtual",
     )
     controller._run_snapshot = RunSnapshot(
-        RunId("active-before-owner-close"),
-        RunState.RUNNING,
-        "execute",
-        False,
-        None,
-        None,
-        (),
-        None,
+        run_id=RunId("active-before-owner-close"),
+        state=RunState.RUNNING,
+        phase="execute",
+        final_committed=False,
+        commit_publication_warning=None,
+        primary_error=None,
+        cleanup_errors=(),
     )
 
     controller.retire_borrowed_authority()

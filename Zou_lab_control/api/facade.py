@@ -22,7 +22,6 @@ from zlc_data import (
     CommittedTransform,
     FitNumericPolicy,
     FitParameterConstraint,
-    FitResultBatch,
     FitSpec,
     HistogramSpec,
     Selection,
@@ -53,6 +52,7 @@ from zlc_neutral_atom.devices.sequencer.application import (
     prepare_pulse_execution,
 )
 from zlc_neutral_atom.devices.sequencer.port import PulseScanProgress
+from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
 from zlc_neutral_atom.runtime.run import CancelOutcome, RunHandle
 from zlc_pulse import (
     PulseDocument,
@@ -67,7 +67,7 @@ from ._application_services import (
     ExperimentCloseAttempt as _ExperimentCloseAttempt,
     ExperimentServices as _ExperimentServices,
     WorkspacePaths,
-    WorkbenchHandle as _WorkbenchHandle,
+    application_start_run as _application_start_run,
     fit_service_guard as _fit_service_guard,
     resolve_role as _resolve_role,
     service_guard as _service_guard,
@@ -337,9 +337,15 @@ class Experiment:
         with _service_guard(self._services) as services:
             return services.workspace_paths
 
+    def _signal_data_plane(self) -> SignalDataPlane:
+        """Lend Workbench the one Experiment-owned signal authority."""
+
+        with _service_guard(self._services) as services:
+            return services.signal_plane
+
     def _open_workbench_handle(
         self,
-        key: str,
+        key: str | None,
         compose: Callable[[], object],
         *,
         existing_error: str | None = None,
@@ -349,31 +355,14 @@ class Experiment:
         Concrete Workbench construction lives in ``Zou_lab_control.workbench``;
         this method owns only Experiment-scoped reuse and retirement.
         """
+        from ._application_services import open_workbench_handle
 
-        name = _text(key, "workbench key")
-        if not callable(compose):
-            raise TypeError("compose must be callable")
-        with _service_guard(self._services) as services:
-            existing = services.gui_handles.get(name)
-            if existing is not None:
-                if existing.permanently_closed:
-                    # A committed teardown can race a later API reopen by
-                    # one owner turn.  Retire the exact dead handle instead of
-                    # leaving an un-restorable registry tombstone forever.
-                    services.gui_handles.pop(name)
-                    existing = None
-            if existing is not None:
-                if existing_error is not None:
-                    raise RuntimeError(existing_error)
-                existing.restore_window()
-                return existing
-            body = compose()
-            if not isinstance(body, _WorkbenchHandle):
-                raise TypeError(
-                    f"{name} composition did not return the application GUI handle port"
-                )
-            services.gui_handles[name] = body
-            return body
+        return open_workbench_handle(
+            self._services,
+            None if key is None else _text(key, "workbench key"),
+            compose,
+            existing_error=existing_error,
+        )
 
     def _close_for_device_restart(self) -> None:
         """Close this installation while its DeviceManager remains the reporter.
@@ -503,7 +492,7 @@ class Experiment:
         initial_fit_result_identity: str | None = None,
         direct_fit_single_panel: bool = False,
     ):
-        """Compose the one Figure-owned Fit host without exposing repositories."""
+        """Validate one Figure request and delegate its Qt composition lazily."""
 
         if not self._artifact_operations.can_project_dataset(fit_source):
             raise TypeError("fit_source must be a composed FINAL Dataset artifact")
@@ -521,183 +510,25 @@ class Experiment:
                 chosen_model = initial_fit_spec.model_id
             elif chosen_model != initial_fit_spec.model_id:
                 raise ValueError("selected model differs from the initial FitSpec")
-        def source_schema(services):
-            return _project_final_dataset_source(
-                self._artifact_operations,
-                fit_source,
-                materialize=False,
-            ).schema
+        from Zou_lab_control.workbench._composition import (
+            open_fit_capable_figure_gui,
+        )
 
-        def prepare_fit(
-            visible_figure,
-            authority_selection: Selection | None,
-            histogram_projection,
-        ):
-            with _service_guard(self._services) as services:
-                schema = source_schema(services)
-            seed_spec = initial_fit_spec
-            if seed_spec is not None:
-                if (
-                    seed_spec.committed_transform.source_schema_fingerprint
-                    != schema.fingerprint
-                ):
-                    raise ValueError("initial FitSpec belongs to another source schema")
-            from zlc_frontend import DataFigure, prepare_fit_authoring_options
-
-            if not isinstance(visible_figure, DataFigure):
-                raise TypeError("Figure Fit requires its exact visible DataFigure")
-            layer = visible_figure.document.layers[0]
-            visible_schema = visible_figure.datasets.resolve(
-                layer.dataset_id
-            ).block.schema
-            if visible_schema.fingerprint != schema.fingerprint:
-                raise ValueError("visible Figure belongs to another Fit source schema")
-            options = prepare_fit_authoring_options(
-                visible_figure,
-                authority_selection,
-                seed_spec=seed_spec,
-                histogram_projection=histogram_projection,
-            )
-            if not options:
-                raise ValueError(
-                    "the displayed named axes and selection have no compatible Fit model"
-                )
-            if chosen_model is not None and chosen_model not in {
-                option.spec.model_id for option in options
-            }:
-                raise ValueError(
-                    f"Fit model {chosen_model!r} is not compatible with this panel"
-                )
-            return tuple(options)
-
-        def execute_fit(
-            spec: FitSpec,
-            cancel_check,
-            deadline_monotonic: float,
-        ) -> FitExecution:
-            if not isinstance(spec, FitSpec):
-                raise TypeError("Figure Fit execution requires FitSpec")
-            with _fit_service_guard(self._services) as services:
-                def combined_cancel_check() -> bool:
-                    with services.operation_lock:
-                        closing = services.state != "OPEN"
-                    return closing or bool(cancel_check())
-
-                return services.fit_repository.execute(
-                    self._artifact_operations,
-                    fit_source,
-                    spec,
-                    cancel_check=combined_cancel_check,
-                    deadline_monotonic=deadline_monotonic,
-                )
-
-        def save_fit_execution(
-            execution: FitExecution,
-        ) -> FitResultArtifactRef:
-            if not isinstance(execution, FitExecution):
-                raise TypeError("Fit save requires FitExecution")
-            if execution.source_artifact_ref != fit_source:
-                raise ValueError("Fit execution belongs to another source artifact")
-            with _service_guard(self._services):
-                return execution.save()
-
-        def reload_fit_result(
-            reference: FitResultArtifactRef,
-        ) -> FitResultBatch:
-            with _service_guard(self._services) as services:
-                admitted = services.fit_repository.load(
-                    reference,
-                    artifacts=self._artifact_operations,
-                )
-            if admitted.source_artifact_ref != fit_source:
-                raise ValueError("saved Fit reopened against another source artifact")
-            return admitted.result
-
-        def figure_factory(source, *, intent, point_ordinals, preferences):
-            with _service_guard(self._services) as services:
-                return _data_figure_for_services(
-                    services,
-                    self._artifact_operations,
-                    source,
-                    intent=intent,
-                    point_ordinals=point_ordinals,
-                    preferences=preferences,
-                    artifact_output=artifact_output,
-                )
-
-        if direct_fit_single_panel:
-            if display_source != fit_source:
-                raise ValueError(
-                    "direct Fit single-panel display requires its exact source artifact"
-                )
-
-            def figure_factory(
-                source,
-                *,
-                intent,
-                point_ordinals,
-                preferences,
-            ):
-                """Resolve the labelled display cell on the Figure worker."""
-
-                if source != fit_source:
-                    raise ValueError("direct Fit Figure loader received another source")
-                with _service_guard(self._services) as services:
-                    figure, figure_intent = _data_figure_for_services(
-                        services,
-                        self._artifact_operations,
-                        source,
-                        intent=intent,
-                        point_ordinals=point_ordinals,
-                        preferences=preferences,
-                        artifact_output=None,
-                    )
-                from zlc_frontend.fit_projection import (
-                    evaluated_figure_panels,
-                    panel_focus_address,
-                )
-
-                panels = evaluated_figure_panels(figure.evaluated)
-                if len(panels) <= 1:
-                    return figure, figure_intent
-                layer, cell, series_group = panels[0]
-                focused = figure.focused_typed_panel(
-                    0,
-                    expected_address=panel_focus_address(
-                        layer,
-                        cell,
-                        series_group,
-                    ),
-                    expected_intent=figure.document.layers[0].view.intent,
-                )
-                from zlc_frontend.plot_panel import figure_intent_from_view
-
-                return focused, figure_intent_from_view(
-                    focused.document.layers[0].view,
-                    title=figure_intent.title,
-                    value_label=figure_intent.value_label,
-                )
-
-        from Zou_lab_control.workbench import open_figure_workbench
-        with _service_guard(self._services) as services:
-            output_root = services.workspace_paths.output_root
-
-        return open_figure_workbench(
-            figure_factory,
+        return open_fit_capable_figure_gui(
+            self,
             display_source,
-            output_root=output_root,
+            fit_source,
             intent=intent,
             point_ordinals=point_ordinals,
             preferences=preferences,
-            fit_preparer=prepare_fit,
-            fit_executor=execute_fit,
-            fit_saver=save_fit_execution,
-            fit_reloader=reload_fit_result,
-            fit_selected_model=chosen_model,
-            fit_initial_selection=initial_selection,
+            artifact_output=artifact_output,
+            selected_model=chosen_model,
+            initial_fit_spec=initial_fit_spec,
+            initial_selection=initial_selection,
             open_fit=open_fit,
-            fit_timeout_seconds=timeout,
+            timeout_seconds=timeout,
             initial_fit_result_identity=initial_fit_result_identity,
+            direct_fit_single_panel=direct_fit_single_panel,
         )
 
     def fit_gui(
@@ -905,9 +736,9 @@ class Experiment:
         with services.operation_lock:
             if services.state == "CLOSED":
                 return
-            if services.fit_operation_thread_counts.get(caller_thread_id, 0):
+            if services.operation_thread_counts.get(caller_thread_id, 0):
                 raise RuntimeError(
-                    "Experiment cannot close reentrantly from its active Fit operation"
+                    "Experiment cannot close reentrantly from an active operation"
                 )
             attempt = services.close_attempt
             if attempt is not None:
@@ -932,7 +763,7 @@ class Experiment:
                 attempt = _ExperimentCloseAttempt(caller_thread_id)
                 services.close_attempt = attempt
                 gui_handles = services.closing_gui_handles
-                fit_operations_drained = services.fit_operations_drained
+                operations_drained = services.operations_drained
                 wait_for_attempt = attempt
                 owns_attempt = True
 
@@ -952,14 +783,14 @@ class Experiment:
                     handle.request_owner_close()
                 except Exception as error:
                     gui_close_failures.append(error)
-            # A Figure Fit owns repository borrows outside the short
-            # composition lock. Closing flips the state first, then waits
-            # without holding the lock needed by the Fit's finally block.
-            fit_operations_drained.wait()
+            # Long application operations own service borrows outside the
+            # short composition lock. Closing flips state first, then waits
+            # without holding the lock needed by their finally blocks.
+            operations_drained.wait()
             with services.operation_lock:
-                if services.active_fit_operations:
+                if services.active_operations:
                     raise RuntimeError(
-                        "Fit drain event disagrees with operation count"
+                        "operation drain event disagrees with operation count"
                     )
 
             # Only this attempt owner may tear down the runtime or repositories.
@@ -1011,7 +842,8 @@ class Experiment:
                 )
 
             failures = (
-                _cleanup_failures(services.fit_repository.close)
+                _cleanup_failures(services.signal_plane.close)
+                + _cleanup_failures(services.fit_repository.close)
                 + list(self.nodes.close())
                 + _cleanup_failures(services.capture_repository.close)
             )
@@ -1050,7 +882,7 @@ def _prepare_pulse_for_services(
     return prepare_pulse_execution(
         request,
         pulse_port=services.runtime.pulse_port(request.sequencer_ref),
-        start_run=services.runtime.start,
+        start_run=lambda plan: _application_start_run(services, plan),
         on_applied=services.pulse_application._record_applied,
     )
 
@@ -1058,14 +890,16 @@ def _prepare_pulse_for_services(
 def _start_pulse(services: _ExperimentServices, request: PulseRunRequest) -> RunHandle:
     with _service_guard(services) as guarded:
         prepared = _prepare_pulse_for_services(guarded, request)
-        return guarded.pulse_application.start(prepared)
+        owner = guarded.pulse_application
+    return owner.start(prepared)
 
 
 def _run_pulse(services: _ExperimentServices, request: PulseRunRequest) -> PulseRunResult:
     with _service_guard(services) as guarded:
         prepared = _prepare_pulse_for_services(guarded, request)
-        handle = guarded.pulse_application.start(prepared)
+        owner = guarded.pulse_application
         runtime = guarded.runtime
+    handle = owner.start(prepared)
     result = runtime.wait(handle)
     if not isinstance(result, PulseRunResult):
         raise TypeError("pulse Run returned an unexpected result")
@@ -1135,6 +969,7 @@ def connect(
     capture_repository = None
     fit_repository = None
     runtime = None
+    signal_plane = None
     try:
         capture_repository = CaptureRepository(repository_root / "captures")
         fit_repository = FitResultRepository(repository_root / "fits")
@@ -1146,8 +981,9 @@ def connect(
         )
         runtime = installation.runtime
         catalog = runtime.device_catalog
-        fit_operations_drained = threading.Event()
-        fit_operations_drained.set()
+        signal_plane = SignalDataPlane()
+        operations_drained = threading.Event()
+        operations_drained.set()
         services = _ExperimentServices(
             workspace_paths=workspace,
             installation=installation,
@@ -1157,9 +993,12 @@ def connect(
             catalog=catalog,
             installation_config=installation_document,
             pulse_application=PulseApplicationOwner(),
+            signal_plane=signal_plane,
             operation_lock=threading.RLock(),
-            fit_operations_drained=fit_operations_drained,
-            fit_operation_thread_counts={},
+            admission_lock=threading.RLock(),
+            operations_drained=operations_drained,
+            operation_thread_counts={},
+            active_runs={},
             gui_handles={},
         )
         experiment = Experiment(
@@ -1177,6 +1016,9 @@ def connect(
                     if runtime is None
                     else lambda: _require_runtime_shutdown(runtime, timeout=2.0)
                 )
+            )
+            + _cleanup_failures(
+                None if signal_plane is None else signal_plane.close,
             )
             + _cleanup_failures(
                 None if fit_repository is None else fit_repository.close,

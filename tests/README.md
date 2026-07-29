@@ -17,6 +17,12 @@ Run the smallest check that proves the changed boundary still works.  Full `pyte
   evidence.  This rule applies to PulseGUI, TaskConsole, DeviceManager,
   FigureViewer, and every future GUI.
 - **Performance optimizations must be logic/appearance-neutral.**  Only make the same output faster (analytic Jacobian, skip-if-unchanged guards, cached invariants); never change cadence/appearance.  Prove equivalence (e.g. fit `popt` agrees numerically).
+- **Production contracts and their tests migrate in the same slice.**  When a
+  contract changes, update the still-useful behavioral test or delete the
+  retired test in that same change.  Never retain a failing test as a "known
+  historical contract", and never restore production compatibility merely to
+  satisfy one.  This applies equally to every migration milestone, including
+  M1 and M2.
 - **After delete/refactor:** `git grep` of the dead identifier == 0; `python -m compileall` clean; no stray TODO/FIXME.
 
 ## Targeted Matrix
@@ -24,11 +30,11 @@ Run the smallest check that proves the changed boundary still works.  Full `pyte
 Use these as starting points, then narrow `-k` to the behavior you touched.
 
 ```powershell
-# Neutral-atom notebook API, qCMOS adapter and exact capture workflow
+# Public Experiment API, qCMOS adapter and exact capture workflow
 pytest -q tests\test_notebook_experiment_facade.py tests\test_zlc_dcam_camera_adapter.py tests\test_triggered_capture_pipeline.py
 
 # Control-computer readout scan through the RPyC RemoteSequencer JSON protocol
-pytest -q tests\test_remote_sequencer_execution_endpoint.py tests\test_w3_api_segmented_scan.py
+pytest -q tests\test_remote_sequencer_execution_endpoint.py tests\test_pulse_scan_tick_quantization.py tests\test_pulse_scan_signal_consumer.py
 
 # FPGA launcher/HDL/Tcl contracts + host image packer + AXI session, without opening Vivado
 pytest -q tests\test_public_hardware_boundary.py tests\test_zlc_pulse_fpga_image.py tests\test_zlc_pulse_hardware_backend.py tests\test_zlc_pulse_transports.py
@@ -40,7 +46,7 @@ pytest -q tests\test_zlc_frontend_figure.py tests\test_zlc_single_panel_host.py 
 pytest -q tests\test_pulse_gui_remote_connection.py tests\test_pulse_gui_scan_runtime_qt.py tests\test_pulse_schedule_view_contract.py
 ```
 
-For notebook edits, validate only the notebooks that changed:
+For tutorial edits, validate only the notebooks that changed:
 
 ```powershell
 python -m json.tool tutorials\neutral_atom_tutorial.ipynb > $null

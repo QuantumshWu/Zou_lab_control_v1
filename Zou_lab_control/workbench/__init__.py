@@ -3,6 +3,57 @@
 from __future__ import annotations
 
 
+def _build_logic_node_ui(
+    contributions,
+    purpose: str,
+    *args,
+    **kwargs,
+):
+    """Resolve and call one leaf-owned optional UI contribution lazily."""
+
+    from importlib import import_module
+
+    from zlc_neutral_atom.logic_node_package import UiContributionDescriptor
+
+    descriptors = tuple(contributions)
+    if any(not isinstance(value, UiContributionDescriptor) for value in descriptors):
+        raise TypeError("contributions must contain UiContributionDescriptor values")
+    name = str(purpose).strip()
+    matches = tuple(
+        value for value in descriptors if value.purpose == name
+    )
+    if len(matches) != 1:
+        raise ValueError(f"Logic-node has no unique UI purpose {name!r}")
+    descriptor = matches[0]
+    symbol = getattr(import_module(descriptor.module), descriptor.symbol)
+    if not callable(symbol):
+        raise TypeError(
+            f"Logic-node UI symbol {descriptor.module}:{descriptor.symbol} "
+            "must be callable"
+        )
+    return symbol(*args, **kwargs)
+
+
+def _invoke_logic_node_ui(
+    contributions,
+    purpose: str,
+    *args,
+    **kwargs,
+):
+    """Launch one already-frozen optional contribution as an owned window."""
+
+    from zlc_frontend.qt_widgets import launch_qt_window
+
+    return launch_qt_window(
+        lambda: _build_logic_node_ui(
+            contributions,
+            purpose,
+            *args,
+            **kwargs,
+        )
+    )
+
+
 def open_figure_workbench(
     figure_factory,
     source,

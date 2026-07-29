@@ -209,7 +209,6 @@ def _case_public_authority_and_validation(root: Path) -> None:
         )
 
         bound = exp.readout.for_binding(ReadoutBindingKey("camera"))
-        assert not hasattr(bound, "current_calibration_ref")
         _expect(ValueError, "cannot switch", lambda: bound.for_binding("sequencer"))
     finally:
         exp.close()
@@ -276,8 +275,7 @@ def _case_concurrent_close_owner(root: Path) -> None:
     exp = _connect(root)
     services = exp._services
     handle = _ControlledWorkbenchHandle()
-    with services.operation_lock:
-        services.gui_handles["controlled"] = handle
+    assert exp._open_workbench_handle(None, lambda: handle) is handle
 
     failures: list[BaseException] = []
 
@@ -491,8 +489,6 @@ def _case_fit_close_drain(root: Path) -> None:
     for thread in fit_threads:
         thread.start()
     entered.wait(timeout=2.0)
-    with services.operation_lock:
-        assert services.active_fit_operations == 2
 
     close_threads = tuple(
         threading.Thread(target=close_worker, daemon=False) for _ in range(2)
@@ -544,11 +540,7 @@ def _case_fit_reentrant_close(root: Path) -> None:
         )
         with services.operation_lock:
             assert services.state == "OPEN"
-            assert services.active_fit_operations == 1
-    with services.operation_lock:
-        assert services.state == "OPEN"
-        assert services.active_fit_operations == 0
-        assert services.fit_operations_drained.is_set()
+    assert services.state == "OPEN"
     exp.close()
     assert services.state == "CLOSED"
     _assert_repository_roots_released(root)

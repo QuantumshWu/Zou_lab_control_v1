@@ -36,7 +36,7 @@ from zlc_neutral_atom.logic_nodes.readout.calibration_input import (
 from zlc_neutral_atom.logic_nodes.readout.measurement_values import (duration_axis_for_document, finite_signed_axis, linear_axis_from_range, optional_trigger, readout_model_kind, scale_authored_value)
 from zlc_neutral_atom.logic_nodes.release_recapture.binding import bind_release_recapture_camera, freeze_release_recapture_rows
 from zlc_neutral_atom.node_input import BoundNodeInputs
-from zlc_neutral_atom.pulse_catalog import RELEASE_RECAPTURE_PULSE_PATH
+from .. import DEFAULT_RELEASE_RECAPTURE_PULSE_PATH
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
 from zlc_neutral_atom.capture.binding import TriggeredCameraBinding
@@ -85,7 +85,7 @@ _GREY_MOLASSES_AUTHORING_SCHEMA = AuthoringSchema(
             "pulse",
             "path",
             "Pulse template",
-            default=RELEASE_RECAPTURE_PULSE_PATH,
+            default=DEFAULT_RELEASE_RECAPTURE_PULSE_PATH,
             required=True,
         ),
         AuthoringField(

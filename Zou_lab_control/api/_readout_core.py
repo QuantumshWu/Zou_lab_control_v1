@@ -8,7 +8,6 @@ this module imports no concrete Logic-node API.
 from __future__ import annotations
 
 from pathlib import Path
-from types import MappingProxyType
 
 from zlc_data import OwnedSnapshot
 from zlc_neutral_atom.artifact_dispatch import ArtifactCapability
@@ -25,113 +24,16 @@ from zlc_neutral_atom.capture.reference import (
     capture_artifact_ref_to_tree,
 )
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
-from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.runtime.run import RunHandle
 from zlc_pulse import PulseDocument, PulseExecutionForm, load_pulse_document
 from zlc_storage.paths import resolve_under
 
 from ._application_services import (
     ExperimentServices,
+    application_start_run,
     resolve_role,
     service_guard,
 )
-
-
-class LogicNodeApplicationOperations:
-    """Cohesive composition-only access to installed application operations.
-
-    Logic-node package factories use this object once to freeze their exact
-    callables and installation facts.  Node API instances retain only those
-    selected dependencies, never this object as a queryable service graph.
-    """
-
-    __slots__ = ("_services",)
-
-    def __init__(self, services: ExperimentServices) -> None:
-        if not isinstance(services, ExperimentServices):
-            raise TypeError("services must be ExperimentServices")
-        self._services = services
-
-    @property
-    def repository_root(self) -> Path:
-        with service_guard(self._services) as services:
-            return services.workspace_paths.repository_root
-
-    @property
-    def pulses_root(self) -> Path:
-        with service_guard(self._services) as services:
-            return services.workspace_paths.pulses_root
-
-    @property
-    def output_root(self) -> Path:
-        with service_guard(self._services) as services:
-            return services.workspace_paths.output_root
-
-    @property
-    def capture_repository(self):
-        """Return the core Capture owner only to a package wiring closure."""
-
-        with service_guard(self._services) as services:
-            return services.capture_repository
-
-    @property
-    def camera_signal_association_authorities(self):
-        with service_guard(self._services) as services:
-            return MappingProxyType(
-                dict(services.installation.camera_signal_association_authorities)
-            )
-
-    @property
-    def readout_apparatus_facts(self) -> tuple:
-        with service_guard(self._services) as services:
-            return tuple(services.installation.readout_apparatus_facts)
-
-    def roles(self, domain: str) -> tuple[str, ...]:
-        with service_guard(self._services) as services:
-            return services.catalog.roles(domain)
-
-    def device_ref(self, role: str) -> DeviceRef:
-        with service_guard(self._services) as services:
-            return services.catalog.require(role).ref
-
-    def device_domain(self, role: str) -> str | None:
-        with service_guard(self._services) as services:
-            info = services.catalog.find(role)
-            return None if info is None else info.domain
-
-    def resolve_role(
-        self,
-        requested: str | None,
-        domain: str,
-        preferred: tuple[str, ...],
-    ) -> str:
-        with service_guard(self._services) as services:
-            return resolve_role(services.catalog, requested, domain, preferred)
-
-    def pulse_port(self, reference: DeviceRef):
-        with service_guard(self._services) as services:
-            return services.runtime.pulse_port(reference)
-
-    def camera_port(self, reference: DeviceRef):
-        with service_guard(self._services) as services:
-            return services.runtime.camera_port(reference)
-
-    def camera_monitor_port(self, reference: DeviceRef):
-        with service_guard(self._services) as services:
-            return services.runtime.camera_monitor_port(reference)
-
-    def rf_port(self, reference: DeviceRef):
-        with service_guard(self._services) as services:
-            return services.runtime.rf_port(reference)
-
-    def start_run(self, plan):
-        with service_guard(self._services) as services:
-            return services.runtime.start(plan)
-
-    def wait_run(self, handle: RunHandle):
-        with service_guard(self._services) as services:
-            runtime = services.runtime
-        return runtime.wait(handle)
 
 
 class ReadoutFacade:
@@ -190,8 +92,11 @@ class ReadoutFacade:
                 pulse_port=services.runtime.pulse_port(request.sequencer_ref),
                 camera_port=services.runtime.camera_port(request.camera_ref),
                 repository=services.capture_repository,
-                start_run=services.runtime.start,
+                start_run=self._start_run,
             )
+
+    def _start_run(self, plan):
+        return application_start_run(self._services, plan)
 
     def capture_request(
         self,
@@ -237,11 +142,6 @@ class ReadoutFacade:
             if not isinstance(reference, CaptureArtifactRef):
                 raise TypeError("reference must be CaptureArtifactRef")
             return services.capture_repository.materialize_final(reference)
-
-    def _logic_node_operations(self) -> LogicNodeApplicationOperations:
-        """Create the composition-only operation set consumed by leaf packages."""
-
-        return LogicNodeApplicationOperations(self._services)
 
     def _project_capture_dataset(
         self,

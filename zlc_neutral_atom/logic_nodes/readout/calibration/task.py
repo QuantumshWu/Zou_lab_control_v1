@@ -58,8 +58,7 @@ from .task_output import (
     read_calibration_task_output,
     write_calibration_task_output,
 )
-from .sitemap import SitemapCalibrationRequest
-from zlc_neutral_atom.pulse_catalog import CALIBRATION_PULSE_PATH
+from .sitemap import DEFAULT_CALIBRATION_PULSE_PATH, SitemapCalibrationRequest
 from zlc_neutral_atom.runtime._failure import safe_error_summary
 from zlc_neutral_atom.runtime.dataset import (
     DatasetPreviewSnapshot,
@@ -105,7 +104,6 @@ CALIBRATION_LIVE_OUTPUT_DECLARATIONS = (
 DEFAULT_CALIBRATION_SOURCE_MODE = "live"
 DEFAULT_CALIBRATION_FOLDER = "calibrations"
 DEFAULT_CALIBRATION_SAVE_FRAMES = True
-DEFAULT_CALIBRATION_PULSE_PATH = CALIBRATION_PULSE_PATH
 DEFAULT_CALIBRATION_THRESHOLD_METHOD = "otsu"
 DEFAULT_CALIBRATION_REFERENCE_EXPOSURE_S = 0.020
 DEFAULT_CALIBRATION_READOUT_EXPOSURE_S = 0.005
@@ -660,6 +658,8 @@ class CalibrationTaskApplicationPort(Protocol):
         self,
         source: CaptureArtifactRef,
         analysis: CalibrationAnalysisRequest,
+        *,
+        lifecycle_owner: object | None = None,
     ) -> RunHandle: ...
 
     def write_calibration_task_outputs(
@@ -856,14 +856,22 @@ class PreparedCalibrationTask:
     def start(
         self,
         live_output: CalibrationTaskLiveOutputPort | None = None,
+        *,
+        cancel_requested=lambda: False,
     ) -> CalibrationTaskHandle:
         if live_output is not None and not self.has_live_output:
             raise ValueError("saved calibration cannot attach a live output")
+        if not callable(cancel_requested):
+            raise TypeError("cancel_requested must be callable")
         with self._lock:
             if self._started:
                 raise RuntimeError("PreparedCalibrationTask is one-shot")
             self._started = True
-        return CalibrationTaskHandle(self, live_output)
+        return CalibrationTaskHandle(
+            self,
+            live_output,
+            cancel_requested=cancel_requested,
+        )
 
     def _start_capture(
         self,
@@ -873,7 +881,7 @@ class PreparedCalibrationTask:
         if capture is None:
             raise RuntimeError("saved calibration has no capture stage")
         if live_output is None:
-            return capture.start()
+            return capture.start(lifecycle_owner=self)
         ordinals = self._preview_ordinals
         assert ordinals is not None
 
@@ -891,6 +899,7 @@ class PreparedCalibrationTask:
         return capture.start_with_preview(
             factory=attach,
             source_ordinals=ordinals,
+            lifecycle_owner=self,
         )
 
     def _start_calibration_analysis(
@@ -900,6 +909,7 @@ class PreparedCalibrationTask:
         handle = self._dependencies.start_calibration_analysis(
             source,
             self._plan.analysis,
+            lifecycle_owner=self,
         )
         if not isinstance(handle, RunHandle):
             raise TypeError("calibration application port returned a non-RunHandle")
@@ -975,6 +985,25 @@ class PreparedCalibrationTask:
         self._require_own_success(result)
         root = Path(self._plan.intent.folder)
         return f"done; results: {root}; report: {root / 'report'}"
+
+
+def start_calibration_task_command(
+    command: PreparedCalibrationTask,
+    live_output_host,
+    cancel_requested,
+):
+    """Choose Calibration's declared live or saved start shape."""
+
+    if not isinstance(command, PreparedCalibrationTask):
+        raise TypeError("Calibration preparer returned another command type")
+    if not callable(cancel_requested):
+        raise TypeError("cancel_requested must be callable")
+    if not callable(getattr(live_output_host, "open_live_dataset", None)):
+        raise TypeError("Calibration start requires a live-output host")
+    return command.start(
+        live_output_host if command.has_live_output else None,
+        cancel_requested=cancel_requested,
+    )
 
 
 def prepare_calibration_task(
@@ -1074,12 +1103,17 @@ class CalibrationTaskHandle:
         self,
         prepared: PreparedCalibrationTask,
         live_output: CalibrationTaskLiveOutputPort | None,
+        *,
+        cancel_requested,
     ) -> None:
         if not isinstance(prepared, PreparedCalibrationTask):
             raise TypeError("prepared must be PreparedCalibrationTask")
+        if not callable(cancel_requested):
+            raise TypeError("cancel_requested must be callable")
         self.run_id = RunId(f"calibration-task-{uuid.uuid4().hex}")
         self._prepared = prepared
         self._live_output = live_output
+        self._cancel_signal = cancel_requested
         self._condition = threading.Condition(threading.RLock())
         self._phase = "capture-starting"
         self._active: RunHandle | None = None
@@ -1102,10 +1136,14 @@ class CalibrationTaskHandle:
         with self._condition:
             return self._source
 
-    def _checkpoint(self) -> None:
+    def _cancellation_requested(self) -> bool:
         with self._condition:
-            if self._cancel_requested:
-                raise _CancelledBetweenStages
+            local = self._cancel_requested
+        return local or bool(self._cancel_signal())
+
+    def _checkpoint(self) -> None:
+        if self._cancellation_requested():
+            raise _CancelledBetweenStages
 
     def _run_child(self, stage: str, handle: RunHandle):
         if not isinstance(handle, RunHandle):
@@ -1117,7 +1155,7 @@ class CalibrationTaskHandle:
             cancelled = self._cancel_requested
             reason = self._cancel_reason
             self._condition.notify_all()
-        if cancelled:
+        if cancelled or self._cancellation_requested():
             handle.cancel(reason)
         try:
             result = handle.result()
@@ -1145,8 +1183,14 @@ class CalibrationTaskHandle:
         *,
         child: RunSnapshot | None = None,
         error: str | None = None,
-        admission_rejection: ResourceBusy | None = None,
+        admission_rejections: tuple[ResourceBusy, ...] = (),
     ) -> None:
+        child_rejections = (
+            () if child is None else child.admission_rejections
+        )
+        blockers = tuple(
+            dict.fromkeys((*child_rejections, *admission_rejections))
+        )
         with self._condition:
             self._terminal = RunSnapshot(
                 self.run_id,
@@ -1160,11 +1204,7 @@ class CalibrationTaskHandle:
                     else None if child is None else child.primary_error
                 ),
                 () if child is None else child.cleanup_errors,
-                (
-                    admission_rejection
-                    if admission_rejection is not None
-                    else None if child is None else child.admission_rejection
-                ),
+                blockers,
             )
             self._active = None
             self._stage = None
@@ -1174,6 +1214,7 @@ class CalibrationTaskHandle:
         try:
             plan = self._prepared._plan
             sequence = plan.sequence
+            self._checkpoint()
             if sequence is None:
                 source = plan.source_capture_ref
                 assert isinstance(source, CaptureArtifactRef)
@@ -1232,11 +1273,11 @@ class CalibrationTaskHandle:
                 RunState.FAILED,
                 "start-rejected",
                 error=safe_error_summary(error),
-                admission_rejection=error.outcome,
+                admission_rejections=error.blockers,
             )
         except BaseException as error:
+            cancelled = self._cancellation_requested()
             with self._condition:
-                cancelled = self._cancel_requested
                 source = self._source
             failure = safe_error_summary(error)
             if source is not None:
@@ -1277,7 +1318,7 @@ class CalibrationTaskHandle:
             None if child is None else child.commit_publication_warning,
             None if child is None else child.primary_error,
             () if child is None else child.cleanup_errors,
-            None if child is None else child.admission_rejection,
+            () if child is None else child.admission_rejections,
         )
 
     def cancel(self, reason: str = "user requested stop") -> CancelOutcome:

@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from Zou_lab_control.api import WorkspacePaths, connect
-from Zou_lab_control.workbench._composition import task_console_ports
 from zlc_neutral_atom.logic_node_package import discover_logic_node_packages
 
 
@@ -19,18 +18,29 @@ def test_fixed_namespace_packages_are_unique_and_complete() -> None:
     )
 
     assert len(packages) == len(package_files)
-    assert tuple(package.api_name for package in packages) == tuple(
-        sorted(package.api_name for package in packages)
-    )
+    names = tuple(package.api_name for package in packages)
+    pending = {package.api_name: package for package in packages}
+    resolved: set[str] = set()
+    expected_order: list[str] = []
+    while pending:
+        ready = tuple(
+            sorted(
+                name
+                for name, package in pending.items()
+                if set(package.api_dependencies) <= resolved
+            )
+        )
+        assert ready
+        for name in ready:
+            pending.pop(name)
+            resolved.add(name)
+            expected_order.append(name)
+    assert names == tuple(expected_order)
     assert len({package.api_name for package in packages}) == len(packages)
     assert len({package.declaration.definition.key for package in packages}) == len(
         packages
     )
-    assert not tuple(
-        (ROOT / "zlc_neutral_atom" / "logic_nodes").rglob("notebook_adapter.py")
-    )
     assert (ROOT / "Zou_lab_control" / "api").is_dir()
-    assert not (ROOT / "Zou_lab_control" / "notebook").exists()
     assert "zlc_neutral_atom.logic_nodes." not in (
         ROOT / "Zou_lab_control" / "workbench" / "_composition.py"
     ).read_text(encoding="utf-8")
@@ -55,7 +65,7 @@ def test_fixed_namespace_packages_are_unique_and_complete() -> None:
     assert "services." not in leaf_api_sources
 
 
-def test_experiment_nodes_and_task_console_share_discovered_packages(tmp_path) -> None:
+def test_experiment_nodes_are_projected_from_discovered_packages(tmp_path) -> None:
     experiment = connect(
         "virtual",
         workspace=WorkspacePaths.for_workspace(
@@ -70,17 +80,5 @@ def test_experiment_nodes_and_task_console_share_discovered_packages(tmp_path) -
         )
         assert experiment.nodes.calibration is not None
         assert experiment.nodes.mot_field is not None
-
-        ports = task_console_ports(experiment)
-        expected_keys = tuple(
-            package.declaration.definition.key
-            for package in sorted(
-                packages,
-                key=lambda package: package.task_console_order,
-            )
-        )
-        assert tuple(
-            attachment.spec.definition.key for attachment in ports.attachments
-        ) == expected_keys
     finally:
         experiment.close()

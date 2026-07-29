@@ -1,18 +1,17 @@
-"""Occupancy-owned loading and raster jobs for its exact-cell viewer."""
+"""Occupancy-owned loading jobs for its exact-cell navigator."""
 
 from __future__ import annotations
 
 from concurrent.futures import CancelledError
 import threading
 
-from zlc_frontend.site_map_render import SiteMapComposer
+from zlc_frontend.figure_source import FigureSource
+from zlc_frontend.plot_panel import FigureIntent
 from zlc_frontend.site_map_view import SiteMapView
-from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import OccupancyCellDomain
-from .view_projection import _occupancy_cell_coherence_identity
-
-
-_PANEL_ID = "sites"
-_BOARD_ID = "occupancy-cell"
+from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import (
+    OccupancyCellDomain,
+    _occupancy_cell_coherence_identity,
+)
 
 
 def _cancel_point(cancelled: threading.Event) -> None:
@@ -31,53 +30,36 @@ def _load_navigation(loader, reference, cancelled):
     return result
 
 
-def _cell_job(
+def _load_cell_figure(
     loader,
     reference,
     address,
     navigation,
-    loaded_view,
-    display,
-    composer,
-    cell_revision,
-    surface_geometry,
-    surface_revision,
     cancelled,
 ):
+    """Load one address and validate its generic Figure source before Qt sees it."""
+
     _cancel_point(cancelled)
-    if loaded_view is None:
-        loaded_view = loader(
-            reference,
-            address,
-            expected_navigation=navigation,
-        )
+    result = loader(
+        reference,
+        address,
+        expected_navigation=navigation,
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise TypeError("cell loader must return (FigureIntent, FigureSource)")
+    figure, source = result
+    if not isinstance(figure, FigureIntent) or not isinstance(source, FigureSource):
+        raise TypeError("cell loader returned another Figure contract")
+    view = source.site_map
     navigation.resolve_address(address)
     if (
-        not isinstance(loaded_view, SiteMapView)
-        or loaded_view.coherence_identity
+        not isinstance(view, SiteMapView)
+        or view.coherence_identity
         != _occupancy_cell_coherence_identity(
             navigation.artifact_identity,
             address,
         )
     ):
         raise ValueError("cell loader returned a different exact address")
-    if not isinstance(composer, SiteMapComposer):
-        raise TypeError("occupancy cell renderer requires SiteMapComposer")
     _cancel_point(cancelled)
-    frame = composer.compose(
-        loaded_view,
-        display=display,
-        selection_revision=cell_revision,
-        surface_geometry=surface_geometry,
-        surface_revision=surface_revision,
-    )
-    _cancel_point(cancelled)
-    return (
-        navigation.identity,
-        address,
-        cell_revision,
-        display.revision,
-        surface_revision,
-        loaded_view,
-        frame,
-    )
+    return navigation.identity, address, figure, source

@@ -131,9 +131,21 @@ def test_owner_wake_coalesces_queued_requests_and_replays_only_during_dispatch()
     """A level-triggered worker wake cannot manufacture empty owner turns."""
 
     source = r'''
-from zlc_frontend.qt_widgets import QtOwnerWake, ensure_qt_app
+from zlc_frontend.qt_widgets import QtOwnerWake, SerialWorkerWindow, ensure_qt_app
 
 app = ensure_qt_app()
+from zlc_workbench.data_figure.window import DataFigureWindow
+from zlc_neutral_atom.logic_nodes.readout.calibration.ui.report_window import CalibrationReportWindow
+from zlc_neutral_atom.logic_nodes.readout.calibration.ui.workbench_window import CalibrationWorkbenchWindow
+from zlc_neutral_atom.logic_nodes.readout.occupancy.ui.workbench_window import OccupancyCellWindow
+
+pending = list(SerialWorkerWindow.__subclasses__())
+while pending:
+    subclass = pending.pop()
+    if "_owner_cycle" in subclass.__dict__:
+        raise RuntimeError(f"{subclass.__qualname__} overrides the sealed owner cycle")
+    pending.extend(subclass.__subclasses__())
+
 queued_calls = []
 queued = QtOwnerWake()
 queued.bind(lambda: queued_calls.append("turn"))
@@ -151,6 +163,15 @@ replay.bind(callback)
 replay.request_owner_wake()
 for _ in range(4):
     app.processEvents()
+
+class ExtendedWorkerWindow(SerialWorkerWindow):
+    def _drain_owner_completions(self):
+        pass
+
+extended = ExtendedWorkerWindow()
+extended.request_owner_close()
+if not extended.wait_owner_closed(1.0):
+    raise RuntimeError("subclass completion hook bypassed application close")
 print(len(queued_calls), len(replay_calls))
 '''
     environment = dict(os.environ)

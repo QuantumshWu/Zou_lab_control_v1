@@ -21,7 +21,6 @@ def open_task_console(
 
     from .capability import ConsoleNodeHost
     from .catalog_bridge import ConsoleCatalogView
-    from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
     from .window import show_task_console
 
     catalog_view = ConsoleCatalogView(
@@ -37,7 +36,7 @@ def open_task_console(
             raise RuntimeError("TaskConsole owner is not composed")
         console[0].request_owner_wake()
 
-    data_plane = SignalDataPlane()
+    data_plane = ports.data_plane
 
     def resolve_inputs(spec, values):
         if not console:

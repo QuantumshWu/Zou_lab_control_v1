@@ -18,7 +18,6 @@ from zlc_neutral_atom.logic_nodes.release_recapture.timing import (
 )
 from zlc_neutral_atom.logic_nodes.release_recapture.temperature.measurement import (
     BoundTemperatureReleaseRecapture,
-    CalibratedTemperatureReleaseRecaptureIntent,
     TEMPERATURE_RELEASE_RECAPTURE_OUTPUT_DECLARATIONS,
     TemperatureReleaseRecaptureIntent,
     TemperatureReleaseRecaptureRequest,
@@ -90,6 +89,8 @@ class TemperatureReleaseRecaptureApplicationPort(Protocol):
     def start_temperature_release_recapture(
         self,
         request: TemperatureReleaseRecaptureRequest,
+        *,
+        lifecycle_owner: object | None = None,
     ) -> RunHandle: ...
 
 
@@ -103,7 +104,10 @@ class TemperatureReleaseRecaptureApplicationCommand:
             raise TypeError("request must be TemperatureReleaseRecaptureRequest")
 
     def start(self) -> RunHandle:
-        return self._application.start_temperature_release_recapture(self.request)
+        return self._application.start_temperature_release_recapture(
+            self.request,
+            lifecycle_owner=self,
+        )
 
     def final_dataset_outputs(
         self,
@@ -133,28 +137,11 @@ def prepare_temperature_release_recapture_application(
     return TemperatureReleaseRecaptureApplicationCommand(request, application)
 
 
-def prepare_bound_temperature_release_recapture(
-    value: CalibratedTemperatureReleaseRecaptureIntent,
-    *,
-    application: TemperatureReleaseRecaptureApplicationPort,
-) -> TemperatureReleaseRecaptureApplicationCommand:
-    """Prepare the exact request already bound by the Logic-node input owner."""
-
-    if not isinstance(value, CalibratedTemperatureReleaseRecaptureIntent):
-        raise TypeError("value must be CalibratedTemperatureReleaseRecaptureIntent")
-    return prepare_temperature_release_recapture_application(
-        value.intent,
-        value.calibration_ref,
-        application,
-    )
-
-
 __all__ = [
     "PreparedReleaseRecapture",
     "TemperatureReleaseRecaptureApplicationCommand",
     "TemperatureReleaseRecaptureApplicationPort",
     "prepare_temperature_release_recapture",
     "prepare_temperature_release_recapture_application",
-    "prepare_bound_temperature_release_recapture",
     "temperature_final_outputs",
 ]

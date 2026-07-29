@@ -571,6 +571,7 @@ class PreparedLiveCameraMeasurement:
             activate_output_bindings=self._activate_output_bindings,
             deactivate_output_bindings=self._deactivate_output_bindings,
         )
+        plan = plan.with_lifecycle(owner=self, preemptible=True)
         try:
             return self._start_run(plan)
         except BaseException as error:

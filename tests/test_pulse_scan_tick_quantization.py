@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 
 from zlc_pulse.scan_template import scan_table_template
-from zlc_neutral_atom.pulse_catalog import PROBE_PULSE_PATH
+from zlc_neutral_atom.logic_nodes.pulse_scan.authoring import (
+    DEFAULT_PULSE_SCAN_PULSE_PATH,
+)
 from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSegmentTable,
     ApiSlotSegmentedProgram,
@@ -30,7 +32,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _default_api_program_parts():
-    document = load_pulse_document(ROOT / "pulses" / PROBE_PULSE_PATH)
+    document = load_pulse_document(
+        ROOT / "pulses" / DEFAULT_PULSE_SCAN_PULSE_PATH
+    )
     specs = api_column_specs(document)
     source = scan_table_template("column_stack", specs)
     rows = evaluate_numeric_scan_program(source, width=len(specs))
@@ -86,7 +90,9 @@ def test_duration_column_cannot_exist_without_domain_owned_quantum():
 
 
 def test_api_delay_starter_is_signed_and_clock_aligned():
-    document = load_pulse_document(ROOT / "pulses" / PROBE_PULSE_PATH)
+    document = load_pulse_document(
+        ROOT / "pulses" / DEFAULT_PULSE_SCAN_PULSE_PATH
+    )
     port = next(port for port in document.target.ports if port.kind == "digital")
     field = PulseFieldRef(FIELD_DELAY, None, port.key)
     document = replace(

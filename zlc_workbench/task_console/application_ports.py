@@ -8,6 +8,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from zlc_neutral_atom.catalog import DefinitionKey
+from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
 
 from .capability import ConsoleCapabilityAttachment
 
@@ -22,6 +23,7 @@ class TaskConsoleApplicationPorts:
     """
 
     attachments: tuple[ConsoleCapabilityAttachment, ...]
+    data_plane: SignalDataPlane
     tasks_root: Path
     output_root: Path
     _by_key: Mapping[DefinitionKey, ConsoleCapabilityAttachment] = field(
@@ -49,6 +51,8 @@ class TaskConsoleApplicationPorts:
                 )
             by_key[attachment.key] = attachment
         object.__setattr__(self, "attachments", attachments)
+        if not isinstance(self.data_plane, SignalDataPlane):
+            raise TypeError("TaskConsole data_plane must be SignalDataPlane")
         for name in ("tasks_root", "output_root"):
             value = Path(getattr(self, name)).expanduser()
             if not value.is_absolute():

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
 import threading
 import time
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from zlc_data import (
     REPEAT,
@@ -119,6 +121,8 @@ def _attach_live(
         notification_failure=None,
     )
     plane.reserve(node)
+    lifecycle = plane.begin_run_lifecycle(node)
+    plane.bind_run_lifecycle(lifecycle, run, preemptible=True)
     plane.attach(node, slot)
     plane.mark_changed(node)
     return slot
@@ -140,6 +144,33 @@ def _live_source_plane():
     )
     first = plane.freeze()
     return plane, state, node, first
+
+
+def test_preemption_keeps_a_parent_with_an_unadmitted_exact_descendant() -> None:
+    plane = SignalDataPlane()
+    parent = _node("parent", (_live_output("source", 1, "1" * 64),))
+    child = _node("child", (_live_output("result", 1, "2" * 64),))
+    parent_command = object()
+    child_command = object()
+    try:
+        plane.reserve(parent)
+        plane.bind_lifecycle_owner(parent, parent_command)
+        parent_ref = plane.begin_run_lifecycle(parent_command)
+        plane.bind_run_lifecycle(parent_ref, "parent-run", preemptible=True)
+
+        plane.reserve(child)
+        plane.bind_lifecycle_owner(
+            child,
+            child_command,
+            parent_owners=(parent_command,),
+        )
+
+        assert plane.retire_preemptible_run_closure(("parent-run",)) is None
+        child_ref = plane.begin_run_lifecycle(child_command)
+        assert plane.abort_run_lifecycle(child_ref)
+        plane.finish_run_lifecycle("parent-run")
+    finally:
+        plane.close()
 
 
 class _GatedProcessorApplication:
@@ -495,3 +526,59 @@ def test_processor_publication_requires_every_declared_sibling() -> None:
         assert front.value("partial/right") is None
     finally:
         plane.close()
+
+
+@pytest.mark.parametrize("failure_point", ("construct", "launch"))
+def test_task_console_failure_and_retirement_release_the_shared_plane_wake(
+    tmp_path,
+    monkeypatch,
+    failure_point: str,
+) -> None:
+    """Only a successfully composed console may retain the application wake."""
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import Zou_lab_control.api as zlc
+    from zlc_frontend.qt_widgets import ensure_qt_app
+    import zlc_workbench.task_console.window as window_module
+
+    application = ensure_qt_app()
+    assert application.platformName().lower() == "offscreen"
+    workspace = zlc.WorkspacePaths.for_workspace(
+        REPO,
+        repository_root=tmp_path.resolve(),
+    )
+    experiment = zlc.connect("virtual", workspace=workspace)
+    original_constructor = window_module.TaskConsole
+    original_launcher = window_module.launch_fluent_window
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(f"deterministic {failure_point} failure")
+
+    if failure_point == "construct":
+        monkeypatch.setattr(window_module, "TaskConsole", fail)
+    else:
+        monkeypatch.setattr(window_module, "launch_fluent_window", fail)
+    try:
+        with pytest.raises(RuntimeError, match=failure_point):
+            experiment.task_console()
+    finally:
+        monkeypatch.setattr(window_module, "TaskConsole", original_constructor)
+        monkeypatch.setattr(
+            window_module,
+            "launch_fluent_window",
+            original_launcher,
+        )
+
+    first = experiment.task_console()
+    try:
+        first.request_owner_close()
+        assert first.wait_owner_closed(10.0)
+        assert first.permanently_closed
+
+        second = experiment.task_console()
+        assert second is not first
+        assert not second.permanently_closed
+    finally:
+        experiment.close()
+
+    assert second.permanently_closed

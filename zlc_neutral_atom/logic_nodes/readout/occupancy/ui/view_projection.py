@@ -1,60 +1,45 @@
-"""Thin Occupancy-domain projections into frontend-owned view values."""
+"""The single Occupancy adapter into frontend-owned Figure contracts."""
 
 from __future__ import annotations
 
 from zlc_data import IndexSelection, Selection
 from zlc_data.value import dataset_cell_value
-from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
+from zlc_frontend.figure_source import FigureSource
 from zlc_frontend.frozen_figure import (
     FrozenFigureSource,
     resolve_frozen_figure_intent,
 )
 from zlc_frontend.plot_kind import PlotKind
 from zlc_frontend.plot_panel import FigureIntent
-from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import ExactOccupancyCellSource
-from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import ResolvedOccupancy
+from zlc_frontend.site_map_view import SiteMapView, build_site_map_cell_view
+from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
+from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import (
+    ExactOccupancyCellSource,
+    _occupancy_cell_coherence_identity,
+)
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
+    OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION,
+    ResolvedOccupancy,
     occupancy_artifact_output_name,
 )
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor_application import (
     PreparedOccupancyProcessor,
 )
-from zlc_neutral_atom.processing.signal_plane import SignalValue
-from zlc_frontend.site_map_view import (
-    SiteMapView,
-    build_site_map_cell_view,
-)
-from zlc_storage import canonical_digest
-from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
+from zlc_neutral_atom.processing.hosted_processor import HostedProcessor
+from zlc_neutral_atom.processing.signal_plane import SignalPublication, SignalValue
 
 
-_LIVE_SITE_MAP_FIGURE = FigureIntent(
+OCCUPANCY_SITE_MAP_FIGURE = FigureIntent(
     PlotKind.SITE_MAP,
     "Occupancy | exact same-shot sites",
     "Occupancy",
 )
 
 
-def _occupancy_cell_coherence_identity(
-    artifact_identity: str,
-    address: DatasetCellAddress,
-) -> str:
-    if not isinstance(address, DatasetCellAddress):
-        raise TypeError("address must be DatasetCellAddress")
-    return canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.occupancy-cell",
-            "artifact": artifact_identity,
-            "repeat_index": address.repeat_index,
-            "point_ordinal": address.point_ordinal,
-        }
-    )
-
-
-def build_exact_occupancy_cell_view(
+def _build_exact_occupancy_cell_view(
     source: ExactOccupancyCellSource,
 ) -> SiteMapView:
-    """Project one admitted same-shot cell without leaking fields into the facade."""
+    """Project one admitted exact cell through frontend's SiteMap contract."""
 
     if not isinstance(source, ExactOccupancyCellSource):
         raise TypeError("source must be ExactOccupancyCellSource")
@@ -62,7 +47,7 @@ def build_exact_occupancy_cell_view(
     site_map = domain.site_map
     metadata = source.frame_metadata
     address = source.address
-    cell_selection = Selection(
+    selection = Selection(
         (
             IndexSelection(
                 domain.occupancy_schema.repeat_axis.axis_id,
@@ -91,7 +76,7 @@ def build_exact_occupancy_cell_view(
         domain.source_ref,
         source.occupied,
         domain.occupancy_ref,
-        cell_selection,
+        selection,
         site_axis=site_map.site_axis,
         coordinate_frame=site_map.coordinate_frame,
         centers_xy=site_map.coordinates_xy,
@@ -107,12 +92,21 @@ def build_exact_occupancy_cell_view(
     )
 
 
+def project_exact_occupancy_cell(
+    source: ExactOccupancyCellSource,
+) -> tuple[FigureIntent, FigureSource]:
+    """Pair one exact cell with the generic Figure source consumed by every host."""
+
+    view = _build_exact_occupancy_cell_view(source)
+    return OCCUPANCY_SITE_MAP_FIGURE, FigureSource(source.occupied_snapshot, view)
+
+
 def project_occupancy_site_map(
     application: PreparedOccupancyProcessor,
     background: SignalValue,
     occupied: SignalValue,
 ) -> tuple[FigureIntent, SiteMapView]:
-    """Project one exact parent/result publication with no revision side index."""
+    """Project one exact parent/result publication without a revision side index."""
 
     if not isinstance(application, PreparedOccupancyProcessor):
         raise TypeError("application must be PreparedOccupancyProcessor")
@@ -163,7 +157,30 @@ def project_occupancy_site_map(
         ),
         presentation_kind="occupancy-cell",
     )
-    return _LIVE_SITE_MAP_FIGURE, view
+    return OCCUPANCY_SITE_MAP_FIGURE, view
+
+
+def project_occupancy_signal_presentation(
+    node: object,
+    output_name: str,
+    publication: SignalPublication,
+):
+    """Project one same-shot Occupancy SiteMap from its exact signal front."""
+
+    if output_name != OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION.name:
+        return None
+    if not isinstance(node, HostedProcessor):
+        raise TypeError("Occupancy presentation requires HostedProcessor")
+    parent = publication.parents[0] if len(publication.parents) == 1 else None
+    background = None if parent is None else parent.value(node.source_signal)
+    occupied = publication.value(node.signal_key(output_name))
+    if background is None or occupied is None:
+        return None
+    return project_occupancy_site_map(
+        node.prepared_application,
+        background,
+        occupied,
+    )
 
 
 def project_occupancy_figure(
@@ -172,7 +189,7 @@ def project_occupancy_figure(
     output: str | None,
     materialize: bool,
 ) -> tuple[ArtifactDatasetSource, FigureIntent]:
-    """Choose one explicit Figure output from an admitted Occupancy artifact."""
+    """Project one admitted Occupancy artifact through the canonical Figure path."""
 
     if type(resolved) is not ResolvedOccupancy:
         raise TypeError("resolved must be an exact ResolvedOccupancy")
@@ -197,7 +214,7 @@ def project_occupancy_figure(
 
 
 __all__ = [
-    "build_exact_occupancy_cell_view",
-    "project_occupancy_site_map",
+    "project_exact_occupancy_cell",
     "project_occupancy_figure",
+    "project_occupancy_signal_presentation",
 ]

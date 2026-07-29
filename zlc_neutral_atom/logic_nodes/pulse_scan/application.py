@@ -480,6 +480,7 @@ class PreparedExactScan:
             plan = self._plan_factory(preview)
             if not isinstance(plan, RunPlan):
                 raise TypeError("PulseScan plan factory returned another type")
+            plan = plan.with_lifecycle(owner=self, preemptible=False)
             return self._start_run(plan)
         except BaseException as error:
             notify_preview_failure(preview, error)

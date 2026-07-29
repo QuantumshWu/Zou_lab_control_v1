@@ -3,35 +3,47 @@
 from __future__ import annotations
 
 from zlc_neutral_atom.logic_node_package import LogicNodePackage
+from zlc_pulse import PulseDocument, load_pulse_document
+from zlc_storage.paths import resolve_under
 
 from .api import MotFieldApi
 from .application import prepare_mot_field_acquisition
 from .mot_field import DEFAULT_MOT_FIELD_CAMERA_ROLE
-from .mot_field_task import MOT_FIELD_LOGIC_NODE, prepare_mot_field_task
+from .mot_field_task import (
+    MOT_FIELD_LOGIC_NODE,
+    prepare_mot_field_task,
+    start_mot_field_task_command,
+)
 
 
-def _bind_api(host: object, _dependencies: tuple[object, ...]) -> MotFieldApi:
-    operations = host._logic_node_operations()
-    capture_repository = operations.capture_repository
-    resolve_role = operations.resolve_role
-    device_ref = operations.device_ref
-    pulse_port = operations.pulse_port
-    camera_port = operations.camera_port
-    start_run = operations.start_run
+def _bind_api(
+    facts: tuple[object, ...],
+    _dependencies: tuple[object, ...],
+) -> MotFieldApi:
+    (
+        pulses_root,
+        output_root,
+        capture_repository,
+        installed_camera_ref,
+        resolve_sequencer_ref,
+        camera_port,
+        pulse_port,
+        start_run,
+    ) = facts
 
     def resolve_camera_ref(requested):
-        role = resolve_role(
-            requested,
-            "camera",
-            (DEFAULT_MOT_FIELD_CAMERA_ROLE,),
-        )
-        if role != DEFAULT_MOT_FIELD_CAMERA_ROLE:
+        if requested not in (None, DEFAULT_MOT_FIELD_CAMERA_ROLE):
             raise ValueError(
                 "MOT field optimization requires the installation's "
                 "'mot_camera' role; an arbitrary camera is not a "
                 "coil-sensitive exact-scan sensor"
             )
-        return device_ref(role)
+        return installed_camera_ref(DEFAULT_MOT_FIELD_CAMERA_ROLE)
+
+    def load_pulse(value):
+        if isinstance(value, PulseDocument):
+            return value
+        return load_pulse_document(resolve_under(pulses_root, value))
 
     def bind_acquisition(request):
         return prepare_mot_field_acquisition(
@@ -45,36 +57,53 @@ def _bind_api(host: object, _dependencies: tuple[object, ...]) -> MotFieldApi:
             intent,
             api,
             capture_repository=capture_repository,
-            output_root=operations.output_root,
+            output_root=output_root,
             start_run=start_run,
         )
 
     return MotFieldApi(
-        load_pulse=host.load_readout_pulse,
+        load_pulse=load_pulse,
         resolve_camera_ref=resolve_camera_ref,
-        resolve_sequencer_ref=host.resolve_readout_sequencer_ref,
+        resolve_sequencer_ref=resolve_sequencer_ref,
         prepare_acquisition=bind_acquisition,
         prepare_task=bind_task,
     )
 
 
-def _bind_task_console(api: MotFieldApi, catalog: object, projection):
-    from .workbench_adapter import start_mot_field_task_command
+def _prepare_hosted(api, request, event_source):
+    if event_source is not None:
+        raise ValueError("MOT Field has no event-associated input")
+    return api.prepare_mot_field_task(request)
 
-    return projection.run(
-        MOT_FIELD_LOGIC_NODE,
-        prepare=api.prepare_mot_field_task,
-        dynamic_choice_context=catalog.roles("camera"),
-        start_with_live_output=start_mot_field_task_command,
-    )
+
+def _availability(catalog, _apparatus):
+    camera = catalog.find(DEFAULT_MOT_FIELD_CAMERA_ROLE)
+    sequencer = catalog.find("sequencer")
+    if camera is None or camera.domain != "camera":
+        return "MOT Field requires the installed mot_camera Camera role"
+    if sequencer is None or sequencer.domain != "sequencer":
+        return "MOT Field requires the installed Sequencer role"
+    return None
 
 
 LOGIC_NODE_PACKAGE = LogicNodePackage(
     api_name="mot_field",
     declaration=MOT_FIELD_LOGIC_NODE,
+    api_requirements=(
+        "pulses_root",
+        "output_root",
+        "capture_repository",
+        "resolve_camera_ref",
+        "resolve_sequencer_ref",
+        "camera_port",
+        "pulse_port",
+        "start_run",
+    ),
     bind_api=_bind_api,
-    bind_task_console=_bind_task_console,
-    task_console_order=70,
+    prepare_hosted=_prepare_hosted,
+    availability=_availability,
+    dynamic_choice_fact="camera_roles",
+    start_prepared=start_mot_field_task_command,
 )
 
 __all__ = ["LOGIC_NODE_PACKAGE"]

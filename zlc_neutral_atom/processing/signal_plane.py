@@ -58,7 +58,6 @@ __all__ = [
     "SignalPublication",
     "SignalProducer",
     "SignalValue",
-    "signal_revision_identity",
 ]
 
 
@@ -406,30 +405,6 @@ def _node_instance_id(node: object) -> str:
     return canonical_text(producer.instance_id, "signal producer instance_id")
 
 
-def _node_declared_signal_names(node: object) -> tuple[str, ...]:
-    """Qualify one node's frozen owner declarations through its route owner."""
-
-    producer = _require_signal_producer(node)
-    declared = _declared_outputs(producer.dataset_output_declarations)
-    qualify = producer.signal_key
-    return tuple(str(qualify(name)) for name in declared)
-
-
-def signal_revision_identity(value: SignalValue) -> tuple[object, ...]:
-    """Exact source identity used by the latest-only Processor lane."""
-
-    if not isinstance(value, SignalValue):
-        raise TypeError("processor source must be SignalValue")
-    return (
-        value.name,
-        value.source_instance_id,
-        value.run_id,
-        value.epoch_id,
-        value.snapshot.ref,
-        value.join_digest,
-    )
-
-
 def _evaluate_prepared_processor_application(
     application: object,
     source: SignalValue,
@@ -477,6 +452,11 @@ class _GenerationState:
     source_name: str | None = None
     source_owner_id: str | None = None
     source_generation: int | None = None
+    lifecycle_owner: object | None = None
+    lifecycle_parents: tuple[tuple[str, int], ...] = ()
+    run_id: str | None = None
+    preemptible: bool | None = None
+    lifecycle_pending: bool = False
     event_root_name: str | None = None
     publication: SignalPublication | None = None
     event_source: SignalEventSource | None = None
@@ -717,9 +697,10 @@ class SignalDataPlane:
         self._membership_changed = False
         self._closed = False
         self._request_owner_wake: Callable[[], None] | None = None
+        self._owner_wake_token: object | None = None
         self._front = SignalFront({}, {})
 
-    def bind_owner_wake(self, request_owner_wake: Callable[[], None]) -> None:
+    def bind_owner_wake(self, request_owner_wake: Callable[[], None]) -> object:
         if not callable(request_owner_wake):
             raise TypeError("request_owner_wake must be callable")
         with self._lock:
@@ -727,7 +708,19 @@ class SignalDataPlane:
                 raise RuntimeError("signal data plane is closed")
             if self._request_owner_wake is not None:
                 raise RuntimeError("signal data plane owner wake is already bound")
+            token = object()
             self._request_owner_wake = request_owner_wake
+            self._owner_wake_token = token
+            return token
+
+    def unbind_owner_wake(self, token: object) -> None:
+        """Release only the exact Workbench wake borrow that was admitted."""
+
+        with self._lock:
+            if token is not self._owner_wake_token:
+                raise RuntimeError("signal data plane owner wake token is not current")
+            self._request_owner_wake = None
+            self._owner_wake_token = None
 
     def set_front_signals(self, signal_names) -> None:
         """Set the connected continuous signal set whose front must be coherent."""
@@ -779,6 +772,90 @@ class SignalDataPlane:
                     f"signal {name!r} is already owned by {state.owner_id!r}"
                 )
 
+    def _state_for_lifecycle_owner_locked(
+        self,
+        owner: object,
+    ) -> _GenerationState | None:
+        selected = None
+        for state in self._states.values():
+            if state.retired or state.lifecycle_owner is not owner:
+                continue
+            if selected is not None:
+                raise RuntimeError("lifecycle owner has more than one generation")
+            selected = state
+        return selected
+
+    def _state_for_lifecycle_ref_locked(
+        self,
+        reference: tuple[str, int],
+    ) -> _GenerationState:
+        if (
+            not isinstance(reference, tuple)
+            or len(reference) != 2
+            or not isinstance(reference[0], str)
+            or isinstance(reference[1], bool)
+            or not isinstance(reference[1], int)
+            or reference[1] < 1
+        ):
+            raise TypeError(
+                "lifecycle reference must be an (owner_id, generation) tuple"
+            )
+        owner_id = canonical_text(reference[0], "lifecycle owner_id")
+        state = self._states.get(owner_id)
+        if (
+            state is None
+            or state.retired
+            or state.generation != reference[1]
+        ):
+            raise RuntimeError("signal lifecycle generation is no longer active")
+        return state
+
+    def _state_for_run_id_locked(self, run_id: str) -> _GenerationState | None:
+        selected = None
+        for state in self._states.values():
+            if state.retired or state.run_id != run_id:
+                continue
+            if selected is not None:
+                raise RuntimeError("RunId belongs to more than one signal generation")
+            selected = state
+        return selected
+
+    def _normalize_lifecycle_parents_locked(
+        self,
+        references,
+    ) -> tuple[tuple[str, int], ...]:
+        if not isinstance(references, tuple):
+            raise TypeError("lifecycle parents must be a tuple")
+        normalized = tuple(
+            (state.owner_id, state.generation)
+            for state in (
+                self._state_for_lifecycle_ref_locked(reference)
+                for reference in references
+            )
+        )
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("lifecycle parents must be unique")
+        return normalized
+
+    def _bind_lifecycle_owner_locked(
+        self,
+        state: _GenerationState,
+        owner: object,
+    ) -> None:
+        existing = self._state_for_lifecycle_owner_locked(owner)
+        if existing is not None and existing is not state:
+            raise RuntimeError("lifecycle owner already belongs to another generation")
+        state.lifecycle_owner = owner
+
+    def _drop_state_locked(self, state: _GenerationState) -> None:
+        if self._states.get(state.owner_id) is not state:
+            return
+        self._states.pop(state.owner_id)
+        state.retired = True
+        state.publication = None
+        state.failure = None
+        self._dirty.discard(state.owner_id)
+
     def _install_state_locked(
         self,
         *,
@@ -795,13 +872,17 @@ class SignalDataPlane:
         source_transform: DataTransformSpec | None = None,
         preserves_event_association: bool = False,
         association_value_schema: ValueSchema | None = None,
+        lifecycle_owner: object | None = None,
+        lifecycle_parents: tuple[tuple[str, int], ...] = (),
+        preemptible: bool | None = None,
     ) -> _GenerationState:
         identity = canonical_text(owner_id, "signal generation owner_id")
+        kind = canonical_text(kind, "signal generation kind")
         names = tuple(
             canonical_text(name, "signal generation output name")
             for name in output_names
         )
-        if not names or len(set(names)) != len(names):
+        if (not names and kind != "lifecycle") or len(set(names)) != len(names):
             raise ValueError("signal generation outputs must be non-empty and unique")
         if identity in self._states:
             raise RuntimeError("signal generation owner is already active")
@@ -821,6 +902,17 @@ class SignalDataPlane:
                 raise LookupError(
                     f"signal route source {source_name!r} is not active"
                 )
+        parents = self._normalize_lifecycle_parents_locked(
+            tuple(lifecycle_parents)
+        )
+        if source_state is not None:
+            source_ref = (source_state.owner_id, source_state.generation)
+            if source_ref not in parents:
+                parents = (*parents, source_ref)
+        if preemptible is not None and type(preemptible) is not bool:
+            raise TypeError("lifecycle preemptible must be bool or None")
+        if preemptible is None and kind in {"processor", "continuous", "event"}:
+            preemptible = True
         if event_source is not None and not isinstance(
             event_source,
             SignalEventSource,
@@ -851,7 +943,7 @@ class SignalDataPlane:
         state = _GenerationState(
             owner_id=identity,
             generation=self._mint_generation_locked(),
-            kind=canonical_text(kind, "signal generation kind"),
+            kind=kind,
             output_names=names,
             bare_names=MappingProxyType(bare),
             node=node,
@@ -863,6 +955,8 @@ class SignalDataPlane:
             source_generation=(
                 None if source_state is None else source_state.generation
             ),
+            lifecycle_parents=parents,
+            preemptible=preemptible,
             event_root_name=event_root_name,
             event_source=event_source,
             route_identity=route_identity,
@@ -871,6 +965,14 @@ class SignalDataPlane:
             association_value_schema=association_value_schema,
         )
         self._states[identity] = state
+        if lifecycle_owner is None and node is not None:
+            lifecycle_owner = node
+        if lifecycle_owner is not None:
+            try:
+                self._bind_lifecycle_owner_locked(state, lifecycle_owner)
+            except BaseException:
+                self._drop_state_locked(state)
+                raise
         self._membership_changed = True
         return state
 
@@ -929,8 +1031,266 @@ class SignalDataPlane:
                 output_names=output_names,
                 bare_names=bare_names,
                 node=node,
+                lifecycle_owner=node,
             )
             return state.generation
+
+    def bind_lifecycle_owner(
+        self,
+        node: object,
+        owner: object,
+        *,
+        parent_owners: tuple[object, ...] = (),
+    ) -> None:
+        """Bind a reserved generation to its command and exact live parents."""
+
+        if owner is None:
+            raise TypeError("lifecycle owner must not be None")
+        if not isinstance(parent_owners, tuple):
+            raise TypeError("lifecycle parent_owners must be a tuple")
+        if any(parent is owner for parent in parent_owners):
+            raise ValueError("a lifecycle owner cannot be its own parent")
+        if len({id(parent) for parent in parent_owners}) != len(parent_owners):
+            raise ValueError("lifecycle parent_owners must be unique by identity")
+        owner_id = _node_instance_id(node)
+        with self._lock:
+            state = self._states.get(owner_id)
+            if (
+                state is None
+                or state.retired
+                or state.node is not node
+                or state.kind != "producer"
+            ):
+                raise RuntimeError("producer has no reserved signal generation")
+            if (
+                state.lifecycle_pending
+                or state.run_id is not None
+                or state.preemptible is not None
+                or state.publication is not None
+            ):
+                raise RuntimeError(
+                    "signal lifecycle owner must be bound before admission"
+                )
+            parent_refs = []
+            for parent in parent_owners:
+                parent_state = self._state_for_lifecycle_owner_locked(parent)
+                if parent_state is None or not self._lifecycle_is_active(parent_state):
+                    raise RuntimeError(
+                        "lifecycle parent is not an active application generation"
+                    )
+                parent_refs.append(
+                    (parent_state.owner_id, parent_state.generation)
+                )
+            self._bind_lifecycle_owner_locked(state, owner)
+            state.lifecycle_parents = tuple(parent_refs)
+
+    def begin_run_lifecycle(
+        self,
+        owner: object,
+    ) -> tuple[str, int]:
+        """Freeze one pending application Run into the exact generation graph."""
+
+        if owner is None:
+            raise TypeError("lifecycle owner must not be None")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("signal data plane is closed")
+            state = self._state_for_lifecycle_owner_locked(owner)
+            if state is None:
+                identity = f"@lifecycle/{self._next_generation}"
+                state = self._install_state_locked(
+                    owner_id=identity,
+                    kind="lifecycle",
+                    output_names=(),
+                    bare_names={},
+                    lifecycle_owner=owner,
+                )
+            elif (
+                state.lifecycle_pending
+                or state.run_id is not None
+                or state.preemptible is not None
+            ):
+                raise RuntimeError("lifecycle owner already has an active Run")
+            state.lifecycle_pending = True
+            return state.owner_id, state.generation
+
+    def lifecycle_cancel_requested(self, owner: object) -> bool:
+        """Read the exact hosted generation's cooperative Stop request."""
+
+        with self._lock:
+            state = self._state_for_lifecycle_owner_locked(owner)
+            if state is None or state.node is None:
+                return False
+            return bool(getattr(state.node, "cancel_requested", False))
+
+    def start_run_lifecycle(
+        self,
+        reference: tuple[str, int],
+        starter: Callable[[], object],
+    ):
+        """Linearize one pending Run admission against its hosted Stop."""
+
+        if not callable(starter):
+            raise TypeError("starter must be callable")
+        with self._lock:
+            state = self._state_for_lifecycle_ref_locked(reference)
+            if not state.lifecycle_pending:
+                raise RuntimeError("Run lifecycle is not pending admission")
+            if state.run_id is not None or state.preemptible is not None:
+                raise RuntimeError("Run lifecycle is already admitted")
+            node = state.node
+        if node is None:
+            return starter()
+        gate = getattr(node, "start_if_not_cancelled", None)
+        if not callable(gate):
+            raise TypeError(
+                "hosted Run lifecycle owner exposes no atomic start gate"
+            )
+        return gate(starter)
+
+    def bind_run_lifecycle(
+        self,
+        reference: tuple[str, int],
+        run_id: str,
+        *,
+        preemptible: bool,
+    ) -> None:
+        """Bind one successfully admitted RunId to its pending generation."""
+
+        run_id = canonical_text(run_id, "run_id")
+        if type(preemptible) is not bool:
+            raise TypeError("preemptible must be bool")
+        with self._lock:
+            state = self._state_for_lifecycle_ref_locked(reference)
+            if not state.lifecycle_pending:
+                raise RuntimeError("Run lifecycle is not pending admission")
+            if state.run_id is not None or state.preemptible is not None:
+                raise RuntimeError("Run lifecycle is already admitted")
+            if self._state_for_run_id_locked(run_id) is not None:
+                raise RuntimeError("RunId is already bound to a lifecycle generation")
+            state.run_id = run_id
+            state.preemptible = preemptible
+            state.lifecycle_pending = False
+
+    def abort_run_lifecycle(self, reference: tuple[str, int]) -> bool:
+        """Withdraw one still-pending request exactly once."""
+
+        if (
+            not isinstance(reference, tuple)
+            or len(reference) != 2
+            or not isinstance(reference[0], str)
+            or isinstance(reference[1], bool)
+            or not isinstance(reference[1], int)
+            or reference[1] < 1
+        ):
+            raise TypeError(
+                "lifecycle reference must be an (owner_id, generation) tuple"
+            )
+        owner_id = canonical_text(reference[0], "lifecycle owner_id")
+        with self._lock:
+            state = self._states.get(owner_id)
+            if (
+                state is None
+                or state.retired
+                or state.generation != reference[1]
+            ):
+                return False
+            if state.run_id is not None:
+                raise RuntimeError("an admitted Run lifecycle cannot be aborted")
+            if not state.lifecycle_pending:
+                return False
+            state.lifecycle_pending = False
+            state.preemptible = None
+            if state.kind == "lifecycle":
+                self._drop_state_locked(state)
+            self._membership_changed = True
+            return True
+
+    def finish_run_lifecycle(self, run_id: str) -> None:
+        """Remove terminal hardware ownership while retaining any FINAL signal."""
+
+        run_id = canonical_text(run_id, "run_id")
+        with self._lock:
+            state = self._state_for_run_id_locked(run_id)
+            if state is None:
+                return
+            state.run_id = None
+            state.preemptible = None
+            state.lifecycle_pending = False
+            if state.kind == "lifecycle":
+                self._drop_state_locked(state)
+            else:
+                # A terminal retained value no longer depends on live hardware.
+                state.lifecycle_parents = ()
+            self._membership_changed = True
+
+    @staticmethod
+    def _lifecycle_is_active(state: _GenerationState) -> bool:
+        return bool(
+            not state.retired
+            and (
+                state.run_id is not None
+                or state.lifecycle_pending
+                or state.preemptible is True
+            )
+        )
+
+    def retire_preemptible_run_closure(
+        self,
+        blocking_run_ids: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], tuple[BaseException, ...]] | None:
+        """Atomically retire a complete exact closure, or mutate nothing."""
+
+        if not isinstance(blocking_run_ids, tuple):
+            raise TypeError("blocking_run_ids must be a tuple")
+        run_ids = tuple(
+            canonical_text(value, "blocking run_id")
+            for value in blocking_run_ids
+        )
+        if not run_ids:
+            raise ValueError("blocking_run_ids must be non-empty")
+        if len(set(run_ids)) != len(run_ids):
+            raise ValueError("blocking_run_ids must be unique")
+        with self._lock:
+            roots = []
+            for run_id in run_ids:
+                state = self._state_for_run_id_locked(run_id)
+                if state is None:
+                    return None
+                roots.append(state)
+            selected = {
+                (state.owner_id, state.generation)
+                for state in roots
+            }
+            changed = True
+            while changed:
+                changed = False
+                for state in self._states.values():
+                    reference = (state.owner_id, state.generation)
+                    if reference in selected:
+                        continue
+                    if any(parent in selected for parent in state.lifecycle_parents):
+                        selected.add(reference)
+                        changed = True
+            states = tuple(
+                state
+                for state in self._states.values()
+                if (state.owner_id, state.generation) in selected
+            )
+            if any(state.preemptible is not True for state in states):
+                return None
+            retired_run_ids = tuple(
+                dict.fromkeys(
+                    state.run_id
+                    for state in states
+                    if state.run_id is not None
+                )
+            )
+            for state in states:
+                self._drop_state_locked(state)
+            self._membership_changed = True
+        cleanup_errors = self._cleanup_retired_states(states)
+        return retired_run_ids, cleanup_errors
 
     def attach(
         self,
@@ -1057,6 +1417,8 @@ class SignalDataPlane:
                 raise RuntimeError(
                     "Processor source is not the exact current publication"
                 )
+            if not self._lifecycle_is_active(source_state):
+                raise RuntimeError("Processor source generation is not live")
             state = self._install_state_locked(
                 owner_id=owner_id,
                 kind="processor",
@@ -1074,7 +1436,7 @@ class SignalDataPlane:
         except BaseException:
             with self._lock:
                 if self._states.get(owner_id) is state:
-                    self._states.pop(owner_id, None)
+                    self._drop_state_locked(state)
                     self._membership_changed = True
             raise
 
@@ -1801,39 +2163,45 @@ class SignalDataPlane:
         root = self._states.get(root_owner_id)
         if root is None or root.retired:
             return ()
-        selected = {root.owner_id}
-        retired_names = set(root.output_names)
+        selected = {(root.owner_id, root.generation)}
         changed = True
         while changed:
             changed = False
             for state in self._states.values():
-                if state.retired or state.owner_id in selected:
+                reference = (state.owner_id, state.generation)
+                if state.retired or reference in selected:
                     continue
-                if state.source_name in retired_names:
-                    selected.add(state.owner_id)
-                    retired_names.update(state.output_names)
+                if any(parent in selected for parent in state.lifecycle_parents):
+                    selected.add(reference)
                     changed = True
         states = tuple(
-            self._states[owner_id]
-            for owner_id in tuple(self._states)
-            if owner_id in selected
+            state
+            for state in self._states.values()
+            if (state.owner_id, state.generation) in selected
         )
         for state in states:
-            state.retired = True
-            state.publication = None
-            state.failure = None
-            self._dirty.discard(state.owner_id)
+            self._drop_state_locked(state)
         self._membership_changed = True
         return states
 
     def _withdraw_owner(self, owner_id: str) -> frozenset[str]:
         with self._lock:
             states = self._retirement_closure_locked(owner_id)
-            for state in states:
-                self._states.pop(state.owner_id, None)
         retired_names = frozenset(
             name for state in states for name in state.output_names
         )
+        errors = self._cleanup_retired_states(states)
+        if errors:
+            raise BaseExceptionGroup(
+                "signal generation cleanup failed",
+                list(errors),
+            )
+        return retired_names
+
+    def _cleanup_retired_states(
+        self,
+        states: tuple[_GenerationState, ...],
+    ) -> tuple[BaseException, ...]:
         slots = []
         for state in states:
             if state.kind == "processor" and state.node is not None:
@@ -1842,14 +2210,16 @@ class SignalDataPlane:
             if state.slot is not None:
                 slots.append(state.slot)
         errors = []
+        seen_slots = set()
         for slot in slots:
+            if id(slot) in seen_slots:
+                continue
+            seen_slots.add(id(slot))
             try:
                 slot.close()
             except BaseException as error:
                 errors.append(error)
-        if errors:
-            raise ExceptionGroup("signal generation cleanup failed", errors)
-        return retired_names
+        return tuple(errors)
 
     def retire(self, node: object) -> frozenset[str]:
         owner_id = _node_instance_id(node)
@@ -2226,6 +2596,7 @@ class SignalDataPlane:
             self._dirty.clear()
             self._front_signals = frozenset()
             self._request_owner_wake = None
+            self._owner_wake_token = None
             self._front = SignalFront({}, {})
         self._lane.close()
         errors = []
@@ -2240,7 +2611,7 @@ class SignalDataPlane:
             except BaseException as error:
                 errors.append(error)
         if errors:
-            raise ExceptionGroup("signal data plane close failed", errors)
+            raise BaseExceptionGroup("signal data plane close failed", errors)
 
     def __len__(self) -> int:
         with self._lock:

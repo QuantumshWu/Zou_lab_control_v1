@@ -8,9 +8,11 @@ import time
 
 import Zou_lab_control.api as zlc
 
-from zlc_neutral_atom.logic_nodes.camera_measurement import (
-    CameraMonitorViewSpec,
+from zlc_neutral_atom.logic_nodes.camera_measurement.finite import (
     PreparedFiniteCameraMeasurement,
+)
+from zlc_neutral_atom.logic_nodes.camera_measurement.monitor import (
+    CameraMonitorViewSpec,
     PreparedLiveCameraMeasurement,
 )
 from zlc_pulse import PulseExecutionForm, load_pulse_document

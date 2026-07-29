@@ -36,7 +36,7 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     CalibrationAnalysisRequest,
     GridOrder,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.ui.report_projection import (
+from zlc_neutral_atom.logic_nodes.readout.calibration.ui.workbench_jobs import (
     project_calibration_plot_report,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.projection import (
@@ -397,9 +397,16 @@ class _SavedCalibrationDependencies:
     def sitemap_analysis_request(self, **_kwargs) -> CalibrationAnalysisRequest:
         return _analysis_request()
 
-    def start_calibration_analysis(self, source, analysis):
+    def start_calibration_analysis(
+        self,
+        source,
+        analysis,
+        *,
+        lifecycle_owner=None,
+    ):
         assert source == self.source
         assert analysis == _analysis_request()
+        assert lifecycle_owner is not None
         return self.child.start()
 
     def write_calibration_task_outputs(

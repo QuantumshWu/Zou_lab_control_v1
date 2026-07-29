@@ -89,10 +89,12 @@ class GreyMolassesDetuningApi:
     def start_grey_molasses_detuning(
         self,
         request: GreyMolassesDetuningRequest,
+        *,
+        lifecycle_owner: object | None = None,
     ) -> RunHandle:
         if not isinstance(request, GreyMolassesDetuningRequest):
             raise TypeError("request must be GreyMolassesDetuningRequest")
-        return self._bind(request).start()
+        return self._bind(request).start(lifecycle_owner=lifecycle_owner)
 
     def _bind(
         self,

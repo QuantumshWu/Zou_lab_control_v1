@@ -17,56 +17,6 @@ from zlc_neutral_atom.installation_config import InstallationConfigDocument
 from zlc_pulse import PulseDocument
 
 
-class _TaskConsoleProjection:
-    """Explicit domain-neutral projectors supplied to capability packages."""
-
-    __slots__ = (
-        "_custom",
-        "_path_roots",
-        "_processor",
-        "_resolve_final_or_saved",
-        "_run",
-    )
-
-    def __init__(
-        self,
-        *,
-        run,
-        processor,
-        custom,
-        resolve_final_or_saved,
-        path_roots,
-    ) -> None:
-        for value, name in (
-            (run, "run"),
-            (processor, "processor"),
-            (custom, "custom"),
-            (resolve_final_or_saved, "resolve_final_or_saved"),
-        ):
-            if not callable(value):
-                raise TypeError(f"TaskConsole {name} projector must be callable")
-        self._run = run
-        self._processor = processor
-        self._custom = custom
-        self._resolve_final_or_saved = resolve_final_or_saved
-        self._path_roots = dict(path_roots)
-
-    def run(self, declaration, **kwargs):
-        kwargs["path_roots"] = self._path_roots
-        return self._run(declaration, **kwargs)
-
-    def processor(self, declaration, **kwargs):
-        kwargs["path_roots"] = self._path_roots
-        return self._processor(declaration, **kwargs)
-
-    def custom(self, declaration, **kwargs):
-        kwargs["path_roots"] = self._path_roots
-        return self._custom(declaration, **kwargs)
-
-    def resolve_final_or_saved(self, binding, **kwargs):
-        return self._resolve_final_or_saved(binding, **kwargs)
-
-
 def _require_experiment(value):
     from Zou_lab_control.api.facade import Experiment
 
@@ -85,35 +35,284 @@ def task_console_ports(experiment):
     from zlc_workbench.task_console.artifact_resolution import (
         resolve_final_or_saved_artifact,
     )
+    from zlc_neutral_atom.catalog import ProcessorDefinition
+    from Zou_lab_control.workbench import _build_logic_node_ui
     from zlc_workbench.task_console.declaration_projection import (
-        project_custom_declaration,
         project_processor_declaration,
         project_run_declaration,
     )
-    from Zou_lab_control.api._logic_node_api import (
-        compose_task_console_attachments,
-    )
 
     workspace = experiment._workspace_paths()
+    path_roots = {
+        "pulses": workspace.pulses_root,
+        "tasks": workspace.tasks_root,
+        "output": workspace.output_root,
+    }
+    attachments = []
+    for package, api, dynamic_choices in experiment.nodes._composition_entries():
+        declaration = package.declaration
+
+        bind_request = declaration.bind_request
+        if package.bind_hosted_request is not None:
+            bind_request = (
+                lambda authored, inputs, owner=package.bind_hosted_request,
+                current_api=api: owner(current_api, authored, inputs)
+            )
+
+        resolve_artifact = None
+        if package.resolve_artifact_reference is not None:
+            resolve_artifact = (
+                lambda binding, owner=package.resolve_artifact_reference,
+                current_api=api: owner(
+                    current_api,
+                    binding,
+                    resolve_final_or_saved_artifact,
+                )
+            )
+
+        editor_builder = None
+        if any(
+            value.purpose == "task_console_editor"
+            for value in package.ui_contributions
+        ):
+            editor_builder = (
+                lambda form, contributions=package.ui_contributions: _build_logic_node_ui(
+                    contributions,
+                    "task_console_editor",
+                    form,
+                    pulses_root=workspace.pulses_root,
+                )
+            )
+
+        presenter = package.project_signal_presentation
+        if isinstance(declaration.definition, ProcessorDefinition):
+            attachments.append(
+                project_processor_declaration(
+                    declaration,
+                    prepare=(
+                        lambda request, owner=package.prepare_hosted,
+                        current_api=api: owner(current_api, request, None)
+                    ),
+                    project_signal_presentation=presenter,
+                    dynamic_choices=dynamic_choices,
+                    resolve_artifact_reference=resolve_artifact,
+                    path_roots=path_roots,
+                )
+            )
+            continue
+
+        start_prepared = None
+        if package.start_prepared is not None:
+            start_prepared = (
+                lambda command, live_host, cancel_requested,
+                owner=package.start_prepared: owner(
+                    command,
+                    live_host,
+                    cancel_requested,
+                )
+            )
+        attachments.append(
+            project_run_declaration(
+                declaration,
+                prepare=(
+                    lambda request, event_source, owner=package.prepare_hosted,
+                    current_api=api: owner(current_api, request, event_source)
+                ),
+                bind_request=bind_request,
+                dynamic_choices=dynamic_choices,
+                resolve_artifact_reference=resolve_artifact,
+                start_prepared=start_prepared,
+                editor_builder=editor_builder,
+                path_roots=path_roots,
+                project_signal_presentation=presenter,
+            )
+        )
+
     return TaskConsoleApplicationPorts(
-        attachments=compose_task_console_attachments(
-            experiment.nodes,
-            experiment.device_catalog,
-            _TaskConsoleProjection(
-                run=project_run_declaration,
-                processor=project_processor_declaration,
-                custom=project_custom_declaration,
-                resolve_final_or_saved=resolve_final_or_saved_artifact,
-                path_roots={
-                    "pulses": workspace.pulses_root,
-                    "tasks": workspace.tasks_root,
-                    "output": workspace.output_root,
-                },
-            ),
-        ),
+        attachments=tuple(attachments),
+        data_plane=experiment._signal_data_plane(),
         tasks_root=workspace.tasks_root,
         output_root=workspace.output_root,
     )
+
+
+def open_fit_capable_figure_gui(
+    experiment,
+    display_source,
+    fit_source,
+    *,
+    intent,
+    point_ordinals,
+    preferences,
+    artifact_output,
+    selected_model,
+    initial_fit_spec,
+    initial_selection,
+    open_fit,
+    timeout_seconds,
+    initial_fit_result_identity,
+    direct_fit_single_panel,
+):
+    """Compose the one Figure-owned Fit host from application-owned ports."""
+
+    experiment = _require_experiment(experiment)
+    artifact_operations = experiment._artifact_operations
+    services_owner = experiment._services
+
+    from Zou_lab_control.api._application_services import (
+        fit_service_guard,
+        service_guard,
+    )
+    from Zou_lab_control.api._dataset_sources import project_final_dataset_source
+    from Zou_lab_control.api._figure_projection import data_figure_for_services
+    from zlc_data import FitSpec
+    from zlc_neutral_atom.artifacts import FitExecution
+
+    def source_schema():
+        with service_guard(services_owner):
+            return project_final_dataset_source(
+                artifact_operations,
+                fit_source,
+                materialize=False,
+            ).schema
+
+    def prepare_fit(
+        visible_figure,
+        authority_selection,
+        histogram_projection,
+    ):
+        schema = source_schema()
+        seed_spec = initial_fit_spec
+        if (
+            seed_spec is not None
+            and seed_spec.committed_transform.source_schema_fingerprint
+            != schema.fingerprint
+        ):
+            raise ValueError("initial FitSpec belongs to another source schema")
+        from zlc_frontend import DataFigure, prepare_fit_authoring_options
+
+        if not isinstance(visible_figure, DataFigure):
+            raise TypeError("Figure Fit requires its exact visible DataFigure")
+        layer = visible_figure.document.layers[0]
+        visible_schema = visible_figure.datasets.resolve(layer.dataset_id).block.schema
+        if visible_schema.fingerprint != schema.fingerprint:
+            raise ValueError("visible Figure belongs to another Fit source schema")
+        options = prepare_fit_authoring_options(
+            visible_figure,
+            authority_selection,
+            seed_spec=seed_spec,
+            histogram_projection=histogram_projection,
+        )
+        if not options:
+            raise ValueError(
+                "the displayed named axes and selection have no compatible Fit model"
+            )
+        if selected_model is not None and selected_model not in {
+            option.spec.model_id for option in options
+        }:
+            raise ValueError(
+                f"Fit model {selected_model!r} is not compatible with this panel"
+            )
+        return tuple(options)
+
+    def execute_fit(spec, cancel_check, deadline_monotonic):
+        if not isinstance(spec, FitSpec):
+            raise TypeError("Figure Fit execution requires FitSpec")
+        with fit_service_guard(services_owner) as services:
+
+            def combined_cancel_check() -> bool:
+                with services.operation_lock:
+                    closing = services.state != "OPEN"
+                return closing or bool(cancel_check())
+
+            return services.fit_repository.execute(
+                artifact_operations,
+                fit_source,
+                spec,
+                cancel_check=combined_cancel_check,
+                deadline_monotonic=deadline_monotonic,
+            )
+
+    def save_fit_execution(execution):
+        if not isinstance(execution, FitExecution):
+            raise TypeError("Fit save requires FitExecution")
+        if execution.source_artifact_ref != fit_source:
+            raise ValueError("Fit execution belongs to another source artifact")
+        with service_guard(services_owner):
+            return execution.save()
+
+    def reload_fit_result(reference):
+        admitted = experiment.load_fit(reference)
+        if admitted.source_artifact_ref != fit_source:
+            raise ValueError("saved Fit reopened against another source artifact")
+        return admitted.result
+
+    if direct_fit_single_panel and display_source != fit_source:
+        raise ValueError(
+            "direct Fit single-panel display requires its exact source artifact"
+        )
+
+    def figure_factory(source, *, intent, point_ordinals, preferences):
+        if direct_fit_single_panel and source != fit_source:
+            raise ValueError("direct Fit Figure loader received another source")
+        with service_guard(services_owner) as services:
+            figure, figure_intent = data_figure_for_services(
+                services,
+                artifact_operations,
+                source,
+                intent=intent,
+                point_ordinals=point_ordinals,
+                preferences=preferences,
+                artifact_output=(
+                    None if direct_fit_single_panel else artifact_output
+                ),
+            )
+        if not direct_fit_single_panel:
+            return figure, figure_intent
+        from zlc_frontend.fit_projection import (
+            evaluated_figure_panels,
+            panel_focus_address,
+        )
+
+        panels = evaluated_figure_panels(figure.evaluated)
+        if len(panels) <= 1:
+            return figure, figure_intent
+        layer, cell, series_group = panels[0]
+        focused = figure.focused_typed_panel(
+            0,
+            expected_address=panel_focus_address(layer, cell, series_group),
+            expected_intent=figure.document.layers[0].view.intent,
+        )
+        from zlc_frontend.plot_panel import figure_intent_from_view
+
+        return focused, figure_intent_from_view(
+            focused.document.layers[0].view,
+            title=figure_intent.title,
+            value_label=figure_intent.value_label,
+        )
+
+    def compose():
+        from Zou_lab_control.workbench import open_figure_workbench
+
+        return open_figure_workbench(
+            figure_factory,
+            display_source,
+            output_root=experiment._workspace_paths().output_root,
+            intent=intent,
+            point_ordinals=point_ordinals,
+            preferences=preferences,
+            fit_preparer=prepare_fit,
+            fit_executor=execute_fit,
+            fit_saver=save_fit_execution,
+            fit_reloader=reload_fit_result,
+            fit_selected_model=selected_model,
+            fit_initial_selection=initial_selection,
+            open_fit=open_fit,
+            fit_timeout_seconds=timeout_seconds,
+            initial_fit_result_identity=initial_fit_result_identity,
+        )
+
+    return experiment._open_workbench_handle(None, compose)
 
 
 def standalone_pulse_connection_factory(workspace):
@@ -181,12 +380,15 @@ def bound_pulse_mode(experiment) -> str:
     """Project the immutable installation backend into PulseGUI's mode choice."""
 
     experiment = _require_experiment(experiment)
-    backend = experiment.installation_config.backend
-    if backend == "virtual":
-        return "virtual"
-    if backend == "remote_pulse":
-        return "remote"
-    raise ValueError(f"unsupported Pulse installation backend {backend!r}")
+    from zlc_neutral_atom.installation_package import installation_package
+
+    package = installation_package(experiment.installation_config.backend)
+    mode = package.pulse_editor_mode
+    if mode is None:
+        raise ValueError(
+            f"installation backend {package.backend!r} has no Pulse editor mode"
+        )
+    return mode
 
 
 class ExperimentDeviceAdmin:

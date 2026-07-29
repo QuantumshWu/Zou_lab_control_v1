@@ -7,7 +7,6 @@ from .causal import (
 )
 from .hosted_processor import (
     HostedProcessor,
-    HostedProcessorSource,
     ProcessorPublication,
 )
 from .signal_plane import (
@@ -17,7 +16,6 @@ from .signal_plane import (
     SignalFront,
     SignalProducer,
     SignalValue,
-    signal_revision_identity,
 )
 
 __all__ = [
@@ -25,7 +23,6 @@ __all__ = [
     "derive_dataset_event_digest",
     "DerivedSignalOutput",
     "HostedProcessor",
-    "HostedProcessorSource",
     "LatestProcessorControl",
     "ProcessorPublication",
     "require_causal_processor_evaluation",
@@ -33,5 +30,4 @@ __all__ = [
     "SignalFront",
     "SignalProducer",
     "SignalValue",
-    "signal_revision_identity",
 ]

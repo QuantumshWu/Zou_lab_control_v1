@@ -1,10 +1,8 @@
 import ast
-from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import subprocess
 import sys
-import threading
 import time
 from types import SimpleNamespace
 
@@ -112,7 +110,14 @@ def test_immutable_site_state_rejects_wrong_dtype_or_shape():
 
 
 def _site_map_image(values):
-    from zlc_data import AxisId, AxisSpec, CoordinateFrameId, SPATIAL_X, SPATIAL_Y
+    from zlc_data import (
+        AxisId,
+        AxisSourceRef,
+        AxisSpec,
+        CoordinateFrameId,
+        SPATIAL_X,
+        SPATIAL_Y,
+    )
     from zlc_frontend.figure import EvaluatedAxis, EvaluatedImage
     from zlc_frontend.image_view import ImageViewportTransform
 
@@ -126,11 +131,11 @@ def _site_map_image(values):
         (0.0, 1.0), unit="pixel", coordinate_frame=frame,
     )
     x_axis = EvaluatedAxis(
-        x_spec.axis_id, "x", SPATIAL_X, "pixel",
+        AxisSourceRef.tensor(x_spec.axis_id), "x", SPATIAL_X, "pixel",
         (0, 1), (0.0, 1.0), frame,
     )
     y_axis = EvaluatedAxis(
-        y_spec.axis_id, "y", SPATIAL_Y, "pixel",
+        AxisSourceRef.tensor(y_spec.axis_id), "y", SPATIAL_Y, "pixel",
         (0, 1), (0.0, 1.0), frame,
     )
     values = np.asarray(values, dtype=np.uint8)
@@ -335,73 +340,53 @@ def test_site_map_composer_persists_named_renderer_and_scans_each_image_once(
     assert compose_calls[5]["previous_relim_mode"] is RelimMode.NORMAL
 
 
-@pytest.mark.parametrize("release_fails", (False, True))
-def test_occupancy_window_releases_composer_as_its_last_worker_job(
-    monkeypatch,
-    release_fails,
-):
+def test_occupancy_window_delegates_to_generic_figure_surface_and_closes():
     import zlc_neutral_atom.logic_nodes.readout.occupancy.ui.workbench_window as module
-    from zlc_frontend.qt_widgets import ensure_qt_app
+    from zlc_frontend.qt_widgets import (
+        FigureSurfaceHost,
+        FigureSurfaceLane,
+        ensure_qt_app,
+    )
     from zlc_neutral_atom.logic_nodes.readout.occupancy.reference import (
         OccupancyArtifactRef,
     )
 
     application = ensure_qt_app()
-    worker_threads = []
-    close_threads = []
-    composer_options = []
-
-    class FakeComposer:
-        def __init__(self, panel_id, **options):
-            composer_options.append((panel_id, options))
-
-        def close(self):
-            close_threads.append(threading.get_ident())
-            if release_fails:
-                raise RuntimeError("injected renderer close failure")
 
     def invalid_navigation_loader(_reference):
-        worker_threads.append(threading.get_ident())
         return object()
 
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="site-map-test")
-    monkeypatch.setattr(module, "RASTER_WORK_EXECUTOR", executor)
-    monkeypatch.setattr(module, "SiteMapComposer", FakeComposer)
     window = module.OccupancyCellWindow(
         invalid_navigation_loader,
         lambda *_args, **_kwargs: None,
         OccupancyArtifactRef("test", "a" * 64),
-        selection=None,
+        address=None,
     )
-    payload_dispatches = []
-    accept_payload = window._accept_finished_future
-
-    def observed_payload_dispatch(future):
-        payload_dispatches.append(future)
-        return accept_payload(future)
-
-    window._accept_finished_future = observed_payload_dispatch
     try:
-        target_ratio = window._surface_geometry.pixel_ratio + 0.5
-        window._apply_surface_pixel_ratio(target_ratio)
-        assert window._surface_revision == 1
-        assert window._surface_geometry.pixel_ratio == target_ratio
+        deadline = time.monotonic() + 3.0
+        while not window.worker_idle and time.monotonic() < deadline:
+            application.processEvents()
+        assert window.worker_idle
+        assert window._status.text() == "OCCUPANCY CELL FAILED"
+        assert isinstance(window._surface_host, FigureSurfaceHost)
+        assert isinstance(window._surface_lane, FigureSurfaceLane)
+
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        for retired_owner in (
+            "SiteMapComposer",
+            "SinglePanelHost",
+            "RasterPixelRatioObserver",
+            "FluentRevisionedFormEditor",
+        ):
+            assert retired_owner not in source
+
         window.shutdown()
         deadline = time.monotonic() + 3.0
         while not window.closed and time.monotonic() < deadline:
             application.processEvents()
         application.processEvents()
         assert window.closed
-        assert worker_threads
-        assert close_threads == [worker_threads[0]]
-        assert len(payload_dispatches) == 1
-        panel_id, options = composer_options[0]
-        assert panel_id == "sites"
-        assert options["board_id"] == "occupancy-cell"
-        geometry = options["surface_geometry"]
-        assert geometry.size_name == "2x2"
-        assert geometry.pixel_ratio > 0.0
+        assert window._surface_lane.shutdown_complete
     finally:
         if not window.closed:
             window.shutdown()
-        executor.shutdown(wait=True)

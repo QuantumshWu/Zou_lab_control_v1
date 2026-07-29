@@ -39,10 +39,12 @@ from zlc_neutral_atom.devices.sequencer.port import (
     SimulatedPulseReceipt,
 )
 from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.logic_nodes.camera_measurement import (
+from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
     CAMERA_MEASUREMENT_KEY,
-    CameraMonitorViewSpec,
     camera_frame_output_declarations,
+)
+from zlc_neutral_atom.logic_nodes.camera_measurement.monitor import (
+    CameraMonitorViewSpec,
 )
 from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
     CameraMeasurementRequest,
@@ -55,7 +57,9 @@ from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSlotSegmentedProgram,
     AutonomousScanSlotProgram,
 )
-from zlc_neutral_atom.pulse_catalog import PROBE_PULSE_PATH
+from zlc_neutral_atom.logic_nodes.pulse_scan.authoring import (
+    DEFAULT_PULSE_SCAN_PULSE_PATH,
+)
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
     OCCUPANCY_LIVE_OUTPUT_DECLARATIONS,
 )
@@ -689,7 +693,9 @@ def test_occupancy_scan_artifact_round_trips_expandable_same_shot_lineage(
 def test_api_segmented_scan_uses_one_terminal_bound_association_per_cell(
     tmp_path,
 ) -> None:
-    document = load_pulse_document(ROOT / "pulses" / PROBE_PULSE_PATH)
+    document = load_pulse_document(
+        ROOT / "pulses" / DEFAULT_PULSE_SCAN_PULSE_PATH
+    )
     program = ApiSlotSegmentedProgram(
         document,
         ApiSegmentTable(

@@ -25,6 +25,7 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     calibration_analysis_authoring_schema,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
+from zlc_neutral_atom.logic_nodes.readout.occupancy.reference import OccupancyArtifactRef
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
 
 
@@ -42,7 +43,7 @@ def calibration_product(tmp_path_factory):
     with zlc.connect(
         "virtual",
         workspace=zlc.WorkspacePaths.for_workspace(
-            (workspace / "authored").resolve(),
+            ROOT,
             repository_root=workspace.resolve(),
         ),
     ) as experiment:
@@ -83,7 +84,14 @@ def test_calibration_owner_presenter_and_public_imports_remain_headless() -> Non
                 "import sys\n"
                 "import zlc_neutral_atom.logic_nodes.readout.calibration.calibration\n"
                 "import zlc_neutral_atom.logic_nodes.readout.calibration.declaration\n"
-                "import zlc_neutral_atom.logic_nodes.readout.calibration.workbench_adapter\n"
+                "from zlc_neutral_atom.logic_node_package import "
+                "discover_logic_node_packages\n"
+                "packages = discover_logic_node_packages()\n"
+                "calibration = next(value for value in packages "
+                "if value.api_name == 'calibration')\n"
+                "assert calibration.ui_contributions\n"
+                "assert not any(value.module in sys.modules "
+                "for value in calibration.ui_contributions)\n"
                 "import zlc_frontend.form\n"
                 "for prefix in ('PyQt5', 'matplotlib', 'scipy'):\n"
                 "    assert not any(\n"
@@ -347,15 +355,13 @@ def test_typed_reference_without_commit_evidence_is_not_admitted_as_final(
         window._run_active = True
         window._run_revision = window._editor_revision
         snapshot = RunSnapshot(
-            RunId("synthetic-uncommitted-calibration"),
-            RunState.SUCCEEDED,
-            "terminal",
-            False,
-            None,
-            None,
-            None,
-            (),
-            None,
+            run_id=RunId("synthetic-uncommitted-calibration"),
+            state=RunState.SUCCEEDED,
+            phase="terminal",
+            final_committed=False,
+            commit_publication_warning=None,
+            primary_error=None,
+            cleanup_errors=(),
         )
         window._record_terminal_warnings = lambda: snapshot
         future = Future()
@@ -417,3 +423,49 @@ def test_stop_before_finalize_publishes_no_calibration(
     finally:
         release.set()
         _close(application, window)
+
+
+def test_experiment_close_retires_lazy_calibration_and_occupancy_windows(
+    application,
+    tmp_path,
+) -> None:
+    """Leaf GUI descriptors borrow exactly the owning Experiment lifetime."""
+
+    experiment = zlc.connect(
+        "virtual",
+        workspace=zlc.WorkspacePaths.for_workspace(
+            ROOT,
+            repository_root=tmp_path.resolve(),
+        ),
+    )
+    closed = False
+    try:
+        calibration = CalibrationArtifactRef(
+            "lazy-ui-lifecycle",
+            "a" * 64,
+        )
+        occupancy = OccupancyArtifactRef(
+            "lazy-ui-lifecycle",
+            "b" * 64,
+        )
+
+        calibration_window = (
+            experiment.nodes.calibration.calibration_report_gui(calibration)
+        )
+        occupancy_window = experiment.nodes.occupancy.occupancy_cell_gui(occupancy)
+        _until(
+            application,
+            lambda: calibration_window.isVisible()
+            and occupancy_window.isVisible(),
+            timeout=15.0,
+        )
+
+        experiment.close()
+        closed = True
+        assert calibration_window.permanently_closed
+        assert occupancy_window.permanently_closed
+        assert not calibration_window.isVisible()
+        assert not occupancy_window.isVisible()
+    finally:
+        if not closed:
+            experiment.close()

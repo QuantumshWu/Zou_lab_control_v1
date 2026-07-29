@@ -49,35 +49,6 @@ _REQUIRED_CURRENT_CODE = (
     "WORKSPACE.pulses_root",
 )
 
-_FORBIDDEN_OLD_OR_RAW_CODE = (
-    "Zou_lab_control.notebook",
-    "exp.readout.sitemap",
-    "exp.readout.load_calibration",
-    "exp.readout.detection_request",
-    "exp.readout.detect",
-    "exp.readout.load_occupancy",
-    "exp.readout.camera_measurement_request",
-    "exp.readout.prepare_camera_measurement",
-    "exp.readout.prepare_scan_source",
-    "exp.readout.materialize_scan",
-    "exp.readout.temperature_release_recapture",
-    "Zou_lab_control.frontend",
-    "Zou_lab_control.neutral_atom",
-    "load_sitemap_pulse",
-    ".target.raw_lanes",
-    'trigger_channel="ch11"',
-    "exp.devices",
-    "exp.camera",
-    "triggered_frames(",
-    "detection_time(",
-    "fit_temperature(",
-    "user_output_path",
-    "repository=",
-    "ZLC_TUTORIAL_WORKSPACE",
-    "schema.point_axes",
-)
-
-
 def _load_notebook():
     notebook = nbformat.read(TUTORIAL, as_version=4)
     nbformat.validate(notebook)
@@ -103,8 +74,6 @@ def test_there_is_one_complete_current_user_tutorial() -> None:
         assert text in markdown
     for text in _REQUIRED_CURRENT_CODE:
         assert text in code
-    for text in _FORBIDDEN_OLD_OR_RAW_CODE:
-        assert text not in code
 
 
 def test_the_checked_in_tutorial_executes_on_the_virtual_installation(

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import math
 from types import MappingProxyType
 
-from zlc_storage import canonical_text, nonnegative_integer
+from zlc_storage import canonical_text
 
 
 def _positive_pair(value: object, field: str) -> tuple[int, int]:
@@ -131,8 +131,6 @@ class DeviceInfo:
     domain: str
     adapter_kind: str
     resource_key: str
-    availability: str = "available"
-    health: str = "healthy"
 
     def __post_init__(self) -> None:
         if not isinstance(self.ref, DeviceRef):
@@ -141,8 +139,6 @@ class DeviceInfo:
             "domain",
             "adapter_kind",
             "resource_key",
-            "availability",
-            "health",
         ):
             object.__setattr__(
                 self,
@@ -160,8 +156,6 @@ class DeviceInfo:
             "domain": self.domain,
             "adapter_kind": self.adapter_kind,
             "resource_key": self.resource_key,
-            "availability": self.availability,
-            "health": self.health,
         }
 
 
@@ -171,7 +165,6 @@ class DeviceCatalogView(Mapping[str, DeviceInfo]):
     __slots__ = (
         "_installation_id",
         "_runtime_instance_id",
-        "_revision",
         "_items",
     )
 
@@ -179,7 +172,6 @@ class DeviceCatalogView(Mapping[str, DeviceInfo]):
         self,
         installation_id: str,
         runtime_instance_id: str,
-        revision: int,
         items: tuple[DeviceInfo, ...],
     ) -> None:
         self._installation_id = canonical_text(
@@ -190,7 +182,6 @@ class DeviceCatalogView(Mapping[str, DeviceInfo]):
             runtime_instance_id,
             "runtime_instance_id",
         )
-        self._revision = nonnegative_integer(revision, "revision")
         by_role: dict[str, DeviceInfo] = {}
         for item in tuple(items):
             if not isinstance(item, DeviceInfo):
@@ -222,10 +213,6 @@ class DeviceCatalogView(Mapping[str, DeviceInfo]):
     def runtime_instance_id(self) -> str:
         return self._runtime_instance_id
 
-    @property
-    def revision(self) -> int:
-        return self._revision
-
     def find(self, role: str) -> DeviceInfo | None:
         return self._items.get(str(role))
 
@@ -250,7 +237,6 @@ class DeviceCatalogView(Mapping[str, DeviceInfo]):
         return {
             "installation_id": self._installation_id,
             "runtime_instance_id": self._runtime_instance_id,
-            "revision": self._revision,
             "devices": [item.to_dict() for item in self._items.values()],
         }
 

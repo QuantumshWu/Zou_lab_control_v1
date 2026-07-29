@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from zlc_neutral_atom.artifact_dispatch import ArtifactCapability
-from zlc_neutral_atom.logic_node_package import LogicNodePackage
-from zlc_storage.paths import resolve_under
+from zlc_neutral_atom.logic_node_package import (
+    LogicNodePackage,
+    UiContributionDescriptor,
+)
 
 from .api import PulseScanApi
 from .application import prepare_exact_scan
@@ -18,12 +20,17 @@ from .reference import (
 from .repository import ScanRepository
 
 
-def _bind_api(host: object, _dependencies: tuple[object, ...]) -> PulseScanApi:
-    operations = host._logic_node_operations()
-    repository = ScanRepository(operations.repository_root / "scans")
-    pulse_port = operations.pulse_port
-    start_run = operations.start_run
-    resolve_sequencer_ref = host.resolve_readout_sequencer_ref
+def _bind_api(
+    facts: tuple[object, ...],
+    _dependencies: tuple[object, ...],
+) -> PulseScanApi:
+    (
+        repository_root,
+        resolve_sequencer_ref,
+        pulse_port,
+        start_run,
+    ) = facts
+    repository = ScanRepository(repository_root / "scans")
 
     def prepare(request, source, sequencer_role):
         sequencer_ref = resolve_sequencer_ref(sequencer_role)
@@ -37,7 +44,6 @@ def _bind_api(host: object, _dependencies: tuple[object, ...]) -> PulseScanApi:
 
     return PulseScanApi(
         repository,
-        pulses_root=operations.pulses_root,
         prepare=prepare,
     )
 
@@ -46,30 +52,17 @@ def _close_api(api: PulseScanApi) -> tuple[Exception, ...]:
     return api.close()
 
 
-def _bind_task_console(api: PulseScanApi, _catalog: object, projection):
-    from zlc_pulse import describe_pulse_template
+def _prepare_hosted(api, request, event_source):
+    if event_source is None:
+        raise ValueError("PulseScan requires one exact event-associated source")
+    return api.prepare_scan_source(request, event_source)
 
-    from .authoring import build_pulse_scan_program
-    from .ui.task_console import pulse_scan_task_console_adapter
 
-    def resolve_values(values):
-        normalized = dict(values)
-        normalized["pulse"] = str(
-            resolve_under(api._pulses_root, normalized["pulse"])
-        )
-        return normalized
-
-    return pulse_scan_task_console_adapter(
-        prepare=api.prepare_scan_source,
-        read_pulse_template=lambda path: describe_pulse_template(
-            resolve_under(api._pulses_root, path)
-        ),
-        build_request=lambda values: build_pulse_scan_program(
-            resolve_values(values)
-        ),
-        pulses_root=api._pulses_root,
-        project_custom=projection.custom,
-    )
+def _availability(catalog, _apparatus):
+    sequencer = catalog.find("sequencer")
+    if sequencer is None or sequencer.domain != "sequencer":
+        return "PulseScan requires the installed Sequencer role"
+    return None
 
 
 def _bind_artifact_capabilities(
@@ -91,9 +84,23 @@ def _bind_artifact_capabilities(
 LOGIC_NODE_PACKAGE = LogicNodePackage(
     api_name="pulse_scan",
     declaration=PULSE_SCAN_LOGIC_NODE,
+    api_requirements=(
+        "repository_root",
+        "resolve_sequencer_ref",
+        "pulse_port",
+        "start_run",
+    ),
     bind_api=_bind_api,
-    bind_task_console=_bind_task_console,
-    task_console_order=80,
+    prepare_hosted=_prepare_hosted,
+    availability=_availability,
+    ui_contributions=(
+        UiContributionDescriptor(
+            "task_console_editor",
+            "zlc_neutral_atom.logic_nodes.pulse_scan.ui."
+            "task_console_parameter_form",
+            "task_console_editor",
+        ),
+    ),
     close_api=_close_api,
     bind_artifact_capabilities=_bind_artifact_capabilities,
 )

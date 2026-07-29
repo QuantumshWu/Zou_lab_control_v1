@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import pytest
 
+from Zou_lab_control.api._application_services import (
+    ExperimentServices,
+    WorkspacePaths,
+    application_start_run,
+)
+from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
 from zlc_neutral_atom.runtime._failure import detach_failure, safe_error_summary
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.commit import PreparedArtifactCommit
+from zlc_neutral_atom.runtime.cancellation import CancellationRequested
 from zlc_neutral_atom.runtime.ports import (
     BoundDevice,
     DeviceBroker,
@@ -26,6 +34,7 @@ from zlc_neutral_atom.runtime.resources import (
     ResourceBusy,
     ResourceClaim,
     ResourceKey,
+    ResourceLease,
 )
 from zlc_neutral_atom.runtime.run import (
     CancelOutcome,
@@ -213,6 +222,263 @@ def commit_final(
     return context.commit_final(operation)
 
 
+class _AdmissionRuntime:
+    """Real RunController with one deterministic post-release test hook."""
+
+    def __init__(self) -> None:
+        self.resources = ResourceArbiter()
+        self.controller = RunController(self.resources)
+        self.after_release = None
+
+    def start(self, plan: RunPlan):
+        return self.controller.start(plan)
+
+    def wait_until_released(
+        self,
+        run_ids: tuple[str, ...],
+        *,
+        timeout: float | None = None,
+    ) -> bool:
+        released = self.resources.wait_until_released(run_ids, timeout=timeout)
+        callback = self.after_release
+        if released and callback is not None:
+            self.after_release = None
+            callback()
+        return released
+
+    def shutdown(self) -> None:
+        assert self.controller.shutdown(2.0)
+        self.resources.shutdown()
+
+
+@contextmanager
+def _admission_environment(tmp_path):
+    runtime = _AdmissionRuntime()
+    plane = SignalDataPlane()
+    drained = threading.Event()
+    drained.set()
+    services = ExperimentServices(
+        workspace_paths=WorkspacePaths.for_workspace(
+            tmp_path.resolve(),
+            repository_root=tmp_path.resolve(),
+        ),
+        installation=object(),
+        runtime=runtime,
+        capture_repository=object(),
+        fit_repository=object(),
+        catalog=object(),
+        installation_config=object(),
+        pulse_application=object(),
+        signal_plane=plane,
+        operation_lock=threading.RLock(),
+        admission_lock=threading.RLock(),
+        operations_drained=drained,
+        operation_thread_counts={},
+        active_runs={},
+        gui_handles={},
+    )
+    try:
+        yield services, runtime
+    finally:
+        plane.close()
+        runtime.shutdown()
+
+
+def _admission_plan(
+    name: str,
+    owner: object,
+    claims: tuple[ResourceClaim, ...],
+    *,
+    preemptible: bool,
+) -> RunPlan:
+    def execute(context, prepared):
+        context.cancellation.wait_requested()
+        return prepared
+
+    return RunPlan(
+        name=name,
+        resource_claims=claims,
+        bound_devices=(),
+        preflight=lambda _context: name,
+        execute=execute,
+        cleanup=lambda _context, _prepared, _primary: CleanupReport.complete(),
+        finalize=lambda _context, executed: executed,
+    ).with_lifecycle(owner, preemptible=preemptible)
+
+
+def _start_admission_run(
+    services: ExperimentServices,
+    name: str,
+    claims: tuple[ResourceClaim, ...],
+    *,
+    preemptible: bool,
+):
+    handle = application_start_run(
+        services,
+        _admission_plan(name, object(), claims, preemptible=preemptible),
+    )
+    wait_snapshot(handle, lambda item: item.state is RunState.RUNNING)
+    return handle
+
+
+@pytest.mark.parametrize("second_preemptible", (False, True))
+def test_application_retires_every_blocker_or_none(
+    tmp_path,
+    second_preemptible: bool,
+) -> None:
+    first_claim = ResourceClaim(ResourceKey.parse("application/camera"))
+    second_claim = ResourceClaim(ResourceKey.parse("application/sequencer"))
+    with _admission_environment(tmp_path) as (services, _runtime):
+        first = _start_admission_run(
+            services,
+            f"first-plan-{second_preemptible}",
+            (first_claim,),
+            preemptible=True,
+        )
+        second = _start_admission_run(
+            services,
+            f"second-plan-{second_preemptible}",
+            (second_claim,),
+            preemptible=second_preemptible,
+        )
+        candidate_plan = _admission_plan(
+            f"candidate-plan-{second_preemptible}",
+            object(),
+            (first_claim, second_claim),
+            preemptible=False,
+        )
+
+        if not second_preemptible:
+            with pytest.raises(RunStartRejected) as rejected:
+                application_start_run(services, candidate_plan)
+            assert {item.conflicting_run_id for item in rejected.value.blockers} == {
+                first.run_id.value,
+                second.run_id.value,
+            }
+            assert first.snapshot().state is RunState.RUNNING
+            assert second.snapshot().state is RunState.RUNNING
+        else:
+            candidate = _start_admission_run(
+                services,
+                candidate_plan.name,
+                candidate_plan.resource_claims,
+                preemptible=False,
+            )
+            assert first.wait(2.0).state is RunState.CANCELLED
+            assert second.wait(2.0).state is RunState.CANCELLED
+            candidate.cancel("test cleanup")
+            assert candidate.wait(2.0).state is RunState.CANCELLED
+
+        first.cancel("test cleanup")
+        second.cancel("test cleanup")
+        assert first.wait(2.0).state is RunState.CANCELLED
+        assert second.wait(2.0).state is RunState.CANCELLED
+
+
+def test_cancel_during_retirement_never_starts_the_candidate(tmp_path) -> None:
+    claim = (ResourceClaim(ResourceKey.parse("application/camera")),)
+    with _admission_environment(tmp_path) as (services, runtime):
+        old = _start_admission_run(
+            services,
+            "retiring-plan",
+            claim,
+            preemptible=True,
+        )
+        release_reached = threading.Event()
+        continue_admission = threading.Event()
+
+        def pause_before_final_admission() -> None:
+            release_reached.set()
+            assert continue_admission.wait(2.0)
+
+        runtime.after_release = pause_before_final_admission
+        cancelled = threading.Event()
+        failures: list[BaseException] = []
+        candidate_plan = _admission_plan(
+            "cancelled-candidate-plan",
+            object(),
+            claim,
+            preemptible=False,
+        )
+
+        def admit_candidate() -> None:
+            try:
+                application_start_run(
+                    services,
+                    candidate_plan,
+                    cancel_requested=cancelled.is_set,
+                )
+            except BaseException as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=admit_candidate, daemon=False)
+        worker.start()
+        assert release_reached.wait(2.0)
+        cancelled.set()
+        continue_admission.set()
+        worker.join(2.0)
+        assert not worker.is_alive()
+        assert old.wait(2.0).state is RunState.CANCELLED
+        assert len(failures) == 1
+        assert isinstance(failures[0], CancellationRequested)
+
+        probe = _start_admission_run(
+            services,
+            "post-cancel-probe",
+            claim,
+            preemptible=False,
+        )
+        probe.cancel("test cleanup")
+        assert probe.wait(2.0).state is RunState.CANCELLED
+
+
+def test_a_new_racer_rejects_the_frozen_plan_once(tmp_path) -> None:
+    claim = (ResourceClaim(ResourceKey.parse("application/camera")),)
+    with _admission_environment(tmp_path) as (services, runtime):
+        old = _start_admission_run(
+            services,
+            "old-plan",
+            claim,
+            preemptible=True,
+        )
+
+        racers = []
+
+        def admit_racer() -> None:
+            racers.append(
+                _start_admission_run(
+                    services,
+                    "racer-plan",
+                    claim,
+                    preemptible=True,
+                )
+            )
+
+        runtime.after_release = admit_racer
+        with pytest.raises(RunStartRejected) as rejected:
+            application_start_run(
+                services,
+                _admission_plan(
+                    "raced-candidate-plan",
+                    object(),
+                    claim,
+                    preemptible=False,
+                ),
+            )
+
+        assert old.wait(2.0).state is RunState.CANCELLED
+        assert len(racers) == 1
+        racer = racers[0]
+        assert rejected.value.blockers == (
+            ResourceBusy(claim[0], racer.run_id.value, claim[0]),
+        )
+        # The final racer is preemptible; remaining RUNNING proves there was
+        # no hidden second retirement/retry pass.
+        assert racer.snapshot().state is RunState.RUNNING
+        racer.cancel("test cleanup")
+        assert racer.wait(2.0).state is RunState.CANCELLED
+
+
 def test_run_plan_has_distinct_prepared_executed_and_final_values(tmp_path):
     item = device_fixture("typed-values")
     runtime, arbiter = controller(tmp_path)
@@ -232,12 +498,13 @@ def test_run_plan_has_distinct_prepared_executed_and_final_values(tmp_path):
         observations.append("finalize")
         return "final"
 
-    result = runtime.start(
+    handle = runtime.start(
         plan(item, preflight=preflight, execute=execute, finalize=finalize)
-    ).result(2.0)
+    )
+    result = handle.result(2.0)
     assert result == "final"
     assert observations == ["preflight", "execute", "finalize"]
-    assert not arbiter._active
+    assert arbiter.wait_until_released((handle.run_id.value,), timeout=0.0)
     close_runtime(runtime, arbiter, item)
 def test_resource_claim_is_held_until_cleanup_finishes(tmp_path):
     item = device_fixture("claim")
@@ -252,13 +519,19 @@ def test_resource_claim_is_held_until_cleanup_finishes(tmp_path):
 
     handle = runtime.start(plan(item, cleanup=cleanup))
     assert cleanup_entered.wait(1.0)
-    assert arbiter._active
+    assert not arbiter.wait_until_released((handle.run_id.value,), timeout=0.0)
     with pytest.raises(RunStartRejected) as caught:
         runtime.start(plan(item))
-    assert isinstance(caught.value.outcome, ResourceBusy)
+    assert caught.value.blockers == (
+        ResourceBusy(
+            ResourceClaim(item.key),
+            handle.run_id.value,
+            ResourceClaim(item.key),
+        ),
+    )
     cleanup_release.set()
     assert handle.result(2.0) == "prepared"
-    assert not arbiter._active
+    assert arbiter.wait_until_released((handle.run_id.value,), timeout=0.0)
     close_runtime(runtime, arbiter, item)
 
 
@@ -275,7 +548,7 @@ def test_resource_claim_is_released_before_blocked_finalize(tmp_path):
 
     first = runtime.start(plan(item, finalize=finalize))
     assert finalize_entered.wait(1.0)
-    assert not arbiter._active
+    assert arbiter.wait_until_released((first.run_id.value,), timeout=0.0)
 
     second = runtime.start(plan(item))
     assert second.result(2.0) == "prepared"
@@ -615,7 +888,7 @@ def test_commit_inspection_wait_does_not_hold_device_or_republish(tmp_path):
     )
     wait_snapshot(first, lambda value: value.phase == "commit-inspection-pending")
     assert publish_calls == 1
-    assert not arbiter._active
+    assert arbiter.wait_until_released((first.run_id.value,), timeout=0.0)
 
     second = runtime.start(plan(item))
     assert second.result(2.0) == "prepared"
@@ -809,5 +1082,10 @@ def test_owner_thread_start_failure_releases_unarmed_claim(tmp_path, monkeypatch
     monkeypatch.setattr(threading.Thread, "start", fail_owner_start)
     with pytest.raises(RuntimeError, match="owner thread failed to start"):
         runtime.start(plan(item))
-    assert not arbiter._active
+    probe = arbiter.acquire_all(
+        "post-start-failure-probe",
+        (ResourceClaim(item.key),),
+    )
+    assert isinstance(probe, ResourceLease)
+    assert probe.release()
     close_runtime(runtime, arbiter, item)

@@ -7,7 +7,7 @@ import pathlib
 
 import pytest
 
-from zlc_neutral_atom.logic_nodes.camera_measurement import (
+from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
     CAMERA_MEASUREMENT_LOGIC_NODE,
 )
 from zlc_neutral_atom.logic_nodes.readout.occupancy.declaration import (
@@ -15,6 +15,7 @@ from zlc_neutral_atom.logic_nodes.readout.occupancy.declaration import (
 )
 from zlc_neutral_atom.catalog import definition_key_to_tree
 from zlc_neutral_atom.logic_node_declaration import OutputPresentation
+from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
 from zlc_workbench.task_console.application_ports import TaskConsoleApplicationPorts
 from zlc_workbench.task_console.catalog_bridge import ConsoleCatalogView
 from zlc_workbench.task_console.declaration_projection import (
@@ -36,8 +37,10 @@ def _ports_and_view(
     attachments = (
         project_run_declaration(
             CAMERA_MEASUREMENT_LOGIC_NODE,
-            prepare=lambda intent: intent,
-            dynamic_choice_context=("camera", "mot_camera"),
+            prepare=lambda intent, event_source: intent,
+            dynamic_choices=CAMERA_MEASUREMENT_LOGIC_NODE.resolve_dynamic_choices(
+                ("camera", "mot_camera")
+            ),
             path_roots=path_roots,
         ),
         project_processor_declaration(
@@ -49,6 +52,7 @@ def _ports_and_view(
     )
     ports = TaskConsoleApplicationPorts(
         attachments=attachments,
+        data_plane=SignalDataPlane(),
         tasks_root=root / "tasks",
         output_root=root / "output",
     )
@@ -78,8 +82,10 @@ def test_every_supplied_attachment_projects_once_with_definition_owned_kind(
 def test_application_ports_reject_duplicate_definition_keys(tmp_path) -> None:
     attachment = project_run_declaration(
         CAMERA_MEASUREMENT_LOGIC_NODE,
-        prepare=lambda intent: intent,
-        dynamic_choice_context=("camera",),
+        prepare=lambda intent, event_source: intent,
+        dynamic_choices=CAMERA_MEASUREMENT_LOGIC_NODE.resolve_dynamic_choices(
+            ("camera",)
+        ),
         path_roots={
             "output": tmp_path / "output",
             "tasks": tmp_path / "tasks",
@@ -88,6 +94,7 @@ def test_application_ports_reject_duplicate_definition_keys(tmp_path) -> None:
     with pytest.raises(ValueError, match="duplicate TaskConsole attachment"):
         TaskConsoleApplicationPorts(
             attachments=(attachment, attachment),
+            data_plane=SignalDataPlane(),
             tasks_root=tmp_path / "tasks",
             output_root=tmp_path / "output",
         )

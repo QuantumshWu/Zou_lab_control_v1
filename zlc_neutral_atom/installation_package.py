@@ -13,12 +13,15 @@ from dataclasses import dataclass
 from functools import cache
 from importlib import import_module
 from pkgutil import walk_packages
+from typing import TYPE_CHECKING
 
-from zlc_neutral_atom.installation_runtime import _InstallationComposition
 from zlc_neutral_atom.authoring import AuthoringSchema
 from zlc_neutral_atom.installation_plan import InstallationDevicePlan
-from zlc_pulse import PulseDocument
 from zlc_storage import canonical_text
+
+if TYPE_CHECKING:
+    from zlc_neutral_atom.installation_runtime import _InstallationComposition
+    from zlc_pulse import PulseDocument
 
 
 @dataclass(frozen=True, slots=True)
