@@ -45,7 +45,11 @@ from zlc_frontend.figure.evaluate import (
     ResolvedDataset,
     ResolvedDatasetMap,
 )
-from zlc_frontend.figure.grid import resolve_grid_view
+from zlc_frontend.figure.grid import (
+    grid_facet_sources,
+    resolve_grid_view,
+    suggest_default_grid_view,
+)
 from zlc_frontend.figure.model import (
     AxisViewRole,
     DatasetDescriptor,
@@ -401,6 +405,133 @@ def test_explicit_f_order_grid_recovers_image_before_repeat_mean():
     image = only_series(evaluated_data(block, suggestion.spec)).data
     np.testing.assert_allclose(image.values, [[50, 51], [60, 61], [70, 71]])
     np.testing.assert_array_equal(image.validity, np.ones((3, 2), dtype=bool))
+
+
+def test_three_dimensional_grid_requires_an_explicit_semantic_orientation():
+    repeat = axis("repeat", REPEAT, 1)
+    dimensions = tuple(
+        axis(name, SCAN_POINT, 2, coordinates=(-1, 1))
+        for name in ("bx", "by", "bz")
+    )
+    rows = tuple(
+        (ix, iy, iz)
+        for ix in range(2)
+        for iy in range(2)
+        for iz in range(2)
+    )
+    block = make_block(
+        np.arange(8, dtype=np.float64).reshape(1, 8),
+        repeat_axis=repeat,
+        point_table=PointTable(
+            8,
+            tuple(
+                PointColumn(
+                    dimension.axis_id,
+                    dimension.name,
+                    dimension.role,
+                    PointColumn.NUMERIC,
+                    tuple(dimension.coordinates[row[index]] for row in rows),
+                )
+                for index, dimension in enumerate(dimensions)
+            ),
+        ),
+        grid_topology=GridTopology(
+            tuple(dimension.axis_id for dimension in dimensions),
+            tuple(dimension.coordinates for dimension in dimensions),
+            rows,
+        ),
+    )
+
+    default = suggest_default_grid_view(block.schema)
+    assert default.status is SuggestionStatus.NEEDS_INPUT
+    assert default.spec is None
+    assert default.reasons[0].code == "AMBIGUOUS_DEFAULT_GRID_FACET"
+
+    sources = tuple(
+        AxisSourceRef.grid_dimension(dimension.axis_id)
+        for dimension in dimensions
+    )
+    assert all(
+        source in grid_facet_sources(block.schema, ViewIntent.IMAGE)
+        for source in sources
+    )
+    facet_only = suggest_view(
+        block.schema,
+        ViewIntent.IMAGE,
+        preferences=ViewPreferences(facet_sources=(sources[0],)),
+    )
+    assert facet_only.status is SuggestionStatus.NEEDS_INPUT
+    one_axis = suggest_view(
+        block.schema,
+        ViewIntent.IMAGE,
+        preferences=ViewPreferences(
+            image_x_source=sources[1],
+            facet_sources=(sources[0],),
+        ),
+    )
+    assert one_axis.status is SuggestionStatus.RESOLVED
+    validate_view_spec(block.schema, one_axis.spec)
+    for facet_index, facet in enumerate(sources):
+        image_sources = tuple(
+            source for index, source in enumerate(sources) if index != facet_index
+        )
+        explicit = suggest_view(
+            block.schema,
+            ViewIntent.IMAGE,
+            preferences=ViewPreferences(
+                image_x_source=image_sources[0],
+                image_y_source=image_sources[1],
+                facet_sources=(facet,),
+            ),
+        )
+        assert explicit.status is SuggestionStatus.RESOLVED
+        validate_view_spec(block.schema, explicit.spec)
+        resolved = resolve_grid_view(
+            block.schema,
+            ViewIntent.IMAGE,
+            facet,
+            current_view=explicit.spec,
+        )
+        assert resolved.status is SuggestionStatus.RESOLVED
+        validate_view_spec(block.schema, resolved.spec)
+
+    from zlc_frontend.qt_widgets import (
+        FluentParameterForm,
+        ViewSpecEditor,
+        ensure_qt_app,
+    )
+
+    application = ensure_qt_app()
+    editor = ViewSpecEditor()
+    emitted = []
+    editor.viewChanged.connect(emitted.append)
+    editor.reconcile(block.schema, None, faceted=True)
+    form = editor.findChild(FluentParameterForm)
+    assert form is not None
+
+    def choose(key, value):
+        control = form.widget_for(key)
+        index = next(
+            index
+            for index in range(control.count())
+            if control.itemData(index) == value
+        )
+        control.setCurrentIndex(index)
+        control.activated.emit(index)
+        application.processEvents()
+
+    try:
+        choose("grid.intent", ViewIntent.IMAGE)
+        choose("grid.facet", sources[0])
+        assert not emitted
+        choose(f"role.{AxisViewRole.IMAGE_X.value}", sources[1])
+        assert emitted
+        assert emitted[-1].binding(sources[0]).role is AxisViewRole.FACET
+        assert emitted[-1].binding(sources[1]).role is AxisViewRole.IMAGE_X
+        assert emitted[-1].binding(sources[2]).role is AxisViewRole.IMAGE_Y
+    finally:
+        editor.close()
+        application.processEvents()
 
 
 def test_sparse_grid_preserves_missing_cell_as_invalid():

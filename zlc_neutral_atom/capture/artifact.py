@@ -887,6 +887,7 @@ def compile_capture_artifact_pipeline(
     *,
     preview: CapturePreviewPort | None = None,
     exact_preview: ExactDatasetPreviewPort | None = None,
+    settle_exact_preview: bool = True,
 ) -> RunPlan:
     """Add one post-safety CaptureArtifact commit to the exact pipeline."""
 
@@ -896,8 +897,12 @@ def compile_capture_artifact_pipeline(
         capture_spec = spec.capture if isinstance(spec, TriggeredCaptureSpec) else spec
         if not isinstance(capture_spec, MinimalPipelineSpec):
             raise TypeError("capture artifact pipeline requires MinimalPipelineSpec")
-        if exact_preview is not None and not isinstance(spec, TriggeredCaptureSpec):
-            raise ValueError("exact dataset preview requires a triggered capture")
+        if type(settle_exact_preview) is not bool:
+            raise TypeError("settle_exact_preview must be bool")
+        if isinstance(spec, TriggeredCaptureSpec) and not settle_exact_preview:
+            raise ValueError(
+                "triggered capture owns its complete exact-preview cleanup boundary"
+            )
         repository._require_active()
     except BaseException as error:
         notify_preview_failure(preview, error)
@@ -910,7 +915,12 @@ def compile_capture_artifact_pipeline(
             exact_preview=exact_preview,
         )
         if isinstance(spec, TriggeredCaptureSpec)
-        else compile_pipeline(spec, preview=preview)
+        else compile_pipeline(
+            spec,
+            preview=preview,
+            exact_preview=exact_preview,
+            settle_exact_preview=settle_exact_preview,
+        )
     )
     base_name = base.name
     base_resource_claims = base.resource_claims
@@ -940,6 +950,7 @@ def compile_capture_artifact_pipeline(
             return base_preflight(context), borrow, pulse_ref
         except BaseException as error:
             notify_preview_failure(preview, error)
+            notify_preview_failure(exact_preview, error)
             if borrow is not None:
                 try:
                     borrow.close()

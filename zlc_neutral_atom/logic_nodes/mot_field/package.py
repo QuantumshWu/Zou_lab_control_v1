@@ -11,6 +11,7 @@ from .application import prepare_mot_field_acquisition
 from .mot_field import DEFAULT_MOT_FIELD_CAMERA_ROLE
 from .mot_field_task import (
     MOT_FIELD_LOGIC_NODE,
+    PreparedMotFieldTask,
     prepare_mot_field_task,
     start_mot_field_task_command,
 )
@@ -73,7 +74,13 @@ def _bind_api(
 def _prepare_hosted(api, request, event_source):
     if event_source is not None:
         raise ValueError("MOT Field has no event-associated input")
-    return api.prepare_mot_field_task(request)
+    command = api.prepare_mot_field_task(request)
+    if not isinstance(command, PreparedMotFieldTask):
+        raise TypeError("MOT-field preparer returned another command type")
+    from .ui.view_projection import mot_field_figure_intent
+
+    command._bind_figure_intent(mot_field_figure_intent(command.output_schema))
+    return command
 
 
 def _availability(catalog, _apparatus):
@@ -84,6 +91,16 @@ def _availability(catalog, _apparatus):
     if sequencer is None or sequencer.domain != "sequencer":
         return "MOT Field requires the installed Sequencer role"
     return None
+
+
+def _project_signal_presentation(node, output_name, publication):
+    from .ui.view_projection import project_mot_field_signal_presentation
+
+    return project_mot_field_signal_presentation(
+        node,
+        output_name,
+        publication,
+    )
 
 
 LOGIC_NODE_PACKAGE = LogicNodePackage(
@@ -104,6 +121,7 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
     availability=_availability,
     dynamic_choice_fact="camera_roles",
     start_prepared=start_mot_field_task_command,
+    project_signal_presentation=_project_signal_presentation,
 )
 
 __all__ = ["LOGIC_NODE_PACKAGE"]

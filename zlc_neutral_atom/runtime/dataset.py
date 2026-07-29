@@ -1458,7 +1458,6 @@ class DatasetBuilder(Generic[PayloadT]):
             self._metadata_contract_fingerprint
         )
         self._lock = threading.RLock()
-        self._condition = threading.Condition(self._lock)
         self._preview_reader_minted = False
         self._values = np.zeros(
             self.schema.physical_shape,
@@ -1554,7 +1553,6 @@ class DatasetBuilder(Generic[PayloadT]):
                 + address.point_ordinal
             )
             self._cell_metadata[flat_cell] = metadata
-            self._condition.notify_all()
 
     def materialize(self, ref: DatasetRevisionRef | None = None) -> DatasetPreviewSnapshot:
         with self._lock:
@@ -1573,47 +1571,67 @@ class DatasetBuilder(Generic[PayloadT]):
             )
 
     def materialize_delta(self, after: DatasetRevision) -> DatasetPreviewDelta:
-        """Copy only cells committed after ``after`` into immutable values."""
+        """Freeze at most one append-only cell, copying it outside the lock."""
 
         if not isinstance(after, DatasetRevision):
             raise TypeError("after must be DatasetRevision")
         with self._lock:
+            if self._aborted:
+                raise DatasetError("aborted exact dataset cannot be previewed")
             if after.value > self._revision:
                 raise KeyError(
                     f"dataset revision {after.value} has not been committed"
                 )
-            selected = self._ref_locked(self._revision)
-            cells: list[DatasetPreviewCell] = []
+            stop = min(self._revision, after.value + 1)
+            selected = self._ref_locked(stop)
+            total = (
+                self.schema.repeat_axis.size
+                * self.schema.point_table.row_count
+            )
+            coverage = DatasetCoverage(stop, total)
+            source = None
             contract = self.schema.cell_schema.validity_contract
-            for ordinal in range(after.value, self._revision):
+            if stop > after.value:
+                ordinal = after.value
                 address = self._cell_schedule.cell_at(ordinal)
                 cell = (address.repeat_index, address.point_ordinal)
-                validity = (
-                    (Valid() if bool(self._validity[cell]) else Invalid())
-                    if contract.mode is ValidityMode.VALUE
-                    else ComponentValidity(
-                        contract.component_axis_ids,
-                        self._validity[cell],
-                    )
+                source = (
+                    ordinal,
+                    address,
+                    self._values[cell],
+                    (
+                        bool(self._validity[cell])
+                        if contract.mode is ValidityMode.VALUE
+                        else self._validity[cell]
+                    ),
+                    self._ordered_event_metadata[ordinal],
                 )
-                cells.append(
-                    DatasetPreviewCell(
-                        ordinal,
-                        address,
-                        Value(
-                            self._values[cell],
-                            validity,
-                            self.schema.cell_schema,
-                        ),
-                        self._ordered_event_metadata[ordinal],
-                    )
+
+        cells = ()
+        if source is not None:
+            ordinal, address, values, validity_source, metadata = source
+            validity = (
+                (Valid() if validity_source else Invalid())
+                if contract.mode is ValidityMode.VALUE
+                else ComponentValidity(
+                    contract.component_axis_ids,
+                    validity_source,
                 )
-            return DatasetPreviewDelta(
-                after,
-                selected,
-                tuple(cells),
-                self._coverage_locked(),
             )
+            cells = (
+                DatasetPreviewCell(
+                    ordinal,
+                    address,
+                    Value(values, validity, self.schema.cell_schema),
+                    metadata,
+                ),
+            )
+        return DatasetPreviewDelta(
+            after,
+            selected,
+            cells,
+            coverage,
+        )
 
     def seal(self, eos: EndOfStream) -> SealedDatasetArtifact:
         self._source._complete_consumer(self._reservation, eos, self, self._seal_locked)
@@ -1646,7 +1664,6 @@ class DatasetBuilder(Generic[PayloadT]):
             if not self._coverage_locked().complete:
                 raise DatasetError("formal dataset coverage is incomplete")
             self._sealed = True
-            self._condition.notify_all()
 
     def abort(self) -> None:
         self._source._abort_consumer(
@@ -1700,7 +1717,6 @@ class DatasetBuilder(Generic[PayloadT]):
             if self._sealed:
                 raise DatasetError("sealed dataset cannot be aborted")
             self._aborted = True
-            self._condition.notify_all()
 
     def _ensure_writable_locked(self) -> None:
         if self._sealed:
@@ -1747,9 +1763,10 @@ _PREVIEW_READER_TOKEN = object()
 class ExactDatasetPreviewReader:
     """Process-local read-only revision surface over one exact materializer.
 
-    Presentation code can wait for a newer revision and freeze an immutable
-    snapshot.  It cannot consume, seal, abort, release, or obtain the exact
-    reservation/cursor, so DatasetBuilder remains the sole authority.
+    An attached exact-live port can freeze committed deltas after the producer
+    explicitly announces an update.  The reader cannot wait, consume, seal,
+    abort, release, or obtain the exact reservation/cursor, so DatasetBuilder
+    remains the sole authority and the port owns its own wake/close lifetime.
     """
 
     __slots__ = ("__builder",)
@@ -1798,53 +1815,12 @@ class ExactDatasetPreviewReader:
         with builder._lock:
             return builder._aborted
 
-    def wait_for_change(
-        self,
-        after: DatasetRevision,
-        timeout: float | None = None,
-    ) -> DatasetRevision | None:
-        if not isinstance(after, DatasetRevision):
-            raise TypeError("after must be DatasetRevision")
-        if timeout is not None:
-            if (
-                isinstance(timeout, bool)
-                or not isinstance(timeout, (int, float))
-                or not math.isfinite(float(timeout))
-                or float(timeout) < 0
-            ):
-                raise ValueError("timeout must be finite and non-negative or None")
-            timeout = float(timeout)
-        builder = self.__builder
-        with builder._condition:
-            builder._condition.wait_for(
-                lambda: (
-                    builder._revision > after.value
-                    or builder._sealed
-                    or builder._aborted
-                ),
-                timeout,
-            )
-            if builder._revision <= after.value:
-                return None
-            return DatasetRevision(builder._revision)
-
-    def freeze_current(self) -> DatasetPreviewSnapshot:
-        builder = self.__builder
-        with builder._lock:
-            if builder._aborted:
-                raise DatasetError("aborted exact dataset cannot be previewed")
-            return builder.materialize()
-
     def freeze_delta(self, after: DatasetRevision) -> DatasetPreviewDelta:
         """Freeze each newly committed cell once without copying prior cells."""
 
         if not isinstance(after, DatasetRevision):
             raise TypeError("after must be DatasetRevision")
-        builder = self.__builder
-        with builder._lock:
-            if builder._aborted:
-                raise DatasetError("aborted exact dataset cannot be previewed")
-            return builder.materialize_delta(after)
+        return self.__builder.materialize_delta(after)
 
 
 @dataclass(frozen=True, slots=True, eq=False)

@@ -8,7 +8,9 @@ inspect the resulting typed fronts, but never bypass a button to create them.
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -16,6 +18,7 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 
 from zlc_data import (
+    CellValidity,
     MONITOR_HISTORY,
     READOUT_EVENT,
     REPEAT,
@@ -237,9 +240,9 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
     )
     from zlc_frontend.figure import (
         AxisViewRole,
+        FixedIndex,
         ViewIntent,
         grid_facet_source,
-        grid_facet_sources,
         view_spec_from_tree,
     )
     from zlc_frontend.qt_widgets import (
@@ -248,7 +251,12 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         FluentSectionLabel,
         FluentSettingRow,
     )
-    from zlc_neutral_atom.processing.signal_plane import SignalPublication, SignalValue
+    from zlc_neutral_atom.catalog import DefinitionKey
+    from zlc_neutral_atom.dataset_output import (
+        DatasetOutputDeclaration,
+        LiveDatasetOutput,
+    )
+    from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 
     repeat = AxisSpec(
         AxisId("formal.grid.repeat"),
@@ -346,23 +354,6 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         block.ref(StreamGenerationId("formal-grid-generation")),
         block,
     )
-    grid_value = SignalValue(
-        name="formal-grid",
-        source_instance_id="formal-immutable-monitor-boundary",
-        snapshot=snapshot,
-        coverage=None,
-        run_id="formal-run",
-        epoch_id="formal-epoch",
-        join_digest="0" * 64,
-    )
-    grid_publication = SignalPublication(
-        owner_id="formal-immutable-monitor-boundary",
-        generation=1,
-        sequence=1,
-        signals={grid_value.name: grid_value},
-        _issuer=object(),
-    )
-
     args = _build_parser().parse_args(
         [
             "--repository",
@@ -376,6 +367,8 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
     flow = _StandaloneTaskConsoleFlow(args)
     devices = flow.open()
     console_wrapper = None
+    console = None
+    grid_node = None
     try:
         QtTest.QTest.mouseClick(devices.lifecycle_button, QtCore.Qt.LeftButton)
         until(
@@ -386,6 +379,39 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         assert flow.failure is None
         console = flow.console
         console_wrapper = console.window()
+        declaration = DatasetOutputDeclaration("grid", "test.formal-grid")
+        grid_node = SimpleNamespace(
+            instance_id="formal-immutable-monitor-boundary",
+            definition_key=DefinitionKey("tests", "formal-grid"),
+            dataset_output_declarations=(declaration,),
+            signal_key=lambda _name: "formal-grid",
+        )
+        live_output = LiveDatasetOutput(
+            declaration,
+            snapshot,
+            MonitorCoverage(12, 12, 0, False),
+            "0" * 64,
+        )
+        slot = SimpleNamespace(
+            freeze_live_outputs=lambda: (
+                "formal-run",
+                "formal-epoch",
+                {"grid": live_output},
+            ),
+            close=lambda: None,
+            notification_failure=None,
+        )
+        plane = console._data
+        plane.reserve(grid_node)
+        lifecycle = plane.begin_run_lifecycle(grid_node)
+        plane.bind_run_lifecycle(lifecycle, "formal-run", preemptible=True)
+        plane.attach(grid_node, slot)
+        plane.mark_changed(grid_node, slot)
+        plane.freeze()
+        grid_publication = plane.latest_publication("formal-grid")
+        assert grid_publication is not None
+        grid_value = grid_publication.value("formal-grid")
+        assert grid_value is not None
         add = next(
             button
             for button in console.findChildren(QtWidgets.QPushButton)
@@ -414,7 +440,7 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
             publication=grid_publication,
         )
         assert request is None
-        assert card._current_schema() == schema
+        assert card._current_schema() == schema, card.status.text()
 
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
         outer_geometry = QtCore.QRect(console_wrapper.geometry())
@@ -451,26 +477,42 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
             application,
         )
         until(application, lambda: "grid.facet" in form.keys)
-        expected_sources = grid_facet_sources(schema, ViewIntent.IMAGE)
         facet_combo = form.widget_for("grid.facet")
         offered_sources = tuple(
             facet_combo.itemData(index)
             for index in range(facet_combo.count())
         )
-        assert offered_sources == expected_sources
         assert all(
             isinstance(source, AxisSourceRef) for source in offered_sources
         )
         point_rows = AxisSourceRef.point_rows()
-        assert offered_sources == (point_rows,)
-        _choose_combo_data(facet_combo, point_rows, application)
+        repeat_source = AxisSourceRef.tensor(repeat.axis_id)
+        point_x = AxisSourceRef.point_coordinate(scan_x.axis_id)
+        point_y = AxisSourceRef.point_coordinate(scan_y.axis_id)
+        grid_x = AxisSourceRef.grid_dimension(scan_x.axis_id)
+        grid_y = AxisSourceRef.grid_dimension(scan_y.axis_id)
+        tensor_y = AxisSourceRef.tensor(image_y.axis_id)
+        tensor_x = AxisSourceRef.tensor(image_x.axis_id)
+        assert offered_sources == (
+            repeat_source,
+            point_rows,
+            point_x,
+            point_y,
+            grid_x,
+            grid_y,
+            tensor_y,
+            tensor_x,
+        )
+        _choose_combo_data(facet_combo, grid_x, application)
         until(
             application,
             lambda: "view_spec" in card.config.params,
         )
         authored = view_spec_from_tree(card.config.params["view_spec"])
         assert authored.intent is ViewIntent.IMAGE
-        assert grid_facet_source(authored) == point_rows
+        assert grid_facet_source(authored) == grid_x
+        assert authored.binding(grid_y).role is AxisViewRole.SELECTED
+        assert authored.binding(grid_y).selector == FixedIndex(0)
         assert sum(
             binding.role is AxisViewRole.FACET
             for binding in authored.source_bindings
@@ -506,7 +548,7 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
             ),
         )
         authored = view_spec_from_tree(card.config.params["view_spec"])
-        assert grid_facet_source(authored) == point_rows
+        assert grid_facet_source(authored) == grid_x
         label_width = card.setting_label_width(card.fontMetrics())
         setting_rows = card.settings_popup.findChildren(FluentSettingRow)
         assert any(row._label.text() == "Bins" for row in setting_rows)
@@ -674,6 +716,8 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         ) <= 1
         assert visible_top_levels() == top_levels_before
     finally:
+        if console is not None and grid_node is not None:
+            console._data.retire(grid_node)
         if not widget_gone(console_wrapper):
             console_wrapper.close()
             until(application, lambda: widget_gone(console_wrapper), timeout=15.0)
@@ -1141,6 +1185,209 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
 
+def test_finite_camera_progress_and_final_reach_one_formal_plot_panel(
+    tmp_path,
+) -> None:
+    """Finite Camera remains atomic from visible Start through PlotPanel FINAL."""
+
+    configure_offscreen_fast_path()
+    application = ensure_qt_app()
+    from task_console import _StandaloneTaskConsoleFlow, _build_parser
+
+    args = _build_parser().parse_args(
+        [
+            "--repository",
+            str(tmp_path / "workspace"),
+            "--name",
+            "finite-camera-user-flow",
+            "--seed",
+            "47",
+        ]
+    )
+    flow = _StandaloneTaskConsoleFlow(args)
+    devices = flow.open()
+    console = None
+    console_wrapper = None
+    pulse_worker = None
+    try:
+        QtTest.QTest.mouseClick(devices.lifecycle_button, QtCore.Qt.LeftButton)
+        until(
+            application,
+            lambda: flow.console is not None or flow.failure is not None,
+            timeout=15.0,
+        )
+        assert flow.failure is None
+        console = flow.console
+        console_wrapper = console.window()
+        add = next(
+            button
+            for button in console.findChildren(QtWidgets.QPushButton)
+            if button.text() == "Add Panel"
+        )
+        from zlc_pulse import PulseExecutionForm, load_pulse_document
+
+        pulse_document = load_pulse_document(
+            Path("pulses/imaging_template.json").resolve()
+        )
+        pulse_request = flow.experiment.pulse.request(
+            pulse_document,
+            PulseExecutionForm.STATIC_ONCE,
+            api_values={
+                parameter.parameter_id: pulse_document.field_value(
+                    parameter.field
+                )[0]
+                for parameter in pulse_document.api_parameters
+            },
+        )
+
+        _choose_combo_text(console.kind_combo, "Measurement: Camera", application)
+        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
+        row = console.logic_nodes[-1]
+        editor = _current_logic_editor(console, application)
+        widgets = _visible_form_widgets(editor)
+        _choose_combo_data(widgets["camera_role"], "camera", application)
+        _replace_spin_value(widgets["repeat"], "3")
+        _replace_spin_value(widgets["frames_per_cycle"], "3")
+        qualified = tuple(
+            console_signal_key(row.node.node_id, f"frame_{index}")
+            for index in range(3)
+        )
+        _choose_combo_data(console.kind_combo, PlotKind.IMAGE, application)
+        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
+        card = console.cards[-1]
+        click_tab(console, console.tabs.widget(0))
+        assert _render_value_or_none(card) is None
+        QtTest.QTest.mouseClick(editor.form.start_button, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
+        until(application, lambda: card.settings_popup.isVisible())
+        until(
+            application,
+            lambda: qualified[1] in _signal_leaf_keys(card.signal_combo),
+            timeout=5.0,
+        )
+        _choose_signal_leaf(card.signal_combo, qualified[1], application)
+        assert card.config.signal == qualified[1]
+
+        pulse_errors = []
+
+        def fire_cycles() -> None:
+            try:
+                for cycle in range(3):
+                    flow.experiment.pulse.run(pulse_request)
+                    if cycle < 2:
+                        # These are three independent external experiments, not
+                        # one software-timed physical pulse.  Leave the operator
+                        # surface time to present each completed Camera cycle.
+                        time.sleep(0.35)
+            except BaseException as error:
+                pulse_errors.append(error)
+
+        pulse_worker = threading.Thread(target=fire_cycles)
+        pulse_worker.start()
+
+        observed = {}
+        deadline = time.monotonic() + 25.0
+        while time.monotonic() < deadline:
+            application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+            try:
+                publication = card.frozen_render_publication()
+            except RuntimeError:
+                publication = None
+            if publication is not None:
+                observed.setdefault(publication.sequence, publication)
+            if (
+                row.status_label.text().startswith("done")
+                and publication is not None
+                and not publication.value(qualified[1]).transient
+            ):
+                break
+            time.sleep(0.005)
+
+        assert row.status_label.text().startswith("done"), row.status_label.text()
+        pulse_worker.join()
+        assert not pulse_errors
+        publications = tuple(observed[index] for index in sorted(observed))
+        transient = tuple(
+            publication
+            for publication in publications
+            if publication.value(qualified[1]).transient
+        )
+        terminal = tuple(
+            publication
+            for publication in publications
+            if not publication.value(qualified[1]).transient
+        )
+        assert len(transient) >= 2
+        assert terminal
+
+        previous_written = 0
+        previous_revision = 0
+        expected_shape = None
+        expected_dtype = None
+        for publication in transient:
+            assert tuple(publication.signals) == qualified
+            values = tuple(publication.value(name) for name in qualified)
+            assert all(value is not None for value in values)
+            coverages = tuple(value.coverage for value in values)
+            assert all(coverage == coverages[0] for coverage in coverages)
+            coverage = coverages[0]
+            assert coverage is not None
+            assert coverage.total_cells == 3
+            assert previous_written < coverage.written_cells <= 3
+            previous_written = coverage.written_cells
+            for value in values:
+                shape = value.shape
+                if expected_shape is None:
+                    expected_shape = shape
+                    expected_dtype = value.dtype
+                assert shape == expected_shape
+                assert shape[:2] == (3, 1)
+                assert value.dtype == expected_dtype == np.dtype("uint16")
+                assert value.schema.point_table.columns == ()
+                assert value.schema.grid_topology is None
+                assert value.snapshot.ref.revision.value > previous_revision
+                validity = value.snapshot.block.validity
+                assert isinstance(validity, CellValidity)
+                assert validity.mask[:, 0].tolist() == (
+                    [True] * coverage.written_cells
+                    + [False] * (3 - coverage.written_cells)
+                )
+            previous_revision = values[0].snapshot.ref.revision.value
+
+        final_publication = terminal[-1]
+        assert tuple(final_publication.signals) == qualified
+        assert final_publication.sequence > transient[-1].sequence
+        for name in qualified:
+            value = final_publication.value(name)
+            assert value is not None and not value.transient
+            assert value.coverage is None
+            assert value.shape == expected_shape
+            assert value.dtype == expected_dtype
+            validity = value.snapshot.block.validity
+            assert isinstance(validity, CellValidity)
+            assert validity.mask[:, 0].tolist() == [True, True, True]
+        assert card.frozen_render_publication() is final_publication
+        assert not card._status_error
+    finally:
+        if pulse_worker is not None and pulse_worker.is_alive():
+            pulse_worker.join(timeout=15.0)
+        if console is not None:
+            for row in reversed(console.logic_nodes):
+                if not row.stop_button.isEnabled():
+                    continue
+                QtTest.QTest.mouseClick(row.stop_button, QtCore.Qt.LeftButton)
+                until(
+                    application,
+                    lambda current=row: not current.stop_button.isEnabled(),
+                    timeout=15.0,
+                )
+        if not widget_gone(console_wrapper):
+            console_wrapper.close()
+            until(application, lambda: widget_gone(console_wrapper), timeout=15.0)
+        flow.finish_close(application, timeout_seconds=15.0)
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+
+
 def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> None:
     """The two flagship tasks run from their real forms and open typed panels."""
 
@@ -1517,7 +1764,6 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
     configure_offscreen_fast_path()
     application = ensure_qt_app()
     from task_console import _StandaloneTaskConsoleFlow, _build_parser
-    from zlc_neutral_atom.runtime.run import RunState
 
     args = _build_parser().parse_args(
         [
@@ -1700,8 +1946,8 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         # The science Camera is externally triggered.  Use the real Pulse GUI
         # On-Pulse control to provide its continuous hardware schedule; neither
         # the Camera Measurement nor Occupancy owns or fakes that producer.
-        pulse_body = flow.pulse
         pulse_path = (Path("pulses/probe_template.json")).resolve()
+        pulse_body = flow.pulse
         with patch.object(
             QtWidgets.QFileDialog,
             "getOpenFileName",
@@ -1720,6 +1966,8 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             pulse_body.schedule_view.fire_button,
             QtCore.Qt.LeftButton,
         )
+        from zlc_neutral_atom.runtime.run import RunState
+
         until(
             application,
             lambda: pulse_body.active_snapshot is not None

@@ -208,7 +208,13 @@ class ViewSpecEditor(QtWidgets.QWidget):
             values[field.key] = value
 
         if self._faceted:
-            facet = None if self._view is None else grid_facet_source(self._view)
+            facet = (
+                grid_facet_source(self._view)
+                if self._view is not None
+                else self._preferences.facet_sources[0]
+                if len(self._preferences.facet_sources) == 1
+                else None
+            )
             if self._intent is not None:
                 choices = self._grid_facet_choices(self._intent)
                 add(
@@ -219,7 +225,7 @@ class ViewSpecEditor(QtWidgets.QWidget):
             intents = tuple(
                 (_GRID_INTENT_LABELS[candidate], candidate)
                 for candidate in GRID_INTENTS
-                if grid_facet_sources(self._schema, candidate, current_view=self._view)
+                if grid_facet_sources(self._schema, candidate)
             )
             add(
                 _choice_field("grid.intent", "sub plot", intents, self._intent,
@@ -367,7 +373,7 @@ class ViewSpecEditor(QtWidgets.QWidget):
 
     def _grid_facet_choices(self, intent: ViewIntent):
         assert self._schema is not None
-        sources = grid_facet_sources(self._schema, intent, current_view=self._view)
+        sources = grid_facet_sources(self._schema, intent)
         names = tuple(_source_name(self._schema, source) for source in sources)
         return tuple(
             (
@@ -414,7 +420,13 @@ class ViewSpecEditor(QtWidgets.QWidget):
     def _commit_grid_intent(self, intent) -> None:
         if not isinstance(intent, ViewIntent) or intent not in GRID_INTENTS:
             return
-        current = None if self._view is None else grid_facet_source(self._view)
+        current = (
+            grid_facet_source(self._view)
+            if self._view is not None
+            else self._preferences.facet_sources[0]
+            if len(self._preferences.facet_sources) == 1
+            else None
+        )
         legal = tuple(value for _label, value in self._grid_facet_choices(intent))
         preferred = current if current in legal else legal[0] if len(legal) == 1 else None
         self._intent = intent
@@ -437,7 +449,11 @@ class ViewSpecEditor(QtWidgets.QWidget):
             current_view=self._view,
         )
         if suggestion.spec is None:
-            raise ValueError("selected Grid cell/facet pair has no complete view")
+            self._view = None
+            self._preferences = ViewPreferences(facet_sources=(source,))
+            self._controls_dirty = True
+            self.reconcile(self._schema, None, intent=intent, faceted=True)
+            return
         self._emit(suggestion.spec)
 
     def _commit_selection(self, sources, selected) -> None:

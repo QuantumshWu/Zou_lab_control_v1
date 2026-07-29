@@ -44,17 +44,22 @@ def start_camera_measurement_command(
 
     if not callable(cancel_requested):
         raise TypeError("cancel_requested must be callable")
-    factory = getattr(live_output_host, "factory", None)
-    if not callable(factory):
-        raise TypeError("Camera start requires a live-output host")
-    live_factory = factory(output_owner=command)
     if isinstance(command, PreparedLiveCameraMeasurement):
+        factory = getattr(live_output_host, "factory", None)
+        if not callable(factory):
+            raise TypeError("Camera live start requires a live-output host")
+        live_factory = factory(output_owner=command)
         return command.start_with_view(factory=live_factory)
     if not isinstance(command, PreparedFiniteCameraMeasurement):
         raise TypeError("Camera command has another type")
-    if command.live_preview_output_name is None:
-        return command.start()
-    return command.start_with_preview(factory=live_factory)
+    open_exact_dataset = getattr(live_output_host, "open_exact_dataset", None)
+    if not callable(open_exact_dataset):
+        raise TypeError("Camera finite start requires an exact Dataset host")
+    preview = open_exact_dataset(
+        command.preview_spec,
+        projection=command.live_projection(),
+    )
+    return command.start(preview)
 
 
 __all__ = [

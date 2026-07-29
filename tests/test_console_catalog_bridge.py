@@ -39,7 +39,7 @@ def _ports_and_view(
             CAMERA_MEASUREMENT_LOGIC_NODE,
             prepare=lambda intent, event_source: intent,
             dynamic_choices=CAMERA_MEASUREMENT_LOGIC_NODE.resolve_dynamic_choices(
-                ("camera", "mot_camera")
+                ("camera", "mot_camera", "science_camera")
             ),
             path_roots=path_roots,
         ),
@@ -105,8 +105,15 @@ def test_camera_is_a_measurement_and_request_owns_frame_vocabulary(tmp_path) -> 
     (camera,) = view.specs("measurement")
 
     assert camera.kind == "measurement"
+    role_field = next(field for field in camera.form.fields if field.key == "camera_role")
+    assert tuple(choice.value for choice in role_field.choices) == (
+        "camera",
+        "mot_camera",
+        "science_camera",
+    )
+    assert role_field.default == "camera"
     request = camera.build_request(
-        {"camera_role": "mot_camera", "frames_per_cycle": 3, "repeat": 0}
+        {"camera_role": "science_camera", "frames_per_cycle": 3, "repeat": 0}
     )
     assert tuple(output.name for output in request.output_declarations) == (
         "frame_0",

@@ -59,6 +59,10 @@ from zlc_pulse.document import FIELD_DAC
 from zlc_storage import canonical_digest, canonical_text, finite_real, positive_real
 
 MOT_SCAN_PARAMETER_IDS = ("da_x", "da_y", "da_z")
+_MOT_SCAN_COORDINATE_IDS = tuple(
+    AxisId(f"mot-field.{parameter_id}")
+    for parameter_id in MOT_SCAN_PARAMETER_IDS
+)
 MOT_FIELD_FINAL_OUTPUT_DECLARATIONS = (
     DatasetOutputDeclaration("mot_field", "zlc_neutral_atom.mot-field.result"),
     DatasetOutputDeclaration("scan", "zlc_neutral_atom.mot-field.source-scan"),
@@ -152,10 +156,6 @@ def build_mot_scan_program(
     if not isinstance(frozen, FrozenScanTable):
         raise TypeError("pulse owner returned a non-FrozenScanTable")
     committed = replace(document, scan_table=frozen, scan_recipe=None)
-    coordinate_ids = tuple(
-        AxisId(f"mot-field.{parameter_id}")
-        for parameter_id in MOT_SCAN_PARAMETER_IDS
-    )
     point_table = PointTable(
         len(rows),
         tuple(
@@ -168,12 +168,12 @@ def build_mot_scan_program(
                 parameters[parameter_id].unit,
             )
             for position, (parameter_id, coordinate_id) in enumerate(
-                zip(MOT_SCAN_PARAMETER_IDS, coordinate_ids, strict=True)
+                zip(MOT_SCAN_PARAMETER_IDS, _MOT_SCAN_COORDINATE_IDS, strict=True)
             )
         ),
     )
     topology = GridTopology(
-        coordinate_ids,
+        _MOT_SCAN_COORDINATE_IDS,
         axes,
         tuple(product(*(range(len(axis)) for axis in axes))),
     )
@@ -685,23 +685,25 @@ def analyze_mot_scan(
     )
 
 
-def materialize_mot_field_snapshot(result: MotFieldResult) -> OwnedSnapshot:
-    """Express a typed logical 3-D MOT result in Dataset storage order."""
+def materialize_mot_field_snapshot(
+    result: MotFieldResult,
+    schema: DatasetSchema,
+) -> OwnedSnapshot:
+    """Express one MOT result in its prepared generation's frozen schema."""
 
     if not isinstance(result, MotFieldResult):
         raise TypeError("result must be MotFieldResult")
-    schema = DatasetSchema(
-        AxisSpec(
-            AxisId("mot-field.repeat"),
-            "repeat",
-            REPEAT,
-            1,
-            (0,),
-        ),
-        result.point_table,
-        result.grid_topology,
-        ValueSchema.scalar(np.dtype("<f8"), "counts"),
-    )
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if (
+        schema.repeat_axis.size != 1
+        or schema.point_table != result.point_table
+        or schema.grid_topology != result.grid_topology
+        or schema.physical_shape
+        != (1, result.point_table.row_count, 1)
+        or schema.cell_schema.dtype != np.dtype("<f8")
+    ):
+        raise ValueError("MOT result differs from its prepared output schema")
     physical = np.empty(schema.physical_shape, dtype="<f8")
     for point_ordinal, cell in enumerate(result.grid_topology.row_to_cell):
         physical[0, point_ordinal, 0] = result.intensity[cell]
@@ -729,6 +731,7 @@ def materialize_mot_field_snapshot(result: MotFieldResult) -> OwnedSnapshot:
 def mot_field_final_outputs(
     result: MotFieldResult,
     source_scan: MotFieldAcquisitionResult,
+    output_schema: DatasetSchema,
 ) -> dict[str, FinalDatasetOutput]:
     """Publish the analyzed MOT grid and its exact source scan together."""
 
@@ -736,11 +739,13 @@ def mot_field_final_outputs(
         raise TypeError("result must be MotFieldResult")
     if not isinstance(source_scan, MotFieldAcquisitionResult):
         raise TypeError("source_scan must be MotFieldAcquisitionResult")
+    if not isinstance(output_schema, DatasetSchema):
+        raise TypeError("output_schema must be DatasetSchema")
     if source_scan.source_identity != result.source_identity:
         raise ValueError("MOT result and materialized source name different scans")
     source_identity = {"mot_field_source_identity": result.source_identity}
     snapshots = (
-        materialize_mot_field_snapshot(result),
+        materialize_mot_field_snapshot(result, output_schema),
         source_scan.snapshot,
     )
     return {

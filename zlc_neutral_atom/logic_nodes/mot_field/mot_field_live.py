@@ -3,8 +3,8 @@
 This module owns the neutral-atom meaning of the live MOT grid: selecting the
 scan output geometry, reducing each camera frame with the frozen MOT ROI,
 preserving value validity, and materializing an exact ``R x P x (1)`` Dataset
-front.  The task's run-scoped reader/notification lifetime is assembled by
-``mot_field_task_live``; no desktop package owns either concern.
+front.  The generic runtime exact-delta port owns reader/notification lifetime;
+no desktop package owns either concern.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ from .mot_field import (
     MotFieldRequest,
     MotRoiProjector,
     build_mot_intensity_projector,
-    mot_intensity_schema,
 )
 from zlc_neutral_atom.runtime.dataset import (
     DatasetCoverage,
@@ -48,23 +47,26 @@ MOT_FIELD_LIVE_OUTPUT_DECLARATIONS = (
 class MotFieldLiveProjection:
     """Atomically accumulate exact camera deltas into one scalar MOT grid.
 
-    The instance is single-consumer by design.  Each accepted delta produces a
-complete immutable provisional front.  A rejected delta leaves the prior
-front unchanged, so the application live-output owner can publish only data whose revision,
-    validity, metadata, and coverage were sealed together by this owner.
+    The instance is single-consumer by design.  Ingestion validates a complete
+    delta before mutating its fixed scalar buffers, so per-cell bookkeeping is
+    O(1).  Immutable Dataset materialization occurs only when SignalPlane asks
+    for a front; a rejected delta leaves the prior front unchanged.
     """
 
     def __init__(
         self,
         request: MotFieldRequest,
         source_schema: DatasetSchema,
+        output_schema: DatasetSchema,
     ) -> None:
         if not isinstance(request, MotFieldRequest):
             raise TypeError("request must be MotFieldRequest")
         if not isinstance(source_schema, DatasetSchema):
             raise TypeError("source_schema must be DatasetSchema")
+        if not isinstance(output_schema, DatasetSchema):
+            raise TypeError("output_schema must be DatasetSchema")
         self._source_schema = source_schema
-        self._output_schema = mot_intensity_schema(request, source_schema)
+        self._output_schema = output_schema
         self._output_block_id = BlockId("mot-field-live-grid")
         self._projector: MotRoiProjector = build_mot_intensity_projector(
             request,
@@ -72,12 +74,16 @@ front unchanged, so the application live-output owner can publish only data whos
         )
         self._values = np.zeros(self._output_schema.physical_shape, dtype=np.float64)
         self._valid = np.zeros(self._output_schema.physical_shape[:2], dtype=bool)
-        self._metadata: tuple[object | None, ...] = (None,) * self._valid.size
+        self._metadata: list[object | None] = [None] * self._valid.size
+        self._written_count = 0
         self._revision = DatasetRevision(0)
         self._generation = None
 
-    def consume(self, delta: DatasetPreviewDelta) -> DatasetPreviewSnapshot:
-        """Project one contiguous exact delta and atomically publish its front."""
+    def consume(
+        self,
+        delta: DatasetPreviewDelta,
+    ) -> bool:
+        """Validate then apply one contiguous exact delta in place."""
 
         if not isinstance(delta, DatasetPreviewDelta):
             raise TypeError("delta must be DatasetPreviewDelta")
@@ -125,57 +131,47 @@ front unchanged, so the application live-output owner can publish only data whos
         ):
             raise RuntimeError("MOT delta attempted to rewrite a committed grid cell")
 
-        values = np.array(self._values, copy=True)
-        valid = np.array(self._valid, copy=True)
-        metadata = list(self._metadata)
-        for output_cell, intensity, cell_metadata in projected:
-            values[(*output_cell, 0)] = intensity
-            valid[output_cell] = True
-            flat = output_cell[0] * valid.shape[1] + output_cell[1]
-            metadata[flat] = cell_metadata
-        written = int(np.count_nonzero(valid))
-        if written != delta.coverage.written_cells:
+        expected_written = self._written_count + len(projected)
+        if expected_written != delta.coverage.written_cells:
             raise RuntimeError("MOT delta coverage differs from accumulated grid cells")
+        for output_cell, intensity, cell_metadata in projected:
+            self._values[(*output_cell, 0)] = intensity
+            self._valid[output_cell] = True
+            flat = output_cell[0] * self._valid.shape[1] + output_cell[1]
+            self._metadata[flat] = cell_metadata
+
+        self._written_count = expected_written
+        self._revision = delta.ref.revision
+        self._generation = delta.ref.stream_generation
+        return True
+
+    def freeze_live_outputs(self) -> dict[str, LiveDatasetOutput]:
+        """Materialize the current scalar front only on consumer demand."""
+
+        if self._generation is None or self._revision.value < 1:
+            raise RuntimeError("MOT live projection has no committed cell")
 
         ref = DatasetRevisionRef(
             self._output_block_id,
-            delta.ref.stream_generation,
+            self._generation,
             self._output_schema.fingerprint,
-            delta.ref.revision,
+            self._revision,
         )
         block = DataBlock(
             ref.block_id,
             ref.revision,
-            values,
-            CellValidity(valid),
+            self._values,
+            CellValidity(self._valid),
             self._output_schema,
         )
         front = DatasetPreviewSnapshot(
             OwnedSnapshot(ref, block),
-            DatasetCoverage(written, valid.size),
-            tuple(metadata),
+            DatasetCoverage(self._written_count, self._valid.size),
+            tuple(self._metadata),
         )
-
-        self._values = values
-        self._valid = valid
-        self._metadata = tuple(metadata)
-        self._revision = delta.ref.revision
-        self._generation = delta.ref.stream_generation
-        return front
-
-    def live_dataset_outputs(
-        self,
-        frozen: DatasetPreviewSnapshot,
-    ) -> dict[str, LiveDatasetOutput]:
-        """Publish the provisional scalar grid under the MOT task's name."""
-
-        if not isinstance(frozen, DatasetPreviewSnapshot):
-            raise TypeError("MOT live output requires DatasetPreviewSnapshot")
-        if frozen.snapshot.block.schema != self._output_schema:
-            raise ValueError("MOT live output differs from its frozen grid schema")
         output = single_live_dataset_output(
             MOT_FIELD_LIVE_OUTPUT_DECLARATIONS[0],
-            frozen,
+            front,
         )
         return {output.name: output}
 

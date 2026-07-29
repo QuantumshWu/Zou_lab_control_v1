@@ -124,7 +124,7 @@ def _attach_live(
     lifecycle = plane.begin_run_lifecycle(node)
     plane.bind_run_lifecycle(lifecycle, run, preemptible=True)
     plane.attach(node, slot)
-    plane.mark_changed(node)
+    plane.mark_changed(node, slot)
     return slot
 
 
@@ -135,7 +135,7 @@ def _live_source_plane():
         "frame_aux": _live_output("frame_aux", 1, "2" * 64),
     }
     node = _node("camera", tuple(state.values()))
-    _attach_live(
+    slot = _attach_live(
         plane,
         node,
         state,
@@ -143,7 +143,7 @@ def _live_source_plane():
         epoch="camera-epoch",
     )
     first = plane.freeze()
-    return plane, state, node, first
+    return plane, state, node, slot, first
 
 
 def test_event_route_freezes_generation_before_any_publication() -> None:
@@ -179,6 +179,65 @@ def test_event_route_freezes_generation_before_any_publication() -> None:
                 expected_generation=generation,
             )
     finally:
+        plane.close()
+
+
+def test_detach_with_slow_slot_cannot_withdraw_or_wake_replacement() -> None:
+    """Retirement is generation-linearized before a live slot joins."""
+
+    plane = SignalDataPlane()
+    old_output = _live_output("frame", 1, "1" * 64)
+    new_output = _live_output("frame", 2, "2" * 64)
+    node = _node("camera", (old_output,))
+    close_entered = threading.Event()
+    allow_close = threading.Event()
+    errors = []
+    old_slot = SimpleNamespace(
+        freeze_live_outputs=lambda: (
+            "old-run",
+            "old-epoch",
+            {"frame": old_output},
+        ),
+        close=lambda: (close_entered.set(), allow_close.wait(2.0)),
+        notification_failure=None,
+    )
+    new_slot = SimpleNamespace(
+        freeze_live_outputs=lambda: (
+            "new-run",
+            "new-epoch",
+            {"frame": new_output},
+        ),
+        close=lambda: None,
+        notification_failure=None,
+    )
+    try:
+        first_generation = plane.reserve(node)
+        plane.attach(node, old_slot)
+
+        def detach() -> None:
+            try:
+                plane.detach_live(node)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=detach)
+        worker.start()
+        assert close_entered.wait(1.0)
+        assert plane.reserve(node) > first_generation
+        plane.attach(node, new_slot)
+
+        plane.mark_changed(node, old_slot)
+        assert plane.freeze().value("camera/frame") is None
+        plane.mark_changed(node, new_slot)
+        assert plane.freeze().value("camera/frame").snapshot.ref.revision.value == 2
+
+        allow_close.set()
+        worker.join(2.0)
+        assert not worker.is_alive()
+        assert not errors
+        assert plane.latest_publication("camera/frame") is not None
+    finally:
+        allow_close.set()
         plane.close()
 
 
@@ -356,7 +415,7 @@ def test_unchanged_sources_reuse_their_exact_publication_and_front() -> None:
     state = {"frame": output}
     node = _node("camera", (output,))
     calls: list[object] = []
-    _attach_live(
+    slot = _attach_live(
         plane,
         node,
         state,
@@ -373,7 +432,7 @@ def test_unchanged_sources_reuse_their_exact_publication_and_front() -> None:
         assert len(calls) == 1
 
         state["frame"] = _live_output("frame", 2, "b" * 64)
-        plane.mark_changed(node)
+        plane.mark_changed(node, slot)
         second = plane.freeze()
         assert second is not first
         assert second.publication("camera/frame") is not publication
@@ -452,7 +511,7 @@ def test_independent_producers_keep_independent_publications() -> None:
 
 
 def test_processor_advances_with_its_exact_source_publication() -> None:
-    plane, state, source_node, first = _live_source_plane()
+    plane, state, source_node, source_slot, first = _live_source_plane()
     gates = {1: threading.Event(), 2: threading.Event()}
     gates[1].set()
     processor = _GatedProcessorNode(
@@ -480,7 +539,7 @@ def test_processor_advances_with_its_exact_source_publication() -> None:
 
         state["frame"] = _live_output("frame", 2, "3" * 64)
         state["frame_aux"] = _live_output("frame_aux", 2, "4" * 64)
-        plane.mark_changed(source_node)
+        plane.mark_changed(source_node, source_slot)
         staged = plane.freeze()
         assert staged.value("camera/frame").snapshot.ref.revision.value == 1
         assert staged.value("camera/frame_aux").snapshot.ref.revision.value == 1
@@ -500,7 +559,7 @@ def test_processor_advances_with_its_exact_source_publication() -> None:
 
 
 def test_source_retirement_removes_the_complete_publication_closure() -> None:
-    plane, _state, source_node, first = _live_source_plane()
+    plane, _state, source_node, _source_slot, first = _live_source_plane()
     gate = threading.Event()
     processor = _GatedProcessorNode(
         plane,
@@ -531,7 +590,7 @@ def test_source_retirement_removes_the_complete_publication_closure() -> None:
 
 
 def test_fan_out_binds_the_same_exact_visible_publication() -> None:
-    plane, _state, _source_node, first = _live_source_plane()
+    plane, _state, _source_node, _source_slot, first = _live_source_plane()
     source_publication = first.publication("camera/frame")
     assert source_publication is not None
     processors = []
@@ -562,7 +621,7 @@ def test_fan_out_binds_the_same_exact_visible_publication() -> None:
 
 
 def test_processor_publication_requires_every_declared_sibling() -> None:
-    plane, _state, _source_node, first = _live_source_plane()
+    plane, _state, _source_node, _source_slot, first = _live_source_plane()
     gate = threading.Event()
     gate.set()
     processor = _GatedProcessorNode(

@@ -1397,7 +1397,11 @@ class SignalDataPlane:
             state.event_source = event_source
             self._membership_changed = True
 
-    def mark_changed(self, node) -> None:
+    def mark_changed(self, node, slot) -> None:
+        """Dirty only the exact live slot that emitted this wake."""
+
+        if slot is None:
+            raise ValueError("changed live slot must not be None")
         owner_id = _node_instance_id(node)
         with self._lock:
             state = self._states.get(owner_id)
@@ -1406,7 +1410,7 @@ class SignalDataPlane:
                 or state.retired
                 or state.terminal
                 or state.node is not node
-                or state.slot is None
+                or state.slot is not slot
             ):
                 return
             self._dirty.add(owner_id)
@@ -2309,14 +2313,14 @@ class SignalDataPlane:
 
     def detach_live(self, node) -> None:
         owner_id = _node_instance_id(node)
+        retained_slot = None
+        retired_states = ()
         with self._lock:
             state = self._states.get(owner_id)
             if state is None:
                 return
             if state.node is not node:
                 raise RuntimeError("signal owner id belongs to another generation")
-            slot = state.slot
-            state.slot = None
             retained_final = bool(
                 state.publication is not None
                 and all(
@@ -2324,10 +2328,24 @@ class SignalDataPlane:
                     for value in state.publication.signals.values()
                 )
             )
-        if slot is not None:
-            slot.close()
-        if not retained_final:
-            self._withdraw_owner(owner_id)
+            if retained_final:
+                retained_slot = state.slot
+                state.slot = None
+                self._dirty.discard(owner_id)
+            else:
+                # Withdraw this exact generation and its descendants before
+                # any slow slot close/join.  A replacement may then reserve
+                # safely; cleanup below carries the retired state objects, not
+                # the reusable textual owner id.
+                retired_states = self._retirement_closure_locked(owner_id)
+        if retained_slot is not None:
+            retained_slot.close()
+        errors = self._cleanup_retired_states(retired_states)
+        if errors:
+            raise BaseExceptionGroup(
+                "signal generation cleanup failed",
+                list(errors),
+            )
 
     def _freeze_one(
         self,

@@ -1691,7 +1691,15 @@ class PanelCard(FluentGroupBox):
             # resolving the view so an already-open popup exposes the same
             # typed choices as a popup opened after the first publication.
             self._refresh_view_spec_controls()
-        view = self._effective_view_spec(schema)
+        declared_default = (
+            None
+            if leaf_figure is None or self.config.kind is PlotKind.SITE_MAP
+            else leaf_figure.view
+        )
+        view = self._effective_view_spec(
+            schema,
+            declared_default=declared_default,
+        )
         if self.config.kind is not PlotKind.SITE_MAP and view is None:
             self.set_status(
                 "the declared axes cannot form a complete typed view",
@@ -1782,7 +1790,15 @@ class PanelCard(FluentGroupBox):
             value,
             publication,
         )
-        view = self._effective_view_spec(schema)
+        declared_default = (
+            None
+            if leaf_figure is None or self.config.kind is PlotKind.SITE_MAP
+            else leaf_figure.view
+        )
+        view = self._effective_view_spec(
+            schema,
+            declared_default=declared_default,
+        )
         if self.config.kind is not PlotKind.SITE_MAP and view is None:
             raise ValueError("dataset surface needs a complete typed view")
         contract = self._plot_panel_contract(
@@ -2254,14 +2270,20 @@ class PanelCard(FluentGroupBox):
         from zlc_frontend import PlotPanelContract
         from zlc_frontend.plot_panel import plot_panel_value_label
 
-        if leaf_figure is None:
+        if leaf_figure is not None and not isinstance(leaf_figure, FigureIntent):
+            raise TypeError("leaf Figure intent must be FigureIntent")
+        if leaf_figure is None or self.config.kind is not PlotKind.SITE_MAP:
             figure = FigureIntent(
                 self.config.kind,
                 str(self.config.title or value_name),
-                plot_panel_value_label(
-                    str(value_name),
-                    axis_labels,
-                    short_labels,
+                (
+                    leaf_figure.value_label
+                    if leaf_figure is not None
+                    else plot_panel_value_label(
+                        str(value_name),
+                        axis_labels,
+                        short_labels,
+                    )
                 ),
                 view=view,
                 rolling_distribution=(
@@ -2275,13 +2297,8 @@ class PanelCard(FluentGroupBox):
                 ),
             )
         else:
-            if not isinstance(leaf_figure, FigureIntent):
-                raise TypeError("leaf Figure intent must be FigureIntent")
-            if (
-                self.config.kind is not PlotKind.SITE_MAP
-                or leaf_figure.kind is not PlotKind.SITE_MAP
-            ):
-                raise ValueError("only SiteMap attachments may supply Figure intent")
+            if leaf_figure.kind is not PlotKind.SITE_MAP or view is not None:
+                raise ValueError("SiteMap attachment supplied another Figure intent")
             figure = leaf_figure
         return PlotPanelContract(
             self.panel_id,
@@ -2295,19 +2312,40 @@ class PanelCard(FluentGroupBox):
         )
 
     def _plot_panel_source(self, snapshot, value, publication):
-        """Bind one exact source and its optional static SiteMap intent.
+        """Bind one exact source and an optional leaf-authored Figure intent.
 
-        A SiteMap surface consumes the leaf's existing ``(FigureIntent,
-        SiteMapPresentation)`` pair.  An ordinary surface consumes only the
-        Dataset snapshot.  Monitor and Edit call this same normalizer, so
-        neither surface can reconstruct leaf semantics independently.
+        A leaf may resolve an otherwise ambiguous standard view, while all
+        rendering and display state still belong to the shared frontend.  A
+        SiteMap additionally supplies its composite presentation payload.
+        Monitor and Edit call this same normalizer, so neither reconstructs
+        leaf semantics independently.
         """
 
         from zlc_frontend.plot_panel import plot_panel_input
 
-        if self.config.kind is not PlotKind.SITE_MAP:
-            return None, plot_panel_input(self.config.kind, snapshot)
         attached = self._presentation_provider(value, publication)
+        if self.config.kind is not PlotKind.SITE_MAP:
+            source = plot_panel_input(self.config.kind, snapshot)
+            if attached is None:
+                return None, source
+            if (
+                isinstance(attached, tuple)
+                and len(attached) == 2
+                and isinstance(attached[0], FigureIntent)
+                and attached[0].kind is PlotKind.SITE_MAP
+            ):
+                # A composite SiteMap attachment is irrelevant when the user
+                # deliberately chooses an ordinary Dataset presentation.
+                return None, source
+            if not isinstance(attached, FigureIntent):
+                raise TypeError("Dataset presentation attachment must be FigureIntent")
+            if attached.kind is not self.config.kind:
+                return None, source
+            if attached.view is None:
+                raise ValueError("Dataset Figure intent needs a complete typed view")
+            if attached.view.schema_fingerprint != snapshot.block.schema.fingerprint:
+                raise ValueError("Dataset Figure intent belongs to another schema")
+            return attached, source
         if not isinstance(attached, tuple) or len(attached) != 2:
             raise TypeError(
                 "SiteMap output requires (FigureIntent, SiteMapPresentation)"
@@ -2942,7 +2980,7 @@ class PanelCard(FluentGroupBox):
             schema,
         )
 
-    def _effective_view_spec(self, schema):
+    def _effective_view_spec(self, schema, *, declared_default=None):
         """Resolve the exact auto-or-authored frontend view used for display."""
 
         if self.config.kind is PlotKind.SITE_MAP:
@@ -2950,6 +2988,10 @@ class PanelCard(FluentGroupBox):
         saved = self._saved_view_spec(schema)
         if saved is not None:
             return saved
+        if declared_default is not None:
+            if declared_default.schema_fingerprint != schema.fingerprint:
+                raise ValueError("declared default view belongs to another schema")
+            return declared_default
         if self.config.kind is PlotKind.GRID:
             from zlc_frontend.figure import suggest_default_grid_view
 
@@ -2966,7 +3008,20 @@ class PanelCard(FluentGroupBox):
             editor.reconcile(None, None)
             return
         schema = self._current_schema()
-        view = None if schema is None else self._effective_view_spec(schema)
+        contract = self._presented_contract or self._pending_contract
+        declared_default = (
+            None
+            if contract is None or contract.figure.kind is PlotKind.SITE_MAP
+            else contract.figure.view
+        )
+        view = (
+            None
+            if schema is None
+            else self._effective_view_spec(
+                schema,
+                declared_default=declared_default,
+            )
+        )
         editor.reconcile(
             schema,
             view,

@@ -41,11 +41,6 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetSealProvenance,
     FrozenDatasetEdge,
 )
-from zlc_neutral_atom.runtime.preview import (
-    ExactDatasetPreviewPort,
-    ExactDatasetPreviewSpec,
-    notify_preview_failure,
-)
 from zlc_neutral_atom.runtime.run import (
     PostSafetyContext,
     RunContext,
@@ -418,7 +413,7 @@ class PreparedExactScan:
         output_contract: ScanOutputContract,
         descriptor: PulseScanPlanDescriptor,
         repository: ScanRepository,
-        plan_factory: Callable[[ExactDatasetPreviewPort | None], RunPlan],
+        plan_factory: Callable[[], RunPlan],
         start_run: Callable[[RunPlan], RunHandle],
     ) -> None:
         if not isinstance(program, (AutonomousScanSlotProgram, ApiSlotSegmentedProgram)):
@@ -455,36 +450,17 @@ class PreparedExactScan:
     def descriptor(self) -> PulseScanPlanDescriptor:
         return self._descriptor
 
-    @property
-    def preview_spec(self) -> ExactDatasetPreviewSpec:
-        return ExactDatasetPreviewSpec(self._source_schema.fingerprint)
-
-    def materialize_provisional_output(self, source) -> OwnedSnapshot:
-        snapshot = getattr(source, "snapshot", None)
-        if not isinstance(snapshot, OwnedSnapshot):
-            raise TypeError("source must be a DatasetPreviewSnapshot")
-        if snapshot.block.schema != self._source_schema:
-            raise ValueError("provisional source differs from this PulseScan")
-        return _identity_output_snapshot(
-            self._program,
-            snapshot,
-            self._output_contract,
+    def start(self) -> RunHandle:
+        with self._lock:
+            if self._started:
+                raise RuntimeError("PreparedExactScan is one-shot")
+            self._started = True
+        plan = self._plan_factory()
+        if not isinstance(plan, RunPlan):
+            raise TypeError("PulseScan plan factory returned another type")
+        return self._start_run(
+            plan.with_lifecycle(owner=self, preemptible=False)
         )
-
-    def start(self, preview: ExactDatasetPreviewPort | None = None) -> RunHandle:
-        try:
-            with self._lock:
-                if self._started:
-                    raise RuntimeError("PreparedExactScan is one-shot")
-                self._started = True
-            plan = self._plan_factory(preview)
-            if not isinstance(plan, RunPlan):
-                raise TypeError("PulseScan plan factory returned another type")
-            plan = plan.with_lifecycle(owner=self, preemptible=False)
-            return self._start_run(plan)
-        except BaseException as error:
-            notify_preview_failure(preview, error)
-            raise
 
     def final_dataset_outputs(self, reference: ScanArtifactRef):
         if not isinstance(reference, ScanArtifactRef):
@@ -585,7 +561,7 @@ def prepare_exact_scan(
             "artifacts": [item.fingerprint for item in compiled],
         }
     )
-    def plan_factory(preview: ExactDatasetPreviewPort | None) -> RunPlan:
+    def plan_factory() -> RunPlan:
         return _compile_scan_plan(
             request,
             program=program,
@@ -597,7 +573,6 @@ def prepare_exact_scan(
             pulse_port=pulse_port,
             pulse_requests=pulse_requests,
             repository=repository,
-            preview=preview,
         )
     descriptor = PulseScanPlanDescriptor(
         f"Pulse scan {program.document.name}",
@@ -1052,7 +1027,6 @@ def _compile_scan_plan(
     pulse_port: BoundPulsePort,
     pulse_requests: tuple[FinitePulseExecutionRequest, ...],
     repository: ScanRepository,
-    preview: ExactDatasetPreviewPort | None,
 ) -> RunPlan:
     compiled = tuple(item.artifact for item in pulse_requests)
     repository._require_active()
@@ -1072,12 +1046,6 @@ def _compile_scan_plan(
                 if isinstance(program, AutonomousScanSlotProgram)
                 else None
             )
-            if preview is not None:
-                preview.bind(
-                    builder.open_preview_reader(),
-                    run_id=context.run_id.value,
-                    causation_domain_id=builder.generation.value,
-                )
             return _PreparedScan(
                 producer,
                 collector_cursor,
@@ -1113,10 +1081,7 @@ def _compile_scan_plan(
     ) -> CleanupReport:
         errors: list[BaseException] = []
         if prepared is None:
-            report = pulse_port.verify_idle(context)
-            if primary is not None or report.errors:
-                notify_preview_failure(preview, primary or report.errors[0])
-            return report
+            return pulse_port.verify_idle(context)
         source_cursor = prepared.source_cursor
         if source_cursor is not None:
             try:
@@ -1141,9 +1106,6 @@ def _compile_scan_plan(
         result = CleanupReport.complete(errors=tuple(errors))
         if primary is not None or result.errors:
             prepared.repository_borrow.close()
-            notify_preview_failure(preview, primary or result.errors[0])
-        elif preview is not None:
-            preview.source_terminal()
         return result
 
     def finalize(context: PostSafetyContext, result: _ExecutedScan) -> ScanArtifactRef:

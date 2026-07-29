@@ -118,15 +118,29 @@ def _display_source_allowed(
     return True
 
 
-def _automatic_tensor_binding(schema, source, contract):
-    axis = _tensor_axis(schema, source)
-    policy = contract.policy_for(axis.role)
+def _automatic_source_binding(schema, source, contract):
+    """Apply one contract policy to an unbound tensor/topology source."""
+
+    if source.kind == AxisSourceRef.GRID_DIMENSION:
+        policy = contract.policy_for(_source_role(schema, source))
+        if policy is None or AxisViewRole.SELECTED not in policy.automatic_roles:
+            return None
+        return SourceViewBinding(
+            source,
+            AxisViewRole.SELECTED,
+            selector=FixedIndex(0),
+        )
+    if source.kind != AxisSourceRef.TENSOR:
+        return None
+    policy = contract.policy_for(_tensor_axis(schema, source).role)
     if policy is None or not policy.automatic_roles:
         return None
     role = policy.automatic_roles[0]
-    if role is AxisViewRole.SELECTED:
-        return SourceViewBinding(source, role, selector=FixedIndex(0))
-    return SourceViewBinding(source, role)
+    return SourceViewBinding(
+        source,
+        role,
+        selector=FixedIndex(0) if role is AxisViewRole.SELECTED else None,
+    )
 
 
 def _suggest_view(
@@ -362,22 +376,23 @@ def _suggest_view(
                 )
             )
 
-    for axis in (schema.repeat_axis, *schema.cell_schema.data_axes):
-        source = AxisSourceRef.tensor(axis.axis_id)
+    for source in available:
         if source in bindings:
             continue
-        binding = _automatic_tensor_binding(schema, source, contract)
+        binding = _automatic_source_binding(schema, source, contract)
         if binding is None:
-            return _needs(
-                "UNRESOLVED_TENSOR_SOURCE",
-                f"{axis.name} requires an explicit role",
-                source=source,
-            )
+            if source.kind == AxisSourceRef.TENSOR:
+                return _needs(
+                    "UNRESOLVED_TENSOR_SOURCE",
+                    f"{_source_name(schema, source)} requires an explicit role",
+                    source=source,
+                )
+            continue
         bindings[source] = binding
         reasons.append(
             DecisionReason(
                 "AUTOMATIC_VISIBLE_ROLE",
-                f"{axis.name} remains visible as {binding.role.value}",
+                f"{_source_name(schema, source)} remains visible as {binding.role.value}",
                 source,
             )
         )
@@ -514,7 +529,7 @@ def _view_authoring_candidates(
             raise TypeError("preferences must be ViewPreferences or None")
 
     roles = []
-    if current_view is not None or not faceted:
+    if current_view is not None or not faceted or preferences.facet_sources:
         roles.extend(slot.binding_role for slot in dataset_contract_for(intent).display_slots)
     roles.extend((AxisViewRole.SAMPLE, AxisViewRole.BATCH))
     repeat = AxisSourceRef.tensor(schema.repeat_axis.axis_id)

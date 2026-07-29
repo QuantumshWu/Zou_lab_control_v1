@@ -31,7 +31,7 @@ class ExactDatasetPreviewSpec:
 
 
 class ExactDatasetPreviewPort(Protocol):
-    """Workbench-owned provisional reader attachment; never artifact authority."""
+    """Runtime-owned provisional reader attachment; never artifact authority."""
 
     @property
     def spec(self) -> ExactDatasetPreviewSpec: ...
@@ -46,6 +46,8 @@ class ExactDatasetPreviewPort(Protocol):
         run_id: str,
         causation_domain_id: str,
     ) -> None: ...
+
+    def updated(self) -> None: ...
 
     def fail(self, message: str) -> None: ...
 

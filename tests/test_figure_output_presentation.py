@@ -175,8 +175,8 @@ def _camera_plane(*, revision: int = 3):
     plane = SignalDataPlane()
     plane.reserve(node)
     plane.attach(node, slot)
-    plane.mark_changed(node)
-    return plane, state, node, declaration, snapshot, y_axis, x_axis
+    plane.mark_changed(node, slot)
+    return plane, state, node, slot, declaration, snapshot, y_axis, x_axis
 
 
 def test_panel_derived_signal_advances_with_its_exact_parent_publication() -> None:
@@ -191,7 +191,16 @@ def test_panel_derived_signal_advances_with_its_exact_parent_publication() -> No
     from zlc_neutral_atom.runtime.dataset import MonitorCoverage
     from zlc_workbench.task_console.console_records import panel_signal_key
 
-    plane, state, node, declaration, snapshot_3, y_axis, x_axis = _camera_plane()
+    (
+        plane,
+        state,
+        node,
+        slot,
+        declaration,
+        snapshot_3,
+        y_axis,
+        x_axis,
+    ) = _camera_plane()
     area_name = panel_signal_key("area-panel", AREA_DATA_OUTPUT)
     plane.set_front_signals({"camera/frame", area_name})
     commit = _area_commit(snapshot_3, y_axis, x_axis)
@@ -228,7 +237,7 @@ def test_panel_derived_signal_advances_with_its_exact_parent_publication() -> No
             MonitorCoverage(1, 1, 0, False),
             "2" * 64,
         )
-        plane.mark_changed(node)
+        plane.mark_changed(node, slot)
         staged = plane.freeze()
         assert staged.value("camera/frame").snapshot.ref.revision.value == 3
         assert staged.value(area_name).snapshot.ref.revision.value == 3
@@ -261,9 +270,16 @@ def test_panel_derived_signal_advances_with_its_exact_parent_publication() -> No
 def test_derived_sibling_bundle_is_atomic_and_route_replacement_is_explicit() -> None:
     from zlc_neutral_atom.processing.signal_plane import DerivedSignalOutput
 
-    plane, _state, _node, _declaration, snapshot, _y_axis, _x_axis = _camera_plane(
-        revision=11
-    )
+    (
+        plane,
+        _state,
+        _node,
+        _slot,
+        _declaration,
+        snapshot,
+        _y_axis,
+        _x_axis,
+    ) = _camera_plane(revision=11)
     try:
         front = plane.freeze()
         parent = front.publication("camera/frame")
@@ -321,9 +337,16 @@ def test_source_retirement_removes_nested_figure_publications() -> None:
     from zlc_frontend.figure_outputs import AREA_DATA_OUTPUT, materialize_area_outputs
     from zlc_frontend.figure_source import FigureSource
 
-    plane, _state, node, declaration, snapshot, y_axis, x_axis = _camera_plane(
-        revision=17
-    )
+    (
+        plane,
+        _state,
+        node,
+        _slot,
+        declaration,
+        snapshot,
+        y_axis,
+        x_axis,
+    ) = _camera_plane(revision=17)
     first_name = "@panel/first/area.data"
     second_name = "@panel/second/area.data"
     try:

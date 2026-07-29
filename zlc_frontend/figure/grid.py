@@ -11,6 +11,7 @@ from .contract import (
     _dataset_sources,
     _resolve_selected_point_ordinals,
     _source_cardinality,
+    _source_role,
     dataset_contract_for,
 )
 from .model import (
@@ -101,6 +102,43 @@ def _facet_cardinality(
     return _source_cardinality(schema, source)
 
 
+def _facet_source_rejection(
+    schema: DatasetSchema,
+    intent: ViewIntent,
+    source: AxisSourceRef,
+    point_ordinals: tuple[int, ...] | None,
+) -> ViewSuggestion | None:
+    """Return the sole semantic/cardinality rejection for one declared facet."""
+
+    if source.kind == AxisSourceRef.POINT_ORDINAL:
+        return _unresolved(
+            "POINT_ORDINAL_GRID_FACET",
+            "the synthetic point ordinal cannot replace an authored Grid facet",
+            source,
+        )
+    if source.kind != AxisSourceRef.POINT_ROWS and source != AxisSourceRef.tensor(
+        schema.repeat_axis.axis_id
+    ):
+        policy = _grid_contract(intent).policy_for(_source_role(schema, source))
+        if policy is None or AxisViewRole.FACET not in policy.automatic_roles:
+            return _unresolved(
+                "GRID_FACET_ROLE_UNAVAILABLE",
+                "the declared source role cannot expand into Grid cells",
+                source,
+            )
+    try:
+        cardinality = _facet_cardinality(schema, source, point_ordinals)
+    except (KeyError, TypeError, ValueError, IndexError) as error:
+        return _unresolved("GRID_FACET_UNAVAILABLE", str(error), source)
+    if cardinality <= 1:
+        return _unresolved(
+            "SINGLETON_GRID_FACET",
+            "a singleton source cannot expand into Grid cells",
+            source,
+        )
+    return None
+
+
 def grid_facet_source(view: ViewSpec) -> AxisSourceRef:
     """Return the sole authored facet source."""
 
@@ -172,20 +210,14 @@ def resolve_grid_view(
             # authority before the suggestion drops GridDimension bindings.
             point_ordinals = _resolve_selected_point_ordinals(schema, current_view)
             cardinality_ordinals = point_ordinals
-    try:
-        cardinality = _facet_cardinality(
-            schema,
-            facet_source,
-            cardinality_ordinals,
-        )
-    except (KeyError, TypeError, ValueError, IndexError) as exc:
-        return _unresolved("GRID_FACET_UNAVAILABLE", str(exc), facet_source)
-    if cardinality <= 1:
-        return _unresolved(
-            "SINGLETON_GRID_FACET",
-            "a singleton source cannot expand into Grid cells",
-            facet_source,
-        )
+    rejection = _facet_source_rejection(
+        schema,
+        intent,
+        facet_source,
+        cardinality_ordinals,
+    )
+    if rejection is not None:
+        return rejection
 
     repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
     if repeat_binding is None and current_view is not None:
@@ -238,23 +270,17 @@ def resolve_grid_view(
 def grid_facet_sources(
     schema: DatasetSchema,
     intent: ViewIntent,
-    *,
-    current_view: ViewSpec | None = None,
 ) -> tuple[AxisSourceRef, ...]:
-    """Return declared sources that can form a complete one-facet Grid view."""
+    """Return every declared source that is legal as the sole Grid facet."""
 
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
+    if not isinstance(intent, ViewIntent) or intent not in GRID_INTENTS:
+        raise ValueError("Grid cells require CURVE, HISTOGRAM, or IMAGE intent")
     return tuple(
         source
         for source in _dataset_sources(schema)
-        if resolve_grid_view(
-            schema,
-            intent,
-            source,
-            current_view=current_view,
-        ).spec
-        is not None
+        if _facet_source_rejection(schema, intent, source, None) is None
     )
 
 
@@ -274,24 +300,35 @@ def suggest_default_grid_view(schema: DatasetSchema) -> ViewSuggestion:
         tuple(source for source in sources if source not in topology_sources),
     )
     for tier in source_tiers:
+        eligible_sources = tuple(
+            source
+            for source in tier
+            if any(
+                _facet_source_rejection(schema, intent, source, None) is None
+                for intent in GRID_INTENTS
+            )
+        )
+        if not eligible_sources:
+            continue
+        if len(eligible_sources) > 1:
+            return _unresolved(
+                "AMBIGUOUS_DEFAULT_GRID_FACET",
+                "multiple equally preferred Grid facet sources are declared",
+            )
+        source = eligible_sources[0]
         candidates = tuple(
             suggestion
-            for source in tier
-            for intent in (
-                ViewIntent.IMAGE,
-                ViewIntent.CURVE,
-                ViewIntent.HISTOGRAM,
-            )
+            for intent in GRID_INTENTS
             if (suggestion := resolve_grid_view(schema, intent, source)).spec
             is not None
         )
         if len(candidates) == 1:
             return candidates[0]
-        if len(candidates) > 1:
-            return _unresolved(
-                "AMBIGUOUS_DEFAULT_GRID_VIEW",
-                "multiple equally preferred Grid facet/cell intents are valid",
-            )
+        return _unresolved(
+            "AMBIGUOUS_DEFAULT_GRID_VIEW",
+            "the preferred Grid facet does not determine one cell intent",
+            source,
+        )
     return _unresolved(
         "NO_DEFAULT_GRID_VIEW",
         "the DatasetSchema does not determine a complete Grid view",

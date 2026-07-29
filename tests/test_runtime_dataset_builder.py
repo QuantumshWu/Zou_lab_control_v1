@@ -467,6 +467,8 @@ def test_exact_preview_delta_copies_only_new_cells_in_frozen_order():
 
     emit(producer, value(11, component_validity=validity), schedule.cell_at(0), 0)
     builder.consume(cursor.next())
+    emit(producer, value(22, component_validity=validity), schedule.cell_at(1), 1)
+    builder.consume(cursor.next())
     first = reader.freeze_delta(DatasetRevision(0))
 
     assert isinstance(first, DatasetPreviewDelta)
@@ -480,8 +482,6 @@ def test_exact_preview_delta_copies_only_new_cells_in_frozen_order():
     with pytest.raises(ValueError):
         first.cells[0].value.values.setflags(write=True)
 
-    emit(producer, value(22, component_validity=validity), schedule.cell_at(1), 1)
-    builder.consume(cursor.next())
     second = reader.freeze_delta(first.ref.revision)
 
     assert second.after == DatasetRevision(1)

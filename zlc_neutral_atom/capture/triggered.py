@@ -85,7 +85,6 @@ class TriggeredPipelineResult:
     __slots__ = (
         "_authority",
         "_capture",
-        "_exact_preview",
         "_lineage",
     )
 
@@ -97,7 +96,6 @@ class TriggeredPipelineResult:
         authority: object,
         *,
         capture: PipelineResult,
-        exact_preview: ExactDatasetPreviewPort | None,
         lineage: PulseCaptureLineage,
     ) -> None:
         if authority is not _TRIGGERED_RESULT_TOKEN:
@@ -127,7 +125,6 @@ class TriggeredPipelineResult:
             )
         object.__setattr__(self, "_authority", authority)
         object.__setattr__(self, "_capture", capture)
-        object.__setattr__(self, "_exact_preview", exact_preview)
         object.__setattr__(self, "_lineage", lineage)
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -156,8 +153,6 @@ def finalize_triggered_pipeline_result(
     spec: TriggeredCaptureSpec,
     capture: PipelineResult,
     pulse_terminal: PulseTerminalAck,
-    *,
-    exact_preview: ExactDatasetPreviewPort | None = None,
 ) -> TriggeredPipelineResult:
     """Bind exact Camera completion to the terminal receipt of the same pulse.
 
@@ -172,7 +167,6 @@ def finalize_triggered_pipeline_result(
     return TriggeredPipelineResult(
         _TRIGGERED_RESULT_TOKEN,
         capture=capture,
-        exact_preview=exact_preview,
         lineage=PulseCaptureLineage(spec.pulse_binding, pulse_terminal),
     )
 
@@ -229,7 +223,6 @@ def compile_triggered_pipeline(
             spec,
             capture_result,
             pulse_terminal,
-            exact_preview=capture.exact_preview_port,
         )
 
     def cleanup(
@@ -265,6 +258,13 @@ def compile_triggered_pipeline(
             lambda: capture.cleanup(context),
         )
         capture.settle_preview_after_cleanup(report, primary)
+        if primary is None and not report.errors:
+            exact = capture.exact_preview_port
+            if exact is not None:
+                try:
+                    exact.source_terminal()
+                except BaseException as error:
+                    notify_preview_failure(exact, error)
         return report
 
     def finalize(
@@ -276,12 +276,6 @@ def compile_triggered_pipeline(
         if result.capture.run_id != context.run_id.value:
             raise ValueError("triggered capture result belongs to another Run")
         context.checkpoint()
-        exact = result._exact_preview
-        if exact is not None:
-            try:
-                exact.source_terminal()
-            except BaseException as error:
-                notify_preview_failure(exact, error)
         return result
 
     return RunPlan(

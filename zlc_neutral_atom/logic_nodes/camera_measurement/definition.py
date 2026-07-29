@@ -9,8 +9,9 @@ from zlc_data import (
     MONITOR_HISTORY,
     READOUT_EVENT,
     BlockId,
+    CellValidity,
     DataBlock,
-    DataTransformSpec,
+    DatasetComponentValidity,
     DatasetRevisionRef,
     DatasetSchema,
     OwnedSnapshot,
@@ -18,7 +19,6 @@ from zlc_data import (
     PointTable,
 )
 from zlc_data.codec import dataset_revision_ref_to_tree
-from zlc_data.transform import apply_transform, commit_transform
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
 from zlc_neutral_atom.logic_node_declaration import (
@@ -54,7 +54,6 @@ from zlc_neutral_atom.authoring import (
 
 
 DEFAULT_CAMERA_MEASUREMENT_ROLE = "camera"
-CAMERA_MEASUREMENT_ROLE_ORDER = ("camera", "mot_camera")
 DEFAULT_CAMERA_MEASUREMENT_REPEAT = 0
 DEFAULT_CAMERA_FRAMES_PER_CYCLE = 1
 DEFAULT_CAMERA_MONITOR_HISTORY_CYCLES = 8
@@ -135,15 +134,14 @@ def camera_measurement_authoring_schema() -> AuthoringSchema:
 
 
 def camera_measurement_roles(installed_roles) -> tuple[str, ...]:
-    """Filter installed Camera roles into the product's declared visible order."""
+    """Preserve every installed Camera role in catalog order."""
 
     roles = tuple(installed_roles)
     if len(set(roles)) != len(roles):
         raise ValueError("installed camera roles must be unique")
     for role in roles:
         canonical_text(role, "installed camera role")
-    installed = set(roles)
-    return tuple(role for role in CAMERA_MEASUREMENT_ROLE_ORDER if role in installed)
+    return roles
 
 
 def camera_measurement_default_role(available_roles) -> str | None:
@@ -274,14 +272,17 @@ def _materialize_camera_frame(
     """Select one physical frame row and remove private cycle coordinates."""
 
     source_schema = source.block.schema
-    selected = apply_transform(
-        source,
-        commit_transform(
-            source_schema,
-            DataTransformSpec(),
-            point_ordinals=(point_ordinal,),
-        ),
-    )
+    selected_values = source.block.values[:, point_ordinal : point_ordinal + 1, ...]
+    selected_validity = source.block.validity
+    if isinstance(selected_validity, CellValidity):
+        selected_validity = CellValidity(
+            selected_validity.mask[:, point_ordinal : point_ordinal + 1]
+        )
+    elif isinstance(selected_validity, DatasetComponentValidity):
+        selected_validity = DatasetComponentValidity(
+            selected_validity.axis_ids,
+            selected_validity.mask[:, point_ordinal : point_ordinal + 1, ...],
+        )
     output_schema = DatasetSchema(
         source_schema.repeat_axis,
         PointTable(1),
@@ -299,8 +300,8 @@ def _materialize_camera_frame(
         DataBlock(
             ref.block_id,
             ref.revision,
-            selected.values,
-            selected.validity,
+            selected_values,
+            selected_validity,
             output_schema,
         ),
     )
@@ -321,6 +322,30 @@ def _unique_camera_point_ordinal(
     return matches[0]
 
 
+def _finite_camera_event_column(
+    schema: DatasetSchema,
+    frames_per_cycle: int,
+) -> PointColumn:
+    """Validate and return the sole canonical finite Camera event column."""
+
+    event_columns = tuple(
+        column
+        for column in schema.point_table.columns
+        if column.role == READOUT_EVENT
+    )
+    if (
+        len(event_columns) != 1
+        or schema.point_table.columns != event_columns
+        or event_columns[0].values != tuple(range(frames_per_cycle))
+    ):
+        raise ValueError(
+            "finite Camera source must contain only its canonical readout events"
+        )
+    if any(axis.role == READOUT_EVENT for axis in schema.cell_schema.data_axes):
+        raise ValueError("READOUT_EVENT cannot be a trailing camera data axis")
+    return event_columns[0]
+
+
 def project_camera_measurement_outputs(
     source: OwnedSnapshot,
     request: "CameraMeasurementRequest",
@@ -329,8 +354,8 @@ def project_camera_measurement_outputs(
 
     The measurement contract, rather than a GUI, owns how one atomic camera
     cycle maps its named ``READOUT_EVENT`` cells to public outputs.  Repeat,
-    remaining point axes, trailing data axes, component validity, revision and
-    stream generation are retained exactly.
+    the singleton public point carrier, trailing data axes, component validity,
+    revision and stream generation are retained exactly.
     """
 
     if not isinstance(source, OwnedSnapshot):
@@ -338,49 +363,19 @@ def project_camera_measurement_outputs(
     if not isinstance(request, CameraMeasurementRequest):
         raise TypeError("camera output projection requires CameraMeasurementRequest")
     schema = source.block.schema
-    event_columns = tuple(
-        column
-        for column in schema.point_table.columns
-        if column.role == READOUT_EVENT
+    event_column = _finite_camera_event_column(
+        schema,
+        request.frames_per_cycle,
     )
-    if len(event_columns) != 1:
-        raise ValueError(
-            "camera Dataset must contain exactly one READOUT_EVENT column"
-        )
-    event_column = event_columns[0]
-    if schema.point_table.columns != (event_column,):
-        raise ValueError("Camera Measurement source contains non-event point columns")
-    if any(axis.role == READOUT_EVENT for axis in schema.cell_schema.data_axes):
-        raise ValueError("READOUT_EVENT cannot be a trailing camera data axis")
-    if tuple(event_column.values) != tuple(range(request.frames_per_cycle)):
-        raise ValueError(
-            "camera Dataset READOUT_EVENT rows differ from frames_per_cycle"
-        )
 
     projected: dict[str, OwnedSnapshot] = {}
     for event_index, output_name in enumerate(request.output_names):
-        snapshot = _materialize_camera_frame(
+        projected[output_name] = _materialize_camera_frame(
             source,
             event_column,
             event_index,
-            _unique_camera_point_ordinal(
-                schema,
-                readout_event=(event_column, event_index),
-            ),
+            event_index,
         )
-        output_schema = snapshot.block.schema
-        if output_schema.repeat_axis != schema.repeat_axis:
-            raise RuntimeError("camera output projection changed the repeat axis")
-        if output_schema.point_table != PointTable(1):
-            raise RuntimeError("camera cycle coordinates leaked into a public frame")
-        if output_schema.cell_schema != schema.cell_schema:
-            raise RuntimeError("camera output projection changed trailing data axes")
-        if snapshot.ref.stream_generation != source.ref.stream_generation:
-            raise RuntimeError("camera output projection changed stream generation")
-        projected[output_name] = snapshot
-
-    if tuple(projected) != request.output_names:
-        raise RuntimeError("camera output projection order is inconsistent")
     return projected
 
 
@@ -626,7 +621,6 @@ CAMERA_MEASUREMENT_LOGIC_NODE = LogicNodeDeclaration(
 
 
 __all__ = [
-    "CAMERA_MEASUREMENT_ROLE_ORDER",
     "CAMERA_MEASUREMENT_DEFINITION",
     "CAMERA_MEASUREMENT_KEY",
     "CAMERA_MEASUREMENT_LOGIC_NODE",

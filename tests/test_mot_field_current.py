@@ -88,7 +88,7 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
         row = console.logic_nodes[-1]
         editor = current_logic_editor(console, application)
         widgets = visible_form_widgets(editor)
-        replace_spin_value(widgets["points"], "2")
+        replace_spin_value(widgets["points"], "7")
         replace_path_value(widgets["folder"], str(tmp_path / "mot-report"))
 
         QtTest.QTest.mouseClick(
@@ -109,11 +109,23 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
         )
         live_card = _faceted_card(console, live_key)
         live_value = live_card.frozen_render_value()
-        live_overview = live_card.board.overview_artifact
+        first_live_publication = live_card.frozen_render_publication()
+        first_live_intent = live_card._presentation_provider(
+            live_value,
+            first_live_publication,
+        )
+        prepared = console._logic_nodes[id(row)].prepared_command
+        assert first_live_intent is prepared._bound_figure_intent()
+        first_live_revision = live_value.snapshot.ref.revision.value
+        first_live_coverage = live_value.coverage
+        assert first_live_coverage is not None
+        assert 0 < first_live_coverage.written_cells < 343
+        assert first_live_coverage.total_cells == 343
+        assert live_value.transient
         live_schema = live_value.schema
-        assert len(live_overview.regions) == live_schema.point_table.row_count
         assert live_schema.grid_topology is not None
-        assert live_schema.grid_topology.logical_shape == (2, 2, 2)
+        assert live_schema.grid_topology.logical_shape == (7, 7, 7)
+        assert live_schema.physical_shape == (1, 343, 1)
         assert tuple(
             (column.coordinate_id.value, column.role.value)
             for column in live_schema.point_table.columns
@@ -125,6 +137,36 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
         until(
             application,
             lambda: (
+                (card := _faceted_card(console, live_key)) is not None
+                and (value := _presented_value(card)) is not None
+                and value.snapshot.ref.revision.value > first_live_revision
+                and card.frozen_render_publication().sequence
+                > first_live_publication.sequence
+            ),
+            timeout=30.0,
+        )
+        second_live_card = _faceted_card(console, live_key)
+        second_live_value = second_live_card.frozen_render_value()
+        second_live_publication = second_live_card.frozen_render_publication()
+        assert second_live_card._presentation_provider(
+            second_live_value,
+            second_live_publication,
+        ) is first_live_intent
+        second_live_coverage = second_live_value.coverage
+        assert second_live_coverage is not None
+        assert second_live_publication.owner_id == first_live_publication.owner_id
+        assert second_live_publication.generation == first_live_publication.generation
+        assert second_live_publication.sequence > first_live_publication.sequence
+        assert second_live_value.snapshot.ref.revision.value > first_live_revision
+        assert (
+            second_live_coverage.written_cells
+            > first_live_coverage.written_cells
+        )
+        assert second_live_coverage.total_cells == 343
+        assert second_live_value.transient
+        until(
+            application,
+            lambda: (
                 row.status_label.text().startswith("done")
                 and editor.form.status.text().startswith("done")
                 and (card := _faceted_card(console, final_key)) is not None
@@ -132,16 +174,21 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
                 and card.board.showing_overview
                 and card.board.overview_artifact is not None
             ),
-            timeout=20.0,
+            timeout=90.0,
         )
         final_card = _faceted_card(console, final_key)
         final_value = final_card.frozen_render_value()
         final_overview = final_card.board.overview_artifact
         final_schema = final_value.schema
-        assert len(final_overview.regions) == final_schema.point_table.row_count
+        assert final_schema is live_schema
+        assert final_schema.fingerprint == live_schema.fingerprint
         assert final_schema.grid_topology is not None
-        assert final_schema.grid_topology.logical_shape == (2, 2, 2)
-        assert final_schema.physical_shape == (1, 8, 1)
+        assert final_schema.grid_topology.logical_shape == (7, 7, 7)
+        assert len(final_overview.regions) == len(
+            final_schema.grid_topology.coordinate_domains[2]
+        )
+        assert final_schema.physical_shape == (1, 343, 1)
+        assert final_value.coverage is None or final_value.coverage.complete
         assert tuple(
             column.coordinate_id.value
             for column in final_schema.point_table.columns

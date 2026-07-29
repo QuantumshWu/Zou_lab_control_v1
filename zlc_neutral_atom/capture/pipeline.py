@@ -450,6 +450,13 @@ class ExactCaptureTransaction:
         )
         envelope = delivery.envelope
         self.builder.consume(delivery)
+        exact_preview = self.exact_preview_port
+        if exact_preview is not None:
+            try:
+                exact_preview.updated()
+            except BaseException as error:
+                self.exact_preview_port = None
+                notify_preview_failure(exact_preview, error)
         preview = self.preview_dataset
         if preview is not None:
             try:
@@ -549,7 +556,7 @@ class ExactCaptureTransaction:
             )
         if self.exact_preview_port is not None:
             raise RuntimeError(
-                "an exact preview must settle through the Run finalize boundary"
+                "an exact preview must settle through the Run cleanup boundary"
             )
         if self.reservation.state not in (
             ReservationState.COMPLETED,
@@ -810,6 +817,8 @@ def compile_pipeline(
     spec: MinimalPipelineSpec,
     *,
     preview: CapturePreviewPort | None = None,
+    exact_preview: ExactDatasetPreviewPort | None = None,
+    settle_exact_preview: bool = True,
 ) -> RunPlan:
     """Compile the passive finite Camera path into one flat RunPlan.
 
@@ -819,11 +828,15 @@ def compile_pipeline(
 
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
+    if type(settle_exact_preview) is not bool:
+        raise TypeError("settle_exact_preview must be bool")
     preview_spec = _admit_capture_preview(spec, preview)
+    exact_preview_spec = _admit_exact_dataset_preview(spec, exact_preview)
     try:
         _require_passive_external_capture(spec.capture)
     except BaseException as error:
         notify_preview_failure(preview, error)
+        notify_preview_failure(exact_preview, error)
         raise
     port = spec.capture.capture_port
 
@@ -833,6 +846,8 @@ def compile_pipeline(
             context,
             preview=preview,
             preview_spec=preview_spec,
+            exact_preview=exact_preview,
+            exact_preview_spec=exact_preview_spec,
         )
 
     def execute(context: RunContext, prepared: ExactCaptureTransaction) -> PipelineResult:
@@ -854,14 +869,29 @@ def compile_pipeline(
                 report = port.verify_idle(context)
             except BaseException as error:
                 notify_preview_failure(preview, error)
+                notify_preview_failure(exact_preview, error)
                 raise
-            return _settle_unbound_preview(preview, report, primary)
+            settled = _settle_unbound_preview(preview, report, primary)
+            failure = primary or (report.errors[0] if report.errors else None)
+            if failure is None:
+                failure = RuntimeError(
+                    "exact dataset preview never reached its capture builder"
+                )
+            notify_preview_failure(exact_preview, failure)
+            return settled
         try:
             report = prepared.cleanup(context)
         except BaseException as error:
-            prepared._detach_preview(error)
+            prepared._fail_previews(error)
             raise
         prepared.settle_preview_after_cleanup(report, primary)
+        if settle_exact_preview and primary is None and not report.errors:
+            exact = prepared.exact_preview_port
+            if exact is not None:
+                try:
+                    exact.source_terminal()
+                except BaseException as error:
+                    notify_preview_failure(exact, error)
         return report
 
     return RunPlan(

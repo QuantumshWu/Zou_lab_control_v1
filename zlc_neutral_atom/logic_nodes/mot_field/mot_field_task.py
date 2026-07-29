@@ -18,6 +18,7 @@ from typing import Callable, Mapping, Protocol
 
 import numpy as np
 
+from zlc_data import DatasetSchema
 from zlc_neutral_atom.capture.artifact import (
     CaptureRepository,
     PendingCaptureArtifact,
@@ -56,8 +57,10 @@ from .mot_field import (
     mot_field_source_identity,
     mot_intensity_schema,
 )
-from .mot_field_live import MOT_FIELD_LIVE_OUTPUT_DECLARATIONS
-from .mot_field_task_live import MotFieldTaskLiveOutput
+from .mot_field_live import (
+    MOT_FIELD_LIVE_OUTPUT_DECLARATIONS,
+    MotFieldLiveProjection,
+)
 from .application import (
     PreparedMotFieldAcquisition,
 )
@@ -65,6 +68,11 @@ from zlc_neutral_atom.runtime.run import (
     PostSafetyContext,
     RunHandle,
     RunPlan,
+)
+from zlc_neutral_atom.runtime.preview import (
+    ExactDatasetPreviewPort,
+    ExactDatasetPreviewSpec,
+    notify_preview_failure,
 )
 from zlc_storage import (
     canonical_text,
@@ -615,12 +623,14 @@ class PreparedMotFieldTask:
 
     __slots__ = (
         "_intent",
-        "_live_output",
+        "_figure_intent",
         "_lock",
         "_handle",
-        "_plan",
+        "_plan_factory",
         "_request",
         "_result_owner",
+        "_output_schema",
+        "_source_schema",
         "_start_run",
         "_started",
     )
@@ -629,28 +639,28 @@ class PreparedMotFieldTask:
         self,
         intent: MotFieldTaskIntent,
         request: MotFieldRequest,
-        plan: RunPlan,
+        source_schema: DatasetSchema,
+        plan_factory: Callable[[ExactDatasetPreviewPort | None], RunPlan],
         start_run: Callable[[RunPlan], RunHandle],
-        live_output: MotFieldTaskLiveOutput,
         result_owner: _MotFieldTaskResultOwner,
     ) -> None:
         if not isinstance(intent, MotFieldTaskIntent):
             raise TypeError("intent must be MotFieldTaskIntent")
         if not isinstance(request, MotFieldRequest):
             raise TypeError("request must be MotFieldRequest")
-        if not isinstance(plan, RunPlan):
-            raise TypeError("plan must be RunPlan")
-        if not callable(start_run):
-            raise TypeError("start_run must be callable")
-        if not isinstance(live_output, MotFieldTaskLiveOutput):
-            raise TypeError("live_output must be MotFieldTaskLiveOutput")
+        if not isinstance(source_schema, DatasetSchema):
+            raise TypeError("source_schema must be DatasetSchema")
+        if not callable(plan_factory) or not callable(start_run):
+            raise TypeError("MOT task requires plan_factory and start_run")
         if not isinstance(result_owner, _MotFieldTaskResultOwner):
             raise TypeError("result_owner must be _MotFieldTaskResultOwner")
         self._intent = intent
         self._request = request
-        self._plan = plan
+        self._source_schema = source_schema
+        self._output_schema = mot_intensity_schema(request, source_schema)
+        self._figure_intent = None
+        self._plan_factory = plan_factory
         self._start_run = start_run
-        self._live_output = live_output
         self._result_owner = result_owner
         self._lock = threading.Lock()
         self._started = False
@@ -665,17 +675,50 @@ class PreparedMotFieldTask:
         return self._request
 
     @property
-    def live_output(self) -> MotFieldTaskLiveOutput:
-        return self._live_output
+    def output_schema(self) -> DatasetSchema:
+        """The generation-static scalar Bx/By/Bz schema shared by live and FINAL."""
 
-    def start(self) -> RunHandle:
+        return self._output_schema
+
+    def _bind_figure_intent(self, intent: object) -> None:
+        """Freeze the optional UI attachment once during hosted preparation."""
+
+        if intent is None:
+            raise TypeError("MOT Figure intent must not be None")
+        if self._figure_intent is not None:
+            raise RuntimeError("MOT Figure intent is already frozen")
+        self._figure_intent = intent
+
+    def _bound_figure_intent(self) -> object:
+        if self._figure_intent is None:
+            raise RuntimeError("MOT Figure intent was not frozen for this hosted generation")
+        return self._figure_intent
+
+    @property
+    def preview_spec(self) -> ExactDatasetPreviewSpec:
+        return ExactDatasetPreviewSpec(self._source_schema.fingerprint)
+
+    def live_projection(self) -> MotFieldLiveProjection:
+        return MotFieldLiveProjection(
+            self._request,
+            self._source_schema,
+            self._output_schema,
+        )
+
+    def start(
+        self,
+        preview: ExactDatasetPreviewPort | None = None,
+    ) -> RunHandle:
         with self._lock:
             if self._started:
                 raise RuntimeError("PreparedMotFieldTask is one-shot")
             self._started = True
         try:
+            plan = self._plan_factory(preview)
+            if not isinstance(plan, RunPlan):
+                raise TypeError("MOT plan factory returned another type")
             handle = self._start_run(
-                self._plan.with_lifecycle(owner=self, preemptible=False)
+                plan.with_lifecycle(owner=self, preemptible=False)
             )
             if not isinstance(handle, RunHandle):
                 raise TypeError("MOT start_run returned another handle type")
@@ -683,7 +726,7 @@ class PreparedMotFieldTask:
                 self._handle = handle
             return handle
         except BaseException as error:
-            self._live_output.fail(f"{type(error).__name__}: {error}")
+            notify_preview_failure(preview, error)
             raise
 
     def _require_own_success(
@@ -713,7 +756,11 @@ class PreparedMotFieldTask:
         """Materialize the named FINAL outputs from the committed capture."""
 
         final = self._require_own_success(reference)
-        return mot_field_final_outputs(final.analysis, final.source)
+        return mot_field_final_outputs(
+            final.analysis,
+            final.source,
+            self._output_schema,
+        )
 
     def completion_summary(self, reference: CaptureArtifactRef) -> str:
         """Name the repository FINAL rather than a replace-last report file."""
@@ -733,11 +780,14 @@ def start_mot_field_task_command(
         raise TypeError("MOT-field preparer returned another command type")
     if not callable(cancel_requested):
         raise TypeError("cancel_requested must be callable")
-    attach_live_output = getattr(live_output_host, "attach_live_output", None)
-    if not callable(attach_live_output):
-        raise TypeError("MOT-field start requires a live-output host")
-    attach_live_output(command.live_output)
-    return command.start()
+    open_exact_dataset = getattr(live_output_host, "open_exact_dataset", None)
+    if not callable(open_exact_dataset):
+        raise TypeError("MOT-field start requires an exact Dataset host")
+    preview = open_exact_dataset(
+        command.preview_spec,
+        projection=command.live_projection(),
+    )
+    return command.start(preview)
 
 
 def prepare_mot_field_task(
@@ -774,33 +824,31 @@ def prepare_mot_field_task(
     acquisition = dependencies.prepare_mot_field_acquisition(request)
     if not isinstance(acquisition, PreparedMotFieldAcquisition):
         raise TypeError("MOT dependency returned another acquisition type")
-    live_output = MotFieldTaskLiveOutput(
-        request,
-        acquisition.source_schema,
-    )
     result_owner = _MotFieldTaskResultOwner()
-    try:
+    report_folder = resolve_under(output_root, intent.folder)
+
+    def plan_factory(
+        preview: ExactDatasetPreviewPort | None,
+    ) -> RunPlan:
         capture_plan = acquisition.compile_capture_plan(
             capture_repository,
-            preview=live_output.preview_port,
+            preview=preview,
         )
-        plan = _compile_mot_field_task_plan(
+        return _compile_mot_field_task_plan(
             request,
             capture_plan,
-            resolve_under(output_root, intent.folder),
+            report_folder,
             result_owner,
         )
-        return PreparedMotFieldTask(
-            intent,
-            request,
-            plan,
-            start_run,
-            live_output,
-            result_owner,
-        )
-    except BaseException:
-        live_output.close()
-        raise
+
+    return PreparedMotFieldTask(
+        intent,
+        request,
+        acquisition.source_schema,
+        plan_factory,
+        start_run,
+        result_owner,
+    )
 
 
 __all__ = [

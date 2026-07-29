@@ -112,9 +112,9 @@ def test_mot_task_analyzes_once_and_reuses_that_result_for_every_output(
         reported.append(result)
         return original_report(result, folder)
 
-    def observe_outputs(result, source):
-        projected.append((result, source))
-        return original_outputs(result, source)
+    def observe_outputs(result, source, output_schema):
+        projected.append((result, source, output_schema))
+        return original_outputs(result, source, output_schema)
 
     monkeypatch.setattr(mot_task_impl, "analyze_mot_scan", count_analysis)
     monkeypatch.setattr(mot_task_impl, "write_mot_field_report", observe_report)
@@ -147,8 +147,9 @@ def test_mot_task_analyzes_once_and_reuses_that_result_for_every_output(
     assert len(analyzed) == 1
     assert reported == [analyzed[0]]
     assert len(projected) == 2
-    assert all(result is analyzed[0] for result, _source in projected)
+    assert all(result is analyzed[0] for result, _source, _schema in projected)
     assert projected[0][1] is projected[1][1]
+    assert projected[0][2] is projected[1][2] is command.output_schema
     assert first.keys() == second.keys() == {"mot_field", "scan"}
     assert first["mot_field"].join_digest == second["mot_field"].join_digest
     assert first["scan"].snapshot is projected[0][1].snapshot

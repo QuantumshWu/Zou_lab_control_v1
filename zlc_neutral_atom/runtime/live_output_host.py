@@ -6,9 +6,13 @@ from collections.abc import Callable
 
 from zlc_neutral_atom.dataset_output import LiveDatasetOutputOwner
 from zlc_neutral_atom.processing.signal_plane import SignalDataPlane, SignalProducer
-from zlc_neutral_atom.runtime.preview import LiveDatasetViewSpec
+from zlc_neutral_atom.runtime.preview import (
+    ExactDatasetPreviewPort,
+    ExactDatasetPreviewSpec,
+    LiveDatasetViewSpec,
+)
 from zlc_neutral_atom.runtime.signal_source import SignalEventSource
-from .live_dataset import LiveDatasetPort
+from .live_dataset import LiveDatasetPort, _ExactDeltaLivePort
 
 
 class LiveDatasetHost:
@@ -53,19 +57,21 @@ class LiveDatasetHost:
             retain_on_terminal=retain_on_terminal,
             output_owner=output_owner,
         )
-        try:
-            self._data_plane.attach(
-                self._node,
-                slot,
-                event_source=self._event_source,
-            )
-            slot.set_change_listener(
-                lambda: self._data_plane.mark_changed(self._node)
-            )
-        except BaseException:
-            slot.close()
-            raise
-        self._opened = True
+        self._attach(slot)
+        return slot
+
+    def open_exact_dataset(
+        self,
+        spec: ExactDatasetPreviewSpec,
+        *,
+        projection: object,
+    ) -> ExactDatasetPreviewPort:
+        """Attach the sole internal exact-delta projection for this start."""
+
+        if self._opened:
+            raise RuntimeError("one hosted start may attach only one live Dataset")
+        slot = _ExactDeltaLivePort(spec, projection)
+        self._attach(slot)
         return slot
 
     def factory(
@@ -82,24 +88,25 @@ class LiveDatasetHost:
             retain_on_terminal=retain_on_terminal,
         )
 
-    def attach_live_output(self, live_output) -> None:
-        """Attach an application-owned live source that already implements the slot."""
-
+    def _attach(self, slot) -> None:
         if self._opened:
             raise RuntimeError("one hosted start may attach only one live Dataset")
-        if not callable(getattr(live_output, "freeze_live_outputs", None)):
-            raise TypeError("live output exposes no typed Dataset materializer")
+        if not callable(getattr(slot, "freeze_live_outputs", None)):
+            raise TypeError("live slot exposes no typed Dataset materializer")
         try:
+            # Fresh slots cannot receive producer updates before this host starts
+            # the command.  Install the sole listener first so attachment is one
+            # atomic transition, never a plane slot with no wake path.
+            slot.set_change_listener(
+                lambda: self._data_plane.mark_changed(self._node, slot)
+            )
             self._data_plane.attach(
                 self._node,
-                live_output,
+                slot,
                 event_source=self._event_source,
             )
-            live_output.set_change_listener(
-                lambda: self._data_plane.mark_changed(self._node)
-            )
         except BaseException:
-            live_output.close()
+            slot.close()
             raise
         self._opened = True
 
