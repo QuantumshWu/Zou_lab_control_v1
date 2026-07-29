@@ -5,7 +5,6 @@ from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
-import threading
 
 import numpy as np
 
@@ -65,31 +64,16 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.sitemap import (
     load_sitemap_pulse,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.task import (
-    CalibrationTaskIntent,
-    prepare_calibration_task,
     write_calibration_task_outputs,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.task_output import (
     read_calibration_task_output,
 )
-from zlc_neutral_atom.capture.application import (
-    CAPTURE_READOUT_EVENT_AXIS_ID,
-)
 from zlc_neutral_atom.capture.artifact import CaptureRepository
 from zlc_neutral_atom.capture.reference import (
     CaptureArtifactRef,
 )
-from zlc_neutral_atom.logic_nodes.readout.contracts import (
-    CalibrationCaptureLayout,
-)
-from zlc_neutral_atom.runtime.cleanup import CleanupReport
-from zlc_neutral_atom.runtime.commit import (
-    PreparedArtifactCommit,
-)
-from zlc_neutral_atom.runtime.resources import ResourceArbiter
-from zlc_neutral_atom.runtime.run import CancelOutcome, RunController, RunPlan
 from zlc_pulse import PulseTarget
-from zlc_storage import RepositoryRootLease
 
 
 def _render_current_report(view):
@@ -173,6 +157,8 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         ablation_errors=np.asarray([0], dtype=np.int64),
         ablation_n_valid=np.asarray([2], dtype=np.int64),
     )
+    calibration_ref = CalibrationArtifactRef("calibration-repository", "a" * 64)
+    capture_ref = CaptureArtifactRef("capture-repository", "b" * 64)
     view = CalibrationReportProjection(
         frame_schema=frame_schema,
         site_axis=site_axis,
@@ -194,7 +180,7 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         psf_mode=None,
         psf_fit_ok=None,
         psf_sigma_xy=None,
-        calibration_identity="calibration/" + "a" * 64,
+        calibration_ref=calibration_ref,
         source_capture_identity="capture/" + "b" * 64,
         binding="camera",
         camera_identity="virtual-qcmos",
@@ -203,8 +189,6 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         group_count=4,
         software_lineage=(("numpy", np.__version__),),
     )
-    calibration_ref = CalibrationArtifactRef("calibration-repository", "a" * 64)
-    capture_ref = CaptureArtifactRef("capture-repository", "b" * 64)
     destination = tmp_path / "report"
 
     write_calibration_result_bundle(
@@ -223,6 +207,10 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
     # test rather than reconstructed here.
     document = project_calibration_plot_report(view)
     overview = next(page for page in document.pages if page.key == "overview")
+    per_site = next(page for page in document.pages if page.key == "hist-box")
+    pooled = next(page for page in document.pages if page.key == "pooled-box")
+    assert per_site.source.snapshot is pooled.source.snapshot
+    assert per_site.source.snapshot.block.schema.physical_shape == (4, 1, 2)
     assert overview.contract.size_name == "2x2"
     report_runtime_contract = replace(
         overview.contract,
@@ -304,178 +292,7 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
     assert rows[0]["model_0_n_train_bright"] == "1"
 
 
-def _analysis_request() -> CalibrationAnalysisRequest:
-    return CalibrationAnalysisRequest(
-        CalibrationCaptureLayout(
-            CAPTURE_READOUT_EVENT_AXIS_ID,
-            (0, 2),
-            1,
-        ),
-        (1, 1),
-        box_radius=1,
-        expected_centers_xy=np.asarray([[4.0, 4.0]]),
-        maximum_site_residual_px=1.0,
-    )
-
-
-class _CommittedCalibrationRun:
-    def __init__(
-        self,
-        root: Path,
-        result: CalibrationArtifactRef,
-    ) -> None:
-        self.result = result
-        self.root_lease = RepositoryRootLease(root)
-        self.resources = ResourceArbiter()
-        self.controller = RunController(self.resources)
-
-    def start(self):
-        result = self.result
-
-        def finalize(context, _executed):
-            run_id = context.authorize_commit_preparation()
-            borrow = self.root_lease.borrow()
-            operation = PreparedArtifactCommit(
-                run_id=run_id,
-                result=result,
-                manifest_payload=b"calibration-result-bundle-test",
-                publish=lambda _payload: None,
-                inspect=lambda _payload: True,
-                repository_borrow=borrow,
-            )
-            try:
-                context.track_prepared_commit(operation)
-            except BaseException:
-                operation.abandon()
-                raise
-            return context.commit_final(operation)
-
-        return self.controller.start(
-            RunPlan(
-                name="focused calibration commit",
-                resource_claims=(),
-                bound_devices=(),
-                preflight=lambda _context: None,
-                execute=lambda _context, prepared: prepared,
-                cleanup=lambda _context, _prepared, _primary: CleanupReport.complete(),
-                finalize=finalize,
-                requires_final_commit=True,
-            )
-        )
-
-    def close(self) -> None:
-        assert self.controller.shutdown(2.0)
-        self.resources.shutdown()
-        self.root_lease.close()
-
-
-class _SavedCalibrationDependencies:
-    def __init__(
-        self,
-        source: CaptureArtifactRef,
-        child: _CommittedCalibrationRun,
-        writing: threading.Event,
-        release: threading.Event,
-    ) -> None:
-        self.source = source
-        self.child = child
-        self.writing = writing
-        self.release = release
-        self.admitted_path: Path | None = None
-        self.written: tuple[str, str] | None = None
-
-    def admit_saved_calibration_capture(
-        self,
-        source_path: Path,
-        *,
-        expected_camera_role: str,
-    ) -> CaptureArtifactRef:
-        self.admitted_path = source_path
-        assert expected_camera_role == "camera"
-        return self.source
-
-    def sitemap_analysis_request(self, **_kwargs) -> CalibrationAnalysisRequest:
-        return _analysis_request()
-
-    def start_calibration_analysis(
-        self,
-        source,
-        analysis,
-        *,
-        lifecycle_owner=None,
-    ):
-        assert source == self.source
-        assert analysis == _analysis_request()
-        assert lifecycle_owner is not None
-        return self.child.start()
-
-    def write_calibration_task_outputs(
-        self,
-        source,
-        calibration,
-        *,
-        folder: str,
-        frame_export_policy: str,
-        expected_camera_role: str,
-    ) -> None:
-        assert source == self.source
-        assert calibration == self.child.result
-        assert expected_camera_role == "camera"
-        self.written = (folder, frame_export_policy)
-        self.writing.set()
-        if not self.release.wait(2.0):
-            raise TimeoutError("focused output writer was not released")
-
-
-def test_saved_task_uses_explicit_output_preserves_frames_and_rejects_late_cancel(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    monkeypatch.chdir(elsewhere)
-    expected_root = (tmp_path / "focused-calibration").resolve()
-    source = CaptureArtifactRef("capture-repository", "b" * 64)
-    calibration = CalibrationArtifactRef("calibration-repository", "a" * 64)
-    child = _CommittedCalibrationRun(tmp_path / "commit-repository", calibration)
-    writing = threading.Event()
-    release = threading.Event()
-    dependencies = _SavedCalibrationDependencies(source, child, writing, release)
-    intent = CalibrationTaskIntent(
-        source_mode="saved frames",
-        folder=str(expected_root),
-        save_frames=False,
-        pulse="imaging_template.json",
-        threshold_method="otsu",
-        reference_exposure_s=0.020,
-        readout_exposure_s=0.005,
-        threshold_frames=2,
-        roi_radius=1,
-        camera_role="camera",
-    )
-    try:
-        assert Path(intent.folder) == expected_root
-        prepared = prepare_calibration_task(intent, dependencies)
-        assert dependencies.admitted_path == expected_root / "frames"
-        handle = prepared.start()
-        assert writing.wait(2.0)
-        assert handle.snapshot().final_committed
-        assert (
-            handle.cancel("after calibration commit")
-            is CancelOutcome.TOO_LATE_ALREADY_COMMITTED
-        )
-        release.set()
-        assert handle.result(2.0) == calibration
-        assert dependencies.written == (str(expected_root), "preserve")
-        assert prepared.completion_summary(calibration) == (
-            f"done; results: {expected_root}; report: {expected_root / 'report'}"
-        )
-    finally:
-        release.set()
-        child.close()
-
-
-def test_preserve_policy_keeps_admitted_saved_frame_export(
+def test_task_output_writes_pointer_and_report_without_duplicate_raw_frames(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -484,10 +301,6 @@ def test_preserve_policy_keeps_admitted_saved_frame_export(
     capture_repository = CaptureRepository(tmp_path / "captures")
     calibration_repository = CalibrationRepository(tmp_path / "calibrations")
     task_root = tmp_path / "task-output"
-    frames = task_root / "frames"
-    frames.mkdir(parents=True)
-    sentinel = frames / "saved-frame-owner.txt"
-    sentinel.write_text("keep", encoding="utf-8")
     admitted = SimpleNamespace(
         artifact=SimpleNamespace(
             camera_provenance=SimpleNamespace(
@@ -535,7 +348,6 @@ def test_preserve_policy_keeps_admitted_saved_frame_export(
             source,
             calibration,
             folder=task_root,
-            frame_export_policy="preserve",
             capture_repository=capture_repository,
             calibration_repository=calibration_repository,
             expected_camera_role="camera",
@@ -545,7 +357,7 @@ def test_preserve_policy_keeps_admitted_saved_frame_export(
         calibration_repository.close()
         capture_repository.close()
 
-    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (task_root / "frames").exists()
     assert (task_root / "report" / "marker.txt").is_file()
     pointer = read_calibration_task_output(task_root / "calibration_ref.json")
     assert pointer.calibration_ref == calibration

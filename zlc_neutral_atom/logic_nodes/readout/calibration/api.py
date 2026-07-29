@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from pathlib import Path
+import threading
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -69,13 +70,16 @@ class SitemapCalibrationInterrupted(KeyboardInterrupt):
 class CalibrationApi:
     __slots__ = (
         "_admit_capture",
-        "_admit_saved_capture",
         "_admit_saved_calibration",
         "_bind_capture",
         "_camera_roles",
+        "_closed",
+        "_current_calibration_ref",
+        "_lock",
         "_load_calibration",
         "_load_pulse",
         "_open_ui",
+        "_operation_guard",
         "_profiles",
         "_repository",
         "_repository_path",
@@ -99,8 +103,8 @@ class CalibrationApi:
         load_pulse: Callable,
         bind_capture: Callable,
         wait_run: Callable,
+        operation_guard: Callable,
         admit_capture: Callable,
-        admit_saved_capture: Callable,
         write_outputs: Callable,
         start_calibration: Callable,
         load_calibration: Callable,
@@ -116,8 +120,8 @@ class CalibrationApi:
             load_pulse,
             bind_capture,
             wait_run,
+            operation_guard,
             admit_capture,
-            admit_saved_capture,
             write_outputs,
             start_calibration,
             load_calibration,
@@ -129,14 +133,17 @@ class CalibrationApi:
         self._repository_path = repository_path
         self._profiles = MappingProxyType(dict(profiles))
         self._camera_roles = tuple(camera_roles)
+        self._lock = threading.RLock()
+        self._closed = False
+        self._current_calibration_ref: CalibrationArtifactRef | None = None
         self._resolve_camera_role = resolve_camera_role
         self._resolve_camera_ref = resolve_camera_ref
         self._resolve_sequencer_ref = resolve_sequencer_ref
         self._load_pulse = load_pulse
         self._bind_capture = bind_capture
         self._wait_run = wait_run
+        self._operation_guard = operation_guard
         self._admit_capture = admit_capture
-        self._admit_saved_capture = admit_saved_capture
         self._write_outputs = write_outputs
         self._start_calibration_operation = start_calibration
         self._load_calibration = load_calibration
@@ -145,19 +152,65 @@ class CalibrationApi:
         self._repository: CalibrationRepository | None = None
 
     def _calibration_repository(self) -> CalibrationRepository:
-        repository = self._repository
-        if repository is None:
-            repository = CalibrationRepository(self._repository_path)
-            self._repository = repository
-        return repository
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Calibration API is closed")
+            repository = self._repository
+            if repository is None:
+                repository = CalibrationRepository(self._repository_path)
+                self._repository = repository
+            return repository
 
     def _repository_for_readout_family(self) -> CalibrationRepository:
         """Share the family-owned repository with dependent readout leaves."""
 
         return self._calibration_repository()
 
+    @property
+    def current_calibration_ref(self) -> CalibrationArtifactRef | None:
+        """Visible application default; authoritative requests still freeze a ref."""
+
+        with self._operation_guard():
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("Calibration API is closed")
+                return self._current_calibration_ref
+
+    @current_calibration_ref.setter
+    def current_calibration_ref(
+        self,
+        reference: CalibrationArtifactRef | None,
+    ) -> None:
+        with self._operation_guard():
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("Calibration API is closed")
+                if reference is not None:
+                    if not isinstance(reference, CalibrationArtifactRef):
+                        raise TypeError(
+                            "current_calibration_ref must be "
+                            "CalibrationArtifactRef or None"
+                        )
+                    self.load_calibration(reference)
+                self._current_calibration_ref = reference
+
+    def _remember_committed_calibration(
+        self,
+        reference: CalibrationArtifactRef,
+    ) -> None:
+        """Record a ref minted by this API's repository after manifest commit."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Calibration API is closed")
+            self._current_calibration_ref = reference
+
     def close(self) -> tuple[Exception, ...]:
-        repository = self._repository
+        with self._lock:
+            self._closed = True
+            self._current_calibration_ref = None
+            repository = self._repository
+            self._repository = None
         if repository is None:
             return ()
         try:
@@ -264,23 +317,12 @@ class CalibrationApi:
         except Exception as error:
             raise SitemapCalibrationFailed(source) from error
 
-    def admit_saved_calibration_capture(
-        self,
-        source_path: str | Path,
-        *,
-        expected_camera_role: str,
-    ) -> CaptureArtifactRef:
-        binding = ReadoutBindingKey(expected_camera_role)
-        self._resolve_camera_ref(binding.value)
-        return self._admit_saved_capture(source_path, binding.value)
-
     def write_calibration_task_outputs(
         self,
         source: CaptureArtifactRef,
         calibration: CalibrationArtifactRef,
         *,
         folder: str | Path,
-        frame_export_policy: str,
         expected_camera_role: str | None = None,
     ) -> None:
         binding = (
@@ -295,7 +337,6 @@ class CalibrationApi:
             calibration,
             self._calibration_repository(),
             folder=folder,
-            frame_export_policy=frame_export_policy,
             expected_camera_role=None if binding is None else binding.value,
         )
 
@@ -325,6 +366,7 @@ class CalibrationApi:
             request,
             self._calibration_repository(),
             lifecycle_owner,
+            self._remember_committed_calibration,
         )
 
     def start_calibration_analysis(

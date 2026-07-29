@@ -21,6 +21,7 @@ from zlc_neutral_atom.artifact_output import ArtifactOutputDeclaration
 from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
 from .owner_mailbox import RunOwnerMailbox
+from .run import RunCancelled, RunFailed, RunHandle
 
 __all__ = ["HostedRun"]
 
@@ -30,6 +31,21 @@ _UNRESOLVED_FINAL = object()
 
 class _StartSuppressed(Exception):
     """The user stopped this node before its starter received hardware authority."""
+
+
+class _HostedCommandContext:
+    """Narrow sequential-child capability owned by one HostedRun generation."""
+
+    __slots__ = ("_owner",)
+
+    def __init__(self, owner: "HostedRun") -> None:
+        self._owner = owner
+
+    def cancel_requested(self) -> bool:
+        return self._owner.cancel_requested
+
+    def start_and_wait(self, starter: Callable[[], RunHandle]):
+        return self._owner._start_child_and_wait(starter)
 
 
 class HostedRun:
@@ -118,10 +134,12 @@ class HostedRun:
         self._materialized_final_outputs = None
         self._completion_summary: str | None = None
         self._final_output_error: str | None = None
+        self._post_final_warning: str | None = None
         self._error: str | None = None
         self._start_exception: BaseException | None = None
         self._stop_reason = "Host requested stop"
         self._starter = None
+        self._command_context = _HostedCommandContext(self)
 
     # ----------------------------------------------------------------- facts
     @property
@@ -265,6 +283,12 @@ class HostedRun:
         return self._final_output_error
 
     @property
+    def post_final_warning(self) -> str | None:
+        """Non-fatal work performed after the exact FINAL commit."""
+
+        return self._post_final_warning
+
+    @property
     def completion_summary(self) -> str | None:
         """Command-owned human result location, if this run persists one."""
 
@@ -301,6 +325,12 @@ class HostedRun:
         """Whether this exact hosted generation has received Stop."""
 
         return self._stop_event.is_set()
+
+    @property
+    def command_context(self):
+        """Return this generation's narrow cancel/start-and-wait capability."""
+
+        return self._command_context
 
     # ------------------------------------------------------------ lifecycle
     def bind_starter(self, start: Callable[[object], object]) -> None:
@@ -352,11 +382,17 @@ class HostedRun:
         self._materialized_final_outputs = None
         self._completion_summary = None
         self._final_output_error = None
+        self._post_final_warning = None
         request = self._request
         prepare = self._prepare
 
         def start_owned():
             prepared = prepare(request)
+            # Keep the exact prepared command reachable even when a later
+            # child fails.  Calibration, for example, must retain the capture
+            # artifact produced by its first flat Run when its second Run
+            # fails; the host must not hide that provenance in a failed Future.
+            self._prepared_command = prepared
             if self._stop_event.is_set():
                 raise _StartSuppressed()
             return prepared, start(prepared)
@@ -389,6 +425,58 @@ class HostedRun:
                 raise _StartSuppressed()
             return starter()
 
+    def _start_child_and_wait(self, starter: Callable[[], RunHandle]):
+        """Start one flat child Run and expose it while the owner thread waits."""
+
+        if not callable(starter):
+            raise TypeError("child starter must be callable")
+        with self._start_gate_lock:
+            if self._stop_event.is_set():
+                raise _StartSuppressed()
+            self._handle = None
+        # Do not hold the host gate across application admission.  The starter
+        # may retire a conflicting Run before the SignalPlane calls the same
+        # host's short start_if_not_cancelled gate.  Holding this lock here
+        # would both self-deadlock that final admission and prevent Stop from
+        # setting the cancellation token during retirement.
+        handle = starter()
+        if not isinstance(handle, RunHandle):
+            raise TypeError("hosted child starter returned a non-RunHandle")
+        with self._start_gate_lock:
+            self._handle = handle
+            self._owner.set_handle(handle)
+            cancelled = self._stop_event.is_set()
+            reason = self._stop_reason
+        if cancelled:
+            handle.cancel(reason)
+        return handle.result()
+
+    def _accept_success_result(self, result: object) -> None:
+        """Admit one exact successful result and schedule optional projections."""
+
+        self._final_result = result
+        command = self._prepared_command
+        summary_factory = getattr(command, "completion_summary", None)
+        if callable(summary_factory):
+            try:
+                summary = summary_factory(result)
+                if not isinstance(summary, str) or not summary.strip():
+                    raise TypeError("completion_summary() must return non-empty str")
+                self._completion_summary = summary.strip()
+            except BaseException as error:
+                self._completion_summary = (
+                    "result committed; location unavailable: "
+                    f"{type(error).__name__}: {error}"
+                )
+        outputs_factory = getattr(command, "final_dataset_outputs", None)
+        if callable(outputs_factory) and not self._final_outputs_submitted:
+            self._final_outputs_submitted = True
+            self._owner.submit(
+                "materialize-final-outputs",
+                lambda: outputs_factory(result),
+                generation=self._owner.generation,
+            )
+
     def poll(self):
         """Drain worker completions and refresh the snapshot.  Call per tick.
 
@@ -419,6 +507,31 @@ class HostedRun:
                             self._materialized_final_outputs = {}
                         else:
                             self._materialized_final_outputs = dict(projected)
+                            warning_factory = getattr(
+                                self._prepared_command,
+                                "post_final_warning",
+                                None,
+                            )
+                            if callable(warning_factory):
+                                try:
+                                    warning = warning_factory()
+                                    if warning is not None and (
+                                        not isinstance(warning, str)
+                                        or not warning.strip()
+                                    ):
+                                        raise TypeError(
+                                            "post_final_warning() must return "
+                                            "non-empty str or None"
+                                        )
+                                    self._post_final_warning = (
+                                        None if warning is None else warning.strip()
+                                    )
+                                except BaseException as warning_error:
+                                    self._post_final_warning = (
+                                        "post-final warning unavailable: "
+                                        f"{type(warning_error).__name__}: "
+                                        f"{warning_error}"
+                                    )
                 else:
                     self._final_output_error = (
                         f"{type(error).__name__}: {error}"
@@ -437,22 +550,36 @@ class HostedRun:
                     continue
                 self._error = f"{type(error).__name__}: {error}"
                 self._start_exception = error
-                self._handle = None
-                self._snapshot = None
+                if isinstance(error, (RunCancelled, RunFailed)):
+                    self._snapshot = error.snapshot
+                else:
+                    self._handle = None
+                    self._snapshot = None
                 self._final_result = _UNRESOLVED_FINAL
                 self._owner.mark_owner_reaped()
                 continue
             if completion.kind == "start":
                 self._start_pending = False
-                prepared, self._handle = completion.future.result()
+                prepared, started = completion.future.result()
                 self._prepared_command = prepared
-                self._owner.set_handle(self._handle)
+                if not isinstance(started, RunHandle):
+                    error = TypeError(
+                        "prepared command starter returned a non-RunHandle"
+                    )
+                    self._error = f"TypeError: {error}"
+                    self._start_exception = error
+                    self._handle = None
+                    self._snapshot = None
+                    self._owner.mark_owner_reaped()
+                    continue
+                self._handle = started
+                self._owner.set_handle(started)
                 if self._stop_event.is_set():
-                    self._handle.cancel(self._stop_reason)
+                    started.cancel(self._stop_reason)
         handle = self._handle
         if handle is not None:
             self._snapshot = handle.snapshot()
-            if self._snapshot.state.terminal:
+            if self._snapshot.state.terminal and not self._start_pending:
                 try:
                     # A Run publishes terminal state just before its owner
                     # thread exits.  The mailbox may retire the handle only
@@ -467,45 +594,7 @@ class HostedRun:
                         self._snapshot.state.name == "SUCCEEDED"
                         and self._final_result is _UNRESOLVED_FINAL
                     ):
-                        self._final_result = handle.result(timeout=0.0)
-                        command = self._prepared_command
-                        summary_factory = getattr(
-                            command,
-                            "completion_summary",
-                            None,
-                        )
-                        if callable(summary_factory):
-                            try:
-                                summary = summary_factory(self._final_result)
-                                if not isinstance(summary, str) or not summary.strip():
-                                    raise TypeError(
-                                        "completion_summary() must return non-empty str"
-                                    )
-                                self._completion_summary = summary.strip()
-                            except BaseException as error:
-                                self._completion_summary = (
-                                    "result committed; location unavailable: "
-                                    f"{type(error).__name__}: {error}"
-                                )
-                        outputs_factory = getattr(
-                            command,
-                            "final_dataset_outputs",
-                            None,
-                        )
-                        if (
-                            callable(outputs_factory)
-                            and not self._final_outputs_submitted
-                        ):
-                            result = self._final_result
-                            def materialize_final_outputs():
-                                return outputs_factory(result)
-
-                            self._final_outputs_submitted = True
-                            self._owner.submit(
-                                "materialize-final-outputs",
-                                materialize_final_outputs,
-                                generation=self._owner.generation,
-                            )
+                        self._accept_success_result(handle.result(timeout=0.0))
                     elif self._snapshot.state.name != "SUCCEEDED":
                         self._final_result = _UNRESOLVED_FINAL
         return self._snapshot

@@ -218,7 +218,7 @@ def test_repeated_index_ranges_preserve_absolute_implicit_axis_indices():
 def test_exact_point_ordinals_preserve_authored_grid_rows():
     a_id = AxisId("a")
     b_id = AxisId("b")
-    row_to_cell = tuple((a, b) for b in range(3) for a in range(2))
+    row_to_cell = ((1, 2), (0, 0), (1, 0), (0, 2), (0, 1), (1, 1))
     points = PointTable(
         6,
         (
@@ -250,14 +250,14 @@ def test_exact_point_ordinals_preserve_authored_grid_rows():
     result = apply_spec(
         block,
         DataTransformSpec(),
-        point_ordinals=(2, 3),
+        point_ordinals=(0, 4),
     )
 
-    assert result.schema.point_table.column(a_id).values == (0, 1)
-    assert result.schema.point_table.column(b_id).values == (1, 1)
+    assert result.schema.point_table.column(a_id).values == (1, 0)
+    assert result.schema.point_table.column(b_id).values == (2, 1)
     assert result.schema.grid_topology is not None
-    assert result.schema.grid_topology.row_to_cell == ((0, 1), (1, 1))
-    np.testing.assert_array_equal(result.values, values[:, 2:4, np.newaxis])
+    assert result.schema.grid_topology.row_to_cell == ((1, 2), (0, 1))
+    np.testing.assert_array_equal(result.values, values[:, (0, 4), np.newaxis])
 
 
 def test_data_axis_selection_preserves_every_other_data_axis():

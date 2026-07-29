@@ -25,7 +25,7 @@ def run_attachment(
     *,
     bind_request: Callable[[object, BoundNodeInputs], object],
     prepare: Callable[[object, object | None], object],
-    start_prepared: Callable[[object, object, Callable[[], bool]], object]
+    start_prepared: Callable[[object, object, object], object]
     | None = None,
     project_signal_presentation: Callable[
         [object, str, SignalPublication], object | None
@@ -173,7 +173,7 @@ def run_attachment(
                     start=lambda current, live_host: start_prepared_owner(
                         current,
                         live_host,
-                        lambda: node.cancel_requested,
+                        node.command_context,
                     ),
                 )
             starter = getattr(command, "start", None)

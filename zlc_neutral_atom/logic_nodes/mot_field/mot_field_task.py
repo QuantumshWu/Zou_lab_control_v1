@@ -772,14 +772,15 @@ class PreparedMotFieldTask:
 def start_mot_field_task_command(
     command: PreparedMotFieldTask,
     live_output_host,
-    cancel_requested,
+    command_context,
 ):
     """Attach MOT's declared live source before its one physical start."""
 
     if not isinstance(command, PreparedMotFieldTask):
         raise TypeError("MOT-field preparer returned another command type")
+    cancel_requested = getattr(command_context, "cancel_requested", None)
     if not callable(cancel_requested):
-        raise TypeError("cancel_requested must be callable")
+        raise TypeError("MOT-field start requires a hosted command context")
     open_exact_dataset = getattr(live_output_host, "open_exact_dataset", None)
     if not callable(open_exact_dataset):
         raise TypeError("MOT-field start requires an exact Dataset host")

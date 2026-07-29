@@ -65,6 +65,28 @@ def _run_isolated(script: str, workspace: Path) -> dict[str, object]:
     pytest.fail(f"isolated probe returned no result marker: {completed.stdout}")
 
 
+def test_current_calibration_surface_rejects_access_after_experiment_close(
+    tmp_path,
+) -> None:
+    from Zou_lab_control.api import WorkspacePaths, connect
+
+    experiment = connect(
+        "virtual",
+        workspace=WorkspacePaths.for_workspace(
+            Path.cwd(),
+            repository_root=tmp_path / "workspace",
+        ),
+    )
+    calibration = experiment.nodes.calibration
+    assert calibration.current_calibration_ref is None
+    experiment.close()
+
+    with pytest.raises(RuntimeError, match="closing or closed"):
+        _ = calibration.current_calibration_ref
+    with pytest.raises(RuntimeError, match="closing or closed"):
+        calibration.current_calibration_ref = None
+
+
 def test_calibration_analysis_owner_is_split_from_commit_authority():
     assert CalibrationAnalysisRequest.__module__ == (
         "zlc_neutral_atom.logic_nodes.readout.calibration.calibration"
@@ -95,10 +117,12 @@ def test_compile_plan_requires_explicit_source_binding_and_deadline():
         "request",
         "expected_readout_binding",
         "timeout_seconds",
+        "on_committed",
     )
     for name in (
         "expected_readout_binding",
         "timeout_seconds",
+        "on_committed",
     ):
         assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
 

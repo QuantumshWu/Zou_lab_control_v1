@@ -382,6 +382,8 @@ def test_stop_before_finalize_publishes_no_calibration(
     monkeypatch,
 ) -> None:
     experiment, _reference, computation, workspace = calibration_product
+    current_before = experiment.nodes.calibration.current_calibration_ref
+    assert current_before is not None
     request = experiment.nodes.calibration.calibration_request(
         computation.artifact.source_binding.source_capture_ref,
         replace(computation.report.request, split_seed=19),
@@ -419,6 +421,7 @@ def test_stop_before_finalize_publishes_no_calibration(
         )
         assert window.saved_reference is None
         assert _manifest_count(workspace) == before
+        assert experiment.nodes.calibration.current_calibration_ref == current_before
         experiment.readout.load_capture(request.source_capture_ref)
     finally:
         release.set()

@@ -256,6 +256,7 @@ def _logic_node_composition_facts(readout):
     from zlc_storage.paths import resolve_under
 
     from ._application_services import (
+        application_operation_guard,
         application_start_run,
         open_workbench_handle,
         service_guard,
@@ -365,6 +366,9 @@ def _logic_node_composition_facts(readout):
     def wait_run(handle):
         return runtime.wait(handle)
 
+    def operation_guard():
+        return application_operation_guard(services)
+
     def open_ui(key, compose, *, existing_error=None):
         return open_workbench_handle(
             services,
@@ -408,6 +412,7 @@ def _logic_node_composition_facts(readout):
             "rf_ports": tuple(sorted(rf_ports.items())),
             "start_run": start_run,
             "wait_run": wait_run,
+            "operation_guard": operation_guard,
             "open_ui": open_ui,
         }
     )

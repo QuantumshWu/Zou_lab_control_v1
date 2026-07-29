@@ -6,9 +6,14 @@ from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from zlc_data import AxisId, AxisSpec, DatasetSchema, REPEAT, ValueSchema
 from zlc_pulse.scan_template import scan_table_template
+from zlc_neutral_atom.logic_nodes.pulse_scan.contracts import (
+    bind_scan_output_contract,
+)
 from zlc_neutral_atom.logic_nodes.pulse_scan.authoring import (
     DEFAULT_PULSE_SCAN_PULSE_PATH,
 )
@@ -67,12 +72,44 @@ def test_default_api_scan_rows_are_exact_native_unit_ticks():
 
 
 def test_grid_starter_creates_rows_without_claiming_grid_topology():
-    _document, specs, _table = _default_api_program_parts()
+    document, specs, _table = _default_api_program_parts()
 
     source = scan_table_template("grid", specs)
+    rows = evaluate_numeric_scan_program(source, width=len(specs))
+    columns = tuple(
+        parameter.parameter_id for parameter in document.api_parameters
+    )
+    program = ApiSlotSegmentedProgram(
+        document,
+        ApiSegmentTable(columns, rows),
+        "validate the grid starter's authored point rows",
+    )
+    points = program.point_table
+    assert points.row_count == len(rows)
+    assert tuple(column.values for column in points.columns) == tuple(
+        tuple(row[position] for row in rows)
+        for position in range(len(columns))
+    )
 
-    assert "np.meshgrid" in source
-    assert "scan_shape" not in source
+    repeat = AxisSpec(
+        AxisId("pulse-scan-grid-test-repeat"),
+        "repeat",
+        REPEAT,
+        program.sweep_count,
+        tuple(range(program.sweep_count)),
+    )
+    source_schema = DatasetSchema(
+        repeat,
+        points,
+        None,
+        ValueSchema.scalar(np.dtype("<f8"), None),
+    )
+    output_schema = bind_scan_output_contract(
+        source_schema,
+        points,
+    ).output_dataset_schema
+    assert output_schema.point_table == points
+    assert output_schema.grid_topology is None
 
 
 def test_api_scan_rejects_an_off_grid_row_when_the_program_is_built():

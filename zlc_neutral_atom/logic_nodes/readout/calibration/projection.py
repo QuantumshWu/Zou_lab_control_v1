@@ -208,7 +208,7 @@ class CalibrationReportProjection:
     psf_mode: str | None
     psf_fit_ok: np.ndarray | None
     psf_sigma_xy: np.ndarray | None
-    calibration_identity: str
+    calibration_ref: CalibrationArtifactRef
     source_capture_identity: str
     binding: str
     camera_identity: str
@@ -217,6 +217,10 @@ class CalibrationReportProjection:
     group_count: int
     software_lineage: tuple[tuple[str, str], ...]
     __hash__ = None
+
+    @property
+    def calibration_identity(self) -> str:
+        return self.calibration_ref.target_ref
 
 
 def project_calibration_report(
@@ -429,7 +433,7 @@ def project_calibration_report(
         psf_mode=psf_mode,
         psf_fit_ok=psf_fit_ok,
         psf_sigma_xy=psf_sigma,
-        calibration_identity=reference.target_ref,
+        calibration_ref=reference,
         source_capture_identity=(
             artifact.source_binding.source_capture_ref.target_ref
         ),
@@ -480,6 +484,59 @@ def _report_snapshot(
         block.ref(StreamGenerationId(f"calibration-report-{identity}")),
         block,
     )
+
+
+def _calibration_reference_snapshot(
+    frame_schema: ValueSchema,
+    reference_average: np.ndarray,
+    reference_average_validity: np.ndarray,
+    reference: CalibrationArtifactRef,
+) -> OwnedSnapshot:
+    """Single canonical SiteMap carrier shared by FINAL and report surfaces."""
+
+    if not isinstance(frame_schema, ValueSchema):
+        raise TypeError("frame_schema must be ValueSchema")
+    if not isinstance(reference, CalibrationArtifactRef):
+        raise TypeError("reference must be CalibrationArtifactRef")
+    if len(frame_schema.data_axes) != 2:
+        raise ValueError("calibration reference requires two declared frame axes")
+    if np.asarray(reference_average).shape != frame_schema.data_shape:
+        raise ValueError("calibration reference average differs from FrameContract")
+    if np.asarray(reference_average_validity).shape != frame_schema.data_shape:
+        raise ValueError("calibration reference validity differs from FrameContract")
+    axes = frame_schema.data_axes
+    schema = DatasetSchema(
+        AxisSpec(
+            AxisId("calibration.repeat"),
+            "repeat",
+            REPEAT,
+            1,
+            (0,),
+        ),
+        PointTable(1),
+        None,
+        ValueSchema(
+            axes,
+            ValidityContract.components(*(axis.axis_id for axis in axes)),
+            np.dtype("<f8"),
+            frame_schema.value_unit,
+        ),
+    )
+    identity = reference.manifest_digest
+    block = DataBlock(
+        BlockId(f"calibration-reference-{identity[:20]}"),
+        DatasetRevision(0),
+        np.asarray(reference_average, dtype="<f8").reshape(schema.physical_shape),
+        DatasetComponentValidity(
+            tuple(axis.axis_id for axis in axes),
+            np.asarray(reference_average_validity, dtype=np.bool_).reshape(
+                schema.physical_shape
+            ),
+        ),
+        schema,
+    )
+    generation = StreamGenerationId(f"calibration-reference-{identity}")
+    return OwnedSnapshot(block.ref(generation), block)
 
 
 def _report_repeat_axis(key: str, size: int) -> AxisSpec:
@@ -551,7 +608,10 @@ def _report_population_values(
         ),
         axis=-1,
     )
-    return np.repeat(source[..., None], 2, axis=-1), common[..., None] & population
+    return (
+        np.repeat(source[..., None], 2, axis=-1),
+        common[..., None] & population & np.isfinite(source)[..., None],
+    )
 
 
 def materialize_calibration_report_datasets(
@@ -569,31 +629,11 @@ def materialize_calibration_report_datasets(
         raise TypeError("view must be CalibrationReportProjection")
     output: dict[str, OwnedSnapshot] = {}
 
-    frame_axes = view.frame_schema.data_axes
-    if len(frame_axes) != 2:
-        raise ValueError("calibration reference report requires two declared frame axes")
-    reference_schema = DatasetSchema(
-        _report_repeat_axis("reference", 1),
-        PointTable(1),
-        None,
-        ValueSchema(
-            frame_axes,
-            ValidityContract.components(*(axis.axis_id for axis in frame_axes)),
-            np.dtype("<f8"),
-            view.frame_schema.value_unit,
-        ),
-    )
-    output["reference"] = _report_snapshot(
-        view,
-        "reference",
-        reference_schema,
-        np.asarray(view.reference_average, dtype="<f8"),
-        DatasetComponentValidity(
-            tuple(axis.axis_id for axis in frame_axes),
-            np.asarray(view.reference_average_validity, dtype=np.bool_).reshape(
-                reference_schema.physical_shape
-            ),
-        ),
+    output["reference"] = _calibration_reference_snapshot(
+        view.frame_schema,
+        view.reference_average,
+        view.reference_average_validity,
+        view.calibration_ref,
     )
 
     model_axis = AxisSpec(
@@ -654,7 +694,7 @@ def materialize_calibration_report_datasets(
         histogram_values, histogram_validity = _report_population_values(
             view,
             model,
-            model.signals,
+            model.threshold_centered_signals,
         )
         histogram_schema = DatasetSchema(
             _report_repeat_axis(histogram_key, view.group_count),
@@ -675,36 +715,6 @@ def materialize_calibration_report_datasets(
             DatasetComponentValidity(
                 (population_axis.axis_id,),
                 histogram_validity.reshape(histogram_schema.physical_shape),
-            ),
-        )
-
-        pooled_key = f"pooled-{model.label}"
-        pooled_population_axis = _report_population_axis(pooled_key)
-        pooled_values, pooled_validity = _report_population_values(
-            view,
-            model,
-            model.threshold_centered_signals,
-        )
-        sample_count = pooled_values.shape[0] * pooled_values.shape[1]
-        pooled_schema = DatasetSchema(
-            _report_repeat_axis(pooled_key, sample_count),
-            PointTable(1),
-            None,
-            ValueSchema(
-                (pooled_population_axis,),
-                ValidityContract.components(pooled_population_axis.axis_id),
-                np.dtype("<f8"),
-                view.frame_schema.value_unit,
-            ),
-        )
-        output[pooled_key] = _report_snapshot(
-            view,
-            pooled_key,
-            pooled_schema,
-            pooled_values.reshape(sample_count, 1, 2),
-            DatasetComponentValidity(
-                (pooled_population_axis.axis_id,),
-                pooled_validity.reshape(sample_count, 1, 2),
             ),
         )
 
@@ -771,47 +781,12 @@ def materialize_calibration_reference_snapshot(
     _require_inputs(computation, reference)
     artifact = computation.artifact
     report = computation.report
-    frame_schema = artifact.frame_contract.frame_schema
-    if report.reference_average.shape != frame_schema.data_shape:
-        raise ValueError("calibration reference average differs from FrameContract")
-    if report.reference_average_validity.shape != frame_schema.data_shape:
-        raise ValueError("calibration reference validity differs from FrameContract")
-    axes = frame_schema.data_axes
-    schema = DatasetSchema(
-        AxisSpec(
-            AxisId("calibration.repeat"),
-            "repeat",
-            REPEAT,
-            1,
-            (0,),
-        ),
-        PointTable(1),
-        None,
-        ValueSchema(
-            axes,
-            ValidityContract.components(*(axis.axis_id for axis in axes)),
-            np.dtype("<f8"),
-            frame_schema.value_unit,
-        ),
+    return _calibration_reference_snapshot(
+        artifact.frame_contract.frame_schema,
+        report.reference_average,
+        report.reference_average_validity,
+        reference,
     )
-    identity = reference.manifest_digest
-    block = DataBlock(
-        BlockId(f"calibration-reference-{identity[:20]}"),
-        DatasetRevision(0),
-        np.asarray(report.reference_average, dtype="<f8").reshape(
-            schema.physical_shape
-        ),
-        DatasetComponentValidity(
-            tuple(axis.axis_id for axis in axes),
-            np.asarray(
-                report.reference_average_validity,
-                dtype=np.bool_,
-            ).reshape(schema.physical_shape),
-        ),
-        schema,
-    )
-    generation = StreamGenerationId(f"calibration-reference-{identity}")
-    return OwnedSnapshot(block.ref(generation), block)
 
 
 def _diagnostic_snapshot(

@@ -86,20 +86,6 @@ class RunSnapshot:
     commit_publication_warning: str | None
     primary_error: str | None
     cleanup_errors: tuple[str, ...]
-    # A synchronous ``RunController.start`` rejects with ``RunStartRejected``.
-    # A composite run-like owner may encounter that same admission boundary on
-    # its coordinator thread after its own handle has already been returned.
-    # Preserve every typed blocker across that async boundary; presentation
-    # must never parse ``primary_error`` to recover conflicting RunIds.
-    admission_rejections: tuple[ResourceBusy, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.admission_rejections, tuple):
-            raise TypeError("admission_rejections must be a tuple")
-        blockers = self.admission_rejections
-        if any(not isinstance(value, ResourceBusy) for value in blockers):
-            raise TypeError("admission_rejections must contain ResourceBusy values")
-        object.__setattr__(self, "admission_rejections", blockers)
 
 
 @dataclass(frozen=True)

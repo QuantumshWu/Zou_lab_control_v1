@@ -1430,9 +1430,7 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         calibration_editor = _current_logic_editor(console, application)
         calibration_widgets = _visible_form_widgets(calibration_editor)
         assert set(calibration_widgets) == {
-            "source_mode",
             "folder",
-            "save_frames",
             "pulse",
             "threshold_method",
             "reference_exposure_s",
@@ -1462,11 +1460,16 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
                 and card.config.kind == PlotKind.IMAGE
                 for card in console.cards
             )
-            if calibration_row.status_label.text().startswith("done"):
+            if calibration_row.status_label.text().startswith(
+                "calibration artifact committed"
+            ):
                 break
             time.sleep(0.005)
         assert saw_calibration_panel
-        assert calibration_row.status_label.text().startswith("done")
+        assert calibration_row.status_label.text().startswith(
+            "calibration artifact committed"
+        )
+        assert str(calibration_output) in calibration_row.status_label.text()
         site_map_signal = console_signal_key(
             calibration_row.node.node_id,
             "site_map",
@@ -1741,7 +1744,9 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
             application,
             lambda: (
                 _resolved_artifact(console, calibration_signal) is not None
-                and calibration_row.status_label.text().startswith("done")
+                and calibration_row.status_label.text().startswith(
+                    "calibration artifact committed"
+                )
             ),
             timeout=25.0,
         )
@@ -1821,7 +1826,9 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             application,
             lambda: (
                 _resolved_artifact(console, calibration_signal) is not None
-                and calibration_row.status_label.text().startswith("done")
+                and calibration_row.status_label.text().startswith(
+                    "calibration artifact committed"
+                )
             ),
             timeout=25.0,
         )
@@ -2200,7 +2207,9 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
             application,
             lambda: (
                 _resolved_artifact(console, calibration_signal) is not None
-                and calibration_row.status_label.text().startswith("done")
+                and calibration_row.status_label.text().startswith(
+                    "calibration artifact committed"
+                )
             ),
             timeout=25.0,
         )

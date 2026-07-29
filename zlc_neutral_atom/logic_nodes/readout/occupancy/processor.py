@@ -122,9 +122,6 @@ OCCUPANCY_EXACT_SCAN_OUTPUT_DECLARATIONS = (
     _OCCUPIED_OUTPUT_DECLARATION,
 )
 OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION = _OCCUPIED_OUTPUT_DECLARATION
-DEFAULT_OCCUPANCY_CALIBRATION_POINTER = (
-    "_output/calibrations/calibration_ref.json"
-)
 _OCCUPANCY_CONFIG_FORMAT = (
     "zlc_neutral_atom.logic_nodes.readout.occupancy.processor-config"
 )
@@ -155,7 +152,6 @@ OCCUPANCY_CALIBRATION_INPUT_SPEC = ArtifactInputSpec(
         "calibration_ref.json pointer"
     ),
     allow_saved_reference=True,
-    default_reference_path=DEFAULT_OCCUPANCY_CALIBRATION_POINTER,
 )
 _OCCUPANCY_INPUT_SPECS = (
     OCCUPANCY_CAMERA_INPUT_SPEC,
@@ -1047,7 +1043,6 @@ def _evaluate_occupancy_processor(
 
 
 __all__ = [
-    "DEFAULT_OCCUPANCY_CALIBRATION_POINTER",
     "OCCUPANCY_COUNTS_BLOCK_ID",
     "OCCUPANCY_OCCUPIED_BLOCK_ID",
     "OCCUPANCY_RATE_BLOCK_ID",

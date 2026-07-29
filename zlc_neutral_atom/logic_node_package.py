@@ -54,7 +54,7 @@ class LogicNodePackage:
     availability: Callable[[object, tuple[object, ...]], str | None] | None = None
     dynamic_choice_fact: str | None = None
     bind_hosted_request: Callable[[object, object, object], object] | None = None
-    start_prepared: Callable[[object, object, Callable[[], bool]], object] | None = None
+    start_prepared: Callable[[object, object, object], object] | None = None
     resolve_artifact_reference: (
         Callable[[object, object, Callable[..., object]], object] | None
     ) = None

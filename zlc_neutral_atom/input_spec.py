@@ -86,12 +86,11 @@ class ArtifactInputSpec:
         if type(self.allow_saved_reference) is not bool:
             raise TypeError("allow_saved_reference must be bool")
         if self.allow_saved_reference:
-            if not isinstance(self.default_reference_path, str):
-                raise TypeError("saved artifact input needs a default reference path")
-            canonical_text(
-                self.default_reference_path,
-                "default artifact reference path",
-            )
+            if self.default_reference_path is not None:
+                canonical_text(
+                    self.default_reference_path,
+                    "default artifact reference path",
+                )
         elif self.default_reference_path is not None:
             raise ValueError(
                 "producer-only artifact input cannot declare saved defaults"

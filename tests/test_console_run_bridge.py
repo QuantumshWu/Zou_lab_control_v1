@@ -15,11 +15,44 @@ import sys
 import time
 
 from zlc_neutral_atom.catalog import DefinitionKey
-from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
 from zlc_neutral_atom.logic_nodes.pulse_scan.reference import ScanArtifactRef
+from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.hosted_run import HostedRun
+from zlc_neutral_atom.runtime.resources import ResourceArbiter
+from zlc_neutral_atom.runtime.run import RunController, RunPlan
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
+
+
+def _successful_handle(result, *, name: str):
+    return RunController(ResourceArbiter()).start(
+        RunPlan(
+            name=name,
+            resource_claims=(),
+            bound_devices=(),
+            preflight=lambda _context: None,
+            execute=lambda _context, _prepared: result,
+            cleanup=lambda _context, _prepared, _primary: CleanupReport.complete(),
+            finalize=lambda _context, executed: executed,
+        )
+    )
+
+
+def _failed_handle(message: str, *, name: str):
+    def fail(_context, _prepared):
+        raise RuntimeError(message)
+
+    return RunController(ResourceArbiter()).start(
+        RunPlan(
+            name=name,
+            resource_claims=(),
+            bound_devices=(),
+            preflight=lambda _context: None,
+            execute=fail,
+            cleanup=lambda _context, _prepared, _primary: CleanupReport.complete(),
+            finalize=lambda _context, executed: executed,
+        )
+    )
 
 
 def test_hosted_run_does_not_import_the_application_or_gui_layer():
@@ -40,36 +73,7 @@ def test_hosted_run_does_not_import_the_application_or_gui_layer():
 
 def test_successful_run_result_is_the_only_final_artifact_authority() -> None:
     reference = ScanArtifactRef("test-scan-repository", "b" * 64)
-    terminal = RunSnapshot(
-        run_id=RunId("console-final-result"),
-        state=RunState.SUCCEEDED,
-        phase="complete",
-        final_committed=True,
-        commit_publication_warning=None,
-        primary_error=None,
-        cleanup_errors=(),
-    )
-
-    class Handle:
-        joined = False
-
-        def snapshot(self):
-            return terminal
-
-        def wait(self, timeout=None):
-            assert timeout == 0.0
-            if not self.joined:
-                raise TimeoutError("owner thread has not exited")
-            return terminal
-
-        def result(self, *, timeout=None):
-            assert timeout == 0.0
-            return reference
-
-        def cancel(self, _reason=""):
-            raise AssertionError("a successful Run must not be cancelled")
-
-    handle = Handle()
+    handle = _successful_handle(reference, name="console final result")
     node = HostedRun(
         definition_key=DefinitionKey("test", "final-result"),
         request={},
@@ -86,18 +90,99 @@ def test_successful_run_result_is_the_only_final_artifact_authority() -> None:
         while observed is None and time.monotonic() < deadline:
             observed = node.poll()
             time.sleep(0.002)
-        assert observed is terminal
-        assert not node.worker_idle
-        assert not node.final_result_resolved
-
-        handle.joined = True
         deadline = time.monotonic() + 2.0
         while not node.final_result_resolved and time.monotonic() < deadline:
             observed = node.poll()
             time.sleep(0.002)
-        assert observed is terminal
+        assert observed is not None and observed.run_id == handle.run_id
         assert node.final_result_resolved
         assert node.final_result == reference
+    finally:
+        node.shutdown()
+
+
+def test_command_context_sequences_two_flat_runs_without_a_composite_handle() -> None:
+    """A two-stage command exposes the real child Runs and owns no Run identity."""
+
+    command = object()
+    capture = _successful_handle("capture-ref", name="calibration capture")
+    analysis = _successful_handle("calibration-ref", name="calibration analysis")
+    observed_children = []
+    node = HostedRun(
+        definition_key=DefinitionKey("test", "two-flat-runs"),
+        request=command,
+        instance_id="two-flat-runs-instance",
+        dataset_output_declarations=(),
+        prepare=lambda request: request,
+        qualify_output=lambda name: f"@logic/two-flat-runs-instance/{name}",
+        request_owner_wake=lambda: None,
+    )
+
+    def start_prepared(prepared):
+        assert prepared is command
+        source = node.command_context.start_and_wait(lambda: capture)
+        observed_children.append((capture.run_id, source))
+        return analysis
+
+    try:
+        node.start(start_prepared)
+        deadline = time.monotonic() + 2.0
+        while not node.final_result_resolved and time.monotonic() < deadline:
+            node.poll()
+            time.sleep(0.002)
+        assert observed_children == [(capture.run_id, "capture-ref")]
+        assert node.handle is analysis
+        assert node.final_result == "calibration-ref"
+        assert capture.run_id != analysis.run_id
+        assert node.prepared_command is command
+        assert not hasattr(command, "run_id")
+        assert not hasattr(command, "snapshot")
+    finally:
+        node.shutdown()
+
+
+def test_failed_second_run_keeps_capture_provenance_and_exact_run_identity() -> None:
+    class CalibrationCommand:
+        source_capture_ref = None
+
+    command = CalibrationCommand()
+    capture = _successful_handle("capture-ref", name="calibration capture")
+    analysis = _failed_handle("analysis failed", name="calibration analysis")
+    node = HostedRun(
+        definition_key=DefinitionKey("test", "failed-second-run"),
+        request=command,
+        instance_id="failed-second-run-instance",
+        dataset_output_declarations=(),
+        prepare=lambda request: request,
+        qualify_output=lambda name: f"@logic/failed-second-run-instance/{name}",
+        request_owner_wake=lambda: None,
+    )
+
+    def start_prepared(prepared):
+        prepared.source_capture_ref = node.command_context.start_and_wait(
+            lambda: capture
+        )
+        return analysis
+
+    try:
+        node.start(start_prepared)
+        observed = None
+        deadline = time.monotonic() + 2.0
+        while (
+            (observed is None or not observed.state.terminal or not node.worker_idle)
+            and time.monotonic() < deadline
+        ):
+            observed = node.poll()
+            time.sleep(0.002)
+        assert observed is not None
+        assert observed.run_id == analysis.run_id
+        assert observed.state.name == "FAILED"
+        assert observed.primary_error == "RuntimeError: analysis failed"
+        assert command.source_capture_ref == "capture-ref"
+        assert node.prepared_command is command
+        assert node.handle is analysis
+        assert node.start_exception is None
+        assert not node.final_result_resolved
     finally:
         node.shutdown()
 
@@ -151,41 +236,10 @@ def test_run_attachment_calls_the_leaf_owned_prepared_starter() -> None:
         request_owner_wake=lambda: None,
     )
     observed: list[tuple[object, object]] = []
-    terminal = RunSnapshot(
-        run_id=RunId("live-output-start-run"),
-        state=RunState.SUCCEEDED,
-        phase="complete",
-        final_committed=True,
-        commit_publication_warning=None,
-        primary_error=None,
-        cleanup_errors=(),
-    )
-
-    class Handle:
-        run_id = terminal.run_id
-
-        @staticmethod
-        def snapshot():
-            return terminal
-
-        @staticmethod
-        def wait(timeout=None):
-            assert timeout == 0.0
-            return terminal
-
-        @staticmethod
-        def result(*, timeout=None):
-            assert timeout == 0.0
-            return None
-
-        @staticmethod
-        def cancel(_reason=""):
-            raise AssertionError("completed handle must not be cancelled")
-
-    def start_prepared(command, live_host, cancel_requested):
-        assert not cancel_requested()
+    def start_prepared(command, live_host, command_context):
+        assert not command_context.cancel_requested()
         observed.append((command, live_host))
-        return Handle()
+        return _successful_handle(None, name="live output start")
 
     attachment = run_attachment(
         spec,

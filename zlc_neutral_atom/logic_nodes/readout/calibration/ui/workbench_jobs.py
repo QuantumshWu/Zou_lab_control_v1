@@ -207,7 +207,7 @@ def _histogram_page(
                 ),
             ),
             (
-                (float(model.runtime_thresholds[site]),)
+                (0.0,)
                 if math.isfinite(float(model.runtime_thresholds[site]))
                 else ()
             ),
@@ -228,7 +228,11 @@ def _histogram_page(
         figure=FigureIntent(
             PlotKind.GRID if faceted else PlotKind.HISTOGRAM,
             f"{model.label} | per-site readout distributions",
-            view.frame_schema.value_unit or "Signal",
+            (
+                f"{view.frame_schema.value_unit} - runtime threshold"
+                if view.frame_schema.value_unit
+                else "Signal - runtime threshold"
+            ),
             view=spec,
         ),
         source=FigureSource(snapshot),
@@ -244,8 +248,7 @@ def _pooled_page(
 ):
     schema = snapshot.block.schema
     if (
-        schema.point_table.row_count != 1
-        or schema.point_table.columns
+        len(schema.point_table.columns) != 1
         or len(schema.cell_schema.data_axes) != 1
     ):
         raise ValueError("calibration pooled Dataset has an invalid declared shape")
@@ -256,6 +259,10 @@ def _pooled_page(
         (
             SourceViewBinding(
                 AxisSourceRef.tensor(schema.repeat_axis.axis_id),
+                AxisViewRole.SAMPLE,
+            ),
+            SourceViewBinding(
+                AxisSourceRef.point_rows(),
                 AxisViewRole.SAMPLE,
             ),
             SourceViewBinding(
@@ -385,7 +392,7 @@ def project_calibration_plot_report(
     ]
     for model in view.models:
         pages.append(_histogram_page(view, model, datasets[f"hist-{model.label}"]))
-        pages.append(_pooled_page(view, model, datasets[f"pooled-{model.label}"]))
+        pages.append(_pooled_page(view, model, datasets[f"hist-{model.label}"]))
     psf = _psf_page(view, datasets.get("psf-kernels"))
     if psf is not None:
         pages.append(psf)

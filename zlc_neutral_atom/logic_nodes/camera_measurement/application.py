@@ -38,12 +38,13 @@ def bind_camera_measurement_intent(
 def start_camera_measurement_command(
     command: PreparedLiveCameraMeasurement | PreparedFiniteCameraMeasurement,
     live_output_host,
-    cancel_requested,
+    command_context,
 ):
     """Start the leaf-owned live/finite shape through one generic host."""
 
+    cancel_requested = getattr(command_context, "cancel_requested", None)
     if not callable(cancel_requested):
-        raise TypeError("cancel_requested must be callable")
+        raise TypeError("Camera start requires a hosted command context")
     if isinstance(command, PreparedLiveCameraMeasurement):
         factory = getattr(live_output_host, "factory", None)
         if not callable(factory):

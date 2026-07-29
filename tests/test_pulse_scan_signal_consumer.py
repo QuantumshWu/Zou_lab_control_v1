@@ -60,13 +60,11 @@ from zlc_neutral_atom.timing.pulse_parameter_scan import (
 from zlc_neutral_atom.logic_nodes.pulse_scan.authoring import (
     DEFAULT_PULSE_SCAN_PULSE_PATH,
 )
-from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
-    OCCUPANCY_LIVE_OUTPUT_DECLARATIONS,
+from zlc_neutral_atom.logic_nodes.readout.occupancy.declaration import (
+    OCCUPANCY_LOGIC_NODE,
 )
-from zlc_neutral_atom.logic_nodes.readout.occupancy.signal_source import (
-    AssociatedRunningOccupancySignalSource,
-    OccupancySignalValues,
-    OccupancySignalValuesContract,
+from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
+    calibration_artifact_input_ref,
 )
 from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import (
     PulseScanBoundRequest,
@@ -570,101 +568,54 @@ def test_camera_association_is_unavailable_before_the_producer_is_armed(
 def test_occupancy_scan_artifact_round_trips_expandable_same_shot_lineage(
     tmp_path,
 ) -> None:
-    site_axis = AxisSpec(AxisId("scan-live-site"), "site", SITE, 1, (0,))
-    site_validity = ValidityContract.components(site_axis.axis_id)
-    counts_schema = ValueSchema(
-        (site_axis,),
-        site_validity,
-        np.dtype("<f8"),
-        "count",
-    )
-    occupied_schema = ValueSchema(
-        (site_axis,),
-        site_validity,
-        np.dtype(bool),
-        "occupation",
-    )
-    rate_schema = ValueSchema.scalar(np.dtype("<f8"), None)
-    occupancy_contract = OccupancySignalValuesContract(
-        counts_schema,
-        occupied_schema,
-        rate_schema,
-    )
-    calibration_input = ArtifactInputRef(
-        "tests.calibration-ref",
-        encode(
-            {
-                "schema": "tests.calibration-ref",
-                "artifact_id": "scan-calibration",
-            }
-        ),
-        canonical_digest({"artifact": "scan-calibration-content"}),
-    )
-    occupancy_stage = ProcessorStageProvenance(
-        canonical_digest({"processor": "occupancy-live-fixture"}),
-        (calibration_input,),
-    )
-
-    def classify(frame: Value) -> OccupancySignalValues:
-        mean_count = float(np.mean(frame.values))
-        occupied_state = mean_count > 0.0
-        validity = ComponentValidity(
-            (site_axis.axis_id,),
-            np.asarray((True,), dtype=bool),
-        )
-        return OccupancySignalValues(
-            Value(
-                np.asarray((mean_count,), dtype="<f8"),
-                validity,
-                counts_schema,
-            ),
-            Value(
-                np.asarray((occupied_state,), dtype=bool),
-                validity,
-                occupied_schema,
-            ),
-            Value(
-                np.asarray((float(occupied_state),), dtype="<f8"),
-                VALID,
-                rate_schema,
-            ),
-        )
-
     program = _autonomous_camera_program(((50_000_000,), (60_000_000,)))
-    request = PulseScanBoundRequest(
-        program,
-        ScanSignalBinding(
-            DefinitionKey(
-                "zlc_neutral_atom.logic_nodes.readout.occupancy",
-                "occupancy-processor",
-            ),
-            OCCUPANCY_LIVE_OUTPUT_DECLARATIONS[2],
-        ),
-    )
     repository = tmp_path / "workspace"
     with zlc.connect("virtual", workspace=_workspace(repository)) as experiment:
+        calibration_ref = experiment.nodes.calibration.sitemap(frames=4)
+        assert (
+            experiment.nodes.calibration.current_calibration_ref
+            == calibration_ref
+        )
+        calibration_input = calibration_artifact_input_ref(calibration_ref)
         camera_source, camera_handle = _start_virtual_readout_camera(experiment)
-        frame_schema = camera_source.value_schema("frame_0")
         camera_binding = camera_source.dataset_output_binding("frame_0")
-        occupancy = AssociatedRunningOccupancySignalSource(
-            camera_source,
-            source_output_name="frame_0",
-            frame_schema=frame_schema,
-            contract=occupancy_contract,
-            classify=classify,
-            artifact_input=calibration_input,
-            processor_stage=occupancy_stage,
-            expected_source_stream_id=camera_binding.stream_id,
-            expected_source_stream_generation=camera_binding.stream_generation,
+        prepared_occupancy = experiment.nodes.occupancy.prepare_occupancy_processor(
+            camera_binding,
+        )
+        assert prepared_occupancy.request.calibration_ref == calibration_ref
+        rate_output = next(
+            output
+            for output in prepared_occupancy.output_declarations
+            if output.name == "rate"
+        )
+        request = PulseScanBoundRequest(
+            program,
+            ScanSignalBinding(
+                OCCUPANCY_LOGIC_NODE.definition.key,
+                rate_output,
+            ),
+        )
+        occupancy = prepared_occupancy.start_signal_events(camera_source)
+        cursors = tuple(
+            occupancy.open_signal_cursor(name)
+            for name in ("counts", "occupied", "rate")
         )
         try:
-            source = occupancy
-            prepared = experiment.nodes.pulse_scan.prepare_scan_source(request, source)
+            prepared = experiment.nodes.pulse_scan.prepare_scan_source(
+                request,
+                occupancy,
+            )
             reference = prepared.start().result(5.0)
+            sibling_events = tuple(
+                tuple(cursor.next(timeout=1.0) for cursor in cursors)
+                for _index in range(2)
+            )
             materialized = experiment.nodes.pulse_scan.materialize_scan(reference)
             artifact = experiment.nodes.pulse_scan.load_scan(reference)
             assert not camera_handle.snapshot().state.terminal
         finally:
+            for cursor in cursors:
+                cursor.close()
             occupancy.request_close()
             deadline = time.monotonic() + 2.0
             while not occupancy.worker_idle and time.monotonic() < deadline:
@@ -678,10 +629,22 @@ def test_occupancy_scan_artifact_round_trips_expandable_same_shot_lineage(
     sequence = artifact.execution.source
     assert tuple(item.sequence for item in sequence.event_refs) == (0, 1)
     assert all(len(refs) == 1 for refs in sequence.direct_input_event_refs)
-    assert sequence.processor_stages == (occupancy_stage,)
+    assert len(sequence.processor_stages) == 1
+    occupancy_stage = sequence.processor_stages[0]
+    assert occupancy_stage.direct_artifact_inputs == (calibration_input,)
     assert sequence.artifact_inputs == (calibration_input,)
     assert sequence.source_run_id == camera_handle.run_id.value
     assert sequence.source_id.startswith("occupancy-associated:")
+    for index, (counts, occupied, rate) in enumerate(sibling_events):
+        assert counts.event_ref is occupied.event_ref is rate.event_ref
+        assert counts.trace is occupied.trace is rate.trace
+        assert counts.trace.causation_refs == (
+            sequence.direct_input_event_refs[index][0],
+            calibration_input,
+        )
+        assert counts.processor_stages == occupied.processor_stages
+        assert counts.processor_stages == rate.processor_stages
+        assert counts.processor_stages == (occupancy_stage,)
     assert len(sequence.associations) == 1
     association_payload = decode(sequence.associations[0].canonical_evidence)
     assert association_payload["schema"].endswith("occupancy.signal-association")

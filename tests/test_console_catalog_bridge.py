@@ -22,6 +22,10 @@ from zlc_workbench.task_console.declaration_projection import (
     project_processor_declaration,
     project_run_declaration,
 )
+from zlc_workbench.task_console.input_binding import (
+    freeze_input_selections,
+    project_input_fields,
+)
 
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -140,6 +144,29 @@ def test_camera_is_a_measurement_and_request_owns_frame_vocabulary(tmp_path) -> 
         }
     )
     assert configured.exposure_seconds == 0.013
+
+
+def test_saved_calibration_has_no_hidden_pointer_default(tmp_path) -> None:
+    fields = project_input_fields(
+        OCCUPANCY_LOGIC_NODE.input_specs,
+        path_presentations={
+            hint.field_key: hint
+            for hint in OCCUPANCY_LOGIC_NODE.input_path_presentations
+        },
+    )
+    path = next(
+        field for field in fields if field.key == "calibration_path"
+    )
+    assert path.default is None
+
+    with pytest.raises(ValueError, match="select an explicit saved calibration"):
+        freeze_input_selections(
+            OCCUPANCY_LOGIC_NODE.input_specs,
+            {
+                "camera_frame": "@logic/camera/frame_0",
+                "calibration_source": "saved",
+            },
+        )
 
 
 def test_the_generic_bridge_is_qt_free_and_has_no_concrete_node_dispatch() -> None:

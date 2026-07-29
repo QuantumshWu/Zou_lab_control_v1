@@ -571,6 +571,7 @@ def compile_calibration_artifact_plan(
     *,
     expected_readout_binding: ReadoutBindingKey,
     timeout_seconds: float,
+    on_committed: Callable[[CalibrationArtifactRef], None] | None = None,
 ) -> RunPlan:
     """Adapt one synchronous calibration calculation to the generic RunPlan."""
 
@@ -595,6 +596,8 @@ def compile_calibration_artifact_plan(
         )
     if not isinstance(expected_readout_binding, ReadoutBindingKey):
         raise TypeError("expected_readout_binding must be ReadoutBindingKey")
+    if on_committed is not None and not callable(on_committed):
+        raise TypeError("on_committed must be callable or None")
     timeout = positive_real(timeout_seconds, "timeout_seconds")
     if source_capture_ref.repository_id != capture_repository.repository_id:
         raise ValueError("source capture belongs to another repository")
@@ -680,7 +683,10 @@ def compile_calibration_artifact_plan(
             for borrow in borrows:
                 borrow.require_active()
             operation = calibration_repository.final_commit(context, result)
-            return context.commit_final(operation)
+            reference = context.commit_final(operation)
+            if on_committed is not None:
+                on_committed(reference)
+            return reference
         finally:
             release_repository_borrows(borrows)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -84,6 +85,7 @@ def prepare_calibration_artifact_plan(
     *,
     capture_repository: CaptureRepository,
     calibration_repository,
+    on_committed: Callable[[CalibrationArtifactRef], None] | None = None,
 ) -> RunPlan:
     """Compile one calibration request without exposing its physical join."""
 
@@ -98,6 +100,8 @@ def prepare_calibration_artifact_plan(
         raise TypeError("capture_repository must be CaptureRepository")
     if type(calibration_repository) is not CalibrationRepository:
         raise TypeError("calibration_repository must be CalibrationRepository")
+    if on_committed is not None and not callable(on_committed):
+        raise TypeError("on_committed must be callable or None")
     return compile_calibration_artifact_plan(
         request.source_capture_ref,
         capture_repository,
@@ -105,6 +109,7 @@ def prepare_calibration_artifact_plan(
         request.analysis,
         expected_readout_binding=request.readout_binding,
         timeout_seconds=_CALIBRATION_RUN_DEADLINE_SECONDS,
+        on_committed=on_committed,
     )
 
 

@@ -160,7 +160,7 @@ def project_run_declaration(
     dynamic_choices: tuple[DynamicChoicePresentation, ...] = (),
     resolve_artifact_reference: Callable[[ResolvedArtifactInput], object]
     | None = None,
-    start_prepared: Callable[[object, object, Callable[[], bool]], object]
+    start_prepared: Callable[[object, object, object], object]
     | None = None,
     editor_builder: Callable[[object], tuple[object, Callable[..., object]]]
     | None = None,

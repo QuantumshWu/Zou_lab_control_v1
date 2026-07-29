@@ -117,16 +117,32 @@ class OccupancyApi:
         self,
         camera_output_binding: CameraFrameOutputBinding,
         *,
-        calibration_ref: CalibrationArtifactRef,
+        calibration_ref: CalibrationArtifactRef | None = None,
         model_kind: ReadoutModelKind | None = None,
     ) -> PreparedOccupancyProcessor:
+        reference = self._resolve_calibration_ref(calibration_ref)
         return self.prepare_occupancy_processor_request(
             OccupancyProcessorRequest(
                 camera_output_binding,
-                calibration_ref,
+                reference,
                 model_kind,
             )
         )
+
+    def _resolve_calibration_ref(
+        self,
+        reference: CalibrationArtifactRef | None,
+    ) -> CalibrationArtifactRef:
+        if reference is None:
+            reference = self._calibration.current_calibration_ref
+            if reference is None:
+                raise RuntimeError(
+                    "no current Calibration; pass calibration_ref explicitly or set "
+                    "exp.nodes.calibration.current_calibration_ref"
+                )
+        if not isinstance(reference, CalibrationArtifactRef):
+            raise TypeError("calibration_ref must be CalibrationArtifactRef or None")
+        return reference
 
     def prepare_saved_occupancy_processor(
         self,
@@ -152,13 +168,14 @@ class OccupancyApi:
     def detection_request(
         self,
         source: CaptureArtifactRef,
-        calibration: CalibrationArtifactRef,
+        calibration: CalibrationArtifactRef | None = None,
         *,
         model_kind: ReadoutModelKind | None = None,
     ) -> DetectionRequest:
+        reference = self._resolve_calibration_ref(calibration)
         request = build_detection_request(
             self._admit_capture(source),
-            self._calibration.load_calibration(calibration),
+            self._calibration.load_calibration(reference),
             model_kind=model_kind,
         )
         return request

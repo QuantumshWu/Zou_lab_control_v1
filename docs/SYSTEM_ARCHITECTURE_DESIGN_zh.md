@@ -518,8 +518,8 @@ baseline允许的optional leaf UI闭集只有：PulseScan scan-table/slot editor
 关键产品纵切必须保持：
 
 - Camera Measurement：同一领域节点可选择 qCMOS 或 MOT Camera；live signal固定 `(1,1,*frame_shape)`；finite 的 K 个 cycle 从 progress 到 FINAL 都让每个 `frame_i` 固定为 `(K,1,*frame_shape)`，其中 `i=0..N-1`、N 是每 cycle 的 frame 数，未完成 cycle 只由 validity 表示；history不进入signal shape，源 dtype（qCMOS常为uint16、MOT Camera常为uint8）原样保留且不得转成float；同一cycle多帧是一个atomic sibling publication。finite progress只按exact delta增量写derived display cache，SignalPlane真正取front时才冻结immutable值，禁止每个cycle重新复制整个exact builder。
-- Calibration：内建 readout能力，不是plugin。capture与calibrate是两个linked flat Runs；命令宿主不是第三Run。结果只通过同一 frontend FigureIntent/report contract呈现，SiteMap物理事实与CalibrationArtifact属于neutral owner。
-- Occupancy：必须显式接受已有CalibrationArtifactRef；current calibration只作为可见可改的默认ref注入。它消费同一 shot 的frame/calibration facts并原子发布typed siblings，不由Workbench拼接。
+- Calibration：内建 readout能力，不是plugin。capture与calibrate是两个linked flat Runs；命令宿主不是第三Run，第二Run失败仍保留第一Run的capture ref与原始失败Run identity。成功FINAL由Experiment唯一持有的`exp.nodes.calibration`记录`current_calibration_ref`；用户显式设置时必须先admit该ref，失败/取消不得改写，Experiment进入closing后public get/set一律拒绝。结果只通过同一 frontend FigureIntent/report contract呈现，SiteMap物理事实与CalibrationArtifact属于neutral owner。
+- Occupancy：权威request必须冻结显式CalibrationArtifactRef；省略参数时只从上述可见可改current ref读取一次并预填，之后不追随current变化。它消费同一 shot 的frame/calibration facts并原子发布typed siblings，不由Workbench拼接；saved分支没有隐藏默认路径，必须显式选择pointer。
 - MOT Field：Ready、Running、multiple live updates、FINAL artifact/default grid view全部可观察；point rows保持authored顺序，标量输出为 `(R,P,1)`，GridTopology只描述真实grid；accumulator不能随采样数平方复制。
 - PulseScan：只消费已经运行且具正式association capability的signal；repeat sweep形成R，pulse内部RepeatRegion不改变R；P来自冻结point table，非grid轨迹保持一串authored rows。
 - Figure-derived Area/Cross与Processor连续输出进入同一 explicit parent transaction graph；Fit参数是事件结果。ROI→ROI→Fit、三份以上仍被operation借用的revision和independent producer都不能依赖name/latest重建因果。
@@ -618,7 +618,7 @@ atomic publish exact canonical manifest + durability barrier
 ### M6：领域 vertical slices 与性能闭环
 
 - Camera一次性收敛live/finite shape、N-frame atomic siblings、role discovery、selection-aware freeze；finite/exact live只走runtime中一个内部exact-delta seam：builder lock内只冻结watermark与一个已提交cell的只读view，immutable copy在lock外完成，source notice可合并但formal cell不得丢弃。SignalPlane wake必须携exact slot identity，generation先从routing原子退休再做慢close/join，旧slot不能唤醒或撤销同名replacement。这里不引入memory budget、byte quota或第二frontier owner。PulseScan修正R/RepeatRegion、删除scan_shape并只消费association port；Capture/Readout按M1/M2 identity验收。
-- Calibration删除第三Run和pooled pseudo Dataset，按两linked flat Runs、post-FINAL warning、single SiteMap FigureIntent闭环；Occupancy explicit calibration ref/provenance闭环。
+- Calibration删除第三Run、Task内saved/raw-frame支路和pooled pseudo Dataset，按两linked flat Runs、post-FINAL warning、single SiteMap FigureIntent及Experiment-lifetime current ref闭环；Occupancy只把current ref预填成冻结的explicit calibration ref，并以真实same-shot typed siblings/provenance闭环。M1/M2中直接受此cut影响的旧fixture/test必须同cut迁到现行PointTable/SignalPlane产品合同或删除。
 - MOT修accumulator O(N²)并跑通Ready→Running→multiple live→FINAL/default grid view；prepared generation冻结唯一output schema并由live/FINAL共享，普通领域包保持headless，只有lazy `ui/**` leaf可把同一schema绑定到frontend FigureIntent。release-recapture及其它leaves逐个用同一generic lifecycle验收。
 - 每个slice都走真实Experiment/SignalPlane/PlotPanel产品入口，不以单元算法或synthetic renderer fixture代替功能验收。
 

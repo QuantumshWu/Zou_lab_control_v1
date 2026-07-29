@@ -3315,6 +3315,7 @@ class TaskConsole(QtWidgets.QWidget):
                         continue
                     projected = node.materialized_final_outputs
                     output_error = node.final_output_error
+                    post_final_warning = node.post_final_warning
                     if projected is not None and output_error is None:
                         try:
                             self._data.publish_final(node, projected)
@@ -3326,17 +3327,24 @@ class TaskConsole(QtWidgets.QWidget):
                         if output_error is None:
                             self._promote_data_front(self._data.freeze())
                     completion_summary = node.completion_summary
-                    done_status = (
-                        completion_summary or "done"
-                        if output_error is None
-                        else f"done; output unavailable: {output_error}"
-                    )
+                    if output_error is not None:
+                        done_status = f"done; output unavailable: {output_error}"
+                    elif post_final_warning is not None:
+                        done_status = (
+                            f"{completion_summary or 'done'}; warning: "
+                            f"{post_final_warning}"
+                        )
+                    else:
+                        done_status = completion_summary or "done"
                     row.set_state("stopped", status=done_status)
                     if editor is not None:
                         editor.set_running(False)
                         editor.set_status(
                             done_status,
-                            error=output_error is not None,
+                            error=(
+                                output_error is not None
+                                or post_final_warning is not None
+                            ),
                         )
                 else:
                     row.set_state("stopped", status="stopped")

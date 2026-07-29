@@ -17,7 +17,6 @@ from .application import prepare_calibration_artifact_plan
 from .declaration import CALIBRATION_LOGIC_NODE
 from .installation import build_sitemap_acquisition_profile
 from .task import (
-    admit_calibration_capture_export,
     admit_calibration_task_output,
     start_calibration_task_command,
     write_calibration_task_outputs,
@@ -40,6 +39,7 @@ def _bind_api(
         pulse_port,
         start_run,
         wait_run,
+        operation_guard,
         open_ui,
     ) = facts
 
@@ -74,13 +74,6 @@ def _bind_api(
             raise ValueError("installation produced duplicate sitemap profile bindings")
         profiles[binding] = profile
 
-    def admit_saved_capture(path, expected_camera_role):
-        return admit_calibration_capture_export(
-            resolve_under(output_root, path),
-            expected_camera_role=expected_camera_role,
-            capture_repository=capture_repository,
-        )
-
     def write_outputs(
         source,
         calibration,
@@ -104,11 +97,13 @@ def _bind_api(
         request,
         calibration_repository,
         lifecycle_owner,
+        on_committed,
     ):
         plan = prepare_calibration_artifact_plan(
             request,
             capture_repository=capture_repository,
             calibration_repository=calibration_repository,
+            on_committed=on_committed,
         )
         if lifecycle_owner is not None:
             plan = plan.with_lifecycle(
@@ -137,8 +132,8 @@ def _bind_api(
         load_pulse=load_pulse,
         bind_capture=prepare_capture,
         wait_run=wait_run,
+        operation_guard=operation_guard,
         admit_capture=capture_repository.admit,
-        admit_saved_capture=admit_saved_capture,
         write_outputs=write_outputs,
         start_calibration=start_calibration,
         load_calibration=load_calibration,
@@ -182,6 +177,7 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
         "pulse_port",
         "start_run",
         "wait_run",
+        "operation_guard",
         "open_ui",
     ),
     bind_api=_bind_api,

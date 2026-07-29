@@ -104,11 +104,11 @@ def task_console_ports(experiment):
         start_prepared = None
         if package.start_prepared is not None:
             start_prepared = (
-                lambda command, live_host, cancel_requested,
+                lambda command, live_host, command_context,
                 owner=package.start_prepared: owner(
                     command,
                     live_host,
-                    cancel_requested,
+                    command_context,
                 )
             )
         attachments.append(

@@ -354,11 +354,11 @@ def test_view_and_document_codecs_are_strict_and_canonical():
         decode_figure_document(encode(malformed))
 
 
-def test_explicit_f_order_grid_recovers_image_before_repeat_mean():
+def test_explicit_authored_grid_mapping_recovers_image_before_repeat_mean():
     repeat = axis("repeat", REPEAT, 2)
     x = axis("grid-x", SPATIAL_X, 2)
     y = axis("grid-y", SPATIAL_Y, 3)
-    mapping = ((0, 0), (1, 0), (0, 1), (1, 1), (0, 2), (1, 2))
+    mapping = ((1, 2), (0, 0), (1, 0), (0, 2), (0, 1), (1, 1))
     table = PointTable(
         len(mapping),
         (
@@ -538,7 +538,7 @@ def test_sparse_grid_preserves_missing_cell_as_invalid():
     repeat = axis("repeat", REPEAT, 1)
     x = axis("x", SPATIAL_X, 2)
     y = axis("y", SPATIAL_Y, 2)
-    mapping = ((0, 0), (1, 0), (0, 1))
+    mapping = ((1, 1), (0, 0), (1, 0))
     table = PointTable(
         3,
         (
@@ -547,19 +547,19 @@ def test_sparse_grid_preserves_missing_cell_as_invalid():
                 x.name,
                 x.role,
                 PointColumn.NUMERIC,
-                (0, 1, 0),
+                tuple(x.coordinates[ix] for ix, _iy in mapping),
             ),
             PointColumn(
                 y.axis_id,
                 y.name,
                 y.role,
                 PointColumn.NUMERIC,
-                (0, 0, 1),
+                tuple(y.coordinates[iy] for _ix, iy in mapping),
             ),
         ),
     )
     block = make_block(
-        np.array([[1.0, 2.0, 3.0]]),
+        np.array([[10.0 * iy + ix + 1.0 for ix, iy in mapping]]),
         repeat_axis=repeat,
         point_table=table,
         grid_topology=GridTopology(
@@ -577,8 +577,8 @@ def test_sparse_grid_preserves_missing_cell_as_invalid():
         ),
     )
     image = only_series(evaluated_data(block, suggestion.spec)).data
-    np.testing.assert_array_equal(image.values, [[1, 2], [3, 0]])
-    np.testing.assert_array_equal(image.validity, [[True, True], [True, False]])
+    np.testing.assert_array_equal(image.values, [[1, 2], [0, 12]])
+    np.testing.assert_array_equal(image.validity, [[True, True], [False, True]])
 
 
 def test_image_evaluator_preserves_frames_units_and_axis_orientation():
