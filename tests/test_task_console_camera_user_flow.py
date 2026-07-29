@@ -1599,7 +1599,9 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             calibration_signal
         }
         _replace_axis_range(temperature_widgets["t_off"], "20", "40", "2")
-        _replace_spin_value(temperature_widgets["shots"], "1")
+        # Dataset R is the authored shot sweep; the release pulse template has
+        # no competing RepeatRegion authority.
+        _replace_spin_value(temperature_widgets["shots"], "2")
         _choose_signal_leaf(
             temperature_widgets["calibration"],
             calibration_signal,
@@ -2058,6 +2060,7 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
     )
     flow = _StandaloneTaskConsoleFlow(args)
     devices = flow.open()
+    console = None
     console_wrapper = None
     try:
         QtTest.QTest.mouseClick(devices.lifecycle_button, QtCore.Qt.LeftButton)
@@ -2110,12 +2113,22 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
         scan_row = console.logic_nodes[-1]
         scan_editor = _current_logic_editor(console, application)
         widgets = _visible_form_widgets(scan_editor)
-        assert set(widgets) == {"pulse", "pulse_slots", "y_signal"}
+        assert set(widgets) == {
+            "pulse",
+            "scan_sweep_count",
+            "pulse_slots",
+            "y_signal",
+        }
+        _replace_spin_value(widgets["scan_sweep_count"], "2")
 
         slots = widgets["pulse_slots"]
         assert slots.isVisible()
         assert slots._program_code.isVisible()
-        assert "scan_table" in slots._program_code.toPlainText()
+        program_source = slots._program_code.toPlainText()
+        assert "scan_table" in program_source and "N = 21" in program_source
+        slots._program_code.setPlainText(
+            program_source.replace("N = 21", "N = 2")
+        )
         assert slots._sweep_combo.currentText() in {
             "Scan slots (hardware table)",
             "API slots (one pulse per point)",
@@ -2128,6 +2141,7 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
         assert y_parameter.label == "Signal (y)"
         assert _signal_leaf_keys(widgets["y_signal"]) == {camera_signal}
         _choose_signal_leaf(widgets["y_signal"], camera_signal, application)
+        assert "—" in camera_row.publishes_label.text()
 
         QtTest.QTest.mouseClick(scan_editor.form.start_button, QtCore.Qt.LeftButton)
         scan_signal = console_signal_key(scan_row.node.node_id, "scan")
@@ -2135,10 +2149,15 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
         # its FINAL result arrives.  Plot ownership remains an explicit Monitor
         # action; only Tasks open their declared run-scoped panels.
         assert not any(card.config.signal == scan_signal for card in console.cards)
-        until(
-            application,
-            lambda: scan_row.status_label.text().startswith("done"),
-            timeout=25.0,
+        deadline = time.monotonic() + 25.0
+        while time.monotonic() < deadline:
+            status = scan_row.status_label.text()
+            if status.startswith("done") or status.startswith(("failed", "rejected")):
+                break
+            application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+            time.sleep(0.005)
+        assert scan_row.status_label.text().startswith("done"), (
+            scan_row.status_label.text()
         )
         current_camera = console.resolve_console_producer(camera_signal)
         assert current_camera.running
@@ -2198,9 +2217,19 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
             or scan_card.board.showing_overview
         ), scan_card.status.text()
         value = scan_card.frozen_render_value()
-        assert value.snapshot.block.schema.repeat_axis.size >= 1
+        assert value.snapshot.block.schema.repeat_axis.size == 2
         assert value.snapshot.block.schema.point_table.row_count >= 1
     finally:
+        if console is not None:
+            for row in reversed(console.logic_nodes):
+                if not row.stop_button.isEnabled():
+                    continue
+                QtTest.QTest.mouseClick(row.stop_button, QtCore.Qt.LeftButton)
+                until(
+                    application,
+                    lambda current=row: not current.stop_button.isEnabled(),
+                    timeout=15.0,
+                )
         if not widget_gone(console_wrapper):
             console_wrapper.close()
             until(application, lambda: widget_gone(console_wrapper), timeout=15.0)

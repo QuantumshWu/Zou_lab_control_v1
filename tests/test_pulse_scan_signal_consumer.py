@@ -185,13 +185,21 @@ def _stop_virtual_readout_camera(handle) -> None:
     assert terminal.state.terminal, terminal
 
 
-def _autonomous_camera_program(rows: tuple[tuple[int], ...]):
+def _autonomous_camera_program(
+    rows: tuple[tuple[int], ...],
+    *,
+    sweep_count: int = 1,
+):
     document = load_pulse_document(_CAMERA_SCAN_PULSE)
     columns = tuple(
         parameter.parameter_id for parameter in document.scan_parameters
     )
     return AutonomousScanSlotProgram(
-        replace(document, scan_table=FrozenScanTable(columns, rows))
+        replace(
+            document,
+            scan_table=FrozenScanTable(columns, rows),
+            scan_sweep_count=sweep_count,
+        )
     )
 
 
@@ -697,7 +705,7 @@ def test_api_segmented_scan_uses_one_terminal_bound_association_per_cell(
         ROOT / "pulses" / DEFAULT_PULSE_SCAN_PULSE_PATH
     )
     program = ApiSlotSegmentedProgram(
-        document,
+        replace(document, scan_sweep_count=2),
         ApiSegmentTable(
             ("probe_exposure",),
             ((2e-8,), (4e-8,)),
@@ -723,19 +731,24 @@ def test_api_segmented_scan_uses_one_terminal_bound_association_per_cell(
         finally:
             _stop_virtual_readout_camera(camera_handle)
 
-    assert materialized.values.shape == (1, 2, 96, 128)
+    assert materialized.values.shape == (2, 2, 96, 128)
     assert materialized.values.dtype == np.dtype("<u2")
     associations = artifact.execution.source.associations
     segments = artifact.execution.segments
-    assert len(associations) == len(segments) == 2
-    assert tuple(item.request.expected_event_count for item in associations) == (1, 1)
+    assert len(associations) == len(segments) == 4
+    assert tuple(item.request.expected_event_count for item in associations) == (
+        1,
+        1,
+        1,
+        1,
+    )
     assert tuple(item.request.cause_id for item in associations) == tuple(
         item.terminal.session_id for item in segments
     )
     assert tuple(item.request.cause_digest for item in associations) == tuple(
         item.artifact.fingerprint for item in segments
     )
-    assert len({item.request.cause_id for item in associations}) == 2
+    assert len({item.request.cause_id for item in associations}) == 4
     assert all(
         item.evidence_schema_id.endswith(
             "camera-measurement.pulse-association"
@@ -831,6 +844,7 @@ def test_pulse_scan_refuses_ordering_only_source_before_any_fire(
             replace(
                 document,
                 scan_table=FrozenScanTable(columns, ((0, 0, 0),)),
+                scan_sweep_count=1,
             )
         ),
         ScanSignalBinding(

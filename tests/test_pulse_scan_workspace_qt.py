@@ -19,7 +19,7 @@ from zlc_pulse import (
     load_deployed_pulse_target,
     new_pulse_document,
 )
-from zlc_workbench.pulse_editor.session import PulseEditorSession
+from zlc_workbench.pulse_editor.app import open_pulse_editor
 from zlc_workbench.pulse_editor.controller import PulseEditorController
 from zlc_workbench.pulse_editor.window import PulseEditorWindowBody
 
@@ -42,15 +42,19 @@ def _click_tab(body: PulseEditorWindowBody, page: QtWidgets.QWidget) -> None:
     )
 
 
-def _body() -> tuple[PulseEditorWindowBody, PulseEditorController]:
+def _body(root: Path) -> tuple[PulseEditorWindowBody, PulseEditorController]:
     document = new_pulse_document(load_deployed_pulse_target(), time_step_ns=20)
     field = PulseFieldRef(FIELD_DURATION, document.periods[0].period_id)
     document = replace(
         document,
         scan_parameters=(ScanParameter("duration", field, "Duration", "ns"),),
     )
-    controller = PulseEditorController(PulseEditorSession(document))
-    return PulseEditorWindowBody(controller), controller
+    body = open_pulse_editor(
+        document=document,
+        pulses_root=root,
+        output_root=root,
+    )
+    return body, body._controller
 
 
 def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
@@ -93,8 +97,7 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
         staticmethod(save_dialog),
     )
 
-    body, controller = _body()
-    body.show()
+    body, controller = _body(tmp_path)
     try:
         messages: list[str] = []
         body._message = messages.append
@@ -152,6 +155,7 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
             application,
             lambda: "np.meshgrid" in body.scan_view.scan_code.toPlainText(),
         )
+        assert "scan_shape" not in body.scan_view.scan_code.toPlainText()
         assert body.scan_view.scan_run_button.text().endswith("*")
 
         QtTest.QTest.mouseClick(
@@ -247,7 +251,5 @@ def test_formal_scan_controls_drive_workspace_and_exact_file_dialogs(
     finally:
         body.request_close(discard_unsaved=True)
         _until(application, lambda: controller.runtime_update().close_complete)
-        body.close()
-        body.deleteLater()
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
     assert controller.worker_idle

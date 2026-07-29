@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Mapping
 
@@ -24,6 +25,7 @@ from zlc_neutral_atom.timing.pulse_parameter_scan import (
 
 
 DEFAULT_PULSE_SCAN_PULSE_PATH = "probe_template.json"
+DEFAULT_PULSE_SCAN_SWEEP_COUNT = 1
 
 
 _PULSE_SCAN_AUTHORING_SCHEMA = AuthoringSchema(
@@ -36,6 +38,18 @@ _PULSE_SCAN_AUTHORING_SCHEMA = AuthoringSchema(
             required=True,
             description=(
                 "Current PulseDocument whose declared scan/API slots are edited below"
+            ),
+        ),
+        AuthoringField(
+            "scan_sweep_count",
+            "int",
+            "Sweeps",
+            default=DEFAULT_PULSE_SCAN_SWEEP_COUNT,
+            required=True,
+            minimum=1,
+            allow_blank=False,
+            description=(
+                "Finite Dataset repeat count; independent of pulse-timeline repeat"
             ),
         ),
     )
@@ -72,18 +86,25 @@ def build_pulse_scan_program(
 
     if not isinstance(values, Mapping):
         raise TypeError("PulseScan values must be a mapping")
-    unknown = set(values) - {"pulse", "pulse_slots"}
+    unknown = set(values) - {"pulse", "scan_sweep_count", "pulse_slots"}
     if unknown:
         raise ValueError(
             f"PulseScan values contain unknown fields: {tuple(sorted(unknown))}"
         )
     authored = pulse_scan_authoring_schema().freeze(
-        {"pulse": values["pulse"]} if "pulse" in values else {}
+        {
+            key: values[key]
+            for key in ("pulse", "scan_sweep_count")
+            if key in values
+        }
     )
     source = Path(authored["pulse"]).expanduser()
     if not source.is_absolute():
         raise ValueError("PulseScan pulse path must be resolved by composition")
-    document = load_pulse_document(source.resolve())
+    document = replace(
+        load_pulse_document(source.resolve()),
+        scan_sweep_count=authored["scan_sweep_count"],
+    )
     slots = dict(values.get("pulse_slots") or {})
     sweep_kind = str(slots.get("sweep_kind") or "")
     source = str(slots.get("program") or "")
@@ -134,6 +155,7 @@ def build_pulse_scan_program(
 
 __all__ = [
     "DEFAULT_PULSE_SCAN_PULSE_PATH",
+    "DEFAULT_PULSE_SCAN_SWEEP_COUNT",
     "PULSE_SCAN_SOURCE_INPUT_SPEC",
     "build_pulse_scan_program",
     "pulse_scan_authoring_schema",

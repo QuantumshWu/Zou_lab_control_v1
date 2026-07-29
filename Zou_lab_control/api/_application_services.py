@@ -397,7 +397,7 @@ def application_start_run(
                         _abort_pending_lifecycle(services, lifecycle_ref)
                         lifecycle_ref = None
                         raise
-                    retired_run_ids, retirement_errors = retirement
+                    retired_run_ids = retirement
                     retired_handles = tuple(
                         services.active_runs[run_id]
                         for run_id in retired_run_ids
@@ -416,17 +416,27 @@ def application_start_run(
 
             for retired in retired_handles:
                 retired.cancel("replaced by a newly admitted Experiment Run")
-            if retirement_errors:
-                raise BaseExceptionGroup(
-                    "preemptible signal closure cleanup failed",
-                    list(retirement_errors),
-                )
 
             while not services.runtime.wait_until_released(
                 retired_run_ids,
                 timeout=0.05,
             ):
-                _check_start_continuation(services, cancel_requested)
+                # Once retirement starts, the old hardware must reach SAFE and
+                # release its exact leases even if the incoming request is
+                # cancelled.  Recheck that request only after safe cleanup.
+                pass
+
+            retirement_errors = (
+                services.signal_plane.finish_preemptible_run_retirement(
+                    retired_run_ids
+                )
+            )
+            if retirement_errors:
+                raise BaseExceptionGroup(
+                    "preemptible signal closure cleanup failed",
+                    list(retirement_errors),
+                )
+            _check_start_continuation(services, cancel_requested)
 
             with services.admission_lock:
                 _prune_terminal_runs_locked(services)

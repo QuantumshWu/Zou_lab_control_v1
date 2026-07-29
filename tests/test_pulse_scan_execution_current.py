@@ -33,6 +33,11 @@ from zlc_pulse.scan_execution import (
     materialize_scan_sweeps,
     resolve_scan_point,
 )
+from zlc_neutral_atom.timing.pulse_parameter_scan import (
+    ApiSegmentTable,
+    ApiSlotSegmentedProgram,
+    AutonomousScanSlotProgram,
+)
 from zlc_pulse.server import PulseExecutionService
 from zlc_pulse.manifest import pulse_target_manifest_from_lanes
 
@@ -85,7 +90,7 @@ def test_materialize_scan_sweeps_repeats_only_frozen_rows_sweep_major():
     assert materialize_scan_sweeps(document, 1) is document
 
 
-def test_materialize_scan_sweeps_validates_the_requested_repeat_count():
+def test_materialize_scan_sweeps_validates_the_requested_sweep_count():
     document = _execution_document()
 
     with pytest.raises(TypeError, match="integer"):
@@ -94,6 +99,37 @@ def test_materialize_scan_sweeps_validates_the_requested_repeat_count():
         materialize_scan_sweeps(document, 0)
     with pytest.raises(ValueError, match="frozen scan table"):
         materialize_scan_sweeps(replace(document, scan_table=None), 1)
+
+
+def test_pulse_scan_sweeps_are_independent_of_pulse_timeline_repeat():
+    document = replace(
+        _execution_document(),
+        repeat=RepeatRegion("p2", "p3", 2),
+        scan_sweep_count=3,
+    )
+    api_parameter = document.api_parameters[0]
+    autonomous = AutonomousScanSlotProgram.from_api_values(
+        document,
+        {api_parameter.parameter_id: document.field_value(api_parameter.field)[0]},
+    )
+
+    assert autonomous.sweep_count == 3
+    assert autonomous.execution_document.repeat == document.repeat
+    assert materialize_scan_sweeps(
+        autonomous.execution_document,
+        autonomous.sweep_count,
+    ).repeat == document.repeat
+
+    api = ApiSlotSegmentedProgram(
+        replace(document, scan_sweep_count=2),
+        ApiSegmentTable((api_parameter.parameter_id,), ((20,), (40,))),
+        "prove Dataset sweeps do not rewrite the pulse timeline",
+    )
+    assert api.sweep_count == 2
+    assert all(
+        point.repeat == document.repeat
+        for point in api.resolved_point_documents
+    )
 
 
 def test_resolve_scan_point_joins_columns_by_parameter_id_and_preserves_api():

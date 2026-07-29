@@ -108,7 +108,6 @@ from .validation import (
 from .deployment import (
     APPROVED_DEPLOYED_TARGET_ABI,
     DeployedGeometryFacts,
-    expand_autonomous_scan_repeats,
     load_deployed_geometry_facts,
     require_deployed_geometry_facts,
     require_approved_target_abi,
@@ -431,7 +430,6 @@ __all__ = [
     "set_output_delay",
     "require_approved_target_abi",
     "require_deployed_geometry_facts",
-    "expand_autonomous_scan_repeats",
     "serve_pulse_execution_service",
     "target_ir_from_tree",
     "target_ir_to_tree",

@@ -41,7 +41,7 @@ from zlc_pulse import (
     PulseExecutionForm,
     decode_compiled_pulse_artifact,
     encode_compiled_pulse_artifact,
-    expand_autonomous_scan_repeats,
+    materialize_scan_sweeps,
 )
 from zlc_storage import (
     CanonicalArrayEvent,
@@ -408,9 +408,9 @@ def _require_scan_facts(
     )
     program = execution.program
     point_table = program.point_table
-    repeat_count = program.repeat_count
-    if source_schema.repeat_axis.size != repeat_count:
-        raise ValueError("source repeat axis differs from logical scan repeats")
+    sweep_count = program.sweep_count
+    if source_schema.repeat_axis.size != sweep_count:
+        raise ValueError("source repeat axis differs from frozen scan sweeps")
     if source_schema.point_table != point_table:
         raise ValueError("source PointTable differs from the frozen pulse rows")
     if not isinstance(
@@ -418,7 +418,7 @@ def _require_scan_facts(
         (AutonomousScanExecution, ApiSegmentedScanExecution),
     ):
         raise TypeError("execution must be a PulseScanExecution")
-    expected_events = repeat_count * point_table.row_count
+    expected_events = sweep_count * point_table.row_count
     event_count = provenance.end_sequence - provenance.start_sequence
     if event_count != expected_events:
         raise ValueError("collected Dataset count differs from logical R by P")
@@ -483,7 +483,10 @@ def _require_program_artifacts(
         artifact = pulses[0]
         if artifact.execution_form is not PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
             raise ValueError("autonomous scan requires AUTONOMOUS_SCAN_ONCE")
-        expected = expand_autonomous_scan_repeats(program.execution_document)
+        expected = materialize_scan_sweeps(
+            program.execution_document,
+            program.sweep_count,
+        )
         if artifact.source_document_digest != expected.fingerprint:
             raise ValueError("autonomous compiled pulse differs from its program")
     elif isinstance(program, ApiSlotSegmentedProgram):

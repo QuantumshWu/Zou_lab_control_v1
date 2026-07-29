@@ -1002,22 +1002,14 @@ def resolve_api_segment_document(
     bind the complete declared API domain.  SCAN_SLOT declarations describe a
     different execution mechanism; their already-present document field values
     are the nominal/reference values for this finite segment and the declarations
-    are removed.  A logical dataset repeat is expanded by the scan owner, never
-    retained as a hardware loop inside an individual segment.
+    are removed.  The authored ``RepeatRegion`` remains the pulse-timeline loop
+    inside each point; a scan application's Dataset sweep count is independent.
     """
 
     if not isinstance(document, PulseDocument):
         raise TypeError("document must be PulseDocument")
     if not isinstance(values, Mapping):
         raise TypeError("values must be a mapping")
-    repeat = document.repeat
-    if repeat is not None and (
-        repeat.start_period_id != document.periods[0].period_id
-        or repeat.end_period_id != document.periods[-1].period_id
-    ):
-        raise ValueError(
-            "API-segment repeat axis requires a whole-document RepeatRegion"
-        )
     requested = dict(values)
     expected_ids = tuple(
         parameter.parameter_id for parameter in document.api_parameters
@@ -1036,7 +1028,6 @@ def resolve_api_segment_document(
         scan_parameters=(),
         scan_table=None,
         scan_recipe=None,
-        repeat=None,
     )
     resolved = resolve_api_parameters(finite, requested)
     if resolved.api_parameters:

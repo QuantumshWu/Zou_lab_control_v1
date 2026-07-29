@@ -9,7 +9,7 @@ frozen timing vocabulary without depending on one another's leaf packages.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import cached_property
 import math
 from typing import Any, Mapping
@@ -37,22 +37,15 @@ def _scan_axis_id(parameter_id: str) -> AxisId:
     return AxisId(f"scan.parameter.{parameter_id}")
 
 
-def _whole_document_repeat_count(
+def _scan_sweep_count(
     document: PulseDocument,
     *,
     execution_name: str,
 ) -> int:
-    repeat = document.repeat
-    if repeat is None:
-        return 1
-    if (
-        repeat.start_period_id != document.periods[0].period_id
-        or repeat.end_period_id != document.periods[-1].period_id
-    ):
-        raise ValueError(
-            f"{execution_name} repeat axis requires a whole-document RepeatRegion"
-        )
-    return repeat.count
+    count = document.scan_sweep_count
+    if count < 1:
+        raise ValueError(f"{execution_name} scan_sweep_count must be positive")
+    return count
 
 
 @dataclass(frozen=True)
@@ -167,7 +160,7 @@ class AutonomousScanSlotProgram:
         if not isinstance(self.document, PulseDocument):
             raise TypeError("document must be PulseDocument")
         _point_table_from_pulse_document(self.document)
-        _whole_document_repeat_count(
+        _scan_sweep_count(
             self.document,
             execution_name="autonomous SCAN_SLOT",
         )
@@ -228,8 +221,8 @@ class AutonomousScanSlotProgram:
         return _point_table_from_pulse_document(self.document)
 
     @property
-    def repeat_count(self) -> int:
-        return _whole_document_repeat_count(
+    def sweep_count(self) -> int:
+        return _scan_sweep_count(
             self.document,
             execution_name="autonomous SCAN_SLOT",
         )
@@ -269,7 +262,7 @@ class ApiSlotSegmentedProgram:
             raise ValueError(
                 "API segment columns must exactly match declared API parameter order"
             )
-        _whole_document_repeat_count(
+        _scan_sweep_count(
             self.document,
             execution_name="API_SLOT segmented",
         )
@@ -288,27 +281,24 @@ class ApiSlotSegmentedProgram:
         return len(self.table.rows)
 
     @property
-    def repeat_count(self) -> int:
-        return _whole_document_repeat_count(
+    def sweep_count(self) -> int:
+        return _scan_sweep_count(
             self.document,
             execution_name="API_SLOT segmented",
         )
 
     @property
     def segment_count(self) -> int:
-        return self.repeat_count * self.point_count
+        return self.sweep_count * self.point_count
 
     @cached_property
     def resolved_point_documents(self) -> tuple[PulseDocument, ...]:
         """Return P single-fire documents resolved once in row order."""
 
         documents = tuple(
-            replace(
-                resolve_api_segment_document(
-                    self.document,
-                    dict(zip(self.table.columns, row)),
-                ),
-                repeat=None,
+            resolve_api_segment_document(
+                self.document,
+                dict(zip(self.table.columns, row)),
             )
             for row in self.table.rows
         )

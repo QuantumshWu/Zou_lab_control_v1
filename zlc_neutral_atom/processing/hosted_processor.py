@@ -284,7 +284,12 @@ class HostedProcessor:
                 raise TypeError(
                     "Processor application start_signal_events must be callable"
                 )
-            upstream, _output_name, transform = self._data_plane.signal_event_binding(
+            (
+                _generation,
+                upstream,
+                _output_name,
+                transform,
+            ) = self._data_plane.signal_event_binding(
                 self._source_signal,
                 expected_generation=self._source_signal_generation,
             )

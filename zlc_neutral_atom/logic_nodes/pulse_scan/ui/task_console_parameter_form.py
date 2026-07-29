@@ -28,25 +28,34 @@ __all__ = ["task_console_editor"]
 
 @dataclass(frozen=True, slots=True)
 class PulseScanFormSpec:
-    """Ordinary pulse path plus the one structured slot/program value."""
+    """Ordinary pulse fields plus the one structured slot/program value."""
 
-    pulse_field: FormFieldProps
+    program_fields: tuple[FormFieldProps, ...]
 
     def __post_init__(self) -> None:
-        if self.pulse_field.key != "pulse" or self.pulse_field.kind != "path":
-            raise ValueError("PulseScan pulse field must be the declared path")
+        fields = tuple(self.program_fields)
+        if tuple(field.key for field in fields) != (
+            "pulse",
+            "scan_sweep_count",
+        ):
+            raise ValueError(
+                "PulseScan program fields must be pulse and scan_sweep_count"
+            )
+        if fields[0].kind != "path" or fields[1].kind != "int":
+            raise ValueError("PulseScan program fields have unexpected kinds")
+        object.__setattr__(self, "program_fields", fields)
 
     @property
-    def fields(self) -> tuple[FormFieldProps]:
-        return (self.pulse_field,)
+    def fields(self) -> tuple[FormFieldProps, ...]:
+        return self.program_fields
 
     @property
-    def keys(self) -> tuple[str, str]:
-        return "pulse", "pulse_slots"
+    def keys(self) -> tuple[str, str, str]:
+        return "pulse", "scan_sweep_count", "pulse_slots"
 
     def default_values(self) -> dict[str, object]:
         return {
-            "pulse": self.pulse_field.default,
+            **{field.key: field.default for field in self.program_fields},
             "pulse_slots": {},
         }
 
@@ -108,8 +117,8 @@ class PulseScanParameterForm(QtWidgets.QWidget):
         self._path_dirty = False
         self._template_error = ""
 
-        self._pulse_form = FluentParameterForm(
-            FormSpec((spec.pulse_field,)),
+        self._program_form = FluentParameterForm(
+            FormSpec(spec.program_fields),
             runtime=runtime,
             parent=self,
         )
@@ -123,15 +132,15 @@ class PulseScanParameterForm(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(scaled_px(6, minimum=4))
-        layout.addWidget(self._pulse_form)
+        layout.addWidget(self._program_form)
         layout.addWidget(self._slots)
         layout.addWidget(self._input_form)
 
-        self._pulse_form.changed.connect(self._on_path_edited)
+        self._program_form.changed.connect(self._on_program_field_edited)
         self._slots.changed.connect(lambda: self.changed.emit("pulse_slots"))
         self._input_form.changed.connect(lambda key: self.changed.emit(str(key)))
 
-        path_widget = self._pulse_form.widget_for("pulse")
+        path_widget = self._program_form.widget_for("pulse")
         path_widget.selected.connect(lambda _path: self._commit_template())
         path_widget.edit.editingFinished.connect(self._commit_template)
         self._commit_template(force=True)
@@ -142,7 +151,9 @@ class PulseScanParameterForm(QtWidgets.QWidget):
 
     def widget_for(self, key: str) -> QtWidgets.QWidget:
         if key == "pulse":
-            return self._pulse_form.widget_for(key)
+            return self._program_form.widget_for(key)
+        if key == "scan_sweep_count":
+            return self._program_form.widget_for(key)
         if key == "pulse_slots":
             return self._slots
         if key in self._input_form.spec.keys:
@@ -150,8 +161,8 @@ class PulseScanParameterForm(QtWidgets.QWidget):
         raise KeyError(f"unknown PulseScan field key: {key!r}")
 
     def is_empty(self, key: str) -> bool:
-        if key == "pulse":
-            return self._pulse_form.is_empty(key)
+        if key in self._program_form.spec.keys:
+            return self._program_form.is_empty(key)
         if key in self._input_form.spec.keys:
             return self._input_form.is_empty(key)
         if key == "pulse_slots":
@@ -165,8 +176,11 @@ class PulseScanParameterForm(QtWidgets.QWidget):
 
     def missing_required_labels(self) -> tuple[str, ...]:
         missing = []
-        if self.is_empty("pulse"):
-            missing.append(self._spec.pulse_field.label)
+        missing.extend(
+            field.label
+            for field in self._program_form.spec.fields
+            if field.required and self._program_form.is_empty(field.key)
+        )
         if self.is_empty("pulse_slots"):
             missing.append("Slots")
         missing.extend(
@@ -189,7 +203,7 @@ class PulseScanParameterForm(QtWidgets.QWidget):
         if missing:
             raise ValueError("set required: " + ", ".join(missing))
         return {
-            "pulse": self._pulse_form.read_value("pulse"),
+            **self._program_form.read_all(),
             "pulse_slots": self._slots.values_dict(),
             **self._input_form.read_all(),
         }
@@ -215,8 +229,11 @@ class PulseScanParameterForm(QtWidgets.QWidget):
         input_values = {
             key: values[key] for key in self._input_form.spec.keys
         }
-        with signals_blocked(self, self._pulse_form, self._input_form, self._slots):
-            self._pulse_form.populate({"pulse": pulse})
+        program_values = {
+            key: values[key] for key in self._program_form.spec.keys
+        }
+        with signals_blocked(self, self._program_form, self._input_form, self._slots):
+            self._program_form.populate(program_values)
             self._input_form.populate(input_values)
             self._slots.seed_value(slots)
             self._path_dirty = False
@@ -228,12 +245,13 @@ class PulseScanParameterForm(QtWidgets.QWidget):
 
         self._input_form.refresh()
 
-    def _on_path_edited(self, _key: str) -> None:
-        self._path_dirty = True
-        self.changed.emit("pulse")
+    def _on_program_field_edited(self, key: str) -> None:
+        if key == "pulse":
+            self._path_dirty = True
+        self.changed.emit(str(key))
 
     def _commit_template(self, *, force: bool = False) -> None:
-        path = str(self._pulse_form.widget_for("pulse").text()).strip()
+        path = str(self._program_form.widget_for("pulse").text()).strip()
         if not force and not self._path_dirty and path == self._loaded_path:
             return
         self._path_dirty = False
@@ -277,13 +295,15 @@ def task_console_editor(base_form: FormSpec, *, pulses_root: str | Path):
 
     if not isinstance(base_form, FormSpec):
         raise TypeError("base_form must be FormSpec")
-    if tuple(base_form.keys) != ("pulse",):
-        raise ValueError("PulseScan base form must contain only its pulse path")
+    if tuple(base_form.keys) != ("pulse", "scan_sweep_count"):
+        raise ValueError(
+            "PulseScan base form must contain pulse and scan_sweep_count"
+        )
     root = Path(pulses_root).expanduser()
     if not root.is_absolute():
         raise ValueError("pulses_root must be absolute")
     root = root.resolve()
-    spec = PulseScanFormSpec(base_form.fields[0])
+    spec = PulseScanFormSpec(base_form.fields)
 
     def read_template(value):
         return describe_pulse_template(resolve_under(root, value))

@@ -1238,8 +1238,15 @@ class SignalDataPlane:
     def retire_preemptible_run_closure(
         self,
         blocking_run_ids: tuple[str, ...],
-    ) -> tuple[tuple[str, ...], tuple[BaseException, ...]] | None:
-        """Atomically retire a complete exact closure, or mutate nothing."""
+    ) -> tuple[str, ...] | None:
+        """Atomically withdraw a complete exact closure, or mutate nothing.
+
+        Withdrawal removes the generations from routing immediately but keeps
+        their live slots open until the application has cancelled the Runs and
+        observed hardware cleanup/buffer sealing/lease release.  Closing a slot
+        before its Run cleanup would destroy the very Dataset owner that must
+        reach a safe terminal.
+        """
 
         if not isinstance(blocking_run_ids, tuple):
             raise TypeError("blocking_run_ids must be a tuple")
@@ -1287,10 +1294,67 @@ class SignalDataPlane:
                 )
             )
             for state in states:
+                state.retired = True
+                state.publication = None
+                state.failure = None
+                self._dirty.discard(state.owner_id)
+            self._membership_changed = True
+        return retired_run_ids
+
+    def finish_preemptible_run_retirement(
+        self,
+        retired_run_ids: tuple[str, ...],
+    ) -> tuple[BaseException, ...]:
+        """Close one withdrawn closure after its physical Runs released safely."""
+
+        if not isinstance(retired_run_ids, tuple):
+            raise TypeError("retired_run_ids must be a tuple")
+        run_ids = tuple(
+            canonical_text(value, "retired run_id")
+            for value in retired_run_ids
+        )
+        if not run_ids or len(set(run_ids)) != len(run_ids):
+            raise ValueError("retired_run_ids must be non-empty and unique")
+        with self._lock:
+            roots = []
+            for run_id in run_ids:
+                matches = tuple(
+                    state
+                    for state in self._states.values()
+                    if state.retired and state.run_id == run_id
+                )
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        "retired RunId has no unique withdrawn signal generation"
+                    )
+                roots.append(matches[0])
+            selected = {
+                (state.owner_id, state.generation)
+                for state in roots
+            }
+            changed = True
+            while changed:
+                changed = False
+                for state in self._states.values():
+                    reference = (state.owner_id, state.generation)
+                    if reference in selected:
+                        continue
+                    if any(parent in selected for parent in state.lifecycle_parents):
+                        if not state.retired:
+                            raise RuntimeError(
+                                "withdrawn Run retained an active signal descendant"
+                            )
+                        selected.add(reference)
+                        changed = True
+            states = tuple(
+                state
+                for state in self._states.values()
+                if (state.owner_id, state.generation) in selected
+            )
+            for state in states:
                 self._drop_state_locked(state)
             self._membership_changed = True
-        cleanup_errors = self._cleanup_retired_states(states)
-        return retired_run_ids, cleanup_errors
+        return self._cleanup_retired_states(states)
 
     def attach(
         self,
@@ -1747,7 +1811,14 @@ class SignalDataPlane:
         signal_name: str,
         *,
         expected_generation: int | None = None,
-    ) -> tuple[SignalEventSource, str, DataTransformSpec | None]:
+    ) -> tuple[int, SignalEventSource, str, DataTransformSpec | None]:
+        """Freeze one active event route without requiring a prior value.
+
+        A passive externally-triggered producer can be armed and association-
+        capable before its first event exists.  The route generation therefore
+        comes from this owner, not from a latest publication.
+        """
+
         name = canonical_text(signal_name, "signal event route name")
         if expected_generation is not None and (
             isinstance(expected_generation, bool)
@@ -1775,7 +1846,12 @@ class SignalDataPlane:
             source = root.event_source
             if source is None:
                 raise TypeError("signal route root has no frozen SignalEventSource")
-            return source, root.bare_names[root_name], transform
+            return (
+                selected.generation,
+                source,
+                root.bare_names[root_name],
+                transform,
+            )
 
     def signal_route_source(
         self,
@@ -1789,7 +1865,9 @@ class SignalDataPlane:
 
     def has_event_association(self, signal_name: str) -> bool:
         try:
-            source, output_name, transform = self.signal_event_binding(signal_name)
+            _generation, source, output_name, transform = (
+                self.signal_event_binding(signal_name)
+            )
             projected = authoritative_signal_event_source(
                 source,
                 output_name,

@@ -82,7 +82,7 @@ from zlc_pulse import (
     PulseExecutionForm,
     bind_pulse_document_target,
     compile_pulse_artifact,
-    expand_autonomous_scan_repeats,
+    materialize_scan_sweeps,
 )
 from zlc_storage import (
     RepositoryRootLeaseBorrow,
@@ -130,7 +130,7 @@ class PulseScanPlanDescriptor:
 
     name: str
     execution_form: PulseExecutionForm
-    repeat_count: int
+    sweep_count: int
     point_count: int
     source_definition: str
     source_output: str
@@ -142,7 +142,7 @@ class PulseScanPlanDescriptor:
         canonical_text(self.name, "scan descriptor name")
         if not isinstance(self.execution_form, PulseExecutionForm):
             raise TypeError("execution_form must be PulseExecutionForm")
-        for field in ("repeat_count", "point_count"):
+        for field in ("sweep_count", "point_count"):
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{field} must be a positive integer")
@@ -553,8 +553,8 @@ def prepare_exact_scan(
         _SCAN_REPEAT_AXIS_ID,
         "repeat",
         REPEAT,
-        program.repeat_count,
-        tuple(range(program.repeat_count)),
+        program.sweep_count,
+        tuple(range(program.sweep_count)),
     )
     source_schema = DatasetSchema(
         repeat_axis,
@@ -606,7 +606,7 @@ def prepare_exact_scan(
             if isinstance(program, AutonomousScanSlotProgram)
             else PulseExecutionForm.STATIC_ONCE
         ),
-        program.repeat_count,
+        program.sweep_count,
         point_table.row_count,
         request.signal.producer_definition.stable_definition_id,
         output_name,
@@ -659,7 +659,7 @@ def _compile_pulse_requests(
     trigger_channels = (association_requirement.trigger_channel,)
     if isinstance(program, AutonomousScanSlotProgram):
         logical = program.execution_document
-        document = expand_autonomous_scan_repeats(logical)
+        document = materialize_scan_sweeps(logical, program.sweep_count)
         artifact = compile_pulse_artifact(
             document,
             clock_hz=pulse_port.capability.clock_hz,

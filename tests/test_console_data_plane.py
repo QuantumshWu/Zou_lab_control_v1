@@ -146,6 +146,42 @@ def _live_source_plane():
     return plane, state, node, first
 
 
+def test_event_route_freezes_generation_before_any_publication() -> None:
+    """A passive trigger source is bindable before the event that FIRE creates."""
+
+    plane = SignalDataPlane()
+    output = _live_output("frame", 1, "1" * 64)
+    node = _node("passive-camera", (output,))
+    source = SimpleNamespace(
+        value_schema=lambda _name: output.snapshot.block.schema.cell_schema,
+        open_signal_cursor=lambda _name: object(),
+    )
+    slot = SimpleNamespace(
+        freeze_live_outputs=lambda: ("camera-run", "camera-epoch", {"frame": output}),
+        close=lambda: None,
+        notification_failure=None,
+    )
+    try:
+        generation = plane.reserve(node)
+        plane.attach(node, slot, event_source=source)
+        assert plane.latest_publication("passive-camera/frame") is None
+        frozen = plane.signal_event_binding("passive-camera/frame")
+        assert frozen == (generation, source, "frame", None)
+
+        plane.retire(node)
+        replacement = _node("passive-camera", (output,))
+        replacement_generation = plane.reserve(replacement)
+        plane.attach(replacement, slot, event_source=source)
+        assert replacement_generation > generation
+        with pytest.raises(RuntimeError, match="generation changed"):
+            plane.signal_event_binding(
+                "passive-camera/frame",
+                expected_generation=generation,
+            )
+    finally:
+        plane.close()
+
+
 def test_preemption_keeps_a_parent_with_an_unadmitted_exact_descendant() -> None:
     plane = SignalDataPlane()
     parent = _node("parent", (_live_output("source", 1, "1" * 64),))
@@ -169,6 +205,36 @@ def test_preemption_keeps_a_parent_with_an_unadmitted_exact_descendant() -> None
         child_ref = plane.begin_run_lifecycle(child_command)
         assert plane.abort_run_lifecycle(child_ref)
         plane.finish_run_lifecycle("parent-run")
+    finally:
+        plane.close()
+
+
+def test_preemption_closes_live_slot_only_after_safe_run_release() -> None:
+    plane = SignalDataPlane()
+    output = _live_output("source", 1, "1" * 64)
+    parent = _node("parent", (output,))
+    closed = []
+    slot = SimpleNamespace(
+        freeze_live_outputs=lambda: ("parent-run", "parent-epoch", {"source": output}),
+        close=lambda: closed.append(True),
+        notification_failure=None,
+    )
+    command = object()
+    try:
+        plane.reserve(parent)
+        plane.bind_lifecycle_owner(parent, command)
+        lifecycle = plane.begin_run_lifecycle(command)
+        plane.bind_run_lifecycle(lifecycle, "parent-run", preemptible=True)
+        plane.attach(parent, slot)
+
+        assert plane.retire_preemptible_run_closure(("parent-run",)) == (
+            "parent-run",
+        )
+        assert closed == []
+        assert len(plane) == 0
+
+        assert plane.finish_preemptible_run_retirement(("parent-run",)) == ()
+        assert closed == [True]
     finally:
         plane.close()
 

@@ -301,7 +301,7 @@ class AutonomousScanExecution:
         validate_pulse_terminal_for_artifact(self.terminal, self.artifact)
         if not isinstance(self.source, SignalEventSequence):
             raise TypeError("source must be SignalEventSequence")
-        expected = self.program.repeat_count * self.program.point_table.row_count
+        expected = self.program.sweep_count * self.program.point_table.row_count
         if self.source.count != expected:
             raise ValueError("source event count differs from autonomous R by P")
         if len(self.source.associations) != 1:
@@ -351,7 +351,7 @@ class ApiSegmentedScanExecution:
             raise ValueError("API segments must cover the complete R by P run")
         expected_cells = tuple(
             (repeat, point)
-            for repeat in range(self.program.repeat_count)
+            for repeat in range(self.program.sweep_count)
             for point in range(self.program.point_count)
         )
         if tuple(

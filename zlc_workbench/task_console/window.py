@@ -2602,11 +2602,15 @@ class TaskConsole(QtWidgets.QWidget):
         self._last_node[id(row)] = node           # survives Stop, for signal-source labelling
         self._sync_terminal_poll_timer()
         self._signal_topology_changed()
-        row.set_state("running", status="running")
+        # Submission is not hardware admission.  Keep the visible lifecycle at
+        # ``starting`` until HostedRun.poll() observes the admitted Run; this
+        # prevents a dependent Task from treating an optimistic GUI label as a
+        # physical owner that is already safe to preempt.
+        row.set_state("running", status="starting")
         self._update_row_publishes(row)            # now show the LIVE node's published shapes
         if editor is not None:
             editor.set_running(True)
-            editor.set_status("running", error=False)
+            editor.set_status("starting", error=False)
         self.status_dot.set_color(GREEN)
         self._mark_dirty()
         self._ensure_default_result_panels(row)

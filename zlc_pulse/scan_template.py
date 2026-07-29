@@ -76,8 +76,9 @@ def scan_table_template(
     """Render the shared human-editable ``scan_table`` starter program.
 
     ``column_stack`` advances all columns in lockstep.  ``grid`` constructs the
-    Cartesian product and records ``scan_shape``.  Physical units, ranges, and
-    clock quantum come exclusively from the supplied pulse-owned descriptors.
+    Cartesian rows only; it does not claim an authoritative GridTopology.
+    Physical units, ranges, and clock quantum come exclusively from the
+    supplied pulse-owned descriptors.
     """
 
     cols = list(columns)
@@ -125,13 +126,8 @@ def scan_table_template(
         mesh = ", ".join(f"A{index}" for index in range(n))
         axes = ", ".join(f"a{index}" for index in range(n))
         ravel = ", ".join(f"A{index}.ravel()" for index in range(n))
-        shape = ", ".join(f"len(a{index})" for index in range(n))
-        shape_expr = f"({shape},)" if n == 1 else f"({shape})"
         lines.append(f'{mesh}, = np.meshgrid({axes}, indexing="ij")')
         lines.append(f"scan_table = np.column_stack([{ravel}])")
-        lines.append(
-            f"scan_shape = {shape_expr}        # {n}-D grid -> a scan map"
-        )
         return "\n".join(lines) + "\n"
 
     lines = [

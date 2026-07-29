@@ -239,9 +239,9 @@ def _readout_duration_point_groups(
 ) -> tuple[PulseDocument, ...]:
     """Resolve owner-frozen rows while retaining the hardware shot repeat.
 
-    Generic API scans expand repeat into host-visible dataset cells.  This
-    coupled Measurement instead arms one point group and lets the sequencer
-    execute its whole-document RepeatRegion under one FIRE.
+    Generic API PulseScan repeats point segments through ``scan_sweep_count``.
+    This coupled Measurement has one host sweep per duration and lets the
+    sequencer execute its whole-document RepeatRegion under one FIRE.
     """
 
     return tuple(
@@ -275,7 +275,7 @@ class BoundReadoutDurationFidelity:
             raise TypeError("camera_port must be BoundCapturePort")
         requests = tuple(self.point_requests)
         if (
-            self.program.repeat_count != self.request.shots
+            self.program.sweep_count != 1
             or self.program.point_count != len(self.request.duration_seconds)
         ):
             raise ValueError("API program cardinality differs from the request")
@@ -430,17 +430,18 @@ def bind_readout_duration_fidelity(
         )
 
     periods = document.periods
-    execution_document = (
-        document
-        if request.shots == 1
-        else replace(
-            document,
-            repeat=RepeatRegion(
+    execution_document = replace(
+        document,
+        scan_sweep_count=1,
+        repeat=(
+            None
+            if request.shots == 1
+            else RepeatRegion(
                 periods[0].period_id,
                 periods[-1].period_id,
                 request.shots,
-            ),
-        )
+            )
+        ),
     )
     scale = 1e9 / TIME_UNIT_TO_NS[parameter.unit]
     program = ApiSlotSegmentedProgram(

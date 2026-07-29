@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 from fpga.pulse_streamer.host.image import (
@@ -14,7 +14,6 @@ from fpga.pulse_streamer.host.image import (
 )
 
 from .artifact import CompiledPulseArtifact
-from .document import FrozenScanTable, PulseDocument
 from .fpga import pack_target_ir
 from .target import (
     DAC_OFFSET_BINARY,
@@ -139,51 +138,6 @@ def require_deployed_geometry_facts(
     return expected.source
 
 
-def _autonomous_scan_repeat_domain(
-    document: PulseDocument,
-) -> tuple[FrozenScanTable, int, int]:
-    if not isinstance(document, PulseDocument):
-        raise TypeError("document must be PulseDocument")
-    table = document.scan_table
-    if table is None:
-        raise ValueError("autonomous scan requires a frozen scan table")
-    repeat = document.repeat
-    if repeat is not None and (
-        repeat.start_period_id != document.periods[0].period_id
-        or repeat.end_period_id != document.periods[-1].period_id
-    ):
-        raise ValueError(
-            "formal scan repeat axis requires a whole-document RepeatRegion"
-        )
-    repeat_count = 1 if repeat is None else repeat.count
-    return table, repeat_count, repeat_count * len(table.rows)
-
-
-def expand_autonomous_scan_repeats(document: PulseDocument) -> PulseDocument:
-    """Freeze a whole-document logical repeat into a repeat-major scan table.
-
-    A partial-period RepeatRegion cannot represent a dataset repeat axis: its
-    triggers need not occur once per loop.  Exact scan therefore removes the
-    hardware loop and duplicates the frozen SCAN_SLOT rows in ``repeat, point``
-    order.  The transport streams the resulting immutable table through the
-    frozen RTL's ping-pong banks.
-    """
-
-    table, repeat_count, _ = _autonomous_scan_repeat_domain(document)
-    repeat = document.repeat
-    if repeat is None:
-        return document
-    return replace(
-        document,
-        scan_table=FrozenScanTable(
-            table.columns,
-            tuple(row for _repeat in range(repeat_count) for row in table.rows),
-        ),
-        scan_recipe=None,
-        repeat=None,
-    )
-
-
 def require_approved_target_abi(target_abi_fingerprint: str) -> None:
     if target_abi_fingerprint != APPROVED_DEPLOYED_TARGET_ABI:
         raise ValueError(
@@ -279,7 +233,6 @@ def _validate_artifact_against_bound_deployment(
 __all__ = [
     "APPROVED_DEPLOYED_TARGET_ABI",
     "DeployedGeometryFacts",
-    "expand_autonomous_scan_repeats",
     "load_deployed_geometry_facts",
     "require_deployed_geometry_facts",
     "require_approved_target_abi",

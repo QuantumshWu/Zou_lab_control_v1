@@ -21,8 +21,8 @@ from zlc_neutral_atom.capture.binding import (
 )
 from zlc_pulse import (
     FIELD_DURATION, TIME_UNIT_TO_NS, PulseDocument, PulseExecutionForm,
-    PulseFieldRef, RepeatRegion, bind_pulse_document_target,
-    expand_autonomous_scan_repeats, freeze_scan_table, replace_pulse_field,
+    PulseFieldRef, bind_pulse_document_target, freeze_scan_table,
+    materialize_scan_sweeps, replace_pulse_field,
 )
 
 
@@ -94,6 +94,11 @@ def release_recapture_template(
     document: PulseDocument,
     calibration: CalibrationArtifact,
 ) -> PulseDocument:
+    if document.repeat is not None:
+        raise ValueError(
+            "release-recapture shots own Dataset repeats; the pulse template "
+            "must not declare a RepeatRegion"
+        )
     if tuple(parameter.parameter_id for parameter in document.scan_parameters) != (
         "t_off",
     ):
@@ -194,13 +199,12 @@ def freeze_release_recapture_rows(
         raise ValueError(
             "trap_off values must already lie on the selected pulse clock grid"
         )
-    periods = document.periods
-    repeat = (
-        None
-        if shots == 1
-        else RepeatRegion(periods[0].period_id, periods[-1].period_id, shots)
+    return replace(
+        document,
+        scan_table=frozen,
+        scan_recipe=None,
+        scan_sweep_count=shots,
     )
-    return replace(document, scan_table=frozen, scan_recipe=None, repeat=repeat)
 
 
 def bind_release_recapture_camera(
@@ -225,10 +229,17 @@ def bind_release_recapture_camera(
         document,
         pulse_port.capability.target,
     )
+    if logical_document.scan_sweep_count != repeat_axis.size:
+        raise ValueError(
+            "release-recapture Dataset repeats differ from scan_sweep_count"
+        )
     binding = bind_triggered_camera_acquisition(
         pulse_port,
         camera_port,
-        pulse_document=expand_autonomous_scan_repeats(logical_document),
+        pulse_document=materialize_scan_sweeps(
+            logical_document,
+            repeat_axis.size,
+        ),
         execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
         trigger_channel=trigger_channel,
         layout=TriggeredCameraLayout(

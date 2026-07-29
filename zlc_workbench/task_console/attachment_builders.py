@@ -84,12 +84,14 @@ def run_attachment(
                     "start the selected Dataset producer before this Logic node"
                 )
             event_signal = association.selection.signal_key
-            publication = host.current_publication(association)
-            event_generation = publication.generation
-            event_source, event_output, event_transform = (
+            (
+                event_generation,
+                event_source,
+                event_output,
+                event_transform,
+            ) = (
                 host.data_plane.signal_event_binding(
                     event_signal,
-                    expected_generation=event_generation,
                 )
             )
             if event_output != event_producer.output.name:
@@ -110,18 +112,28 @@ def run_attachment(
                     raise RuntimeError(
                         "selected Dataset producer stopped before prepare"
                     )
-                source, output_name, transform = host.data_plane.signal_event_binding(
+                (
+                    generation,
+                    source,
+                    output_name,
+                    transform,
+                ) = host.data_plane.signal_event_binding(
                     event_signal,
                     expected_generation=event_generation,
                 )
                 if (
-                    source is not event_source
+                    generation != event_generation
+                    or source is not event_source
                     or output_name != event_output
                     or transform != event_transform
                 ):
                     raise RuntimeError("event-associated Dataset route changed")
                 command = prepare(current, event_source)
-                parent = event_producer.prepared_command
+                parent = getattr(
+                    event_producer.run_node,
+                    "prepared_command",
+                    None,
+                )
                 if parent is None:
                     raise RuntimeError(
                         "event-associated producer has no admitted command"

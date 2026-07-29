@@ -32,8 +32,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _default_api_program_parts():
-    document = load_pulse_document(
-        ROOT / "pulses" / DEFAULT_PULSE_SCAN_PULSE_PATH
+    document = replace(
+        load_pulse_document(
+            ROOT / "pulses" / DEFAULT_PULSE_SCAN_PULSE_PATH
+        ),
+        scan_sweep_count=1,
     )
     specs = api_column_specs(document)
     source = scan_table_template("column_stack", specs)
@@ -63,6 +66,15 @@ def test_default_api_scan_rows_are_exact_native_unit_ticks():
             assert ratio.denominator == 1
 
 
+def test_grid_starter_creates_rows_without_claiming_grid_topology():
+    _document, specs, _table = _default_api_program_parts()
+
+    source = scan_table_template("grid", specs)
+
+    assert "np.meshgrid" in source
+    assert "scan_shape" not in source
+
+
 def test_api_scan_rejects_an_off_grid_row_when_the_program_is_built():
     document, specs, table = _default_api_program_parts()
     rows = [list(row) for row in table.rows]
@@ -90,8 +102,11 @@ def test_duration_column_cannot_exist_without_domain_owned_quantum():
 
 
 def test_api_delay_starter_is_signed_and_clock_aligned():
-    document = load_pulse_document(
-        ROOT / "pulses" / DEFAULT_PULSE_SCAN_PULSE_PATH
+    document = replace(
+        load_pulse_document(
+            ROOT / "pulses" / DEFAULT_PULSE_SCAN_PULSE_PATH
+        ),
+        scan_sweep_count=1,
     )
     port = next(port for port in document.target.ports if port.kind == "digital")
     field = PulseFieldRef(FIELD_DELAY, None, port.key)
