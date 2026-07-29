@@ -17,26 +17,18 @@ from zlc_data import MONITOR_HISTORY, DatasetSchema, FitResultBatch, OwnedSnapsh
 from zlc_storage import canonical_text
 
 from .curve_display import CurveDisplayState
-from .display_range import RelimMode
-from .figure import GRID_INTENTS, ViewIntent, ViewSpec
+from .figure import AxisViewRole, GRID_INTENTS, ViewIntent, ViewSpec
 from .histogram_display import (
     FacetedHistogramDisplayState,
-    HistogramCountScale,
     HistogramDisplayState,
     histogram_cell_thresholds_from_tree,
 )
-from .image_display import ImageColormap, ImageDisplayState
+from .image_display import ImageDisplayState
 from .figure_source import FigureSource
 from .meter_display import MeterDisplayState
-from .panel_params import resolved_panel_param
+from .panel_params import panel_display_state_from_params
 from .panel_size import DEFAULT_PANEL_SIZE
-from .panel_policy import (
-    HISTOGRAM_CELL_THRESHOLDS_PARAM,
-    HISTOGRAM_THRESHOLDS_PARAM,
-    VIEW_SPEC_PARAM,
-    panel_view_intents,
-)
-from .plot_kind import PLOT_KIND_SPEC_BY_KEY
+from .plot_kind import PlotKind
 from .plot_layout import PanelSurfaceGeometry, panel_surface_geometry
 from .panel_render import PanelProvenance
 from .site_map import SiteMapPresentation
@@ -56,9 +48,113 @@ PlotDisplayState: TypeAlias = (
 )
 
 
+# Canonical persisted keys belong beside the sole PlotPanel decoder.  The
+# Workbench composition owner imports them when committing authored values;
+# a separate policy module would only mirror this vocabulary.
+VIEW_SPEC_PARAM = "view_spec"
+HISTOGRAM_THRESHOLDS_PARAM = "histogram_thresholds"
+HISTOGRAM_CELL_THRESHOLDS_PARAM = "histogram_cell_thresholds"
+
+
+def _dataset_view_intent_for_kind(kind: PlotKind) -> ViewIntent | None:
+    if not isinstance(kind, PlotKind):
+        raise TypeError("figure kind must be PlotKind")
+    return {
+        PlotKind.IMAGE: ViewIntent.IMAGE,
+        PlotKind.CURVE: ViewIntent.CURVE,
+        PlotKind.METER: ViewIntent.METER,
+        PlotKind.ROLLING: ViewIntent.CURVE,
+        PlotKind.HISTOGRAM: ViewIntent.HISTOGRAM,
+    }.get(kind)
+
+
+def _validate_figure_view(kind: PlotKind, view: ViewSpec | None) -> ViewIntent | None:
+    if not isinstance(kind, PlotKind):
+        raise TypeError("figure kind must be PlotKind")
+    if view is not None and not isinstance(view, ViewSpec):
+        raise TypeError("figure view must be ViewSpec or None")
+    if kind in (PlotKind.SITE_MAP, PlotKind.PULSE):
+        if view is not None:
+            raise ValueError(f"{kind.value} Figure does not accept Dataset ViewSpec")
+        return None
+    if kind is PlotKind.GRID:
+        if view is None or view.intent not in GRID_INTENTS:
+            raise ValueError("Grid Figure requires an explicit faceted ViewSpec")
+        from .figure import grid_facet_source
+
+        grid_facet_source(view)
+        return view.intent
+    intent = _dataset_view_intent_for_kind(kind)
+    if intent is None:
+        raise ValueError(f"plot kind {kind.value!r} has no Dataset view intent")
+    if view is not None and view.intent is not intent:
+        raise ValueError("plot kind and ViewSpec intent disagree")
+    return intent
+
+
+@dataclass(frozen=True, slots=True)
+class FigureIntent:
+    """Generation-static Figure semantics shared by every presentation host."""
+
+    kind: PlotKind
+    title: str
+    value_label: str
+    view: ViewSpec | None = None
+    rolling_distribution: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, PlotKind):
+            raise TypeError("FigureIntent kind must be PlotKind")
+        object.__setattr__(self, "title", str(self.title))
+        object.__setattr__(self, "value_label", str(self.value_label))
+        if not isinstance(self.rolling_distribution, bool):
+            raise TypeError("rolling_distribution must be bool")
+        _validate_figure_view(self.kind, self.view)
+        if self.rolling_distribution and self.kind is not PlotKind.ROLLING:
+            raise ValueError("side distribution belongs only to rolling Figures")
+
+    @property
+    def view_intent(self) -> ViewIntent | None:
+        return _validate_figure_view(self.kind, self.view)
+
+    @property
+    def faceted(self) -> bool:
+        return self.kind is PlotKind.GRID
+
+    @property
+    def rolling_trace(self) -> bool:
+        return self.kind is PlotKind.ROLLING
+
+
+def figure_intent_from_view(
+    view: ViewSpec,
+    *,
+    title: str,
+    value_label: str,
+) -> FigureIntent:
+    """Build the one typed Figure intent for an already-resolved Dataset view."""
+
+    if not isinstance(view, ViewSpec):
+        raise TypeError("resolved Figure view must be ViewSpec")
+    faceted = any(
+        binding.role is AxisViewRole.FACET for binding in view.source_bindings
+    )
+    kind = (
+        PlotKind.GRID
+        if faceted
+        else {
+            ViewIntent.IMAGE: PlotKind.IMAGE,
+            ViewIntent.CURVE: PlotKind.CURVE,
+            ViewIntent.HISTOGRAM: PlotKind.HISTOGRAM,
+            ViewIntent.METER: PlotKind.METER,
+        }[view.intent]
+    )
+    return FigureIntent(kind, title, value_label, view=view)
+
+
 @dataclass(frozen=True, slots=True)
 class PlotPanelContract:
-    """One complete static presentation contract for a plot surface.
+    """One Figure intent bound to a panel identity and raster surface.
 
     ``pixel_size`` is derived from the named frontend size and DPR.  It is not
     a QWidget measurement and therefore cannot drift between a live card,
@@ -66,43 +162,22 @@ class PlotPanelContract:
     """
 
     panel_id: str
-    kind: str
-    title: str
-    value_label: str
+    figure: FigureIntent
     size_name: str = DEFAULT_PANEL_SIZE
     pixel_ratio: float = 1.0
-    view: ViewSpec | None = None
-    rolling_distribution: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "panel_id", canonical_text(self.panel_id, "panel_id"))
-        kind = canonical_text(self.kind, "plot kind")
-        if kind not in PLOT_KIND_SPEC_BY_KEY:
-            raise ValueError(f"unknown plot kind {kind!r}")
-        if kind == "pulse":
+        if not isinstance(self.figure, FigureIntent):
+            raise TypeError("plot panel contract requires FigureIntent")
+        if self.figure.kind is PlotKind.PULSE:
             raise ValueError("pulse documents use their dedicated Figure contract")
-        object.__setattr__(self, "kind", kind)
-        object.__setattr__(self, "title", str(self.title))
-        object.__setattr__(self, "value_label", str(self.value_label))
         geometry = panel_surface_geometry(
             self.size_name,
             pixel_ratio=self.pixel_ratio,
         )
         object.__setattr__(self, "size_name", geometry.size_name)
         object.__setattr__(self, "pixel_ratio", geometry.pixel_ratio)
-        if self.view is not None and not isinstance(self.view, ViewSpec):
-            raise TypeError("plot panel view must be ViewSpec or None")
-        plot_panel_intent(kind, self.view)
-        if bool(self.rolling_distribution) and kind != "monitor":
-            raise ValueError("side distribution belongs only to rolling monitor panels")
-
-    @property
-    def intent(self) -> ViewIntent | None:
-        return plot_panel_intent(self.kind, self.view)
-
-    @property
-    def faceted(self) -> bool:
-        return self.kind == "grid"
 
     @property
     def surface_geometry(self) -> PanelSurfaceGeometry:
@@ -124,36 +199,33 @@ class PlotPanelContract:
         """Facts whose change requires another worker-owned Agg session."""
 
         return (
-            self.kind,
-            self.title,
-            self.value_label,
+            self.figure,
             self.size_name,
             self.pixel_size,
             self.pixel_ratio,
-            self.view,
-            bool(self.rolling_distribution),
         )
 
 
 def plot_panel_input(
-    kind: str,
+    kind: PlotKind,
     snapshot: OwnedSnapshot,
     presentation: object | None = None,
 ) -> FigureSource:
     """Bind one immutable source under the plot kind's input contract."""
 
-    key = canonical_text(kind, "plot kind")
+    if not isinstance(kind, PlotKind):
+        raise TypeError("plot panel kind must be PlotKind")
     if not isinstance(snapshot, OwnedSnapshot):
         raise TypeError("plot panel input requires OwnedSnapshot")
-    validate_plot_panel_schema(key, snapshot.block.schema)
-    if key == "sites":
+    validate_plot_panel_schema(kind, snapshot.block.schema)
+    if kind is PlotKind.SITE_MAP:
         if not isinstance(presentation, SiteMapPresentation):
             raise TypeError("SiteMap plot requires SiteMapPresentation")
         return FigureSource(snapshot, presentation)
     return FigureSource(snapshot)
 
 
-def validate_plot_panel_schema(kind: str, schema: DatasetSchema) -> None:
+def validate_plot_panel_schema(kind: PlotKind, schema: DatasetSchema) -> None:
     """Validate source semantics that distinguish otherwise similar views.
 
     A Meter reads one scalar projection from the supplied dataset.  A rolling
@@ -162,12 +234,11 @@ def validate_plot_panel_schema(kind: str, schema: DatasetSchema) -> None:
     never turns successive unrelated snapshots into a hidden GUI-side buffer.
     """
 
-    key = canonical_text(kind, "plot kind")
-    if key not in PLOT_KIND_SPEC_BY_KEY:
-        raise ValueError(f"unknown plot kind {key!r}")
+    if not isinstance(kind, PlotKind):
+        raise TypeError("plot panel kind must be PlotKind")
     if not isinstance(schema, DatasetSchema):
         raise TypeError("plot panel schema must be DatasetSchema")
-    if key != "monitor":
+    if kind is not PlotKind.ROLLING:
         return
     history_columns = tuple(
         column
@@ -275,32 +346,8 @@ class PlotPanelComposeResult:
             raise ValueError("faceted result and Figure owner disagree")
 
 
-def plot_panel_intent(kind: str, view: ViewSpec | None = None) -> ViewIntent | None:
-    """Resolve one plot kind to its frontend-owned typed view intent."""
-
-    key = canonical_text(kind, "plot kind")
-    if key == "sites":
-        if view is not None:
-            raise ValueError("SiteMap panels do not accept ViewSpec")
-        return None
-    if key == "grid":
-        if not isinstance(view, ViewSpec) or view.intent not in GRID_INTENTS:
-            raise ValueError("grid plot requires an explicit faceted ViewSpec")
-        from .figure import grid_facet_source
-
-        grid_facet_source(view)
-        return view.intent
-    try:
-        intent = panel_view_intents()[key]
-    except KeyError as error:
-        raise ValueError(f"plot kind {key!r} has no dataset view intent") from error
-    if view is not None and view.intent is not intent:
-        raise ValueError("plot kind and ViewSpec intent disagree")
-    return intent
-
-
 def plot_panel_view_from_params(
-    kind: str,
+    kind: PlotKind,
     params: Mapping[str, object],
 ) -> ViewSpec | None:
     """Decode the sole persisted ViewSpec under Plot Panel policy."""
@@ -310,21 +357,19 @@ def plot_panel_view_from_params(
     raw = params.get(VIEW_SPEC_PARAM)
     if raw is None:
         return None
-    key = canonical_text(kind, "plot kind")
-    if key == "sites":
+    if not isinstance(kind, PlotKind):
+        raise TypeError("plot panel kind must be PlotKind")
+    if kind is PlotKind.SITE_MAP:
         raise ValueError("SiteMap panels cannot persist a generic ViewSpec")
     from .figure import view_spec_from_tree
 
     view = view_spec_from_tree(raw)
-    if key == "grid":
-        plot_panel_intent(key, view)
-    else:
-        plot_panel_intent(key, view)
+    _validate_figure_view(kind, view)
     return view
 
 
 def plot_panel_view_for_schema(
-    kind: str,
+    kind: PlotKind,
     params: Mapping[str, object],
     schema,
     *,
@@ -335,7 +380,7 @@ def plot_panel_view_for_schema(
     view = plot_panel_view_from_params(kind, params)
     if view is not None and view.schema_fingerprint != schema.fingerprint:
         view = None
-    if view is None and str(kind) == "grid" and bool(default_grid):
+    if view is None and kind is PlotKind.GRID and bool(default_grid):
         from .figure import suggest_default_grid_view
 
         view = suggest_default_grid_view(schema).spec
@@ -361,242 +406,13 @@ def plot_panel_value_label(
     return key.rsplit("/", 1)[-1].strip() or "Signal"
 
 
-def _repeat_mode_from_view(view: ViewSpec, schema):
-    """Return the authored repeat source binding itself."""
-
-    from zlc_data import AxisSourceRef
-
-    return view.binding(AxisSourceRef.tensor(schema.repeat_axis.axis_id))
-
-
-def _view_preferences(
-    view: ViewSpec,
-    schema,
-    *,
-    repeat_binding=None,
-    facet_sources=None,
-):
-    """Re-author view preferences without treating a ViewSpec as authority."""
-
-    from .figure import AxisViewRole, ViewPreferences
-
-    by_role = {
-        role: tuple(
-            binding.source
-            for binding in view.source_bindings
-            if binding.role is role
-        )
-        for role in (
-            AxisViewRole.X,
-            AxisViewRole.IMAGE_X,
-            AxisViewRole.IMAGE_Y,
-            AxisViewRole.BATCH,
-            AxisViewRole.FACET,
-            AxisViewRole.SAMPLE,
-        )
-    }
-    from zlc_data import AxisSourceRef
-
-    repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
-    facets = (
-        tuple(facet_sources)
-        if facet_sources is not None
-        else tuple(
-            source
-            for source in by_role[AxisViewRole.FACET]
-            if source != repeat_source
-        )
-    )
-    return ViewPreferences(
-        repeat_binding=(
-            repeat_binding
-            if repeat_binding is not None
-            else _repeat_mode_from_view(view, schema)
-        ),
-        x_source=next(iter(by_role[AxisViewRole.X]), None),
-        image_x_source=next(iter(by_role[AxisViewRole.IMAGE_X]), None),
-        image_y_source=next(iter(by_role[AxisViewRole.IMAGE_Y]), None),
-        batch_sources=tuple(
-            source
-            for source in by_role[AxisViewRole.BATCH]
-            if source != repeat_source
-        ),
-        facet_sources=facets,
-        sample_sources=tuple(
-            source
-            for source in by_role[AxisViewRole.SAMPLE]
-            if source != repeat_source
-        ),
-    )
-
-
-def _repeat_binding_candidates(schema):
-    from zlc_data import AxisSourceRef
-    from .figure import (
-        AxisViewRole,
-        DisplayReduction,
-        DisplayReductionMethod,
-        LatestNonempty,
-        SourceViewBinding,
-    )
-
-    source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
-    return (
-        SourceViewBinding(
-            source,
-            AxisViewRole.REDUCED,
-            reduction=DisplayReduction(DisplayReductionMethod.MEAN),
-        ),
-        SourceViewBinding(
-            source,
-            AxisViewRole.REDUCED,
-            reduction=DisplayReduction(DisplayReductionMethod.SUM),
-        ),
-        SourceViewBinding(source, AxisViewRole.SELECTED, selector=LatestNonempty()),
-        SourceViewBinding(source, AxisViewRole.BATCH),
-        SourceViewBinding(source, AxisViewRole.SAMPLE),
-        SourceViewBinding(source, AxisViewRole.FACET),
-    )
-
-
-def _view_with_repeat_binding(kind, schema, intent, current_view, repeat_binding):
-    from .figure import (
-        ViewPreferences,
-        grid_facet_source,
-        resolve_grid_view,
-        suggest_view,
-    )
-
-    if str(kind) == "grid":
-        if current_view is None:
-            raise ValueError("Grid repeat policy needs a committed facet view")
-        return resolve_grid_view(
-            schema,
-            intent,
-            grid_facet_source(current_view),
-            current_view=current_view,
-            repeat_binding=repeat_binding,
-        )
-    preferences = (
-        _view_preferences(current_view, schema, repeat_binding=repeat_binding)
-        if current_view is not None
-        else ViewPreferences(repeat_binding=repeat_binding)
-    )
-    return suggest_view(
-        schema,
-        intent,
-        None if current_view is None else current_view.point_ordinals,
-        preferences=preferences,
-    )
-
-
-def plot_panel_repeat_modes(
-    kind: str,
-    schema,
-    intent: ViewIntent,
-    current_view: ViewSpec | None,
-):
-    """Return repeat policies renderable by this exact panel host."""
-
-    if str(kind) == "sites":
-        return ()
-    candidates = _repeat_binding_candidates(schema)
-    probe_view = current_view
-    if str(kind) == "grid" and probe_view is None:
-        from .figure import grid_facet_sources, resolve_grid_view
-
-        for source in grid_facet_sources(schema, intent):
-            suggestion = resolve_grid_view(schema, intent, source)
-            if suggestion.spec is not None:
-                probe_view = suggestion.spec
-                break
-        if probe_view is None:
-            return ()
-    if str(kind) == "grid" and current_view is not None:
-        from zlc_data import AxisSourceRef
-        from .figure import AxisViewRole, grid_facet_source
-
-        repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
-        if grid_facet_source(current_view) == repeat_source:
-            return tuple(
-                binding
-                for binding in candidates
-                if binding.role is AxisViewRole.FACET
-            )
-    return tuple(
-        binding
-        for binding in candidates
-        if _view_with_repeat_binding(
-            kind,
-            schema,
-            intent,
-            probe_view,
-            binding,
-        ).spec
-        is not None
-    )
-
-
-def plot_panel_selected_repeat_mode(
-    schema,
-    intent: ViewIntent,
-    current_view: ViewSpec | None,
-    presented_view: ViewSpec | None = None,
-):
-    """Resolve the control selection from authored or visible Figure state."""
-
-    from .figure import suggest_view
-
-    view = current_view
-    if (
-        view is None
-        and presented_view is not None
-        and presented_view.schema_fingerprint == schema.fingerprint
-    ):
-        view = presented_view
-    if view is not None:
-        return _repeat_mode_from_view(view, schema)
-    suggestion = suggest_view(schema, intent)
-    if suggestion.spec is None:
-        raise ValueError("schema does not determine a default repeat presentation")
-    return _repeat_mode_from_view(suggestion.spec, schema)
-
-
-def plot_panel_view_with_repeat_mode(
-    kind: str,
-    schema,
-    intent: ViewIntent,
-    current_view: ViewSpec | None,
-    repeat_mode,
-):
-    """Re-resolve a panel view after one explicit repeat-policy edit."""
-
-    if repeat_mode not in plot_panel_repeat_modes(
-        kind,
-        schema,
-        intent,
-        current_view,
-    ):
-        raise ValueError(
-            "repeat binding is not renderable by this panel"
-        )
-    return _view_with_repeat_binding(
-        kind,
-        schema,
-        intent,
-        current_view,
-        repeat_mode,
-    )
-
-
 def plot_panel_display_state(
     contract: PlotPanelContract,
     params: Mapping[str, object],
     *,
     revision: int,
-    x_view=None,
-    y_view=None,
     focus=None,
+    home_view: bool = False,
 ) -> PlotDisplayState:
     """Resolve authored panel parameters into the renderer's sole state type."""
 
@@ -604,60 +420,26 @@ def plot_panel_display_state(
         raise TypeError("contract must be PlotPanelContract")
     if not isinstance(params, Mapping):
         raise TypeError("params must be a mapping")
-    mode = RelimMode(str(params.get("relim", RelimMode.TIGHT.value)))
-    fixed = None
-    if mode is RelimMode.FIXED:
-        fixed = (float(params.get("fixed_lo", 0.0)), float(params.get("fixed_hi", 1.0)))
-    intent = contract.intent
-    if intent is ViewIntent.CURVE:
-        return CurveDisplayState(
-            revision=revision,
-            relim_mode=mode,
-            fixed_y_limits=fixed,
-            x_view=x_view,
-        )
-    if intent is ViewIntent.HISTOGRAM:
-        param_kind = "hist" if contract.faceted else contract.kind
-        count_scale = resolved_panel_param(param_kind, params, "count_scale")
-        if not isinstance(count_scale, HistogramCountScale):
-            raise TypeError("histogram count_scale lost its typed value")
-        display = HistogramDisplayState(
-            revision=revision,
-            relim_mode=mode,
-            count_scale=count_scale,
-            bin_count=int(resolved_panel_param(param_kind, params, "bin_count")),
-            fixed_count_limits=fixed,
-            x_view=x_view,
-            thresholds=(
-                ()
-                if contract.faceted
-                else tuple(params.get(HISTOGRAM_THRESHOLDS_PARAM, ()))
-            ),
-        )
-        if not contract.faceted:
-            return display
-        raw = params.get(HISTOGRAM_CELL_THRESHOLDS_PARAM)
-        return FacetedHistogramDisplayState(
-            display,
-            () if raw is None else histogram_cell_thresholds_from_tree(raw),
-        )
-    if intent is ViewIntent.METER:
-        return MeterDisplayState(
-            0 if focus is None else int(focus.panel_index),
-            None if focus is None else focus.address,
-            revision,
-        )
-    param_kind = "2d" if contract.faceted else contract.kind
-    colormap = resolved_panel_param(param_kind, params, "colormap")
-    if not isinstance(colormap, ImageColormap):
-        raise TypeError("image colormap lost its typed value")
-    return ImageDisplayState(
+    figure = contract.figure
+    intent = figure.view_intent
+    raw_cell_thresholds = params.get(HISTOGRAM_CELL_THRESHOLDS_PARAM)
+    return panel_display_state_from_params(
+        figure.kind,
+        params,
         revision=revision,
-        relim_mode=mode,
-        colormap=colormap,
-        fixed_color_limits=fixed,
-        x_view=x_view,
-        y_view=y_view,
+        cell_intent=intent if figure.faceted else None,
+        focus=focus,
+        thresholds=(
+            ()
+            if figure.faceted
+            else tuple(params.get(HISTOGRAM_THRESHOLDS_PARAM, ()))
+        ),
+        cell_thresholds=(
+            ()
+            if raw_cell_thresholds is None
+            else histogram_cell_thresholds_from_tree(raw_cell_thresholds)
+        ),
+        home_view=home_view,
     )
 
 
@@ -674,7 +456,8 @@ class PlotPanelSession:
         if not isinstance(request, PlotPanelComposeRequest):
             raise TypeError("request must be PlotPanelComposeRequest")
         contract = self.contract
-        if contract.kind == "sites":
+        figure = contract.figure
+        if figure.kind is PlotKind.SITE_MAP:
             if request.source.site_map is None:
                 raise ValueError("SiteMap plot requires one joined SiteMapPresentation")
             if not isinstance(request.display, ImageDisplayState):
@@ -687,8 +470,8 @@ class PlotPanelSession:
                 self._composer = SiteMapComposer(
                     contract.panel_id,
                     surface_geometry=contract.surface_geometry,
-                    title=contract.title,
-                    value_label=contract.value_label,
+                    title=figure.title,
+                    value_label=figure.value_label,
                 )
             frame = self._composer.compose(
                 request.source.site_map,
@@ -698,23 +481,23 @@ class PlotPanelSession:
 
         if request.source.site_map is not None:
             raise ValueError("ordinary dataset plot cannot carry SiteMapPresentation")
-        if not contract.faceted and request.focus is not None:
+        if not figure.faceted and request.focus is not None:
             raise ValueError("ordinary plot panels do not accept facet focus")
         if self._composer is None:
             from .panel_render import PanelComposer
 
             self._composer = PanelComposer(
                 contract.panel_id,
-                intent=contract.intent,
+                intent=figure.view_intent,
                 size_name=contract.size_name,
                 pixel_ratio=contract.pixel_ratio,
-                label=contract.title,
-                value_label=contract.value_label,
-                view=contract.view,
-                rolling_trace=contract.kind == "monitor",
-                rolling_distribution=contract.rolling_distribution,
+                label=figure.title,
+                value_label=figure.value_label,
+                view=figure.view,
+                rolling_trace=figure.rolling_trace,
+                rolling_distribution=figure.rolling_distribution,
             )
-        if contract.faceted:
+        if figure.faceted:
             result = self._composer.compose_faceted(
                 request.source.snapshot,
                 display=request.display,
@@ -758,7 +541,8 @@ class PlotPanelSession:
         if not isinstance(request, PlotPanelComposeRequest):
             raise TypeError("request must be PlotPanelComposeRequest")
         contract = self.contract
-        if contract.faceted or contract.kind == "sites":
+        intent = contract.figure
+        if intent.faceted or intent.kind is PlotKind.SITE_MAP:
             raise ValueError(
                 "already-evaluated single-panel composition rejects grid/SiteMap"
             )
@@ -771,12 +555,12 @@ class PlotPanelSession:
 
             self._composer = PanelComposer(
                 contract.panel_id,
-                intent=contract.intent,
+                intent=intent.view_intent,
                 size_name=contract.size_name,
                 pixel_ratio=contract.pixel_ratio,
-                label=contract.title,
-                value_label=contract.value_label,
-                view=contract.view,
+                label=intent.title,
+                value_label=intent.value_label,
+                view=intent.view,
             )
         frame, visible = self._composer.compose_data_figure(
             figure,
@@ -805,7 +589,8 @@ class PlotPanelSession:
         if not isinstance(request, PlotPanelComposeRequest):
             raise TypeError("request must be PlotPanelComposeRequest")
         contract = self.contract
-        if not contract.faceted:
+        intent = contract.figure
+        if not intent.faceted:
             raise ValueError("already-evaluated grid composition requires grid kind")
         if request.focus is not None:
             raise ValueError("already-evaluated grid composition is overview-only")
@@ -824,12 +609,12 @@ class PlotPanelSession:
 
             self._composer = PanelComposer(
                 contract.panel_id,
-                intent=contract.intent,
+                intent=intent.view_intent,
                 size_name=contract.size_name,
                 pixel_ratio=contract.pixel_ratio,
-                label=contract.title,
-                value_label=contract.value_label,
-                view=contract.view,
+                label=intent.title,
+                value_label=intent.value_label,
+                view=intent.view,
             )
         result = self._composer.compose_data_figure_faceted(
             figure,
@@ -847,18 +632,16 @@ class PlotPanelSession:
 
 
 __all__ = [
+    "FigureIntent",
     "PlotDisplayState",
     "PlotPanelComposeRequest",
     "PlotPanelComposeResult",
     "PlotPanelContract",
     "PlotPanelSession",
+    "figure_intent_from_view",
     "plot_panel_display_state",
-    "plot_panel_intent",
     "plot_panel_input",
-    "plot_panel_repeat_modes",
-    "plot_panel_selected_repeat_mode",
     "plot_panel_value_label",
     "plot_panel_view_for_schema",
     "plot_panel_view_from_params",
-    "plot_panel_view_with_repeat_mode",
 ]

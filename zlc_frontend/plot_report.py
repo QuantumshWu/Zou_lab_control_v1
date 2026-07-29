@@ -13,11 +13,14 @@ from .encoded_raster import (
     encode_raster_buffer_png,
 )
 from .plot_panel import (
+    FigureIntent,
     PlotPanelComposeRequest,
     PlotPanelContract,
     PlotPanelSession,
     PlotDisplayState,
+    plot_panel_display_state,
 )
+from .plot_kind import PlotKind
 from .figure_source import FigureSource
 from .panel_render import PanelProvenance
 from .plot_layout import (
@@ -33,7 +36,6 @@ class PlotReportPage:
     """One typed report page before backend rendering."""
 
     key: str
-    title: str
     contract: PlotPanelContract
     source: FigureSource
     display: PlotDisplayState
@@ -41,11 +43,6 @@ class PlotReportPage:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "key", canonical_text(self.key, "report page key"))
-        object.__setattr__(
-            self,
-            "title",
-            canonical_text(self.title, "report page title"),
-        )
         if not isinstance(self.contract, PlotPanelContract):
             raise TypeError("report page contract must be PlotPanelContract")
         if not isinstance(self.source, FigureSource):
@@ -77,45 +74,36 @@ class PlotReportDocument:
 
 def plot_report_page(
     key: str,
-    title: str,
     *,
-    kind: str,
+    figure: FigureIntent,
     source: FigureSource,
-    display: PlotDisplayState,
+    display: PlotDisplayState | None = None,
     provenance: PanelProvenance,
-    value_label: str,
-    view=None,
 ) -> PlotReportPage:
     """Create one report page using the frontend's single report surface."""
 
     key = canonical_text(key, "report page key")
-    title = canonical_text(title, "report page title")
     # Ordinary pages use the product's stock 2x2 surface.  A Grid uses the
     # exact same schema/view topology policy as an interactive Grid; export
     # resolution remains a separate terminal-render concern below.
     size_name = DEFAULT_PANEL_SIZE
-    if str(kind) == "grid":
-        if view is None:
+    if not isinstance(figure, FigureIntent):
+        raise TypeError("report page figure must be FigureIntent")
+    if figure.kind is PlotKind.GRID:
+        if figure.view is None:
             raise ValueError("Grid report page requires a resolved ViewSpec")
         size_name = optimal_grid_size_for_view(
             source.snapshot.block.schema,
-            view,
+            figure.view,
         )
-    return PlotReportPage(
-        key,
-        title,
-        PlotPanelContract(
-            f"report-{key}",
-            kind,
-            title,
-            str(value_label),
-            size_name=size_name,
-            view=view,
-        ),
-        source,
-        display,
-        provenance,
+    contract = PlotPanelContract(
+        f"report-{key}",
+        figure,
+        size_name=size_name,
     )
+    if display is None:
+        display = plot_panel_display_state(contract, {}, revision=0)
+    return PlotReportPage(key, contract, source, display, provenance)
 
 
 def _one_panel_png(frame) -> bytes:
@@ -179,7 +167,9 @@ def render_plot_report(
                 payload = encode_raster_buffer_png(faceted.overview.raster)
         finally:
             session.close()
-        encoded.append(EncodedRasterPage(page.key, page.title, payload))
+        encoded.append(
+            EncodedRasterPage(page.key, page.contract.figure.title, payload)
+        )
     if checkpoint is not None:
         checkpoint()
     return EncodedRasterDocument(document.summary, tuple(encoded))

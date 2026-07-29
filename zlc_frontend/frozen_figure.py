@@ -13,12 +13,17 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from zlc_data import (
+    MONITOR_HISTORY,
+    SCAN_POINT,
+    SPATIAL_X,
+    SPATIAL_Y,
+    SPECTRAL,
     DatasetRevisionRef,
     DatasetSchema,
     FitResultBatch,
     OwnedSnapshot,
-    validate_fit_result_source_binding,
 )
+from zlc_data.fit import validate_fit_result_source_binding
 
 from .data_figure import DataFigure
 from .figure import (
@@ -34,7 +39,7 @@ from .figure import (
     suggest_fit_view,
     suggest_view,
 )
-from .panel_policy import automatic_figure_intent
+from .plot_panel import FigureIntent, figure_intent_from_view
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,19 +78,36 @@ class FrozenFigureSource:
             )
 
 
-def build_frozen_figure_document(
+def _default_view_intent(schema: DatasetSchema) -> ViewIntent:
+    """Choose one ordinary Figure family from declared roles only."""
+
+    point_roles = tuple(column.role for column in schema.point_table.columns)
+    data_roles = tuple(axis.role for axis in schema.cell_schema.data_axes)
+    roles = (*point_roles, *data_roles)
+    if roles.count(SPATIAL_X) == 1 and roles.count(SPATIAL_Y) == 1:
+        return ViewIntent.IMAGE
+    if any(
+        role in {SCAN_POINT, SPECTRAL, MONITOR_HISTORY}
+        for role in roles
+    ):
+        return ViewIntent.CURVE
+    return ViewIntent.HISTOGRAM
+
+
+def resolve_frozen_figure_intent(
     source: FrozenFigureSource,
     *,
     intent: ViewIntent | None = None,
     point_ordinals: tuple[int, ...] | None = None,
     preferences: ViewPreferences | None = None,
-    document_id: str | None = None,
-) -> FigureDocument:
-    """Create the sole one-Dataset FigureDocument suggestion path.
+    title: str | None = None,
+    value_label: str | None = None,
+) -> FigureIntent:
+    """Resolve public authoring choices once into the canonical Figure intent.
 
     Automatic choices are frontend policy derived from the declared schema.
-    Ambiguous axes remain an explicit error; this function never guesses from
-    rank or silently reduces an informative data axis.
+    Ambiguous axes remain explicit; no renderer is allowed to repeat this
+    decision from rank, singleton lengths, or data values.
     """
 
     if not isinstance(source, FrozenFigureSource):
@@ -98,11 +120,7 @@ def build_frozen_figure_document(
         raise TypeError("preferences must be ViewPreferences or None")
 
     if source.fit_result is None:
-        resolved_intent = (
-            automatic_figure_intent(source.schema)
-            if intent is None
-            else intent
-        )
+        resolved_intent = _default_view_intent(source.schema) if intent is None else intent
         suggestion = suggest_view(
             source.schema,
             resolved_intent,
@@ -130,6 +148,28 @@ def build_frozen_figure_document(
         details = "; ".join(reason.message for reason in suggestion.reasons)
         raise ValueError(f"figure view needs explicit input: {details}")
 
+    return figure_intent_from_view(
+        suggestion.spec,
+        title=source.label if title is None else title,
+        value_label=source.label if value_label is None else value_label,
+    )
+
+
+def build_frozen_figure_document(
+    source: FrozenFigureSource,
+    figure: FigureIntent,
+    *,
+    document_id: str | None = None,
+) -> FigureDocument:
+    """Create one FigureDocument from an already-resolved Figure intent."""
+
+    if not isinstance(source, FrozenFigureSource):
+        raise TypeError("source must be FrozenFigureSource")
+    if not isinstance(figure, FigureIntent) or figure.view is None:
+        raise TypeError("frozen Dataset Figure requires a resolved FigureIntent")
+    if figure.view.schema_fingerprint != source.schema.fingerprint:
+        raise ValueError("FigureIntent view belongs to another Dataset schema")
+
     dataset_id = DatasetId("source")
     resolved_document_id = (
         f"figure-{uuid4().hex}" if document_id is None else document_id
@@ -144,16 +184,14 @@ def build_frozen_figure_document(
                 source.schema.fingerprint,
             ),
         ),
-        layers=(FigureLayer("data", dataset_id, suggestion.spec),),
+        layers=(FigureLayer("data", dataset_id, figure.view),),
     )
 
 
 def build_frozen_data_figure(
     source: FrozenFigureSource,
+    figure: FigureIntent,
     *,
-    intent: ViewIntent | None = None,
-    point_ordinals: tuple[int, ...] | None = None,
-    preferences: ViewPreferences | None = None,
     document_id: str | None = None,
 ) -> DataFigure:
     """Evaluate one exact frozen source without resolving an artifact owner."""
@@ -164,9 +202,7 @@ def build_frozen_data_figure(
         raise ValueError("a DataFigure requires the exact source snapshot")
     document = build_frozen_figure_document(
         source,
-        intent=intent,
-        point_ordinals=point_ordinals,
-        preferences=preferences,
+        figure,
         document_id=document_id,
     )
     dataset_id = document.datasets[0].dataset_id
@@ -185,4 +221,5 @@ __all__ = [
     "FrozenFigureSource",
     "build_frozen_data_figure",
     "build_frozen_figure_document",
+    "resolve_frozen_figure_intent",
 ]

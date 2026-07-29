@@ -4,43 +4,46 @@ from __future__ import annotations
 
 import numpy as np
 
-from zlc_data import (
+from zlc_data.axis import (
     REPEAT,
     SCALAR_AXIS,
     SITE,
     AxisId,
+    AxisSourceRef,
     AxisSpec,
+)
+from zlc_data.fit_contract import FitBatchStatus
+from zlc_data.schema import DatasetSchema, PointTable, ValueSchema
+from zlc_data.validity import DatasetComponentValidity, VALID, ValidityContract
+from zlc_data.value import (
     BlockId,
     DataBlock,
     DatasetRevision,
     DatasetRevisionRef,
-    DatasetSchema,
-    FitBatchStatus,
     OwnedSnapshot,
-    PointLayout,
     StreamGenerationId,
-    VALID,
-    ValidityContract,
-    ValueSchema,
 )
-from zlc_frontend import DataFigure
-from zlc_frontend._mpl_document import FacetedPanelAggRenderer
+from zlc_frontend.data_figure import DataFigure
+from zlc_frontend.data_figure_render import (
+    render_data_figure_front,
+    render_data_figure_grid_overview,
+)
 from zlc_frontend._mpl_histogram import _update_histogram_presentation
-from zlc_frontend.figure import (
-    AxisViewBinding,
+from zlc_frontend.figure.evaluate import ResolvedDataset, ResolvedDatasetMap
+from zlc_frontend.figure.model import (
     AxisViewRole,
     DatasetDescriptor,
     DatasetId,
     FigureDocument,
     FigureLayer,
     FixedIndex,
-    ResolvedDataset,
-    ResolvedDatasetMap,
+    SourceViewBinding,
     ViewIntent,
     ViewSpec,
 )
 from zlc_frontend.histogram_display import HistogramDisplayState
-from zlc_frontend.matplotlib_render import SinglePanelAggRenderer
+from zlc_frontend.plot_kind import PlotKind
+from zlc_frontend.plot_panel import FigureIntent, PlotPanelContract
 from zlc_frontend.render import HistogramFitOverlay, HistogramPanelPayload
 from zlc_frontend.render_style import PALETTE, render_style_context
 
@@ -184,8 +187,8 @@ def _distribution_panel() -> DataFigure:
     values[210:, 0, 0] = rng.normal(2.1, 0.60, 210)
     schema = DatasetSchema(
         repeat,
-        (),
-        PointLayout.rect_c(()),
+        PointTable(1),
+        None,
         ValueSchema.scalar(values.dtype, "count"),
     )
     block = DataBlock(
@@ -208,9 +211,12 @@ def _distribution_panel() -> DataFigure:
                     schema.fingerprint,
                     ViewIntent.HISTOGRAM,
                     (
-                        AxisViewBinding(repeat.axis_id, AxisViewRole.SAMPLE),
-                        AxisViewBinding(
-                            SCALAR_AXIS.axis_id,
+                        SourceViewBinding(
+                            AxisSourceRef.tensor(repeat.axis_id),
+                            AxisViewRole.SAMPLE,
+                        ),
+                        SourceViewBinding(
+                            AxisSourceRef.tensor(SCALAR_AXIS.axis_id),
                             AxisViewRole.SELECTED,
                             selector=FixedIndex(0),
                         ),
@@ -232,21 +238,29 @@ def _distribution_panel() -> DataFigure:
 def test_automatic_cut_is_drawn_only_and_publishes_no_formal_fit() -> None:
     data_figure = _distribution_panel()
     display = HistogramDisplayState()
-    renderer = SinglePanelAggRenderer(data_figure.document, width=420, height=280)
-    try:
-        _raster, payload = renderer.render_interactive_histogram(
-            data_figure.evaluated,
-            display,
-            current_count_limits=None,
-            previous_relim_mode=None,
-            previous_count_scale=None,
-        )
-        assert isinstance(payload, HistogramPanelPayload)
-        assert payload.fit_overlays == ()
-        assert len(payload.thresholds) == 1
-        assert display.thresholds == ()
-    finally:
-        renderer.close()
+    view = data_figure.document.layers[0].view
+    contract = PlotPanelContract(
+        "distribution-panel",
+        FigureIntent(
+            PlotKind.HISTOGRAM,
+            "Distribution",
+            "Counts",
+            view=view,
+        ),
+    )
+
+    rendered = render_data_figure_front(
+        data_figure,
+        display,
+        contract=contract,
+        sequence=1,
+    )
+    assert rendered.frame is not None
+    payload = rendered.frame.panels[0].display_payload
+    assert isinstance(payload, HistogramPanelPayload)
+    assert payload.fit_overlays == ()
+    assert len(payload.thresholds) == 1
+    assert display.thresholds == ()
 
 
 def _distribution_grid() -> DataFigure:
@@ -259,8 +273,8 @@ def _distribution_grid() -> DataFigure:
         values[210:, 0, index] = rng.normal(2.1 + shift, 0.60, 210)
     schema = DatasetSchema(
         repeat,
-        (),
-        PointLayout.rect_c(()),
+        PointTable(1),
+        None,
         ValueSchema(
             (site,),
             ValidityContract.components(site.axis_id),
@@ -272,28 +286,32 @@ def _distribution_grid() -> DataFigure:
         BlockId("distribution-grid"),
         DatasetRevision(1),
         values,
-        VALID,
+        DatasetComponentValidity(
+            (site.axis_id,),
+            np.ones(values.shape, dtype=np.bool_),
+        ),
         schema,
     )
     dataset_id = DatasetId("distribution-grid")
+    view = ViewSpec(
+        schema.fingerprint,
+        ViewIntent.HISTOGRAM,
+        (
+            SourceViewBinding(
+                AxisSourceRef.tensor(repeat.axis_id),
+                AxisViewRole.SAMPLE,
+            ),
+            SourceViewBinding(
+                AxisSourceRef.tensor(site.axis_id),
+                AxisViewRole.FACET,
+            ),
+        ),
+    )
     document = FigureDocument(
         "distribution-grid-document",
         1,
         (DatasetDescriptor(dataset_id, "Distribution", schema.fingerprint),),
-        (
-            FigureLayer(
-                "distribution-grid-layer",
-                dataset_id,
-                ViewSpec(
-                    schema.fingerprint,
-                    ViewIntent.HISTOGRAM,
-                    (
-                        AxisViewBinding(repeat.axis_id, AxisViewRole.SAMPLE),
-                        AxisViewBinding(site.axis_id, AxisViewRole.FACET),
-                    ),
-                ),
-            ),
-        ),
+        (FigureLayer("distribution-grid-layer", dataset_id, view),),
     )
     snapshot = OwnedSnapshot(
         block.ref(StreamGenerationId("distribution-grid-generation")),
@@ -305,33 +323,49 @@ def _distribution_grid() -> DataFigure:
     )
 
 
-def test_distribution_grid_reuses_the_same_automatic_analysis_renderer() -> None:
-    data_figure = _distribution_grid()
-    renderer = FacetedPanelAggRenderer(
+def test_distribution_grid_reuses_the_same_automatic_analysis_path() -> None:
+    figure = _distribution_grid()
+    grid_contract = PlotPanelContract(
+        "distribution-grid",
+        FigureIntent(
+            PlotKind.GRID,
+            "Distribution",
+            "Counts",
+            view=figure.document.layers[0].view,
+        ),
         size_name="2x2",
-        width=420,
-        height=280,
-        dpi=100.0,
-        title="Distribution",
-        value_label="Counts",
     )
-    try:
-        raster, regions = renderer.render(
-            data_figure.document,
-            data_figure.evaluated,
-            {},
-            display_state=HistogramDisplayState(),
+    overview = render_data_figure_grid_overview(
+        figure,
+        contract=grid_contract,
+        display_state=HistogramDisplayState(),
+    )
+    assert len(overview.regions) == 2
+    for index, region in enumerate(overview.regions):
+        focused = overview.figure.focused_typed_panel(
+            index,
+            expected_address=region.focus_address,
+            expected_intent=ViewIntent.HISTOGRAM,
         )
-        assert raster.pixels
-        assert len(regions) == 2
-        assert len(renderer._cells) == 2
-        for cell in renderer._cells:
-            assert len(cell.histogram_fit) == 3
-            assert all(
-                np.asarray(artist.get_xdata()).size
-                == HistogramDisplayState().bin_count
-                for artist in cell.histogram_fit
-            )
-            assert len(cell.histogram_thresholds) == 1
-    finally:
-        renderer.close()
+        view = focused.document.layers[0].view
+        rendered = render_data_figure_front(
+            focused,
+            HistogramDisplayState(),
+            contract=PlotPanelContract(
+                "distribution-grid",
+                FigureIntent(
+                    PlotKind.HISTOGRAM,
+                    "Distribution",
+                    "Counts",
+                    view=view,
+                ),
+                size_name="2x2",
+            ),
+            sequence=index + 1,
+            histogram_projection_value_range=overview.histogram_home_x_limits,
+        )
+        assert rendered.frame is not None
+        payload = rendered.frame.panels[0].display_payload
+        assert isinstance(payload, HistogramPanelPayload)
+        assert payload.fit_overlays == ()
+        assert len(payload.thresholds) == 1

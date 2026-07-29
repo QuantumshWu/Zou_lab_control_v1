@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import math
 
 from PyQt5 import QtCore, QtGui
@@ -340,25 +340,6 @@ class _HeldPanelFront:
             self.sequence,
             self.source_identity,
         )
-
-
-def _advance_held_front(
-    hold: _HeldPanelFront,
-    frame: BoardFrame,
-    panel: PanelFrame,
-    prepared: tuple[bytes, QtGui.QImage],
-) -> _HeldPanelFront:
-    """Absorb one same-gesture raster answer into the painted hold."""
-
-    return replace(
-        hold,
-        sequence=frame.sequence,
-        source_identity=panel.source_identity,
-        presentation=_panel_presentation(panel),
-        raster_geometry=_raster_geometry(panel),
-        prepared=prepared,
-        display_payload=panel.display_payload,
-    )
 
 
 def _visible_display(

@@ -42,11 +42,10 @@ from zlc_data import (
     VALID,
     ValidityContract,
     ValueSchema,
-    expand_dataset_validity,
-    grid_topology_to_tree,
-    immutable_array,
-    point_table_to_tree,
 )
+from zlc_data._arrays import immutable_array
+from zlc_data.codec import grid_topology_to_tree, point_table_to_tree
+from zlc_data.value import expand_dataset_validity
 from zlc_neutral_atom.catalog import DefinitionKey, TaskDefinition
 from zlc_neutral_atom.dataset_output import (
     DatasetOutputDeclaration,

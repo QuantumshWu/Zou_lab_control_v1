@@ -1,47 +1,49 @@
-"""The frontend plot-kind vocabulary: which views exist and what each accepts.
+"""The sole typed vocabulary for every frontend Figure surface.
 
-A plot kind's headless vocabulary is its key, human label, fitting family, whether it is
-offered in Add Panel, and accepted value shape.  Rendering classes and display controls
-belong to the frontend renderer that actually consumes them.
-
-The console builds its menu and input-format text from these words; saved-figure readers
-validate stored kinds against them.  Neither needs to import a renderer to read a string.
+The console builds its menu and input-format text from this table.  Persistence
+encodes :class:`PlotKind.value` only at the wire boundary; production contracts
+never keep a parallel string vocabulary.
 
 This table deliberately contains no display controls.  A control belongs to the typed
-renderer that consumes it; putting an unconsumed ``repeat_mode`` or expression knob in
-the vocabulary creates a convincing UI that does nothing.
+renderer that consumes it; putting unconsumed view or expression knobs in the vocabulary
+creates a convincing UI that does nothing.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from enum import Enum
 from types import MappingProxyType
 from typing import Mapping
 
-__all__ = ["PLOT_KIND_SPECS", "PLOT_KIND_SPEC_BY_KEY", "PlotKindSpec"]
+__all__ = ["PlotKind"]
 
 
-@dataclass(frozen=True)
-class PlotKindSpec:
-    """ONE declarative record per plot kind -- everything about a kind EXCEPT its renderer.
+class PlotKind(str, Enum):
+    """The sole typed vocabulary for every Figure surface."""
 
-    Fields
-    ------
-    key            the canonical kind string (``"1d"``, ``"2d"``, ...).
-    label          the human Add-Panel / panel-title label.
-    panel          True if this kind is offered in the live console ADD-PANEL
-                   dropdown (you add a blank panel of it and wire it to a signal).
-                   False retains the kind in the renderer/saved-figure vocabulary
-                   without advertising an unfinished live product.
-    input_format   one-line description of the accepted ``value`` shape.
-    A live panel binds exactly one typed dataset.  Multi-input transforms are
-    explicit Processor outputs or joined datasets, not arbitrary GUI expressions.
-    """
+    IMAGE = "2d"
+    SITE_MAP = "sites"
+    CURVE = "1d"
+    METER = "meter"
+    ROLLING = "monitor"
+    HISTOGRAM = "hist"
+    PULSE = "pulse"
+    GRID = "grid"
 
-    key: str
-    label: str
-    panel: bool = True
-    input_format: str = ""
+    def __str__(self) -> str:
+        return self.value
+
+    @property
+    def label(self) -> str:
+        return _PLOT_KIND_METADATA[self][0]
+
+    @property
+    def panel(self) -> bool:
+        return _PLOT_KIND_METADATA[self][1]
+
+    @property
+    def input_format(self) -> str:
+        return _PLOT_KIND_METADATA[self][2]
 
 
 #: The ONE plot-kind table, in Add-Panel MENU order.  ``monitor`` names the DEFAULT rolling
@@ -51,55 +53,48 @@ class PlotKindSpec:
 #: each spec with a class, and does so in two steps only because ``GridPlot`` is defined
 #: later in that module than the table -- a fact about Python's execution order in ONE file,
 #: which is why the deferral lives there and the vocabulary here stays whole.
-PLOT_KIND_SPECS: tuple[PlotKindSpec, ...] = (
-    PlotKindSpec(
-        key="2d", label="2D image",
-        input_format="value must be a 2D array / camera frame (H×W)",
+_PLOT_KIND_METADATA: Mapping[PlotKind, tuple[str, bool, str]] = MappingProxyType({
+    PlotKind.IMAGE: (
+        "2D image", True, "value must be a 2D array / camera frame (H×W)"
     ),
-    PlotKindSpec(
-        key="sites", label="Site map", panel=True,
-        input_format=(
+    PlotKind.SITE_MAP: (
+        "Site map",
+        True,
+        (
             "value must carry a typed SiteMapPresentation whose site state, "
             "background, geometry and revision are already joined"),
     ),
-    PlotKindSpec(
-        key="1d", label="1D vector",
-        input_format="value must be a 1D vector (N,) or per-site array",
+    PlotKind.CURVE: (
+        "1D vector", True, "value must be a 1D vector (N,) or per-site array"
     ),
-    PlotKindSpec(
-        key="meter", label="Meter", panel=False,
-        input_format="value must resolve to one explicit scalar",
+    PlotKind.METER: (
+        "Meter", False, "value must resolve to one explicit scalar"
     ),
-    PlotKindSpec(
-        key="monitor", label="Rolling trace",
-        input_format=(
+    PlotKind.ROLLING: (
+        "Rolling trace",
+        True,
+        (
             "value must carry one explicit MONITOR_HISTORY point axis; "
             "the panel does not manufacture history"
         ),
     ),
-    PlotKindSpec(
-        key="hist", label="Distribution",
-        input_format="value must be a 1D sample vector",
+    PlotKind.HISTOGRAM: (
+        "Distribution", True, "value must be a 1D sample vector"
     ),
     # Static timing diagram -- not a blank live-console panel.
-    PlotKindSpec(key="pulse", label="Pulse sequence", panel=False),
+    PlotKind.PULSE: ("Pulse sequence", False, ""),
     # GRID is a TaskConsole layout over one typed dataset ViewSpec.  Its exact
     # named FACET bindings are evaluated by the ordinary FigureEvaluator; it
     # does not own a second shape-driven slicer or renderer.
-    PlotKindSpec(
-        key="grid",
-        label="Site grid",
-        panel=True,
-        input_format=(
+    PlotKind.GRID: (
+        "Site grid",
+        True,
+        (
             "value must admit an explicit named-axis CURVE, HISTOGRAM, or "
             "IMAGE facet view"
         ),
     ),
-)
+})
 
-#: ``key -> PlotKindSpec`` for O(1) lookup.  Insertion order = menu order.
-if len({spec.key for spec in PLOT_KIND_SPECS}) != len(PLOT_KIND_SPECS):
-    raise RuntimeError("plot kind keys must be unique")
-PLOT_KIND_SPEC_BY_KEY: Mapping[str, PlotKindSpec] = MappingProxyType(
-    {spec.key: spec for spec in PLOT_KIND_SPECS}
-)
+if set(_PLOT_KIND_METADATA) != set(PlotKind):
+    raise RuntimeError("plot kind metadata must be complete")

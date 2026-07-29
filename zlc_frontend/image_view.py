@@ -24,9 +24,9 @@ from zlc_data import (
     Selection,
     SPATIAL_X,
     SPATIAL_Y,
-    immutable_array,
-    resolve_selection_indices,
 )
+from zlc_data._arrays import immutable_array
+from zlc_data.selection import resolve_selection_indices
 from zlc_storage import nonnegative_integer, positive_integer
 
 from .figure.model import EvaluatedAxis, EvaluatedImage

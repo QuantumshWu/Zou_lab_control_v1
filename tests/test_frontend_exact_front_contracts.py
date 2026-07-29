@@ -11,7 +11,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
-def _meter_figure():
+def _meter_figure(*, faceted: bool = True):
     """Build the smallest real faceted METER figure under current data contracts."""
 
     from zlc_data import (
@@ -25,7 +25,7 @@ def _meter_figure():
         DatasetRevision,
         DatasetSchema,
         OwnedSnapshot,
-        PointLayout,
+        PointTable,
         StreamGenerationId,
         ValidityContract,
         ValueSchema,
@@ -43,6 +43,7 @@ def _meter_figure():
         ViewPreferences,
         suggest_view,
     )
+    from zlc_data import AxisSourceRef
 
     repeat = AxisSpec(AxisId("repeat"), "repeat", REPEAT, 2, (0, 1))
     site = AxisSpec(AxisId("site"), "site", SITE, 3, ("A", "B", "C"))
@@ -50,8 +51,8 @@ def _meter_figure():
     valid = np.ones(values.shape, dtype=bool)
     schema = DatasetSchema(
         repeat,
-        (),
-        PointLayout.rect_c(()),
+        PointTable(1),
+        None,
         ValueSchema(
             (site,),
             ValidityContract.components(site.axis_id),
@@ -81,7 +82,13 @@ def _meter_figure():
     suggestion = suggest_view(
         schema,
         ViewIntent.METER,
-        preferences=ViewPreferences(facet_axis_ids=(site.axis_id,)),
+        preferences=ViewPreferences(
+            facet_sources=(
+                (AxisSourceRef.tensor(site.axis_id),)
+                if faceted
+                else ()
+            ),
+        ),
     )
     assert suggestion.status is SuggestionStatus.RESOLVED
     document = FigureDocument(
@@ -94,12 +101,12 @@ def _meter_figure():
 
 
 def test_image_cache_is_bound_to_the_exact_evaluated_projection() -> None:
-    from test_u02c_qt_curve_interaction import _image_panel
+    from figure_surface_fixtures import image_panel
     from zlc_frontend.figure import EvaluatedImage, EvaluatedProjectionIdentity
     from zlc_frontend.image_display import ImageDisplayState
     from zlc_frontend.matplotlib_render import ImagePanelAggRenderer
 
-    payload = _image_panel(0).display_payload
+    payload = image_panel(0).display_payload
     first = payload.image
     second = EvaluatedImage(
         first.x_axis,
@@ -146,7 +153,7 @@ def test_image_cache_is_bound_to_the_exact_evaluated_projection() -> None:
 
 
 def test_invalid_full_resolution_uint_image_is_masked_without_dtype_promotion() -> None:
-    from zlc_data import immutable_array
+    from zlc_data._arrays import immutable_array
     from zlc_frontend._mpl_image import _decimate_image_view
 
     values = immutable_array(
@@ -172,11 +179,11 @@ def test_invalid_full_resolution_uint_image_is_masked_without_dtype_promotion() 
 
 
 def test_evaluated_image_reuses_bytes_backed_values_and_compact_all_valid_plane() -> None:
-    from test_u02c_qt_curve_interaction import _image_panel
-    from zlc_data import immutable_array, immutable_bool_broadcast
+    from figure_surface_fixtures import image_panel
+    from zlc_data._arrays import immutable_array, immutable_bool_broadcast
     from zlc_frontend.figure import EvaluatedImage
 
-    prototype = _image_panel(0).display_payload.image
+    prototype = image_panel(0).display_payload.image
     source = immutable_array(
         np.arange(prototype.values.size, dtype=np.uint16).reshape(
             prototype.values.shape
@@ -201,12 +208,12 @@ def test_evaluated_image_reuses_bytes_backed_values_and_compact_all_valid_plane(
 
 
 def test_live_image_renderer_keeps_invalid_uint_source_masked_and_uint() -> None:
-    from test_u02c_qt_curve_interaction import _image_panel
+    from figure_surface_fixtures import image_panel
     from zlc_frontend.figure import EvaluatedImage, EvaluatedProjectionIdentity
     from zlc_frontend.image_display import ImageDisplayState
     from zlc_frontend.matplotlib_render import ImagePanelAggRenderer
 
-    payload = _image_panel(0).display_payload
+    payload = image_panel(0).display_payload
     source = payload.image
     values = np.arange(source.values.size, dtype=np.uint8).reshape(source.values.shape)
     validity = np.ones(source.validity.shape, dtype=bool)
@@ -248,7 +255,7 @@ def test_live_image_renderer_keeps_invalid_uint_source_masked_and_uint() -> None
 
 
 def test_invalid_image_decimation_promotes_only_the_display_sized_result() -> None:
-    from zlc_data import immutable_array
+    from zlc_data._arrays import immutable_array
     from zlc_frontend._mpl_image import _decimate_image_view
 
     values = immutable_array(
@@ -275,7 +282,7 @@ def test_invalid_image_decimation_promotes_only_the_display_sized_result() -> No
 
 
 def test_transposed_image_sampling_and_blocking_remain_views_until_reduction() -> None:
-    from zlc_data import immutable_array, immutable_bool_broadcast
+    from zlc_data._arrays import immutable_array, immutable_bool_broadcast
     from zlc_frontend._mpl_image import _block_view_2d, _image_distribution_values
 
     source = immutable_array(
@@ -339,52 +346,60 @@ def test_latest_resolution_value_is_not_persistent_artist_topology() -> None:
         renderer.close()
 
 
-def test_failed_family_change_keeps_the_old_front_and_binding() -> None:
-    from test_u02c_qt_curve_interaction import _curve_panel, _image_panel
+def test_failed_family_change_keeps_the_old_front_and_interaction_family() -> None:
+    from figure_surface_fixtures import curve_panel, image_panel
     from zlc_frontend.qt_widgets import SinglePanelHost, ensure_qt_app
     from zlc_frontend.render import BoardFrame
 
     application = ensure_qt_app()
     host = SinglePanelHost("curve")
-    old = BoardFrame("host-board", 0, 0, (_curve_panel(0),))
+    old = BoardFrame("host-board", 0, 0, (curve_panel(0),))
     host.present_frame(old)
-    image_panel = _image_panel(1)
+    candidate = image_panel(1)
     presentation = replace(
-        image_panel.coherence_stamp.presentations[0],
+        candidate.coherence_stamp.presentations[0],
         panel_id="curve",
     )
-    image_panel = replace(
-        image_panel,
+    candidate = replace(
+        candidate,
         panel_id="curve",
         coherence_group="curve",
         coherence_stamp=replace(
-            image_panel.coherence_stamp,
+            candidate.coherence_stamp,
             presentations=(presentation,),
         ),
     )
     try:
         import pytest
 
+        old_origin = host.visible_interaction_origin()
+        assert old_origin is not None
         with pytest.raises(ValueError):
-            host.present_frame(BoardFrame("wrong-board", 0, 1, (image_panel,)))
+            host.present_frame(BoardFrame("wrong-board", 0, 1, (candidate,)))
         assert host.front_frame is old
-        assert host._bound_kind == "curve"
-        assert "curve" in host.board._numeric_bindings
+        assert host.visible_interaction_origin() == old_origin
+        host.set_range_candidate(None)
+        with pytest.raises(RuntimeError, match="image binding"):
+            host.set_rectangle_candidate(None)
 
-        host.present_frame(BoardFrame("host-board", 0, 1, (image_panel,)))
-        assert host._bound_kind == "image"
-        assert "curve" in host.board._image_bindings
-        assert "curve" not in host.board._numeric_bindings
+        current = BoardFrame("host-board", 0, 1, (candidate,))
+        host.present_frame(current)
+        assert host.front_frame is current
+        assert host.visible_interaction_origin() != old_origin
+        host.set_rectangle_candidate(None)
+        with pytest.raises(RuntimeError, match="numeric binding"):
+            host.set_range_candidate(None)
     finally:
         host.close()
         application.processEvents()
 
 
 def test_faceted_host_accepts_one_indivisible_overview_artifact() -> None:
-    from zlc_frontend import FacetedOverviewArtifact, RasterBuffer
+    from zlc_frontend.data_figure import FacetedOverviewArtifact
     from zlc_frontend.qt_widgets import FacetedPanelHost, ensure_qt_app
     from zlc_frontend.render import (
         PanelPresentationIdentity,
+        RasterBuffer,
     )
 
     figure = _meter_figure()
@@ -417,84 +432,132 @@ def test_faceted_host_accepts_one_indivisible_overview_artifact() -> None:
 
 
 def test_newer_but_semantically_different_frame_does_not_ack_viewport() -> None:
-    from test_u02c_qt_curve_interaction import (
-        _accepted_curve_frame,
-        _board,
-        _curve_target,
-        _frame,
-        _point,
-        _wheel,
-    )
+    from figure_surface_fixtures import curve_panel
+    from gui_user_flow import normalized_subrect, point_in_rect, send_wheel
+    from zlc_frontend.qt_widgets import SinglePanelHost, ensure_qt_app
+    from zlc_frontend.render import BoardFrame
 
-    application, board = _board(_frame(0), [], [])
+    application = ensure_qt_app()
+
+    def frame(sequence, panel):
+        return BoardFrame("curve-host", 0, sequence, (panel,))
+
+    def accepted_panel(sequence, command):
+        panel = curve_panel(
+            sequence,
+            display_revision=command.viewport.display_revision,
+        )
+        return replace(
+            panel,
+            source_identity=command.origin.source_identity,
+            coherence_stamp=replace(
+                panel.coherence_stamp,
+                inputs=(command.origin.input_identity,),
+            ),
+            display_payload=replace(
+                panel.display_payload,
+                evaluated_input=command.origin.input_identity,
+                viewport=command.viewport,
+            ),
+        )
+
+    host = SinglePanelHost("curve")
+    host.resize(640, 320)
+    host.show()
+    host.set_selectors_enabled(True)
     commands: list[object] = []
-    board._numeric_bindings["curve"].callback = commands.append
+    host.viewCommitted.connect(commands.append)
+    host.present_frame(frame(0, curve_panel(0)))
+    board = host.board
+    application.processEvents()
     try:
-        target = _curve_target(board)
-        _wheel(board, _point(target.plot, 0.5, 0.5), 120)
+        payload = host.front_frame.panels[0].display_payload
+        plot = normalized_subrect(board.rect(), payload.viewport.plot_bounds)
+        send_wheel(board, point_in_rect(plot, 0.5, 0.5), 120)
         command = commands[-1]
-        binding = board._numeric_bindings["curve"]
-        assert binding.pending_viewport_answer is not None
 
-        board.present(
-            _frame(
+        host.present_frame(
+            frame(
                 1,
-                curve_revision=command.viewport.display_revision + 1,
+                curve_panel(
+                    1,
+                    display_revision=command.viewport.display_revision + 1,
+                ),
             )
         )
-        assert binding.pending_viewport_answer is not None
+        payload = host.front_frame.panels[0].display_payload
+        plot = normalized_subrect(board.rect(), payload.viewport.plot_bounds)
+        send_wheel(board, point_in_rect(plot, 0.5, 0.5), 120)
+        assert commands == [command]
     finally:
-        board.close()
+        host.close()
         application.processEvents()
 
-    application, board = _board(_frame(0), [], [])
+    host = SinglePanelHost("curve")
+    host.resize(640, 320)
+    host.show()
+    host.set_selectors_enabled(True)
     commands = []
-    board._numeric_bindings["curve"].callback = commands.append
+    host.viewCommitted.connect(commands.append)
+    host.present_frame(frame(0, curve_panel(0)))
+    board = host.board
+    application.processEvents()
     try:
-        target = _curve_target(board)
-        _wheel(board, _point(target.plot, 0.5, 0.5), 120)
+        payload = host.front_frame.panels[0].display_payload
+        plot = normalized_subrect(board.rect(), payload.viewport.plot_bounds)
+        send_wheel(board, point_in_rect(plot, 0.5, 0.5), 120)
         command = commands[-1]
-        board.present(_accepted_curve_frame(1, command))
-        assert board._numeric_bindings["curve"].pending_viewport_answer is None
+        host.present_frame(frame(1, accepted_panel(1, command)))
+        payload = host.front_frame.panels[0].display_payload
+        plot = normalized_subrect(board.rect(), payload.viewport.plot_bounds)
+        send_wheel(board, point_in_rect(plot, 0.5, 0.5), 120)
+        assert len(commands) == 2
+        assert commands[-1].origin == host.visible_interaction_origin()
     finally:
-        board.close()
+        host.close()
         application.processEvents()
 
 
 def test_image_viewport_coalesces_at_render_rate_without_losing_exact_ack() -> None:
     """Rapid wheel input retains one exact answer and one latest viewport."""
 
-    from test_u02c_qt_curve_interaction import (
-        _board,
-        _curve_panel,
-        _frame,
-        _image_panel,
-        _point,
-        _wheel,
-    )
+    from figure_surface_fixtures import image_panel
+    from gui_user_flow import point_in_rect, raster_subrect, send_wheel
+    from zlc_frontend.qt_widgets import SinglePanelHost, ensure_qt_app
     from zlc_frontend.render import BoardFrame
     from zlc_frontend.selector import ImageViewportCommit
 
     commands: list[ImageViewportCommit] = []
-    application, board = _board(_frame(0), [], commands)
-    board.set_selectors_enabled(True)
+    application = ensure_qt_app()
+    host = SinglePanelHost("image")
+    host.resize(640, 420)
+    host.show()
+    host.set_selectors_enabled(True)
+    host.viewCommitted.connect(commands.append)
+    host.present_frame(BoardFrame(
+        "image-host",
+        0,
+        0,
+        (image_panel(0),),
+    ))
+    board = host.board
+    application.processEvents()
     try:
-        binding = board._image_bindings["image"]
-        target = board._selector_target(binding)
-        assert target is not None
-        centre = _point(target[0], 0.5, 0.5)
+        payload = host.front_frame.panels[0].display_payload
+        target = raster_subrect(
+            board.rect(), payload.raster_geometry.image_bounds
+        )
+        centre = point_in_rect(target, 0.5, 0.5)
 
-        _wheel(board, centre, -120)
+        send_wheel(board, centre, -120)
         first = commands[-1]
         assert isinstance(first, ImageViewportCommit)
-        assert binding.pending_viewport_answer is not None
 
-        _wheel(board, centre, -120)
+        send_wheel(board, centre, -120)
         assert commands == [first]
-        queued = binding.queued_viewport_bounds
-        assert queued is not None and queued != first.viewport.visible_bounds
+        expected = first.viewport.centered_zoom((0.5, 0.5), 1.0 / 1.1)
 
-        answered = _image_panel(
+        answered = image_panel(
             1,
             viewport_revision=first.viewport.viewport_revision,
         )
@@ -511,152 +574,135 @@ def test_image_viewport_coalesces_at_render_rate_without_losing_exact_ack() -> N
                 viewport=first.viewport,
             ),
         )
-        board.present(BoardFrame(
-            "curve-board",
+        host.present_frame(BoardFrame(
+            "image-host",
             0,
             1,
-            (answered, _curve_panel(1)),
+            (answered,),
         ))
 
         assert len(commands) == 2
         latest = commands[-1]
-        assert latest.viewport.visible_bounds == queued
+        assert latest.viewport.visible_bounds == expected.visible_bounds
         assert (
             latest.viewport.viewport_revision
             > first.viewport.viewport_revision
         )
-        assert binding.queued_viewport_bounds is None
-        assert binding.pending_viewport_answer is not None
-        assert binding.pending_viewport_answer.viewport == latest.viewport
+        assert latest.origin == host.visible_interaction_origin()
     finally:
-        board.close()
-        application.processEvents()
-
-
-def test_one_numeric_panel_never_owns_two_inflight_answer_families() -> None:
-    """A viewport answer serializes threshold authoring on the same panel."""
-
-    from PyQt5 import QtCore, QtTest
-    from test_u02e_qt_histogram_interaction import (
-        _histogram_panel,
-        _numeric_target,
-        _point,
-        _wheel,
-    )
-    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
-    from zlc_frontend.render import BoardFrame
-
-    application = ensure_qt_app()
-    commands: list[object] = []
-    board = QtRasterBoard(("histogram",), columns=1)
-    board.resize(640, 420)
-    board.show()
-    board.present(BoardFrame(
-        "numeric-board",
-        0,
-        0,
-        (_histogram_panel(1, thresholds=(1.0,)),),
-    ))
-    board.bind_histogram_interaction("histogram", commands.append)
-    board.set_selectors_enabled(True)
-    application.processEvents()
-    try:
-        target = _numeric_target(board, "histogram")
-        _wheel(board, _point(target.plot, 0.5, 0.5), -120)
-        binding = board._numeric_bindings["histogram"]
-        assert binding.pending_viewport_answer is not None
-
-        x_low, x_high = target.payload.viewport.x_limits
-        line_fraction = (1.0 - x_low) / (x_high - x_low)
-        QtTest.QTest.mousePress(
-            board,
-            QtCore.Qt.LeftButton,
-            pos=_point(target.plot, line_fraction, 0.5),
-        )
-        assert binding.threshold_drag is None
-        assert binding.threshold_pending_answer is None
-        assert binding.queued_thresholds is None
-        assert len(commands) == 1
-    finally:
-        board.close()
+        host.close()
         application.processEvents()
 
 
 def test_numeric_pan_release_authors_a_final_unseen_pointer_position() -> None:
     """Release reuses motion geometry when Qt omitted the final move event."""
 
-    from PyQt5 import QtCore, QtGui, QtTest
-    from test_u02c_qt_curve_interaction import (
-        _board,
-        _curve_target,
-        _frame,
-        _point,
-        _drag_move,
-    )
+    from PyQt5 import QtCore, QtTest
+    from figure_surface_fixtures import curve_panel
+    from gui_user_flow import drag_mouse_move, normalized_subrect, point_in_rect
+    from zlc_frontend.qt_widgets import SinglePanelHost, ensure_qt_app
+    from zlc_frontend.render import BoardFrame
 
     commands: list[object] = []
-    application, board = _board(_frame(0), commands, [])
-    board.set_selectors_enabled(True)
+    application = ensure_qt_app()
+    host = SinglePanelHost("curve")
+    host.resize(640, 320)
+    host.show()
+    host.set_selectors_enabled(True)
+    host.viewCommitted.connect(commands.append)
+    host.present_frame(BoardFrame(
+        "curve-pan-host",
+        0,
+        0,
+        (curve_panel(0),),
+    ))
+    board = host.board
+    application.processEvents()
     try:
-        target = _curve_target(board)
-        press = _point(target.plot, 0.45, 0.5)
-        motion = _point(target.plot, 0.50, 0.5)
-        release = _point(target.plot, 0.70, 0.5)
+        payload = host.front_frame.panels[0].display_payload
+        plot = normalized_subrect(board.rect(), payload.viewport.plot_bounds)
+        press = point_in_rect(plot, 0.45, 0.5)
+        motion = point_in_rect(plot, 0.50, 0.5)
+        release = point_in_rect(plot, 0.70, 0.5)
+        board_bounds = board.rect()
+        origin = payload.viewport
+        anchor = (
+            float(press.x()) - board_bounds.x()
+        ) / max(1, board_bounds.width())
         QtTest.QTest.mousePress(board, QtCore.Qt.MiddleButton, pos=press)
-        binding = board._numeric_bindings["curve"]
-        origin = binding.pan_origin
-        anchor = binding.pan_anchor
-        assert origin is not None and anchor is not None
-        _drag_move(board, motion, QtCore.Qt.MiddleButton)
+        drag_mouse_move(board, motion, QtCore.Qt.MiddleButton)
         first = commands[-1]
 
         release_x = (
-            float(release.x()) - target.bounds.x()
-        ) / max(1, target.bounds.width())
+            float(release.x()) - board_bounds.x()
+        ) / max(1, board_bounds.width())
         expected = origin.panned_x_limits(
             anchor,
             release_x,
             start_x_limits=origin.x_limits,
         )
-        board.mouseReleaseEvent(QtGui.QMouseEvent(
-            QtCore.QEvent.MouseButtonRelease,
-            QtCore.QPointF(release),
+        QtTest.QTest.mouseRelease(
+            board,
             QtCore.Qt.MiddleButton,
-            QtCore.Qt.NoButton,
-            QtCore.Qt.NoModifier,
-        ))
+            pos=release,
+        )
 
         assert commands == [first]
-        assert binding.queued_viewport_limits == pytest.approx(expected)
-        assert board._selector_hold is None
+        answered = curve_panel(
+            1,
+            display_revision=first.viewport.display_revision,
+        )
+        answered = replace(
+            answered,
+            source_identity=first.origin.source_identity,
+            coherence_stamp=replace(
+                answered.coherence_stamp,
+                inputs=(first.origin.input_identity,),
+            ),
+            display_payload=replace(
+                answered.display_payload,
+                evaluated_input=first.origin.input_identity,
+                viewport=first.viewport,
+            ),
+        )
+        host.present_frame(BoardFrame(
+            "curve-pan-host",
+            0,
+            1,
+            (answered,),
+        ))
+        assert len(commands) == 2
+        assert commands[-1].viewport.x_limits == pytest.approx(expected)
+        assert commands[-1].origin == host.visible_interaction_origin()
     finally:
-        board.close()
+        host.close()
         application.processEvents()
 
 
 def test_archive_payload_owns_complete_typed_presentation() -> None:
     from zlc_frontend import (
-        FigurePresentationContract,
+        FigureIntent,
         MeterDisplayState,
+        PlotKind,
+    )
+    from zlc_frontend.figure_archive import (
         decode_figure_archive_payload,
         encode_figure_archive_payload,
     )
-    from zlc_frontend.figure import ViewIntent
 
-    figure = _meter_figure()
-    presentation = FigurePresentationContract(
-        intent=ViewIntent.METER,
-        faceted=True,
-        rolling_trace=False,
-        rolling_distribution=False,
-        title="occupancy",
-        value_label="state",
-        size_name="4x4",
-        display=MeterDisplayState(0, None, revision=9),
+    figure = _meter_figure(faceted=False)
+    figure_intent = FigureIntent(
+        PlotKind.METER,
+        "occupancy",
+        "state",
+        view=figure.document.layers[0].view,
     )
+    display = MeterDisplayState(0, None, revision=9)
     payload = encode_figure_archive_payload(
         figure,
-        presentation=presentation,
+        figure_intent=figure_intent,
+        size_name="4x4",
+        display=display,
         metadata={"source": "virtual"},
     )
     reopened = decode_figure_archive_payload(payload)
@@ -667,7 +713,9 @@ def test_archive_payload_owns_complete_typed_presentation() -> None:
     assert "pixel_ratio" not in presentation_tree
     assert presentation_tree["size_name"] == "4x4"
 
-    assert reopened.presentation == presentation
+    assert reopened.figure_intent == figure_intent
+    assert reopened.size_name == "4x4"
+    assert reopened.display == display
     assert reopened.metadata["source"] == "virtual"
     assert reopened.figure.document == figure.document
 
@@ -677,7 +725,7 @@ def test_frontend_contract_registry_and_rolling_histogram_diagnostic_are_closed(
 
     import pytest
 
-    from zlc_data import histogram_gaussian_display_diagnostic
+    from zlc_data.fit import histogram_gaussian_display_diagnostic
     from zlc_frontend.figure import VIEW_CONTRACTS, ViewIntent
 
     assert isinstance(VIEW_CONTRACTS, MappingProxyType)
@@ -697,3 +745,46 @@ def test_frontend_contract_registry_and_rolling_histogram_diagnostic_are_closed(
     assert amplitude == 4.0
     assert center == pytest.approx(0.0)
     assert sigma > 0.0
+
+
+def test_grid_view_editor_exposes_singleton_dataset_as_typed_unavailable() -> None:
+    """A Dataset with no facet source remains a valid, non-fatal UI state."""
+
+    from zlc_data import REPEAT, AxisId, AxisSpec, DatasetSchema, PointTable, ValueSchema
+    from zlc_frontend.qt_widgets import (
+        FluentParameterForm,
+        ViewSpecEditor,
+        ensure_qt_app,
+    )
+
+    schema = DatasetSchema(
+        AxisSpec(AxisId("singleton.repeat"), "repeat", REPEAT, 1, (0,)),
+        PointTable(1),
+        None,
+        ValueSchema.scalar(np.dtype("<f8"), "count"),
+    )
+    application = ensure_qt_app()
+    editor = ViewSpecEditor()
+    editor.show()
+    try:
+        editor.reconcile(schema, None, faceted=True)
+        application.processEvents()
+
+        form = editor.findChild(FluentParameterForm)
+        assert form is not None
+        assert form.keys == ("grid.intent",)
+        field = form.spec.fields[0]
+        assert field.required_choice_unavailable
+        control = form.widget_for("grid.intent")
+        assert not control.isEnabled()
+        assert "No declared sub plot" in control.toolTip()
+
+        # Reconciliation of the same unavailable declaration is stable and
+        # must never turn an empty candidate set into an invalid fake choice.
+        editor.reconcile(schema, None, faceted=True)
+        application.processEvents()
+        assert form is editor.findChild(FluentParameterForm)
+        assert not form.widget_for("grid.intent").isEnabled()
+    finally:
+        editor.close()
+        application.processEvents()

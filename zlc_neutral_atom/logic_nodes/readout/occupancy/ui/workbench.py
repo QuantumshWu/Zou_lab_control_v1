@@ -10,11 +10,11 @@ def open_occupancy_cell_workbench(
     *,
     address=None,
 ):
-    from zlc_workbench.window_runtime import open_workbench_window
+    from zlc_frontend.qt_widgets import launch_qt_window
 
     from .workbench_window import OccupancyCellWindow
 
-    return open_workbench_window(
+    return launch_qt_window(
         lambda: OccupancyCellWindow(
             navigation_loader,
             cell_loader,

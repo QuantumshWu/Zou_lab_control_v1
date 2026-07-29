@@ -9,17 +9,16 @@ rendered front.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from enum import Enum
+import hashlib
 import math
 
 import numpy as np
 
 from zlc_data import (
     AxisSourceRef,
-    axis_source_ref_from_tree,
-    axis_source_ref_to_tree,
-    immutable_array,
 )
+from zlc_data._arrays import immutable_array
+from zlc_data.codec import axis_source_ref_from_tree, axis_source_ref_to_tree
 from zlc_storage import exact_mapping, finite_real, nonnegative_integer
 
 from .display_range import (
@@ -47,13 +46,6 @@ MIN_HISTOGRAM_BINS = 5
 _COUNT_SHRINK_DEADBAND = 0.60
 
 
-class HistogramCountScale(str, Enum):
-    """Closed count-axis scales supported by the histogram renderer."""
-
-    LINEAR = "linear"
-    LOG = "log"
-
-
 def _histogram_bin_count(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
         raise TypeError("histogram bin_count must be an integer")
@@ -69,10 +61,12 @@ def _validated_count_limits(
     value: object,
     field: str,
     *,
-    scale: HistogramCountScale,
+    log_count_axis: bool,
 ) -> DisplayRange:
+    if not isinstance(log_count_axis, bool):
+        raise TypeError("log_count_axis must be bool")
     result = validated_display_range(value, field)
-    if scale is HistogramCountScale.LOG and result[0] <= 0.0:
+    if log_count_axis and result[0] <= 0.0:
         raise ValueError(f"{field} lower limit must be positive for log count scale")
     return result
 
@@ -83,7 +77,7 @@ class HistogramDisplayState:
 
     revision: int = 0
     relim_mode: RelimMode = RelimMode.TIGHT
-    count_scale: HistogramCountScale = HistogramCountScale.LINEAR
+    log_count_axis: bool = False
     bin_count: int = DEFAULT_HISTOGRAM_BINS
     x_view: DisplayRange | None = None
     fixed_count_limits: DisplayRange | None = None
@@ -101,8 +95,8 @@ class HistogramDisplayState:
         )
         if not isinstance(self.relim_mode, RelimMode):
             raise TypeError("relim_mode must be RelimMode")
-        if not isinstance(self.count_scale, HistogramCountScale):
-            raise TypeError("count_scale must be HistogramCountScale")
+        if not isinstance(self.log_count_axis, bool):
+            raise TypeError("log_count_axis must be bool")
         object.__setattr__(self, "bin_count", _histogram_bin_count(self.bin_count))
         object.__setattr__(
             self,
@@ -115,12 +109,12 @@ class HistogramDisplayState:
             object.__setattr__(self, "fixed_count_limits", fixed)
             if (
                 self.relim_mode is RelimMode.FIXED
-                and self.count_scale is HistogramCountScale.LOG
+                and self.log_count_axis
             ):
                 _validated_count_limits(
                     fixed,
                     "fixed_count_limits",
-                    scale=self.count_scale,
+                    log_count_axis=self.log_count_axis,
                 )
         if self.relim_mode is RelimMode.FIXED:
             if fixed is None:
@@ -346,14 +340,10 @@ _HISTOGRAM_DISPLAY_FORM = FormSpec(
             ),
         ),
         FormFieldProps(
-            "count_scale",
-            "choice",
+            "log_count_axis",
+            "bool",
             "Log count",
-            default=HistogramCountScale.LINEAR,
-            choices=tuple(
-                FormChoice(scale.value.title(), scale)
-                for scale in HistogramCountScale
-            ),
+            default=False,
         ),
         FormFieldProps(
             "bin_count",
@@ -385,7 +375,7 @@ def histogram_display_form_values(
     count_min, count_max = display_range_form_values(state.fixed_count_limits)
     return {
         "relim_mode": state.relim_mode,
-        "count_scale": state.count_scale,
+        "log_count_axis": state.log_count_axis,
         "bin_count": state.bin_count,
         "x_min": x_min,
         "x_max": x_max,
@@ -415,11 +405,11 @@ def histogram_display_from_form(
         discriminator=None,
     )
     relim_mode = values["relim_mode"]
-    count_scale = values["count_scale"]
+    log_count_axis = values["log_count_axis"]
     if not isinstance(relim_mode, RelimMode):
         raise TypeError("relim_mode form value must be RelimMode")
-    if not isinstance(count_scale, HistogramCountScale):
-        raise TypeError("count_scale form value must be HistogramCountScale")
+    if not isinstance(log_count_axis, bool):
+        raise TypeError("log_count_axis form value must be bool")
     bin_count = _histogram_bin_count(values["bin_count"])
     x_view = display_range_from_form(values, "x_min", "x_max", "x_view")
     submitted_fixed = display_range_from_form(
@@ -437,7 +427,7 @@ def histogram_display_from_form(
             fixed_count_limits = _validated_count_limits(
                 current_count_limits,
                 "current_count_limits",
-                scale=count_scale,
+                log_count_axis=log_count_axis,
             )
         else:
             if submitted_fixed is None:
@@ -447,7 +437,7 @@ def histogram_display_from_form(
             fixed_count_limits = _validated_count_limits(
                 submitted_fixed,
                 "fixed_count_limits",
-                scale=count_scale,
+                log_count_axis=log_count_axis,
             )
     else:
         fixed_count_limits = submitted_fixed
@@ -455,7 +445,7 @@ def histogram_display_from_form(
     candidate = HistogramDisplayState(
         revision=base.revision,
         relim_mode=relim_mode,
-        count_scale=count_scale,
+        log_count_axis=log_count_axis,
         bin_count=bin_count,
         x_view=x_view,
         fixed_count_limits=fixed_count_limits,
@@ -511,7 +501,7 @@ class HistogramViewportTransform:
     x_limits: DisplayRange
     count_limits: DisplayRange
     home_x_limits: DisplayRange
-    count_scale: HistogramCountScale
+    log_count_axis: bool
     relim_mode: RelimMode
     x_limits_are_auto: bool
     bin_count: int
@@ -530,8 +520,8 @@ class HistogramViewportTransform:
             "plot_bounds",
             normalized_plot_bounds(self.plot_bounds),
         )
-        if not isinstance(self.count_scale, HistogramCountScale):
-            raise TypeError("count_scale must be HistogramCountScale")
+        if not isinstance(self.log_count_axis, bool):
+            raise TypeError("log_count_axis must be bool")
         if not isinstance(self.relim_mode, RelimMode):
             raise TypeError("relim_mode must be RelimMode")
         if not isinstance(self.x_limits_are_auto, bool):
@@ -553,7 +543,7 @@ class HistogramViewportTransform:
             _validated_count_limits(
                 self.count_limits,
                 "count_limits",
-                scale=self.count_scale,
+                log_count_axis=self.log_count_axis,
             ),
         )
         if self.x_limits_are_auto and self.x_limits != self.home_x_limits:
@@ -578,7 +568,7 @@ class HistogramViewportTransform:
         left, top, right, bottom = self.plot_bounds
         count_fraction = (y - top) / (bottom - top)
         count_low, count_high = self.count_limits
-        if self.count_scale is HistogramCountScale.LOG:
+        if self.log_count_axis:
             log_low = math.log(count_low)
             log_high = math.log(count_high)
             count = math.exp(log_high - count_fraction * (log_high - log_low))
@@ -595,7 +585,7 @@ class HistogramViewportTransform:
         count = finite_real(count, "data count")
         left, top, right, bottom = self.plot_bounds
         count_low, count_high = self.count_limits
-        if self.count_scale is HistogramCountScale.LOG:
+        if self.log_count_axis:
             if count <= 0.0:
                 raise ValueError("data count must be positive for log count scale")
             count_fraction = (math.log(count_high) - math.log(count)) / (
@@ -658,7 +648,7 @@ def histogram_count_limits(
     *,
     current_count_limits: DisplayRange | None = None,
     previous_relim_mode: RelimMode | None = None,
-    previous_count_scale: HistogramCountScale | None = None,
+    previous_log_count_axis: bool | None = None,
 ) -> DisplayRange:
     """Resolve count limits with the established shrink-only deadband.
 
@@ -675,22 +665,20 @@ def histogram_count_limits(
         RelimMode,
     ):
         raise TypeError("previous_relim_mode must be RelimMode or None")
-    if previous_count_scale is not None and not isinstance(
-        previous_count_scale,
-        HistogramCountScale,
+    if previous_log_count_axis is not None and not isinstance(
+        previous_log_count_axis,
+        bool,
     ):
-        raise TypeError(
-            "previous_count_scale must be HistogramCountScale or None"
-        )
+        raise TypeError("previous_log_count_axis must be bool or None")
 
     if state.relim_mode is RelimMode.FIXED:
         assert state.fixed_count_limits is not None
         return _validated_count_limits(
             state.fixed_count_limits,
             "fixed_count_limits",
-            scale=state.count_scale,
+            log_count_axis=state.log_count_axis,
         )
-    if state.count_scale is HistogramCountScale.LOG:
+    if state.log_count_axis:
         target = (0.5, max(3.0 * peak, 1.0))
     elif state.relim_mode is RelimMode.TIGHT:
         target = (0.0, max(1.1 * peak, 1.0))
@@ -699,21 +687,21 @@ def histogram_count_limits(
     target = _validated_count_limits(
         target,
         "derived histogram count limits",
-        scale=state.count_scale,
+        log_count_axis=state.log_count_axis,
     )
 
     force = (
         previous_relim_mode is None
-        or previous_count_scale is None
+        or previous_log_count_axis is None
         or previous_relim_mode is not state.relim_mode
-        or previous_count_scale is not state.count_scale
+        or previous_log_count_axis is not state.log_count_axis
     )
     if current_count_limits is None or force:
         return target
     current = _validated_count_limits(
         current_count_limits,
         "current_count_limits",
-        scale=state.count_scale,
+        log_count_axis=state.log_count_axis,
     )
     if current[0] != target[0]:
         return target
@@ -797,6 +785,25 @@ def histogram_projection_home_x_limits(
     )
 
 
+def _histogram_projection_digest(
+    requested_bin_count: int,
+    bin_edges: np.ndarray,
+    bin_counts: tuple[np.ndarray, ...],
+) -> str:
+    """Digest exact bins once on their worker-owned construction boundary."""
+
+    digest = hashlib.sha256(b"zlc_frontend.HistogramBinProjection\0")
+    digest.update(int(requested_bin_count).to_bytes(8, "little", signed=False))
+    for values in (bin_edges, *bin_counts):
+        digest.update(values.dtype.str.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(int(values.ndim).to_bytes(2, "little", signed=False))
+        for size in values.shape:
+            digest.update(int(size).to_bytes(8, "little", signed=False))
+        digest.update(memoryview(values).cast("B"))
+    return digest.hexdigest()
+
+
 @dataclass(frozen=True, slots=True, eq=False, init=False)
 class HistogramBinProjection:
     """One exact-sample-bound, shared-edge display projection.
@@ -813,6 +820,7 @@ class HistogramBinProjection:
     bin_counts: tuple[np.ndarray, ...]
     bin_edges: np.ndarray
     requested_bin_count: int
+    projection_digest: str
 
     def __init__(
         self,
@@ -854,6 +862,11 @@ class HistogramBinProjection:
         object.__setattr__(self, "bin_counts", tuple(counts))
         object.__setattr__(self, "bin_edges", immutable_edges)
         object.__setattr__(self, "requested_bin_count", bins)
+        object.__setattr__(
+            self,
+            "projection_digest",
+            _histogram_projection_digest(bins, immutable_edges, tuple(counts)),
+        )
 
     @classmethod
     def _from_committed_edges(
@@ -898,6 +911,15 @@ class HistogramBinProjection:
         object.__setattr__(projection, "bin_counts", tuple(counts))
         object.__setattr__(projection, "bin_edges", immutable_edges)
         object.__setattr__(projection, "requested_bin_count", requested)
+        object.__setattr__(
+            projection,
+            "projection_digest",
+            _histogram_projection_digest(
+                requested,
+                immutable_edges,
+                tuple(counts),
+            ),
+        )
         return projection
 
 
@@ -964,7 +986,6 @@ def histogram_home_x_limits(edges: np.ndarray) -> DisplayRange:
 __all__ = [
     "DEFAULT_HISTOGRAM_BINS",
     "FacetedHistogramDisplayState",
-    "HistogramCountScale",
     "HistogramCellThresholds",
     "HistogramBinProjection",
     "HistogramDisplayState",

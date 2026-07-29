@@ -21,8 +21,8 @@ from zlc_data import (
     CoordinateFrameId,
     DatasetRevisionRef,
     Selection,
-    immutable_array,
 )
+from zlc_data._arrays import immutable_array
 from zlc_storage.canonical import (
     canonical_text as _text,
     nonnegative_integer as _nonnegative,
@@ -328,7 +328,6 @@ class ViewContract:
 
 class SuggestionStatus(str, Enum):
     RESOLVED = "RESOLVED"
-    REVIEW_REQUIRED = "REVIEW_REQUIRED"
     NEEDS_INPUT = "NEEDS_INPUT"
 
 
@@ -346,25 +345,10 @@ class DecisionReason:
 
 
 @dataclass(frozen=True)
-class ViewAlternative:
-    source: AxisSourceRef
-    binding_role: AxisViewRole
-    label: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.source, AxisSourceRef):
-            raise TypeError("alternative source must be AxisSourceRef")
-        if not isinstance(self.binding_role, AxisViewRole):
-            raise TypeError("alternative binding_role must be AxisViewRole")
-        object.__setattr__(self, "label", _text(self.label, "alternative label"))
-
-
-@dataclass(frozen=True)
 class ViewSuggestion:
     spec: ViewSpec | None
     status: SuggestionStatus
     reasons: tuple[DecisionReason, ...] = ()
-    alternatives: tuple[ViewAlternative, ...] = ()
 
     def __post_init__(self) -> None:
         if self.spec is not None and not isinstance(self.spec, ViewSpec):
@@ -372,17 +356,13 @@ class ViewSuggestion:
         if not isinstance(self.status, SuggestionStatus):
             raise TypeError("status must be SuggestionStatus")
         reasons = tuple(self.reasons)
-        alternatives = tuple(self.alternatives)
         if any(not isinstance(reason, DecisionReason) for reason in reasons):
             raise TypeError("reasons must contain DecisionReason values")
-        if any(not isinstance(alternative, ViewAlternative) for alternative in alternatives):
-            raise TypeError("alternatives must contain ViewAlternative values")
         if self.status is SuggestionStatus.NEEDS_INPUT and self.spec is not None:
             raise ValueError("NEEDS_INPUT suggestion cannot carry a resolved ViewSpec")
         if self.status is not SuggestionStatus.NEEDS_INPUT and self.spec is None:
             raise ValueError("resolved suggestion must carry a ViewSpec")
         object.__setattr__(self, "reasons", reasons)
-        object.__setattr__(self, "alternatives", alternatives)
 
 
 @dataclass(frozen=True, order=True)
@@ -630,33 +610,22 @@ class EvaluatedCurve:
         object.__setattr__(self, "validity", validity)
 
 
-@dataclass(frozen=True)
-class SampleCoordinates:
-    source: AxisSourceRef
-    coordinates: tuple[Any, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.source, AxisSourceRef):
-            raise TypeError("sample source must be AxisSourceRef")
-        object.__setattr__(self, "coordinates", tuple(self.coordinates))
-
-
 @dataclass(frozen=True, eq=False)
 class EvaluatedHistogram:
     samples: np.ndarray
-    sample_coordinates: tuple[SampleCoordinates, ...]
+    sample_sources: tuple[AxisSourceRef, ...]
     dropped_count: int
     value_unit: str | None = None
 
     def __post_init__(self) -> None:
         samples = _immutable_evaluated_array(self.samples, ndim=1)
-        coordinates = tuple(self.sample_coordinates)
-        if any(not isinstance(item, SampleCoordinates) for item in coordinates):
-            raise TypeError("sample_coordinates must contain SampleCoordinates values")
-        if any(len(item.coordinates) != len(samples) for item in coordinates):
-            raise ValueError("sample coordinates must align with samples")
+        sources = tuple(self.sample_sources)
+        if not sources or any(not isinstance(item, AxisSourceRef) for item in sources):
+            raise TypeError("sample_sources must contain AxisSourceRef values")
+        if len(set(sources)) != len(sources):
+            raise ValueError("sample_sources must be unique")
         object.__setattr__(self, "samples", samples)
-        object.__setattr__(self, "sample_coordinates", coordinates)
+        object.__setattr__(self, "sample_sources", sources)
         object.__setattr__(self, "dropped_count", _nonnegative(self.dropped_count, "dropped_count"))
         if self.value_unit is not None:
             object.__setattr__(
@@ -909,9 +878,7 @@ __all__ = [
     "FixedIndex",
     "LatestNonempty",
     "ReductionResolution",
-    "SampleCoordinates",
     "SuggestionStatus",
-    "ViewAlternative",
     "ViewContract",
     "ViewIntent",
     "ViewPreferences",

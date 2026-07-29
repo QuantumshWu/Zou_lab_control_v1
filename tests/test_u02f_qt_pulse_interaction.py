@@ -17,6 +17,14 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from gui_user_flow import (
+    drag_mouse_move,
+    normalized_subrect,
+    point_in_rect,
+    send_mouse_double_click,
+    send_wheel,
+)
+
 
 def _pulse_panel(*, digest: str = "e" * 64):
     from zlc_frontend.matplotlib_render import render_pulse_timeline_panel
@@ -47,68 +55,38 @@ def _pulse_panel(*, digest: str = "e" * 64):
     )
 
 
-def _board(commands, *, panel=None):
-    from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
+def _pulse_frame(*, panel=None, sequence: int = 0):
     from zlc_frontend.render import BoardFrame
 
+    return BoardFrame(
+        "pulse-board",
+        0,
+        sequence,
+        (_pulse_panel() if panel is None else panel,),
+    )
+
+
+def _pulse_host(events, *, panel=None):
+    from zlc_frontend.qt_widgets import SinglePanelHost, ensure_qt_app
+
     application = ensure_qt_app()
-    board = QtRasterBoard(("pulse",), columns=1)
-    board.resize(600, 450)
-    board.show()
-    board.present(BoardFrame(
-        "pulse-board", 0, 0, (_pulse_panel() if panel is None else panel,)
-    ))
-    board.bind_pulse_interaction("pulse", commands.append)
+    host = SinglePanelHost("pulse")
+    host.resize(600, 450)
+    host.show()
+    host.set_selectors_enabled(True)
+    host.rangeSelected.connect(events.append)
+    host.viewCommitted.connect(events.append)
+    host.crossSelected.connect(events.append)
+    host.present_frame(_pulse_frame(panel=panel))
     application.processEvents()
-    return application, board
+    return application, host
 
 
-def _target(board):
-    binding = board._numeric_binding_for_kind("pulse")
-    assert binding is not None
-    target = board._numeric_target(binding)
-    assert target is not None
-    return target
-
-
-def _point(rect, x_fraction: float, y_fraction: float):
-    from PyQt5 import QtCore
-
-    return QtCore.QPoint(
-        int(round(rect.left() + x_fraction * rect.width())),
-        int(round(rect.top() + y_fraction * rect.height())),
-    )
-
-
-def _drag_move(board, position, button) -> None:
-    from PyQt5 import QtCore, QtGui
-
-    board.mouseMoveEvent(
-        QtGui.QMouseEvent(
-            QtCore.QEvent.MouseMove,
-            QtCore.QPointF(position),
-            QtCore.Qt.NoButton,
-            button,
-            QtCore.Qt.NoModifier,
-        )
-    )
-
-
-def _wheel(board, position, delta: int):
-    from PyQt5 import QtCore, QtGui
-
-    event = QtGui.QWheelEvent(
-        QtCore.QPointF(position),
-        QtCore.QPointF(board.mapToGlobal(position)),
-        QtCore.QPoint(),
-        QtCore.QPoint(0, delta),
-        QtCore.Qt.NoButton,
-        QtCore.Qt.NoModifier,
-        QtCore.Qt.ScrollUpdate,
-        False,
-    )
-    board.wheelEvent(event)
-    return event
+def _pulse_plot_rect(host):
+    frame = host.front_frame
+    assert frame is not None
+    payload = frame.panels[0].display_payload
+    return normalized_subrect(host.board.rect(), payload.viewport.plot_bounds)
 
 
 def test_pulse_area_select_is_display_only_and_cannot_resolve_a_selection() -> None:
@@ -121,52 +99,44 @@ def test_pulse_area_select_is_display_only_and_cannot_resolve_a_selection() -> N
     from PyQt5 import QtCore, QtTest
     from zlc_frontend.selector import CurveRangeGesture
 
-    commands: list[object] = []
-    application, board = _board(commands)
-
-    def resolve(gesture):
-        commands.append(gesture)
-        if isinstance(gesture, CurveRangeGesture) and gesture.x_span is not None:
-            with pytest.raises(RuntimeError, match="display-only"):
-                board.selection_for_curve_range_gesture(gesture)
-
-    board.unbind_pulse_interaction()
-    board.bind_pulse_interaction("pulse", resolve)
+    events: list[object] = []
+    application, host = _pulse_host(events)
+    board = host.board
     try:
-        plot = _target(board).plot
-        payload = board.visible_pulse_payload()
-        assert payload is not None
+        plot = _pulse_plot_rect(host)
+        payload = host.front_frame.panels[0].display_payload
         x_low, x_high = payload.viewport.x_limits
+        origin = host.visible_interaction_origin()
+        assert origin is not None
 
-        start, end = _point(plot, 0.25, 0.50), _point(plot, 0.75, 0.50)
+        start = point_in_rect(plot, 0.25, 0.50)
+        end = point_in_rect(plot, 0.75, 0.50)
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
-        _drag_move(board, end, QtCore.Qt.LeftButton)
-        assert board._selector_hold is not None, "area drag must hold the panel front"
+        drag_mouse_move(board, end, QtCore.Qt.LeftButton)
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
 
-        gesture = commands[-1]
+        gesture = events[-1]
         assert isinstance(gesture, CurveRangeGesture)
+        assert gesture.origin == origin
         assert gesture.x_span is not None
         span_low, span_high = gesture.x_span
         assert x_low < span_low < span_high < x_high, (
             f"the selected span {gesture.x_span} must be a time range inside "
             f"the drawn frame {payload.viewport.x_limits}")
         assert not hasattr(payload.viewport.x_axis, "axis_id")
-        board.set_pulse_range_candidate(gesture.x_span)
-        assert board._numeric_bindings["pulse"].applied_span == pytest.approx(
-            gesture.x_span)
+        with pytest.raises(TypeError, match="requires a dataset source"):
+            host.area_commit_for_range_gesture(gesture, figure=object())
 
         # Click OUTSIDE the standing box (a press on its edge/centre is the
         # reference's resize/move grab, not a clearing click).
-        outside = _point(plot, 0.05, 0.10)
+        outside = point_in_rect(plot, 0.05, 0.10)
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=outside)
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=outside)
-        clear = commands[-1]
+        clear = events[-1]
         assert isinstance(clear, CurveRangeGesture) and clear.x_span is None
-        board.set_pulse_range_candidate(clear.x_span)
-        assert board._numeric_bindings["pulse"].applied_span is None
+        assert host.area_commit_for_range_gesture(clear, figure=object()) is None
     finally:
-        board.close()
+        host.close()
         application.processEvents()
 
 
@@ -177,17 +147,22 @@ def test_pulse_wheel_zoom_is_x_only_and_typed() -> None:
 
     from zlc_frontend.selector import CurveViewportCommit
 
-    commands: list[object] = []
-    application, board = _board(commands)
+    events: list[object] = []
+    application, host = _pulse_host(events)
+    board = host.board
     try:
-        plot = _target(board).plot
-        payload = board.visible_pulse_payload()
-        assert payload is not None
+        plot = _pulse_plot_rect(host)
+        payload = host.front_frame.panels[0].display_payload
         before = payload.viewport
 
-        _wheel(board, _point(plot, 0.5, 0.5), -120)
-        command = commands[-1]
+        assert send_wheel(
+            board,
+            point_in_rect(plot, 0.5, 0.5),
+            -120,
+        ).isAccepted()
+        command = events[-1]
         assert isinstance(command, CurveViewportCommit)
+        assert command.origin == host.visible_interaction_origin()
         candidate = command.viewport
         assert candidate.x_limits != before.x_limits, "wheel did not zoom time"
         assert candidate.y_limits == before.y_limits, (
@@ -196,41 +171,38 @@ def test_pulse_wheel_zoom_is_x_only_and_typed() -> None:
         assert candidate.home_x_limits == before.home_x_limits, (
             "home must stay pinned to the drawn frame")
     finally:
-        board.close()
+        host.close()
         application.processEvents()
 
 
 def test_pulse_cross_pins_and_clears() -> None:
     """Right click pins a continuous cross; right double-click clears it."""
 
-    from PyQt5 import QtCore, QtGui, QtTest
+    from PyQt5 import QtCore, QtTest
+    from zlc_frontend.selector import CrossGesture
 
-    commands: list[object] = []
-    application, board = _board(commands)
+    events: list[object] = []
+    application, host = _pulse_host(events)
+    board = host.board
     try:
-        plot = _target(board).plot
-        binding = board._numeric_bindings["pulse"]
+        plot = _pulse_plot_rect(host)
 
-        position = _point(plot, 0.33, 0.61)
+        position = point_in_rect(plot, 0.33, 0.61)
         QtTest.QTest.mouseClick(board, QtCore.Qt.RightButton, pos=position)
-        cross = binding.cross
-        assert cross is not None, "right click must pin the continuous cross"
-        payload = board.visible_pulse_payload()
+        pinned = events[-1]
+        assert isinstance(pinned, CrossGesture)
+        assert pinned.origin == host.visible_interaction_origin()
+        assert pinned.point is not None
+        payload = host.front_frame.panels[0].display_payload
         x_low, x_high = payload.viewport.x_limits
-        assert x_low <= cross[0] <= x_high
+        assert x_low <= pinned.point[0] <= x_high
 
-        board.mouseDoubleClickEvent(
-            QtGui.QMouseEvent(
-                QtCore.QEvent.MouseButtonDblClick,
-                QtCore.QPointF(position),
-                QtCore.Qt.RightButton,
-                QtCore.Qt.RightButton,
-                QtCore.Qt.NoModifier,
-            )
-        )
-        assert binding.cross is None, "right double-click must clear the cross"
+        send_mouse_double_click(board, position, QtCore.Qt.RightButton)
+        cleared = events[-1]
+        assert isinstance(cleared, CrossGesture)
+        assert cleared.point is None
     finally:
-        board.close()
+        host.close()
         application.processEvents()
 
 
@@ -240,54 +212,38 @@ def test_pulse_area_box_is_data_anchored_and_double_middle_zooms_to_it() -> None
     and the standing box (still the same data span) now covers the whole
     zoomed view instead of clinging to stale screen fractions."""
 
-    from PyQt5 import QtCore, QtGui, QtTest
+    from PyQt5 import QtCore, QtTest
     from zlc_frontend.selector import CurveRangeGesture, CurveViewportCommit
 
-    commands: list[object] = []
-    application, board = _board(commands)
+    events: list[object] = []
+    application, host = _pulse_host(events)
+    board = host.board
     try:
-        plot = _target(board).plot
-        start, end = _point(plot, 0.30, 0.30), _point(plot, 0.60, 0.70)
+        plot = _pulse_plot_rect(host)
+        before_y_limits = (
+            host.front_frame.panels[0].display_payload.viewport.y_limits
+        )
+        start = point_in_rect(plot, 0.30, 0.30)
+        end = point_in_rect(plot, 0.60, 0.70)
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
-        _drag_move(board, end, QtCore.Qt.LeftButton)
+        drag_mouse_move(board, end, QtCore.Qt.LeftButton)
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
-        gesture = commands[-1]
+        gesture = events[-1]
         assert isinstance(gesture, CurveRangeGesture)
         span = gesture.x_span
         assert span is not None
-        board.set_pulse_range_candidate(span)
-        binding = board._numeric_bindings["pulse"]
-        rect = binding.span_rect
-        assert rect is not None
-        # The standing box IS the selection, stored in data coordinates.
-        assert tuple(sorted((rect[0], rect[2]))) == pytest.approx(span)
 
-        # A REAL double-click arrives as press, release, press, dblclick,
-        # release -- the first press starts a pan the dblclick must shrug off.
-        centre = _point(_target(board).plot, 0.5, 0.5)
-        QtTest.QTest.mousePress(board, QtCore.Qt.MiddleButton, pos=centre)
-        QtTest.QTest.mouseRelease(board, QtCore.Qt.MiddleButton, pos=centre)
-        board.mousePressEvent(QtGui.QMouseEvent(
-            QtCore.QEvent.MouseButtonPress, QtCore.QPointF(centre),
-            QtCore.Qt.MiddleButton, QtCore.Qt.MiddleButton,
-            QtCore.Qt.NoModifier))
-        board.mouseDoubleClickEvent(QtGui.QMouseEvent(
-            QtCore.QEvent.MouseButtonDblClick, QtCore.QPointF(centre),
-            QtCore.Qt.MiddleButton, QtCore.Qt.MiddleButton,
-            QtCore.Qt.NoModifier))
-        board.mouseReleaseEvent(QtGui.QMouseEvent(
-            QtCore.QEvent.MouseButtonRelease, QtCore.QPointF(centre),
-            QtCore.Qt.MiddleButton, QtCore.Qt.NoButton, QtCore.Qt.NoModifier))
-        command = commands[-1]
+        send_mouse_double_click(
+            board,
+            point_in_rect(plot, 0.5, 0.5),
+            QtCore.Qt.MiddleButton,
+        )
+        command = events[-1]
         assert isinstance(command, CurveViewportCommit)
         assert command.viewport.x_limits == pytest.approx(span)
-        # The box did not move: still the same data span, regardless of the
-        # viewport it will next be painted through.
-        rect_after = binding.span_rect
-        assert rect_after is not None
-        assert tuple(sorted((rect_after[0], rect_after[2]))) == pytest.approx(span)
+        assert command.viewport.y_limits == before_y_limits
     finally:
-        board.close()
+        host.close()
         application.processEvents()
 
 
@@ -477,23 +433,24 @@ def test_document_digest_change_cancels_a_real_inflight_pulse_gesture() -> None:
     """A drag cannot commit against a newer document with a reused revision."""
 
     from PyQt5 import QtCore, QtTest
-    from zlc_frontend.render import BoardFrame
 
-    commands: list[object] = []
-    application, board = _board(commands)
+    events: list[object] = []
+    application, host = _pulse_host(events)
+    board = host.board
     try:
-        plot = _target(board).plot
-        start = _point(plot, 0.25, 0.5)
-        end = _point(plot, 0.75, 0.5)
+        plot = _pulse_plot_rect(host)
+        start = point_in_rect(plot, 0.25, 0.5)
+        end = point_in_rect(plot, 0.75, 0.5)
+        old_origin = host.visible_interaction_origin()
+        assert old_origin is not None
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
-        _drag_move(board, end, QtCore.Qt.LeftButton)
-        assert board._selector_hold is not None
+        drag_mouse_move(board, end, QtCore.Qt.LeftButton)
 
         changed = _pulse_panel(digest="f" * 64)
-        board.present(BoardFrame("pulse-board", 0, 1, (changed,)))
-        assert board._selector_hold is None
+        host.present_frame(_pulse_frame(panel=changed, sequence=1))
+        assert host.visible_interaction_origin() != old_origin
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
-        assert commands == []
+        assert events == []
     finally:
-        board.close()
+        host.close()
         application.processEvents()

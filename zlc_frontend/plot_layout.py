@@ -421,7 +421,8 @@ def optimal_grid_size_for_view(schema, view) -> str:
     initial recommendation has been consumed.
     """
 
-    from zlc_data import AxisSourceRef, DatasetSchema, resolve_point_rows
+    from zlc_data import AxisSourceRef, DatasetSchema
+    from zlc_data.schema import resolve_point_rows
     from .figure import (
         ViewSpec,
         grid_facet_source,

@@ -26,7 +26,6 @@ import numpy as np
 from zlc_storage import canonical_digest, canonical_text, sha256_text
 
 from zlc_data import (
-    AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID,
     AxisSourceRef,
     AxisSpec,
     BlockId,
@@ -36,26 +35,26 @@ from zlc_data import (
     DatasetRevisionRef,
     IndexRangeSelection,
     IndexSelection,
-    MissingPolicy,
     OwnedSnapshot,
-    ReductionMethod,
     ReductionSpec,
     Selection,
     StreamGenerationId,
-    ValidityPolicy,
-    apply_transform,
-    commit_transform,
-    committed_transform_to_tree,
-    dataset_revision_ref_to_tree,
-    expand_dataset_validity,
-    fit_spec_to_tree,
+)
+from zlc_data.codec import dataset_revision_ref_to_tree
+from zlc_data.fit import fit_spec_to_tree
+from zlc_data.output_contract import (
+    AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID,
+    projected_dataset_output_contract_id,
+)
+from zlc_data.selection import resolve_selection_indices, selection_to_tree
+from zlc_data.snapshot_projection import (
     materialize_dataset_acceptance_mask,
     materialize_fit_parameter_snapshots,
     materialize_scalar_dataset,
-    projected_dataset_output_contract_id,
-    resolve_selection_indices,
-    selection_to_tree,
 )
+from zlc_data.transform import apply_transform, commit_transform
+from zlc_data.transform_codec import committed_transform_to_tree
+from zlc_data.value import expand_dataset_validity
 from .curve_display import numeric_curve_coordinates
 from .data_figure import DataFigure
 from .figure import (
@@ -65,6 +64,7 @@ from .figure import (
     EvaluatedImage,
     ViewIntent,
 )
+from .figure.contract import _display_reduction_spec
 from .site_map import SiteMapPresentation
 from .figure_source import FigureSource
 from .render import (
@@ -514,27 +514,9 @@ def _compile_figure_transform(
     if terms_by_axis:
         operations.append(Selection(tuple(terms_by_axis.values())))
     if include_reductions:
-        reductions = tuple(
-            binding
-            for binding in view.source_bindings
-            if binding.role is AxisViewRole.REDUCED
-        )
-        if reductions:
-            methods = {binding.reduction.method.value for binding in reductions}
-            if len(methods) != 1:
-                raise ValueError("Figure reductions do not share one method")
-            method = {
-                "MEAN": ReductionMethod.MEAN,
-                "SUM": ReductionMethod.SUM,
-            }[methods.pop()]
-            operations.append(
-                ReductionSpec(
-                    tuple(binding.source for binding in reductions),
-                    method,
-                    missing_policy=MissingPolicy.OMIT_MISSING,
-                    validity_policy=ValidityPolicy.OMIT_INVALID,
-                )
-            )
+        reduction = _display_reduction_spec(view)
+        if reduction is not None:
+            operations.append(reduction)
     return commit_transform(
         schema,
         DataTransformSpec(tuple(operations)),
@@ -816,6 +798,87 @@ def area_data_output_presentation(
     )
 
 
+def _event_local_data_transform(
+    source: FigureSource,
+    transform: CommittedTransform,
+) -> DataTransformSpec:
+    """Project one Dataset transform onto a single signal event value.
+
+    A ``SignalEvent`` carries only ``ValueSchema`` data axes; its repeat and
+    point carriers are synthetic singleton axes owned by the event adapter.
+    A generation-scoped Figure commit may therefore preserve association only
+    when the rendered Dataset also has singleton carriers.  Operations on
+    those singleton carriers are identity and are removed, while every real
+    data-axis operation is retained verbatim.  Aggregated repeat/point domains
+    are fan-in and must not claim one-event-to-one-output association.
+    """
+
+    schema = source.snapshot.block.schema
+    if (
+        schema.repeat_axis.size != 1
+        or schema.point_table.row_count != 1
+        or transform.exact_point_ordinals != (0,)
+    ):
+        raise ValueError(
+            "Figure selector is not local to one repeat/point event"
+        )
+    repeat_axis_id = schema.repeat_axis.axis_id
+    data_axis_ids = frozenset(
+        axis.axis_id for axis in schema.cell_schema.data_axes
+    )
+    operations = []
+    for operation in transform.spec.operations:
+        if isinstance(operation, Selection):
+            terms = []
+            for term in operation.terms:
+                if term.axis_id == repeat_axis_id:
+                    continue
+                if term.axis_id not in data_axis_ids:
+                    raise ValueError(
+                        "Figure selector selection is not event-local"
+                    )
+                terms.append(term)
+            if terms:
+                operations.append(Selection(tuple(terms)))
+            continue
+        if isinstance(operation, ReductionSpec):
+            sources = []
+            for axis_source in operation.sources:
+                if (
+                    axis_source.kind == AxisSourceRef.TENSOR
+                    and axis_source.axis_id == repeat_axis_id
+                ):
+                    continue
+                if (
+                    axis_source.kind == AxisSourceRef.TENSOR
+                    and axis_source.axis_id in data_axis_ids
+                ):
+                    sources.append(axis_source)
+                    continue
+                if axis_source.kind != AxisSourceRef.TENSOR:
+                    # The point carrier is proven singleton above, so reducing
+                    # it is the same event-local identity as reducing repeat.
+                    continue
+                raise ValueError(
+                    "Figure selector reduction is not event-local"
+                )
+            if sources:
+                operations.append(
+                    ReductionSpec(
+                        tuple(sources),
+                        operation.method,
+                        missing_policy=operation.missing_policy,
+                        validity_policy=operation.validity_policy,
+                        minimum_valid_count=operation.minimum_valid_count,
+                    )
+                )
+            continue
+        # Histogram analysis is a display fan-in, not a replayable event-cell
+        # selector.  Keep this boundary closed if more operation kinds appear.
+        raise ValueError("Figure selector transform is not event-local")
+    return DataTransformSpec(tuple(operations))
+
+
 def figure_event_transform(
     source: FigureSource,
     commit: FigureAreaCommit | FigureCrossCommit,
@@ -848,7 +911,7 @@ def figure_event_transform(
     full_rows = tuple(range(snapshot.block.schema.point_table.row_count))
     if transform.exact_point_ordinals != full_rows:
         raise ValueError("point-row selection has no one-to-one event mapping")
-    return transform.spec
+    return _event_local_data_transform(source, transform)
 
 
 def figure_selector_identity(

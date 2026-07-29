@@ -9,37 +9,42 @@ from fractions import Fraction
 import numpy as np
 import pytest
 
-from zlc_data import (
+from zlc_data._arrays import immutable_array, is_intrinsically_immutable_array
+from zlc_data.axis import (
     REPEAT,
     SCAN_POINT,
     SITE,
     SPATIAL_X,
     SPATIAL_Y,
     AxisId,
-    AxisLayout,
     AxisSpec,
-    BlockId,
+)
+from zlc_data.codec import dataset_schema_from_tree, dataset_schema_to_tree
+from zlc_data.schema import (
+    DatasetSchema,
+    GridTopology,
+    PointColumn,
+    PointTable,
+    ValueSchema,
+)
+from zlc_data.validity import (
+    INVALID,
+    VALID,
     CellValidity,
     ComponentValidity,
-    DataBlock,
     DatasetComponentValidity,
-    DatasetRevision,
-    DatasetSchema,
-    INVALID,
-    PointLayout,
-    StreamGenerationId,
-    VALID,
     ValidityContract,
+)
+from zlc_data.value import (
+    BlockId,
+    DataBlock,
+    DatasetRevision,
+    StreamGenerationId,
     Value,
     ValuePayloadContract,
-    ValueSchema,
     canonical_value_array,
-    dataset_schema_from_tree,
-    dataset_schema_to_tree,
-    expand_value_validity,
     expand_component_validity,
-    immutable_array,
-    is_intrinsically_immutable_array,
+    expand_value_validity,
 )
 
 
@@ -57,12 +62,30 @@ def image_schema(*, component_validity: bool = False) -> ValueSchema:
 def dataset_schema(*, explicit: bool = False, component_validity: bool = False) -> DatasetSchema:
     repeat = axis("capture.repeat", REPEAT, 2)
     detuning = axis("scan.detuning", SCAN_POINT, 3)
-    layout = (
-        PointLayout.explicit((3,), ((2,), (0,)))
-        if explicit
-        else PointLayout.rect_c((3,))
+    point_values = (2, 0) if explicit else (0, 1, 2)
+    point_table = PointTable(
+        len(point_values),
+        (
+            PointColumn(
+                detuning.axis_id,
+                detuning.name,
+                detuning.role,
+                PointColumn.NUMERIC,
+                point_values,
+            ),
+        ),
     )
-    return DatasetSchema(repeat, (detuning,), layout, image_schema(component_validity=component_validity))
+    topology = GridTopology(
+        (detuning.axis_id,),
+        ((0, 1, 2),),
+        tuple((value,) for value in point_values),
+    )
+    return DatasetSchema(
+        repeat,
+        point_table,
+        topology,
+        image_schema(component_validity=component_validity),
+    )
 
 
 def test_scalar_has_the_canonical_length_one_carrier_axis():
@@ -97,7 +120,7 @@ def test_intrinsically_immutable_strided_views_cross_value_and_dataset_without_c
     assert is_intrinsically_immutable_array(value.values)
 
     repeat = axis("camera.transposed.repeat", REPEAT, 1)
-    schema = DatasetSchema(repeat, (), PointLayout.rect_c(()), value_schema)
+    schema = DatasetSchema(repeat, PointTable(1), None, value_schema)
     block = DataBlock(
         BlockId("immutable-transpose"),
         DatasetRevision(0),
@@ -114,41 +137,23 @@ def test_intrinsically_immutable_strided_views_cross_value_and_dataset_without_c
         block.values.setflags(write=True)
 
 
-@pytest.mark.parametrize("layout", [PointLayout.rect_c((2, 3)), PointLayout.rect_f((2, 3))])
-def test_rectangular_point_layout_round_trips_every_index(layout):
-    for storage_index in range(layout.storage_size):
-        multi = layout.multi_index(storage_index)
-        assert layout.storage_index(multi) == storage_index
-
-
-def test_explicit_layout_preserves_sparse_order_and_rejects_duplicates():
-    layout = PointLayout.explicit((4, 5), ((3, 1), (0, 4), (2, 2)))
-    assert [layout.multi_index(index) for index in range(3)] == [(3, 1), (0, 4), (2, 2)]
-    assert layout.storage_index((0, 4)) == 1
-    with pytest.raises(KeyError):
-        layout.storage_index((1, 1))
-    with pytest.raises(ValueError, match="duplicate"):
-        PointLayout.explicit((2,), ((0,), (0,)))
-
-
-def test_explicit_layout_reverse_lookup_is_preindexed():
-    mapping = tuple((index,) for index in range(5000))
-    layout = PointLayout.explicit((5000,), mapping)
-    assert all(layout.storage_index((index,)) == index for index in range(5000))
-
-
-def test_no_point_axes_have_one_storage_cell():
-    layout = PointLayout.rect_c(())
-    assert layout.storage_size == 1
-    assert layout.multi_index(0) == ()
-    assert layout.storage_index(()) == 0
-
-
 def test_dataset_rejects_duplicate_axis_identity_across_axis_families():
     repeat = axis("same", REPEAT, 1)
     point = axis("same", SCAN_POINT, 1)
+    point_table = PointTable(
+        1,
+        (
+            PointColumn(
+                point.axis_id,
+                point.name,
+                point.role,
+                PointColumn.NUMERIC,
+                (0,),
+            ),
+        ),
+    )
     with pytest.raises(ValueError, match="unique"):
-        DatasetSchema(repeat, (point,), PointLayout.rect_c((1,)), image_schema())
+        DatasetSchema(repeat, point_table, None, image_schema())
 
 
 def test_component_validity_is_named_and_cannot_broadcast_by_trailing_position():
@@ -183,7 +188,7 @@ def test_equal_sized_component_axes_broadcast_by_identity_not_shape():
     np.testing.assert_array_equal(component_valid, [[True, False], [True, False]])
 
 
-def test_dataset_component_validity_includes_repeat_and_physical_point_axes():
+def test_dataset_component_validity_includes_repeat_and_physical_point_rows():
     schema = dataset_schema(component_validity=True)
     site_like_x = schema.cell_schema.data_axes[1]
     validity = DatasetComponentValidity(
@@ -226,13 +231,9 @@ def test_datablock_owns_intrinsically_immutable_bytes():
 
 def test_dataset_ref_carries_complete_identity():
     schema = dataset_schema(explicit=True)
-    assert schema.cell_layout is schema.cell_layout
-    assert schema.cell_layout.factors is not None
-    assert schema.cell_layout.factors[-1] is schema.point_layout
     restored = dataset_schema_from_tree(dataset_schema_to_tree(schema))
-    assert restored.cell_layout == schema.cell_layout
-    assert restored.cell_layout.factors is not None
-    assert restored.cell_layout.factors[-1] is restored.point_layout
+    assert restored.point_table == schema.point_table
+    assert restored.grid_topology == schema.grid_topology
     block = DataBlock(
         BlockId("sparse-capture"),
         DatasetRevision(3),
@@ -244,15 +245,6 @@ def test_dataset_ref_carries_complete_identity():
     assert ref.block_id == block.block_id
     assert ref.revision == block.revision
     assert ref.schema_fingerprint == schema.fingerprint
-
-
-def test_point_layout_specialization_has_generic_structural_identity():
-    point = PointLayout.explicit((4,), ((3,), (1,)))
-    generic = AxisLayout.explicit((4,), ((3,), (1,)))
-
-    assert point == generic
-    assert generic == point
-    assert hash(point) == hash(generic)
 
 
 def test_dataset_schema_tree_matches_the_independent_current_grammar():
@@ -270,24 +262,27 @@ def test_dataset_schema_tree_matches_the_independent_current_grammar():
             "coordinate_frame": None,
             "index_origin": 0,
         },
-        "point_axes": [
-            {
-                "schema": "zlc_data.AxisSpec",
-                "axis_id": "scan.detuning",
-                "name": "scan.detuning",
-                "role": "scan-point",
-                "size": 3,
-                "coordinates": [0, 1, 2],
-                "unit": None,
-                "coordinate_frame": None,
-                "index_origin": 0,
-            }
-        ],
-        "point_layout": {
-            "logical_shape": [3],
-            "mode": "RECT_C",
-            "storage_size": 3,
-            "storage_to_multi": None,
+        "point_table": {
+            "schema": "zlc_data.PointTable",
+            "row_count": 3,
+            "columns": [
+                {
+                    "schema": "zlc_data.PointColumn",
+                    "coordinate_id": "scan.detuning",
+                    "name": "scan.detuning",
+                    "role": "scan-point",
+                    "value_kind": "NUMERIC",
+                    "values": [0, 1, 2],
+                    "unit": None,
+                    "coordinate_frame": None,
+                }
+            ],
+        },
+        "grid_topology": {
+            "schema": "zlc_data.GridTopology",
+            "dimension_ids": ["scan.detuning"],
+            "coordinate_domains": [[0, 1, 2]],
+            "row_to_cell": [[0], [1], [2]],
         },
         "cell_schema": {
             "schema": "zlc_data.ValueSchema",
@@ -331,7 +326,7 @@ def test_dataset_schema_tree_matches_the_independent_current_grammar():
         dataset_schema_from_tree(malformed)
 
 
-def test_schema_fingerprint_covers_layout_and_component_validity():
+def test_schema_fingerprint_covers_point_rows_topology_and_component_validity():
     sparse = dataset_schema(explicit=True, component_validity=True)
     dense = dataset_schema(explicit=False, component_validity=True)
     value_only = dataset_schema(explicit=True, component_validity=False)
@@ -447,12 +442,26 @@ def test_numeric_coordinates_have_one_python_and_fingerprint_identity():
     assert all(type(value) is int for value in negative_zero.coordinates)
 
     repeat = axis("repeat", REPEAT, 1)
-    left = DatasetSchema(repeat, (negative_zero,), PointLayout.rect_c((2,)), image_schema())
-    right = DatasetSchema(repeat, (integers,), PointLayout.rect_c((2,)), image_schema())
+    left_column = PointColumn(
+        negative_zero.axis_id,
+        negative_zero.name,
+        negative_zero.role,
+        PointColumn.NUMERIC,
+        negative_zero.coordinates,
+    )
+    right_column = PointColumn(
+        integers.axis_id,
+        integers.name,
+        integers.role,
+        PointColumn.NUMERIC,
+        integers.coordinates,
+    )
+    left = DatasetSchema(repeat, PointTable(2, (left_column,)), None, image_schema())
+    right = DatasetSchema(repeat, PointTable(2, (right_column,)), None, image_schema())
     assert left == right
     assert left.fingerprint == right.fingerprint
 
-    with pytest.raises(TypeError, match="integer"):
+    with pytest.raises(TypeError, match="finite number"):
         AxisSpec(AxisId("bool"), "bool", SCAN_POINT, 1, (True,))
     fractional = AxisSpec(
         AxisId("fraction"), "fraction", SCAN_POINT, 1, (Fraction(1, 2),)
@@ -460,57 +469,23 @@ def test_numeric_coordinates_have_one_python_and_fingerprint_identity():
     assert fractional.coordinates == (0.5,)
 
 
-def test_layout_constructor_normalizes_equal_physical_mappings():
-    assert PointLayout.rect_f((3,)) == PointLayout.rect_c((3,))
-    assert PointLayout.rect_f((1, 3, 1)) == PointLayout.rect_c((1, 3, 1))
-
-    c_mapping = tuple(np.ndindex(2, 3))
-    explicit_c = PointLayout.explicit((2, 3), c_mapping)
-    assert explicit_c == PointLayout.rect_c((2, 3))
-
-    f_mapping = tuple(
-        tuple(int(index) for index in np.unravel_index(row, (2, 3), order="F"))
-        for row in range(6)
-    )
-    explicit_f = PointLayout.explicit((2, 3), f_mapping)
-    assert explicit_f == PointLayout.rect_f((2, 3))
-
-    repeat = axis("repeat", REPEAT, 1)
-    points = (axis("row", SCAN_POINT, 2), axis("column", SCAN_POINT, 3))
-    left = DatasetSchema(repeat, points, explicit_c, image_schema())
-    right = DatasetSchema(repeat, points, PointLayout.rect_c((2, 3)), image_schema())
-    assert left.fingerprint == right.fingerprint
-
-    with_singleton = AxisLayout.product(
-        AxisLayout.rect_c((1,)),
-        AxisLayout.rect_f((2, 3)),
-    )
-    assert with_singleton == AxisLayout.rect_f((1, 2, 3))
-
-    empty_product = AxisLayout.product(
-        AxisLayout.explicit((4,), ()),
-        AxisLayout.rect_c((3,)),
-    )
-    assert empty_product == AxisLayout.explicit((4, 3), ())
-
-
 def test_repeat_role_has_exactly_one_structural_owner():
     repeat = axis("repeat", REPEAT, 1)
-    counterfeit_point = axis("counterfeit.point", REPEAT, 2)
-    with pytest.raises(ValueError, match="only"):
-        DatasetSchema(
-            repeat,
-            (counterfeit_point,),
-            PointLayout.rect_c((2,)),
-            image_schema(),
+    with pytest.raises(ValueError, match="point-domain"):
+        PointColumn(
+            AxisId("counterfeit.point"),
+            "counterfeit.point",
+            REPEAT,
+            PointColumn.NUMERIC,
+            (0, 1),
         )
 
     counterfeit_data = axis("counterfeit.data", REPEAT, 2)
     with pytest.raises(ValueError, match="only"):
         DatasetSchema(
             repeat,
-            (),
-            PointLayout.rect_c(()),
+            PointTable(1),
+            None,
             ValueSchema(
                 (counterfeit_data,),
                 ValidityContract.value(),

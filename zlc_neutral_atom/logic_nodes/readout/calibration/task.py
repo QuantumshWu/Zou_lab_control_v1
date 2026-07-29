@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Mapping, Protocol
 
 import numpy as np
 
-from zlc_data import expand_dataset_validity
+from zlc_data.value import expand_dataset_validity
 from zlc_neutral_atom.capture.artifact import CaptureRepository
 from zlc_neutral_atom.authoring import (
     AuthoringChoice,

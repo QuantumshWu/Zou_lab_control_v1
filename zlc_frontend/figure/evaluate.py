@@ -17,8 +17,8 @@ from zlc_data import (
     DataBlock,
     DatasetSchema,
     OwnedSnapshot,
-    expand_dataset_validity,
 )
+from zlc_data.value import expand_dataset_validity
 from zlc_data.numeric import (
     canonical_mean_dtype,
     canonical_sum_dtype,
@@ -26,6 +26,7 @@ from zlc_data.numeric import (
 )
 
 from .contract import (
+    _dataset_sources,
     _resolved_point_group_records,
     _resolve_selected_point_ordinals,
     _resolve_view_point_rows,
@@ -59,7 +60,6 @@ from .model import (
     FixedIndex,
     LatestNonempty,
     ReductionResolution,
-    SampleCoordinates,
     SourceViewBinding,
     ViewIntent,
     ViewSpec,
@@ -76,6 +76,34 @@ class FigureEvaluationCancelled(FigureEvaluationError):
 
 class FigureEvaluationDeadlineExceeded(FigureEvaluationError):
     """Evaluation crossed its caller-provided monotonic deadline."""
+
+
+def _view_bindings_in_schema_order(
+    schema: DatasetSchema,
+    view: ViewSpec,
+) -> tuple[SourceViewBinding, ...]:
+    """Separate canonical wire order from declared evaluation order."""
+
+    by_source = {binding.source: binding for binding in view.source_bindings}
+    return tuple(
+        by_source[source]
+        for source in _dataset_sources(schema)
+        if source in by_source
+    )
+
+
+def _addresses_in_schema_order(
+    schema: DatasetSchema,
+    *groups: tuple[AxisAddress, ...],
+) -> tuple[AxisAddress, ...]:
+    """Merge independently resolved point/tensor addresses by producer order."""
+
+    by_source = {item.source: item for group in groups for item in group}
+    return tuple(
+        by_source[source]
+        for source in _dataset_sources(schema)
+        if source in by_source
+    )
 
 
 @dataclass
@@ -270,7 +298,7 @@ def _prepare_working(
     if repeat_binding.role is not AxisViewRole.SELECTED:
         row_indices[repeat_source] = repeated
     topology = schema.grid_topology
-    for binding in view.source_bindings:
+    for binding in _view_bindings_in_schema_order(schema, view):
         source = binding.source
         if source.kind == AxisSourceRef.TENSOR or binding.role is AxisViewRole.SELECTED:
             continue
@@ -287,7 +315,7 @@ def _prepare_working(
             # identity.  Coordinate values are labels, never a Cartesian index.
             row_indices[source] = tiled_points
 
-    for binding in view.source_bindings:
+    for binding in _view_bindings_in_schema_order(schema, view):
         if (
             binding.source.kind == AxisSourceRef.GRID_DIMENSION
             and isinstance(binding.selector, FixedIndex)
@@ -455,7 +483,7 @@ def _reduce(
     )
     surviving_rows = tuple(
         binding.source
-        for binding in view.source_bindings
+        for binding in _view_bindings_in_schema_order(schema, view)
         if binding.source in working.row_indices
         and binding.source not in reduce_sources
         and binding.role
@@ -725,22 +753,6 @@ def _curve(
     raise FigureEvaluationError("curve X source disappeared before evaluation")
 
 
-def _sample_coordinate_values(
-    schema: DatasetSchema,
-    source: AxisSourceRef,
-    indices: np.ndarray,
-    guard: _EvaluationGuard,
-) -> tuple[Any, ...]:
-    values: list[Any] = []
-    for start in range(0, len(indices), 4096):
-        guard.check()
-        values.extend(
-            _source_coordinate(schema, source, int(index))
-            for index in indices[start : start + 4096]
-        )
-    return tuple(values)
-
-
 def _histogram(
     working: _WorkingData,
     schema: DatasetSchema,
@@ -749,9 +761,11 @@ def _histogram(
     *,
     value_unit: str | None,
 ) -> EvaluatedHistogram:
+    del guard
+    ordered_bindings = _view_bindings_in_schema_order(schema, view)
     sample_sources = {
         binding.source
-        for binding in view.source_bindings
+        for binding in ordered_bindings
         if binding.role is AxisViewRole.SAMPLE
     }
     remaining = set(working.row_indices) | set(working.data_sources)
@@ -759,36 +773,15 @@ def _histogram(
         raise FigureEvaluationError("histogram retains a non-sample source")
     flat_values = working.values.reshape(-1)
     flat_validity = working.validity.reshape(-1)
-    data_shape = working.values.shape[1:]
-    data_items = int(np.prod(data_shape, dtype=np.int64)) if data_shape else 1
-    coordinate_columns: dict[AxisSourceRef, np.ndarray] = {}
-    for source, indices in working.row_indices.items():
-        coordinate_columns[source] = np.repeat(indices, data_items)
-    if working.data_sources:
-        grids = np.meshgrid(
-            *(working.data_indices[source] for source in working.data_sources),
-            indexing="ij",
-        )
-        for source, grid in zip(working.data_sources, grids):
-            coordinate_columns[source] = np.tile(
-                np.asarray(grid).reshape(-1), len(working.values)
-            )
     keep = np.asarray(flat_validity, dtype=bool)
-    coordinates = []
-    for binding in view.source_bindings:
-        if binding.role is not AxisViewRole.SAMPLE:
-            continue
-        source = binding.source
-        indices = coordinate_columns[source][keep]
-        coordinates.append(
-            SampleCoordinates(
-                source,
-                _sample_coordinate_values(schema, source, indices, guard),
-            )
-        )
+    sample_sources = tuple(
+        binding.source
+        for binding in ordered_bindings
+        if binding.role is AxisViewRole.SAMPLE
+    )
     return EvaluatedHistogram(
         flat_values[keep],
-        tuple(coordinates),
+        sample_sources,
         int(len(flat_values) - np.count_nonzero(keep)),
         value_unit,
     )
@@ -908,30 +901,31 @@ class FigureEvaluator:
         guard.check()
         schema = block.schema
         view = layer.view
+        ordered_bindings = _view_bindings_in_schema_order(schema, view)
         working_base, resolutions = _prepare_working(block, view, guard)
         repeat_source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
 
         tensor_facets = tuple(
             binding.source
-            for binding in view.source_bindings
+            for binding in ordered_bindings
             if binding.role is AxisViewRole.FACET
             and binding.source.kind == AxisSourceRef.TENSOR
         )
         tensor_batches = tuple(
             binding.source
-            for binding in view.source_bindings
+            for binding in ordered_bindings
             if binding.role is AxisViewRole.BATCH
             and binding.source.kind == AxisSourceRef.TENSOR
         )
         reduction_bindings = tuple(
             binding
-            for binding in view.source_bindings
+            for binding in ordered_bindings
             if binding.role is AxisViewRole.REDUCED
         )
         point_records = _resolved_point_group_records(schema, view)
         point_group_sources = tuple(
             binding.source
-            for binding in view.source_bindings
+            for binding in ordered_bindings
             if binding.role in {AxisViewRole.FACET, AxisViewRole.BATCH}
             and binding.source.kind != AxisSourceRef.TENSOR
         )
@@ -1016,20 +1010,38 @@ class FigureEvaluator:
                         )
                         series.append(
                             EvaluatedSeries(
-                                (*point_batch_address, *tensor_batch_address),
+                                _addresses_in_schema_order(
+                                    schema,
+                                    point_batch_address,
+                                    tensor_batch_address,
+                                ),
                                 data,
                                 reduction_records,
                             )
                         )
                 if series:
+                    series.sort(
+                        key=lambda item: tuple(
+                            address.index for address in item.batch_address
+                        )
+                    )
                     cells.append(
                         EvaluatedCell(
-                            (*point_facet_address, *tensor_facet_address),
+                            _addresses_in_schema_order(
+                                schema,
+                                point_facet_address,
+                                tensor_facet_address,
+                            ),
                             tuple(series),
                         )
                     )
         if not cells:
             raise FigureEvaluationError("view resolved no visible cell")
+        cells.sort(
+            key=lambda item: tuple(
+                address.index for address in item.facet_address
+            )
+        )
         return EvaluatedLayer(
             layer.layer_id,
             layer.dataset_id,

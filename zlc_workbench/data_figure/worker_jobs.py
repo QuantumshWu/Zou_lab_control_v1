@@ -1,22 +1,22 @@
-"""DataFigure worker scheduling, Fit lifecycle, and atomic export jobs.
+"""DataFigure worker jobs for snapshot Fit, raster work, and atomic export.
 
 All Figure classification, renderer choice, payload construction, visual defaults,
 and front validation belong to :mod:`zlc_frontend.data_figure_render`.  This leaf
-owns only Workbench execution concerns: cancellation events, the capacity-one Fit
-lane, application-supplied Fit capabilities, and committing encoded bytes to disk.
+owns only pure worker calls around application-supplied capabilities and committing
+encoded bytes to disk.  Scheduling belongs to the Workbench composition owner.
 """
 
 from __future__ import annotations
 
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import CancelledError
 from dataclasses import dataclass
 from pathlib import Path
 import threading
 import time
 
 from zlc_data import (
-    AxisSourceRef,
     FitDeadlineExceeded,
+    FitResultBatch,
     FitSpec,
     Selection,
 )
@@ -25,7 +25,6 @@ from zlc_frontend import (
     DataFigure,
     FitAuthoringOption,
     HistogramBinProjection,
-    histogram_fit_transform,
     validate_fit_authoring_options,
 )
 from zlc_frontend.data_figure_presentation import (
@@ -33,16 +32,8 @@ from zlc_frontend.data_figure_presentation import (
     fit_result_draft_summary,
 )
 from zlc_frontend.data_figure_render import encode_data_figure_front_png
-from zlc_frontend.figure import AxisViewRole
 from zlc_frontend.plot_layout import PanelSurfaceGeometry
-from zlc_workbench.data_figure.fit_draft import FitDraftAuthority, FitDraftResult
 from zlc_workbench.window_runtime import stage_and_replace_export
-
-
-_FIT_WORK_EXECUTOR = ThreadPoolExecutor(
-    max_workers=1,
-    thread_name_prefix="zlc-data-figure-fit",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,11 +80,8 @@ def _require_not_cancelled(cancelled: threading.Event) -> None:
 def _prepare_fit_options(
     prepare,
     figure: DataFigure,
-    fit_sources: tuple[AxisSourceRef, ...],
-    axis_roles: tuple[tuple[AxisSourceRef, AxisViewRole], ...],
     selection: Selection | None,
     histogram_projection: HistogramBinProjection | None,
-    allow_prepared_transform: bool = False,
 ) -> tuple[FitAuthoringOption, ...]:
     if not isinstance(figure, DataFigure):
         raise TypeError("Fit preparation requires the exact visible DataFigure")
@@ -107,48 +95,28 @@ def _prepare_fit_options(
         not isinstance(option, FitAuthoringOption) for option in options
     ):
         raise ValueError("Fit preparation produced no FitAuthoringOption")
-    schemas = {
-        option.spec.committed_transform.source_schema_fingerprint
-        for option in options
-    }
     models = tuple(option.spec.model_id for option in options)
-    if len(schemas) != 1 or len(models) != len(set(models)):
-        raise ValueError("Fit options require one source schema and unique models")
-    if any(option.spec.independent_sources != fit_sources for option in options):
-        raise ValueError("Fit option axes differ from the exact displayed axes")
-    validated_allow_prepared_transform = bool(allow_prepared_transform)
-    if histogram_projection is not None:
-        required_transform = histogram_fit_transform(
-            figure,
-            histogram_projection,
-        )
-        if any(
-            option.spec.committed_transform != required_transform
-            for option in options
-        ):
-            raise ValueError(
-                "Histogram Fit options differ from the exact visible sample/bin authority"
-            )
-        # This is not permission for an injected arbitrary transform: the
-        # exact committed transform was reconstructed above from this Figure's
-        # named view plus the painted bin projection and matched byte-for-byte.
-        validated_allow_prepared_transform = True
+    if len(models) != len(set(models)):
+        raise ValueError("Fit options require unique models")
     return validate_fit_authoring_options(
         options,
-        fit_sources=fit_sources,
-        axis_roles=axis_roles,
+        figure=figure,
         selection=selection,
-        allow_prepared_transform=validated_allow_prepared_transform,
+        histogram_projection=histogram_projection,
     )
 
 
-def _execute_fit_draft(
-    authority: FitDraftAuthority,
+def _execute_snapshot_fit(
+    execute,
+    result_of,
+    figure: DataFigure,
+    source_frame: BoardFrame,
+    result_identity: str,
     spec: FitSpec,
     deadline_monotonic: float,
     window_cancelled: threading.Event,
     analysis_cancelled: threading.Event,
-) -> tuple[FitDraftResult, str]:
+) -> tuple[object, FitResultBatch, str, DataFigure, BoardFrame, object | None]:
     def cancelled() -> bool:
         return window_cancelled.is_set() or analysis_cancelled.is_set()
 
@@ -159,18 +127,25 @@ def _execute_fit_draft(
     if cancelled():
         raise CancelledError()
     if time.monotonic() >= deadline_monotonic:
-        raise FitDeadlineExceeded("fit expired while waiting for its worker lane")
-    draft = authority.execute(spec, cancelled, deadline_monotonic)
-    try:
-        return draft, fit_result_draft_summary(
-            draft.result,
-            check_cancelled=check_cancelled,
-        )
-    except BaseException:
-        # The authority already installed this live draft.  Presentation failure
-        # must release that exact generation so later submissions cannot deadlock.
-        authority.discard(draft)
-        raise
+        raise FitDeadlineExceeded("fit expired while waiting for compute")
+    execution = execute(spec, cancelled, deadline_monotonic)
+    if execution is None:
+        raise TypeError("fit executor returned no opaque execution")
+    result = result_of(execution)
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("fit result capability returned another result type")
+    check_cancelled()
+    summary = fit_result_draft_summary(
+        result,
+        check_cancelled=check_cancelled,
+    )
+    overlays = figure.materialize_transient_fit_overlays(
+        result,
+        source_frame,
+        result_identity=result_identity,
+        check_cancelled=check_cancelled,
+    )
+    return execution, result, summary, figure, source_frame, overlays
 
 
 def _export_typed_png(

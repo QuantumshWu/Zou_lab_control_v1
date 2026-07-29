@@ -19,7 +19,8 @@ def _source(*, revision: int):
         DatasetRevision,
         DatasetSchema,
         OwnedSnapshot,
-        PointLayout,
+        PointColumn,
+        PointTable,
         StreamGenerationId,
         ValidityContract,
         ValueSchema,
@@ -49,8 +50,21 @@ def _source(*, revision: int):
     valid[2, 2, 1] = False
     schema = DatasetSchema(
         repeat,
-        (scan,),
-        PointLayout.rect_c((scan.size,)),
+        PointTable(
+            scan.size,
+            (
+                PointColumn(
+                    scan.axis_id,
+                    scan.name,
+                    scan.role,
+                    PointColumn.NUMERIC,
+                    scan.coordinates,
+                    scan.unit,
+                    scan.coordinate_frame,
+                ),
+            ),
+        ),
+        None,
         ValueSchema(
             (site,),
             ValidityContract.components(site.axis_id),
@@ -81,6 +95,7 @@ def _composed_front(intent, *, revision: int, faceted: bool):
         FacetedHistogramDisplayState,
         HistogramDisplayState,
     )
+    from zlc_data import AxisSourceRef
     from zlc_frontend.figure import ViewPreferences, suggest_view
     from zlc_frontend.panel_render import (
         FacetedPanelFocus,
@@ -89,9 +104,17 @@ def _composed_front(intent, *, revision: int, faceted: bool):
     )
 
     snapshot, scan, site = _source(revision=revision)
+    site_source = AxisSourceRef.tensor(site.axis_id)
+    point_source = AxisSourceRef.point_coordinate(scan.axis_id)
     preferences = ViewPreferences(
-        facet_axis_ids=((site.axis_id,) if faceted else ()),
-        batch_axis_ids=(() if faceted else (site.axis_id,)),
+        x_source=(point_source if intent.value == "CURVE" else None),
+        facet_sources=((site_source,) if faceted else ()),
+        batch_sources=(() if faceted else (site_source,)),
+        sample_sources=(
+            (AxisSourceRef.point_rows(),)
+            if intent.value == "HISTOGRAM"
+            else ()
+        ),
     )
     suggestion = suggest_view(snapshot.block.schema, intent, preferences=preferences)
     assert suggestion.spec is not None
@@ -126,8 +149,7 @@ def _composed_front(intent, *, revision: int, faceted: bool):
     )
     assert overview.overview is not None
     region = overview.overview.regions[1]
-    assert region.focus_selection is not None
-    focus = FacetedPanelFocus(1, region.focus_selection)
+    focus = FacetedPanelFocus(1, region.focus_address)
     focused = composer.compose_faceted(
         snapshot,
         display=faceted_display,
@@ -137,7 +159,7 @@ def _composed_front(intent, *, revision: int, faceted: bool):
     assert focused.frame is not None
     focused_figure = focused.figure.focused_typed_panel(
         focus.panel_index,
-        expected_selection=focus.selection,
+        expected_address=focus.address,
         expected_intent=intent,
     )
     return composer, snapshot, scan, site, focused.frame, focused_figure
@@ -150,8 +172,8 @@ def test_area_and_cross_publish_the_exact_visible_data_context(
     faceted: bool,
 ) -> None:
     from zlc_data import (
+        CommittedTransform,
         CoordinateRangeSelection,
-        DataTransformSpec,
         IndexRangeSelection,
         Selection,
     )
@@ -163,6 +185,7 @@ def test_area_and_cross_publish_the_exact_visible_data_context(
         HistogramValueRangeSelection,
         bind_area_data_commit,
         bind_cross_data_commit,
+        cross_data_output_presentation,
         materialize_area_outputs,
         materialize_cross_outputs,
     )
@@ -205,7 +228,7 @@ def test_area_and_cross_publish_the_exact_visible_data_context(
                 float((edges[bin_index] + edges[bin_index + 1]) / 2.0),
                 float(counts[bin_index]),
             )
-            area_selection = HistogramValueRangeSelection(100.0, 140.0)
+            area_selection = (100.0, 140.0)
             expected_cross = int(counts[bin_index])
 
         area_commit = bind_area_data_commit(
@@ -220,7 +243,7 @@ def test_area_and_cross_publish_the_exact_visible_data_context(
             payload,
         )
         source = FigureSource(snapshot, source_contract_id="tests.selector-source")
-        area = materialize_area_outputs(source, area_commit.selection)[AREA_DATA_OUTPUT]
+        area = materialize_area_outputs(source, area_commit)[AREA_DATA_OUTPUT]
         cross = materialize_cross_outputs(source, cross_commit)[CROSS_DATA_OUTPUT]
     finally:
         composer.close()
@@ -231,28 +254,31 @@ def test_area_and_cross_publish_the_exact_visible_data_context(
     assert cross.snapshot.ref.revision == snapshot.ref.revision
     assert cross.snapshot.block.values.shape == (1, 1, 1)
     assert cross.snapshot.block.values[0, 0, 0] == pytest.approx(expected_cross)
-    assert cross.presentation.contract_id == "zlc_frontend.figure.cross-data"
+    assert (
+        cross_data_output_presentation(cross_commit).contract_id
+        == "zlc_frontend.figure.cross-data"
+    )
     assert area.snapshot.block.schema.repeat_axis.size == 4
-    assert area.snapshot.block.schema.point_layout.storage_size == (
+    assert area.snapshot.block.schema.point_table.row_count == (
         3 if intent is ViewIntent.CURVE else 5
     )
     if intent is ViewIntent.HISTOGRAM:
-        assert area.source_transform is None
+        assert isinstance(area_commit.authority, HistogramValueRangeSelection)
     else:
-        assert area.source_transform == DataTransformSpec(
-            (area_commit.selection,)
-        )
+        assert isinstance(area_commit.authority, CommittedTransform)
+        assert area_commit.authority.exact_point_ordinals == (1, 2, 3)
 
     if faceted:
-        if isinstance(area_commit.selection, Selection):
+        if isinstance(area_commit.authority, CommittedTransform):
+            selection = area_commit.authority.spec.operations[0]
+            assert isinstance(selection, Selection)
             site_terms = tuple(
                 term
-                for term in area_commit.selection.terms
+                for term in selection.terms
                 if term.axis_id == site.axis_id
             )
         else:
-            context = area_commit.selection.source_selection
-            assert context is not None
+            context = area_commit.authority.source_transform.spec.operations[0]
             site_terms = tuple(
                 term for term in context.terms if term.axis_id == site.axis_id
             )
@@ -275,11 +301,11 @@ def test_focused_selector_outputs_advance_only_with_their_exact_source_revision(
     from zlc_frontend.figure_outputs import (
         AREA_DATA_OUTPUT,
         CROSS_DATA_OUTPUT,
-        FigureOutputRequest,
-        FigureOutputSession,
         HistogramValueRangeSelection,
         bind_area_data_commit,
         bind_cross_data_commit,
+        materialize_area_outputs,
+        materialize_cross_outputs,
     )
     from zlc_frontend.render import CurvePanelPayload, HistogramPanelPayload
 
@@ -317,7 +343,7 @@ def test_focused_selector_outputs_advance_only_with_their_exact_source_revision(
                 float((edges[position] + edges[position + 1]) / 2.0),
                 float(payload.bin_counts[0][position]),
             )
-            selection = HistogramValueRangeSelection(100.0, 140.0)
+            selection = (100.0, 140.0)
         area = bind_area_data_commit(panel.source_identity, selection, figure)
         cross = bind_cross_data_commit(
             panel.source_identity,
@@ -328,35 +354,27 @@ def test_focused_selector_outputs_advance_only_with_their_exact_source_revision(
     finally:
         composer.close()
 
-    session = FigureOutputSession()
-    try:
-        first = session.evaluate(
-            FigureOutputRequest(
-                FigureSource(
-                    snapshot_7,
-                    source_contract_id="tests.selector-source",
-                ),
-                area=area,
-                cross=cross,
-            )
-        )
-        snapshot_8, _scan, _site = _source(revision=8)
-        second = session.evaluate(
-            FigureOutputRequest(
-                FigureSource(
-                    snapshot_8,
-                    source_contract_id="tests.selector-source",
-                ),
-                area=area,
-                cross=cross,
-            )
-        )
-    finally:
-        session.close()
+    source_7 = FigureSource(
+        snapshot_7,
+        source_contract_id="tests.selector-source",
+    )
+    first = {
+        **materialize_area_outputs(source_7, area),
+        **materialize_cross_outputs(source_7, cross),
+    }
+    snapshot_8, _scan, _site = _source(revision=8)
+    source_8 = FigureSource(
+        snapshot_8,
+        source_contract_id="tests.selector-source",
+    )
+    second = {
+        **materialize_area_outputs(source_8, area),
+        **materialize_cross_outputs(source_8, cross),
+    }
 
     for name in (AREA_DATA_OUTPUT, CROSS_DATA_OUTPUT):
-        assert first.outputs[name].source_ref == snapshot_7.ref
-        assert first.outputs[name].snapshot.ref.revision.value == 7
-        assert second.outputs[name].source_ref == snapshot_8.ref
-        assert second.outputs[name].snapshot.ref.revision.value == 8
-        assert second.outputs[name].snapshot.ref.revision != first.outputs[name].snapshot.ref.revision
+        assert first[name].source_ref == snapshot_7.ref
+        assert first[name].snapshot.ref.revision.value == 7
+        assert second[name].source_ref == snapshot_8.ref
+        assert second[name].snapshot.ref.revision.value == 8
+        assert second[name].snapshot.ref.revision != first[name].snapshot.ref.revision

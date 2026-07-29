@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from pprint import pformat
 from typing import TypeAlias
 
-from zlc_frontend import FlowGraph, flow_graph_from_tree
+from zlc_frontend.flow_graph import FlowGraph, flow_graph_from_tree
 from zlc_storage.paths import display_path
 
 
@@ -167,7 +167,9 @@ def _raw_projection(archive) -> str:
             "document": figure.document,
             "datasets": tuple(datasets),
             "fit_results": dict(figure.fit_results),
-            "presentation": value.presentation,
+            "figure_intent": value.figure_intent,
+            "size_name": value.size_name,
+            "display": value.display,
             "metadata": dict(value.metadata),
         },
         sort_dicts=False,
@@ -197,7 +199,13 @@ def project_figure_info(archive) -> FigureInfoProjection:
         )
     if document.selections:
         plot_rows.append(("selections", len(document.selections)))
-    plot_rows.append(("presentation", value.presentation))
+    plot_rows.extend(
+        (
+            ("figure_intent", value.figure_intent),
+            ("size", value.size_name),
+            ("display", value.display),
+        )
+    )
 
     measurement_rows = list(_dataset_projection(figure))
     measurement_rows.append(("path", display_path(str(archive.path))))

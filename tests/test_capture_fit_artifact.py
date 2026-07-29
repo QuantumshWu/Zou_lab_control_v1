@@ -9,14 +9,15 @@ import numpy as np
 import pytest
 
 from fpga.pulse_streamer.host.image import DEFAULT_CONFIG_PATH, default_clock_hz
-from zlc_data import (
+from zlc_data.axis import (
     AxisId,
+    AxisSourceRef,
     AxisSpec,
-    BlockId,
     REPEAT,
-    encode_fit_result_batch,
-    fit_spec_for,
 )
+from zlc_data.fit import fit_spec_for
+from zlc_data.fit_codec import encode_fit_result_batch
+from zlc_data.value import BlockId
 from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureTerminalRecord,
     CameraFrameRecord,
@@ -297,10 +298,17 @@ def _artifact_dispatch(case) -> ArtifactDispatch:
 
 def _execution(repository, case):
     artifact = case.capture_repository.load(case.capture_reference)
+    schema = artifact.frame_source.schema
     spec = fit_spec_for(
-        artifact.frame_source.schema,
+        schema,
         "exponential_decay",
-        fit_axis_ids=(AxisId("camera.x"),),
+        independent_sources=(
+            AxisSourceRef.tensor(AxisId("camera.x")),
+        ),
+        batch_sources=(
+            AxisSourceRef.point_rows(),
+            AxisSourceRef.tensor(AxisId("camera.y")),
+        ),
     )
     return repository.execute(
         _artifact_dispatch(case),

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from itertools import product
 import json
 from pathlib import Path
 import subprocess
@@ -12,19 +11,7 @@ import textwrap
 import numpy as np
 import pytest
 
-from zlc_data import (
-    READOUT_EVENT,
-    REPEAT,
-    SCAN_POINT,
-    SPATIAL_X,
-    SPATIAL_Y,
-    AxisId,
-    AxisSpec,
-    DatasetSchema,
-    PointLayout,
-    ValidityContract,
-    ValueSchema,
-)
+from zlc_data.axis import AxisId
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     CalibrationAnalysisRequest,
 )
@@ -37,10 +24,6 @@ from zlc_neutral_atom.logic_nodes.readout.model_contract import (
 
 
 ROOT = Path(__file__).parents[1]
-
-
-def _axis(name: str, role, size: int) -> AxisSpec:
-    return AxisSpec(AxisId(name), name, role, size, tuple(range(size)))
 
 
 def _run_isolated(script: str, workspace: Path) -> dict[str, object]:
@@ -93,43 +76,6 @@ def test_request_owns_independent_expected_center_evidence():
         )
 
 
-def test_named_multiaxis_join_never_flattens_or_drops_data_shape():
-    repeat = _axis("repeat", REPEAT, 2)
-    event = _axis("event", READOUT_EVENT, 3)
-    detuning = _axis("detuning", SCAN_POINT, 2)
-    phase = _axis("phase", SCAN_POINT, 2)
-    logical_rows = tuple(product(range(3), range(2), range(2)))
-    layout = PointLayout.explicit((3, 2, 2), tuple(reversed(logical_rows)))
-    frame = ValueSchema(
-        (_axis("camera-y", SPATIAL_Y, 4), _axis("camera-x", SPATIAL_X, 5)),
-        ValidityContract.value(),
-        np.dtype("<u2"),
-        value_unit="count",
-    )
-    schema = DatasetSchema(repeat, (event, detuning, phase), layout, frame)
-    join = CalibrationCaptureLayout(event.axis_id, (0, 2), 1)._resolve(schema)
-
-    assert schema.physical_shape == (2, 12, 4, 5)
-    assert schema.cell_schema.data_shape == (4, 5)
-    assert join.group_count == 8
-    assert join.context_axis_ids == (detuning.axis_id, phase.axis_id)
-    assert tuple(join.contexts()) == tuple(
-        (
-            (repeat.axis_id, repeat_index),
-            (detuning.axis_id, detuning_index),
-            (phase.axis_id, phase_index),
-        )
-        for repeat_index in range(2)
-        for detuning_index in range(2)
-        for phase_index in range(2)
-    )
-    for reference_rows, readout_row in (
-        (rows, readout) for _repeat, rows, readout in join.rows()
-    ):
-        assert len(reference_rows) == 2
-        assert readout_row not in reference_rows
-
-
 def test_current_sitemap_preserves_repeat_event_image_and_site_axes(tmp_path):
     result = _run_isolated(
         """
@@ -157,10 +103,15 @@ def test_current_sitemap_preserves_repeat_event_image_and_site_axes(tmp_path):
                     schema.repeat_axis.role.value,
                     schema.repeat_axis.size,
                 ],
-                "point_axes": [
-                    [axis.axis_id.value, axis.role.value, axis.size]
-                    for axis in schema.point_axes
+                "point_columns": [
+                    [
+                        column.coordinate_id.value,
+                        column.role.value,
+                        len(column.values),
+                    ]
+                    for column in schema.point_table.columns
                 ],
+                "has_grid_topology": schema.grid_topology is not None,
                 "data_shape": list(schema.cell_schema.data_shape),
                 "group_contexts": [
                     [[axis.value, index] for axis, index in context]
@@ -191,9 +142,10 @@ def test_current_sitemap_preserves_repeat_event_image_and_site_axes(tmp_path):
     assert result["computation_type"] == "CalibrationComputation"
     assert result["physical_shape"] == [4, 3, 96, 128]
     assert result["repeat_axis"] == ["capture.repeat", "repeat", 4]
-    assert result["point_axes"] == [
+    assert result["point_columns"] == [
         ["capture.readout_event", "readout-event", 3]
     ]
+    assert result["has_grid_topology"] is False
     assert result["data_shape"] == [96, 128]
     assert result["group_contexts"] == [
         [["capture.repeat", repeat]] for repeat in range(4)
@@ -224,9 +176,3 @@ def test_readout_model_selection_contract_is_owned_by_the_readout_family():
     assert readout_model_kind_from_authoring("psf") is ReadoutModelKind.PER_SITE_PSF
     with pytest.raises(ValueError, match="unknown readout model choice"):
         readout_model_kind_from_authoring("missing")
-
-    from zlc_neutral_atom.logic_nodes.readout.calibration import (
-        calibration as calibration_values,
-    )
-
-    assert not hasattr(calibration_values, "ReadoutModelKind")

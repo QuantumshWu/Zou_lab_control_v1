@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 import numpy as np
-from zlc_data import FitBatchStatus, analyze_bimodal_distribution
+from zlc_data import FitBatchStatus
+from zlc_data.fit import analyze_bimodal_distribution
 from .figure import (
     EvaluatedAxis,
     EvaluatedCurve,
@@ -18,7 +19,6 @@ from .histogram_display import (
     DEFAULT_HISTOGRAM_BINS,
     FacetedHistogramDisplayState,
     HistogramBinProjection,
-    HistogramCountScale,
     HistogramDisplayState,
     HistogramViewportTransform,
     histogram_count_limits,
@@ -47,6 +47,28 @@ from .render_style import (
 from ._mpl_common import (
     _series_label,
 )
+
+_AUTOMATIC_ANALYSIS_NOT_SUPPLIED = object()
+
+
+def _histogram_analysis_cache(cache, counts_group, edges):
+    """Return the exact observation-keyed automatic bimodal analysis cache."""
+
+    primary_counts = np.asarray(counts_group[0])
+    edge_values = np.asarray(edges)
+    key = (
+        edge_values.dtype.str,
+        edge_values.tobytes(order="C"),
+        primary_counts.dtype.str,
+        primary_counts.tobytes(order="C"),
+    )
+    if cache is not None and cache[0] == key:
+        return cache
+    bin_centers = (edge_values[:-1] + edge_values[1:]) * 0.5
+    return (
+        key,
+        analyze_bimodal_distribution(bin_centers, primary_counts),
+    )
 
 def _histogram_left_fraction(
     threshold: float,
@@ -218,6 +240,7 @@ def _update_histogram_presentation(
     stats_text=None,
     show_stats: bool,
     threshold_linewidth: float,
+    automatic_analysis=_AUTOMATIC_ANALYSIS_NOT_SUPPLIED,
 ):
     """Draw Distribution's one automatic analysis or a formal Fit projection.
 
@@ -251,13 +274,14 @@ def _update_histogram_presentation(
     ):
         raise ValueError("formal histogram Fit overlays must align with series")
 
-    automatic_analysis = None
-    if not fit_overlays:
-        bin_centers = (edges[:-1] + edges[1:]) * 0.5
-        automatic_analysis = analyze_bimodal_distribution(
-            bin_centers,
-            counts_group[0],
-        )
+    if fit_overlays:
+        automatic_analysis = None
+    elif automatic_analysis is _AUTOMATIC_ANALYSIS_NOT_SUPPLIED:
+        automatic_analysis = _histogram_analysis_cache(
+            None,
+            counts_group,
+            edges,
+        )[1]
 
     fit_artists = tuple(fit_artists)
     required_artist_count = 3 * len(counts_group)

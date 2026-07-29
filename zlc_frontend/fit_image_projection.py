@@ -10,8 +10,8 @@ from zlc_data import (
     DatasetSchema,
     FitBatchStatus,
     FitResultBatch,
-    validate_fit_result_source_binding,
 )
+from zlc_data.fit import validate_fit_result_source_binding
 from zlc_storage import canonical_text
 
 from .figure import (
@@ -207,16 +207,7 @@ def transient_single_panel_radial_fit_overlay(
     }
     if any(
         document_layer.view.binding(source).role not in allowed_batch_roles
-        and not (
-            axis.size == 1
-            and document_layer.view.binding(source).role
-            is AxisViewRole.REDUCED
-        )
-        for source, axis in zip(
-            result.spec.batch_sources,
-            result.batch_axis_specs,
-            strict=True,
-        )
+        for source in result.spec.batch_sources
     ):
         raise ValueError("cached IMAGE view does not uniquely bind fit batch axes")
     if len(layer.cells) != 1 or len(layer.cells[0].series) != 1:
@@ -232,7 +223,14 @@ def transient_single_panel_radial_fit_overlay(
     ):
         raise ValueError("cached IMAGE axes differ from radial fit axes")
 
-    selected_by_source = dict(_fit_display_selection_indices(source_schema, result))
+    selected_by_source = dict(
+        _fit_display_selection_indices(
+            source_schema,
+            document_layer.view,
+            layer.resolutions,
+            result,
+        )
+    )
     for evaluated_axis, fit_axis, source in zip(
         (image.x_axis, image.y_axis),
         result.fit_axis_specs,

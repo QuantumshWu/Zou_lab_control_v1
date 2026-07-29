@@ -17,12 +17,13 @@ import Zou_lab_control.api as zlc
 import Zou_lab_control.api.facade as facade_impl
 import Zou_lab_control.api._readout_core as readout_core_impl
 from zlc_data import (
+    AxisSourceRef,
     FitCancelled,
     FitNumericPolicy,
     SPATIAL_X,
     SPATIAL_Y,
-    encode_fit_result_batch,
 )
+from zlc_data.fit_codec import encode_fit_result_batch
 from zlc_neutral_atom.artifacts import (
     FitResultArtifactRef,
     FitResultRepository,
@@ -95,10 +96,30 @@ def _case_capture_and_fit(root: Path) -> None:
         ) == (0, 1, 2)
 
         convenience_reference = exp.readout.capture(IMAGING_PULSE)
-        assert exp.readout.load_capture(convenience_reference).pulse_evidence is not None
+        convenience_capture = exp.readout.load_capture(convenience_reference)
+        assert convenience_capture.pulse_evidence is not None
+        fit_schema = convenience_capture.frame_source.schema
+        fit_axes = {axis.role: axis for axis in fit_schema.cell_schema.data_axes}
+        batch_sources = (
+            *(
+                (AxisSourceRef.tensor(fit_schema.repeat_axis.axis_id),)
+                if fit_schema.repeat_axis.size > 1
+                else ()
+            ),
+            *(
+                (AxisSourceRef.point_rows(),)
+                if fit_schema.point_table.row_count > 1
+                else ()
+            ),
+        )
         execution = exp.fit(
             convenience_reference,
             model="radial_gaussian_center",
+            independent_sources=(
+                AxisSourceRef.tensor(fit_axes[SPATIAL_X].axis_id),
+                AxisSourceRef.tensor(fit_axes[SPATIAL_Y].axis_id),
+            ),
+            batch_sources=batch_sources,
             numeric_policy=FitNumericPolicy(
                 max_evaluations=500,
             ),
@@ -107,10 +128,10 @@ def _case_capture_and_fit(root: Path) -> None:
             SPATIAL_X,
             SPATIAL_Y,
         )
-        assert execution.result.spec.batch_axis_ids == tuple(
-            axis.axis_id for axis in execution.result.batch_axis_specs
+        assert execution.result.spec.batch_sources == batch_sources
+        assert execution.result.batch_layout.storage_size == (
+            fit_schema.repeat_axis.size * fit_schema.point_table.row_count
         )
-        assert len(execution.result.batch_axis_specs) == 2
 
         fit_ref = execution.save()
         assert isinstance(fit_ref, FitResultArtifactRef)

@@ -32,18 +32,18 @@ def _special_figure_projection(
         output=output,
         materialize=materialize,
     )
-    dataset_source = getattr(projected, "source", None)
+    if not isinstance(projected, tuple) or len(projected) != 2:
+        raise TypeError(
+            "artifact Figure projection must return (ArtifactDatasetSource, FigureIntent)"
+        )
+    dataset_source, figure_intent = projected
     if not isinstance(dataset_source, ArtifactDatasetSource):
         raise TypeError("artifact Figure projection lost its Dataset source")
-    label = str(getattr(projected, "label", "")).strip()
-    if not label:
-        raise ValueError("artifact Figure projection requires a visible label")
-    resolver = getattr(projected, "resolve_preferences", None)
-    if not callable(resolver):
-        raise TypeError("artifact Figure projection must resolve view preferences")
-    if not hasattr(projected, "default_intent"):
-        raise TypeError("artifact Figure projection requires a default intent")
-    return projected, dataset_source, label
+    from zlc_frontend.plot_panel import FigureIntent
+
+    if not isinstance(figure_intent, FigureIntent):
+        raise TypeError("artifact Figure projection lost its FigureIntent")
+    return dataset_source, figure_intent
 
 
 def project_figure(
@@ -61,10 +61,11 @@ def project_figure(
 ):
     """Resolve application artifacts, then delegate all view policy to frontend."""
 
-    from zlc_frontend import (
+    from zlc_frontend.frozen_figure import (
         FrozenFigureSource,
         build_frozen_data_figure,
         build_frozen_figure_document,
+        resolve_frozen_figure_intent,
     )
 
     if not isinstance(artifacts, ArtifactDispatch):
@@ -86,7 +87,7 @@ def project_figure(
 
     fit_result = draft_fit_result
     dataset_source = preprojected_source
-    owner_projection = None
+    owner_figure_intent = None
     source_ref = None
     source_label = "artifact"
 
@@ -124,12 +125,13 @@ def project_figure(
             raise ValueError(
                 "a special artifact Figure projection owns its Dataset source"
             )
-        owner_projection, dataset_source, source_label = _special_figure_projection(
+        dataset_source, owner_figure_intent = _special_figure_projection(
             artifacts,
             source,
             output=artifact_output,
             materialize=materialize,
         )
+        source_label = owner_figure_intent.value_label
     elif artifacts.can_project_dataset(source):
         if artifact_output is not None:
             raise ValueError(
@@ -156,15 +158,6 @@ def project_figure(
         else dataset_source.snapshot
     )
 
-    resolved_intent = intent
-    resolved_preferences = preferences
-    if fit_result is None and owner_projection is not None:
-        if resolved_intent is None:
-            resolved_intent = owner_projection.default_intent
-        resolved_preferences = owner_projection.resolve_preferences(
-            resolved_intent,
-            resolved_preferences,
-        )
     frontend_source = FrozenFigureSource(
         label=(
             source_label
@@ -176,21 +169,42 @@ def project_figure(
         snapshot=snapshot,
         fit_result=fit_result,
     )
+    if (
+        fit_result is None
+        and owner_figure_intent is not None
+        and intent is None
+        and point_ordinals is None
+        and preferences is None
+    ):
+        figure_intent = owner_figure_intent
+    else:
+        figure_intent = resolve_frozen_figure_intent(
+            frontend_source,
+            intent=intent,
+            point_ordinals=point_ordinals,
+            preferences=preferences,
+            title=(
+                None
+                if owner_figure_intent is None
+                else owner_figure_intent.title
+            ),
+            value_label=(
+                None
+                if owner_figure_intent is None
+                else owner_figure_intent.value_label
+            ),
+        )
     if not materialize:
         document = build_frozen_figure_document(
             frontend_source,
-            intent=resolved_intent,
-            point_ordinals=point_ordinals,
-            preferences=resolved_preferences,
+            figure_intent,
         )
-        return document, None, fit_result
+        return document, None, figure_intent, fit_result
     figure = build_frozen_data_figure(
         frontend_source,
-        intent=resolved_intent,
-        point_ordinals=point_ordinals,
-        preferences=resolved_preferences,
+        figure_intent,
     )
-    return figure.document, figure, fit_result
+    return figure.document, figure, figure_intent, fit_result
 
 
 def data_figure_for_services(
@@ -204,10 +218,10 @@ def data_figure_for_services(
     artifact_output: str | None,
     draft_fit_result: FitResultBatch | None = None,
     preprojected_source: ArtifactDatasetSource | None = None,
-) -> "DataFigure":
+) -> tuple["DataFigure", object]:
     """Build one frozen DataFigure while repository authority stays private."""
 
-    _document, figure, _fit_result = project_figure(
+    _document, figure, figure_intent, _fit_result = project_figure(
         services,
         artifacts,
         source,
@@ -221,7 +235,7 @@ def data_figure_for_services(
     )
     if figure is None:
         raise RuntimeError("frozen Figure source was not materialized")
-    return figure
+    return figure, figure_intent
 
 
 __all__ = ["data_figure_for_services", "project_figure"]

@@ -7,27 +7,39 @@ from typing import Callable, Literal
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from zlc_data import Selection
+from zlc_data import DatasetRevisionRef, FitBatchStatus, Selection
 from zlc_storage import canonical_text, nonnegative_integer
 
 from ..display_range import validated_display_range
 from ..image_view import validate_normalized_rectangle
 from ..render import (
     BoardFrame,
+    CurveFitOverlay,
     CurvePanelPayload,
     DisplayPayload,
+    HistogramFitOverlay,
     HistogramPanelPayload,
     ImagePanelPayload,
     MeterPanelPayload,
+    PanelFrame,
     PulsePanelPayload,
+    RadialGaussianImageFitOverlay,
     SiteMapPanelPayload,
     detached_render_fault,
 )
+from ..render_style import (
+    ANNOTATION_FONT_SIZE,
+    FIT_FAILURE_COLOR,
+    FIT_RADIAL_CENTER_SIZE,
+    FIT_RADIAL_COLOR,
+    FIT_RADIAL_RING_ALPHA,
+    FIT_RADIAL_RING_LINEWIDTH,
+    bimodal_fit_line_specs,
+    curve_fit_line_kwargs,
+)
 from ..selector import (
     CrossGesture,
-    CurveInteractionIntent,
     CurveRangeGesture,
-    HistogramInteractionIntent,
     HistogramRangeGesture,
     ImageInteractionCommit,
     ImageViewportTransform,
@@ -35,9 +47,9 @@ from ..selector import (
     PanelInteractionOrigin,
     RectangleGesture,
 )
+from ..typography import FONT_FAMILY as PLOT_FONT_FAMILY
 from ._raster_front import (
     _HeldPanelFront,
-    _advance_held_front,
     _image_payload,
     _hold_matches_frame,
     _panel_bounds,
@@ -89,6 +101,7 @@ from ._raster_numeric_interaction import (
     _commit_histogram_thresholds as _commit_numeric_thresholds,
     _commit_numeric_viewport as _commit_numeric_x_viewport,
     _numeric_payload,
+    _numeric_plot_geometry,
     _held_panel_from_numeric_target,
     _paint_numeric_overlays,
     _numeric_target,
@@ -106,6 +119,388 @@ from ._rectangle_selector import (
     hit_rectangle_handle,
 )
 from .style import BG
+
+
+_FitOverlays = (
+    RadialGaussianImageFitOverlay
+    | tuple[CurveFitOverlay, ...]
+    | tuple[HistogramFitOverlay, ...]
+)
+_InstalledFitOverlay = tuple[PanelFrame, tuple[object, ...]]
+
+
+def _fit_payload_ref(payload) -> DatasetRevisionRef:
+    if isinstance(payload, (ImagePanelPayload, CurvePanelPayload, HistogramPanelPayload)):
+        return payload.evaluated_input.ref
+    raise TypeError("Fit overlays require an IMAGE, CURVE, or HISTOGRAM payload")
+
+
+def _payload_has_composed_fit(payload) -> bool:
+    if isinstance(payload, ImagePanelPayload):
+        return payload.fit_overlay is not None
+    if isinstance(payload, (CurvePanelPayload, HistogramPanelPayload)):
+        return bool(payload.fit_overlays)
+    return False
+
+
+def _fit_overlays(payload) -> _FitOverlays:
+    if isinstance(payload, ImagePanelPayload) and payload.fit_overlay is not None:
+        return payload.fit_overlay
+    if isinstance(payload, (CurvePanelPayload, HistogramPanelPayload)) and (
+        payload.fit_overlays
+    ):
+        return payload.fit_overlays
+    raise ValueError("Fit overlay panel requires one composed typed payload")
+
+
+def _validated_fit_overlay_panel(
+    source_panel: PanelFrame,
+    overlay_panel: PanelFrame,
+    *,
+    source_projection_key: tuple[object, ...],
+) -> _InstalledFitOverlay:
+    """Admit only a canonical payload replacement of the exact source panel."""
+
+    if not isinstance(source_panel, PanelFrame):
+        raise TypeError("Fit source must be PanelFrame")
+    if not isinstance(overlay_panel, PanelFrame):
+        raise TypeError("Fit overlay must be PanelFrame")
+    source_payload = source_panel.display_payload
+    overlay_payload = overlay_panel.display_payload
+    if _payload_has_composed_fit(source_payload):
+        raise ValueError("live Fit overlays require an uncomposed base raster")
+    if not _payload_has_composed_fit(overlay_payload):
+        raise ValueError("Fit overlay panel has no composed primitives")
+    if (
+        overlay_panel.panel_id != source_panel.panel_id
+        or overlay_panel.coherence_group != source_panel.coherence_group
+        or overlay_panel.source_identity is not source_panel.source_identity
+        or overlay_panel.coherence_stamp is not source_panel.coherence_stamp
+        or overlay_panel.raster is not source_panel.raster
+        or type(overlay_payload) is not type(source_payload)
+    ):
+        raise ValueError("Fit overlay changed its immutable source panel")
+    if not isinstance(
+        source_payload,
+        (ImagePanelPayload, CurvePanelPayload, HistogramPanelPayload),
+    ):
+        raise TypeError("Fit overlay panel has another renderer family")
+    if overlay_payload.evaluated_input is not source_payload.evaluated_input:
+        raise ValueError("Fit overlay changed its evaluated input")
+    if overlay_payload.viewport is not source_payload.viewport:
+        raise ValueError("Fit overlay changed its display viewport")
+    if isinstance(source_payload, ImagePanelPayload):
+        unchanged = (
+            overlay_payload.image is source_payload.image
+            and overlay_payload.raster_geometry is source_payload.raster_geometry
+            and overlay_payload.data_range == source_payload.data_range
+            and overlay_payload.colormap == source_payload.colormap
+            and overlay_payload.color_limits == source_payload.color_limits
+        )
+    else:
+        unchanged = (
+            len(overlay_payload.series) == len(source_payload.series)
+            and all(
+                overlaid is source
+                for overlaid, source in zip(
+                    overlay_payload.series,
+                    source_payload.series,
+                    strict=True,
+                )
+            )
+            and overlay_payload.series_labels == source_payload.series_labels
+        )
+        if isinstance(source_payload, HistogramPanelPayload):
+            unchanged = unchanged and (
+                overlay_payload.bin_projection is source_payload.bin_projection
+                and overlay_payload.thresholds == source_payload.thresholds
+            )
+    if not unchanged:
+        raise ValueError("Fit overlay changed its frozen base payload")
+    overlays = _fit_overlays(overlay_payload)
+    prediction_points = ()
+    if isinstance(overlay_payload, CurvePanelPayload):
+        maximum_points = max(2, 2 * overlay_panel.raster.width)
+        converged = tuple(
+            item for item in overlays
+            if item.status is FitBatchStatus.CONVERGED
+        )
+        if any(item.coordinates is None for item in converged):
+            raise ValueError("live curve Fit overlay is not a bounded paint primitive")
+        prediction_points = tuple(item.coordinates.size for item in converged)
+    elif isinstance(overlay_payload, HistogramPanelPayload):
+        maximum_points = max(2, 2 * overlay_panel.raster.width)
+        prediction_points = tuple(
+            item.coordinates.size * len(item.component_predictions)
+            for item in overlays
+            if item.status is FitBatchStatus.CONVERGED
+        )
+    if prediction_points and (
+        max(prediction_points) > maximum_points
+        or sum(prediction_points) > maximum_points
+    ):
+        raise ValueError("live Fit overlay exceeds its panel prediction point budget")
+    return overlay_panel, source_projection_key
+
+
+def _fit_overlay_status(
+    installed: _InstalledFitOverlay,
+    *,
+    source_identity,
+    payload,
+    current_projection_key: tuple[object, ...] | None,
+) -> Literal["CURRENT", "LAGGING", "INCOMPATIBLE"]:
+    try:
+        current_ref = _fit_payload_ref(payload)
+    except (TypeError, ValueError):
+        return "INCOMPATIBLE"
+    overlay_panel, source_projection = installed
+    if overlay_panel.source_identity != source_identity:
+        return "INCOMPATIBLE"
+    if (
+        current_projection_key is None
+        or source_projection[0] != current_projection_key[0]
+    ):
+        return "INCOMPATIBLE"
+    if _fit_payload_ref(overlay_panel.display_payload) != current_ref:
+        return "LAGGING"
+    return (
+        "CURRENT"
+        if source_projection[1] == current_projection_key[1]
+        else "INCOMPATIBLE"
+    )
+
+
+def _numeric_fit_point(bounds, viewport, x: float, y: float) -> QtCore.QPointF | None:
+    try:
+        normalized_x, normalized_y = viewport.data_to_widget_normalized(x, y)
+    except (TypeError, ValueError):
+        return None
+    return QtCore.QPointF(
+        bounds.x() + normalized_x * bounds.width(),
+        bounds.y() + normalized_y * bounds.height(),
+    )
+
+
+def _fit_pen(painter: QtGui.QPainter, style: dict[str, object]) -> QtGui.QPen:
+    color = QtGui.QColor(str(style["color"]))
+    color.setAlphaF(float(style.get("alpha", 1.0)))
+    pen = QtGui.QPen(color)
+    pen.setWidthF(
+        float(style.get("linewidth", 1.0))
+        * float(painter.device().logicalDpiX())
+        / 72.0
+    )
+    return pen
+
+
+def _paint_fit_path(painter, bounds, viewport, xs, ys, style) -> None:
+    path = QtGui.QPainterPath()
+    active = False
+    for x, y in zip(xs, ys, strict=True):
+        point = _numeric_fit_point(bounds, viewport, float(x), float(y))
+        if point is None:
+            active = False
+        elif active:
+            path.lineTo(point)
+        else:
+            path.moveTo(point)
+            active = True
+    painter.setPen(_fit_pen(painter, style))
+    painter.setBrush(QtCore.Qt.NoBrush)
+    painter.drawPath(path)
+
+
+def _paint_fit_label(
+    painter: QtGui.QPainter,
+    target: QtCore.QRectF,
+    status: str,
+    diagnostic: str,
+) -> None:
+    color = QtGui.QColor(FIT_FAILURE_COLOR if diagnostic else FIT_RADIAL_COLOR)
+    painter.setPen(color)
+    font = painter.font()
+    font.setFamily(PLOT_FONT_FAMILY)
+    font.setPointSizeF(ANNOTATION_FONT_SIZE)
+    painter.setFont(font)
+    text = f"FIT · {status}"
+    if diagnostic:
+        text = f"{text}\n{diagnostic}"
+    painter.drawText(
+        target.adjusted(3.0, 2.0, -3.0, -2.0),
+        QtCore.Qt.AlignTop | QtCore.Qt.AlignRight,
+        text,
+    )
+
+
+def _paint_fit_overlays(
+    painter: QtGui.QPainter,
+    *,
+    widget_rect: QtCore.QRect,
+    panel_ids: tuple[str, ...],
+    columns: int,
+    front,
+    hold: _HeldPanelFront | None,
+    installed: _InstalledFitOverlay | None,
+    current_projection_key: tuple[object, ...] | None,
+) -> None:
+    if front is None or installed is None:
+        return
+    overlay_panel = installed[0]
+    panel_id = overlay_panel.panel_id
+    if panel_id not in panel_ids:
+        return
+    index = panel_ids.index(panel_id)
+    panel = front[0].panels[index]
+    payload = (
+        hold.display_payload
+        if hold is not None and hold.panel_id == panel_id
+        else panel.display_payload
+    )
+    source_identity = (
+        hold.source_identity
+        if hold is not None and hold.panel_id == panel_id
+        else panel.source_identity
+    )
+    status = _fit_overlay_status(
+        installed,
+        source_identity=source_identity,
+        payload=payload,
+        current_projection_key=current_projection_key,
+    )
+    if status == "INCOMPATIBLE" or _payload_has_composed_fit(payload):
+        return
+    overlays = _fit_overlays(overlay_panel.display_payload)
+    bounds = _panel_bounds(
+        widget_rect,
+        index=index,
+        count=len(front[1]),
+        columns=columns,
+    )
+    painter.save()
+    try:
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        diagnostic = ""
+        if isinstance(overlays, RadialGaussianImageFitOverlay):
+            if not isinstance(payload, ImagePanelPayload):
+                return
+            prepared = (
+                hold.prepared
+                if hold is not None and hold.panel_id == panel_id
+                else front[1][index]
+            )
+            target = QtCore.QRectF(
+                _panel_image_geometry(bounds, prepared[1], payload).axes_target
+            )
+            painter.setClipRect(target)
+            if overlays.status is FitBatchStatus.CONVERGED:
+                center = overlays.center_xy
+                radius = overlays.one_over_e_radius
+                if center is None or radius is None:
+                    diagnostic = "INVALID FIT OVERLAY"
+                    center = None
+                if center is None:
+                    painter.setClipping(False)
+                    _paint_fit_label(painter, target, status, diagnostic)
+                    return
+                normalized = payload.viewport.unbounded_visible_point_for_coordinate(
+                    center,
+                    coordinate_frame=overlays.coordinate_frame,
+                )
+                diameter = payload.viewport.visible_span_for_coordinate_span(
+                    (2.0 * radius, 2.0 * radius),
+                    coordinate_frame=overlays.coordinate_frame,
+                )
+                point = QtCore.QPointF(
+                    target.x() + normalized[0] * target.width(),
+                    target.y() + normalized[1] * target.height(),
+                )
+                ring = QtCore.QRectF(
+                    point.x() - 0.5 * diameter[0] * target.width(),
+                    point.y() - 0.5 * diameter[1] * target.height(),
+                    diameter[0] * target.width(),
+                    diameter[1] * target.height(),
+                )
+                color = QtGui.QColor(FIT_RADIAL_COLOR)
+                color.setAlphaF(FIT_RADIAL_RING_ALPHA)
+                pen = QtGui.QPen(color)
+                pen.setWidthF(
+                    FIT_RADIAL_RING_LINEWIDTH
+                    * float(painter.device().logicalDpiX())
+                    / 72.0
+                )
+                painter.setPen(pen)
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.drawEllipse(ring)
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.setBrush(QtGui.QColor(FIT_RADIAL_COLOR))
+                marker_radius = max(
+                    1.0,
+                    0.5
+                    * math.sqrt(FIT_RADIAL_CENTER_SIZE)
+                    * float(painter.device().logicalDpiX())
+                    / 72.0,
+                )
+                painter.drawEllipse(point, marker_radius, marker_radius)
+            else:
+                diagnostic = overlays.diagnostic or (
+                    "NOT_PRESENT"
+                    if overlays.status is None
+                    else overlays.status.value
+                )
+        elif isinstance(payload, CurvePanelPayload):
+            target = _numeric_plot_geometry(bounds, payload.viewport)
+            painter.setClipRect(target)
+            style = curve_fit_line_kwargs()
+            for overlay in overlays:
+                if overlay.status is FitBatchStatus.CONVERGED:
+                    if overlay.coordinates is None:
+                        diagnostic = "INVALID FIT OVERLAY"
+                        continue
+                    _paint_fit_path(
+                        painter,
+                        bounds,
+                        payload.viewport,
+                        overlay.coordinates,
+                        overlay.predicted_y,
+                        style,
+                    )
+                elif not diagnostic and overlay.diagnostic:
+                    diagnostic = overlay.diagnostic
+        else:
+            if not isinstance(payload, HistogramPanelPayload):
+                return
+            target = _numeric_plot_geometry(bounds, payload.viewport)
+            painter.setClipRect(target)
+            styles = bimodal_fit_line_specs()
+            for overlay in overlays:
+                if overlay.status is FitBatchStatus.CONVERGED:
+                    components = overlay.component_predictions
+                    if len(components) not in (1, len(styles)):
+                        diagnostic = "INVALID FIT OVERLAY"
+                        continue
+                    selected_styles = (
+                        (styles[2],) if len(components) == 1 else styles
+                    )
+                    for values, style in zip(
+                        components,
+                        selected_styles,
+                        strict=True,
+                    ):
+                        _paint_fit_path(
+                            painter,
+                            bounds,
+                            payload.viewport,
+                            overlay.coordinates,
+                            values,
+                            style,
+                        )
+                elif not diagnostic and overlay.diagnostic:
+                    diagnostic = overlay.diagnostic
+        painter.setClipping(False)
+        _paint_fit_label(painter, target, status, diagnostic)
+    finally:
+        painter.restore()
 
 
 class QtRasterBoard(QtWidgets.QWidget):
@@ -139,6 +534,10 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._staged_layout: tuple[str, int, tuple[str, ...], int] | None = None
         self._empty_text = str(empty_text)
         self._front: tuple[BoardFrame, tuple[tuple[bytes, QtGui.QImage], ...]] | None = None
+        self._fit_overlay: _InstalledFitOverlay | None = None
+        self._fit_projection_key: tuple[object, ...] | None = None
+        self._held_fit_overlay: _InstalledFitOverlay | None = None
+        self._held_fit_projection_key: tuple[object, ...] | None = None
         self._selector_enabled = False
         self._selector_hold: _HeldPanelFront | None = None
         self._image_bindings: dict[str, _ImagePanelBinding] = {}
@@ -155,6 +554,8 @@ class QtRasterBoard(QtWidgets.QWidget):
         if self._selector_hold is not None:
             raise RuntimeError("another pointer interaction is already active")
         self._selector_hold = hold
+        self._held_fit_overlay = self._fit_overlay
+        self._held_fit_projection_key = self._fit_projection_key
         _payload, origin = self._visible_display(
             hold.panel_id,
             (
@@ -167,6 +568,8 @@ class QtRasterBoard(QtWidgets.QWidget):
         )
         if origin is None:
             self._selector_hold = None
+            self._held_fit_overlay = None
+            self._held_fit_projection_key = None
             raise RuntimeError("interaction hold has no exact painted origin")
         self.interactionStarted.emit(origin)
 
@@ -176,6 +579,8 @@ class QtRasterBoard(QtWidgets.QWidget):
         if self._selector_hold is None:
             return
         self._selector_hold = None
+        self._held_fit_overlay = None
+        self._held_fit_projection_key = None
         self.interactionFinished.emit()
 
     @property
@@ -225,28 +630,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 clear_numeric_spans=True,
             )
             self.update()
-
-    def discard_staged_layout(
-        self,
-        *,
-        board_id: str,
-        layout_generation: int,
-    ) -> bool:
-        """Discard only the named unpresented layout, preserving the old front."""
-
-        self._require_owner()
-        if self._closed:
-            return False
-        identity = (
-            canonical_text(board_id, "board_id"),
-            nonnegative_integer(layout_generation, "layout_generation"),
-        )
-        staged = self._staged_layout
-        if staged is None or (staged[0], staged[1]) != identity:
-            return False
-        self._staged_layout = None
-        self.update()
-        return True
 
     def present(self, frame: BoardFrame) -> None:
         """Validate, prepare, then atomically install one ordinary front."""
@@ -461,7 +844,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             # Only after all cheap identity/revision checks pass do we wrap the
             # worker-owned immutable raster in a QImage view.
             prepared = tuple(_prepared_qimage(panel) for panel in frame.panels)
-        except BaseException:
+        except Exception:
             if promoting:
                 self._staged_layout = None
             if interaction_was_active:
@@ -559,7 +942,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 binding.revision_floor = max(
                     binding.revision_floor, viewport.display_revision)
         for panel_id, binding in self._image_bindings.items():
-            hold = self._selector_hold
             panel = frame.panels[target_panel_ids.index(panel_id)]
             viewport_answered = (
                 binding.pending_viewport_answer is not None
@@ -581,24 +963,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 binding.queued_color_limits = None
                 if queued is not None:
                     queued_image_colors.append((binding, queued))
-            if (
-                (viewport_answered or color_answered)
-                and hold is not None
-                and hold.panel_id == panel_id
-                # Area is a Qt-only gesture against the exact raster held at
-                # press time.  A render-backed answer may be admitted in the
-                # background, but advancing this held front would change the
-                # coordinate transform halfway through the drag.  Keep the
-                # old raster/viewport until release; the newly admitted front
-                # becomes visible as soon as the hold is cleared.
-                and binding.rectangle_drag is None
-            ):
-                index = target_panel_ids.index(panel_id)
-                self._selector_hold = _advance_held_front(
-                    hold, frame, panel, prepared[index]
-                )
         for panel_id, binding in self._numeric_bindings.items():
-            hold = self._selector_hold
             index = target_panel_ids.index(panel_id)
             panel = frame.panels[index]
             viewport_answered = (
@@ -621,12 +986,21 @@ class QtRasterBoard(QtWidgets.QWidget):
                 binding.queued_thresholds = None
                 if queued is not None:
                     queued_histogram_thresholds.append((binding, queued))
-            if viewport_answered or threshold_answered:
-                if hold is not None and hold.panel_id == panel_id:
-                    self._selector_hold = _advance_held_front(
-                        hold, frame, panel, prepared[index]
-                    )
         self._front = (frame, prepared)
+        installed = self._fit_overlay
+        if installed is not None:
+            panel_id = installed[0].panel_id
+            panel = (
+                None
+                if panel_id not in target_panel_ids
+                else frame.panels[target_panel_ids.index(panel_id)]
+            )
+            if (
+                panel is None
+                or _payload_has_composed_fit(panel.display_payload)
+                or installed[0].source_identity != panel.source_identity
+            ):
+                self._fit_overlay = None
         # Pointer input is allowed to outrun Agg, but semantic answers are not
         # guessed or accepted by revision alone.  Each binding keeps one exact
         # in-flight answer plus one latest desired state.  Once that answer is
@@ -643,9 +1017,101 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._author_queued_histogram_thresholds(binding, thresholds)
         self.update()
 
+    def _install_fit_overlays(
+        self,
+        source_frame: BoardFrame,
+        overlay_panel: PanelFrame,
+        *,
+        source_projection_key: tuple[object, ...],
+        current_projection_key: tuple[object, ...],
+    ) -> Literal["CURRENT", "LAGGING", "INCOMPATIBLE"]:
+        """Install one worker-materialized vector result over the visible base."""
+
+        self._require_owner()
+        self._ensure_open()
+        if not isinstance(source_frame, BoardFrame) or len(source_frame.panels) != 1:
+            raise TypeError("live Fit overlay source must be a one-panel BoardFrame")
+        source_panel = source_frame.panels[0]
+        if source_panel.panel_id not in self._panel_ids:
+            return "INCOMPATIBLE"
+        try:
+            installed = _validated_fit_overlay_panel(
+                source_panel,
+                overlay_panel,
+                source_projection_key=source_projection_key,
+            )
+        except (TypeError, ValueError):
+            self._fit_overlay = None
+            self.update()
+            return "INCOMPATIBLE"
+        self._fit_projection_key = current_projection_key
+        front = self._front
+        if front is None or source_panel.panel_id not in self._panel_ids:
+            return "INCOMPATIBLE"
+        current = front[0].panels[self._panel_ids.index(source_panel.panel_id)]
+        status = _fit_overlay_status(
+            installed,
+            source_identity=current.source_identity,
+            payload=current.display_payload,
+            current_projection_key=self._fit_projection_key,
+        )
+        if status == "INCOMPATIBLE" or _payload_has_composed_fit(
+            current.display_payload
+        ):
+            self._fit_overlay = None
+            self.update()
+            return "INCOMPATIBLE"
+        self._fit_overlay = installed
+        self.update()
+        return status
+
+    def _reconcile_fit_projection(
+        self,
+        current_projection_key: tuple[object, ...],
+    ) -> None:
+        """Reconcile the installed overlay after one atomic front promotion."""
+
+        self._require_owner()
+        self._ensure_open()
+        self._fit_projection_key = current_projection_key
+        installed = self._fit_overlay
+        if installed is None or self._front is None:
+            return
+        panel_id = installed[0].panel_id
+        panels = {panel.panel_id: panel for panel in self._front[0].panels}
+        panel = panels.get(panel_id)
+        if (
+            panel is None
+            or _payload_has_composed_fit(panel.display_payload)
+            or _fit_overlay_status(
+                installed,
+                source_identity=panel.source_identity,
+                payload=panel.display_payload,
+                current_projection_key=current_projection_key,
+            )
+            == "INCOMPATIBLE"
+        ):
+            self._fit_overlay = None
+        self.update()
+
+    def _clear_fit_overlays(self) -> None:
+        self._require_owner()
+        self._ensure_open()
+        self._fit_projection_key = None
+        if self._fit_overlay is not None:
+            self._fit_overlay = None
+            self.update()
+        if self._selector_hold is None:
+            self._held_fit_overlay = None
+            self._held_fit_projection_key = None
+
     def clear(self) -> None:
         self._require_owner()
         self._front = None
+        self._fit_overlay = None
+        self._fit_projection_key = None
+        self._held_fit_overlay = None
+        self._held_fit_projection_key = None
         self._active_layout_identity = None
         self._staged_layout = None
         self._cancel_active_gesture(
@@ -821,142 +1287,40 @@ class QtRasterBoard(QtWidgets.QWidget):
         self.update()
         return True
 
-    def visible_curve_payload(
+    def visible_numeric_origin(
         self,
-        panel_id: str | None = None,
-    ) -> CurvePanelPayload | None:
-        """Return the exact held/current CURVE payload currently painted."""
-
-        self._require_owner()
-        binding = self._numeric_binding_for_kind("curve", panel_id=panel_id)
-        payload, _origin = self._visible_display(
-            None if binding is None else binding.panel_id, CurvePanelPayload
-        )
-        return payload if isinstance(payload, CurvePanelPayload) else None
-
-    def visible_curve_origin(
-        self,
-        panel_id: str | None = None,
+        panel_id: str,
     ) -> PanelInteractionOrigin | None:
-        """Return provenance for the exact held/current CURVE being painted."""
+        """Return provenance for the exact held/current numeric panel."""
 
         self._require_owner()
-        binding = self._numeric_binding_for_kind("curve", panel_id=panel_id)
+        binding = self._numeric_bindings.get(
+            canonical_text(panel_id, "numeric panel_id")
+        )
+        if binding is None:
+            return None
+        payload_type = {
+            "curve": CurvePanelPayload,
+            "histogram": HistogramPanelPayload,
+            "pulse": PulsePanelPayload,
+        }[binding.kind]
         _payload, origin = self._visible_display(
-            None if binding is None else binding.panel_id, CurvePanelPayload
+            binding.panel_id,
+            payload_type,
         )
         return origin
 
-    def visible_histogram_payload(
-        self,
-        panel_id: str | None = None,
-    ) -> HistogramPanelPayload | None:
-        """Return the exact held/current HISTOGRAM payload currently painted."""
-
-        self._require_owner()
-        binding = self._numeric_binding_for_kind("histogram", panel_id=panel_id)
-        payload, _origin = self._visible_display(
-            None if binding is None else binding.panel_id, HistogramPanelPayload
-        )
-        return payload if isinstance(payload, HistogramPanelPayload) else None
-
-    def visible_meter_payload(
-        self,
-        panel_id: str | None = None,
-    ) -> MeterPanelPayload | None:
-        """Return the exact display-only METER payload currently painted."""
-
-        self._require_owner()
-        if panel_id is None:
-            frame = None if self._front is None else self._front[0]
-            if frame is None:
-                return None
-            matches = tuple(
-                panel.panel_id
-                for panel in frame.panels
-                if isinstance(panel.display_payload, MeterPanelPayload)
-            )
-            if len(matches) != 1:
-                return None
-            panel_id = matches[0]
-        payload, _origin = self._visible_display(panel_id, MeterPanelPayload)
-        return payload if isinstance(payload, MeterPanelPayload) else None
-
-    def visible_histogram_origin(
-        self,
-        panel_id: str | None = None,
-    ) -> PanelInteractionOrigin | None:
-        """Return provenance for the exact held/current HISTOGRAM front."""
-
-        self._require_owner()
-        binding = self._numeric_binding_for_kind("histogram", panel_id=panel_id)
-        _payload, origin = self._visible_display(
-            None if binding is None else binding.panel_id, HistogramPanelPayload
-        )
-        return origin
-
-    def visible_pulse_payload(
-        self,
-        panel_id: str | None = None,
-    ) -> PulsePanelPayload | None:
-        """Return the exact held/current PULSE payload currently painted."""
-
-        self._require_owner()
-        binding = self._numeric_binding_for_kind("pulse", panel_id=panel_id)
-        payload, _origin = self._visible_display(
-            None if binding is None else binding.panel_id, PulsePanelPayload
-        )
-        return payload if isinstance(payload, PulsePanelPayload) else None
-
-    def visible_pulse_origin(
-        self,
-        panel_id: str | None = None,
-    ) -> PanelInteractionOrigin | None:
-        """Return provenance for the exact held/current PULSE front."""
-
-        self._require_owner()
-        binding = self._numeric_binding_for_kind("pulse", panel_id=panel_id)
-        _payload, origin = self._visible_display(
-            None if binding is None else binding.panel_id, PulsePanelPayload
-        )
-        return origin
-
-    def discard_pending_curve_interaction(
+    def discard_pending_numeric_interaction(
         self,
         origin: PanelInteractionOrigin,
     ) -> bool:
-        """Discard only the exact failed CURVE display intent."""
+        """Discard the exact failed viewport/threshold commit for one panel."""
 
         self._require_owner()
         if not isinstance(origin, PanelInteractionOrigin):
             raise TypeError("origin must be PanelInteractionOrigin")
         binding = self._numeric_bindings.get(origin.panel_id)
-        if (
-            binding is None
-            or binding.kind != "curve"
-            or binding.pending_viewport_answer is None
-            or origin != binding.pending_viewport_answer.origin
-        ):
-            return False
-        queued = binding.queued_viewport_limits
-        binding.pending_viewport_answer = None
-        binding.queued_viewport_limits = None
-        if queued is not None:
-            self._author_queued_numeric_viewport(binding, queued)
-        self.update()
-        return True
-
-    def discard_pending_histogram_interaction(
-        self,
-        origin: PanelInteractionOrigin,
-    ) -> bool:
-        """Discard only the exact failed HISTOGRAM display intent."""
-
-        self._require_owner()
-        if not isinstance(origin, PanelInteractionOrigin):
-            raise TypeError("origin must be PanelInteractionOrigin")
-        binding = self._numeric_bindings.get(origin.panel_id)
-        if binding is None or binding.kind != "histogram":
+        if binding is None:
             return False
         discarded = False
         if (
@@ -969,7 +1333,7 @@ class QtRasterBoard(QtWidgets.QWidget):
             discarded = True
         else:
             queued_viewport = None
-        if (
+        if binding.kind == "histogram" and (
             binding.threshold_pending_answer is not None
             and origin == binding.threshold_pending_answer.origin
         ):
@@ -988,31 +1352,6 @@ class QtRasterBoard(QtWidgets.QWidget):
                 binding,
                 queued_thresholds,
             )
-        self.update()
-        return True
-
-    def discard_pending_pulse_interaction(
-        self,
-        origin: PanelInteractionOrigin,
-    ) -> bool:
-        """Discard only the exact failed PULSE display intent."""
-
-        self._require_owner()
-        if not isinstance(origin, PanelInteractionOrigin):
-            raise TypeError("origin must be PanelInteractionOrigin")
-        binding = self._numeric_bindings.get(origin.panel_id)
-        if (
-            binding is None
-            or binding.kind != "pulse"
-            or binding.pending_viewport_answer is None
-            or origin != binding.pending_viewport_answer.origin
-        ):
-            return False
-        queued = binding.queued_viewport_limits
-        binding.pending_viewport_answer = None
-        binding.queued_viewport_limits = None
-        if queued is not None:
-            self._author_queued_numeric_viewport(binding, queued)
         self.update()
         return True
 
@@ -1238,52 +1577,6 @@ class QtRasterBoard(QtWidgets.QWidget):
         binding.interaction_ready = ready
         self.update()
 
-    def bind_curve_interaction(
-        self,
-        panel_id: str,
-        callback: Callable[[CurveInteractionIntent], object],
-        *,
-        enabled: bool = True,
-    ) -> None:
-        """Bind one CURVE panel to display-only typed intents."""
-
-        self._bind_numeric_interaction(
-            "curve", panel_id, callback, enabled=enabled
-        )
-
-    def bind_histogram_interaction(
-        self,
-        panel_id: str,
-        callback: Callable[[HistogramInteractionIntent], object],
-        *,
-        enabled: bool = True,
-    ) -> None:
-        """Bind one HISTOGRAM panel to display-only typed intents."""
-
-        self._bind_numeric_interaction(
-            "histogram", panel_id, callback, enabled=enabled
-        )
-
-    def bind_pulse_interaction(
-        self,
-        panel_id: str,
-        callback: Callable[[CurveInteractionIntent], object],
-        *,
-        enabled: bool = True,
-    ) -> None:
-        """Bind one PULSE timeline panel to display-only typed intents.
-
-        The pulse timeline is an x-only interactive surface, so it speaks the
-        CURVE intent vocabulary (``CurveRangeGesture`` for area,
-        ``CurveViewportCommit`` for wheel zoom / middle-drag pan) over its
-        :class:`PulsePanelPayload` front -- one gesture owner, no second
-        selector family.
-        """
-
-        self._bind_numeric_interaction(
-            "pulse", panel_id, callback, enabled=enabled
-        )
-
     def set_selector_applied_selection(
         self,
         selection: Selection | None,
@@ -1325,66 +1618,25 @@ class QtRasterBoard(QtWidgets.QWidget):
         self._cancel_image_gesture(binding, clear_draft=True)
         self.update()
 
-    def set_curve_range_candidate(
+    def set_numeric_range_candidate(
         self,
         x_span: tuple[float, float] | None,
         *,
-        panel_id: str | None = None,
+        panel_id: str,
     ) -> None:
-        """Project the Workbench-owned display-only CURVE range candidate."""
+        """Project one display-only range on the identified numeric panel."""
 
         self._require_owner()
-        binding = self._numeric_binding_for_kind("curve", panel_id=panel_id)
+        panel_id = canonical_text(panel_id, "numeric panel_id")
+        binding = self._numeric_bindings.get(panel_id)
         if binding is None:
             if x_span is None:
                 return
-            raise RuntimeError("no curve panel is bound")
+            raise RuntimeError("no numeric panel is bound for that identity")
         binding.applied_span = (
             None
             if x_span is None
-            else validated_display_range(x_span, "curve range candidate")
-        )
-        self.update()
-
-    def set_histogram_range_candidate(
-        self,
-        x_span: tuple[float, float] | None,
-        *,
-        panel_id: str | None = None,
-    ) -> None:
-        """Project one display-only HISTOGRAM value-range candidate."""
-
-        self._require_owner()
-        binding = self._numeric_binding_for_kind("histogram", panel_id=panel_id)
-        if binding is None:
-            if x_span is None:
-                return
-            raise RuntimeError("no histogram panel is bound")
-        binding.applied_span = (
-            None
-            if x_span is None
-            else validated_display_range(x_span, "histogram range candidate")
-        )
-        self.update()
-
-    def set_pulse_range_candidate(
-        self,
-        x_span: tuple[float, float] | None,
-        *,
-        panel_id: str | None = None,
-    ) -> None:
-        """Project the owner-applied display-only PULSE time-range candidate."""
-
-        self._require_owner()
-        binding = self._numeric_binding_for_kind("pulse", panel_id=panel_id)
-        if binding is None:
-            if x_span is None:
-                return
-            raise RuntimeError("no pulse panel is bound")
-        binding.applied_span = (
-            None
-            if x_span is None
-            else validated_display_range(x_span, "pulse range candidate")
+            else validated_display_range(x_span, f"{binding.kind} range candidate")
         )
         self.update()
 
@@ -1395,25 +1647,11 @@ class QtRasterBoard(QtWidgets.QWidget):
             self._reset_image_binding(binding.panel_id)
         self.update()
 
-    def unbind_curve_interaction(self, panel_id: str | None = None) -> None:
-        self._require_owner()
-        binding = self._numeric_binding_for_kind("curve", panel_id=panel_id)
-        if binding is not None:
-            self._reset_numeric_binding(binding.panel_id)
-        self.update()
+    def unbind_numeric_interaction(self, panel_id: str) -> None:
+        """Retire the one numeric gesture binding identified by its panel."""
 
-    def unbind_histogram_interaction(self, panel_id: str | None = None) -> None:
         self._require_owner()
-        binding = self._numeric_binding_for_kind("histogram", panel_id=panel_id)
-        if binding is not None:
-            self._reset_numeric_binding(binding.panel_id)
-        self.update()
-
-    def unbind_pulse_interaction(self, panel_id: str | None = None) -> None:
-        self._require_owner()
-        binding = self._numeric_binding_for_kind("pulse", panel_id=panel_id)
-        if binding is not None:
-            self._reset_numeric_binding(binding.panel_id)
+        self._reset_numeric_binding(canonical_text(panel_id, "numeric panel_id"))
         self.update()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
@@ -1513,6 +1751,30 @@ class QtRasterBoard(QtWidgets.QWidget):
                     self._image_bindings.get(panel_id),
                     hold=self._selector_hold,
                 )
+        try:
+            _paint_fit_overlays(
+                painter,
+                widget_rect=self.rect(),
+                panel_ids=self._panel_ids,
+                columns=self._columns,
+                front=self._front,
+                hold=self._selector_hold,
+                installed=(
+                    self._held_fit_overlay
+                    if self._selector_hold is not None
+                    else self._fit_overlay
+                ),
+                current_projection_key=(
+                    self._held_fit_projection_key
+                    if self._selector_hold is not None
+                    else self._fit_projection_key
+                ),
+            )
+        except Exception:
+            # Fit decoration is optional.  A malformed primitive must never
+            # escape Qt's paint callback or suppress the valid base raster.
+            self._fit_overlay = None
+            self._held_fit_overlay = None
         _paint_image_overlays(
             painter,
             selector_enabled=self._selector_enabled,
@@ -1939,7 +2201,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                         else CurveRangeGesture(origin, candidate)
                     )
                     numeric_binding.callback(gesture)
-            except BaseException as error:
+            except Exception as error:
                 if numeric_binding.fault is None:
                     numeric_binding.fault = detached_render_fault(error)
                 numeric_binding.binding_enabled = False
@@ -2038,7 +2300,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 )
                 callback(gesture)
                 delivered = True
-        except BaseException as error:
+        except Exception as error:
             if image_binding.fault is None:
                 image_binding.fault = detached_render_fault(error)
             image_binding.binding_enabled = False
@@ -2281,22 +2543,26 @@ class QtRasterBoard(QtWidgets.QWidget):
         super().resizeEvent(event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._retire_surface_state()
+        super().closeEvent(event)
+
+    def _retire_surface_state(self) -> None:
+        """Release every front and interaction owner held by this board."""
+
         self._reset_all_image_bindings()
         self._reset_all_numeric_bindings()
         self._front = None
+        self._fit_overlay = None
+        self._fit_projection_key = None
+        self._held_fit_overlay = None
+        self._held_fit_projection_key = None
         self._active_layout_identity = None
         self._staged_layout = None
         self._closed = True
-        super().closeEvent(event)
 
     def event(self, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.DeferredDelete:
-            self._reset_all_image_bindings()
-            self._reset_all_numeric_bindings()
-            self._front = None
-            self._active_layout_identity = None
-            self._staged_layout = None
-            self._closed = True
+            self._retire_surface_state()
         elif event.type() in (
             QtCore.QEvent.Hide,
             QtCore.QEvent.WindowDeactivate,

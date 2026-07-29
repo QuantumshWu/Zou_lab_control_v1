@@ -41,7 +41,7 @@ def _close_api(api: PulseScanApi) -> tuple[Exception, ...]:
     return api.close()
 
 
-def _bind_task_console(api: PulseScanApi, _catalog: object, _projection):
+def _bind_task_console(api: PulseScanApi, _catalog: object, projection):
     from zlc_pulse import describe_pulse_template
 
     from .ui.task_console import pulse_scan_task_console_adapter
@@ -49,6 +49,7 @@ def _bind_task_console(api: PulseScanApi, _catalog: object, _projection):
     return pulse_scan_task_console_adapter(
         prepare=api.prepare_scan_source,
         read_pulse_template=describe_pulse_template,
+        project_custom=projection.custom,
     )
 
 

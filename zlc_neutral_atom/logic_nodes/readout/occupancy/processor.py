@@ -35,10 +35,9 @@ from zlc_data import (
     ValidityContract,
     Value,
     ValueSchema,
-    dataset_cell_value,
-    dataset_revision_ref_to_tree,
-    expand_dataset_validity,
 )
+from zlc_data.codec import dataset_revision_ref_to_tree
+from zlc_data.value import dataset_cell_value, expand_dataset_validity
 from zlc_neutral_atom.catalog import DefinitionKey, ProcessorDefinition
 from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 from zlc_neutral_atom.dataset_output import (

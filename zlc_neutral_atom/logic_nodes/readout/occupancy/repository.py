@@ -15,9 +15,8 @@ from zlc_data import (
     DatasetComponentValidity,
     DatasetSchema,
     StreamGenerationId,
-    dataset_schema_from_tree,
-    dataset_schema_to_tree,
 )
+from zlc_data.codec import dataset_schema_from_tree, dataset_schema_to_tree
 from zlc_neutral_atom.capture.artifact import (
     AdmittedCapture,
     CaptureRepository,

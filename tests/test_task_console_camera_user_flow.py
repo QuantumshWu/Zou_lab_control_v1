@@ -21,49 +21,28 @@ from zlc_data import (
     REPEAT,
     SPATIAL_X,
     SPATIAL_Y,
-    PointLayout,
 )
 from gui_user_flow import (
     capture_offscreen_window,
+    choose_combo_data as _choose_combo_data,
+    choose_combo_text as _choose_combo_text,
     click_tab,
     configure_offscreen_fast_path,
+    current_logic_editor as _current_logic_editor,
     drag_mouse_move,
+    replace_path_value as _replace_path_value,
+    replace_spin_value as _replace_spin_value,
     require_offscreen_platform,
     until,
+    visible_form_widgets as _visible_form_widgets,
     widget_gone,
 )
-from zlc_workbench.task_console.console_records import console_signal_key
+from zlc_workbench.task_console.console_records import (
+    console_signal_key,
+    panel_signal_key,
+)
+from zlc_frontend import PlotKind
 from zlc_frontend.qt_widgets import ensure_qt_app
-
-
-def _choose_combo_data(combo, value, application) -> None:
-    """Choose a normal combo entry through its visible popup and keyboard."""
-
-    row = combo.findData(value)
-    assert row >= 0, (value, [combo.itemData(i) for i in range(combo.count())])
-    QtTest.QTest.mouseClick(combo, QtCore.Qt.LeftButton)
-    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-    view = combo.view()
-    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Home)
-    for _ in range(row):
-        QtTest.QTest.keyClick(view, QtCore.Qt.Key_Down)
-    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Return)
-    assert combo.currentData() == value
-
-
-def _choose_combo_text(combo, text, application) -> None:
-    """Choose one visible menu label without depending on QVariant coercion."""
-
-    row = combo.findText(text)
-    assert row >= 0, (text, [combo.itemText(i) for i in range(combo.count())])
-    QtTest.QTest.mouseClick(combo, QtCore.Qt.LeftButton)
-    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-    view = combo.view()
-    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Home)
-    for _ in range(row):
-        QtTest.QTest.keyClick(view, QtCore.Qt.Key_Down)
-    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Return)
-    assert combo.currentText() == text
 
 
 def _choose_signal_leaf(combo, signal, application) -> None:
@@ -161,45 +140,12 @@ def _signal_leaf_keys(combo) -> set[str]:
     return found
 
 
-def _replace_spin_value(spin, text: str) -> None:
-    """Edit the visible numeric control exactly as an operator would.
-
-    Required bounded numbers project to Fluent spin controls; optional numbers
-    project to validated blank-or-number Fluent edits.  This helper drives both
-    through their shared visible editor without inventing a sentinel value.
-    """
-
-    edit = spin.lineEdit() if hasattr(spin, "lineEdit") else spin
-    QtTest.QTest.mouseClick(edit, QtCore.Qt.LeftButton)
-    QtTest.QTest.keyClick(edit, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
-    QtTest.QTest.keyClicks(edit, str(text))
-    QtTest.QTest.keyClick(edit, QtCore.Qt.Key_Return)
-
-
-def _replace_path_value(path_widget, text: str) -> None:
-    """Edit the text field of the shared visible path control."""
-
-    edit = path_widget.edit
-    QtTest.QTest.mouseClick(edit, QtCore.Qt.LeftButton)
-    QtTest.QTest.keyClick(edit, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
-    QtTest.QTest.keyClicks(edit, str(text))
-    QtTest.QTest.keyClick(edit, QtCore.Qt.Key_Return)
-
-
 def _replace_axis_range(widget, minimum: str, maximum: str, points: str) -> None:
     """Edit the three visible controls of one swept axis as an operator would."""
 
     _replace_spin_value(widget.min_spin, minimum)
     _replace_spin_value(widget.max_spin, maximum)
     _replace_spin_value(widget.pts_spin, points)
-
-
-def _visible_form_widgets(editor) -> dict[str, QtWidgets.QWidget]:
-    """Resolve the current stable controls through the form owner's public API."""
-
-    form = editor.form._parameter_form
-    assert form is not None
-    return {key: form.widget_for(key) for key in form.spec.keys}
 
 
 def _resolved_artifact(console, output_key: str):
@@ -209,28 +155,44 @@ def _resolved_artifact(console, output_key: str):
     return producer.artifact if producer.artifact_resolved else None
 
 
-def _wheel(widget, position, delta: int) -> None:
-    """Deliver one wheel step through the real Qt widget event path."""
+def _current_panel_editor(console, application):
+    """Return the Panel Edit page reached through the visible Edit button."""
 
-    event = QtGui.QWheelEvent(
-        QtCore.QPointF(position),
-        QtCore.QPointF(widget.mapToGlobal(position)),
-        QtCore.QPoint(),
-        QtCore.QPoint(0, int(delta)),
-        QtCore.Qt.NoButton,
-        QtCore.Qt.NoModifier,
-        QtCore.Qt.ScrollUpdate,
-        False,
+    from zlc_workbench.task_console.panel_editor import PanelEditor
+
+    until(
+        application,
+        lambda: isinstance(console.tabs.currentWidget(), PanelEditor),
     )
-    widget.wheelEvent(event)
-    assert event.isAccepted()
+    editor = console.tabs.currentWidget()
+    assert editor.isVisible() and not editor.isWindow()
+    return editor
+
+
+def _render_value_or_none(card):
+    """Read the public immutable value currently presented by one panel."""
+
+    try:
+        return card.frozen_render_value()
+    except RuntimeError:
+        return None
+
+
+def _dataset_producer_or_none(console, signal_key: str):
+    """Resolve a running typed producer once its public binding is ready."""
+
+    try:
+        producer = console.resolve_console_producer(signal_key)
+    except RuntimeError:
+        return None
+    return producer if producer.running and producer.output_binding is not None else None
 
 
 def _add_plot_and_bind(console, add_button, kind: str, signal: str, application):
     """Add one blank plot and wire its Setting popup through visible controls."""
 
     before = len(console.cards)
-    _choose_combo_data(console.kind_combo, kind, application)
+    _choose_combo_data(console.kind_combo, PlotKind(kind), application)
     QtTest.QTest.mouseClick(add_button, QtCore.Qt.LeftButton)
     assert len(console.cards) == before + 1
     card = console.cards[-1]
@@ -258,32 +220,35 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         SPATIAL_X,
         SPATIAL_Y,
         AxisId,
+        AxisSourceRef,
         AxisSpec,
         BlockId,
         CellValidity,
         DataBlock,
         DatasetRevision,
         DatasetSchema,
+        GridTopology,
         OwnedSnapshot,
-        PointLayout,
+        PointColumn,
+        PointTable,
         StreamGenerationId,
         ValidityContract,
         ValueSchema,
     )
     from zlc_frontend.figure import (
         AxisViewRole,
-        FixedIndex,
         ViewIntent,
-        grid_facet_axes,
-        grid_facet_axis,
+        grid_facet_source,
+        grid_facet_sources,
         view_spec_from_tree,
     )
     from zlc_frontend.qt_widgets import (
         FitAuthoringPane,
+        FluentParameterForm,
         FluentSectionLabel,
         FluentSettingRow,
     )
-    from zlc_neutral_atom.processing.signal_plane import SignalValue
+    from zlc_neutral_atom.processing.signal_plane import SignalPublication, SignalValue
 
     repeat = AxisSpec(
         AxisId("formal.grid.repeat"),
@@ -326,8 +291,42 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
     )
     schema = DatasetSchema(
         repeat,
-        (scan_x, scan_y),
-        PointLayout.rect_c((scan_x.size, scan_y.size)),
+        PointTable(
+            scan_x.size * scan_y.size,
+            (
+                PointColumn(
+                    scan_x.axis_id,
+                    scan_x.name,
+                    scan_x.role,
+                    PointColumn.NUMERIC,
+                    tuple(
+                        value
+                        for value in scan_x.coordinates
+                        for _ in scan_y.coordinates
+                    ),
+                    scan_x.unit,
+                    scan_x.coordinate_frame,
+                ),
+                PointColumn(
+                    scan_y.axis_id,
+                    scan_y.name,
+                    scan_y.role,
+                    PointColumn.NUMERIC,
+                    tuple(scan_y.coordinates) * scan_x.size,
+                    scan_y.unit,
+                    scan_y.coordinate_frame,
+                ),
+            ),
+        ),
+        GridTopology(
+            (scan_x.axis_id, scan_y.axis_id),
+            (scan_x.coordinates, scan_y.coordinates),
+            tuple(
+                (x_index, y_index)
+                for x_index in range(scan_x.size)
+                for y_index in range(scan_y.size)
+            ),
+        ),
         ValueSchema(
             (image_y, image_x),
             ValidityContract.value(),
@@ -355,6 +354,13 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         run_id="formal-run",
         epoch_id="formal-epoch",
         join_digest="0" * 64,
+    )
+    grid_publication = SignalPublication(
+        owner_id="formal-immutable-monitor-boundary",
+        generation=1,
+        sequence=1,
+        signals={grid_value.name: grid_value},
+        _issuer=object(),
     )
 
     args = _build_parser().parse_args(
@@ -391,28 +397,23 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         _choose_combo_text(console.kind_combo, "Measurement: Camera", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         logic_row = console.logic_nodes[-1]
-        _choose_combo_data(console.kind_combo, "grid", application)
+        _choose_combo_data(console.kind_combo, PlotKind.GRID, application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         card = console.cards[-1]
-        assert card.config.kind == "grid"
+        assert card.config.kind == PlotKind.GRID
         click_tab(console, console.tabs.widget(0))
 
         # A producer fixture may enter only at the immutable monitor boundary.
-        # The first valid Grid value receives one deterministic frontend-owned
-        # ViewSpec.  Every role remains explicit even though Setting still lets
-        # the operator replace the default facet below.
+        # This schema deliberately has multiple legal Grid views, so it must
+        # remain unresolved until the operator chooses a cell intent and facet.
         card.config.signal = grid_value.name
-        request = card._freeze_value_render_request(grid_value, 1, force=True)
-        assert request is not None
-        default_view = request.contract.view
-        assert default_view.intent is ViewIntent.IMAGE
-        assert grid_facet_axis(default_view) == repeat.axis_id
-        for axis in (scan_x, scan_y):
-            binding = default_view.binding(axis.axis_id)
-            assert binding.role is AxisViewRole.SLIDER
-            assert binding.selector == FixedIndex(0)
-        assert default_view.binding(image_x.axis_id).role is AxisViewRole.IMAGE_X
-        assert default_view.binding(image_y.axis_id).role is AxisViewRole.IMAGE_Y
+        request = card._freeze_value_render_request(
+            grid_value,
+            1,
+            force=True,
+            publication=grid_publication,
+        )
+        assert request is None
         assert card._current_schema() == schema
 
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
@@ -430,14 +431,6 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
         until(application, lambda: card.settings_popup.isVisible())
         assert card.view_spec_editor.isVisible()
-        assert set(card.view_spec_editor._rows) == {
-            scan_x.axis_id,
-            scan_y.axis_id,
-        }
-        assert all(
-            combo.isEnabled()
-            for _row, combo in card.view_spec_editor._rows.values()
-        )
         popup_width = card.settings_popup.width()
         assert popup_width == card.settings_popup.minimumWidth()
         assert popup_width == card.settings_popup.maximumWidth()
@@ -446,84 +439,78 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
             == QtCore.Qt.ScrollBarAlwaysOff
         )
 
-        # The typed resolver owns every legal named facet.  Qt only presents
-        # those AxisId values and commits the one the operator clicks.
-        _choose_combo_text(card.grid_intent_combo, "2d", application)
-        expected_axes = grid_facet_axes(schema, ViewIntent.IMAGE)
-        until(
-            application,
-            lambda: card.grid_facet_combo.count() == len(expected_axes),
-        )
-        offered_axis_ids = tuple(
-            card.grid_facet_combo.itemData(index)
-            for index in range(card.grid_facet_combo.count())
-        )
-        assert offered_axis_ids == tuple(axis.axis_id for axis in expected_axes)
-        assert all(isinstance(axis_id, AxisId) for axis_id in offered_axis_ids)
-        scan_x_index = offered_axis_ids.index(scan_x.axis_id)
-        _choose_combo_text(
-            card.grid_facet_combo,
-            card.grid_facet_combo.itemText(scan_x_index),
+        # The frontend form is the one keyed authoring owner for both Setting
+        # and Edit.  Qt presents typed SourceRefs and commits the exact view the
+        # operator chooses; Workbench has no parallel Grid vocabulary.
+        form = card.view_spec_editor.findChild(FluentParameterForm)
+        assert form is not None
+        assert form.keys == ("grid.intent",)
+        _choose_combo_data(
+            form.widget_for("grid.intent"),
+            ViewIntent.IMAGE,
             application,
         )
+        until(application, lambda: "grid.facet" in form.keys)
+        expected_sources = grid_facet_sources(schema, ViewIntent.IMAGE)
+        facet_combo = form.widget_for("grid.facet")
+        offered_sources = tuple(
+            facet_combo.itemData(index)
+            for index in range(facet_combo.count())
+        )
+        assert offered_sources == expected_sources
+        assert all(
+            isinstance(source, AxisSourceRef) for source in offered_sources
+        )
+        point_rows = AxisSourceRef.point_rows()
+        assert offered_sources == (point_rows,)
+        _choose_combo_data(facet_combo, point_rows, application)
         until(
             application,
             lambda: "view_spec" in card.config.params,
         )
         authored = view_spec_from_tree(card.config.params["view_spec"])
         assert authored.intent is ViewIntent.IMAGE
-        assert grid_facet_axis(authored) == scan_x.axis_id
+        assert grid_facet_source(authored) == point_rows
         assert sum(
             binding.role is AxisViewRole.FACET
-            for binding in authored.axis_bindings
+            for binding in authored.source_bindings
         ) == 1
-        assert not card.grid_colormap_row.isHidden()
-        assert card.grid_bin_count_row.isHidden()
-        assert card.grid_count_scale_row.isHidden()
+        request = card._freeze_value_render_request(
+            grid_value,
+            2,
+            force=True,
+            publication=grid_publication,
+        )
+        assert request is not None
+        assert request.contract.figure.view == authored
+        assert authored.binding(
+            AxisSourceRef.tensor(image_x.axis_id)
+        ).role is AxisViewRole.IMAGE_X
+        assert authored.binding(
+            AxisSourceRef.tensor(image_y.axis_id)
+        ).role is AxisViewRole.IMAGE_Y
 
-        # The same typed facet survives a legal sub-plot change; the shared
-        # inventory reveals bins/log-count and hides colormap without rebuilding
-        # either Setting or Edit from a second schema.
-        _choose_combo_text(card.grid_intent_combo, "hist", application)
-        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-        if card._grid_cell_intent() is not ViewIntent.HISTOGRAM:
-            offered_axis_ids = tuple(
-                card.grid_facet_combo.itemData(index)
-                for index in range(card.grid_facet_combo.count())
-            )
-            scan_x_index = offered_axis_ids.index(scan_x.axis_id)
-            _choose_combo_text(
-                card.grid_facet_combo,
-                card.grid_facet_combo.itemText(scan_x_index),
-                application,
-            )
+        # A legal cell-kind change retains the typed facet and reconciles only
+        # the canonical frontend display form for the new intent.
+        _choose_combo_data(
+            form.widget_for("grid.intent"),
+            ViewIntent.HISTOGRAM,
+            application,
+        )
         until(
             application,
-            lambda: card._grid_cell_intent() is ViewIntent.HISTOGRAM,
+            lambda: (
+                "view_spec" in card.config.params
+                and view_spec_from_tree(card.config.params["view_spec"]).intent
+                is ViewIntent.HISTOGRAM
+            ),
         )
         authored = view_spec_from_tree(card.config.params["view_spec"])
-        assert grid_facet_axis(authored) == scan_x.axis_id
-        assert not card.grid_bin_count_row.isHidden()
-        assert not card.grid_count_scale_row.isHidden()
-        assert card.grid_colormap_row.isHidden()
-
-        inventory_names = (
-            "grid_facet_row",
-            "grid_intent_row",
-            "grid_bin_count_row",
-            "grid_count_scale_row",
-            "grid_colormap_row",
-        )
-        setting_rows = tuple(getattr(card, name) for name in inventory_names)
-        assert tuple(row._label.text() for row in setting_rows) == (
-            "facet",
-            "sub plot",
-            "Bins",
-            "Log count",
-            "Colormap",
-        )
+        assert grid_facet_source(authored) == point_rows
         label_width = card.setting_label_width(card.fontMetrics())
-        assert {row._label.width() for row in setting_rows} == {label_width}
+        setting_rows = card.settings_popup.findChildren(FluentSettingRow)
+        assert any(row._label.text() == "Bins" for row in setting_rows)
+        assert any(row._label.text() == "Log count" for row in setting_rows)
 
         # Unbroken errors and user-authored fields are ordinary bounded content.
         long_text = "unbroken-field-or-error-" + "W" * 1200
@@ -573,7 +560,7 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
             QtTest.QTest.mouseClick(card.edit_button, QtCore.Qt.LeftButton)
             until(
                 application,
-                lambda: id(card) in console._panel_editors,
+                lambda: console.tabs.currentWidget() is not None,
             )
             application.processEvents(QtCore.QEventLoop.AllEvents, 20)
         finally:
@@ -581,7 +568,7 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         assert probe.shown == []
         assert visible_top_levels() == top_levels_before
 
-        editor = console._panel_editors[id(card)]
+        editor = _current_panel_editor(console, application)
         assert editor.window() is console_wrapper
         assert not editor.isWindow()
         assert editor._board is not None
@@ -592,13 +579,15 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
         assert not editor._board.isWindow()
         assert not editor._board.isWindow()
         assert editor._scroll.horizontalScrollBarPolicy() == QtCore.Qt.ScrollBarAlwaysOff
-        edit_rows = tuple(getattr(editor, name) for name in inventory_names)
-        assert tuple(row._label.text() for row in edit_rows) == tuple(
-            row._label.text() for row in setting_rows
+        edit_view_form = editor.view_spec_editor.findChild(FluentParameterForm)
+        assert edit_view_form is not None
+        assert edit_view_form.keys == form.keys
+        assert (
+            editor.display_form_surface._zlc_display_signature
+            == card.display_form_surface._zlc_display_signature
         )
-        assert {row._label.width() for row in edit_rows} == {label_width}
-        assert tuple(row.isHidden() for row in edit_rows) == tuple(
-            row.isHidden() for row in setting_rows
+        assert set(editor.display_form_surface._zlc_display_widgets) == set(
+            card.display_form_surface._zlc_display_widgets
         )
 
         # Fit is exactly one embedded model + one single-line args editor in
@@ -736,7 +725,7 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         assert len(console.logic_nodes) == 1
         row = console.logic_nodes[0]
-        editor = console._logic_editors[id(row)]
+        editor = _current_logic_editor(console, application)
 
         # Virtual MOT camera is a true free-running source, so this is the
         # deterministic live Camera role for an operator-path acceptance run.
@@ -757,66 +746,9 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         signal = frame_signals[1]
         until(
             application,
-            lambda: all(
-                console._data.freeze().value(key) is not None
-                for key in frame_signals
-            ),
+            lambda: row.status_label.text() == "running"
+            and row.stop_button.isEnabled(),
             timeout=15.0,
-        )
-        atomic_front = console._data.freeze()
-        atomic_values = tuple(atomic_front.value(key) for key in frame_signals)
-        assert all(value is not None for value in atomic_values)
-        schemas = tuple(value.snapshot.block.schema for value in atomic_values)
-        assert len(set(schemas)) == 1
-        frame_schema = schemas[0]
-        assert frame_schema.repeat_axis.role == REPEAT
-        assert frame_schema.repeat_axis.size == 1
-        assert frame_schema.point_axes == ()
-        assert frame_schema.point_layout == PointLayout.rect_c(())
-        assert tuple(axis.role for axis in frame_schema.cell_schema.data_axes) == (
-            SPATIAL_Y,
-            SPATIAL_X,
-        )
-        assert not any(
-            axis.role in (MONITOR_HISTORY, READOUT_EVENT)
-            for schema in schemas
-            for axis in (
-                schema.repeat_axis,
-                *schema.point_axes,
-                *schema.cell_schema.data_axes,
-            )
-        )
-        expected_shape = (1, 1, *frame_schema.cell_schema.data_shape)
-        assert all(value.shape == expected_shape for value in atomic_values)
-        assert len({value.run_id for value in atomic_values}) == 1
-        assert len({value.epoch_id for value in atomic_values}) == 1
-        assert len(
-            {value.snapshot.ref.revision for value in atomic_values}
-        ) == 1
-        assert all(value.coverage.total_cells == 1 for value in atomic_values)
-        first_refs = tuple(value.snapshot.ref for value in atomic_values)
-        until(
-            application,
-            lambda: (
-                (front := console._data.freeze()) is not None
-                and all(
-                    (value := front.value(key)) is not None
-                    and value.snapshot.ref != first_ref
-                    for key, first_ref in zip(
-                        frame_signals,
-                        first_refs,
-                        strict=True,
-                    )
-                )
-                and len(
-                    {
-                        front.value(key).snapshot.ref.revision
-                        for key in frame_signals
-                    }
-                )
-                == 1
-            ),
-            timeout=10.0,
         )
 
         # The visible Logic row must expose the data dimensions, not merely an
@@ -834,13 +766,14 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             timeout=3.0,
         )
 
-        _choose_combo_data(console.kind_combo, "2d", application)
+        _choose_combo_data(console.kind_combo, PlotKind.IMAGE, application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         assert len(console.cards) == 1
         card = console.cards[0]
         click_tab(console, console.tabs.widget(0))
         surface = None
         first_front = second_front = None
+        seen_schemas = []
         # All declared frames use one stable PlotPanel surface.  Switching a
         # binding changes only the typed source; every selected output must then
         # continue advancing on its own live Camera revisions.
@@ -862,8 +795,8 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
                 lambda: (
                     card.board is not None
                     and card.board.front_frame is not None
-                    and card._presented_value is not None
-                    and card._presented_value.name == selected_signal
+                    and (presented := _render_value_or_none(card)) is not None
+                    and presented.name == selected_signal
                 ),
                 timeout=15.0,
             )
@@ -872,13 +805,29 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             else:
                 assert card.board.board is surface
             selected_front = card.board.front_frame
-            selected_ref = card._presented_value.snapshot.ref
+            selected_value = card.frozen_render_value()
+            selected_ref = selected_value.snapshot.ref
+            frame_schema = selected_value.snapshot.block.schema
+            seen_schemas.append(frame_schema)
+            assert frame_schema.repeat_axis.role == REPEAT
+            assert frame_schema.repeat_axis.size == 1
+            assert frame_schema.point_table.row_count == 1
+            assert frame_schema.point_table.columns == ()
+            assert frame_schema.grid_topology is None
+            assert tuple(
+                axis.role for axis in frame_schema.cell_schema.data_axes
+            ) == (SPATIAL_Y, SPATIAL_X)
+            assert selected_value.shape == (
+                1,
+                1,
+                *frame_schema.cell_schema.data_shape,
+            )
             until(
                 application,
                 lambda: (
-                    card._presented_value is not None
-                    and card._presented_value.name == selected_signal
-                    and card._presented_value.snapshot.ref != selected_ref
+                    (presented := _render_value_or_none(card)) is not None
+                    and presented.name == selected_signal
+                    and presented.snapshot.ref != selected_ref
                     and card.board.front_frame is not None
                     and card.board.front_frame.sequence > selected_front.sequence
                 ),
@@ -889,17 +838,23 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
                 second_front = card.board.front_frame
 
         assert first_front is not None and second_front is not None
+        assert len(set(seen_schemas)) == 1
+        assert not any(
+            axis.role in (MONITOR_HISTORY, READOUT_EVENT)
+            for axis in (
+                seen_schemas[0].repeat_axis,
+                *seen_schemas[0].point_table.columns,
+                *seen_schemas[0].cell_schema.data_axes,
+            )
+        )
         assert bytes(second_front.panels[0].raster.pixels) != bytes(
             first_front.panels[0].raster.pixels
         )
 
         # Exercise Fit through the actual DeviceManager -> Camera Measurement
-        # -> live 2-D Plot Panel controls.  A DTO or changed byte stream is not
-        # sufficient evidence: the same painted camera revision must visibly
-        # gain the frontend's canonical orange centre/radius overlay.
-        from matplotlib.colors import to_rgba
-
-        from zlc_data import FitBatchStatus
+        # -> live 2-D Plot Panel controls.  Fit is a live surface-local operation:
+        # the Camera base keeps advancing, the Qt surface paints the canonical
+        # overlay, and the data plane publishes only exact-parent parameters.
         from zlc_frontend.render_style import FIT_RADIAL_COLOR
 
         if not card.settings_popup.isVisible():
@@ -913,37 +868,47 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             timeout=15.0,
         )
         assert fit_pane.model_combo.currentData() == "radial_gaussian_center"
-        fitted_ref = card._presented_value.snapshot.ref
-        before_fit = card.board.front_frame.panels[0].raster
+        fitted_ref = card.frozen_render_value().snapshot.ref
+
+        def exact_fit_pixels() -> int:
+            image = card.board.grab().toImage().convertToFormat(
+                QtGui.QImage.Format_RGBA8888
+            )
+            bits = image.bits()
+            bits.setsize(image.byteCount())
+            rows = np.frombuffer(bits, dtype=np.uint8).reshape(
+                image.height(),
+                image.bytesPerLine(),
+            )
+            rgba = rows[:, : image.width() * 4].reshape(
+                image.height(),
+                image.width(),
+                4,
+            )
+            color = QtGui.QColor(FIT_RADIAL_COLOR)
+            expected = np.asarray(
+                (color.red(), color.green(), color.blue()),
+                dtype=np.uint8,
+            )
+            return int(np.all(rgba[..., :3] == expected, axis=-1).sum())
+
+        before_fit_pixels = exact_fit_pixels()
         QtTest.QTest.mouseClick(fit_pane.fit_button, QtCore.Qt.LeftButton)
+        center_x_signal = panel_signal_key(card.panel_id, "fit.center_x")
         until(
             application,
             lambda: (
-                card._fit_result is not None
-                and card._fit_result.source_ref == fitted_ref
-                and card._fit_result.statuses == (FitBatchStatus.CONVERGED,)
-                and card.frozen_render_payload() is not None
-                and card.frozen_render_payload().fit_overlay is not None
+                "converged" in card.status.text()
+                and center_x_signal in _signal_leaf_keys(card.signal_combo)
+                and exact_fit_pixels() > before_fit_pixels
             ),
             timeout=20.0,
         )
-        assert card._presented_value.snapshot.ref == fitted_ref
-        after_fit = card.board.front_frame.panels[0].raster
-        expected_fit_rgb = np.rint(
-            np.asarray(to_rgba(FIT_RADIAL_COLOR)[:3]) * 255.0
-        ).astype(np.uint8)
-
-        def exact_fit_pixels(raster) -> int:
-            rgba = np.frombuffer(raster.pixels, dtype=np.uint8).reshape(
-                raster.height,
-                raster.width,
-                4,
-            )
-            return int(
-                np.all(rgba[..., :3] == expected_fit_rgb, axis=-1).sum()
-            )
-
-        assert exact_fit_pixels(after_fit) > exact_fit_pixels(before_fit)
+        until(
+            application,
+            lambda: card.frozen_render_value().snapshot.ref != fitted_ref,
+            timeout=10.0,
+        )
         assert "no retained producer transaction" not in card.status.text()
         capture_offscreen_window(
             application,
@@ -955,21 +920,23 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         until(
             application,
             lambda: (
-                card._presented_value is not None
-                and card._presented_value.snapshot.ref != fitted_ref
-                and card.frozen_render_payload() is not None
-                and card.frozen_render_payload().fit_overlay is None
+                card.frozen_render_value().snapshot.ref != fitted_ref
+                and center_x_signal not in _signal_leaf_keys(card.signal_combo)
+                and card.status.text() == "Fit cleared"
             ),
             timeout=15.0,
         )
+        if card.settings_popup.isVisible():
+            QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
+            until(application, lambda: not card.settings_popup.isVisible())
 
         # No-button movement is inert: the board does not even request tracking.
         board = card.board.board
         assert not board.hasMouseTracking()
-        before = card.frozen_figure_output_state()[1:3]
+        before = card.frozen_figure_output_state()[2:4]
         QtTest.QTest.mouseMove(board, board.rect().center())
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-        assert card.frozen_figure_output_state()[1:3] == before
+        assert card.frozen_figure_output_state()[2:4] == before
 
         # The product selector is one shared gesture owner, exercised here on
         # the actual live TaskConsole front rather than a synthetic board.  It
@@ -998,9 +965,14 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         )
         until(
             application,
-            lambda: card.frozen_figure_output_state()[2] is not None,
+            lambda: card.frozen_figure_output_state()[3] is not None,
         )
 
+        from zlc_frontend.figure_outputs import AREA_DATA_OUTPUT
+
+        # Consume one real Area selection through a second 2-D panel.  The
+        # derived publication must carry the exact painted publication as its
+        # sole parent, so ROI pixels and source metadata cannot diverge.
         area_start = plot_point(0.18, 0.20)
         area_end = plot_point(0.48, 0.58)
         QtTest.QTest.mousePress(
@@ -1008,6 +980,8 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             QtCore.Qt.LeftButton,
             pos=area_start,
         )
+        area_pressed_publication = card.frozen_render_publication()
+        assert area_pressed_publication.value(signal) is card.frozen_render_value()
         drag_mouse_move(board, area_end, QtCore.Qt.LeftButton)
         QtTest.QTest.mouseRelease(
             board,
@@ -1016,138 +990,13 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         )
         until(
             application,
-            lambda: card.frozen_figure_output_state()[1] is not None,
+            lambda: card.frozen_figure_output_state()[2] is not None,
         )
-
-        # A fresh, non-dragging click in blank plot space clears Area.  It does
-        # not restore the old rectangle and does not affect the locked Cross.
-        QtTest.QTest.mouseClick(
-            board,
-            QtCore.Qt.LeftButton,
-            pos=plot_point(0.84, 0.84),
-        )
-        until(
-            application,
-            lambda: card.frozen_figure_output_state()[1] is None,
-        )
-        assert card.frozen_figure_output_state()[2] is not None
-
-        # Keep one middle-button gesture alive across a worker answer.  The
-        # second motion must rebase from the newly painted revision while
-        # retaining the exact held input instead of crashing or splicing in a
-        # newer live-camera value.
-        zoom_revision = card._display_revision
-        _wheel(board, plot_point(0.52, 0.52), -120)
-        until(
-            application,
-            lambda: card._display_revision > zoom_revision,
-        )
-        zoom_revision = card._display_revision
-        until(
-            application,
-            lambda: (
-                (origin := board.visible_image_origin()) is not None
-                and origin.presentation.panel_revision >= zoom_revision
-            ),
-            timeout=15.0,
-        )
-        pan_start = plot_point(0.52, 0.52)
-        first_move = plot_point(0.55, 0.52)
-        second_move = plot_point(0.45, 0.52)
-        QtTest.QTest.mousePress(
-            board,
-            QtCore.Qt.MiddleButton,
-            pos=pan_start,
-        )
-        pressed_ref = card._presented_value.snapshot.ref
-        # Leave the button down while the free-running camera advances.  This
-        # is the real race: the board still paints ``pressed_ref`` and the card
-        # must not promote a newer semantic owner before the first move.
-        until(
-            application,
-            lambda: (
-                card._candidate_value is not None
-                and card._candidate_value.snapshot.ref != pressed_ref
-            ),
-            timeout=10.0,
-        )
-        assert card._presented_value.snapshot.ref == pressed_ref
-        held_front = card.board.front_frame
-        assert held_front is not None
-        assert held_front.panels[0].raster.pixels
-        initial_revision = card._display_revision
-        drag_mouse_move(board, first_move, QtCore.Qt.MiddleButton)
-        first_revision = card._display_revision
-        assert first_revision > initial_revision
-        # The press-time raster remains a complete visible front while the
-        # worker computes the matching viewport answer; there is no blank
-        # intermediate state and no QImage stretching placeholder.
-        during_move_front = card.board.front_frame
-        during_move_origin = board.visible_image_origin()
-        assert during_move_front is not None
-        assert during_move_front.panels[0].raster.pixels
-        assert during_move_origin is not None
-        assert during_move_origin.input_identity.ref == pressed_ref
-        until(
-            application,
-            lambda: (
-                (origin := board.visible_image_origin()) is not None
-                and origin.presentation.panel_revision >= first_revision
-            ),
-            timeout=15.0,
-        )
-        drag_mouse_move(board, second_move, QtCore.Qt.MiddleButton)
-        assert card._display_revision > first_revision
-        QtTest.QTest.mouseRelease(
-            board,
-            QtCore.Qt.MiddleButton,
-            pos=second_move,
-        )
-        assert board.image_selector_fault(card.panel_id) is None
-
-        # Recreate Area, then consume it through a second real 2-D Plot Panel.
-        # This is the product path that used to make Setting intermittently
-        # read a new ROI schema beside old pixels/controls.
-        from dataclasses import replace
-
-        from zlc_frontend.figure_outputs import (
-            AREA_DATA_OUTPUT,
-            FigureOutputSession,
-        )
-        from zlc_neutral_atom.processing.signal_plane import (
-            signal_revision_identity,
-        )
-        from zlc_workbench.task_console.console_records import panel_signal_key
-
-        area_start = plot_point(0.12, 0.16)
-        area_end = plot_point(0.42, 0.48)
-        QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=area_start)
-        area_pressed_ref = card._presented_value.snapshot.ref
-        area_pressed_component = card.frozen_render_source_component()
-        assert area_pressed_component is not None
-        # Area must own the same press-time presentation transaction as pan.
-        # Let the free-running camera overtake it before the first move; the
-        # completed selection still has to publish from the pixels the user
-        # actually enclosed, not from whichever revision is latest at release.
-        until(
-            application,
-            lambda: (
-                card._candidate_value is not None
-                and card._candidate_value.snapshot.ref != area_pressed_ref
-            ),
-            timeout=10.0,
-        )
-        assert card._presented_value.snapshot.ref == area_pressed_ref
-        assert card.frozen_render_source_component() is area_pressed_component
-        drag_mouse_move(board, area_end, QtCore.Qt.LeftButton)
-        QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=area_end)
         area_signal = panel_signal_key(card.panel_id, AREA_DATA_OUTPUT)
-        until(
-            application,
-            lambda: console._tick_data.value(area_signal) is not None,
-            timeout=15.0,
-        )
         assert "no retained producer transaction" not in card.status.text()
+        # A hidden picker is deliberately parked.  Open the destination
+        # panel's real Setting surface: its canonical provider must already
+        # contain the Area key and let the operator bind it directly.
         area_card = _add_plot_and_bind(
             console,
             add,
@@ -1155,21 +1004,32 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             area_signal,
             application,
         )
+        assert area_signal in _signal_leaf_keys(area_card.signal_combo)
         until(
             application,
-            lambda: area_card._presented_value is not None,
+            lambda: _render_value_or_none(area_card) is not None,
             timeout=15.0,
         )
+        area_publication = area_card.frozen_render_publication()
+        assert len(area_publication.parents) == 1
+        area_parent = area_publication.parents[0]
+        assert area_parent.owner_id == area_pressed_publication.owner_id
+        assert area_parent.generation == area_pressed_publication.generation
+        assert area_parent.sequence >= area_pressed_publication.sequence
+        area_value = area_card.frozen_render_value()
+        assert area_publication.value(area_signal) is area_value
+        area_source = area_parent.value(signal)
+        assert area_source is not None
+        assert area_value.snapshot.ref.revision == area_source.snapshot.ref.revision
         if not area_card.settings_popup.isVisible():
             QtTest.QTest.mouseClick(
                 area_card.setting_button,
                 QtCore.Qt.LeftButton,
             )
         until(application, lambda: area_card.settings_popup.isVisible())
-        assert area_card.view_spec_editor._rows == {}
-        assert area_card.view_spec_editor.isHidden()
+        assert area_card.view_spec_editor.isVisible()
 
-        first_roi_schema = area_card._presented_value.schema.fingerprint
+        first_roi_schema = area_card.frozen_render_value().schema.fingerprint
         area_start = plot_point(0.20, 0.24)
         area_end = plot_point(0.62, 0.72)
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=area_start)
@@ -1177,167 +1037,18 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=area_end)
         until(
             application,
-            lambda: area_card._presented_value is not None
-            and area_card._presented_value.schema.fingerprint
+            lambda: _render_value_or_none(area_card) is not None
+            and area_card.frozen_render_value().schema.fingerprint
             != first_roi_schema,
             timeout=15.0,
         )
         assert not area_card._status_error
-        assert area_card.view_spec_editor._rows == {}
-        assert area_card.view_spec_editor.isHidden()
-
-        # Give the downstream Figure its own Area output.  It is now a real
-        # causal descendant of the first Area signal, so an upstream N+1 must
-        # wait for this Figure's matching N+1 instead of exposing mixed fronts.
-        area_board = area_card.board.board
-        until(application, lambda: area_board.selectors_enabled)
-        area_binding = area_board._image_bindings[area_card.panel_id]
-        area_target = area_board._selector_target(area_binding)
-        assert area_target is not None
-        area_plot = area_target[0]
-
-        def area_plot_point(
-            x_fraction: float,
-            y_fraction: float,
-        ) -> QtCore.QPoint:
-            return QtCore.QPoint(
-                int(round(area_plot.left() + x_fraction * area_plot.width())),
-                int(round(area_plot.top() + y_fraction * area_plot.height())),
-            )
-
-        downstream_start = area_plot_point(0.18, 0.20)
-        downstream_end = area_plot_point(0.70, 0.76)
-        QtTest.QTest.mousePress(
-            area_board,
+        assert area_card.view_spec_editor.isVisible()
+        QtTest.QTest.mouseClick(
+            area_card.setting_button,
             QtCore.Qt.LeftButton,
-            pos=downstream_start,
         )
-        drag_mouse_move(area_board, downstream_end, QtCore.Qt.LeftButton)
-        QtTest.QTest.mouseRelease(
-            area_board,
-            QtCore.Qt.LeftButton,
-            pos=downstream_end,
-        )
-        downstream_area_signal = panel_signal_key(
-            area_card.panel_id,
-            AREA_DATA_OUTPUT,
-        )
-        until(
-            application,
-            lambda: console._tick_data.value(downstream_area_signal) is not None,
-            timeout=15.0,
-        )
-
-        # Deterministically stop at the old-visible/new-candidate boundary:
-        # camera N+1 and Area N+1 are complete, while the downstream Area panel
-        # still keeps the coherent N closure visible.  Restart the source Logic
-        # node through its real Start button before the queued descendant can
-        # be accepted.  Topology must keep the exact N sidecar and never throw.
-        until(application, lambda: console._render_lane.idle, timeout=15.0)
-        console._timer.stop()
-        visible_source = console._tick_data.value(signal)
-        visible_area = console._tick_data.value(area_signal)
-        assert visible_source is not None and visible_area is not None
-        until(
-            application,
-            lambda: bool(console._data._dirty),
-            timeout=10.0,
-        )
-        retained_front = console._data.freeze()
-        candidate_source = console._data.candidate_value(signal)
-        assert retained_front.value(area_signal) is not None
-        assert candidate_source is not None
-        assert (
-            signal_revision_identity(candidate_source)
-            != signal_revision_identity(visible_source)
-        )
-        source_entry = console._signal_topology()[signal]
-        output_request = card.freeze_figure_output_request(
-            source_contract_id=source_entry.declaration.contract_id,
-            live_source_override=candidate_source,
-        )
-        assert output_request is not None and output_request.request is not None
-        output_request = replace(
-            output_request,
-            source_component=console._data.capture_source_component(
-                candidate_source
-            ),
-        )
-        output_session = FigureOutputSession()
-        try:
-            candidate_outputs = output_session.evaluate(output_request.request)
-        finally:
-            output_session.close()
-        assert AREA_DATA_OUTPUT in candidate_outputs.outputs
-        console._accept_figure_output_completion(
-            output_request,
-            candidate_outputs,
-            None,
-        )
-        staged_route = console._presentations._routes[area_signal]
-        still_visible = console._tick_data.value(area_signal)
-        assert still_visible is not None
-        assert staged_route.visible is not None
-        assert staged_route.candidate is not None
-        assert (
-            staged_route.visible.revision_identity
-            == signal_revision_identity(still_visible)
-        )
-        assert (
-            staged_route.candidate.revision_identity
-            != staged_route.visible.revision_identity
-        )
-        assert console._presentations.presentation_for(still_visible) is not None
-        old_route_identities = {
-            entry.revision_identity
-            for route_name in (area_signal, downstream_area_signal)
-            for entry in (
-                console._presentations._routes[route_name].visible,
-                console._presentations._routes[route_name].candidate,
-            )
-            if entry is not None
-        }
-        old_generation = (visible_source.run_id, visible_source.epoch_id)
-        previous_node = console._logic_nodes[id(row)]
-
-        editor.form.stop_button.click()
-        console._timer.start()
-        until(
-            application,
-            lambda: not previous_node.running,
-            timeout=15.0,
-        )
-        editor.form.start_button.click()
-        # Restart retires the complete old causal tree before the replacement
-        # generation may publish.  Neither a staged selector completion nor a
-        # downstream selector may resurrect the old Camera run/epoch.
-        until(
-            application,
-            lambda: (
-                (replacement := console._logic_nodes.get(id(row))) is not None
-                and replacement is not previous_node
-            ),
-            timeout=15.0,
-        )
-        # A completion already frozen against the retired generation is stale
-        # even if it arrives after the replacement has started.
-        console._accept_figure_output_completion(
-            output_request,
-            candidate_outputs,
-            None,
-        )
-        restarted_front = console._tick_data
-        for route_name in (signal, area_signal, downstream_area_signal):
-            value = restarted_front.value(route_name)
-            assert value is None or (value.run_id, value.epoch_id) != old_generation
-        for route_name in (area_signal, downstream_area_signal):
-            route = console._presentations._routes.get(route_name)
-            if route is not None:
-                assert all(
-                    entry is None
-                    or entry.revision_identity not in old_route_identities
-                    for entry in (route.visible, route.candidate)
-                )
+        until(application, lambda: not area_card.settings_popup.isVisible())
 
         capture_offscreen_window(
             application,
@@ -1352,14 +1063,18 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
         until(application, lambda: card.settings_popup.isVisible())
         QtTest.QTest.mouseClick(card.edit_button, QtCore.Qt.LeftButton)
+        from zlc_frontend.qt_widgets import FitAuthoringPane
+        from zlc_workbench.task_console.panel_editor import PanelEditor
+
         until(
             application,
             lambda: (
-                id(card) in console._panel_editors
-                and console._panel_editors[id(card)]._board is not None
+                isinstance(console.tabs.currentWidget(), PanelEditor)
+                and console.tabs.currentWidget().findChild(FitAuthoringPane)
+                is not None
             ),
         )
-        edit = console._panel_editors[id(card)]
+        edit = console.tabs.currentWidget()
         assert edit.window() is console.window()
         assert edit._board.isVisible(), (
             console.tabs.currentWidget() is edit,
@@ -1368,6 +1083,35 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             console.tabs.currentIndex(),
             console.tabs.indexOf(edit),
         )
+        edit_request = edit.freeze_current_view_request()
+        assert edit_request is not None
+        edit_ref = edit_request.value.snapshot.ref
+        edit_fit = edit.findChild(FitAuthoringPane)
+        assert edit_fit is not None
+        assert edit_fit is not card.fit_authoring_pane
+
+        # Edit Fit belongs to this frozen surface only.  It may neither clear nor
+        # publish the live panel's parameter route, and opening Edit must not stop
+        # the live Camera front from advancing.
+        fit_request_spy = QtTest.QSignalSpy(card.fit_requested)
+        fit_clear_spy = QtTest.QSignalSpy(card.fit_output_clear_requested)
+        live_ref = card.frozen_render_value().snapshot.ref
+        until(application, lambda: edit_fit.fit_button.isEnabled(), timeout=15.0)
+        QtTest.QTest.mouseClick(edit_fit.fit_button, QtCore.Qt.LeftButton)
+        assert not edit_fit.fit_button.isEnabled()
+        assert len(fit_request_spy) == 1
+        assert fit_request_spy[0][0] is edit_fit
+        assert fit_request_spy[0][0] is not fit_pane
+        assert len(fit_clear_spy) == 0
+        until(application, lambda: edit_fit.fit_button.isEnabled(), timeout=20.0)
+        until(
+            application,
+            lambda: card.frozen_render_value().snapshot.ref != live_ref,
+            timeout=10.0,
+        )
+        assert edit.freeze_current_view_request().value.snapshot.ref == edit_ref
+        assert center_x_signal not in _signal_leaf_keys(card.signal_combo)
+        assert len(fit_clear_spy) == 0
         capture_offscreen_window(
             application,
             console,
@@ -1389,42 +1133,6 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             tmp_path / "camera-live-edit-scrolled.png",
             settle_ms=100,
         )
-
-        # Edit is a second presentation surface, not a global pause switch for
-        # the live card.  Hold a real pan on its frozen image while Camera keeps
-        # advancing: Edit must retain its own transaction and Live must keep
-        # promoting complete fronts.  This catches any future attempt to put a
-        # card-global pointer pin back between the two surfaces.
-        edit_board = edit._board.board
-        edit_binding = edit_board._image_bindings[card.panel_id]
-        edit_target = edit_board._selector_target(edit_binding)
-        assert edit_target is not None
-        edit_plot = edit_target[0]
-        edit_start = edit_plot.center()
-        edit_end = QtCore.QPoint(
-            edit_start.x() + max(2, edit_plot.width() // 20),
-            edit_start.y(),
-        )
-        edit_snapshot_ref = edit._snapshot_value.snapshot.ref
-        live_ref = card._presented_value.snapshot.ref
-        QtTest.QTest.mousePress(
-            edit_board,
-            QtCore.Qt.MiddleButton,
-            pos=edit_start,
-        )
-        until(
-            application,
-            lambda: card._presented_value.snapshot.ref != live_ref,
-            timeout=10.0,
-        )
-        assert edit._snapshot_value.snapshot.ref == edit_snapshot_ref
-        drag_mouse_move(edit_board, edit_end, QtCore.Qt.MiddleButton)
-        QtTest.QTest.mouseRelease(
-            edit_board,
-            QtCore.Qt.MiddleButton,
-            pos=edit_end,
-        )
-        assert edit_board.image_selector_fault(card.panel_id) is None
     finally:
         if not widget_gone(console_wrapper):
             console_wrapper.close()
@@ -1472,7 +1180,7 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         _choose_combo_text(console.kind_combo, "Task: Calibrate readout", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         calibration_row = console.logic_nodes[-1]
-        calibration_editor = console._logic_editors[id(calibration_row)]
+        calibration_editor = _current_logic_editor(console, application)
         calibration_widgets = _visible_form_widgets(calibration_editor)
         assert set(calibration_widgets) == {
             "source_mode",
@@ -1504,14 +1212,14 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             application.processEvents(QtCore.QEventLoop.AllEvents, 20)
             saw_calibration_panel = saw_calibration_panel or any(
                 card.config.signal == calibration_frame
-                and card.config.kind == "2d"
+                and card.config.kind == PlotKind.IMAGE
                 for card in console.cards
             )
-            if not console._task_locked:
+            if calibration_row.status_label.text().startswith("done"):
                 break
             time.sleep(0.005)
         assert saw_calibration_panel
-        assert not console._task_locked
+        assert calibration_row.status_label.text().startswith("done")
         site_map_signal = console_signal_key(
             calibration_row.node.node_id,
             "site_map",
@@ -1520,7 +1228,7 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             application,
             lambda: any(
                 card.config.signal == site_map_signal
-                and card.config.kind == "sites"
+                and card.config.kind == PlotKind.SITE_MAP
                 and card.board is not None
                 and card.board.front_frame is not None
                 for card in console.cards
@@ -1531,71 +1239,23 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             card
             for card in console.cards
             if card.config.signal == site_map_signal
-            and card.config.kind == "sites"
+            and card.config.kind == PlotKind.SITE_MAP
         )
 
-        # Exercise the real FINAL projector and the exact presentation that
-        # TaskConsole admitted beside its visible SignalValue.  This is not a
-        # report-shaped contract reconstructed by the test.
-        from zlc_frontend import (
-            DEFAULT_PANEL_SIZE,
-            PlotPanelComposeRequest,
-            PlotPanelSession,
-        )
+        # The visible task panel itself is the public presentation boundary.
+        from zlc_frontend.panel_size import DEFAULT_PANEL_SIZE
         from zlc_frontend.plot_layout import (
             PANEL_EXPORT_PIXEL_RATIO,
             panel_surface_geometry,
         )
-        from zlc_frontend.site_map import SiteMapPresentation
-        from zlc_neutral_atom.logic_nodes.readout.calibration.ui.view_projection import (
-            project_calibration_final_views,
-        )
-
-        retained = console._last_node[id(calibration_row)]
-        visible_front = console._data.freeze()
-        site_map_value = visible_front.value(site_map_signal)
-        assert site_map_value is not None
-        visible_presentation = console._presentations.presentation_for(
-            site_map_value
-        )
-        assert isinstance(visible_presentation, SiteMapPresentation)
-        projected = project_calibration_final_views(
-            retained.prepared_command,
-            retained.final_result,
-            retained.materialized_final_outputs,
-        )["site_map"]
-        assert visible_presentation.view_identity == projected.view_identity
-        assert visible_presentation.background_input == projected.background_input
-        assert visible_presentation.site_state_input == projected.site_state_input
 
         contract = site_map_card.frozen_plot_panel_contract()
-        assert contract.kind == "sites"
+        site_map_value = site_map_card.frozen_render_value()
+        site_map_publication = site_map_card.frozen_render_publication()
+        assert site_map_publication.value(site_map_signal) is site_map_value
+        assert contract.figure.kind.value == "sites"
         assert contract.size_name == DEFAULT_PANEL_SIZE
-        axis_labels, short_labels = console._panel_render_labels()
-        request = site_map_card.freeze_render_request(
-            visible_front,
-            ("calibration-final-site-map", site_map_value.snapshot.ref.revision.value),
-            force=True,
-            axis_labels=axis_labels,
-            short_labels=short_labels,
-        )
-        assert request is not None
-        assert request.contract == contract
-        assert request.source.site_map is visible_presentation
-        direct_session = PlotPanelSession(request.contract)
-        try:
-            direct = direct_session.compose(
-                PlotPanelComposeRequest(
-                    request.source,
-                    request.display,
-                    request.provenance,
-                )
-            )
-        finally:
-            direct_session.close()
-        assert direct.frame is not None
-        visible_raster = site_map_card.board.front_frame.panels[0].raster
-        assert direct.frame.panels[0].raster == visible_raster
+        assert site_map_card.board.front_frame.panels[0].raster is not None
 
         # The saved report uses denser export pixels for the same ordinary
         # logical 2x2 surface.  It does not obtain resolution by authoring a
@@ -1623,40 +1283,15 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             calibration_row.node.node_id,
             "fidelity_site",
         )
-        threshold_site = console_signal_key(
-            calibration_row.node.node_id,
-            "fidelity_threshold",
-        )
-        centers_site = console_signal_key(
-            calibration_row.node.node_id,
-            "fidelity_centers",
-        )
-        aggregate_fidelity = console_signal_key(
-            calibration_row.node.node_id,
-            "aggregate_fidelity",
-        )
-        global_fidelity = console_signal_key(
-            calibration_row.node.node_id,
-            "global_fidelity",
-        )
-        calibration_front = console._data.freeze()
-        fidelity_value = calibration_front.value(fidelity_site)
-        threshold_value = calibration_front.value(threshold_site)
-        centers_value = calibration_front.value(centers_site)
-        assert fidelity_value is not None
-        assert threshold_value is not None
-        assert centers_value is not None
-        assert calibration_front.value(aggregate_fidelity) is not None
-        assert calibration_front.value(global_fidelity) is not None
-        site_axis = fidelity_value.schema.cell_schema.data_axes[0]
-        assert site_axis.role.value == "site"
-        assert fidelity_value.schema.physical_shape == (1, 1, site_axis.size)
-        assert threshold_value.schema.cell_schema.data_axes == (site_axis,)
-        assert centers_value.schema.physical_shape == (1, 1, site_axis.size, 2)
         assert "site fidelity" in calibration_row.publishes_label.text()
-        assert (
-            f"1 × 1 × ({site_axis.size})"
-            in calibration_row.publishes_label.text()
+        assert all(
+            output in calibration_row.publishes_label.text()
+            for output in (
+                "site threshold",
+                "site centres",
+                "aggregate fidelity",
+                "global fidelity",
+            )
         )
 
         fidelity_card = _add_plot_and_bind(
@@ -1668,6 +1303,16 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         )
         until(
             application,
+            lambda: _render_value_or_none(fidelity_card) is not None,
+            timeout=15.0,
+        )
+        fidelity_value = fidelity_card.frozen_render_value()
+        site_axis = fidelity_value.schema.cell_schema.data_axes[0]
+        assert site_axis.role.value == "site"
+        assert fidelity_value.schema.physical_shape == (1, 1, site_axis.size)
+        assert f"1 × 1 × ({site_axis.size})" in calibration_row.publishes_label.text()
+        until(
+            application,
             lambda: (
                 fidelity_card.board is not None
                 and fidelity_card.board.front_frame is not None
@@ -1675,14 +1320,14 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             timeout=15.0,
         )
         assert (
-            fidelity_card.frozen_plot_panel_contract().value_label
+            fidelity_card.frozen_plot_panel_contract().figure.value_label
             == "Readout fidelity"
         )
 
         _choose_combo_text(console.kind_combo, "Task: Optimize MOT field", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         mot_row = console.logic_nodes[-1]
-        mot_editor = console._logic_editors[id(mot_row)]
+        mot_editor = _current_logic_editor(console, application)
         mot_widgets = _visible_form_widgets(mot_editor)
         assert set(mot_widgets) == {
             "pulse",
@@ -1707,25 +1352,41 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             QtCore.Qt.LeftButton,
         )
         mot_grid = console_signal_key(mot_row.node.node_id, "grid")
+        mot_final = console_signal_key(mot_row.node.node_id, "mot_field")
         saw_mot_panel = False
         deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
             application.processEvents(QtCore.QEventLoop.AllEvents, 20)
             saw_mot_panel = saw_mot_panel or any(
                 card.config.signal == mot_grid
-                and card.config.kind == "grid"
+                and card.config.kind == PlotKind.GRID
                 for card in console.cards
             )
-            if not console._task_locked:
+            if mot_row.status_label.text().startswith("done"):
                 break
             time.sleep(0.005)
         assert saw_mot_panel
-        assert not console._task_locked
-        mot_final = console_signal_key(mot_row.node.node_id, "mot_field")
-        mot_value = console._data.freeze().value(mot_final)
-        assert mot_value is not None
+        assert mot_row.status_label.text().startswith("done")
+        until(
+            application,
+            lambda: any(
+                card.config.signal == mot_final
+                and card.config.kind == PlotKind.GRID
+                and card.board is not None
+                and (
+                    card.board.front_frame is not None
+                    or card.board.showing_overview
+                )
+                for card in console.cards
+            ),
+            timeout=15.0,
+        )
+        mot_card = next(
+            card for card in console.cards if card.config.signal == mot_final
+        )
+        mot_value = mot_card.frozen_render_value()
         mot_schema = mot_value.schema
-        assert tuple(axis.role.value for axis in mot_schema.point_axes) == (
+        assert tuple(column.role.value for column in mot_schema.point_table.columns) == (
             "scan-point",
             "scan-point",
             "scan-point",
@@ -1736,10 +1397,10 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         ) == (1,)
         assert mot_schema.physical_shape == (
             1,
-            mot_schema.point_layout.storage_size,
+            mot_schema.point_table.row_count,
             1,
         )
-        mot_shape = f"1 × {mot_schema.point_layout.storage_size} × (1)"
+        mot_shape = f"1 × {mot_schema.point_table.row_count} × (1)"
         assert mot_shape in mot_row.publishes_label.text()
         assert "points:" not in mot_row.publishes_label.text()
     finally:
@@ -1791,7 +1452,7 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
         _choose_combo_text(console.kind_combo, "Measurement: Camera", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         camera_row = console.logic_nodes[-1]
-        camera_editor = console._logic_editors[id(camera_row)]
+        camera_editor = _current_logic_editor(console, application)
         camera_widgets = _visible_form_widgets(camera_editor)
         _choose_combo_data(camera_widgets["camera_role"], "camera", application)
         _replace_spin_value(camera_widgets["repeat"], "0")
@@ -1801,19 +1462,14 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
         )
         until(
             application,
-            lambda: (
-                (node := console._logic_nodes.get(id(camera_row))) is not None
-                and node.handle is not None
-                and node.running
-            ),
+            lambda: camera_row.status_label.text() == "running",
             timeout=15.0,
         )
-        camera_run_id = console._logic_nodes[id(camera_row)].handle.run_id
 
         _choose_combo_text(console.kind_combo, "Task: Calibrate readout", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         calibration_row = console.logic_nodes[-1]
-        calibration_editor = console._logic_editors[id(calibration_row)]
+        calibration_editor = _current_logic_editor(console, application)
         calibration_widgets = _visible_form_widgets(calibration_editor)
         _replace_path_value(
             calibration_widgets["folder"],
@@ -1838,19 +1494,13 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
             application,
             lambda: (
                 _resolved_artifact(console, calibration_signal) is not None
-                and not console._task_locked
+                and calibration_row.status_label.text().startswith("done")
             ),
             timeout=25.0,
         )
-        assert console._logic_nodes.get(id(camera_row)) is None
         assert not camera_row.stop_button.isEnabled()
         assert camera_row.status_label.text() == "stopped"
         assert _resolved_artifact(console, calibration_signal) is not None
-        assert camera_run_id != getattr(
-            getattr(console._last_node[id(calibration_row)], "handle", None),
-            "run_id",
-            None,
-        )
     finally:
         if not widget_gone(console_wrapper):
             console_wrapper.close()
@@ -1881,6 +1531,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
     )
     flow = _StandaloneTaskConsoleFlow(args)
     devices = flow.open()
+    console = None
     console_wrapper = None
     pulse_body = None
     try:
@@ -1905,7 +1556,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         _choose_combo_text(console.kind_combo, "Task: Calibrate readout", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         calibration_row = console.logic_nodes[-1]
-        calibration_editor = console._logic_editors[id(calibration_row)]
+        calibration_editor = _current_logic_editor(console, application)
         calibration_widgets = _visible_form_widgets(calibration_editor)
         _replace_path_value(
             calibration_widgets["folder"],
@@ -1924,7 +1575,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             application,
             lambda: (
                 _resolved_artifact(console, calibration_signal) is not None
-                and not console._task_locked
+                and calibration_row.status_label.text().startswith("done")
             ),
             timeout=25.0,
         )
@@ -1935,7 +1586,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         _choose_combo_text(console.kind_combo, "Measurement: Temperature", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         temperature_row = console.logic_nodes[-1]
-        temperature_editor = console._logic_editors[id(temperature_row)]
+        temperature_editor = _current_logic_editor(console, application)
         temperature_widgets = _visible_form_widgets(temperature_editor)
         assert set(temperature_widgets) == {
             "pulse",
@@ -1965,16 +1616,10 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         )
         until(
             application,
-            lambda: console._data.freeze().value(temperature_signal) is not None,
+            lambda: temperature_row.status_label.text().startswith("done"),
             timeout=25.0,
         )
         assert tuple(console.cards) == cards_before
-        temperature_value = console._data.freeze().value(temperature_signal)
-        temperature_axis = temperature_value.snapshot.block.schema.point_axes[0]
-        assert (temperature_axis.name, temperature_axis.unit) == (
-            "Trap-off time",
-            "s",
-        )
         temperature_card = _add_plot_and_bind(
             console,
             add,
@@ -1988,6 +1633,12 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             and temperature_card.board.front_frame is not None,
             timeout=15.0,
         )
+        temperature_value = temperature_card.frozen_render_value()
+        temperature_axis = temperature_value.snapshot.block.schema.point_table.columns[0]
+        assert (temperature_axis.name, temperature_axis.unit) == (
+            "Trap-off time",
+            "s",
+        )
 
         # Readout-duration fidelity uses the same exact Calibration output.  It
         # performs its supported camera API update only between duration points;
@@ -1999,7 +1650,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         )
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         fidelity_row = console.logic_nodes[-1]
-        fidelity_editor = console._logic_editors[id(fidelity_row)]
+        fidelity_editor = _current_logic_editor(console, application)
         fidelity_widgets = _visible_form_widgets(fidelity_editor)
         assert set(fidelity_widgets) == {
             "pulse",
@@ -2026,7 +1677,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         fidelity_signal = console_signal_key(fidelity_row.node.node_id, "fidelity")
         until(
             application,
-            lambda: console._data.freeze().value(fidelity_signal) is not None,
+            lambda: fidelity_row.status_label.text().startswith("done"),
             timeout=25.0,
         )
         assert tuple(console.cards) == cards_before
@@ -2077,7 +1728,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         _choose_combo_text(console.kind_combo, "Measurement: Camera", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         camera_row = console.logic_nodes[-1]
-        camera_editor = console._logic_editors[id(camera_row)]
+        camera_editor = _current_logic_editor(console, application)
         camera_widgets = _visible_form_widgets(camera_editor)
         _choose_combo_data(camera_widgets["camera_role"], "camera", application)
         _replace_spin_value(camera_widgets["repeat"], "0")
@@ -2086,19 +1737,32 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         camera_signal = console_signal_key(camera_row.node.node_id, "frame_0")
         until(
             application,
-            lambda: console._data.freeze().value(camera_signal) is not None,
+            lambda: camera_row.status_label.text() == "running",
             timeout=20.0,
         )
-        first_camera = console._data.freeze().value(camera_signal)
+        assert tuple(console.cards) == cards_before
+        camera_card = _add_plot_and_bind(
+            console,
+            add,
+            "2d",
+            camera_signal,
+            application,
+        )
+        until(
+            application,
+            lambda: camera_card.board is not None
+            and camera_card.board.front_frame is not None,
+            timeout=15.0,
+        )
+        first_camera = camera_card.frozen_render_value()
         until(
             application,
             lambda: (
-                (value := console._data.freeze().value(camera_signal)) is not None
+                (value := _render_value_or_none(camera_card)) is not None
                 and value.snapshot.ref != first_camera.snapshot.ref
             ),
             timeout=10.0,
         )
-        assert tuple(console.cards) == cards_before
 
         _choose_combo_text(
             console.kind_combo,
@@ -2107,7 +1771,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         )
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         occupancy_row = console.logic_nodes[-1]
-        occupancy_editor = console._logic_editors[id(occupancy_row)]
+        occupancy_editor = _current_logic_editor(console, application)
         occupancy_widgets = _visible_form_widgets(occupancy_editor)
         assert set(occupancy_widgets) == {
             "model_kind",
@@ -2157,26 +1821,10 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
         rate_signal = console_signal_key(occupancy_row.node.node_id, "rate")
         until(
             application,
-            lambda: (
-                console._data.freeze().value(occupied_signal) is not None
-                and console._data.freeze().value(rate_signal) is not None
-            ),
+            lambda: occupancy_row.status_label.text() == "running",
             timeout=20.0,
         )
         assert tuple(console.cards) == cards_before
-        first_occupied = console._data.freeze().value(occupied_signal)
-        first_rate = console._data.freeze().value(rate_signal)
-        until(
-            application,
-            lambda: (
-                (occupied := console._data.freeze().value(occupied_signal))
-                is not None
-                and occupied.snapshot.ref != first_occupied.snapshot.ref
-                and (rate := console._data.freeze().value(rate_signal)) is not None
-                and rate.snapshot.ref != first_rate.snapshot.ref
-            ),
-            timeout=10.0,
-        )
 
         sites_card = _add_plot_and_bind(
             console,
@@ -2193,6 +1841,7 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             ),
             timeout=20.0,
         )
+        assert rate_signal in _signal_leaf_keys(sites_card.signal_combo)
         first_sites_front = sites_card.board.front_frame
         until(
             application,
@@ -2220,6 +1869,19 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
                 and pulse_body.active_snapshot.state.terminal,
                 timeout=15.0,
             )
+        if console is not None:
+            for row in reversed(console.logic_nodes):
+                if not row.stop_button.isEnabled():
+                    continue
+                QtTest.QTest.mouseClick(
+                    row.stop_button,
+                    QtCore.Qt.LeftButton,
+                )
+                until(
+                    application,
+                    lambda current=row: not current.stop_button.isEnabled(),
+                    timeout=15.0,
+                )
         if not widget_gone(console_wrapper):
             console_wrapper.close()
             until(application, lambda: widget_gone(console_wrapper), timeout=15.0)
@@ -2235,10 +1897,6 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
     configure_offscreen_fast_path()
     application = ensure_qt_app()
     from task_console import _StandaloneTaskConsoleFlow, _build_parser
-    from zlc_neutral_atom.logic_nodes.release_recapture.timing import (
-        TriggeredReleaseRecaptureResult,
-    )
-
     args = _build_parser().parse_args(
         [
             "--repository",
@@ -2273,7 +1931,7 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
         _choose_combo_text(console.kind_combo, "Task: Calibrate readout", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         calibration_row = console.logic_nodes[-1]
-        calibration_editor = console._logic_editors[id(calibration_row)]
+        calibration_editor = _current_logic_editor(console, application)
         calibration_widgets = _visible_form_widgets(calibration_editor)
         _replace_path_value(
             calibration_widgets["folder"],
@@ -2292,7 +1950,7 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
             application,
             lambda: (
                 _resolved_artifact(console, calibration_signal) is not None
-                and not console._task_locked
+                and calibration_row.status_label.text().startswith("done")
             ),
             timeout=25.0,
         )
@@ -2304,7 +1962,7 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
         )
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         grey_row = console.logic_nodes[-1]
-        grey_editor = console._logic_editors[id(grey_row)]
+        grey_editor = _current_logic_editor(console, application)
         grey_widgets = _visible_form_widgets(grey_editor)
         assert set(grey_widgets) == {
             "pulse",
@@ -2315,10 +1973,9 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
             "rf_role",
             "calibration",
         }
-        grey_spec = console._spec_for_logic(grey_row.node)
-        assert grey_spec is not None
+        grey_spec = grey_editor.form.current_spec()
         detuning_decl = next(
-            field for field in grey_spec.form.fields if field.key == "detuning"
+            field for field in grey_spec.editor_fields if field.key == "detuning"
         )
         assert (detuning_decl.label, detuning_decl.unit) == (
             "Two-photon detuning",
@@ -2341,28 +1998,13 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
             grey_editor.form.start_button,
             QtCore.Qt.LeftButton,
         )
-        grey_node = console._logic_nodes[id(grey_row)]
         recapture_signal = console_signal_key(grey_row.node.node_id, "recapture")
         until(
             application,
-            lambda: (
-                grey_node.final_result_resolved
-                and console._data.freeze().value(recapture_signal) is not None
-            ),
+            lambda: grey_row.status_label.text().startswith("done"),
             timeout=25.0,
         )
         assert tuple(console.cards) == cards_before
-        result = grey_node.final_result
-        assert isinstance(result, TriggeredReleaseRecaptureResult)
-        assert result.rf_terminal is not None
-        assert result.rf_terminal.advanced_points == 3
-        recapture = console._data.freeze().value(recapture_signal)
-        axis = recapture.snapshot.block.schema.point_axes[0]
-        assert (axis.name, axis.unit, axis.coordinates) == (
-            "Two-photon detuning",
-            "Γ",
-            (-0.2, 0.0, 0.2),
-        )
 
         card = _add_plot_and_bind(
             console,
@@ -2376,7 +2018,17 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
             lambda: card.board is not None and card.board.front_frame is not None,
             timeout=15.0,
         )
-        assert card.frozen_plot_panel_contract().value_label == "Recapture rate"
+        recapture = card.frozen_render_value()
+        axis = recapture.snapshot.block.schema.point_table.columns[0]
+        assert (axis.name, axis.unit, axis.values) == (
+            "Two-photon detuning",
+            "Γ",
+            (-0.2, 0.0, 0.2),
+        )
+        assert (
+            card.frozen_plot_panel_contract().figure.value_label
+            == "Recapture rate"
+        )
     finally:
         if not widget_gone(console_wrapper):
             console_wrapper.close()
@@ -2429,7 +2081,7 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
         _choose_combo_text(console.kind_combo, "Measurement: Camera", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         camera_row = console.logic_nodes[-1]
-        camera_editor = console._logic_editors[id(camera_row)]
+        camera_editor = _current_logic_editor(console, application)
         camera_widgets = _visible_form_widgets(camera_editor)
         _choose_combo_data(camera_widgets["camera_role"], "camera", application)
         _replace_spin_value(camera_widgets["repeat"], "0")
@@ -2439,22 +2091,24 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
         )
         until(
             application,
-            lambda: (
-                (node := console._logic_nodes.get(id(camera_row))) is not None
-                and node.handle is not None
-                and node.running
-            ),
+            lambda: camera_row.status_label.text() == "running",
             timeout=15.0,
         )
-        camera_node = console._logic_nodes[id(camera_row)]
-        camera_handle = camera_node.handle
-        camera_run_id = camera_handle.run_id
         camera_signal = console_signal_key(camera_row.node.node_id, "frame_0")
+        until(
+            application,
+            lambda: _dataset_producer_or_none(console, camera_signal) is not None,
+            timeout=15.0,
+        )
+        camera_producer = _dataset_producer_or_none(console, camera_signal)
+        assert camera_producer is not None
+        assert camera_producer.running
+        camera_binding_identity = camera_producer.output_binding.identity
 
         _choose_combo_text(console.kind_combo, "Measurement: Pulse scan", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         scan_row = console.logic_nodes[-1]
-        scan_editor = console._logic_editors[id(scan_row)]
+        scan_editor = _current_logic_editor(console, application)
         widgets = _visible_form_widgets(scan_editor)
         assert set(widgets) == {"pulse", "pulse_slots", "y_signal"}
 
@@ -2466,10 +2120,9 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
             "Scan slots (hardware table)",
             "API slots (one pulse per point)",
         }
-        scan_spec = console._spec_for_logic(scan_row.node)
-        assert scan_spec is not None
+        scan_spec = scan_editor.form.current_spec()
         y_parameter = next(
-            parameter for parameter in scan_spec.input_fields
+            parameter for parameter in scan_spec.editor_fields
             if parameter.key == "y_signal"
         )
         assert y_parameter.label == "Signal (y)"
@@ -2482,49 +2135,71 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
         # its FINAL result arrives.  Plot ownership remains an explicit Monitor
         # action; only Tasks open their declared run-scoped panels.
         assert not any(card.config.signal == scan_signal for card in console.cards)
-        deadline = time.monotonic() + 25.0
-        while time.monotonic() < deadline:
-            application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-            if console._data.freeze().value(scan_signal) is not None:
-                break
-            time.sleep(0.005)
-        value = console._data.freeze().value(scan_signal)
-        if value is None:
-            raise AssertionError(scan_row.status_label.text())
-        current_camera = console._logic_nodes.get(id(camera_row))
-        assert current_camera is camera_node
-        assert current_camera.handle is camera_handle
-        assert current_camera.handle.run_id == camera_run_id
+        until(
+            application,
+            lambda: scan_row.status_label.text().startswith("done"),
+            timeout=25.0,
+        )
+        current_camera = console.resolve_console_producer(camera_signal)
         assert current_camera.running
+        assert current_camera.output_binding.identity == camera_binding_identity
         assert camera_row.status_label.text() == "running"
         assert camera_row.stop_button.isEnabled()
-        camera_value = console._data.freeze().value(camera_signal)
-        assert camera_value is not None
-        assert camera_value.run_id == camera_run_id.value
         assert not any(card.config.signal == scan_signal for card in console.cards)
-        data_roles = {
-            axis.role for axis in value.snapshot.block.schema.cell_schema.data_axes
-        }
-        from zlc_data import SPATIAL_X, SPATIAL_Y
-
-        plot_kind = (
-            "2d" if {SPATIAL_X, SPATIAL_Y}.issubset(data_roles) else "1d"
-        )
         scan_card = _add_plot_and_bind(
             console,
             add,
-            plot_kind,
+            "grid",
             scan_signal,
             application,
         )
+        from zlc_data import AxisSourceRef
+        from zlc_frontend.figure import ViewIntent
+        from zlc_frontend.qt_widgets import FluentParameterForm
+
+        if not scan_card.settings_popup.isVisible():
+            QtTest.QTest.mouseClick(
+                scan_card.setting_button,
+                QtCore.Qt.LeftButton,
+            )
+        until(application, lambda: scan_card.settings_popup.isVisible())
         until(
             application,
-            lambda: scan_card.board is not None
-            and scan_card.board.front_frame is not None,
-            timeout=15.0,
+            lambda: scan_card.view_spec_editor.isVisible()
+            or not scan_card.status.text().startswith("waiting for "),
         )
+        assert scan_card.view_spec_editor.isVisible(), scan_card.status.text()
+        view_form = scan_card.view_spec_editor.findChild(FluentParameterForm)
+        assert view_form is not None
+        _choose_combo_data(
+            view_form.widget_for("grid.intent"),
+            ViewIntent.IMAGE,
+            application,
+        )
+        until(application, lambda: "grid.facet" in view_form.keys)
+        _choose_combo_data(
+            view_form.widget_for("grid.facet"),
+            AxisSourceRef.point_rows(),
+            application,
+        )
+        deadline = time.monotonic() + 15.0
+        while (
+            scan_card.board is None
+            or not (
+                scan_card.board.front_frame is not None
+                or scan_card.board.showing_overview
+            )
+        ) and time.monotonic() < deadline:
+            application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+            time.sleep(0.005)
+        assert scan_card.board is not None, scan_card.status.text()
+        assert (
+            scan_card.board.front_frame is not None
+            or scan_card.board.showing_overview
+        ), scan_card.status.text()
+        value = scan_card.frozen_render_value()
         assert value.snapshot.block.schema.repeat_axis.size >= 1
-        assert value.snapshot.block.schema.point_layout.storage_size >= 1
+        assert value.snapshot.block.schema.point_table.row_count >= 1
     finally:
         if not widget_gone(console_wrapper):
             console_wrapper.close()

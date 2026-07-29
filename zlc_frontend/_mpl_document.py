@@ -92,6 +92,7 @@ from ._mpl_histogram import (
     _draw_histogram_projection,
     _grid_histogram_value_range,
     _histogram,
+    _histogram_analysis_cache,
     _update_histogram_artist,
     _update_histogram_presentation,
 )
@@ -147,7 +148,7 @@ def _faceted_panel_topology(
         if isinstance(data, EvaluatedHistogram):
             return (
                 EvaluatedHistogram,
-                tuple(item.source for item in data.sample_coordinates),
+                data.sample_sources,
                 data.value_unit,
             )
         if isinstance(data, EvaluatedMeter):
@@ -186,6 +187,7 @@ class _FacetedCellArtists:
         "diagnostics",
         "fit",
         "histogram_fit",
+        "histogram_analysis_cache",
         "histogram_thresholds",
         "image_center",
         "image_diagnostic",
@@ -200,6 +202,7 @@ class _FacetedCellArtists:
         self.fit = ()
         self.diagnostics = ()
         self.histogram_fit = ()
+        self.histogram_analysis_cache = None
         self.histogram_thresholds = []
         self.image_center = None
         self.image_ring = None
@@ -241,7 +244,7 @@ class FacetedPanelAggRenderer:
         "_font_scale",
         "_height",
         "_histogram_count_limits",
-        "_histogram_count_scale",
+        "_histogram_log_count_axis",
         "_histogram_relim_mode",
         "_image_color_limits",
         "_image_relim_mode",
@@ -286,7 +289,7 @@ class FacetedPanelAggRenderer:
         self._blit_cache = _AggBlitCache()
         self._histogram_count_limits = None
         self._histogram_relim_mode = None
-        self._histogram_count_scale = None
+        self._histogram_log_count_axis = None
         self._image_color_limits = None
         self._image_relim_mode = None
         self._image_range_evaluated = None
@@ -661,11 +664,11 @@ class FacetedPanelAggRenderer:
             peak,
             current_count_limits=self._histogram_count_limits,
             previous_relim_mode=self._histogram_relim_mode,
-            previous_count_scale=self._histogram_count_scale,
+            previous_log_count_axis=self._histogram_log_count_axis,
         )
         self._histogram_count_limits = count_limits
         self._histogram_relim_mode = display.relim_mode
-        self._histogram_count_scale = display.count_scale
+        self._histogram_log_count_axis = display.log_count_axis
         return faceted, display, counts, edges, x_limits, count_limits
 
     def _update_histograms(
@@ -734,11 +737,11 @@ class FacetedPanelAggRenderer:
                 peak,
                 current_count_limits=self._histogram_count_limits,
                 previous_relim_mode=self._histogram_relim_mode,
-                previous_count_scale=self._histogram_count_scale,
+                previous_log_count_axis=self._histogram_log_count_axis,
             )
             self._histogram_count_limits = count_limits
             self._histogram_relim_mode = display.relim_mode
-            self._histogram_count_scale = display.count_scale
+            self._histogram_log_count_axis = display.log_count_axis
         offset = 0
         for axis, state, (layer, cell, series_group), cell_fit_overlays in zip(
             self._axes,
@@ -766,6 +769,14 @@ class FacetedPanelAggRenderer:
                 _update_histogram_artist(artist, current, edges)
             address = _panel_focus_address(layer, cell, series_group)
             cell_display = faceted.display_for(address)
+            automatic_analysis = None
+            if not cell_fit_overlays:
+                state.histogram_analysis_cache = _histogram_analysis_cache(
+                    state.histogram_analysis_cache,
+                    panel_counts,
+                    edges,
+                )
+                automatic_analysis = state.histogram_analysis_cache[1]
             (
                 state.histogram_fit,
                 thresholds,
@@ -782,9 +793,10 @@ class FacetedPanelAggRenderer:
                 stats_text=None,
                 show_stats=False,
                 threshold_linewidth=1.4,
+                automatic_analysis=automatic_analysis,
             )
             state.histogram_thresholds = list(thresholds)
-            axis.set_yscale(display.count_scale.value)
+            axis.set_yscale("log" if display.log_count_axis else "linear")
             axis.set_xlim(*x_limits)
             axis.set_ylim(*count_limits)
             axis.set_xlabel(self._value_label)
@@ -1036,7 +1048,7 @@ class FacetedPanelAggRenderer:
         self._curve_relim_mode = None
         self._histogram_count_limits = None
         self._histogram_relim_mode = None
-        self._histogram_count_scale = None
+        self._histogram_log_count_axis = None
         self._image_color_limits = None
         self._image_relim_mode = None
         self._image_range_evaluated = None
@@ -1369,7 +1381,9 @@ def _render_evaluated_figure(
                     assert shared_histogram_x_limits is not None
                     assert shared_histogram_count_limits is not None
                     assert histogram_display is not None
-                    target.set_yscale(histogram_display.count_scale.value)
+                    target.set_yscale(
+                        "log" if histogram_display.log_count_axis else "linear"
+                    )
                     target.set_xlim(*shared_histogram_x_limits)
                     target.set_ylim(*shared_histogram_count_limits)
             elif isinstance(kind, EvaluatedMeter):

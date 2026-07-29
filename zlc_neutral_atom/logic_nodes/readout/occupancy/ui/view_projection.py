@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-
-from zlc_data import IndexSelection, Selection, dataset_cell_value
+from zlc_data import IndexSelection, Selection
+from zlc_data.value import dataset_cell_value
 from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
-from zlc_frontend import automatic_figure_view
-from zlc_frontend.figure import ViewIntent, ViewPreferences
+from zlc_frontend.frozen_figure import (
+    FrozenFigureSource,
+    resolve_frozen_figure_intent,
+)
+from zlc_frontend.plot_kind import PlotKind
+from zlc_frontend.plot_panel import FigureIntent
 from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import ExactOccupancyCellSource
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import ResolvedOccupancy
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
@@ -25,6 +28,13 @@ from zlc_storage import canonical_digest
 from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 
 
+_LIVE_SITE_MAP_FIGURE = FigureIntent(
+    PlotKind.SITE_MAP,
+    "Occupancy | exact same-shot sites",
+    "Occupancy",
+)
+
+
 def _occupancy_cell_coherence_identity(
     artifact_identity: str,
     address: DatasetCellAddress,
@@ -39,52 +49,6 @@ def _occupancy_cell_coherence_identity(
             "point_ordinal": address.point_ordinal,
         }
     )
-
-
-@dataclass(frozen=True, slots=True)
-class OccupancyFigureProjection:
-    """One admitted Occupancy output ready for generic Figure suggestion."""
-
-    source: ArtifactDatasetSource
-    label: str
-    default_intent: ViewIntent
-    default_preferences: ViewPreferences | None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.source, ArtifactDatasetSource):
-            raise TypeError("source must be ArtifactDatasetSource")
-        if not isinstance(self.label, str) or not self.label.strip():
-            raise ValueError("label must be non-empty")
-        if not isinstance(self.default_intent, ViewIntent):
-            raise TypeError("default_intent must be ViewIntent")
-        if self.default_preferences is not None and not isinstance(
-            self.default_preferences,
-            ViewPreferences,
-        ):
-            raise TypeError("default_preferences must be ViewPreferences or None")
-
-    def resolve_preferences(
-        self,
-        intent: ViewIntent,
-        requested: ViewPreferences | None,
-    ) -> ViewPreferences | None:
-        """Apply Occupancy's default only when the caller left it unspecified."""
-
-        if not isinstance(intent, ViewIntent):
-            raise TypeError("intent must be ViewIntent")
-        if requested is not None and not isinstance(requested, ViewPreferences):
-            raise TypeError("requested must be ViewPreferences or None")
-        defaults = self.default_preferences
-        if (
-            defaults is None
-            or intent is not self.default_intent
-            or (requested is not None and requested.repeat_mode is not None)
-        ):
-            return requested
-        return replace(
-            ViewPreferences() if requested is None else requested,
-            repeat_mode=defaults.repeat_mode,
-        )
 
 
 def build_exact_occupancy_cell_view(
@@ -147,7 +111,7 @@ def project_occupancy_site_map(
     application: PreparedOccupancyProcessor,
     background: SignalValue,
     occupied: SignalValue,
-) -> SiteMapView:
+) -> tuple[FigureIntent, SiteMapView]:
     """Project one exact parent/result publication with no revision side index."""
 
     if not isinstance(application, PreparedOccupancyProcessor):
@@ -178,7 +142,7 @@ def project_occupancy_site_map(
     )
     site_map = application.site_map
     calibration_identity = application.request.calibration_ref.target_ref
-    return build_site_map_cell_view(
+    view = build_site_map_cell_view(
         source_value,
         background.snapshot.ref,
         occupied_value,
@@ -199,6 +163,7 @@ def project_occupancy_site_map(
         ),
         presentation_kind="occupancy-cell",
     )
+    return _LIVE_SITE_MAP_FIGURE, view
 
 
 def project_occupancy_figure(
@@ -206,7 +171,7 @@ def project_occupancy_figure(
     *,
     output: str | None,
     materialize: bool,
-) -> OccupancyFigureProjection:
+) -> tuple[ArtifactDatasetSource, FigureIntent]:
     """Choose one explicit Figure output from an admitted Occupancy artifact."""
 
     if type(resolved) is not ResolvedOccupancy:
@@ -217,20 +182,21 @@ def project_occupancy_figure(
         output=selected_output,
         materialize=materialize,
     )
-    default_intent, default_preferences = automatic_figure_view(
-        source.schema,
-        prefer_meter=selected_output == "occupied",
+    label = f"occupancy {selected_output} | {artifact.model_kind.value}"
+    figure = resolve_frozen_figure_intent(
+        FrozenFigureSource(
+            label,
+            source.schema,
+            source.ref,
+            snapshot=source.snapshot,
+        ),
+        title=label,
+        value_label=selected_output,
     )
-    return OccupancyFigureProjection(
-        source=source,
-        label=f"occupancy {selected_output} | {artifact.model_kind.value}",
-        default_intent=default_intent,
-        default_preferences=default_preferences,
-    )
+    return source, figure
 
 
 __all__ = [
-    "OccupancyFigureProjection",
     "build_exact_occupancy_cell_view",
     "project_occupancy_site_map",
     "project_occupancy_figure",

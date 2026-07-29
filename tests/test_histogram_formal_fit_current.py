@@ -17,6 +17,7 @@ from zlc_data import (  # noqa: E402
     COMPONENT,
     SITE,
     AxisId,
+    AxisSourceRef,
     AxisSpec,
     BlockId,
     DataBlock,
@@ -27,38 +28,45 @@ from zlc_data import (  # noqa: E402
     HistogramSpec,
     IndexSelection,
     OwnedSnapshot,
-    PointLayout,
+    PointColumn,
+    PointTable,
     SCALAR_AXIS,
     Selection,
     StreamGenerationId,
     VALID,
     ValidityContract,
     ValueSchema,
-    apply_transform,
-    bind_fit,
-    commit_transform,
+)
+from zlc_data.fit_problem import bind_fit  # noqa: E402
+from zlc_data.transform import apply_transform, commit_transform  # noqa: E402
+from zlc_data.transform_codec import (  # noqa: E402
     data_transform_spec_from_tree,
     data_transform_spec_to_tree,
 )
-from zlc_frontend import (  # noqa: E402
-    AxisViewBinding,
+from zlc_frontend.data_figure import DataFigure  # noqa: E402
+from zlc_frontend.figure import (  # noqa: E402
     AxisViewRole,
-    DataFigure,
     DatasetDescriptor,
     DatasetId,
     FigureDocument,
     FigureLayer,
-    FigurePresentationContract,
     FixedIndex,
-    HistogramPanelPayload,
     ResolvedDataset,
     ResolvedDatasetMap,
+    SourceViewBinding,
     ViewIntent,
     ViewSpec,
-    prepare_fit_authoring_options,
 )
+from zlc_frontend.fit_editor import prepare_fit_authoring_options  # noqa: E402
+from zlc_frontend.render import HistogramPanelPayload  # noqa: E402
 from zlc_frontend.data_figure_render import render_data_figure_front  # noqa: E402
+from zlc_frontend.data_figure_presentation import DATA_FIGURE_PANEL_ID  # noqa: E402
 from zlc_frontend.histogram_display import HistogramDisplayState  # noqa: E402
+from zlc_frontend.plot_kind import PlotKind  # noqa: E402
+from zlc_frontend.plot_panel import (  # noqa: E402
+    FigureIntent,
+    PlotPanelContract,
+)
 from zlc_frontend.qt_widgets import ensure_qt_app  # noqa: E402
 from zlc_workbench.data_figure.app import create_data_figure_pane  # noqa: E402
 from zlc_workbench.data_figure.worker_jobs import _prepare_fit_options  # noqa: E402
@@ -76,8 +84,19 @@ def _figure(selected_point: int = 0):
     point = AxisSpec(AxisId("formal-hist.point"), "Point", SCAN_POINT, 2)
     schema = DatasetSchema(
         repeat,
-        (point,),
-        PointLayout.rect_c((2,)),
+        PointTable(
+            point.size,
+            (
+                PointColumn(
+                    point.axis_id,
+                    point.name,
+                    point.role,
+                    PointColumn.NUMERIC,
+                    tuple(range(point.size)),
+                ),
+            ),
+        ),
+        None,
         ValueSchema.scalar(np.dtype("<f8"), "count"),
     )
     block = DataBlock(
@@ -96,18 +115,17 @@ def _figure(selected_point: int = 0):
         schema.fingerprint,
         ViewIntent.HISTOGRAM,
         (
-            AxisViewBinding(repeat.axis_id, AxisViewRole.SAMPLE),
-            AxisViewBinding(
-                point.axis_id,
-                AxisViewRole.SELECTED,
-                selector=FixedIndex(selected_point),
+            SourceViewBinding(
+                AxisSourceRef.tensor(repeat.axis_id),
+                AxisViewRole.SAMPLE,
             ),
-            AxisViewBinding(
-                SCALAR_AXIS.axis_id,
+            SourceViewBinding(
+                AxisSourceRef.tensor(SCALAR_AXIS.axis_id),
                 AxisViewRole.SELECTED,
                 selector=FixedIndex(0),
             ),
         ),
+        point_ordinals=(selected_point,),
     )
     document = FigureDocument(
         f"formal-hist-document-{selected_point}",
@@ -124,19 +142,24 @@ def _figure(selected_point: int = 0):
     )
 
 
-def _front(figure, *, sequence=1, display=None, result=None):
+def _front(figure, *, sequence=1, display=None):
+    intent = FigureIntent(
+        PlotKind.HISTOGRAM,
+        "Histogram",
+        "Counts",
+        view=figure.document.layers[0].view,
+    )
     return render_data_figure_front(
         figure,
         HistogramDisplayState(bin_count=60) if display is None else display,
+        contract=PlotPanelContract(DATA_FIGURE_PANEL_ID, intent, size_name="2x2"),
         sequence=sequence,
-        fit_result=result,
-        fit_result_identity=None if result is None else "formal-hist-fit",
     )
 
 
 def test_histogram_transform_is_one_terminal_operation() -> None:
     histogram = HistogramSpec(
-        (AxisId("sample"),),
+        (AxisSourceRef.tensor(AxisId("sample")),),
         (0.0, 1.0),
     )
     selection = Selection((IndexSelection(AxisId("point"), 0),))
@@ -146,7 +169,7 @@ def test_histogram_transform_is_one_terminal_operation() -> None:
         DataTransformSpec((histogram, histogram))
     spec = DataTransformSpec((histogram,))
     tree = data_transform_spec_to_tree(spec)
-    assert set(tree["operations"][0]) == {"kind", "axis_ids", "bin_edges"}
+    assert set(tree["operations"][0]) == {"kind", "sources", "bin_edges"}
     assert data_transform_spec_from_tree(tree) == spec
 
 
@@ -159,8 +182,19 @@ def test_histogram_transform_groups_multi_cell_and_multi_data_axes_once() -> Non
     site = AxisSpec(AxisId("grouped.site"), "site", SITE, 2)
     schema = DatasetSchema(
         repeat,
-        (point,),
-        PointLayout.rect_c((point.size,)),
+        PointTable(
+            point.size,
+            (
+                PointColumn(
+                    point.axis_id,
+                    point.name,
+                    point.role,
+                    PointColumn.NUMERIC,
+                    tuple(range(point.size)),
+                ),
+            ),
+        ),
+        None,
         ValueSchema(
             (sample, site),
             ValidityContract.components(sample.axis_id, site.axis_id),
@@ -194,20 +228,28 @@ def test_histogram_transform_groups_multi_cell_and_multi_data_axes_once() -> Non
     )
     edges = (-0.5, 0.5, 1.5, 2.5, 3.5, 10.5, 11.5, 12.5, 13.5)
     transform = DataTransformSpec(
-        (HistogramSpec((repeat.axis_id, sample.axis_id), edges),)
+        (
+            HistogramSpec(
+                (
+                    AxisSourceRef.tensor(repeat.axis_id),
+                    AxisSourceRef.tensor(sample.axis_id),
+                ),
+                edges,
+            ),
+        )
     )
     result = apply_transform(snapshot, commit_transform(schema, transform))
 
-    assert result.schema.cell_axes == (point,)
-    assert result.schema.data_axes[:-1] == (site,)
-    assert result.values.shape == (point.size, site.size, len(edges) - 1)
+    assert result.schema.point_table == schema.point_table
+    assert result.schema.cell_schema.data_axes[:-1] == (site,)
+    assert result.values.shape == (1, point.size, site.size, len(edges) - 1)
     expanded_validity = result.expanded_validity()
     for p in range(point.size):
         for s in range(site.size):
             valid_values = values[:, p, :, s][validity[:, p, :, s]]
             expected = np.histogram(valid_values, bins=edges)[0]
-            np.testing.assert_array_equal(result.values[p, s], expected)
-            assert np.all(expanded_validity[p, s]) == bool(valid_values.size)
+            np.testing.assert_array_equal(result.values[0, p, s], expected)
+            assert np.all(expanded_validity[0, p, s]) == bool(valid_values.size)
 
 
 def test_formal_histogram_fit_uses_full_samples_and_rejects_changed_view() -> None:
@@ -225,12 +267,17 @@ def test_formal_histogram_fit_uses_full_samples_and_rejects_changed_view() -> No
         "histogram_gaussian",
     )
     result = bind_fit(options[0].spec, snapshot.block.schema).run(snapshot)
-    fitted = _front(figure, sequence=2, result=result)
-    fitted_payload = fitted.frame.panels[0].display_payload
+    fitted_panel = figure.materialize_transient_fit_overlays(
+        result,
+        source.frame,
+        result_identity="formal-hist-fit",
+    )
+    assert fitted_panel is not None
+    fitted_payload = fitted_panel.display_payload
     assert isinstance(fitted_payload, HistogramPanelPayload)
     assert len(fitted_payload.fit_overlays) == 1
     assert len(fitted_payload.fit_overlays[0].component_predictions) == 3
-    assert source.frame.panels[0].raster.pixels != fitted.frame.panels[0].raster.pixels
+    assert source.frame.panels[0].raster is fitted_panel.raster
 
     zoomed = _front(
         figure,
@@ -242,13 +289,14 @@ def test_formal_histogram_fit_uses_full_samples_and_rejects_changed_view() -> No
     assert np.array_equal(payload.bin_edges, zoomed_payload.bin_edges)
 
     changed, _same_snapshot = _figure(1)
-    changed_payload = _front(changed, sequence=4).frame.panels[0].display_payload
+    changed_front = _front(changed, sequence=4)
+    changed_payload = changed_front.frame.panels[0].display_payload
     assert isinstance(changed_payload, HistogramPanelPayload)
     assert np.array_equal(payload.bin_edges, changed_payload.bin_edges)
     with pytest.raises(ValueError, match="authority differs"):
-        changed.transient_single_panel_histogram_fit_overlays(
-            changed_payload.bin_projection,
+        changed.materialize_transient_fit_overlays(
             result,
+            changed_front.frame,
             result_identity="formal-hist-fit",
         )
 
@@ -257,21 +305,17 @@ def test_standalone_data_figure_uses_the_same_histogram_fit_context() -> None:
     application = ensure_qt_app()
     figure, _snapshot = _figure(0)
     display = HistogramDisplayState(bin_count=60)
-    presentation = FigurePresentationContract(
-        ViewIntent.HISTOGRAM,
-        False,
-        False,
-        False,
+    figure_intent = FigureIntent(
+        PlotKind.HISTOGRAM,
         "Histogram",
         "Counts",
-        "2x2",
-        display,
+        view=figure.document.layers[0].view,
     )
     window = create_data_figure_pane(
         figure,
+        figure_intent,
         initial_display=display,
         local_fit=True,
-        local_fit_archive_presentation=presentation,
         open_fit=True,
     )
 
@@ -291,14 +335,14 @@ def test_standalone_data_figure_uses_the_same_histogram_fit_context() -> None:
             "bimodal_gaussian",
             "histogram_gaussian",
         )
+        before = window._surface_host.grab().toImage()
         pane = window._fit_pane
         assert pane is not None and pane.fit_button.isEnabled()
         pane.fit_button.click()
-        until(
-            lambda: window.worker_idle
-            and isinstance(window._visible_typed_payload(), HistogramPanelPayload)
-            and bool(window._visible_typed_payload().fit_overlays)
-        )
+        until(lambda: window.worker_idle and window.draft_ready)
+        application.processEvents()
+        after = window._surface_host.grab().toImage()
+        assert before != after
     finally:
         window.shutdown()
         until(lambda: window.closed)
@@ -322,11 +366,8 @@ def test_artifact_binding_default_admits_the_exact_histogram_transform() -> None
     options = _prepare_fit_options(
         prepare,
         figure,
-        front.fit_axis_ids,
-        front.axis_roles,
         None,
         payload.bin_projection,
-        False,
     )
     assert options[0].spec.model_id == "bimodal_gaussian"
 
@@ -342,13 +383,10 @@ def test_artifact_binding_default_admits_the_exact_histogram_transform() -> None
             histogram_projection=changed_payload.bin_projection,
         )
 
-    with pytest.raises(ValueError, match="exact visible sample/bin authority"):
+    with pytest.raises(ValueError, match="exact visible Figure authority"):
         _prepare_fit_options(
             prepare_other_selection,
             figure,
-            front.fit_axis_ids,
-            front.axis_roles,
             None,
             payload.bin_projection,
-            False,
         )

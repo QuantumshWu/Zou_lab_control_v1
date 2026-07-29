@@ -21,18 +21,20 @@ from zlc_pulse import PulseDocument
 class _TaskConsoleProjection:
     """Explicit domain-neutral projectors supplied to capability packages."""
 
-    __slots__ = ("_processor", "_resolve_final_or_saved", "_run")
+    __slots__ = ("_custom", "_processor", "_resolve_final_or_saved", "_run")
 
-    def __init__(self, *, run, processor, resolve_final_or_saved) -> None:
+    def __init__(self, *, run, processor, custom, resolve_final_or_saved) -> None:
         for value, name in (
             (run, "run"),
             (processor, "processor"),
+            (custom, "custom"),
             (resolve_final_or_saved, "resolve_final_or_saved"),
         ):
             if not callable(value):
                 raise TypeError(f"TaskConsole {name} projector must be callable")
         self._run = run
         self._processor = processor
+        self._custom = custom
         self._resolve_final_or_saved = resolve_final_or_saved
 
     def run(self, declaration, **kwargs):
@@ -40,6 +42,9 @@ class _TaskConsoleProjection:
 
     def processor(self, declaration, **kwargs):
         return self._processor(declaration, **kwargs)
+
+    def custom(self, declaration, **kwargs):
+        return self._custom(declaration, **kwargs)
 
     def resolve_final_or_saved(self, binding, **kwargs):
         return self._resolve_final_or_saved(binding, **kwargs)
@@ -64,6 +69,7 @@ def task_console_ports(experiment):
         resolve_final_or_saved_artifact,
     )
     from zlc_workbench.task_console.declaration_projection import (
+        project_custom_declaration,
         project_processor_declaration,
         project_run_declaration,
     )
@@ -78,6 +84,7 @@ def task_console_ports(experiment):
             _TaskConsoleProjection(
                 run=project_run_declaration,
                 processor=project_processor_declaration,
+                custom=project_custom_declaration,
                 resolve_final_or_saved=resolve_final_or_saved_artifact,
             ),
         )

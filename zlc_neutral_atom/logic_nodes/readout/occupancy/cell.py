@@ -20,8 +20,8 @@ from zlc_data import (
     SPATIAL_Y,
     StreamGenerationId,
     Value,
-    dataset_cell_value,
 )
+from zlc_data.value import dataset_cell_value
 from zlc_storage import canonical_text
 
 from zlc_neutral_atom.devices.camera.contract import CameraFrameMetadata

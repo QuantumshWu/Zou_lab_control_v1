@@ -4,12 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from zlc_data import (
-    axis_source_ref_from_tree,
-    axis_source_ref_to_tree,
-    selection_from_tree,
-    selection_to_tree,
-)
+from zlc_data.codec import axis_source_ref_from_tree, axis_source_ref_to_tree
+from zlc_data.selection import selection_from_tree, selection_to_tree
 from zlc_storage.canonical import (
     decode,
     encode,

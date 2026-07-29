@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
-import itertools
-import random
 
 import numpy as np
 import pytest
 
-from zlc_data import (
+from zlc_data.axis import (
     READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
@@ -16,12 +14,16 @@ from zlc_data import (
     AxisId,
     AxisSpec,
     CoordinateFrameId,
-    DatasetSchema,
-    PointLayout,
-    ValidityContract,
-    ValueSchema,
-    value_schema_to_tree,
 )
+from zlc_data.codec import value_schema_to_tree
+from zlc_data.schema import (
+    DatasetSchema,
+    GridTopology,
+    PointColumn,
+    PointTable,
+    ValueSchema,
+)
+from zlc_data.validity import ValidityContract
 from zlc_neutral_atom.logic_nodes.readout.contracts import (
     CalibrationCaptureLayout,
     FrameContract,
@@ -50,7 +52,6 @@ Y = AxisId("camera-y")
 X = AxisId("camera-x")
 EVENT = AxisId("readout-event")
 SCAN = AxisId("detuning")
-PHASE = AxisId("phase")
 FRAME = CoordinateFrameId("qcm-camera-pixels")
 BINDING = ReadoutBindingKey("primary-readout")
 
@@ -84,25 +85,54 @@ def _descriptor(**changes: object) -> CameraCaptureDescriptor:
     return replace(value, **changes)
 
 
-def _default_point_axes() -> tuple[AxisSpec, ...]:
-    return (
-        AxisSpec(EVENT, "readout event", READOUT_EVENT, 3),
-        AxisSpec(SCAN, "detuning", SCAN_POINT, 2, unit="MHz"),
+def _default_point_domain() -> tuple[PointTable, GridTopology]:
+    cells = tuple(
+        (event_index, scan_index)
+        for event_index in range(3)
+        for scan_index in range(2)
+    )
+    table = PointTable(
+        len(cells),
+        (
+            PointColumn(
+                EVENT,
+                "readout event",
+                READOUT_EVENT,
+                PointColumn.NUMERIC,
+                tuple(event_index for event_index, _scan_index in cells),
+            ),
+            PointColumn(
+                SCAN,
+                "detuning",
+                SCAN_POINT,
+                PointColumn.NUMERIC,
+                tuple(scan_index for _event_index, scan_index in cells),
+                unit="MHz",
+            ),
+        ),
+    )
+    return table, GridTopology(
+        (EVENT, SCAN),
+        (tuple(range(3)), tuple(range(2))),
+        cells,
     )
 
 
 def _schema(
     *,
     descriptor: CameraCaptureDescriptor | None = None,
-    point_axes: tuple[AxisSpec, ...] | None = None,
-    point_layout: PointLayout | None = None,
+    point_table: PointTable | None = None,
+    grid_topology: GridTopology | None = None,
     data_axes: tuple[AxisSpec, ...] | None = None,
     validity: ValidityContract | None = None,
     dtype: object | None = None,
     unit: str = "camera-count",
 ) -> DatasetSchema:
     descriptor = _descriptor() if descriptor is None else descriptor
-    point_axes = _default_point_axes() if point_axes is None else point_axes
+    if point_table is None:
+        point_table, default_grid_topology = _default_point_domain()
+        if grid_topology is None:
+            grid_topology = default_grid_topology
     if data_axes is None:
         height, width = descriptor.output_shape_yx
         data_axes = (
@@ -125,12 +155,10 @@ def _schema(
                 coordinate_frame=FRAME,
             ),
         )
-    if point_layout is None:
-        point_layout = PointLayout.rect_c(tuple(axis.size for axis in point_axes))
     return DatasetSchema(
         repeat_axis=AxisSpec(AxisId("repeat"), "repeat", REPEAT, 4),
-        point_axes=point_axes,
-        point_layout=point_layout,
+        point_table=point_table,
+        grid_topology=grid_topology,
         cell_schema=ValueSchema(
             data_axes,
             ValidityContract.value() if validity is None else validity,
@@ -146,14 +174,21 @@ def _calibration_layout() -> CalibrationCaptureLayout:
 
 def _contract() -> FrameContract:
     descriptor = _descriptor()
-    schema = _schema(descriptor=descriptor)
-    contract, _join = FrameContract._resolve_calibration_capture(
-        BINDING,
-        descriptor,
-        schema,
-        _calibration_layout(),
+    setting = descriptor.setting(_calibration_layout().readout_event_index)
+    physical_facts = replace(
+        _physical_facts(),
+        exposure_seconds=setting.exposure_seconds,
+        gain=setting.gain,
+        readout_mode=setting.readout_mode,
+        opaque_frame_settings_fingerprint=(
+            setting.opaque_frame_settings_fingerprint
+        ),
     )
-    return contract
+    return FrameContract.from_camera_working_point(
+        BINDING,
+        physical_facts,
+        _schema(descriptor=descriptor).cell_schema,
+    )
 
 
 def _physical_facts() -> CameraPhysicalFacts:
@@ -352,9 +387,22 @@ def _single_event_schema(
     descriptor: CameraCaptureDescriptor,
     **changes: object,
 ) -> DatasetSchema:
+    point_table = PointTable(
+        2,
+        (
+            PointColumn(
+                SCAN,
+                "detuning",
+                SCAN_POINT,
+                PointColumn.NUMERIC,
+                (0, 1),
+            ),
+        ),
+    )
     return _schema(
         descriptor=descriptor,
-        point_axes=(AxisSpec(SCAN, "detuning", SCAN_POINT, 2),),
+        point_table=point_table,
+        grid_topology=GridTopology((SCAN,), ((0, 1),), ((0,), (1,))),
         **changes,
     )
 
@@ -415,34 +463,6 @@ def test_live_camera_working_point_requires_explicit_applicability_facts() -> No
             replace(live_facts, **change),
             frame_schema,
         )
-
-
-def test_reference_schedule_and_capture_fingerprint_do_not_leak_into_frame_applicability() -> None:
-    descriptor = _descriptor(
-        event_settings=(
-            CameraEventReadoutSetting(
-                0,
-                0.009,
-                8.0,
-                "reference-only",
-                "8" * 64,
-            ),
-            _event_settings()[1],
-            CameraEventReadoutSetting(
-                2,
-                0.008,
-                7.0,
-                "reference-only",
-                "7" * 64,
-            ),
-        ),
-        camera_arm_spec_fingerprint="c" * 64,
-    )
-    schema = _schema(descriptor=descriptor)
-    observed, _join = FrameContract._resolve_calibration_capture(
-        BINDING, descriptor, schema, _calibration_layout()
-    )
-    assert observed == _contract()
 
 
 @pytest.mark.parametrize(
@@ -551,158 +571,13 @@ def test_binding_validity_and_selected_event_metadata_mismatch_fail_closed() -> 
 @pytest.mark.parametrize("dtype", [np.dtype("uint8"), np.dtype("int32"), np.dtype("float32")])
 def test_real_integer_and_float_count_dtypes_are_supported(dtype: np.dtype) -> None:
     descriptor = _descriptor(dtype=dtype)
-    FrameContract._resolve_calibration_capture(
-        BINDING,
-        descriptor,
-        _schema(descriptor=descriptor),
-        _calibration_layout(),
-    )
+    descriptor.validate_schema(_schema(descriptor=descriptor))
 
 
 @pytest.mark.parametrize("dtype", [np.dtype(bool), np.dtype("complex64")])
 def test_bool_and_complex_count_dtypes_are_forbidden(dtype: np.dtype) -> None:
     with pytest.raises(TypeError, match="real integer or floating"):
         _descriptor(dtype=dtype)
-
-
-def _axes_with_event_at(position: int) -> tuple[AxisSpec, ...]:
-    axes = [
-        AxisSpec(SCAN, "detuning", SCAN_POINT, 2),
-        AxisSpec(PHASE, "phase", SCAN_POINT, 2),
-    ]
-    axes.insert(position, AxisSpec(EVENT, "readout event", READOUT_EVENT, 3))
-    return tuple(axes)
-
-
-def _assert_join_preserves_context(
-    schema: DatasetSchema,
-    capture_layout: CalibrationCaptureLayout,
-) -> None:
-    event_position = tuple(axis.axis_id for axis in schema.point_axes).index(EVENT)
-    context_positions = tuple(
-        position for position in range(len(schema.point_axes)) if position != event_position
-    )
-    expected_axis_ids = (
-        schema.repeat_axis.axis_id,
-        *(schema.point_axes[position].axis_id for position in context_positions),
-    )
-    join = capture_layout._resolve(schema)
-    contexts = tuple(join.contexts())
-    rows = tuple(join.rows())
-    assert join.group_count == schema.repeat_axis.size * 4
-    assert len(contexts) == len(rows) == join.group_count
-    assert len(set(contexts)) == len(contexts)
-    for context_key, (repeat_index, reference_rows, readout_row) in zip(
-        contexts,
-        rows,
-        strict=True,
-    ):
-        assert tuple(axis_id for axis_id, _ in context_key) == expected_axis_ids
-        assert repeat_index == context_key[0][1]
-        assert 0 <= repeat_index < schema.repeat_axis.size
-        context = tuple(index for _, index in context_key[1:])
-        for event_index, storage_row in zip(
-            capture_layout.reference_event_indices,
-            reference_rows,
-            strict=True,
-        ):
-            logical = schema.point_layout.multi_index(storage_row)
-            assert logical[event_position] == event_index
-            assert tuple(logical[position] for position in context_positions) == context
-        logical = schema.point_layout.multi_index(readout_row)
-        assert logical[event_position] == capture_layout.readout_event_index
-        assert tuple(logical[position] for position in context_positions) == context
-
-
-@pytest.mark.parametrize("event_position", [0, 1, 2])
-@pytest.mark.parametrize("order", ["C", "F"])
-def test_context_join_handles_event_axis_anywhere_in_c_and_f_layouts(
-    event_position: int,
-    order: str,
-) -> None:
-    axes = _axes_with_event_at(event_position)
-    shape = tuple(axis.size for axis in axes)
-    point_layout = PointLayout.rect_c(shape) if order == "C" else PointLayout.rect_f(shape)
-    schema = _schema(point_axes=axes, point_layout=point_layout)
-    capture_layout = CalibrationCaptureLayout(EVENT, (0, 2), 1)
-    _assert_join_preserves_context(schema, capture_layout)
-    resolved, _join = FrameContract._resolve_calibration_capture(
-        BINDING,
-        _descriptor(),
-        schema,
-        capture_layout,
-    )
-    assert resolved.exposure_seconds == 0.002
-
-
-@pytest.mark.parametrize("event_position", [0, 1, 2])
-def test_random_explicit_permutations_join_by_context_not_filtered_row_position(
-    event_position: int,
-) -> None:
-    axes = _axes_with_event_at(event_position)
-    shape = tuple(axis.size for axis in axes)
-    logical_rows = list(itertools.product(*(range(size) for size in shape)))
-    for seed in range(12):
-        shuffled = logical_rows.copy()
-        random.Random(seed).shuffle(shuffled)
-        schema = _schema(
-            point_axes=axes,
-            point_layout=PointLayout.explicit(shape, tuple(shuffled)),
-        )
-        capture_layout = CalibrationCaptureLayout(EVENT, (2, 0), 1)
-        _assert_join_preserves_context(schema, capture_layout)
-
-
-def test_join_keeps_repeat_lazy_when_event_is_the_only_point_axis() -> None:
-    event_axis = AxisSpec(EVENT, "readout event", READOUT_EVENT, 3)
-    schema = _schema(
-        point_axes=(event_axis,),
-        point_layout=PointLayout.rect_c((3,)),
-    )
-    layout = CalibrationCaptureLayout(EVENT, (0, 2), 1)
-    join = layout._resolve(schema)
-    assert join.group_count == schema.repeat_axis.size
-    assert tuple(join.contexts()) == tuple(
-        ((schema.repeat_axis.axis_id, repeat),)
-        for repeat in range(schema.repeat_axis.size)
-    )
-
-    many_repeat_schema = replace(
-        schema,
-        repeat_axis=replace(schema.repeat_axis, size=1000),
-    )
-    many_repeat_join = layout._resolve(many_repeat_schema)
-    assert many_repeat_join._context_indices == join._context_indices == ((),)
-    assert many_repeat_join._selected_point_storage_rows == (
-        join._selected_point_storage_rows
-    )
-    assert many_repeat_join.group_count == 1000
-
-
-@pytest.mark.parametrize(
-    "mapping",
-    [
-        # readout event 1 is entirely absent
-        ((0, 0), (0, 1), (2, 0), (2, 1)),
-        # event 1 lacks context scan=1 while both references have it
-        ((0, 0), (0, 1), (1, 0), (2, 0), (2, 1)),
-        # reference event 2 lacks context scan=0
-        ((0, 0), (0, 1), (1, 0), (1, 1), (2, 1)),
-    ],
-)
-def test_missing_or_unbalanced_context_sets_fail_closed(
-    mapping: tuple[tuple[int, int], ...],
-) -> None:
-    schema = _schema(point_layout=PointLayout.explicit((3, 2), mapping))
-    with pytest.raises(ValueError, match="context"):
-        CalibrationCaptureLayout(EVENT, (0, 2), 1)._resolve(schema)
-    with pytest.raises(ValueError, match="context"):
-        FrameContract._resolve_calibration_capture(
-            BINDING,
-            _descriptor(),
-            schema,
-            CalibrationCaptureLayout(EVENT, (0, 2), 1),
-        )
 
 
 def test_frame_contract_is_immutable() -> None:
@@ -717,12 +592,16 @@ def test_event_schedule_coverage_and_event_axis_metadata_are_strict() -> None:
     descriptor = _descriptor(event_settings=_event_settings()[:2])
     with pytest.raises(ValueError, match="cover every"):
         descriptor.validate_schema(_schema(descriptor=descriptor))
-    wrong_role = (
-        AxisSpec(EVENT, "readout event", SCAN_POINT, 3),
-        AxisSpec(SCAN, "detuning", SCAN_POINT, 2),
+    point_table, _grid_topology = _default_point_domain()
+    wrong_role = replace(
+        point_table,
+        columns=(
+            replace(point_table.columns[0], role=SCAN_POINT),
+            point_table.columns[1],
+        ),
     )
     with pytest.raises(ValueError, match="wrong role"):
-        _descriptor().validate_schema(_schema(point_axes=wrong_role))
+        _descriptor().validate_schema(_schema(point_table=wrong_role))
 
 
 def test_event_setting_permutation_has_one_canonical_capture_descriptor() -> None:

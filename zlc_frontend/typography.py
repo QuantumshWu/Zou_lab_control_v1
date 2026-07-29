@@ -1,16 +1,16 @@
-"""Pure typography identity shared by render and Qt presentation owners."""
+"""Pure font identity shared by the Matplotlib and QPainter plot backends."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 
+FONT_FAMILY = "Helvetica Light"
 FONT_PATH = (
     Path(__file__).resolve().parent
     / "assets"
     / "helvetica-light-587ebe5a59211.ttf"
 )
-FONT_FAMILY = "Helvetica Light"
 SANS_SERIF = (FONT_FAMILY, "Arial")
 
 

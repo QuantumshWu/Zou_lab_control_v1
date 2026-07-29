@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import math
 from numbers import Number
@@ -14,9 +14,9 @@ from zlc_data import (
     DatasetRevisionRef,
     FitBatchStatus,
     FitResultBatch,
-    immutable_array,
-    validate_fit_result_source_binding,
 )
+from zlc_data._arrays import immutable_array
+from zlc_data.fit import validate_fit_result_source_binding
 from zlc_storage import canonical_text
 
 from .figure import (
@@ -66,31 +66,6 @@ class CurveFitOverlayPlan:
         ):
             raise ValueError("curve fit plan requires validated series entries")
         object.__setattr__(self, "_entries", entries)
-
-
-def single_panel_curve_fit_overlay_plan(
-    document: FigureDocument,
-    evaluated: EvaluatedFigureData,
-    fit_results: Mapping[str, FitResultBatch],
-    source_schema: DatasetSchema,
-    *,
-    result_identity: str,
-) -> CurveFitOverlayPlan:
-    """Validate one canonical curve result without evaluating its model."""
-
-    if not isinstance(document, FigureDocument):
-        raise TypeError("document must be FigureDocument")
-    supplied = dict(fit_results)
-    if len(document.layers) != 1 or set(supplied) != {document.layers[0].layer_id}:
-        raise ValueError("typed curve fit projection requires one exact layer result")
-    result = supplied[document.layers[0].layer_id]
-    return transient_single_panel_curve_fit_overlay_plan(
-        document,
-        evaluated,
-        source_schema,
-        result,
-        result_identity=result_identity,
-    )
 
 
 def transient_single_panel_curve_fit_overlay_plan(
@@ -154,16 +129,7 @@ def transient_single_panel_curve_fit_overlay_plan(
     }
     if any(
         document_layer.view.binding(source).role not in allowed_batch_roles
-        and not (
-            axis.size == 1
-            and document_layer.view.binding(source).role
-            is AxisViewRole.REDUCED
-        )
-        for source, axis in zip(
-            result.spec.batch_sources,
-            result.batch_axis_specs,
-            strict=True,
-        )
+        for source in result.spec.batch_sources
     ):
         raise ValueError("cached CURVE view does not uniquely bind fit batch axes")
 
@@ -175,7 +141,13 @@ def transient_single_panel_curve_fit_overlay_plan(
             raise ValueError("typed curve fit projection requires only CURVE series")
         if curve.x_axis.source != result.spec.independent_sources[0]:
             raise ValueError("evaluated curve x axis differs from fitted axis")
-        source_span = _curve_source_span(source_schema, result, curve)
+        source_span = _curve_source_span(
+            source_schema,
+            document_layer.view,
+            layer.resolutions,
+            result,
+            curve,
+        )
         storage_index = fit_batch_storage_index(result, layer, cell, series)
         if storage_index is None:
             status = None
@@ -217,15 +189,51 @@ def transient_single_panel_curve_fit_overlay_plan(
     )
 
 
+def _panel_prediction_point_share(
+    maximum_prediction_points: int | None,
+    painted_path_count: int,
+) -> int | None:
+    """Divide one optional panel budget among its painted prediction paths."""
+
+    if maximum_prediction_points is not None:
+        if (
+            isinstance(maximum_prediction_points, bool)
+            or not isinstance(maximum_prediction_points, (int, np.integer))
+        ):
+            raise TypeError("maximum_prediction_points must be an integer or None")
+        maximum_prediction_points = int(maximum_prediction_points)
+        if maximum_prediction_points < 2:
+            raise ValueError("maximum_prediction_points must be at least two")
+    if painted_path_count < 0:
+        raise ValueError("painted_path_count must be non-negative")
+    if maximum_prediction_points is None:
+        return None
+    if painted_path_count == 0:
+        return 0
+    if maximum_prediction_points < 2 * painted_path_count:
+        raise ValueError(
+            "panel prediction budget must provide two points per painted path"
+        )
+    return maximum_prediction_points // painted_path_count
+
+
 def materialize_curve_fit_overlay_plan(
     plan: CurveFitOverlayPlan,
     *,
+    maximum_prediction_points: int | None = None,
     check_cancelled: Callable[[], None] | None = None,
 ) -> tuple[CurveFitOverlay, ...]:
-    """Evaluate predictions only after the caller has admitted ``plan``."""
+    """Evaluate predictions under one optional panel-wide point budget."""
 
     if not isinstance(plan, CurveFitOverlayPlan):
         raise TypeError("plan must be CurveFitOverlayPlan")
+    point_share = _panel_prediction_point_share(
+        maximum_prediction_points,
+        sum(
+            entry.status is FitBatchStatus.CONVERGED
+            for entry in plan._entries
+        ),
+    )
     if check_cancelled is not None and not callable(check_cancelled):
         raise TypeError("check_cancelled must be callable or None")
     result = plan._result
@@ -234,6 +242,7 @@ def materialize_curve_fit_overlay_plan(
         if check_cancelled is not None:
             check_cancelled()
         predicted = np.empty((0,), dtype=np.dtype("<f8"))
+        fit_coordinates = None
         if entry.status is FitBatchStatus.CONVERGED:
             assert entry.batch_storage_index is not None
             curve = entry.series.data
@@ -243,6 +252,13 @@ def materialize_curve_fit_overlay_plan(
                 curve.x_axis.coordinates[start:stop],
                 dtype=np.dtype("<f8"),
             )
+            if point_share is not None and coordinates.size > point_share:
+                positions = (
+                    np.arange(point_share, dtype=np.int64)
+                    * (coordinates.size - 1)
+                    // (point_share - 1)
+                )
+                coordinates = coordinates[positions]
             evaluated_prediction = np.asarray(
                 result.evaluate_batch(
                     entry.batch_storage_index,
@@ -255,7 +271,7 @@ def materialize_curve_fit_overlay_plan(
                 evaluated_prediction,
                 dtype=np.dtype("<f8"),
             )
-            prediction_shape = (stop - start,)
+            prediction_shape = coordinates.shape
             if evaluated_prediction.shape != prediction_shape:
                 raise ValueError("fit prediction shape differs from CURVE fit span")
             if not bool(np.all(np.isfinite(evaluated_prediction))):
@@ -265,6 +281,8 @@ def materialize_curve_fit_overlay_plan(
                 dtype=np.dtype("<f8"),
                 shape=prediction_shape,
             )
+            if maximum_prediction_points is not None:
+                fit_coordinates = coordinates
         projected.append(
             CurveFitOverlay(
                 plan.source_ref,
@@ -275,6 +293,7 @@ def materialize_curve_fit_overlay_plan(
                 entry.status,
                 entry.diagnostic,
                 predicted,
+                coordinates=fit_coordinates,
             )
         )
     return tuple(projected)
@@ -282,13 +301,22 @@ def materialize_curve_fit_overlay_plan(
 
 def _curve_source_span(
     source_schema: DatasetSchema,
+    view,
+    resolutions,
     result: FitResultBatch,
     curve: EvaluatedCurve,
 ) -> tuple[int, int]:
     """Resolve the authority ROI into one contiguous cached-curve span."""
 
     source = result.spec.independent_sources[0]
-    selected = dict(_fit_display_selection_indices(source_schema, result)).get(source)
+    selected = dict(
+        _fit_display_selection_indices(
+            source_schema,
+            view,
+            resolutions,
+            result,
+        )
+    ).get(source)
     if selected is None:
         positions = tuple(range(curve.values.size))
     else:
@@ -320,6 +348,5 @@ def _curve_source_span(
 __all__ = [
     "CurveFitOverlayPlan",
     "materialize_curve_fit_overlay_plan",
-    "single_panel_curve_fit_overlay_plan",
     "transient_single_panel_curve_fit_overlay_plan",
 ]

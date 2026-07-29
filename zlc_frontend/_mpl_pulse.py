@@ -129,11 +129,10 @@ def _draw_pulse_repeat_brackets(
                   clip_on=True, zorder=8 + index)
         if label:
             # Label placement matches the reference EXACTLY: just to the RIGHT of the right stem
-            # (``stop + tick*0.12``, left-aligned), not centred above the span.  DejaVu Sans supplies
-            # the U+221E glyph the design's Helvetica Light lacks, so ×∞ reads as infinity, not tofu.
+            # (``stop + tick*0.12``, left-aligned), not centred above the span.  The canonical
+            # The canonical Matplotlib style supplies main's Helvetica Light.
             text = axis.text(stop + tick * 0.12, y_high + 0.055, label,
                              ha="left", va="bottom", color=color, alpha=alpha,
-                             fontfamily="DejaVu Sans",
                              fontsize=smaller_fontsize(0.8, 5.5),
                              clip_on=False, zorder=9 + index)
             # clip_on=False is the reference's look (a zoomed-out label floats

@@ -42,6 +42,7 @@ from zlc_frontend.qt_widgets import (
     release_window,
     screen_fit_window_size,
     set_fluent_scale,
+    wait_for_owner_retirement,
     window_pad,
 )
 from zlc_neutral_atom.runtime.run import RunState
@@ -71,8 +72,6 @@ from .scan_view import (
 )
 from .schedule_view import PulseScheduleView
 from .target_view import PulseTargetView
-from zlc_workbench.window_runtime import wait_for_owner_retirement
-
 
 _PULSE_FILES_ENV = "ZLC_PULSE_DIR"
 

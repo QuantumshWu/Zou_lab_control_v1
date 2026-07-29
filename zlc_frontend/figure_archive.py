@@ -24,17 +24,18 @@ from zlc_data import (
     AxisSourceRef,
     DataBlock,
     OwnedSnapshot,
+)
+from zlc_data.codec import (
     axis_source_ref_from_tree,
     axis_source_ref_to_tree,
     dataset_revision_ref_from_tree,
     dataset_revision_ref_to_tree,
     dataset_schema_from_tree,
     dataset_schema_to_tree,
-    decode_fit_result_batch,
-    encode_fit_result_batch,
     validity_from_tree,
     validity_to_tree,
 )
+from zlc_data.fit import decode_fit_result_batch, encode_fit_result_batch
 from zlc_storage import (
     decode,
     encode,
@@ -56,7 +57,6 @@ from .figure import (
 from .figure.codec import decode_figure_document, encode_figure_document
 from .histogram_display import (
     FacetedHistogramDisplayState,
-    HistogramCountScale,
     HistogramDisplayState,
     histogram_cell_thresholds_from_tree,
     histogram_cell_thresholds_to_tree,
@@ -65,6 +65,9 @@ from .image_display import ImageColormap, ImageDisplayState
 from .fit_projection import canonical_panel_focus_address
 from .meter_display import MeterDisplayState
 from .panel_size import panel_size_cells
+from .panel_params import panel_display_state_intent
+from .plot_kind import PlotKind
+from .plot_panel import FigureIntent
 
 
 FIGURE_ARCHIVE_SCHEMA = "zlc_frontend.DataFigureArchive"
@@ -84,131 +87,64 @@ FigureDisplayState: TypeAlias = (
 _FACETED_HISTOGRAM_DISPLAY_KIND = "FACETED_HISTOGRAM"
 
 
-def _display_intent(state: FigureDisplayState) -> ViewIntent:
-    if isinstance(state, CurveDisplayState):
-        return ViewIntent.CURVE
-    if isinstance(state, ImageDisplayState):
-        return ViewIntent.IMAGE
-    if isinstance(state, (HistogramDisplayState, FacetedHistogramDisplayState)):
-        return ViewIntent.HISTOGRAM
-    if isinstance(state, MeterDisplayState):
-        return ViewIntent.METER
-    raise TypeError("display has another Figure display-state type")
-
-
-@dataclass(frozen=True, slots=True)
-class FigurePresentationContract:
-    """Everything needed to reproduce one archived interactive surface.
-
-    This is deliberately frontend vocabulary rather than TaskConsole metadata.
-    The already-frozen :class:`DataFigure` owns data/view/fit facts; this value
-    owns only reproducible presentation intent.  The current screen DPR is a
-    Qt-surface fact and is deliberately not archived.
-    """
-
-    intent: ViewIntent
-    faceted: bool
-    rolling_trace: bool
-    rolling_distribution: bool
-    title: str
-    value_label: str
-    size_name: str
-    display: FigureDisplayState
-
-    @classmethod
-    def from_plot_panel(
-        cls,
-        contract,
-        display: FigureDisplayState,
-    ) -> "FigurePresentationContract":
-        """Freeze the archive projection of frontend's live panel contract."""
-
-        from .plot_panel import PlotPanelContract
-
-        if not isinstance(contract, PlotPanelContract):
-            raise TypeError("contract must be PlotPanelContract")
-        intent = contract.intent
-        if intent is None:
-            raise ValueError("SiteMap does not have a DataFigure archive")
-        return cls(
-            intent=intent,
-            faceted=contract.faceted,
-            rolling_trace=contract.kind == "monitor",
-            rolling_distribution=contract.rolling_distribution,
-            title=contract.title,
-            value_label=contract.value_label,
-            size_name=contract.size_name,
-            display=display,
-        )
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.intent, ViewIntent)
-            or self.intent not in DATASET_VIEW_INTENTS
-        ):
-            raise ValueError("figure presentation requires a dataset ViewIntent")
-        for name in ("faceted", "rolling_trace", "rolling_distribution"):
-            if not isinstance(getattr(self, name), bool):
-                raise TypeError(f"{name} must be bool")
-        if self.rolling_trace and (
-            self.intent is not ViewIntent.CURVE or self.faceted
-        ):
-            raise ValueError("rolling trace requires one ordinary CURVE surface")
-        if self.rolling_distribution and not self.rolling_trace:
-            raise ValueError("rolling distribution requires rolling_trace")
-        if _display_intent(self.display) is not self.intent:
-            raise ValueError("presentation display and intent disagree")
-        if isinstance(self.display, FacetedHistogramDisplayState) and not self.faceted:
-            raise ValueError("per-cell histogram display requires a faceted surface")
-        if not isinstance(self.title, str) or not isinstance(self.value_label, str):
-            raise TypeError("figure presentation labels must be strings")
-        panel_size_cells(self.size_name)
-        object.__setattr__(self, "size_name", str(self.size_name))
-
-    def validate_figure(self, figure: DataFigure) -> None:
-        if not isinstance(figure, DataFigure):
-            raise TypeError("figure presentation requires DataFigure")
-        if (
-            len(figure.document.layers) != 1
-            or len(figure.evaluated.layers) != 1
-            or len(figure.evaluated.inputs) != 1
-        ):
-            raise ValueError(
-                "archived interactive presentation requires one layer and input"
-            )
-        if figure.document.layers[0].view.intent is not self.intent:
-            raise ValueError("figure presentation intent differs from its document")
-        cell_count = len(figure.evaluated.layers[0].cells)
-        if self.faceted != (cell_count > 1):
-            raise ValueError(
-                "figure presentation faceting differs from evaluated panel topology"
-            )
+def _validate_archive_figure(
+    figure: DataFigure,
+    figure_intent: FigureIntent,
+    size_name: str,
+    display: FigureDisplayState,
+) -> str:
+    if not isinstance(figure, DataFigure):
+        raise TypeError("archived Figure requires DataFigure")
+    if not isinstance(figure_intent, FigureIntent) or figure_intent.view is None:
+        raise TypeError("archive requires one resolved FigureIntent")
+    if (
+        len(figure.document.layers) != 1
+        or len(figure.evaluated.layers) != 1
+        or len(figure.evaluated.inputs) != 1
+    ):
+        raise ValueError("archived interactive Figure requires one layer and input")
+    if figure.document.layers[0].view != figure_intent.view:
+        raise ValueError("archived FigureIntent differs from its document")
+    intent = figure_intent.view_intent
+    if (
+        intent not in DATASET_VIEW_INTENTS
+        or panel_display_state_intent(display) is not intent
+    ):
+        raise ValueError("archived display and FigureIntent disagree")
+    cell_count = len(figure.evaluated.layers[0].cells)
+    if figure_intent.faceted != (cell_count > 1):
+        raise ValueError("archived Figure faceting differs from evaluated topology")
+    if isinstance(display, FacetedHistogramDisplayState) and not figure_intent.faceted:
+        raise ValueError("per-cell histogram display requires a Grid Figure")
+    panel_size_cells(size_name)
+    return str(size_name)
 
 
 def _presentation_to_tree(
-    presentation: FigurePresentationContract,
+    figure_intent: FigureIntent,
+    size_name: str,
+    display: FigureDisplayState,
 ) -> dict[str, Any]:
-    if not isinstance(presentation, FigurePresentationContract):
-        raise TypeError("presentation must be FigurePresentationContract")
+    if not isinstance(figure_intent, FigureIntent):
+        raise TypeError("archive presentation requires FigureIntent")
     return {
-        "intent": presentation.intent.value,
-        "faceted": presentation.faceted,
-        "rolling_trace": presentation.rolling_trace,
-        "rolling_distribution": presentation.rolling_distribution,
-        "title": presentation.title,
-        "value_label": presentation.value_label,
-        "size_name": presentation.size_name,
-        "display": _display_state_to_tree(presentation.display),
+        "kind": figure_intent.kind.value,
+        "title": figure_intent.title,
+        "value_label": figure_intent.value_label,
+        "rolling_distribution": figure_intent.rolling_distribution,
+        "size_name": str(size_name),
+        "display": _display_state_to_tree(display),
     }
 
 
-def _presentation_from_tree(tree: Any) -> FigurePresentationContract:
+def _presentation_from_tree(
+    tree: Any,
+    figure: DataFigure,
+) -> tuple[FigureIntent, str, FigureDisplayState]:
     data = exact_mapping(
         tree,
         {
-            "intent",
-            "faceted",
-            "rolling_trace",
+            "kind",
             "rolling_distribution",
             "title",
             "value_label",
@@ -221,16 +157,22 @@ def _presentation_from_tree(tree: Any) -> FigurePresentationContract:
     display = _display_state_from_tree(data["display"])
     if display is None:
         raise ValueError("figure presentation requires authored display state")
-    return FigurePresentationContract(
-        intent=ViewIntent(data["intent"]),
-        faceted=data["faceted"],
-        rolling_trace=data["rolling_trace"],
+    if len(figure.document.layers) != 1:
+        raise ValueError("archived FigureIntent requires one document layer")
+    figure_intent = FigureIntent(
+        PlotKind(data["kind"]),
+        data["title"],
+        data["value_label"],
+        view=figure.document.layers[0].view,
         rolling_distribution=data["rolling_distribution"],
-        title=data["title"],
-        value_label=data["value_label"],
-        size_name=data["size_name"],
-        display=display,
     )
+    size_name = _validate_archive_figure(
+        figure,
+        figure_intent,
+        data["size_name"],
+        display,
+    )
+    return figure_intent, size_name, display
 
 
 def _optional_range_to_tree(value) -> list[float] | None:
@@ -317,7 +259,7 @@ def _display_state_to_tree(
             "kind": ViewIntent.HISTOGRAM.value,
             "revision": state.revision,
             "relim_mode": state.relim_mode.value,
-            "count_scale": state.count_scale.value,
+            "log_count_axis": state.log_count_axis,
             "bin_count": state.bin_count,
             "x_view": _optional_range_to_tree(state.x_view),
             "fixed_count_limits": _optional_range_to_tree(
@@ -418,7 +360,7 @@ def _display_state_from_tree(tree: Any) -> FigureDisplayState | None:
                 "kind",
                 "revision",
                 "relim_mode",
-                "count_scale",
+                "log_count_axis",
                 "bin_count",
                 "x_view",
                 "fixed_count_limits",
@@ -432,7 +374,7 @@ def _display_state_from_tree(tree: Any) -> FigureDisplayState | None:
         return HistogramDisplayState(
             revision=data["revision"],
             relim_mode=RelimMode(data["relim_mode"]),
-            count_scale=HistogramCountScale(data["count_scale"]),
+            log_count_axis=data["log_count_axis"],
             bin_count=data["bin_count"],
             x_view=_optional_range_from_tree(
                 data["x_view"],
@@ -477,14 +419,19 @@ def _metadata_for_tree(
 def _archive_tree(
     figure: DataFigure,
     *,
-    presentation: FigurePresentationContract,
+    figure_intent: FigureIntent,
+    size_name: str,
+    display: FigureDisplayState,
     metadata: Mapping[str, object] | None,
 ) -> dict[str, Any]:
     if not isinstance(figure, DataFigure):
         raise TypeError("figure must be DataFigure")
-    if not isinstance(presentation, FigurePresentationContract):
-        raise TypeError("presentation must be FigurePresentationContract")
-    presentation.validate_figure(figure)
+    size_name = _validate_archive_figure(
+        figure,
+        figure_intent,
+        size_name,
+        display,
+    )
     datasets = []
     for entry in sorted(
         figure.datasets.entries,
@@ -511,14 +458,24 @@ def _archive_tree(
             }
             for layer_id, result in sorted(figure.fit_results.items())
         ],
-        "presentation": _presentation_to_tree(presentation),
+        "presentation": _presentation_to_tree(
+            figure_intent,
+            size_name,
+            display,
+        ),
         "metadata": _metadata_for_tree(metadata),
     }
 
 
 def _decode_archive_payload(
     payload: bytes,
-) -> tuple[DataFigure, FigurePresentationContract, dict[str, object]]:
+) -> tuple[
+    DataFigure,
+    FigureIntent,
+    str,
+    FigureDisplayState,
+    dict[str, object],
+]:
     tree = decode(payload)
     data = exact_mapping(
         tree,
@@ -586,14 +543,16 @@ def _decode_archive_payload(
             raise ValueError("figure archive fit payload must be canonical bytes")
         fit_results[layer_id] = decode_fit_result_batch(result_payload)
 
-    presentation = _presentation_from_tree(data["presentation"])
     metadata = data["metadata"]
     if not isinstance(metadata, dict) or any(
         not isinstance(key, str) for key in metadata
     ):
         raise ValueError("figure archive metadata must be a string-keyed map")
     figure = DataFigure(document, datasets, fit_results=fit_results)
-    presentation.validate_figure(figure)
+    figure_intent, size_name, display = _presentation_from_tree(
+        data["presentation"],
+        figure,
+    )
 
     # A canonical primitive payload can still encode a typed value in a
     # non-canonical field order/normal form.  Re-project through every owner and
@@ -601,7 +560,9 @@ def _decode_archive_payload(
     rebuilt = encode(
         _archive_tree(
             figure,
-            presentation=presentation,
+            figure_intent=figure_intent,
+            size_name=size_name,
+            display=display,
             metadata=metadata,
         )
     )
@@ -609,7 +570,7 @@ def _decode_archive_payload(
         raise ValueError(
             "figure archive payload uses a non-canonical typed representation"
         )
-    return figure, presentation, metadata
+    return figure, figure_intent, size_name, display, metadata
 
 
 def _freeze_metadata_value(value: Any) -> Any:
@@ -627,16 +588,20 @@ class FigureArchive:
     """Decoded current archive value, independent of any repository path."""
 
     figure: DataFigure
-    presentation: FigurePresentationContract
+    figure_intent: FigureIntent
+    size_name: str
+    display: FigureDisplayState
     metadata: Mapping[str, object]
     payload_digest: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.figure, DataFigure):
-            raise TypeError("figure must be DataFigure")
-        if not isinstance(self.presentation, FigurePresentationContract):
-            raise TypeError("presentation must be FigurePresentationContract")
-        self.presentation.validate_figure(self.figure)
+        size_name = _validate_archive_figure(
+            self.figure,
+            self.figure_intent,
+            self.size_name,
+            self.display,
+        )
+        object.__setattr__(self, "size_name", size_name)
         if not isinstance(self.metadata, Mapping) or any(
             not isinstance(key, str) for key in self.metadata
         ):
@@ -659,7 +624,9 @@ class FigureArchive:
 def encode_figure_archive_payload(
     figure: DataFigure,
     *,
-    presentation: FigurePresentationContract,
+    figure_intent: FigureIntent,
+    size_name: str,
+    display: FigureDisplayState,
     metadata: Mapping[str, object] | None = None,
 ) -> bytes:
     """Encode one exact current archive payload without doing filesystem I/O."""
@@ -667,7 +634,9 @@ def encode_figure_archive_payload(
     return encode(
         _archive_tree(
             figure,
-            presentation=presentation,
+            figure_intent=figure_intent,
+            size_name=size_name,
+            display=display,
             metadata=metadata,
         )
     )
@@ -678,10 +647,14 @@ def decode_figure_archive_payload(payload: bytes) -> FigureArchive:
 
     if not isinstance(payload, bytes):
         raise TypeError("figure archive payload must be bytes")
-    figure, presentation, metadata = _decode_archive_payload(payload)
+    figure, figure_intent, size_name, display, metadata = _decode_archive_payload(
+        payload
+    )
     return FigureArchive(
         figure=figure,
-        presentation=presentation,
+        figure_intent=figure_intent,
+        size_name=size_name,
+        display=display,
         metadata=metadata,
         payload_digest=sha256_digest(payload),
     )
@@ -691,7 +664,6 @@ __all__ = [
     "FIGURE_ARCHIVE_SCHEMA",
     "FigureArchive",
     "FigureDisplayState",
-    "FigurePresentationContract",
     "decode_figure_archive_payload",
     "encode_figure_archive_payload",
 ]

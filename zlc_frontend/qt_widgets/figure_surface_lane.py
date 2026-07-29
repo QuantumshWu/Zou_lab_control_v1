@@ -1,34 +1,35 @@
 """Reusable Figure-surface worker lanes for raster and selector outputs.
 
 Qt freezes immutable requests and accepts completed fronts.  This owner keeps
-every ``PanelComposer`` and Agg object on one render thread, evaluates selector
-materializations on an independent worker, coalesces work that has not started,
-and never reads a card widget from either worker.
+every ``PanelComposer`` and Agg object on one render thread, submits selector
+materialization through the composition-owned compute seam, coalesces work that
+has not started, and never reads a card widget from either worker.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass
 import threading
 from types import MappingProxyType
 
-from zlc_data import FitResultBatch
 from zlc_frontend import (
     FigureAreaCommit,
     FigureCrossCommit,
     FigureSource,
-    PlotPanelComposeRequest,
     PlotPanelContract,
     PanelProvenance,
     PlotPanelSession,
+)
+from zlc_frontend.figure_outputs import (
     materialize_area_outputs,
     materialize_cross_outputs,
 )
+from zlc_frontend.plot_panel import PlotPanelComposeRequest
 from zlc_frontend.panel_render import FacetedPanelFocus
-from .owner_wake import QtOwnerWake
+from .owner_wake import QtOwnerWake, RASTER_WORK_EXECUTOR
 
 
 __all__ = [
@@ -51,8 +52,6 @@ class FigureSurfaceRenderRequest:
     display: object
     provenance: PanelProvenance
     focus: FacetedPanelFocus | None
-    fit_result: FitResultBatch | None = None
-    fit_result_identity: str | None = None
     # One Figure may be presented by the live card and by an Edit tab frozen
     # at an older accepted input.  They share this lane and the same renderer
     # implementation, but each surface needs its own persistent Agg state.
@@ -88,21 +87,18 @@ class FigureSurfaceLane:
         *,
         accept_completion: Callable[[object], set[str]],
         request_shutdown_wake: Callable[[], None],
+        submit_compute: Callable[..., Future],
     ) -> None:
         if not callable(accept_completion):
             raise TypeError("accept_completion must be callable")
         if not callable(request_shutdown_wake):
             raise TypeError("request_shutdown_wake must be callable")
+        if not callable(submit_compute):
+            raise TypeError("submit_compute must be callable")
         self._accept_completion = accept_completion
         self._request_shutdown_wake = request_shutdown_wake
-        self._pool = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="zlc-task-console-raster",
-        )
-        self._selector_pool = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="zlc-task-console-selector",
-        )
+        self._submit_compute = submit_compute
+        self._pool = RASTER_WORK_EXECUTOR
         self._lock = threading.Lock()
         self._future: Future | None = None
         self._completion = None
@@ -306,8 +302,6 @@ class FigureSurfaceLane:
                         request.display,
                         request.provenance,
                         focus=request.focus,
-                        fit_result=request.fit_result,
-                        fit_result_identity=request.fit_result_identity,
                     )
                 )
                 frame = composed.frame
@@ -336,7 +330,7 @@ class FigureSurfaceLane:
                 return
             if self._selector_future is not None:
                 raise RuntimeError("selector lane admitted overlapping work")
-            future = self._selector_pool.submit(self._evaluate_selector, work)
+            future = self._submit_compute(self._evaluate_selector, work)
             self._selector_active = work
             self._selector_future = future
         future.add_done_callback(
@@ -526,8 +520,9 @@ class FigureSurfaceLane:
         The Qt owner never waits for a compose.  The release task is queued on
         the same single-worker executor, so it necessarily runs after an
         already-started compose and closes every Agg session on its creating
-        thread.  Stateless selector work retires independently. ``True`` is
-        returned only after both workers have released their references.
+        thread. Stateless selector work retires independently through the
+        injected compute seam. ``True`` is returned only after both workers
+        have released their references.
         """
 
         with self._lock:
@@ -553,14 +548,6 @@ class FigureSurfaceLane:
             with self._lock:
                 self._shutdown_future = future
             future.add_done_callback(self._shutdown_finished)
-        else:
-            # ThreadPoolExecutor is lazy; with no submitted/current work there
-            # is no worker-owned graph to retire and no thread to join.
-            self._pool.shutdown(wait=False)
-        if has_render_state:
-            self._pool.shutdown(wait=False)
-        self._selector_pool.shutdown(wait=False, cancel_futures=True)
-
         with self._lock:
             self._complete_shutdown_if_ready_locked()
             complete = self._shutdown_complete

@@ -20,8 +20,8 @@ import weakref
 from PyQt5 import QtCore, QtGui, QtWidgets
 from qframelesswindow import FramelessWindow, StandardTitleBar
 
-from ..typography import FONT_FAMILY, FONT_PATH
-
+from ..typography import FONT_FAMILY as PLOT_FONT_FAMILY
+from ..typography import FONT_PATH as PLOT_FONT_PATH
 from .style import (
     ACCENT,
     AUTO_SCALE_BASIS,
@@ -57,6 +57,7 @@ from .style import (
     WINDOW_MIN_FLOOR_PX,
     WINDOW_MIN_PX,
     WINDOW_PAD,
+    WINDOW_SCREEN_FRACTION,
     WINDOW_TITLEBAR_FLOOR_PX,
     WINDOW_TITLEBAR_PX,
 )
@@ -343,19 +344,19 @@ def _ensure_offscreen_fluent_fonts(app: QtWidgets.QApplication) -> bool:
 _PLOT_FONT_ID: int | None = None
 
 
-def _ensure_plot_font_registered() -> None:
-    """Register the same repository font used by the Main/Agg plot style."""
+def _ensure_plot_font() -> None:
+    """Register main's exact bundled plot font for QPainter overlays once."""
 
     global _PLOT_FONT_ID
     if _PLOT_FONT_ID is not None:
         return
-    font_id = QtGui.QFontDatabase.addApplicationFont(str(FONT_PATH))
+    font_id = QtGui.QFontDatabase.addApplicationFont(str(PLOT_FONT_PATH))
     if font_id < 0:
-        raise RuntimeError(f"Qt could not register plot font asset {FONT_PATH}")
+        raise RuntimeError(f"Qt could not register plot font asset {PLOT_FONT_PATH}")
     families = tuple(QtGui.QFontDatabase.applicationFontFamilies(font_id))
-    if FONT_FAMILY not in families:
+    if PLOT_FONT_FAMILY not in families:
         raise RuntimeError(
-            f"plot font asset exposes {families!r}, expected {FONT_FAMILY!r}"
+            f"plot font asset exposes {families!r}, expected {PLOT_FONT_FAMILY!r}"
         )
     _PLOT_FONT_ID = font_id
 
@@ -375,9 +376,9 @@ def ensure_qt_app() -> QtWidgets.QApplication:
             raise RuntimeError("Qt UI operations must run on the QApplication owner thread")
         if _ensure_offscreen_fluent_fonts(app):
             app.setFont(QtGui.QFont(FONT, fluent_font_size()))
+        _ensure_plot_font()
         _QT_APP = app
         _enable_ipython_qt_loop()
-        _ensure_plot_font_registered()
         return app
     if threading.current_thread() is not threading.main_thread():
         raise RuntimeError("QApplication must be created on the Python main thread")
@@ -389,7 +390,7 @@ def ensure_qt_app() -> QtWidgets.QApplication:
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
     _QT_APP = QtWidgets.QApplication(sys.argv)
     _ensure_offscreen_fluent_fonts(_QT_APP)
-    _ensure_plot_font_registered()
+    _ensure_plot_font()
     _QT_APP.setFont(QtGui.QFont(FONT, fluent_font_size()))
     _enable_ipython_qt_loop()
     return _QT_APP
@@ -2107,36 +2108,123 @@ class FluentTreeComboBox(FluentComboBox):
         return found
 
     def set_signal_tree(self, groups, *, current="", none_label=None) -> None:
-        """Populate the tree from ``groups`` = ``[(producer, [(leaf_label, bare_name, full_label)])]``
-        and select ``current`` (a bare signal name).  Parents are non-selectable + bold + collapsed;
-        ``none_label`` adds a leading selectable empty row."""
-        self._model.clear()
-        self._full_by_bare = {}                  # {bare -> producer-qualified label} for live _display_text
+        """Reconcile one grouped signal topology without rebuilding its items."""
+
+        normalized = []
+        producer_names: set[str] = set()
+        signal_names: set[str] = set()
+        full_by_bare: dict[str, str] = {}
+        for producer, leaves in groups:
+            producer_name = str(producer)
+            if producer_name in producer_names:
+                raise ValueError("signal tree contains a duplicate producer")
+            producer_names.add(producer_name)
+            normalized_leaves = []
+            for leaf_label, bare, full_label in leaves:
+                signal_name = str(bare)
+                if not signal_name or signal_name in signal_names:
+                    raise ValueError("signal tree contains a duplicate or empty signal")
+                signal_names.add(signal_name)
+                full = str(full_label)
+                normalized_leaves.append((str(leaf_label), signal_name, full))
+                full_by_bare[signal_name] = full
+            normalized.append((producer_name, tuple(normalized_leaves)))
+
+        view = self.view()
+        expanded = set()
+        vertical = horizontal = 0
+        if isinstance(view, QtWidgets.QTreeView):
+            vertical = view.verticalScrollBar().value()
+            horizontal = view.horizontalScrollBar().value()
+            expanded = {
+                item.text()
+                for row in range(self._model.rowCount())
+                for item in (self._model.item(row),)
+                if (
+                    item is not None
+                    and item.data(QtCore.Qt.UserRole) is None
+                    and view.isExpanded(item.index())
+                )
+            }
+
+        existing_none = None
+        existing_parents = {}
+        for row in range(self._model.rowCount()):
+            item = self._model.item(row)
+            if item is None:
+                continue
+            payload = item.data(QtCore.Qt.UserRole)
+            if payload == "":
+                existing_none = item
+            elif payload is None:
+                existing_parents[item.text()] = item
+
+        desired_top = []
         if none_label is not None:
-            none_item = QtGui.QStandardItem(str(none_label))
+            none_item = existing_none or QtGui.QStandardItem()
+            none_item.setText(str(none_label))
             none_item.setData("", QtCore.Qt.UserRole)
             none_item.setData("", QtCore.Qt.UserRole + 1)
             none_item.setEditable(False)
-            self._model.appendRow(none_item)
-        for producer, leaves in groups:
-            parent = QtGui.QStandardItem(str(producer))
+            desired_top.append(none_item)
+
+        for producer, leaves in normalized:
+            parent = existing_parents.get(producer) or QtGui.QStandardItem()
+            parent.setText(producer)
             parent.setSelectable(False)
             parent.setEditable(False)
-            font = parent.font(); font.setBold(True); parent.setFont(font)
+            font = parent.font()
+            font.setBold(True)
+            parent.setFont(font)
+            existing_children = {
+                str(child.data(QtCore.Qt.UserRole)): child
+                for row in range(parent.rowCount())
+                for child in (parent.child(row),)
+                if child is not None and child.data(QtCore.Qt.UserRole)
+            }
+            desired_children = []
             for leaf_label, bare, full_label in leaves:
-                child = QtGui.QStandardItem(str(leaf_label))
-                child.setData(str(bare), QtCore.Qt.UserRole)
-                child.setData(str(full_label), QtCore.Qt.UserRole + 1)
+                child = existing_children.get(bare) or QtGui.QStandardItem()
+                child.setText(leaf_label)
+                child.setData(bare, QtCore.Qt.UserRole)
+                child.setData(full_label, QtCore.Qt.UserRole + 1)
                 child.setEditable(False)
-                self._full_by_bare[str(bare)] = str(full_label)   # for the live collapsed-box label
-                parent.appendRow(child)
-            self._model.appendRow(parent)
-        view = self.view()
-        if isinstance(view, QtWidgets.QTreeView):
-            view.collapseAll()
-        # Initial population and later saved-value restoration share the exact
-        # same nested-leaf selection semantics.
+                desired_children.append(child)
+            desired_child_ids = {id(child) for child in desired_children}
+            for row in range(parent.rowCount() - 1, -1, -1):
+                if id(parent.child(row)) not in desired_child_ids:
+                    parent.removeRow(row)
+            for row, child in enumerate(desired_children):
+                if child.parent() is parent:
+                    current_row = child.row()
+                    if current_row != row:
+                        parent.insertRow(row, parent.takeRow(current_row))
+                else:
+                    parent.insertRow(row, child)
+            desired_top.append(parent)
+
+        desired_top_ids = {id(item) for item in desired_top}
+        for row in range(self._model.rowCount() - 1, -1, -1):
+            if id(self._model.item(row)) not in desired_top_ids:
+                self._model.removeRow(row)
+        for row, item in enumerate(desired_top):
+            if item.parent() is None and item.model() is self._model:
+                current_row = item.row()
+                if current_row != row:
+                    self._model.insertRow(row, self._model.takeRow(current_row))
+            else:
+                self._model.insertRow(row, item)
+
+        self._full_by_bare = full_by_bare
         self.select_signal(current)
+        if isinstance(view, QtWidgets.QTreeView):
+            for producer in expanded:
+                parent = existing_parents.get(producer)
+                if parent is not None and parent.model() is self._model:
+                    view.setExpanded(parent.index(), True)
+            view.verticalScrollBar().setValue(vertical)
+            view.horizontalScrollBar().setValue(horizontal)
+            view.viewport().update()
 
     def reconcile_signal_tree_metadata(self, groups) -> bool:
         """Update existing signal-leaf labels without rebuilding the tree.
@@ -3120,6 +3208,25 @@ class FluentWindow(FramelessWindow):
     def hideEvent(self, event):
         self.hidden.emit()
         super().hideEvent(event)
+
+
+def launch_qt_window(factory) -> QtWidgets.QWidget:
+    """Construct, size, retain, and show one frontend-owned Qt window."""
+
+    if not callable(factory):
+        raise TypeError("window factory must be callable")
+    application = ensure_qt_app()
+    if QtCore.QThread.currentThread() != application.thread():
+        raise RuntimeError("Qt windows must be opened on the GUI thread")
+    set_fluent_scale(None)
+    window = factory()
+    if not isinstance(window, QtWidgets.QWidget):
+        raise TypeError("window factory must return QWidget")
+    window.resize(screen_fit_window_size(WINDOW_SCREEN_FRACTION))
+    retain_window(window)
+    window.show()
+    center_window_on_primary_screen(window, application)
+    return window
 
 
 def launch_fluent_window(

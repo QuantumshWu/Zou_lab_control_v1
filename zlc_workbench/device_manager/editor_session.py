@@ -10,15 +10,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from zlc_frontend.form import FormSpec
+from zlc_frontend.form import FormSpec, project_authoring_form
 from zlc_neutral_atom.installation_config import (
     InstallationConfigDocument,
     default_installation_authoring_schema,
     installation_authoring_schema,
 )
 from zlc_storage import sha256_text
-from zlc_workbench.form_projection import project_authoring_form
-
 
 def form_spec(
     document_or_backend: InstallationConfigDocument | str,

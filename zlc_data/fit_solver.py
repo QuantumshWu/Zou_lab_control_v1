@@ -9,7 +9,7 @@ from typing import Callable
 
 import numpy as np
 import scipy
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize
 from zlc_storage.canonical import finite_real
 
 from .fit_contract import (
@@ -22,12 +22,17 @@ from .fit_contract import (
 )
 from .fit_model import (
     FitParameterDomain,
-    _radial_cartesian_grid,
+    _radial_gaussian_center_axis_basis,
     _radial_gaussian_center_jacobian,
+    _spatial_radial_center_seeds,
     evaluate_fit_model,
     initialize_fit_model,
 )
-from .fit_problem import build_fit_problem
+from .fit_problem import (
+    _RegularFitProblem,
+    _build_solver_problem,
+    _float64_observations,
+)
 from .value import OwnedSnapshot
 
 
@@ -54,13 +59,6 @@ class _ResolvedInitialization:
     fixed: np.ndarray
     fixed_values: np.ndarray
     free_indices: np.ndarray
-
-
-@dataclass(frozen=True)
-class _NumericalView:
-    coordinates: tuple[np.ndarray, ...]
-    observations: np.ndarray
-    subsampled: bool
 
 
 @dataclass(frozen=True)
@@ -104,7 +102,7 @@ def _fit_analysis(
         _check_host_abort(cancel_check, deadline_monotonic)
 
     _check_host_abort(cancel_check, deadline_monotonic)
-    problem = build_fit_problem(bound, snapshot, abort_check=packing_abort)
+    problem = _build_solver_problem(bound, snapshot, abort_check=packing_abort)
     _check_host_abort(cancel_check, deadline_monotonic)
 
     batch_size = problem.batch_layout.storage_size
@@ -137,15 +135,44 @@ def _fit_analysis(
             )
             continue
         try:
-            start = int(problem.batch_offsets[batch_index])
-            stop = int(problem.batch_offsets[batch_index + 1])
-            success = _fit_cell(
-                bound,
-                tuple(values[start:stop] for values in problem.independent_values),
-                problem.observations[start:stop],
-                cancel_check=cancel_check,
-                host_deadline=deadline_monotonic,
-            )
+            if isinstance(problem, _RegularFitProblem):
+                coordinates, observations, validity = problem.cells[batch_index]
+                if len(coordinates) == 2:
+                    success = _fit_regular_radial_cell(
+                        bound,
+                        coordinates,
+                        observations,
+                        validity,
+                        cancel_check=cancel_check,
+                        host_deadline=deadline_monotonic,
+                    )
+                else:
+                    valid = np.asarray(validity, dtype=bool).reshape(-1)
+                    selected: slice | np.ndarray = (
+                        slice(None) if bool(np.all(valid)) else valid
+                    )
+                    success = _fit_cell(
+                        bound,
+                        (np.asarray(coordinates[0]).reshape(-1)[selected],),
+                        _float64_observations(
+                            np.asarray(observations).reshape(-1)[selected]
+                        ),
+                        cancel_check=cancel_check,
+                        host_deadline=deadline_monotonic,
+                    )
+            else:
+                start = int(problem.batch_offsets[batch_index])
+                stop = int(problem.batch_offsets[batch_index + 1])
+                success = _fit_cell(
+                    bound,
+                    tuple(
+                        values[start:stop]
+                        for values in problem.independent_values
+                    ),
+                    problem.observations[start:stop],
+                    cancel_check=cancel_check,
+                    host_deadline=deadline_monotonic,
+                )
         except (FitCancelled, FitDeadlineExceeded):
             raise
         except _CellFailure as exc:
@@ -214,23 +241,18 @@ def _fit_cell(
     _check_host_abort(cancel_check, host_deadline)
     try:
         user_seed = _complete_user_seed(bound)
-        if user_seed is None:
-            model_seeds = initialize_fit_model(
+        model_seeds = (
+            initialize_fit_model(
                 bound.model,
                 model_coordinates,
                 observations,
             )
-        else:
-            model_seeds = (user_seed,)
+            if user_seed is None
+            else (user_seed,)
+        )
         initialization = _resolve_initialization(
             bound,
             model_seeds,
-        )
-        numerical_view = _numerical_view(
-            bound,
-            model_coordinates,
-            observations,
-            initialization.seeds,
         )
         _check_host_abort(cancel_check, host_deadline)
     except _CellFailure:
@@ -242,11 +264,6 @@ def _fit_cell(
         ) from exc
 
     evaluation_count = 0
-
-    def full_parameters(free: np.ndarray) -> np.ndarray:
-        result = initialization.fixed_values.copy()
-        result[initialization.free_indices] = free
-        return result
 
     def evaluated_residual(
         free: np.ndarray,
@@ -262,7 +279,7 @@ def _fit_cell(
                 evaluations=evaluation_count,
             )
         evaluation_count += 1
-        parameters = full_parameters(np.asarray(free, dtype=np.float64))
+        parameters = _full_parameter_vector(initialization, free)
         with np.errstate(all="ignore"):
             predicted = evaluate_fit_model(
                 bound.model,
@@ -284,8 +301,8 @@ def _fit_cell(
     def residual(free: np.ndarray) -> np.ndarray:
         return evaluated_residual(
             free,
-            numerical_view.coordinates,
-            numerical_view.observations,
+            model_coordinates,
+            observations,
         )
 
     if initialization.free_indices.size == 0:
@@ -346,66 +363,7 @@ def _fit_cell(
                     evaluations=evaluation_count,
                 )
             continue
-        if numerical_view.subsampled:
-            remaining_evaluations = (
-                bound.spec.numeric_policy.max_evaluations - evaluation_count
-            )
-            if remaining_evaluations <= 0:
-                raise _CellFailure(
-                    FitBatchStatus.EVALUATION_LIMIT,
-                    "per-batch model evaluation limit exceeded before full-image polish",
-                    evaluations=evaluation_count,
-                )
-
-            def authoritative_jacobian(free: np.ndarray) -> np.ndarray:
-                _check_host_abort(cancel_check, host_deadline)
-                parameters = full_parameters(np.asarray(free, dtype=np.float64))
-                with np.errstate(all="ignore"):
-                    jacobian = _radial_gaussian_center_jacobian(
-                        model_coordinates,
-                        parameters,
-                    )[:, initialization.free_indices]
-                if not np.all(np.isfinite(jacobian)):
-                    raise _CellFailure(
-                        FitBatchStatus.NUMERIC_ERROR,
-                        "radial full-image Jacobian produced non-finite values",
-                        evaluations=evaluation_count,
-                    )
-                return jacobian
-
-            polished = least_squares(
-                lambda free: evaluated_residual(
-                    free,
-                    model_coordinates,
-                    observations,
-                ),
-                solved.x,
-                jac=authoritative_jacobian,
-                bounds=(free_lower, free_upper),
-                method="trf",
-                ftol=1e-8,
-                xtol=1e-8,
-                gtol=1e-8,
-                x_scale=1.0,
-                loss="linear",
-                f_scale=1.0,
-                diff_step=None,
-                tr_solver="exact",
-                tr_options=None,
-                max_nfev=remaining_evaluations,
-            )
-            if not polished.success:
-                last_message = f"full-image polish failed: {polished.message}"
-                if polished.status == 0:
-                    raise _CellFailure(
-                        FitBatchStatus.EVALUATION_LIMIT,
-                        "radial full-image polish exhausted its evaluation limit",
-                        evaluations=evaluation_count,
-                    )
-                continue
-            solved = polished
-
-        parameters = full_parameters(solved.x)
+        parameters = _full_parameter_vector(initialization, solved.x)
         residual_values = np.asarray(solved.fun, dtype=np.float64).reshape(-1)
         candidate_rss = _sum_squares(residual_values)
         if not np.isfinite(candidate_rss):
@@ -450,78 +408,427 @@ def _fit_cell(
     )
 
 
-def _numerical_view(
+def _fit_regular_radial_cell(
     bound: BoundFit,
     coordinates: tuple[np.ndarray, ...],
     observations: np.ndarray,
-    seeds: tuple[np.ndarray, ...],
-) -> _NumericalView:
-    """Choose the model's nonlinear refinement view.
+    validity: np.ndarray,
+    *,
+    cancel_check: Callable[[], bool] | None,
+    host_deadline: float | None,
+) -> _CellSuccess:
+    """Fit the exact raster objective, with a bounded masked-data fallback."""
 
-    Only the radial image model has a distinct numerical path.  Its complete
-    camera plane determines the robust moment seed and remains the authority for
-    candidate ranking/RSS/R-squared.  Repeated nonlinear evaluations use dense
-    samples around every coherent feature plus a regular whole-frame background
-    mesh, so a megapixel background is not recomputed thousands of times.
-    """
-
-    if bound.model.model_id != "radial_gaussian_center":
-        return _NumericalView(coordinates, observations, False)
-    indices = _radial_refinement_indices(coordinates, observations, seeds)
-    if indices is None:
-        return _NumericalView(coordinates, observations, False)
-    return _NumericalView(
-        tuple(np.take(values, indices) for values in coordinates),
-        np.take(observations, indices),
-        True,
-    )
-
-
-def _radial_refinement_indices(
-    coordinates: tuple[np.ndarray, ...],
-    observations: np.ndarray,
-    seeds: tuple[np.ndarray, ...],
-) -> np.ndarray | None:
-    if len(coordinates) != 2 or not seeds:
-        return None
-    x, y = coordinates
-    cartesian = _radial_cartesian_grid(x, y, observations)
-    if cartesian is None:
-        return None
-    x_values, y_values, _image, observation_indices = cartesian
-
-    def coordinate_step(values: np.ndarray) -> float:
-        differences = np.diff(values)
-        positive = differences[differences > 0.0]
-        return float(np.min(positive)) if positive.size else 1.0
-
-    local_step = max(coordinate_step(x_values), coordinate_step(y_values))
-    selected = np.zeros(observations.size, dtype=bool)
-    for seed in seeds:
-        radius = abs(float(seed[2]))
-        center_x = float(seed[3])
-        center_y = float(seed[4])
-        if not all(np.isfinite(value) for value in (radius, center_x, center_y)):
-            continue
-        dense_radius = max(6.0 * radius, 12.0 * local_step)
-        selected |= (
-            (x - center_x) ** 2 + (y - center_y) ** 2 <= dense_radius**2
+    if bound.model.model_id != "radial_gaussian_center" or len(coordinates) != 2:
+        raise RuntimeError("regular two-axis Fit requires the radial image model")
+    x_values, y_values = coordinates
+    image = np.asarray(observations)
+    valid = np.broadcast_to(np.asarray(validity, dtype=bool), image.shape)
+    if image.shape != (x_values.size, y_values.size):
+        raise RuntimeError("regular Fit image shape disagrees with its axes")
+    _check_host_abort(cancel_check, host_deadline)
+    all_valid = bool(np.all(valid))
+    observation_scale = 0.0
+    observation_min = math.inf
+    observation_max = -math.inf
+    for start in range(0, image.shape[0], 64):
+        _check_host_abort(cancel_check, host_deadline)
+        source = np.asarray(image[start : start + 64]).reshape(-1)
+        if all_valid:
+            values = _float64_observations(source)
+        else:
+            mask = np.asarray(valid[start : start + 64], dtype=bool).reshape(-1)
+            values = _float64_observations(source[mask])
+        if values.size:
+            if not np.all(np.isfinite(values)):
+                raise _CellFailure(
+                    FitBatchStatus.NUMERIC_ERROR,
+                    "authoritative valid observations contain non-finite values",
+                )
+            observation_scale = max(observation_scale, float(np.max(np.abs(values))))
+            observation_min = min(observation_min, float(np.min(values)))
+            observation_max = max(observation_max, float(np.max(values)))
+    observation_scale = observation_scale or 1.0
+    if observation_min >= 0.0 or observation_max <= 0.0:
+        optimizer_scale = observation_max - observation_min
+    else:
+        # A cross-zero range can overflow even when max-absolute scaling is safe.
+        optimizer_scale = observation_scale
+    optimizer_scale = optimizer_scale or observation_scale
+    optimizer_ratio = observation_scale / optimizer_scale
+    optimizer_factor = optimizer_ratio * optimizer_ratio
+    if not np.isfinite(optimizer_factor):
+        raise _CellFailure(
+            FitBatchStatus.NUMERIC_ERROR,
+            "full-image objective scale is not finite",
         )
+    observation_sum = observation_square_sum = observation_total = 0.0
+    observation_count = 0
+    if all_valid:
+        sums: list[float] = []
+        squares: list[float] = []
+        mean = 0.0
+        for start in range(0, image.shape[0], 64):
+            _check_host_abort(cancel_check, host_deadline)
+            values = np.asarray(image[start : start + 64]).reshape(-1).astype(
+                np.float64, copy=False
+            ) / observation_scale
+            sums.append(float(np.sum(values)))
+            squares.append(float(np.dot(values, values)))
+            local_count = values.size
+            local_mean = float(np.mean(values))
+            centered = values - local_mean
+            delta = local_mean - mean
+            combined = observation_count + local_count
+            observation_total += float(np.dot(centered, centered)) + (
+                delta * delta * observation_count * local_count / combined
+            )
+            mean += delta * local_count / combined
+            observation_count = combined
+        observation_sum = math.fsum(sums)
+        observation_square_sum = math.fsum(squares)
 
-    # Sixty-four intervals per spatial direction are a deterministic quadrature
-    # of the slowly varying background/offset, not a caller-visible resource or
-    # memory budget.  The feature neighbourhood above stays fully sampled.
-    x_mesh = np.unique(
-        np.linspace(0, x_values.size - 1, min(x_values.size, 65), dtype=np.int64)
+    user_seed = _complete_user_seed(bound)
+    try:
+        seeds = (
+            (user_seed,)
+            if user_seed is not None
+            else _spatial_radial_center_seeds(
+                x_values,
+                y_values,
+                image,
+                valid,
+                lambda: _check_host_abort(cancel_check, host_deadline),
+            )
+        )
+        if not seeds:
+            raise ValueError("radial center fit requires coherent contrast")
+        initialization = _resolve_initialization(bound, seeds)
+    except _CellFailure:
+        raise
+    except (ValueError, FloatingPointError, OverflowError) as exc:
+        raise _CellFailure(
+            FitBatchStatus.INITIALIZATION_FAILED,
+            f"initialization failed: {exc}",
+        ) from exc
+
+    free_indices = initialization.free_indices
+    evaluation_count = 0
+
+    def full_pass(
+        parameters: np.ndarray,
+        *,
+        collect_metrics: bool,
+        collect_information: bool,
+    ) -> tuple[float, np.ndarray, np.ndarray, float, int]:
+        _check_host_abort(cancel_check, host_deadline)
+        rss = 0.0
+        gradient = np.zeros(free_indices.size, dtype=np.float64)
+        information = np.zeros(
+            (free_indices.size, free_indices.size), dtype=np.float64
+        )
+        if all_valid:
+            with np.errstate(all="ignore"):
+                radial_x, radial_y, radius_x, radius_y, center_x, center_y = (
+                    _radial_gaussian_center_axis_basis(x_values, y_values, parameters)
+                )
+            amplitude, offset = float(parameters[0]), float(parameters[1])
+            inverse_scale = 1.0 / observation_scale
+            # Basis order is radial, constant, radius derivative, center derivative.
+            row_basis = np.stack(
+                (radial_x, np.ones_like(radial_x), radius_x, center_x)
+            )
+            column_basis = np.stack(
+                (radial_y, np.ones_like(radial_y), radius_y, center_y)
+            )
+            coefficients = np.zeros((6, 4, 4), dtype=np.float64)
+            coefficients[0, 0, 0] = amplitude * inverse_scale
+            coefficients[0, 1, 1] = offset * inverse_scale
+            coefficients[1, 0, 0] = inverse_scale
+            coefficients[2, 1, 1] = inverse_scale
+            coefficients[3, 2, 0] = coefficients[3, 0, 2] = (
+                amplitude * inverse_scale
+            )
+            coefficients[4, 3, 0] = amplitude * inverse_scale
+            coefficients[5, 0, 3] = amplitude * inverse_scale
+            data_projection = np.einsum(
+                "ij,bj->bi",
+                image,
+                column_basis,
+                optimize=False,
+                dtype=np.float64,
+                casting="unsafe",
+            ) / observation_scale
+            data_matrix = row_basis @ data_projection.T
+            data_matrix[1, 1] = observation_sum
+            data_inner = np.einsum(
+                "kab,ab->k", coefficients, data_matrix, optimize=False
+            )
+            function_inner = np.einsum(
+                "kab,lcd,ac,bd->kl",
+                coefficients,
+                coefficients,
+                row_basis @ row_basis.T,
+                column_basis @ column_basis.T,
+                optimize=False,
+            )
+            model_square = float(function_inner[0, 0])
+            model_data = float(data_inner[0])
+            rss = model_square - 2.0 * model_data + observation_square_sum
+            cancellation = 64.0 * np.finfo(np.float64).eps * max(
+                model_square,
+                2.0 * abs(model_data),
+                observation_square_sum,
+                1.0,
+            )
+            gradient = (function_inner[0, 1:] - data_inner[1:])[free_indices]
+            if collect_information:
+                information = function_inner[1:, 1:][
+                    np.ix_(free_indices, free_indices)
+                ]
+            if not np.isfinite(rss) or not np.all(
+                np.isfinite(gradient)
+            ) or not np.all(np.isfinite(information)):
+                raise _CellFailure(
+                    FitBatchStatus.NUMERIC_ERROR,
+                    "separable full-image objective produced non-finite values",
+                    evaluations=evaluation_count,
+                )
+            if abs(rss) > cancellation:
+                if rss < 0.0:
+                    raise _CellFailure(
+                        FitBatchStatus.NUMERIC_ERROR,
+                        "separable full-image objective lost numeric precision",
+                        evaluations=evaluation_count,
+                    )
+                return (
+                    rss,
+                    gradient,
+                    information,
+                    observation_total if collect_metrics else 0.0,
+                    observation_count if collect_metrics else 0,
+                )
+            # The separable expansion subtracts three nearly equal inner
+            # products near a good fit.  Once their rounding envelope can hide
+            # the residual, use the same bounded exact pass as masked rasters.
+            rss = 0.0
+            gradient.fill(0.0)
+            information.fill(0.0)
+        mean = total = 0.0
+        count = 0
+        need_jacobian = bool(free_indices.size) and (
+            not collect_metrics or collect_information
+        )
+        for start in range(0, x_values.size, 64):
+            _check_host_abort(cancel_check, host_deadline)
+            stop = min(x_values.size, start + 64)
+            mask = np.asarray(valid[start:stop], dtype=bool).reshape(-1)
+            if not bool(np.any(mask)):
+                continue
+            coordinates = np.broadcast_arrays(
+                x_values[start:stop, None],
+                y_values[None, :],
+            )
+            with np.errstate(all="ignore"):
+                predicted = evaluate_fit_model(bound.model, coordinates, parameters)
+                jacobian = (
+                    _radial_gaussian_center_jacobian(coordinates, parameters)[
+                        :, free_indices
+                    ]
+                    if need_jacobian
+                    else None
+                )
+            observed = np.asarray(image[start:stop]).reshape(-1)[mask].astype(
+                np.float64, copy=False
+            )
+            residual = (predicted.reshape(-1)[mask] - observed) / observation_scale
+            if jacobian is not None:
+                jacobian = jacobian[mask] / observation_scale
+            if not np.all(np.isfinite(residual)) or (
+                jacobian is not None and not np.all(np.isfinite(jacobian))
+            ):
+                raise _CellFailure(
+                    FitBatchStatus.NUMERIC_ERROR,
+                    "full-image model evaluation produced non-finite values",
+                    evaluations=evaluation_count,
+                )
+            rss += float(np.dot(residual, residual))
+            if jacobian is not None:
+                gradient += jacobian.T @ residual
+                if collect_information:
+                    information += jacobian.T @ jacobian
+            if collect_metrics:
+                observed = observed / observation_scale
+                local_count = observed.size
+                local_mean = float(np.mean(observed))
+                centered = observed - local_mean
+                delta = local_mean - mean
+                combined = count + local_count
+                total += float(np.dot(centered, centered)) + (
+                    delta * delta * count * local_count / combined
+                )
+                mean += delta * local_count / combined
+                count = combined
+        if not np.isfinite(rss) or not np.all(np.isfinite(gradient)):
+            raise _CellFailure(
+                FitBatchStatus.NUMERIC_ERROR,
+                "full-image objective overflowed",
+                evaluations=evaluation_count,
+            )
+        return rss, gradient, information, total, count
+
+    best_parameters: np.ndarray | None = None
+    covariance_allowed = True
+    if free_indices.size == 0:
+        best_parameters = initialization.fixed_values
+        evaluation_count = 1
+    else:
+        free_lower = initialization.lower[free_indices]
+        free_upper = initialization.upper[free_indices]
+        best_objective = math.inf
+        last_message = "full-image optimizer did not run"
+        for seed in initialization.seeds:
+            _check_host_abort(cancel_check, host_deadline)
+            remaining = bound.spec.numeric_policy.max_evaluations - evaluation_count
+            if remaining <= 0:
+                break
+
+            def objective(free: np.ndarray) -> tuple[float, np.ndarray]:
+                nonlocal evaluation_count
+                _check_host_abort(cancel_check, host_deadline)
+                if evaluation_count >= bound.spec.numeric_policy.max_evaluations:
+                    raise _CellFailure(
+                        FitBatchStatus.EVALUATION_LIMIT,
+                        "per-batch model evaluation limit exceeded",
+                        evaluations=evaluation_count,
+                    )
+                evaluation_count += 1
+                rss, gradient, _information, _total, _count = full_pass(
+                    _full_parameter_vector(initialization, free),
+                    collect_metrics=False,
+                    collect_information=False,
+                )
+                return 0.5 * rss * optimizer_factor, gradient * optimizer_factor
+
+            try:
+                solved = minimize(
+                    objective,
+                    seed[free_indices],
+                    method="L-BFGS-B",
+                    jac=True,
+                    bounds=tuple(zip(free_lower, free_upper)),
+                    options={
+                        "ftol": 1e-8,
+                        "gtol": 1e-8,
+                        "maxfun": remaining,
+                        "maxiter": remaining,
+                        "maxls": 50,
+                    },
+                )
+            except _CellFailure as exc:
+                if best_parameters is not None and exc.status in {
+                    FitBatchStatus.EVALUATION_LIMIT,
+                    FitBatchStatus.NUMERIC_ERROR,
+                }:
+                    break
+                raise
+            last_message = str(solved.message)
+            if not solved.success:
+                continue
+            candidate = float(solved.fun)
+            if not np.isfinite(candidate) or candidate >= best_objective:
+                continue
+            best_objective = candidate
+            best_parameters = _full_parameter_vector(initialization, solved.x)
+            tolerance = np.sqrt(np.finfo(np.float64).eps) * np.maximum(
+                1.0, np.abs(solved.x)
+            )
+            active = np.zeros(solved.x.shape, dtype=np.int8)
+            active[
+                np.isfinite(free_lower) & (solved.x - free_lower <= tolerance)
+            ] = -1
+            active[
+                np.isfinite(free_upper) & (free_upper - solved.x <= tolerance)
+            ] = 1
+            covariance_allowed = not _has_authoritative_active_bound(
+                bound, initialization, active
+            )
+
+        if best_parameters is None:
+            status = (
+                FitBatchStatus.EVALUATION_LIMIT
+                if evaluation_count >= bound.spec.numeric_policy.max_evaluations
+                else FitBatchStatus.SOLVER_FAILED
+            )
+            message = (
+                "full-image optimizer exhausted its evaluation limit"
+                if status is FitBatchStatus.EVALUATION_LIMIT
+                else f"full-image optimizer failed for every initializer: {last_message}"
+            )
+            raise _CellFailure(status, message, evaluations=evaluation_count)
+
+    assert best_parameters is not None
+    normalized_rss, _gradient, information, total, observation_count = full_pass(
+        best_parameters,
+        collect_metrics=True,
+        collect_information=covariance_allowed,
     )
-    y_mesh = np.unique(
-        np.linspace(0, y_values.size - 1, min(y_values.size, 65), dtype=np.int64)
+    rss = _restore_scaled_square_sum(normalized_rss, observation_scale)
+    if not np.isfinite(rss):
+        raise _CellFailure(
+            FitBatchStatus.NUMERIC_ERROR,
+            "residual sum of squares overflowed",
+            evaluations=evaluation_count,
+        )
+    total = max(0.0, float(total))
+    r_squared_valid = total > 0.0 and np.isfinite(normalized_rss)
+    r_squared = float(1.0 - normalized_rss / total) if r_squared_valid else 0.0
+    if r_squared_valid and -64.0 * np.finfo(np.float64).eps <= r_squared < 0.0:
+        r_squared = 0.0
+    r_squared_valid = r_squared_valid and np.isfinite(r_squared)
+
+    covariance = np.zeros(
+        (len(bound.model.parameters), len(bound.model.parameters)),
+        dtype=np.float64,
     )
-    selected[observation_indices[np.ix_(x_mesh, y_mesh)].reshape(-1)] = True
-    indices = np.flatnonzero(selected)
-    if indices.size < 2 * len(seeds[0]) or indices.size * 2 >= observations.size:
-        return None
-    return indices.astype(np.int64, copy=False)
+    covariance_valid = False
+    if covariance_allowed:
+        covariance, covariance_valid = _covariance_from_information(
+            information,
+            observation_count,
+            normalized_rss,
+            free_indices,
+            len(bound.model.parameters),
+            bound.spec.numeric_policy.covariance_rcond,
+        )
+    return _CellSuccess(
+        best_parameters,
+        covariance,
+        covariance_valid,
+        evaluation_count,
+        rss,
+        r_squared if r_squared_valid else 0.0,
+        r_squared_valid,
+    )
+
+
+def _full_parameter_vector(
+    initialization: _ResolvedInitialization,
+    free: np.ndarray,
+) -> np.ndarray:
+    result = initialization.fixed_values.copy()
+    result[initialization.free_indices] = np.asarray(free, dtype=np.float64)
+    return result
+
+
+def _restore_scaled_square_sum(normalized_sum: float, scale: float) -> float:
+    if not np.isfinite(normalized_sum) or normalized_sum < 0.0:
+        return math.inf
+    if normalized_sum == 0.0 or scale == 0.0:
+        return 0.0
+    if scale > math.sqrt(np.finfo(np.float64).max) / math.sqrt(normalized_sum):
+        return math.inf
+    return float(scale * scale * normalized_sum)
 
 
 def _complete_user_seed(bound: BoundFit) -> tuple[float, ...] | None:
@@ -670,28 +977,75 @@ def _covariance(
     free_count = int(free_indices.size)
     if free_count == 0:
         return result, True
-    if jacobian.shape != (residual.size, free_count) or residual.size <= free_count:
+    if jacobian.shape != (residual.size, free_count):
         return result, False
     if not np.all(np.isfinite(jacobian)):
         return result, False
     column_norms = np.linalg.norm(jacobian, axis=0)
-    if np.any(~np.isfinite(column_norms)) or np.any(column_norms <= np.finfo(np.float64).tiny):
+    if np.any(~np.isfinite(column_norms)) or np.any(
+        column_norms <= np.finfo(np.float64).tiny
+    ):
         return result, False
     normalized = jacobian / column_norms
+    return _covariance_from_information(
+        normalized.T @ normalized,
+        residual.size,
+        _sum_squares(residual),
+        free_indices,
+        parameter_count,
+        rcond,
+        column_norms=column_norms,
+    )
+
+
+def _covariance_from_information(
+    information: np.ndarray,
+    observation_count: int,
+    rss: float,
+    free_indices: np.ndarray,
+    parameter_count: int,
+    rcond: float,
+    *,
+    column_norms: np.ndarray | None = None,
+) -> tuple[np.ndarray, bool]:
+    result = np.zeros((parameter_count, parameter_count), dtype=np.float64)
+    free_count = int(free_indices.size)
+    if free_count == 0:
+        return result, True
+    if (
+        information.shape != (free_count, free_count)
+        or observation_count <= free_count
+        or not np.all(np.isfinite(information))
+        or not np.isfinite(rss)
+    ):
+        return result, False
+    if column_norms is None:
+        column_norms = np.sqrt(np.diag(information))
+        normalized_information = None
+    else:
+        column_norms = np.asarray(column_norms, dtype=np.float64)
+        normalized_information = information
+    if column_norms.shape != (free_count,) or np.any(
+        ~np.isfinite(column_norms)
+    ) or np.any(column_norms <= np.finfo(np.float64).tiny):
+        return result, False
+    if normalized_information is None:
+        normalized_information = information / np.outer(column_norms, column_norms)
     rank = int(
         np.linalg.matrix_rank(
-            normalized,
-            tol=rcond * np.linalg.norm(normalized, ord=2),
+            normalized_information,
+            tol=rcond**2 * np.linalg.norm(normalized_information, ord=2),
         )
     )
     if rank != free_count:
         return result, False
-    information = normalized.T @ normalized
-    variance = _sum_squares(residual) / (residual.size - free_count)
+    variance = rss / (observation_count - free_count)
     if not np.isfinite(variance):
         return result, False
     try:
-        normalized_covariance = np.linalg.pinv(information, rcond=rcond) * variance
+        normalized_covariance = (
+            np.linalg.pinv(normalized_information, rcond=rcond) * variance
+        )
     except np.linalg.LinAlgError:
         return result, False
     free_covariance = normalized_covariance / np.outer(column_norms, column_norms)
@@ -755,12 +1109,7 @@ def _sum_squares(values: np.ndarray) -> float:
     if scale == 0.0:
         return 0.0
     normalized = values / scale
-    normalized_sum = float(np.dot(normalized, normalized))
-    if not np.isfinite(normalized_sum) or normalized_sum <= 0.0:
-        return math.inf
-    if scale > math.sqrt(np.finfo(np.float64).max / normalized_sum):
-        return math.inf
-    return float(scale * scale * normalized_sum)
+    return _restore_scaled_square_sum(float(np.dot(normalized, normalized)), scale)
 
 
 def _check_host_abort(

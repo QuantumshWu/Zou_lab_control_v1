@@ -13,9 +13,8 @@ from zlc_data import (
     GridTopology,
     PointColumn,
     PointTable,
-    grid_topology_to_tree,
-    point_table_to_tree,
 )
+from zlc_data.codec import grid_topology_to_tree, point_table_to_tree
 from zlc_neutral_atom.authoring import AuthoringChoice, AuthoringField, AuthoringSchema, MINIMUM_POSITIVE_FLOAT
 from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration

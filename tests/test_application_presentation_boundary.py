@@ -19,15 +19,17 @@ from zlc_data import (
     DatasetRevision,
     DatasetSchema,
     OwnedSnapshot,
-    PointLayout,
+    PointColumn,
+    PointTable,
     StreamGenerationId,
     ValueSchema,
 )
-from zlc_frontend import (
+from zlc_frontend.figure import ViewIntent
+from zlc_frontend.frozen_figure import (
     FrozenFigureSource,
-    ViewIntent,
     build_frozen_data_figure,
     build_frozen_figure_document,
+    resolve_frozen_figure_intent,
 )
 from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 
@@ -48,10 +50,22 @@ def _axis(name: str, role, size: int) -> AxisSpec:
 
 
 def _source() -> FrozenFigureSource:
+    scan = _axis("scan", SCAN_POINT, 3)
     schema = DatasetSchema(
         _axis("repeat", REPEAT, 1),
-        (_axis("scan", SCAN_POINT, 3),),
-        PointLayout.rect_c((3,)),
+        PointTable(
+            3,
+            (
+                PointColumn(
+                    scan.axis_id,
+                    scan.name,
+                    scan.role,
+                    PointColumn.NUMERIC,
+                    scan.coordinates,
+                ),
+            ),
+        ),
+        None,
         ValueSchema.scalar(np.dtype("<f8"), "count"),
     )
     block = DataBlock(
@@ -70,8 +84,9 @@ def _source() -> FrozenFigureSource:
 
 def test_frontend_builds_the_frozen_document_and_data_figure() -> None:
     source = _source()
-    document = build_frozen_figure_document(source)
-    figure = build_frozen_data_figure(source)
+    intent = resolve_frozen_figure_intent(source)
+    document = build_frozen_figure_document(source, intent)
+    figure = build_frozen_data_figure(source, intent)
 
     assert document.layers[0].view.intent is ViewIntent.CURVE
     assert figure.document.layers[0].view.intent is ViewIntent.CURVE
@@ -143,7 +158,8 @@ def test_application_boundary_does_not_construct_domain_or_view_owners() -> None
         "DefaultOutputView",
         "LogicNodeDeclaration",
         "OutputPresentation",
-        "PointLayout",
+        "PointTable",
+        "GridTopology",
         "ValueSchema",
         # Frontend document/view/render owners.
         "ConsoleNodeSpec",

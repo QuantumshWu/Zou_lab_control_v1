@@ -22,7 +22,7 @@ def open_calibration_report_workbench(
 ) -> CalibrationReportWindow:
     """Load and display one FINAL calibration report on the shared raster lane."""
 
-    from zlc_workbench.window_runtime import open_workbench_window
+    from zlc_frontend.qt_widgets import launch_qt_window
     from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
         CalibrationArtifactRef,
     )
@@ -33,7 +33,7 @@ def open_calibration_report_workbench(
         raise TypeError("computation_loader must be callable")
     if not isinstance(reference, CalibrationArtifactRef):
         raise TypeError("reference must be CalibrationArtifactRef")
-    return open_workbench_window(
+    return launch_qt_window(
         lambda: CalibrationReportWindow(
             computation_loader,
             reference,
@@ -50,13 +50,13 @@ def open_calibration_workbench(
 ) -> CalibrationWorkbenchWindow:
     """Open formal creation/editing from one request or exact artifact ref."""
 
-    from zlc_workbench.window_runtime import open_workbench_window
+    from zlc_frontend.qt_widgets import launch_qt_window
 
     from .workbench_window import CalibrationWorkbenchWindow
 
     if (request is None) == (reference is None):
         raise ValueError("provide exactly one calibration request or reference")
-    return open_workbench_window(
+    return launch_qt_window(
         lambda: CalibrationWorkbenchWindow(
             computation_loader,
             run_starter,

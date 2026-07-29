@@ -160,7 +160,11 @@ class LogicNodeParameterPanel(QtWidgets.QWidget):
                 runtime=self._runtime(),
             )
         else:
-            form = editor_factory(runtime=self._runtime(), parent=self)
+            form = editor_factory(
+                runtime=self._runtime(),
+                input_fields=spec.input_fields,
+                parent=self,
+            )
             if not isinstance(form, QtWidgets.QWidget):
                 raise TypeError("console editor_factory must return QWidget")
             for name in ("changed", "read_all", "refresh"):

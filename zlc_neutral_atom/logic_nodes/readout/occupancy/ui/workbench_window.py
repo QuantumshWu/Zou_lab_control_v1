@@ -18,9 +18,11 @@ from zlc_frontend.qt_widgets import (
     FluentButton, FluentFormGrid, FluentLabel, FluentPopup, FluentSpinBox,
     FluentSwitch,
     FluentRevisionedFormEditor, FluentTabWidget, GREY,
+    RASTER_WORK_EXECUTOR,
     RasterPixelRatioObserver, RectangleGesture, SinglePanelHost,
+    SerialWorkerWindow,
     FluentSettingsPopupAnchor, runtime_range_placeholders, signals_blocked,
-    sync_revisioned_form_editors,
+    error_summary, sync_revisioned_form_editors,
 )
 from zlc_frontend.render import SiteMapPanelPayload
 from zlc_frontend.site_map_render import SiteMapComposer
@@ -29,12 +31,6 @@ from zlc_frontend.selector import (
 )
 from zlc_neutral_atom.logic_nodes.readout.occupancy.reference import OccupancyArtifactRef
 from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
-
-from zlc_workbench.window_runtime import (
-    RASTER_WORK_EXECUTOR,
-    SerialWorkerWindow,
-    error_summary,
-)
 
 from .workbench_jobs import _BOARD_ID, _PANEL_ID, _cell_job, _load_navigation
 
@@ -80,6 +76,7 @@ class OccupancyCellWindow(SerialWorkerWindow):
         self._cell_loader = cell_loader
         self._reference, self._initial_address = reference, address
         self._navigation = self._navigator = None
+        self._cell_selection_switch = None
         self._repeat_control = self._point_control = None
         self._previous_cell = self._load_cell_button = self._next_cell = None
         self._display = ImageDisplayState()
@@ -266,6 +263,10 @@ class OccupancyCellWindow(SerialWorkerWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         form = FluentFormGrid(navigator)
         form.setObjectName("occupancyCellAxisForm")
+        self._cell_selection_switch = FluentSwitch("Use exact cell", form)
+        self._cell_selection_switch.setObjectName("occupancyCellSelection")
+        self._cell_selection_switch.setChecked(navigation.linear_cell_count == 1)
+        self._cell_selection_switch.toggled.connect(self._refresh_candidate)
         self._repeat_control = FluentSpinBox(form)
         self._point_control = FluentSpinBox(form)
         for control, count, name in (
@@ -273,14 +274,10 @@ class OccupancyCellWindow(SerialWorkerWindow):
             (self._point_control, navigation.point_count, "occupancyCellPointRow"),
         ):
             control.setObjectName(name)
-            if count == 1:
-                control.setRange(0, 0)
-                control.setValue(0)
-            else:
-                control.setRange(-1, count - 1)
-                control.setSpecialValueText("Select…")
-                control.setValue(-1)
+            control.setRange(0, count - 1)
+            control.setValue(0)
             control.valueChanged.connect(self._refresh_candidate)
+        form.add_row("Cell selection", self._cell_selection_switch)
         form.add_row("Repeat index", self._repeat_control)
         form.add_row("Point row", self._point_control)
         outer.addWidget(form)
@@ -305,16 +302,24 @@ class OccupancyCellWindow(SerialWorkerWindow):
         self._refresh_candidate()
 
     def _control_address(self):
-        if self._navigation is None or self._navigator is None:
+        if (
+            self._navigation is None
+            or self._navigator is None
+            or self._cell_selection_switch is None
+            or not self._cell_selection_switch.isChecked()
+        ):
             return None
         indices = (self._repeat_control.value(), self._point_control.value())
-        if any(index < 0 for index in indices):
-            return None
         return DatasetCellAddress(*indices)
 
     def _set_controls(self, address):
         repeat, point_ordinal, _logical = self._navigation.resolve_address(address)
-        with signals_blocked(self._repeat_control, self._point_control):
+        with signals_blocked(
+            self._cell_selection_switch,
+            self._repeat_control,
+            self._point_control,
+        ):
+            self._cell_selection_switch.setChecked(True)
             self._repeat_control.setValue(repeat)
             self._point_control.setValue(point_ordinal)
         self._refresh_navigation_controls()
@@ -330,7 +335,9 @@ class OccupancyCellWindow(SerialWorkerWindow):
             return
         if address is None:
             self._status.setText("NEEDS CELL SELECTION")
-            self._summary.setText("Choose every non-singleton repeat / point index")
+            self._summary.setText(
+                "Enable exact cell selection to choose a repeat / point row"
+            )
         elif address != self._presented_address:
             repeat, point_ordinal, logical = self._navigation.resolve_address(address)
             label = _cell_label(
@@ -355,8 +362,16 @@ class OccupancyCellWindow(SerialWorkerWindow):
         address = self._control_address()
         linear = None if address is None else self._navigation.linear_index(address)
         enabled = not self._closing
-        self._repeat_control.setEnabled(enabled and self._navigation.repeat_count > 1)
-        self._point_control.setEnabled(enabled and self._navigation.point_count > 1)
+        selection_enabled = self._cell_selection_switch.isChecked()
+        self._cell_selection_switch.setEnabled(
+            enabled and self._navigation.linear_cell_count > 1
+        )
+        self._repeat_control.setEnabled(
+            enabled and selection_enabled and self._navigation.repeat_count > 1
+        )
+        self._point_control.setEnabled(
+            enabled and selection_enabled and self._navigation.point_count > 1
+        )
         self._load_cell_button.setEnabled(enabled and address is not None)
         self._previous_cell.setEnabled(enabled and linear is not None and linear > 0)
         self._next_cell.setEnabled(

@@ -28,13 +28,13 @@ from zlc_frontend.qt_widgets import (
     FluentFrame,
     FluentLabel,
     QtOwnerWake,
+    RASTER_WORK_EXECUTOR,
     WINDOW_SCREEN_FRACTION,
     ensure_qt_app,
     screen_fit_window_size,
     set_fluent_scale,
     window_pad,
 )
-from zlc_workbench.window_runtime import RASTER_WORK_EXECUTOR
 
 from .info_projection import project_figure_info
 
@@ -253,56 +253,41 @@ class FigureViewer(QtWidgets.QWidget):
         """Build a hidden candidate; its admitted first front commits the generation."""
 
         from zlc_workbench.data_figure.app import create_data_figure_pane
-        from zlc_frontend.data_figure_presentation import (
-            classify_faceted_data_figure,
-            classify_single_data_figure,
-        )
         from zlc_frontend.figure import ViewIntent
 
         value = archive.archive
-        presentation = value.presentation
+        figure_intent = value.figure_intent
         if not isinstance(info, tuple) or len(info) != 5:
             raise TypeError("Figure info worker returned invalid values")
-        single_intent, _single_reason = classify_single_data_figure(value.figure)
-        grid_intent, grid_panel_count, _grid_reason = classify_faceted_data_figure(
-            value.figure
-        )
-        is_grid = bool(presentation.faceted)
-        if is_grid:
-            if grid_intent is not presentation.intent or grid_panel_count is None:
-                raise ValueError("archive presentation requires another Grid topology")
-        elif single_intent is not presentation.intent:
-            raise ValueError("archive presentation requires another single-panel topology")
+        is_grid = figure_intent.faceted
         local_fit = bool(
             not is_grid
-            and presentation.intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
+            and figure_intent.view_intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
         )
         local_fit_options = (
             {
                 "local_fit": True,
                 "local_fit_archive_path": archive.path,
-                "local_fit_archive_presentation": presentation,
                 "local_fit_archive_metadata": value.metadata,
             }
             if local_fit
             else {}
         )
         display_options = (
-            {"initial_grid_display": presentation.display}
+            {"initial_grid_display": value.display}
             if is_grid
-            else {"initial_display": presentation.display}
+            else {"initial_display": value.display}
         )
         candidate = create_data_figure_pane(
             value.figure,
+            figure_intent,
             initial_fit_result_identity=(
                 value.payload_digest
                 if value.figure.has_fit_overlays
                 else None
             ),
             embedded=True,
-            size_name=presentation.size_name,
-            presentation_title=presentation.title,
-            presentation_value_label=presentation.value_label,
+            size_name=value.size_name,
             **display_options,
             **local_fit_options,
         )

@@ -1,7 +1,8 @@
-"""Fit binding and the sole authoritative dataset-to-solver packing path."""
+"""Fit binding and authoritative dataset-to-solver representations."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 from typing import Callable
 
@@ -10,13 +11,33 @@ import numpy as np
 from .axis import AxisSourceRef, AxisSpec, SCALAR
 from .fit_contract import BoundFit, FitProblem, FitResultBatch, FitSpec
 from .layout import AxisLayout, AxisLayoutMode
-from .schema import DatasetSchema
-from .transform import apply_transform
+from .schema import DatasetSchema, ResolvedPointRows
+from .transform import TransformedData, apply_transform
 from .value import DatasetRevisionRef, OwnedSnapshot
 
 
 _CANONICAL_TRAVERSAL_CHUNK_SIZE = 65_536
 _POINT_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _RegularFitProblem:
+    """Private zero-copy solver view for one- or two-axis regular observations."""
+
+    source_ref: DatasetRevisionRef
+    spec: FitSpec
+    fit_axis_specs: tuple[AxisSpec, ...]
+    batch_axis_specs: tuple[AxisSpec, ...]
+    point_groups: ResolvedPointRows
+    batch_layout: AxisLayout
+    value_unit: str | None
+    cells: tuple[
+        tuple[tuple[np.ndarray, ...], np.ndarray, np.ndarray],
+        ...,
+    ]
+    present_observation_counts: np.ndarray
+    valid_observation_counts: np.ndarray
+    used_observation_counts: np.ndarray
 
 
 def bind_fit(spec: FitSpec, expected_schema: DatasetSchema) -> BoundFit:
@@ -33,6 +54,27 @@ def build_fit_problem(
 ) -> FitProblem:
     """Pack valid observations without flattening or reinterpreting R/P authority."""
 
+    return _build_problem(bound, snapshot, abort_check, prefer_regular=False)
+
+
+def _build_solver_problem(
+    bound: BoundFit,
+    snapshot: OwnedSnapshot,
+    *,
+    abort_check: Callable[[], None] | None = None,
+) -> FitProblem | _RegularFitProblem:
+    """Choose the cheapest faithful internal representation for the solver."""
+
+    return _build_problem(bound, snapshot, abort_check, prefer_regular=True)
+
+
+def _build_problem(
+    bound: BoundFit,
+    snapshot: OwnedSnapshot,
+    abort_check: Callable[[], None] | None,
+    *,
+    prefer_regular: bool,
+) -> FitProblem | _RegularFitProblem:
     if type(bound) is not BoundFit:
         raise TypeError("bound must be BoundFit")
     if not isinstance(snapshot, OwnedSnapshot):
@@ -50,9 +92,13 @@ def build_fit_problem(
     schema = transformed.schema
     if schema != bound.effective_schema:
         raise RuntimeError("fit binding and transform execution schemas disagree")
+    _check_abort(abort_check)
+    if prefer_regular:
+        regular = _try_regular_problem(bound, snapshot, transformed, abort_check)
+        if regular is not None:
+            return regular
     values = transformed.values
     validity = transformed.expanded_validity()
-    _check_abort(abort_check)
 
     entries, batch_layout = _batch_plan(bound)
     observations_parts: list[np.ndarray] = []
@@ -147,6 +193,153 @@ def build_fit_problem(
         used_observation_counts=np.asarray(used_counts, dtype=np.dtype("<i8")),
     )
 
+
+def _try_regular_problem(
+    bound: BoundFit,
+    snapshot: OwnedSnapshot,
+    transformed: TransformedData,
+    abort_check: Callable[[], None] | None,
+) -> _RegularFitProblem | None:
+    """Retain regular source storage instead of expanding Cartesian coordinates.
+
+    This path is deliberately structural, not heuristic: every surviving
+    dimension maps one-to-one to a declared independent source, coordinates are
+    finite axis vectors, validity stays aligned as a compact/broadcast view, and
+    observations remain a view of the immutable source.  Anything else uses the
+    general packed representation above.
+    """
+
+    source_values = snapshot.block.values
+    values = transformed.values
+    if (
+        len(bound.spec.independent_sources) not in (1, 2)
+        or values.dtype != source_values.dtype
+        or not np.shares_memory(values, source_values)
+    ):
+        return None
+
+    source_tokens = tuple(
+        source if source.kind == AxisSourceRef.TENSOR else _POINT_TOKEN
+        for source in bound.spec.independent_sources
+    )
+    if len(set(source_tokens)) != len(source_tokens):
+        return None
+
+    validity = transformed.expanded_validity()
+    entries, batch_layout = _batch_plan(bound)
+    cells: list[tuple[tuple[np.ndarray, ...], np.ndarray, np.ndarray]] = []
+    present_counts: list[int] = []
+    valid_counts: list[int] = []
+    used_counts: list[int] = []
+    point_groups = bound._effective_point_groups
+    tensor_batch_sources = tuple(
+        source
+        for source in bound.spec.batch_sources
+        if source.kind == AxisSourceRef.TENSOR
+    )
+
+    for point_group_index, tensor_batch_indices in entries:
+        _check_abort(abort_check)
+        row_ids = np.asarray(
+            point_groups.group_member_ordinals[point_group_index],
+            dtype=np.int64,
+        )
+        if (
+            not row_ids.size
+            or int(row_ids[-1]) - int(row_ids[0]) + 1 != row_ids.size
+        ):
+            # Eligibility probing must never copy a large observation merely to
+            # discover that the result cannot remain a source-backed view.
+            return None
+        batch_by_source = dict(zip(tensor_batch_sources, tensor_batch_indices))
+        observation_view, validity_view, view_tokens = _observation_view(
+            bound,
+            values,
+            validity,
+            row_ids,
+            batch_by_source,
+        )
+        if not np.shares_memory(observation_view, source_values):
+            return None
+        dimension_order = _canonical_dimension_order(bound, view_tokens)
+        canonical_tokens = tuple(view_tokens[index] for index in dimension_order)
+        observation_view = np.transpose(observation_view, dimension_order)
+        validity_view = np.transpose(validity_view, dimension_order)
+        selectors: list[int | slice] = []
+        for token, size in zip(canonical_tokens, observation_view.shape):
+            if token in source_tokens:
+                selectors.append(slice(None))
+            elif size == 1:
+                selectors.append(0)
+            else:
+                return None
+        selection = tuple(selectors)
+        observation_view = observation_view[selection]
+        validity_view = validity_view[selection]
+        expected_shape = tuple(axis.size for axis in bound.fit_axis_specs)
+        if observation_view.shape != expected_shape:
+            return None
+
+        coordinates = tuple(
+            _axis_coordinates(axis, np.arange(axis.size, dtype=np.int64))
+            if source.kind == AxisSourceRef.TENSOR
+            else _independent_coordinates(
+                bound,
+                source,
+                row_ids,
+                (_POINT_TOKEN,),
+                (np.arange(row_ids.size, dtype=np.int64),),
+            )
+            for source, axis in zip(bound.spec.independent_sources, bound.fit_axis_specs)
+        )
+        _check_abort(abort_check)
+        if any(
+            coordinate.shape != (expected_shape[index],)
+            or not np.all(np.isfinite(coordinate))
+            for index, coordinate in enumerate(coordinates)
+        ):
+            return None
+        for coordinate in coordinates:
+            coordinate.setflags(write=False)
+
+        present = int(observation_view.size)
+        count = 0
+        validity_chunks = np.nditer(
+            validity_view,
+            flags=("buffered", "external_loop", "zerosize_ok"),
+            op_flags=("readonly",),
+            order="C",
+            buffersize=_CANONICAL_TRAVERSAL_CHUNK_SIZE,
+        )
+        for validity_chunk in validity_chunks:
+            _check_abort(abort_check)
+            count += int(np.count_nonzero(validity_chunk))
+        _check_abort(abort_check)
+        cells.append((coordinates, observation_view, validity_view))
+        present_counts.append(present)
+        valid_counts.append(count)
+        used_counts.append(count)
+
+    count_arrays = (
+        np.asarray(present_counts, dtype=np.dtype("<i8")),
+        np.asarray(valid_counts, dtype=np.dtype("<i8")),
+        np.asarray(used_counts, dtype=np.dtype("<i8")),
+    )
+    for counts in count_arrays:
+        counts.setflags(write=False)
+    return _RegularFitProblem(
+        source_ref=snapshot.ref,
+        spec=bound.spec,
+        fit_axis_specs=bound.fit_axis_specs,
+        batch_axis_specs=bound.batch_axis_specs,
+        point_groups=bound.point_groups,
+        batch_layout=batch_layout,
+        value_unit=transformed.schema.cell_schema.value_unit,
+        cells=tuple(cells),
+        present_observation_counts=count_arrays[0],
+        valid_observation_counts=count_arrays[1],
+        used_observation_counts=count_arrays[2],
+    )
 
 def validate_fit_result_source_binding(
     result: FitResultBatch,
@@ -307,10 +500,7 @@ def _observation_view(
 
 
 def _take_rows(array: np.ndarray, row_ids: np.ndarray) -> np.ndarray:
-    if row_ids.size and np.array_equal(
-        row_ids,
-        np.arange(int(row_ids[0]), int(row_ids[0]) + row_ids.size, dtype=np.int64),
-    ):
+    if row_ids.size and int(row_ids[-1]) - int(row_ids[0]) + 1 == row_ids.size:
         return array[:, int(row_ids[0]) : int(row_ids[-1]) + 1, ...]
     return np.take(array, row_ids, axis=1)
 

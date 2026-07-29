@@ -3,34 +3,42 @@
 from __future__ import annotations
 
 from pathlib import Path
-import time
 
 import numpy as np
 from PyQt5 import QtCore, QtTest, QtWidgets
 
 from gui_user_flow import (
+    choose_combo_text,
     configure_offscreen_fast_path,
+    current_logic_editor,
+    replace_path_value,
+    replace_spin_value,
     require_offscreen_platform,
     until,
+    visible_form_widgets,
     widget_gone,
 )
-from test_task_console_camera_user_flow import (
-    _choose_combo_text,
-    _replace_path_value,
-    _replace_spin_value,
-    _visible_form_widgets,
-)
+from zlc_frontend import PlotKind
 from zlc_frontend.qt_widgets import FigureSurfaceHost, ensure_qt_app
 from zlc_workbench.task_console.console_records import console_signal_key
 
 
-def _faceted_overview(console, signal_key: str):
+def _faceted_card(console, signal_key: str):
     for card in console.cards:
-        if card.config.signal != signal_key or card.config.kind != "grid":
+        if card.config.signal != signal_key or card.config.kind != PlotKind.GRID:
             continue
         if isinstance(card.board, FigureSurfaceHost) and card.board.faceted:
-            return card.board.overview_artifact
+            return card
     return None
+
+
+def _presented_value(card):
+    if card is None:
+        return None
+    try:
+        return card.frozen_render_value()
+    except RuntimeError:
+        return None
 
 
 def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> None:
@@ -71,17 +79,17 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
             if button.text() == "Add Panel"
         )
 
-        _choose_combo_text(
+        choose_combo_text(
             console.kind_combo,
             "Task: Optimize MOT field",
             application,
         )
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
         row = console.logic_nodes[-1]
-        editor = console._logic_editors[id(row)]
-        widgets = _visible_form_widgets(editor)
-        _replace_spin_value(widgets["points"], "2")
-        _replace_path_value(widgets["folder"], str(tmp_path / "mot-report"))
+        editor = current_logic_editor(console, application)
+        widgets = visible_form_widgets(editor)
+        replace_spin_value(widgets["points"], "2")
+        replace_path_value(widgets["folder"], str(tmp_path / "mot-report"))
 
         QtTest.QTest.mouseClick(
             editor.form.start_button,
@@ -89,52 +97,55 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
         )
         live_key = console_signal_key(row.node.node_id, "grid")
         final_key = console_signal_key(row.node.node_id, "mot_field")
-        saw_running = False
-        live_value = None
-        live_overview = None
-        deadline = time.monotonic() + 20.0
-        while time.monotonic() < deadline:
-            application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-            saw_running = saw_running or (
-                row.status_label.text() == "running"
-                and editor.form.status.text() == "running"
-            )
-            live_value = console._data.freeze().value(live_key) or live_value
-            live_overview = _faceted_overview(console, live_key) or live_overview
-            if not console._task_locked:
-                break
-            time.sleep(0.005)
-
-        assert saw_running
-        assert live_value is not None
-        assert live_overview is not None
-        assert len(live_overview.regions) == 2
+        until(
+            application,
+            lambda: (
+                (card := _faceted_card(console, live_key)) is not None
+                and _presented_value(card) is not None
+                and card.board.showing_overview
+                and card.board.overview_artifact is not None
+            ),
+            timeout=20.0,
+        )
+        live_card = _faceted_card(console, live_key)
+        live_value = live_card.frozen_render_value()
+        live_overview = live_card.board.overview_artifact
         live_schema = live_value.schema
-        assert live_schema.point_layout.logical_shape == (2, 2, 2)
+        assert len(live_overview.regions) == live_schema.point_table.row_count
+        assert live_schema.grid_topology is not None
+        assert live_schema.grid_topology.logical_shape == (2, 2, 2)
         assert tuple(
-            (axis.axis_id.value, axis.role.value)
-            for axis in live_schema.point_axes
+            (column.coordinate_id.value, column.role.value)
+            for column in live_schema.point_table.columns
         ) == (
             ("mot-field.da_x", "scan-point"),
             ("mot-field.da_y", "scan-point"),
             ("mot-field.da_z", "scan-point"),
         )
-        assert not console._task_locked
-
-        final_value = console._data.freeze().value(final_key)
-        assert final_value is not None
         until(
             application,
-            lambda: _faceted_overview(console, final_key) is not None,
-            timeout=15.0,
+            lambda: (
+                row.status_label.text().startswith("done")
+                and editor.form.status.text().startswith("done")
+                and (card := _faceted_card(console, final_key)) is not None
+                and _presented_value(card) is not None
+                and card.board.showing_overview
+                and card.board.overview_artifact is not None
+            ),
+            timeout=20.0,
         )
-        final_overview = _faceted_overview(console, final_key)
-        assert final_overview is not None
-        assert len(final_overview.regions) == 2
+        final_card = _faceted_card(console, final_key)
+        final_value = final_card.frozen_render_value()
+        final_overview = final_card.board.overview_artifact
         final_schema = final_value.schema
-        assert final_schema.point_layout.logical_shape == (2, 2, 2)
+        assert len(final_overview.regions) == final_schema.point_table.row_count
+        assert final_schema.grid_topology is not None
+        assert final_schema.grid_topology.logical_shape == (2, 2, 2)
         assert final_schema.physical_shape == (1, 8, 1)
-        assert tuple(axis.axis_id.value for axis in final_schema.point_axes) == (
+        assert tuple(
+            column.coordinate_id.value
+            for column in final_schema.point_table.columns
+        ) == (
             "mot-field.da_x",
             "mot-field.da_y",
             "mot-field.da_z",

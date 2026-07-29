@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from zlc_frontend.form import project_authoring_form
 from zlc_neutral_atom.input_spec import ArtifactInputSpec
 from zlc_neutral_atom.logic_node_declaration import (
     DynamicChoicePresentation,
@@ -11,8 +12,8 @@ from zlc_neutral_atom.logic_node_declaration import (
     PathPresentationHint,
 )
 from zlc_neutral_atom.processing.signal_plane import SignalPublication
-from zlc_workbench.form_projection import project_authoring_form
 from .input_binding import ResolvedArtifactInput, project_input_fields
+from .capability import ConsoleCapabilityAttachment
 from zlc_workbench.task_console.attachment_builders import (
     processor_attachment,
     run_attachment,
@@ -194,7 +195,27 @@ def project_processor_declaration(
     )
 
 
+def project_custom_declaration(
+    declaration: LogicNodeDeclaration,
+    *,
+    form: object,
+    editor_factory: Callable[..., object],
+    create_node: Callable[..., object],
+) -> ConsoleCapabilityAttachment:
+    """Admit one earned structured editor without exposing Workbench types."""
+
+    if not callable(editor_factory) or not callable(create_node):
+        raise TypeError("custom editor_factory and create_node must be callable")
+    spec = project_declaration_spec(
+        declaration,
+        form=form,
+        editor_factory=editor_factory,
+    )
+    return ConsoleCapabilityAttachment(spec, create_node)
+
+
 __all__ = [
+    "project_custom_declaration",
     "project_declaration_spec",
     "project_processor_declaration",
     "project_run_declaration",

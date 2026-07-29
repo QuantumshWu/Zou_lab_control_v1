@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from zlc_data import AxisId, value_schema_from_tree, value_schema_to_tree
+from zlc_data import AxisId
+from zlc_data.codec import value_schema_from_tree, value_schema_to_tree
 from zlc_storage import exact_mapping as _exact_map
 
 from zlc_neutral_atom.devices.camera.contract import (

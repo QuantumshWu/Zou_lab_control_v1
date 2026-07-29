@@ -16,6 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_frontend.qt_widgets import ensure_qt_app
+from zlc_frontend.form import project_authoring_form
 import pytest
 
 import Zou_lab_control.api as zlc
@@ -25,7 +26,6 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
-from zlc_workbench.form_projection import project_authoring_form
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,7 +78,7 @@ def test_calibration_owner_presenter_and_public_imports_remain_headless() -> Non
                 "import zlc_neutral_atom.logic_nodes.readout.calibration.calibration\n"
                 "import zlc_neutral_atom.logic_nodes.readout.calibration.declaration\n"
                 "import zlc_neutral_atom.logic_nodes.readout.calibration.workbench_adapter\n"
-                "import zlc_workbench.form_projection\n"
+                "import zlc_frontend.form\n"
                 "for prefix in ('PyQt5', 'matplotlib', 'scipy'):\n"
                 "    assert not any(\n"
                 "        name == prefix or name.startswith(prefix + '.')\n"

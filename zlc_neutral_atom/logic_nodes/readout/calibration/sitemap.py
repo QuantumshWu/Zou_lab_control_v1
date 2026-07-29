@@ -14,7 +14,8 @@ import math
 
 import numpy as np
 
-from zlc_data import AxisId, CoordinateFrameId, immutable_array
+from zlc_data import AxisId, CoordinateFrameId
+from zlc_data._arrays import immutable_array
 from zlc_neutral_atom.capture.application import (
     CAPTURE_READOUT_EVENT_AXIS_ID,
     CaptureRequest,

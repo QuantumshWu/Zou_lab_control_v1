@@ -23,9 +23,8 @@ from zlc_data import (
     FitBatchStatus,
     SITE,
     StreamGenerationId,
-    axis_to_tree,
-    dataset_revision_ref_to_tree,
 )
+from zlc_data.codec import axis_to_tree, dataset_revision_ref_to_tree
 from zlc_storage import (
     canonical_digest,
     canonical_text as _text,
@@ -389,10 +388,9 @@ class CurveFitOverlay:
 
     The DTO deliberately carries no model, solver, repository, or mutable fit
     result.  ``source_sample_span`` names the contiguous authority ROI inside
-    the unchanged cached curve; ``predicted_y`` exists only for a converged
-    stored row and only over that span.  Failed and sparse ``NOT_PRESENT`` rows
-    own the canonical empty array, which makes a newer failed result clear any
-    previously painted successful prediction.
+    the unchanged cached curve.  ``coordinates`` may carry a worker-bounded
+    paint sampling of that span; otherwise ``predicted_y`` covers the full
+    span.  Failed and sparse rows own an empty prediction and no coordinates.
     """
 
     source_ref: DatasetRevisionRef
@@ -403,6 +401,7 @@ class CurveFitOverlay:
     status: FitBatchStatus | None
     diagnostic: str
     predicted_y: np.ndarray
+    coordinates: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_ref, DatasetRevisionRef):
@@ -449,14 +448,42 @@ class CurveFitOverlay:
         owned = np.frombuffer(predicted.tobytes(order="C"), dtype=np.dtype("<f8"))
         owned.setflags(write=False)
         object.__setattr__(self, "predicted_y", owned)
-        if status is FitBatchStatus.CONVERGED:
-            if owned.size != stop - start or not bool(np.all(np.isfinite(owned))):
-                raise ValueError(
-                    "converged curve fit prediction must align with its span and be finite"
+        coordinates = self.coordinates
+        owned_coordinates = None
+        if coordinates is not None:
+            coordinates = np.asarray(coordinates)
+            if coordinates.dtype != np.dtype("<f8") or coordinates.ndim != 1:
+                raise TypeError(
+                    "curve fit coordinates must be a one-dimensional float64 array"
                 )
-        elif owned.size:
+            owned_coordinates = np.frombuffer(
+                coordinates.tobytes(order="C"),
+                dtype=np.dtype("<f8"),
+            )
+            owned_coordinates.setflags(write=False)
+            object.__setattr__(self, "coordinates", owned_coordinates)
+        if status is FitBatchStatus.CONVERGED:
+            expected_size = (
+                stop - start
+                if owned_coordinates is None
+                else owned_coordinates.size
+            )
+            if (
+                expected_size == 0
+                or expected_size > stop - start
+                or owned.size != expected_size
+                or not bool(np.all(np.isfinite(owned)))
+                or (
+                    owned_coordinates is not None
+                    and not bool(np.all(np.isfinite(owned_coordinates)))
+                )
+            ):
+                raise ValueError(
+                    "converged curve fit primitive must align with its span and be finite"
+                )
+        elif owned.size or owned_coordinates is not None:
             raise ValueError(
-                "failed or absent curve fit cells cannot retain a prediction"
+                "failed or absent curve fit cells cannot retain a prediction primitive"
             )
 
 
@@ -747,7 +774,15 @@ def _validated_curve_fit_overlays(
         if stop > curve.values.size:
             raise ValueError("curve fit source span exceeds source samples")
         if overlay.status is FitBatchStatus.CONVERGED:
-            if overlay.predicted_y.shape != (stop - start,):
+            expected_shape = (
+                (stop - start,)
+                if overlay.coordinates is None
+                else overlay.coordinates.shape
+            )
+            if (
+                overlay.predicted_y.shape != expected_shape
+                or expected_shape[0] > stop - start
+            ):
                 raise ValueError("curve fit prediction does not align with source span")
         elif overlay.predicted_y.size:
             # The DTO already closes this invariant; keep it explicit at the

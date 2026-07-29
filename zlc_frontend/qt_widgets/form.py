@@ -367,7 +367,7 @@ class _FloatHandler(_StaticHandler):
     def _spin_range(field: FormFieldProps) -> tuple[float, float] | None:
         # QDoubleSpinBox owns one real number only.  Optional numbers remain a
         # typed blank-or-number edit instead of smuggling None through an
-        # out-of-domain floating-point value and specialValueText.
+        # out-of-domain floating-point value and a textual numeric sentinel.
         if field.blank_allowed:
             return None
         minimum = (
@@ -792,12 +792,20 @@ class FluentParameterForm(QtWidgets.QWidget):
         parent=None,
         *,
         runtime: FormRuntimeContext | None = None,
+        label_width: int | None = None,
     ) -> None:
         if not isinstance(spec, FormSpec):
             raise TypeError("spec must be FormSpec")
+        if label_width is not None and (
+            isinstance(label_width, bool)
+            or not isinstance(label_width, int)
+            or label_width <= 0
+        ):
+            raise ValueError("label_width must be a positive integer or None")
         super().__init__(parent)
         self._spec = spec
         self._runtime = runtime or FormRuntimeContext()
+        self._label_width = label_width
         self._fields = {field.key: field for field in spec.fields}
         self._widgets: dict[str, QtWidgets.QWidget] = {}
         self._handlers: dict[str, FormWidgetHandler] = {}
@@ -806,7 +814,9 @@ class FluentParameterForm(QtWidgets.QWidget):
         self._layout = QtWidgets.QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(scaled_px(6, minimum=4))
-        label_width = setting_label_width(field.row_label for field in spec.fields)
+        label_width = self._label_width or setting_label_width(
+            field.row_label for field in spec.fields
+        )
         for field in spec.fields:
             handler = FORM_WIDGET_HANDLERS[field.kind]
             widget = handler.build(
@@ -945,7 +955,9 @@ class FluentParameterForm(QtWidgets.QWidget):
 
         old_fields = self._fields
         replacements: dict[str, tuple[QtWidgets.QWidget, QtWidgets.QWidget]] = {}
-        label_width = setting_label_width(field.row_label for field in spec.fields)
+        label_width = self._label_width or setting_label_width(
+            field.row_label for field in spec.fields
+        )
         for field in spec.fields:
             old_field = old_fields.get(field.key)
             if (

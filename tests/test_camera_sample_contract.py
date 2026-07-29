@@ -7,24 +7,19 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from zlc_data import (
+from zlc_data.axis import (
     AxisId,
     AxisSpec,
     CoordinateFrameId,
-    DatasetSchema,
-    PointLayout,
     READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
     SPATIAL_X,
     SPATIAL_Y,
-    VALID,
-    ValidityContract,
-    Value,
-    ValuePayloadContract,
-    ValueSchema,
-    is_intrinsically_immutable_array,
 )
+from zlc_data.schema import DatasetSchema, PointColumn, PointTable, ValueSchema
+from zlc_data.validity import VALID, ValidityContract
+from zlc_data.value import Value
 from zlc_neutral_atom.devices.camera.contract import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
     CameraAcquisitionMode,
@@ -65,7 +60,6 @@ from zlc_neutral_atom.runtime.resources import (
 from zlc_neutral_atom.runtime.streams import StreamId
 from zlc_neutral_atom.capture.binding import (
     CameraCaptureBindingRequest,
-    _source_group_sizes,
     bind_camera_capture,
 )
 from zlc_neutral_atom.capture.pipeline import BoundCameraCapture
@@ -103,74 +97,25 @@ def _schemas() -> tuple[ValueSchema, DatasetSchema]:
         np.dtype("<u2"),
         "count",
     )
+    point = _axis("point", SCAN_POINT, 2)
     dataset_schema = DatasetSchema(
         _axis("repeat", REPEAT, 2),
-        (_axis("point", SCAN_POINT, 2),),
-        PointLayout.rect_c((2,)),
+        PointTable(
+            point.size,
+            (
+                PointColumn(
+                    point.axis_id,
+                    point.name,
+                    point.role,
+                    PointColumn.NUMERIC,
+                    point.coordinates,
+                ),
+            ),
+        ),
+        None,
         value_schema,
     )
     return value_schema, dataset_schema
-
-
-def test_camera_source_groups_come_only_from_the_frozen_cell_schedule() -> None:
-    value_schema, _ = _schemas()
-    repeat = _axis("repeat.grouping", REPEAT, 2)
-    scan = _axis("scan.grouping", SCAN_POINT, 3)
-
-    scalar_layout = PointLayout.rect_c((scan.size,))
-    scalar_schema = DatasetSchema(repeat, (scan,), scalar_layout, value_schema)
-    scalar_cells = tuple(
-        DatasetCellAddress(r, p)
-        for r in range(repeat.size)
-        for p in range(scan.size)
-    )
-    scalar_request = CameraCaptureBindingRequest(
-        "camera",
-        scalar_schema,
-        DatasetCellSchedule.from_cells(scalar_schema, scalar_cells),
-        CameraAcquisitionMode.EXTERNAL_TRIGGERED,
-    )
-    assert _source_group_sizes(scalar_request) == (1,) * 6
-
-    event = _axis("event.grouping", READOUT_EVENT, 2)
-    layout = PointLayout.rect_c((scan.size, event.size))
-    schema = DatasetSchema(repeat, (scan, event), layout, value_schema)
-
-    def address(r: int, p: int, e: int) -> DatasetCellAddress:
-        return DatasetCellAddress(r, layout.storage_index((p, e)))
-
-    cells = tuple(
-        address(r, p, e)
-        for r in range(repeat.size)
-        for p in range(scan.size)
-        for e in range(event.size)
-    )
-    request = CameraCaptureBindingRequest(
-        "camera",
-        schema,
-        DatasetCellSchedule.from_cells(schema, cells),
-        CameraAcquisitionMode.EXTERNAL_TRIGGERED,
-    )
-    assert _source_group_sizes(request) == (2,) * 6
-
-    split = (
-        address(0, 0, 0),
-        address(0, 1, 0),
-        address(0, 0, 1),
-        address(0, 1, 1),
-        *(address(r, p, e) for r, p, e in (
-            (0, 2, 0), (0, 2, 1),
-            (1, 0, 0), (1, 0, 1),
-            (1, 1, 0), (1, 1, 1),
-            (1, 2, 0), (1, 2, 1),
-        )),
-    )
-    split_request = replace(
-        request,
-        cell_schedule=DatasetCellSchedule.from_cells(schema, split),
-    )
-    with pytest.raises(ValueError, match="incomplete READOUT_EVENT group"):
-        _source_group_sizes(split_request)
 
 
 def _metadata(**changes) -> CameraFrameMetadata:
@@ -255,7 +200,7 @@ def test_camera_record_snapshots_mutable_driver_pixels_once_then_value_reuses():
         driver_buffer_index=0,
     )
     assert not np.shares_memory(record.image, mutable)
-    assert is_intrinsically_immutable_array(record.image)
+    assert not record.image.flags.writeable
 
     value = Value(record.image, VALID, value_schema)
     assert np.shares_memory(value.values, record.image)
@@ -423,11 +368,21 @@ def test_camera_capture_owner_proof_belongs_to_the_bound_camera_contract():
         port = runtime.camera_port(camera_ref)
         repeat = _axis("binding.repeat", REPEAT, 1)
         event = _axis("binding.event", READOUT_EVENT, 1)
-        layout = PointLayout.rect_c((1,))
         schema = DatasetSchema(
             repeat,
-            (event,),
-            layout,
+            PointTable(
+                1,
+                (
+                    PointColumn(
+                        event.axis_id,
+                        event.name,
+                        event.role,
+                        PointColumn.NUMERIC,
+                        event.coordinates,
+                    ),
+                ),
+            ),
+            None,
             port.capability.payload_contract.value_schema,
         )
         schedule = DatasetCellSchedule.from_cells(
@@ -445,7 +400,6 @@ def test_camera_capture_owner_proof_belongs_to_the_bound_camera_contract():
             ),
         )
 
-        assert not hasattr(camera_capture, "definition")
         assert camera_capture.capture_spec.owner_fingerprint == (
             camera_capture.capture_contract.capture_spec_owner_fingerprint
         )

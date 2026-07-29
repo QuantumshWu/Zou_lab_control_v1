@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Any, Iterator, Mapping
 
 import matplotlib
-from matplotlib import font_manager as fm
+from matplotlib import font_manager as _font_manager
 
 from .image_display import ImageColormap
 from .plot_layout import (
@@ -40,16 +40,14 @@ from .site_map import (
 from .typography import FONT_FAMILY, FONT_PATH, SANS_SERIF
 
 NEW_BLACK = "black"
-
-_FONT_NAME = None
-if FONT_PATH.exists():
-    try:
-        fm.fontManager.addfont(str(FONT_PATH))
-        _FONT_NAME = fm.FontProperties(fname=str(FONT_PATH)).get_name()
-    except Exception:
-        _FONT_NAME = None
-if _FONT_NAME != FONT_FAMILY:
-    _FONT_NAME = None
+if not FONT_PATH.is_file():
+    raise RuntimeError("the canonical Helvetica Light plot font is missing")
+_font_manager.fontManager.addfont(str(FONT_PATH))
+_MATPLOTLIB_FONT_FAMILY = _font_manager.FontProperties(
+    fname=str(FONT_PATH)
+).get_name()
+if _MATPLOTLIB_FONT_FAMILY != FONT_FAMILY:
+    raise RuntimeError("the canonical plot font asset is not Helvetica Light")
 
 # Stock figure size in inches = (data + L + R, data + B + T) / dpi.  Derived, so
 # it can never disagree with FigureSpec's defaults (which read the same tokens).
@@ -371,7 +369,6 @@ __all__ = [
     "FIT_RADIAL_COLOR",
     "FIT_RADIAL_RING_ALPHA",
     "FIT_RADIAL_RING_LINEWIDTH",
-    "FONT_PATH",
     "NEW_BLACK",
     "PALETTE",
     "colormap_argb_at",
@@ -390,7 +387,6 @@ __all__ = [
     "PULSE_SCAN_ANNOTATION_COLOR",
     "PULSE_SCAN_ANNOTATION_FONT_SIZE",
     "PULSE_SCAN_REGION_COLOR",
-    "SANS_SERIF",
     "SERIES_COLORS",
     "SITE_OCCUPANCY_STYLE",
     "STOCK_DATA_PX",

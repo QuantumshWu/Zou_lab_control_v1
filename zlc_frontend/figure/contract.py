@@ -21,20 +21,32 @@ from zlc_data import (
     AxisRoleId,
     AxisSourceRef,
     AxisSpec,
+    CoordinateRangeSelection,
+    DataTransformSpec,
     DatasetSchema,
     FitResultBatch,
+    HISTOGRAM_BIN_AXIS_ID,
+    HistogramSpec,
+    IndexRangeSelection,
+    IndexSelection,
+    MissingPolicy,
     PointColumn,
+    ReductionMethod,
+    ReductionSpec,
     ResolvedPointRows,
     Selection,
-    resolve_point_rows,
-    resolve_selection_indices,
+    ValidityPolicy,
 )
+from zlc_data.schema import resolve_point_rows
+from zlc_data.selection import resolve_selection_indices
 from zlc_data.axis import point_ordinal_axis
+from zlc_data.transform import commit_transform
 from zlc_storage import canonical_text
 
 from .model import (
     DATASET_VIEW_INTENTS,
     AxisAddress,
+    AxisResolution,
     AxisRolePolicy,
     AxisViewRole,
     DisplayReductionMethod,
@@ -66,6 +78,30 @@ IMAGE_CONTRACT = ViewContract(
     ),
     (REPEAT,),
 )
+
+
+def _display_reduction_spec(view: ViewSpec) -> ReductionSpec | None:
+    """Translate the one canonical display reduction into data semantics."""
+
+    reduced = tuple(
+        binding
+        for binding in view.source_bindings
+        if binding.role is AxisViewRole.REDUCED
+    )
+    if not reduced:
+        return None
+    methods = {binding.reduction.method for binding in reduced}
+    if len(methods) != 1:
+        raise ValueError("Figure reductions require one common method")
+    method = next(iter(methods))
+    return ReductionSpec(
+        tuple(binding.source for binding in reduced),
+        ReductionMethod.MEAN
+        if method is DisplayReductionMethod.MEAN
+        else ReductionMethod.SUM,
+        missing_policy=MissingPolicy.OMIT_MISSING,
+        validity_policy=ValidityPolicy.OMIT_INVALID,
+    )
 
 
 CURVE_CONTRACT = ViewContract(
@@ -255,37 +291,232 @@ def _tensor_axis(schema: DatasetSchema, source: AxisSourceRef) -> AxisSpec:
     raise KeyError(source)
 
 
-def _fit_display_selection_indices(
+def _fit_transform_from_view(
     schema: DatasetSchema,
-    result: FitResultBatch,
-) -> tuple[tuple[AxisSourceRef, tuple[int, ...]], ...]:
-    """Validate the sole range-preserving Fit selection against source axes.
-
-    A saved Curve/Image Fit is displayed over the unchanged source Figure; the
-    committed selection limits only its overlay.  This private contract owner
-    resolves that authority once so suggestion, immutable Figure validation,
-    and both render projections cannot drift into separate interpretations.
-    Histogram transforms have their own exact sample/bin projection and never
-    pass through this path.
-    """
+    view: ViewSpec,
+    resolutions: tuple[AxisResolution, ...],
+    *,
+    independent_selection: Selection | None = None,
+    histogram_bin_edges: tuple[float, ...] | None = None,
+    display_batch_sources: tuple[AxisSourceRef, ...] = (),
+    authority_point_ordinals: tuple[int, ...] | None = None,
+):
+    """Freeze one visible view as explicit data-owned Fit authority."""
 
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
+    if not isinstance(view, ViewSpec):
+        raise TypeError("view must be ViewSpec")
+    if view.schema_fingerprint != schema.fingerprint:
+        raise ValueError("Figure view belongs to another Dataset schema")
+    resolutions = tuple(resolutions)
+    if any(not isinstance(item, AxisResolution) for item in resolutions):
+        raise TypeError("resolutions must contain AxisResolution values")
+    display_batch_sources = tuple(display_batch_sources)
+    if any(not isinstance(item, AxisSourceRef) for item in display_batch_sources):
+        raise TypeError("display_batch_sources must contain AxisSourceRef values")
+    resolved = {item.source: item for item in resolutions}
+    if len(resolved) != len(resolutions):
+        raise ValueError("Figure evaluation resolved one source more than once")
+
+    selected_terms = []
+    for binding in view.source_bindings:
+        if binding.role is not AxisViewRole.SELECTED:
+            continue
+        if binding.source in display_batch_sources:
+            continue
+        try:
+            resolution = resolved[binding.source]
+        except KeyError as exc:
+            raise ValueError(
+                f"Fit cannot freeze unresolved selector {binding.source}"
+            ) from exc
+        selector = binding.selector
+        if isinstance(selector, FixedIndex) and (
+            resolution.selector != "FIXED_INDEX"
+            or resolution.index != selector.index
+        ):
+            raise ValueError("fixed Figure selector and resolution differ")
+        if (
+            isinstance(selector, LatestNonempty)
+            and resolution.selector != "LATEST_NONEMPTY"
+        ):
+            raise ValueError("latest Figure selector lacks a latest resolution")
+        if binding.source.kind == AxisSourceRef.TENSOR:
+            if binding.source.axis_id is None:
+                raise TypeError("tensor selector lacks an AxisId")
+            selected_terms.append(
+                IndexSelection(binding.source.axis_id, resolution.index)
+            )
+        elif binding.source.kind != AxisSourceRef.GRID_DIMENSION:
+            raise ValueError("Fit view selectors support tensor or Grid sources")
+
+    fit_sources = tuple(
+        binding.source
+        for role in (
+            AxisViewRole.X,
+            AxisViewRole.IMAGE_X,
+            AxisViewRole.IMAGE_Y,
+        )
+        for binding in view.source_bindings
+        if binding.role is role
+    )
+    if independent_selection is not None:
+        if not isinstance(independent_selection, Selection):
+            raise TypeError("independent_selection must be Selection or None")
+        tensor_fit_ids = {
+            source.axis_id
+            for source in fit_sources
+            if source.kind == AxisSourceRef.TENSOR
+        }
+        if any(
+            not isinstance(term, (IndexRangeSelection, CoordinateRangeSelection))
+            or term.axis_id not in tensor_fit_ids
+            for term in independent_selection.terms
+        ):
+            raise ValueError(
+                "Fit range selection may name only tensor independent sources"
+            )
+        selected_terms.extend(independent_selection.terms)
+
+    operations = []
+    if selected_terms:
+        operations.append(Selection(tuple(selected_terms)))
+    reduction = _display_reduction_spec(view)
+    if reduction is not None:
+        operations.append(reduction)
+
+    if view.intent is ViewIntent.HISTOGRAM:
+        if histogram_bin_edges is None:
+            raise ValueError("Histogram Fit requires exact painted bin edges")
+        operations.append(
+            HistogramSpec(
+                tuple(
+                    binding.source
+                    for binding in view.source_bindings
+                    if binding.role is AxisViewRole.SAMPLE
+                ),
+                histogram_bin_edges,
+            )
+        )
+    elif histogram_bin_edges is not None:
+        raise ValueError("only a Histogram Fit accepts bin edges")
+    return commit_transform(
+        schema,
+        DataTransformSpec(tuple(operations)),
+        point_ordinals=(
+            _resolve_selected_point_ordinals(
+                schema,
+                view,
+                ignore_selected_sources=display_batch_sources,
+            )
+            if authority_point_ordinals is None
+            else authority_point_ordinals
+        ),
+    )
+
+
+def _fit_authority_selection(
+    schema: DatasetSchema,
+    view: ViewSpec,
+    resolutions: tuple[AxisResolution, ...],
+    result: FitResultBatch,
+) -> Selection | None:
+    """Validate exact view-derived authority and recover its explicit Fit ROI."""
+
     if not isinstance(result, FitResultBatch):
         raise TypeError("result must be FitResultBatch")
     transform = result.spec.committed_transform
     if transform.source_schema_fingerprint != schema.fingerprint:
         raise ValueError("Fit transform belongs to another source schema")
-    operations = tuple(transform.spec.operations)
-    if not operations:
-        return ()
-    if len(operations) != 1 or not isinstance(operations[0], Selection):
-        raise ValueError(
-            "Curve/Image Fit display supports identity or one range-preserving "
-            "Selection authority"
+    expected_fit_sources = (
+        (AxisSourceRef.tensor(HISTOGRAM_BIN_AXIS_ID),)
+        if view.intent is ViewIntent.HISTOGRAM
+        else tuple(
+            binding.source
+            for role in (
+                AxisViewRole.X,
+                AxisViewRole.IMAGE_X,
+                AxisViewRole.IMAGE_Y,
+            )
+            for binding in view.source_bindings
+            if binding.role is role
         )
+    )
+    if result.spec.independent_sources != expected_fit_sources:
+        raise ValueError("Fit independent axes differ from the Figure view")
 
-    selection = operations[0]
+    display_batches = tuple(
+        source
+        for source in result.spec.batch_sources
+        if view.binding(source).role is AxisViewRole.SELECTED
+    )
+    view_selected_ids = {
+        binding.source.axis_id
+        for binding in view.source_bindings
+        if binding.role is AxisViewRole.SELECTED
+        and binding.source.kind == AxisSourceRef.TENSOR
+        and binding.source not in display_batches
+    }
+    operations = tuple(transform.spec.operations)
+    selection = (
+        operations[0]
+        if operations and isinstance(operations[0], Selection)
+        else None
+    )
+    external_terms = () if selection is None else tuple(
+        term for term in selection.terms if term.axis_id not in view_selected_ids
+    )
+    external = Selection(external_terms) if external_terms else None
+    histogram = (
+        operations[-1]
+        if operations and isinstance(operations[-1], HistogramSpec)
+        else None
+    )
+    visible_rows = _resolve_selected_point_ordinals(
+        schema,
+        view,
+        ignore_selected_sources=display_batches,
+    )
+    point_batches = tuple(
+        source
+        for source in result.spec.batch_sources
+        if source.kind != AxisSourceRef.TENSOR
+    )
+    authority_rows = transform.exact_point_ordinals
+    if point_batches and not set(visible_rows).issubset(authority_rows):
+        raise ValueError("focused Figure rows lie outside the Fit point authority")
+    if point_batches:
+        visible_set = set(visible_rows)
+        for members in result.point_groups.group_member_ordinals:
+            overlap = visible_set.intersection(members)
+            if overlap and overlap != set(members):
+                raise ValueError("focused Figure splits one authoritative Fit group")
+    rebuilt = _fit_transform_from_view(
+        schema,
+        view,
+        resolutions,
+        independent_selection=external,
+        histogram_bin_edges=None if histogram is None else histogram.bin_edges,
+        display_batch_sources=display_batches,
+        authority_point_ordinals=authority_rows if point_batches else None,
+    )
+    if rebuilt != transform:
+        raise ValueError("Fit authority differs from the exact Figure view")
+    return external
+
+
+def _fit_display_selection_indices(
+    schema: DatasetSchema,
+    view: ViewSpec,
+    resolutions: tuple[AxisResolution, ...],
+    result: FitResultBatch,
+) -> tuple[tuple[AxisSourceRef, tuple[int, ...]], ...]:
+    """Resolve the explicit Fit ROI after exact view-authority validation."""
+
+    selection = _fit_authority_selection(schema, view, resolutions, result)
+    if selection is None:
+        return ()
     independent = tuple(result.spec.independent_sources)
     fit_axes = dict(zip(independent, result.fit_axis_specs, strict=True))
     terms = {term.axis_id: term for term in selection.terms}

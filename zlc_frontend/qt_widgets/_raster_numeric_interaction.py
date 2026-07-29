@@ -91,7 +91,7 @@ class _ExpectedNumericViewportAnswer:
                 return False
             return (
                 candidate.x_limits_are_auto == expected.x_limits_are_auto
-                and candidate.count_scale is expected.count_scale
+                and candidate.log_count_axis is expected.log_count_axis
                 and candidate.relim_mode is expected.relim_mode
                 and candidate.bin_count == expected.bin_count
                 and (
@@ -206,7 +206,7 @@ def _numeric_viewport_for_presented_panel(
         and isinstance(pending, HistogramViewportTransform)
         and candidate.display_revision == pending.display_revision
         and (
-            candidate.count_scale is not pending.count_scale
+            candidate.log_count_axis is not pending.log_count_axis
             or candidate.relim_mode is not pending.relim_mode
             or candidate.x_limits_are_auto != pending.x_limits_are_auto
             or candidate.bin_count != pending.bin_count
@@ -231,7 +231,7 @@ def _numeric_viewport_for_presented_panel(
             isinstance(candidate, HistogramViewportTransform)
             and isinstance(current, HistogramViewportTransform)
             and (
-                candidate.count_scale is not current.count_scale
+                candidate.log_count_axis is not current.log_count_axis
                 or candidate.relim_mode is not current.relim_mode
                 or candidate.x_limits_are_auto != current.x_limits_are_auto
                 or candidate.bin_count != current.bin_count

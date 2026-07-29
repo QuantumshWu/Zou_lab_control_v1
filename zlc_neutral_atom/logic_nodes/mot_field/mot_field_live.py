@@ -19,8 +19,8 @@ from zlc_data import (
     DatasetRevisionRef,
     DatasetSchema,
     OwnedSnapshot,
-    expand_value_validity,
 )
+from zlc_data.value import expand_value_validity
 from zlc_neutral_atom.dataset_output import (
     DatasetOutputDeclaration,
     LiveDatasetOutput,

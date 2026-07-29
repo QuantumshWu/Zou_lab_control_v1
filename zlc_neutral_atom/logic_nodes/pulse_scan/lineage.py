@@ -7,6 +7,8 @@ import hashlib
 
 from zlc_data import (
     StreamGenerationId,
+)
+from zlc_data.transform_codec import (
     data_transform_spec_from_tree,
     data_transform_spec_to_tree,
 )
@@ -258,13 +260,13 @@ class AutonomousScanExecution:
 @dataclass(frozen=True, slots=True)
 class ApiSegmentEvidence:
     repeat_index: int
-    point_storage_index: int
+    point_ordinal: int
     artifact: CompiledPulseArtifact
     terminal: PulseTerminalAck
 
     def __post_init__(self) -> None:
         repeat = nonnegative_integer(self.repeat_index, "repeat_index")
-        point = nonnegative_integer(self.point_storage_index, "point_storage_index")
+        point = nonnegative_integer(self.point_ordinal, "point_ordinal")
         if not isinstance(self.artifact, CompiledPulseArtifact):
             raise TypeError("artifact must be CompiledPulseArtifact")
         if self.artifact.execution_form is not PulseExecutionForm.STATIC_ONCE:
@@ -273,7 +275,7 @@ class ApiSegmentEvidence:
             raise TypeError("terminal must be PulseTerminalAck")
         validate_pulse_terminal_for_artifact(self.terminal, self.artifact)
         object.__setattr__(self, "repeat_index", repeat)
-        object.__setattr__(self, "point_storage_index", point)
+        object.__setattr__(self, "point_ordinal", point)
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,7 +298,7 @@ class ApiSegmentedScanExecution:
             for point in range(self.program.point_count)
         )
         if tuple(
-            (item.repeat_index, item.point_storage_index) for item in segments
+            (item.repeat_index, item.point_ordinal) for item in segments
         ) != expected_cells:
             raise ValueError("API segment order must be repeat-major and point-fast")
         if not isinstance(self.source, SignalEventSequence):
@@ -318,9 +320,9 @@ def execution_compiled_artifacts(
         raise TypeError("execution must be PulseScanExecution")
     by_point: list[CompiledPulseArtifact | None] = [None] * execution.program.point_count
     for item in execution.segments:
-        existing = by_point[item.point_storage_index]
+        existing = by_point[item.point_ordinal]
         if existing is None:
-            by_point[item.point_storage_index] = item.artifact
+            by_point[item.point_ordinal] = item.artifact
         elif existing != item.artifact:
             raise ValueError("one API point used different artifacts across repeats")
     if any(item is None for item in by_point):
@@ -483,7 +485,7 @@ def pulse_scan_execution_to_tree(value: PulseScanExecution) -> dict[str, object]
             "segments": [
                 {
                     "repeat_index": item.repeat_index,
-                    "point_storage_index": item.point_storage_index,
+                    "point_ordinal": item.point_ordinal,
                     "artifact_index": artifact_index[item.artifact.fingerprint],
                     "terminal": pulse_terminal_ack_to_tree(item.terminal),
                 }
@@ -534,7 +536,7 @@ def pulse_scan_execution_from_tree(
         for row in rows:
             item = exact_mapping(
                 row,
-                {"repeat_index", "point_storage_index", "artifact_index", "terminal"},
+                {"repeat_index", "point_ordinal", "artifact_index", "terminal"},
                 "API segment evidence",
                 discriminator=None,
             )
@@ -544,7 +546,7 @@ def pulse_scan_execution_from_tree(
             segments.append(
                 ApiSegmentEvidence(
                     item["repeat_index"],
-                    item["point_storage_index"],
+                    item["point_ordinal"],
                     artifacts[index],
                     pulse_terminal_ack_from_tree(item["terminal"]),
                 )

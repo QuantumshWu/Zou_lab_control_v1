@@ -8,6 +8,7 @@ it never loads Qt.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 import math
@@ -408,6 +409,126 @@ class FormSpec:
         return {field.key: field.default for field in self.fields}
 
 
+def project_authoring_form(
+    schema: object,
+    *,
+    dynamic_choices: Mapping[str, object] | None = None,
+    path_presentations: Mapping[str, object] | None = None,
+) -> FormSpec:
+    """Project an ordered owner declaration into the canonical form contract.
+
+    The source declaration remains domain-owned.  This projector deliberately
+    consumes its small structural field vocabulary instead of importing a
+    product/domain schema type back into the frontend.
+    """
+
+    source_fields = getattr(schema, "fields", None)
+    if source_fields is None:
+        raise TypeError("schema must expose ordered authoring fields")
+    fields = tuple(source_fields)
+    if not fields:
+        raise ValueError("authoring schema must contain at least one field")
+    required_attributes = (
+        "key",
+        "kind",
+        "label",
+        "default",
+        "required",
+        "unit",
+        "description",
+        "minimum",
+        "maximum",
+        "choices",
+        "dynamic_choices",
+        "allow_blank",
+    )
+    if any(
+        any(not hasattr(field, attribute) for attribute in required_attributes)
+        for field in fields
+    ):
+        raise TypeError("authoring fields do not expose the canonical vocabulary")
+
+    injected = dict(dynamic_choices or {})
+    dynamic_keys = {field.key for field in fields if field.dynamic_choices}
+    if set(injected) != dynamic_keys:
+        raise ValueError(
+            "dynamic choice keys must exactly cover the owner declaration"
+        )
+    if any(
+        key != getattr(value, "field_key", None)
+        or not hasattr(value, "choices")
+        or not hasattr(value, "default")
+        or not hasattr(value, "unavailable_reason")
+        for key, value in injected.items()
+    ):
+        raise TypeError(
+            "dynamic choices must map field keys to their exact owner presentation"
+        )
+
+    paths = dict(path_presentations or {})
+    path_keys = {field.key for field in fields if field.kind == "path"}
+    if not set(paths) <= path_keys:
+        raise ValueError("path presentation keys must name owner-declared path fields")
+    if any(
+        key != getattr(value, "field_key", None)
+        or not hasattr(value, "mode")
+        or not hasattr(value, "file_filter")
+        or not hasattr(value, "base_dir")
+        for key, value in paths.items()
+    ):
+        raise TypeError(
+            "path presentations must map field keys to their exact owner hint"
+        )
+
+    projected = []
+    for field in fields:
+        if field.dynamic_choices:
+            projection = injected[field.key]
+            choices = tuple(
+                FormChoice(choice.label, choice.value)
+                for choice in projection.choices
+            )
+            values = tuple(choice.value for choice in projection.choices)
+            if values and not any(
+                _typed_equal(projection.default, value) for value in values
+            ):
+                raise ValueError("dynamic choice default is not one available value")
+            if not values and projection.default is not None:
+                raise ValueError("unavailable dynamic choice cannot have a default")
+            default = projection.default
+            unavailable = projection.unavailable_reason
+        else:
+            choices = tuple(
+                FormChoice(choice.label, choice.value)
+                for choice in field.choices
+            )
+            default = field.default
+            unavailable = ""
+        path = paths.get(field.key)
+        projected.append(
+            FormFieldProps(
+                field.key,
+                field.kind,
+                field.label,
+                default=default,
+                required=field.required,
+                unit=field.unit,
+                description=field.description,
+                minimum=field.minimum,
+                maximum=field.maximum,
+                choices=choices,
+                allow_blank=field.allow_blank,
+                path_mode="file" if path is None else path.mode,
+                file_filter=(
+                    "All files (*)" if path is None else path.file_filter
+                ),
+                base_dir="" if path is None else path.base_dir,
+                unavailable_reason=unavailable,
+            )
+        )
+    return FormSpec(tuple(projected))
+
+
 __all__ = [
     "choice_value_from_tree",
     "choice_value_to_tree",
@@ -415,15 +536,6 @@ __all__ = [
     "FormFieldKind",
     "FormFieldProps",
     "FormSpec",
-    "lenient_float",
     "parse_number_text",
+    "project_authoring_form",
 ]
-
-
-def lenient_float(text: object, fallback: float) -> float:
-    """Decode an in-progress display limit, retaining the current value on error."""
-
-    try:
-        return float(str(text).strip())
-    except (TypeError, ValueError):
-        return float(fallback)

@@ -42,6 +42,7 @@ from zlc_frontend.qt_widgets import (
     screen_fit_window_size,
     setting_label_width,
     signals_blocked,
+    wait_for_owner_retirement,
     window_pad,
 )
 from zlc_neutral_atom.installation_plan import (
@@ -52,7 +53,6 @@ from zlc_neutral_atom.installation_package import discover_installation_packages
 
 from .controller import DeviceAdminState, DeviceManagerController
 from .editor_session import form_spec
-from zlc_workbench.window_runtime import wait_for_owner_retirement
 
 
 _BACKEND_PRESENTATION = tuple(

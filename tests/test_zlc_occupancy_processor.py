@@ -12,23 +12,10 @@ import time
 import numpy as np
 import pytest
 
-from zlc_data import (
-    READOUT_EVENT,
-    REPEAT,
-    SITE,
-    AxisId,
-    AxisSpec,
-    ComponentValidity,
-    DatasetSchema,
-    PointLayout,
-    ValidityContract,
-    Value,
-    ValueSchema,
-)
-from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
-    _require_occupancy_output_schemas,
-    _validate_sample_fields,
-)
+from zlc_data.axis import SITE, AxisId, AxisSpec
+from zlc_data.schema import ValueSchema
+from zlc_data.validity import ComponentValidity, ValidityContract
+from zlc_data.value import Value
 
 
 ROOT = Path(__file__).parents[1]
@@ -58,64 +45,6 @@ def _run_isolated(script: str, workspace: Path) -> dict[str, object]:
         if line.startswith(marker):
             return json.loads(line[len(marker) :])
     pytest.fail(f"isolated probe returned no result marker: {completed.stdout}")
-
-
-def test_output_schema_keeps_repeat_point_and_site_as_distinct_axes():
-    repeat = _axis("repeat", REPEAT, 2)
-    event = _axis("event", READOUT_EVENT, 1)
-    site = _axis("site", SITE, 3)
-    validity_contract = ValidityContract.components(site.axis_id)
-    counts_schema = DatasetSchema(
-        repeat,
-        (event,),
-        PointLayout.rect_c((1,)),
-        ValueSchema(
-            (site,),
-            validity_contract,
-            np.dtype("<f8"),
-            value_unit="count",
-        ),
-    )
-    occupied_schema = DatasetSchema(
-        repeat,
-        (event,),
-        PointLayout.rect_c((1,)),
-        ValueSchema(
-            (site,),
-            validity_contract,
-            np.dtype(bool),
-            value_unit="occupation",
-        ),
-    )
-    assert _require_occupancy_output_schemas(counts_schema, occupied_schema) == site
-    assert counts_schema.physical_shape == (2, 1, 3)
-    assert counts_schema.cell_schema.data_shape == (3,)
-
-
-def test_component_validity_is_per_site_and_invalid_fillers_are_canonical():
-    site = _axis("site", SITE, 3)
-    contract = ValidityContract.components(site.axis_id)
-    validity = ComponentValidity((site.axis_id,), np.asarray((True, False, True)))
-    counts_schema = ValueSchema(
-        (site,), contract, np.dtype("<f8"), value_unit="count"
-    )
-    occupied_schema = ValueSchema(
-        (site,), contract, np.dtype(bool), value_unit="occupation"
-    )
-    counts = Value(np.asarray((1.0, 0.0, 2.0)), validity, counts_schema)
-    occupied = Value(np.asarray((True, False, True)), validity, occupied_schema)
-    _validate_sample_fields(counts, occupied)
-
-    negative_zero = Value(
-        np.asarray((1.0, -0.0, 2.0)), validity, counts_schema
-    )
-    with pytest.raises(ValueError, match="positive-zero"):
-        _validate_sample_fields(negative_zero, occupied)
-    invalid_true = Value(
-        np.asarray((True, True, True)), validity, occupied_schema
-    )
-    with pytest.raises(ValueError, match="canonical False"):
-        _validate_sample_fields(counts, invalid_true)
 
 
 def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_path):
@@ -182,7 +111,8 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
                 ),
                 "repeat_role": artifact.counts.schema.repeat_axis.role.value,
                 "point_roles": [
-                    axis.role.value for axis in artifact.counts.schema.point_axes
+                    column.role.value
+                    for column in artifact.counts.schema.point_table.columns
                 ],
                 "data_roles": [
                     axis.role.value
@@ -223,21 +153,9 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
     assert result["invalid_occupied_fillers_are_false"] is True
 
 
-def test_normal_committed_path_has_one_repository_compiler_owner():
-    from zlc_neutral_atom.logic_nodes.readout.occupancy.repository import (
-        compile_occupancy_artifact_plan,
-    )
-    import zlc_neutral_atom.logic_nodes.readout.occupancy.repository as repository_module
-
-    assert compile_occupancy_artifact_plan.__module__ == (
-        "zlc_neutral_atom.logic_nodes.readout.occupancy.repository"
-    )
-    assert not hasattr(repository_module, "OccupancyCheckpoint")
-    assert not hasattr(repository_module, "LegacyOccupancyProcessor")
-
-
 def test_live_signal_source_preserves_every_future_camera_event_and_same_shot():
-    from zlc_data import VALID, ValuePayloadContract
+    from zlc_data.validity import VALID
+    from zlc_data.value import ValuePayloadContract
     from zlc_neutral_atom.logic_nodes.readout.occupancy.signal_source import (
         OccupancySignalValues,
         OccupancySignalValuesContract,

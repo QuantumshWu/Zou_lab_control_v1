@@ -17,6 +17,7 @@ window layout requires, but they do not reinterpret a gesture or a Figure.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from PyQt5 import QtCore, QtWidgets
 
@@ -37,7 +38,13 @@ from ..histogram_display import (
 from ..image_display import ImageDisplayState
 from ..meter_display import MeterDisplayState
 from ..plot_panel import PlotDisplayState, PlotPanelContract
-from ..render import BoardFrame, CurvePanelPayload, ImagePanelPayload, SourceIdentity
+from ..render import (
+    BoardFrame,
+    CurvePanelPayload,
+    ImagePanelPayload,
+    PanelFrame,
+    SourceIdentity,
+)
 from ..selector import (
     CrossGesture,
     CurveRangeGesture,
@@ -85,7 +92,7 @@ class FigureSurfaceContext:
             raise TypeError("selector_figure must be DataFigure or None")
         if self.selector_figure is not None and self.figure is None:
             raise ValueError("selector_figure requires a complete Figure owner")
-        if self.selector_figure is not None and not self.contract.faceted:
+        if self.selector_figure is not None and not self.contract.figure.faceted:
             raise ValueError("selector_figure override belongs only to a focused grid")
         semantic_figure = self.selector_figure or self.figure
         if semantic_figure is not None and not _identity_matches_figure_input(
@@ -232,6 +239,7 @@ class FigureSurfaceHost(QtWidgets.QWidget):
         if self._dynamic and self._faceted:
             raise ValueError("dynamic multi-panel surface cannot be faceted")
         self._context: FigureSurfaceContext | None = None
+        self._fit_projection_key: tuple[object, ...] | None = None
         self._dynamic_area_candidates: dict[
             str, tuple[float, float, float, float]
         ] = {}
@@ -453,6 +461,12 @@ class FigureSurfaceHost(QtWidgets.QWidget):
         if self._dynamic:
             raise RuntimeError("dynamic Figure grid requires present_image_grid")
         self._validate_context(context)
+        semantic_figure = context.selector_figure or context.figure
+        projection_key = (
+            None
+            if semantic_figure is None
+            else _figure_projection_identity(semantic_figure, frame)
+        )
         geometry_changes = logical_size is not None and (
             self.width(), self.height()
         ) != logical_size
@@ -468,7 +482,7 @@ class FigureSurfaceHost(QtWidgets.QWidget):
             self._presenter.present_frame(frame, logical_size=logical_size)
             if logical_size is not None:
                 self.setFixedSize(*logical_size)
-            self._promote_context(context)
+            self._promote_context(context, projection_key)
         finally:
             if geometry_changes:
                 self.setUpdatesEnabled(True)
@@ -500,6 +514,12 @@ class FigureSurfaceHost(QtWidgets.QWidget):
             raise ValueError(
                 "faceted overview and PlotPanel contract have different geometry"
             )
+        semantic_figure = context.selector_figure or context.figure
+        projection_key = (
+            None
+            if result.overview is not None or semantic_figure is None
+            else _figure_projection_identity(semantic_figure, result.frame)
+        )
         geometry_changes = (
             self.width(), self.height()
         ) != logical_size
@@ -514,7 +534,7 @@ class FigureSurfaceHost(QtWidgets.QWidget):
                     logical_size=logical_size,
                 )
             self.setFixedSize(*logical_size)
-            self._promote_context(context)
+            self._promote_context(context, projection_key)
         finally:
             if geometry_changes:
                 self.setUpdatesEnabled(True)
@@ -543,7 +563,7 @@ class FigureSurfaceHost(QtWidgets.QWidget):
         try:
             self._presenter.present_overview(artifact)
             self.setFixedSize(*logical_size)
-            self._promote_context(context)
+            self._promote_context(context, None)
         finally:
             if geometry_changes:
                 self.setUpdatesEnabled(True)
@@ -620,7 +640,7 @@ class FigureSurfaceHost(QtWidgets.QWidget):
             selection,
             payload,
         )
-        self.board.set_curve_range_candidate(span, panel_id=self._panel_id)
+        self.board.set_numeric_range_candidate(span, panel_id=self._panel_id)
 
     def set_rectangle_candidate(self, normalized_bounds) -> None:
         if self._dynamic:
@@ -635,10 +655,59 @@ class FigureSurfaceHost(QtWidgets.QWidget):
     def clear_outputs(self) -> None:
         self._output_authority.clear()
 
+    def install_fit_overlays(
+        self,
+        source_figure: DataFigure,
+        source_frame: BoardFrame,
+        overlay_panel: PanelFrame,
+    ) -> Literal["CURRENT", "LAGGING", "INCOMPATIBLE"]:
+        """Install a worker-materialized Fit result without composing base pixels.
+
+        ``source_figure`` and ``source_frame`` are the exact immutable
+        single-panel front frozen when the Fit was submitted.  The host
+        compares the authoritative View/facet while the board compares producer
+        and draw-geometry semantics with the currently painted front, then
+        paints only the existing backend-neutral vector primitives.  A
+        different revision of the same compatible producer is visibly
+        LAGGING; an incompatible result is not retained or painted.
+        """
+
+        self._require_open()
+        if not isinstance(source_figure, DataFigure):
+            raise TypeError("source_figure must be DataFigure")
+        if self._dynamic:
+            return "INCOMPATIBLE"
+        if not isinstance(source_frame, BoardFrame) or len(source_frame.panels) != 1:
+            raise TypeError("source_frame must contain one exact panel")
+        if not _identity_matches_figure_input(
+            _frame_source_identity(source_frame),
+            source_figure,
+        ):
+            raise ValueError("Fit source Figure and frame have another input")
+        source_projection = _figure_projection_identity(source_figure, source_frame)
+        current_projection = self._fit_projection_key
+        if current_projection is None or self.front_frame is None:
+            self.clear_fit_overlays()
+            return "INCOMPATIBLE"
+        status = self.board._install_fit_overlays(
+            source_frame,
+            overlay_panel,
+            source_projection_key=source_projection,
+            current_projection_key=current_projection,
+        )
+        return status
+
+    def clear_fit_overlays(self) -> None:
+        """Clear only this surface's transient Fit result layer."""
+
+        self._require_open()
+        self.board._clear_fit_overlays()
+
     def clear(self) -> None:
         self._require_open()
         self._presenter.clear()
         self._context = None
+        self._fit_projection_key = None
         if self._dynamic:
             self._dynamic_area_candidates.clear()
         self.clear_outputs()
@@ -648,6 +717,7 @@ class FigureSurfaceHost(QtWidgets.QWidget):
             return
         self._closed = True
         self._context = None
+        self._fit_projection_key = None
         clear = getattr(self._presenter, "clear", None)
         if callable(clear):
             clear()
@@ -684,14 +754,23 @@ class FigureSurfaceHost(QtWidgets.QWidget):
             raise TypeError("context must be FigureSurfaceContext")
         if context.contract.panel_id != self._panel_id:
             raise ValueError("Figure context belongs to another surface")
-        if context.contract.faceted != self._faceted:
+        if context.contract.figure.faceted != self._faceted:
             raise ValueError("Figure context has another surface topology")
 
-    def _promote_context(self, context: FigureSurfaceContext) -> None:
+    def _promote_context(
+        self,
+        context: FigureSurfaceContext,
+        projection_key: tuple[object, ...] | None,
+    ) -> None:
         previous = self._context
         self._context = context
+        self._fit_projection_key = projection_key
         previous_identity = _source_identity(previous)
         current_identity = _source_identity(context)
+        if projection_key is None:
+            self.board._clear_fit_overlays()
+        else:
+            self.board._reconcile_fit_projection(projection_key)
         if previous_identity != current_identity:
             self.clear_outputs()
 
@@ -762,6 +841,17 @@ class FigureSurfaceHost(QtWidgets.QWidget):
 
 def _source_identity(context: FigureSurfaceContext | None):
     return None if context is None else context.source_identity
+
+
+def _figure_projection_identity(
+    figure: DataFigure,
+    frame: BoardFrame,
+) -> tuple[object, ...]:
+    """Validate and return a precomputed typed overlay projection key."""
+
+    if not isinstance(figure, DataFigure):
+        raise TypeError("projection identity requires DataFigure")
+    return figure._transient_fit_projection_key(frame)
 
 
 def _frame_source_identity(frame: BoardFrame) -> SourceIdentity:

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from zlc_data import AxisSourceRef, DatasetSchema, resolve_point_rows
+from zlc_data import AxisSourceRef, DatasetSchema
+from zlc_data.schema import resolve_point_rows
 
 from .contract import (
     _dataset_sources,
@@ -41,7 +42,6 @@ def _unresolved(
         None,
         SuggestionStatus.NEEDS_INPUT,
         (DecisionReason(code, message, source),),
-        (),
     )
 
 
@@ -259,7 +259,7 @@ def grid_facet_sources(
 
 
 def suggest_default_grid_view(schema: DatasetSchema) -> ViewSuggestion:
-    """Suggest a stable Grid view from declared source semantics."""
+    """Resolve a Grid default only when one declared candidate is unique."""
 
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
@@ -269,16 +269,29 @@ def suggest_default_grid_view(schema: DatasetSchema) -> ViewSuggestion:
         for source in sources
         if source.kind == AxisSourceRef.GRID_DIMENSION
     )
-    ordered_sources = (*topology_sources, *(source for source in sources if source not in topology_sources))
-    for intent in (
-        ViewIntent.IMAGE,
-        ViewIntent.CURVE,
-        ViewIntent.HISTOGRAM,
-    ):
-        for source in ordered_sources:
-            suggestion = resolve_grid_view(schema, intent, source)
-            if suggestion.spec is not None:
-                return suggestion
+    source_tiers = (
+        topology_sources,
+        tuple(source for source in sources if source not in topology_sources),
+    )
+    for tier in source_tiers:
+        candidates = tuple(
+            suggestion
+            for source in tier
+            for intent in (
+                ViewIntent.IMAGE,
+                ViewIntent.CURVE,
+                ViewIntent.HISTOGRAM,
+            )
+            if (suggestion := resolve_grid_view(schema, intent, source)).spec
+            is not None
+        )
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            return _unresolved(
+                "AMBIGUOUS_DEFAULT_GRID_VIEW",
+                "multiple equally preferred Grid facet/cell intents are valid",
+            )
     return _unresolved(
         "NO_DEFAULT_GRID_VIEW",
         "the DatasetSchema does not determine a complete Grid view",

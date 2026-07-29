@@ -25,10 +25,9 @@ from zlc_data import (
     StreamGenerationId,
     Valid,
     Value,
-    canonical_value_array,
-    dataset_schema_from_tree,
-    dataset_schema_to_tree,
 )
+from zlc_data.codec import dataset_schema_from_tree, dataset_schema_to_tree
+from zlc_data.value import canonical_value_array
 from zlc_storage import (
     CanonicalArrayEvent,
     CanonicalListEvent,

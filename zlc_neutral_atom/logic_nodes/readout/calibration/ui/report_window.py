@@ -7,13 +7,14 @@ import math
 
 from zlc_frontend import PlotReportDocument
 from zlc_frontend.encoded_raster import EncodedRasterDocument
-from zlc_frontend.qt_widgets import RasterPixelRatioObserver
+from zlc_frontend.qt_widgets import (
+    FrozenRasterWindow,
+    RasterPixelRatioObserver,
+    error_summary,
+)
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
 )
-from zlc_workbench.frozen_raster import FrozenRasterWindow
-from zlc_workbench.window_runtime import error_summary
-
 from .workbench_jobs import (
     _load_calibration_report_document,
     _render_calibration_report,

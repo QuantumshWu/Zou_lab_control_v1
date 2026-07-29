@@ -8,15 +8,18 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from zlc_data import (
-    AxisId,
-    AxisSpec,
-    DatasetSchema,
-    PointLayout,
+from zlc_data.axis import (
     READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
-    ValidityContract,
+    AxisId,
+    AxisSpec,
+)
+from zlc_data.schema import (
+    DatasetSchema,
+    GridTopology,
+    PointColumn,
+    PointTable,
     ValueSchema,
 )
 from zlc_neutral_atom.logic_nodes.readout.physical_context import (
@@ -117,17 +120,53 @@ def _cell_plan(
     point_count = max(1, len(artifact.target_ir.scan_points))
     if artifact.target_ir.scan_points:
         scan_axis = _axis("capture.scan", SCAN_POINT, point_count)
-        point_axes = (scan_axis, event_axis)
-        dataset_layout = PointLayout.rect_c((point_count, readout_events))
-        scan_layout = PointLayout.rect_c((point_count,))
+        cells = tuple(
+            (scan_index, event_index)
+            for scan_index in range(point_count)
+            for event_index in range(readout_events)
+        )
+        point_table = PointTable(
+            len(cells),
+            (
+                PointColumn(
+                    scan_axis.axis_id,
+                    scan_axis.name,
+                    scan_axis.role,
+                    PointColumn.NUMERIC,
+                    tuple(scan_index for scan_index, _event_index in cells),
+                ),
+                PointColumn(
+                    event_axis.axis_id,
+                    event_axis.name,
+                    event_axis.role,
+                    PointColumn.NUMERIC,
+                    tuple(event_index for _scan_index, event_index in cells),
+                ),
+            ),
+        )
+        grid_topology = GridTopology(
+            (scan_axis.axis_id, event_axis.axis_id),
+            (tuple(range(point_count)), tuple(range(readout_events))),
+            cells,
+        )
     else:
-        point_axes = (event_axis,)
-        dataset_layout = PointLayout.rect_c((readout_events,))
-        scan_layout = PointLayout.rect_c(())
+        point_table = PointTable(
+            readout_events,
+            (
+                PointColumn(
+                    event_axis.axis_id,
+                    event_axis.name,
+                    event_axis.role,
+                    PointColumn.NUMERIC,
+                    tuple(range(readout_events)),
+                ),
+            ),
+        )
+        grid_topology = None
     schema = DatasetSchema(
         _axis("capture.repeat", REPEAT, repeats),
-        point_axes,
-        dataset_layout,
+        point_table,
+        grid_topology,
         ValueSchema.scalar(np.dtype("<u2"), "count"),
     )
     trigger_lane = artifact.trigger_schedules[0].channel
@@ -136,7 +175,7 @@ def _cell_plan(
         trigger_lane,
         schema,
         readout_event_axis_id=event_axis.axis_id,
-        scan_point_layout=scan_layout,
+        base_point_count=point_count,
     )
 
 

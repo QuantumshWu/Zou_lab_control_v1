@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import numpy as np
 import pytest
@@ -12,10 +13,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtCore, QtTest, QtWidgets  # noqa: E402
 
-from test_u03b_interactive_curve_figure import _curve_figure, _until  # noqa: E402
 from zlc_frontend import (  # noqa: E402
     CurveDisplayState,
-    FigurePresentationContract,
 )
 from zlc_frontend.figure import ViewIntent  # noqa: E402
 from zlc_frontend.display_range import RelimMode  # noqa: E402
@@ -32,7 +31,159 @@ def application():
     return ensure_qt_app()
 
 
+def _until(application, predicate, *, timeout: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        application.processEvents()
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError("Qt condition did not become true")
+
+
+def _curve_figure():
+    from zlc_data import (
+        COMPONENT,
+        REPEAT,
+        SCAN_POINT,
+        SITE,
+        AxisId,
+        AxisSourceRef,
+        AxisSpec,
+        BlockId,
+        DataBlock,
+        DatasetComponentValidity,
+        DatasetRevision,
+        DatasetSchema,
+        OwnedSnapshot,
+        PointColumn,
+        PointTable,
+        StreamGenerationId,
+        ValidityContract,
+        ValueSchema,
+    )
+    from zlc_frontend import DataFigure
+    from zlc_frontend.figure import (
+        AxisViewRole,
+        DatasetDescriptor,
+        DatasetId,
+        DisplayReduction,
+        DisplayReductionMethod,
+        FigureDocument,
+        FigureLayer,
+        ResolvedDataset,
+        ResolvedDatasetMap,
+        SourceViewBinding,
+        ViewIntent,
+        ViewSpec,
+    )
+
+    coordinates = tuple(float(value) for value in np.linspace(-2.0, 2.0, 21))
+    repeat = AxisSpec(AxisId("archive.repeat"), "Repeat", REPEAT, 2, (0, 1))
+    scan_id = AxisId("archive.detuning")
+    site = AxisSpec(
+        AxisId("archive.site"),
+        "Site",
+        SITE,
+        3,
+        ("left", "middle", "right"),
+    )
+    component = AxisSpec(
+        AxisId("archive.component"),
+        "Component",
+        COMPONENT,
+        2,
+        ("signal", "reference"),
+    )
+    x = np.arange(len(coordinates), dtype=np.float64)
+    sites = np.stack(
+        (
+            1.0 + 4.0 * np.exp(-((x - 9.0) ** 2) / 18.0),
+            2.0 + 3.0 * np.exp(-((x - 11.0) ** 2) / 14.0),
+            0.5 + 2.0 * np.exp(-((x - 7.0) ** 2) / 12.0),
+        ),
+        axis=-1,
+    )
+    values = np.stack(
+        (np.stack((sites, 0.5 * sites + 0.3), axis=-1),) * 2,
+        axis=0,
+    )
+    values[1] += 0.2
+    valid = np.ones(values.shape, dtype=np.bool_)
+    valid[:, 4, 1, 0] = False
+    schema = DatasetSchema(
+        repeat,
+        PointTable(
+            len(coordinates),
+            (
+                PointColumn(
+                    scan_id,
+                    "Detuning",
+                    SCAN_POINT,
+                    PointColumn.NUMERIC,
+                    coordinates,
+                    "MHz",
+                ),
+            ),
+        ),
+        None,
+        ValueSchema(
+            (site, component),
+            ValidityContract.components(site.axis_id, component.axis_id),
+            values.dtype,
+            value_unit="photoelectron",
+        ),
+    )
+    block = DataBlock(
+        BlockId("archive-curve-block"),
+        DatasetRevision(5),
+        values,
+        DatasetComponentValidity((site.axis_id, component.axis_id), valid),
+        schema,
+    )
+    snapshot = OwnedSnapshot(
+        block.ref(StreamGenerationId("archive-curve-generation")),
+        block,
+    )
+    view = ViewSpec(
+        schema.fingerprint,
+        ViewIntent.CURVE,
+        (
+            SourceViewBinding(
+                AxisSourceRef.tensor(repeat.axis_id),
+                AxisViewRole.REDUCED,
+                reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+            ),
+            SourceViewBinding(
+                AxisSourceRef.point_coordinate(scan_id),
+                AxisViewRole.X,
+            ),
+            SourceViewBinding(
+                AxisSourceRef.tensor(site.axis_id),
+                AxisViewRole.BATCH,
+            ),
+            SourceViewBinding(
+                AxisSourceRef.tensor(component.axis_id),
+                AxisViewRole.BATCH,
+            ),
+        ),
+    )
+    dataset_id = DatasetId("archive-curve-dataset")
+    return DataFigure(
+        FigureDocument(
+            "archive-curve-document",
+            3,
+            (DatasetDescriptor(dataset_id, "site curves", schema.fingerprint),),
+            (FigureLayer("curve", dataset_id, view),),
+        ),
+        ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
+    )
+
+
 def _saved_curve(path):
+    from zlc_frontend.plot_kind import PlotKind
+    from zlc_frontend.plot_panel import FigureIntent
+
     figure = _curve_figure()
     display = CurveDisplayState(
         revision=7,
@@ -43,16 +194,14 @@ def _saved_curve(path):
     save_figure_archive(
         figure,
         path,
-        presentation=FigurePresentationContract(
-            ViewIntent.CURVE,
-            False,
-            False,
-            False,
+        figure_intent=FigureIntent(
+            PlotKind.CURVE,
             "curve",
             "value",
-            "2x2",
-            display,
+            view=figure.document.layers[0].view,
         ),
+        size_name="2x2",
+        display=display,
         metadata={"device": "virtual"},
     )
     return figure, display
@@ -66,22 +215,22 @@ def _fit_ready_curve_figure():
         SCALAR_AXIS,
         SCAN_POINT,
         AxisId,
+        AxisSourceRef,
         AxisSpec,
         BlockId,
         DataBlock,
         DatasetRevision,
         DatasetSchema,
         OwnedSnapshot,
-        PointLayout,
+        PointColumn,
+        PointTable,
         StreamGenerationId,
         VALID,
         ValueSchema,
-        bind_fit,
-        fit_spec_for,
     )
-    from zlc_frontend import DataFigure
+    from zlc_data.fit import bind_fit
+    from zlc_frontend import DataFigure, prepare_fit_authoring_options
     from zlc_frontend.figure import (
-        AxisViewBinding,
         AxisViewRole,
         DatasetDescriptor,
         DatasetId,
@@ -90,6 +239,7 @@ def _fit_ready_curve_figure():
         FigureLayer,
         ResolvedDataset,
         ResolvedDatasetMap,
+        SourceViewBinding,
         ViewIntent,
         ViewSpec,
     )
@@ -113,8 +263,21 @@ def _fit_ready_curve_figure():
     values = (1.5 + 6.0 * np.exp(-((x - 14.0) / 3.5) ** 2))[None, :, None]
     schema = DatasetSchema(
         repeat,
-        (scan,),
-        PointLayout.rect_c((scan.size,)),
+        PointTable(
+            scan.size,
+            (
+                PointColumn(
+                    scan.axis_id,
+                    scan.name,
+                    scan.role,
+                    PointColumn.NUMERIC,
+                    scan.coordinates,
+                    scan.unit,
+                    scan.coordinate_frame,
+                ),
+            ),
+        ),
+        None,
         ValueSchema.scalar(values.dtype, "count"),
     )
     block = DataBlock(
@@ -132,14 +295,17 @@ def _fit_ready_curve_figure():
         schema.fingerprint,
         ViewIntent.CURVE,
         (
-            AxisViewBinding(
-                repeat.axis_id,
+            SourceViewBinding(
+                AxisSourceRef.tensor(repeat.axis_id),
                 AxisViewRole.SELECTED,
                 selector=FixedIndex(0),
             ),
-            AxisViewBinding(scan.axis_id, AxisViewRole.X),
-            AxisViewBinding(
-                SCALAR_AXIS.axis_id,
+            SourceViewBinding(
+                AxisSourceRef.point_coordinate(scan.axis_id),
+                AxisViewRole.X,
+            ),
+            SourceViewBinding(
+                AxisSourceRef.tensor(SCALAR_AXIS.axis_id),
                 AxisViewRole.SELECTED,
                 selector=FixedIndex(0),
             ),
@@ -156,14 +322,11 @@ def _fit_ready_curve_figure():
         document,
         ResolvedDatasetMap((ResolvedDataset(dataset_id, snapshot),)),
     )
-    saved_result = bind_fit(
-        fit_spec_for(
-            schema,
-            "gaussian_offset",
-            fit_axis_ids=(scan.axis_id,),
-        ),
-        schema,
-    ).run(snapshot)
+    options = prepare_fit_authoring_options(source, None)
+    gaussian = next(
+        option for option in options if option.spec.model_id == "gaussian_offset"
+    )
+    saved_result = bind_fit(gaussian.spec, schema).run(snapshot)
     return source.with_fit_results({"curve": saved_result})
 
 
@@ -201,7 +364,8 @@ def test_archive_roundtrip_preserves_multidimensional_source_and_validity(tmp_pa
     loaded = load_figure_archive(path)
     source = figure.datasets.entries[0].snapshot
     reopened = loaded.archive.figure.datasets.entries[0].snapshot
-    assert loaded.archive.presentation.display == display
+    assert loaded.archive.display == display
+    assert loaded.archive.size_name == "2x2"
     assert loaded.archive.metadata["device"] == "virtual"
     assert reopened.ref == source.ref
     assert reopened.block.schema == source.block.schema
@@ -219,7 +383,7 @@ def test_archive_roundtrip_preserves_multidimensional_source_and_validity(tmp_pa
 
 
 def test_archive_codec_preserves_faceted_histogram_display():
-    from zlc_data import AxisId, Selection
+    from zlc_data import AxisId, AxisSourceRef
     from zlc_frontend import (
         FacetedHistogramDisplayState,
         HistogramCellThresholds,
@@ -233,8 +397,8 @@ def test_archive_codec_preserves_faceted_histogram_display():
     display = FacetedHistogramDisplayState(
         HistogramDisplayState(revision=9),
         (
-            HistogramCellThresholds(
-                Selection.index(AxisId("archive.site"), 1),
+                HistogramCellThresholds(
+                    ((AxisSourceRef.tensor(AxisId("archive.site")), 1),),
                 (12.0, 24.0),
             ),
         ),
@@ -310,19 +474,20 @@ def test_formal_viewer_refits_and_reopens_the_same_archive(
 ):
     path = tmp_path / "refitted-curve.npz"
     original = _fit_ready_curve_figure()
+    from zlc_frontend.plot_kind import PlotKind
+    from zlc_frontend.plot_panel import FigureIntent
+
     save_figure_archive(
         original,
         path,
-        presentation=FigurePresentationContract(
-            ViewIntent.CURVE,
-            False,
-            False,
-            False,
+        figure_intent=FigureIntent(
+            PlotKind.CURVE,
             "fitted curve",
             "count",
-            "2x2",
-            CurveDisplayState(),
+            view=original.document.layers[0].view,
         ),
+        size_name="2x2",
+        display=CurveDisplayState(),
         metadata={"source": "formal archive refit"},
     )
     original_ref = original.datasets.entries[0].snapshot.ref
@@ -455,8 +620,8 @@ def test_formal_viewer_keeps_old_generation_when_candidate_first_render_fails(
 
         monkeypatch.setattr(workbench, "create_data_figure_pane", tracked_create)
         monkeypatch.setattr(
-            workbench.DataFigureRenderSession,
-            "render_front",
+            workbench,
+            "render_data_figure_front",
             reject_initial_render,
         )
 

@@ -24,7 +24,7 @@ from typing import Mapping
 from uuid import uuid4
 
 from zlc_frontend.panel_size import DEFAULT_PANEL_SIZE, panel_size_cells
-from zlc_frontend.plot_kind import PLOT_KIND_SPECS
+from zlc_frontend.plot_kind import PlotKind
 from zlc_storage.canonical import canonical_text, exact_mapping, normalized_text
 
 __all__ = ["DEFAULT_UPDATE_MS", "LOGIC_KINDS", "LOGIC_NODE_CONFIG_FIELDS",
@@ -163,8 +163,8 @@ class LogicNodeConfig:
 #: only kinds with an end-to-end typed live payload and renderer.  A
 #: ``PanelConfig`` therefore cannot persist an advertised-but-unimplemented
 #: pulse/site/grid bridge.
-PANEL_KINDS: dict[str, str] = {
-    spec.key: spec.label for spec in PLOT_KIND_SPECS if spec.panel
+PANEL_KINDS: dict[PlotKind, str] = {
+    kind: kind.label for kind in PlotKind if kind.panel
 }
 
 
@@ -197,7 +197,7 @@ class PanelConfig:
         self,
         *,
         panel_id: str | None = None,
-        kind: str,
+        kind: PlotKind,
         title: str = "",
         row: int = 0,
         col: int = 0,
@@ -205,10 +205,11 @@ class PanelConfig:
         signal: str = "",
         params: Mapping[str, object] | None = None,
     ):
-        if not isinstance(kind, str):
-            raise TypeError("panel kind must be str")
+        if not isinstance(kind, PlotKind):
+            raise TypeError("panel kind must be PlotKind")
         if kind not in PANEL_KINDS:
-            raise ValueError(f"unknown panel kind {kind!r}; choose from {sorted(PANEL_KINDS)}.")
+            choices = sorted(item.value for item in PANEL_KINDS)
+            raise ValueError(f"unknown panel kind {kind!r}; choose from {choices}.")
         if not isinstance(size, str):
             raise TypeError("panel size must be str")
         panel_size_cells(size)              # validate against the limited preset list
@@ -262,7 +263,7 @@ class PanelConfig:
         # (top-to-bottom, left-to-right) is what round-trips -- exact pixels are recomputed.
         return {
             "panel_id": self.panel_id,
-            "kind": self.kind,
+            "kind": self.kind.value,
             "title": self.title,
             "row": self.row,
             "col": self.col,
@@ -281,7 +282,12 @@ class PanelConfig:
         )
         if data["row"] < 0 or data["col"] < 0:
             raise ValueError("panel row and col must be non-negative")
-        result = cls(**data)
+        constructor = dict(data)
+        try:
+            constructor["kind"] = PlotKind(data["kind"])
+        except ValueError as error:
+            raise ValueError(f"unknown persisted panel kind {data['kind']!r}") from error
+        result = cls(**constructor)
         if result.to_dict() != data:
             raise ValueError("PanelConfig is not in current canonical form")
         return result

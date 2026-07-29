@@ -11,7 +11,6 @@ import time
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_data import (
-    AxisSourceRef,
     FitCancelled,
     FitDeadlineExceeded,
     FitResultBatch,
@@ -19,41 +18,41 @@ from zlc_data import (
     Selection,
 )
 from zlc_frontend import (
-    CurvePanelPayload,
     DataFigure,
     FitAuthoringDraft,
     FitAuthoringOption,
-    HistogramPanelPayload,
-    ImagePanelPayload,
-    MeterDisplayState,
-    MeterPanelPayload,
     reconcile_fit_authoring_draft,
 )
 from zlc_frontend.curve_display import CurveDisplayState
+from zlc_frontend.curve_display import curve_display_with_x_view
+from zlc_frontend.meter_display import MeterDisplayState
+from zlc_frontend.render import (
+    BoardFrame,
+    CurvePanelPayload,
+    HistogramPanelPayload,
+    ImagePanelPayload,
+    MeterPanelPayload,
+)
 from zlc_frontend.data_figure_presentation import (
     DATA_FIGURE_PANEL_ID,
     DataFigureDisplayState,
-    DataFigureFront,
     DataFigureGridFocusRequest,
     DataFigureGridOverview,
     DataFigurePanelPayload,
-    data_figure_display_form_spec,
-    data_figure_display_form_values,
-    data_figure_display_state_from_form,
-    data_figure_display_state_with_x_view,
-    data_figure_front_contract,
+    data_figure_frame_contract,
+    data_figure_summary,
     default_data_figure_display_state,
-    display_state_intent,
     same_exact_data_owners,
     validate_rendered_data_figure_payload,
 )
 from zlc_frontend.display_range import RelimMode
 from zlc_frontend.encoded_raster import EncodedRasterDocument
-from zlc_frontend.figure import AxisViewRole, ViewIntent
+from zlc_frontend.figure import ViewIntent
 from zlc_frontend.histogram_display import (
     FacetedHistogramDisplayState,
     HistogramDisplayState,
     histogram_display_with_thresholds,
+    histogram_display_with_x_view,
 )
 from zlc_frontend.image_display import ImageDisplayState, image_display_for_viewport
 from zlc_frontend.qt_widgets import (
@@ -62,6 +61,7 @@ from zlc_frontend.qt_widgets import (
     FluentPopup,
     FluentRevisionedFormEditor,
     FluentSwitch,
+    FrozenRasterWindow,
     FigureSurfaceContext,
     FigureSurfaceHost,
     GREY,
@@ -71,9 +71,16 @@ from zlc_frontend.qt_widgets import (
     FrozenRasterView,
     runtime_range_placeholders,
     FluentSettingsPopupAnchor,
+    error_summary,
     sync_revisioned_form_editors,
 )
 from zlc_frontend.plot_layout import PanelSurfaceGeometry, panel_surface_geometry
+from zlc_frontend.panel_params import (
+    panel_display_form_spec,
+    panel_display_form_values,
+    panel_display_state_from_form,
+    panel_display_state_intent,
+)
 from zlc_frontend.selector import (
     CurveInteractionIntent,
     CurveRangeGesture,
@@ -89,22 +96,20 @@ from zlc_frontend.selector import (
     RectangleGesture,
 )
 from zlc_neutral_atom.artifacts import FitResultArtifactRef
-from zlc_workbench.data_figure.fit_draft import FitDraftAuthority, FitDraftResult
 from zlc_storage import nonnegative_integer
 from zlc_storage.paths import user_output_path
-from zlc_workbench.frozen_raster import FrozenRasterWindow
-from zlc_workbench.window_runtime import cancel_export_commits, error_summary
+from zlc_workbench.window_runtime import (
+    cancel_export_commits,
+    submit_compute,
+)
 
 from .fit_contract import (
-    FitOverlayRequest,
     FitSaveReceipt,
     FitWorkbenchBindings,
-    same_fit_overlay_request,
 )
 from .worker_jobs import (
     DataFigureSurfaceResult,
-    _FIT_WORK_EXECUTOR,
-    _execute_fit_draft,
+    _execute_snapshot_fit,
     _execute_surface_work,
     _export_encoded_png,
     _export_typed_png,
@@ -123,10 +128,8 @@ class DataFigureWindow(FrozenRasterWindow):
         self,
         initial_loader,
         typed_renderer,
-        fit_overlay_renderer=None,
         *,
         fit_bindings: FitWorkbenchBindings | None = None,
-        typed_front_committed=None,
         worker_release=None,
         initial_display: DataFigureDisplayState | None = None,
         embedded: bool = False,
@@ -139,21 +142,13 @@ class DataFigureWindow(FrozenRasterWindow):
             FitWorkbenchBindings,
         ):
             raise TypeError("fit_bindings must be FitWorkbenchBindings or None")
-        if (fit_bindings is None) != (fit_overlay_renderer is None):
-            raise ValueError("Fit bindings and overlay renderer must be supplied together")
-        if fit_overlay_renderer is not None and not callable(fit_overlay_renderer):
-            raise TypeError("fit_overlay_renderer must be callable or None")
-        if typed_front_committed is not None and not callable(typed_front_committed):
-            raise TypeError("typed_front_committed must be callable or None")
         if initial_display is not None:
-            display_state_intent(initial_display)
+            panel_display_state_intent(initial_display)
         if not isinstance(embedded, bool):
             raise TypeError("embedded must be bool")
         initial_surface = panel_surface_geometry(surface_size_name)
         self._typed_renderer = typed_renderer
-        self._fit_overlay_renderer = fit_overlay_renderer
         self._fit_bindings = fit_bindings
-        self._typed_front_committed = typed_front_committed
         self._initial_display = initial_display
         self._embedded = embedded
         self._surface_size_name = initial_surface.size_name
@@ -182,10 +177,6 @@ class DataFigureWindow(FrozenRasterWindow):
         self._edit_display: FluentRevisionedFormEditor | None = None
         self._setting_display: FluentRevisionedFormEditor | None = None
         self._export_commit_lock = threading.Lock()
-        self._visible_transient_fit_result_owner: FitResultBatch | None = None
-        self._fit_sources: tuple[AxisSourceRef, ...] = ()
-        self._fit_axis_roles: tuple[tuple[AxisSourceRef, AxisViewRole], ...] = ()
-        self._visible_fit_result_identity: str | None = None
         self._grid_overview: DataFigureGridOverview | None = None
         self._visible_figure: DataFigure | None = None
         self._grid_focus_pending: DataFigureGridFocusRequest | None = None
@@ -196,18 +187,17 @@ class DataFigureWindow(FrozenRasterWindow):
         self._fit_job_revision: int | None = None
         self._fit_editor_revision = 0
         self._fit_prepare_pending = False
-        self._fit_overlay_desired: FitOverlayRequest | None = None
-        self._fit_overlay_pending: FitOverlayRequest | None = None
-        self._fit_overlay_inflight: FitOverlayRequest | None = None
         self._fit_selection_candidate: Selection | None = None
         self._fit_initial_selection_consumed = False
         self._fit_auto_open_consumed = False
         self._fit_options: dict[str, FitAuthoringOption] = {}
         self._fit_authoring_draft: FitAuthoringDraft | None = None
         self._fit_cancelled: threading.Event | None = None
-        self._fit_draft: FitDraftResult | None = None
-        self._fit_draft_summary: str | None = None
-        self._fit_save_inflight: FitDraftResult | None = None
+        self._fit_execution: object | None = None
+        self._fit_result: FitResultBatch | None = None
+        self._fit_result_summary: str | None = None
+        self._fit_save_inflight: tuple[object, FitResultBatch, str] | None = None
+        self._fit_invocation = 0
         self._deferred_fit_reload: tuple[FitSaveReceipt, int] | None = None
         self._saved_fit_receipt: FitSaveReceipt | None = None
         self._saved_fit_reference: FitResultArtifactRef | None = None
@@ -220,24 +210,6 @@ class DataFigureWindow(FrozenRasterWindow):
         self._close_deferred_during_fit_save = False
         self._fit_pane: FitAuthoringPane | None = None
         self._fit_save_button: FluentButton | None = None
-        self._fit_authority: FitDraftAuthority | None = None
-        if fit_bindings is not None:
-            def execute_for_authority(spec, cancel_check, deadline):
-                execution = fit_bindings.execute(
-                    spec,
-                    cancel_check,
-                    deadline,
-                )
-                return execution, fit_bindings.result(execution)
-
-            self._fit_authority = FitDraftAuthority(
-                execute_for_authority,
-                lambda execution, destination, display: fit_bindings.save(
-                    execution,
-                    destination,
-                    display,
-                ),
-            )
 
         super().__init__(
             None,
@@ -397,9 +369,6 @@ class DataFigureWindow(FrozenRasterWindow):
         # scroll host.  They are not interactive named panel surfaces.
         if self._view_family == "encoded":
             return
-        self._surface_host.clear()
-        for board in self._boards:
-            board.clear()
         if self._initial_outcome is not None:
             self._status.setText("UPDATING DISPLAY")
         self._set_typed_controls_enabled(False)
@@ -442,22 +411,17 @@ class DataFigureWindow(FrozenRasterWindow):
         display = self._display
         if display is None:
             raise RuntimeError("typed surface refresh lost its display state")
-        overlay = self._fit_overlay_desired
         self._pending_state = display
-        self._fit_overlay_inflight = overlay
         self._active_kind = "surface"
         self._status.setText(f"UPDATING {family.upper()} DISPLAY")
         if not self._submit_surface_future(
             "surface",
             self._typed_renderer,
-            None if overlay is None else overlay.result,
-            None if overlay is None else overlay.result_identity,
             display,
             self._request_revision,
             self._cancelled,
         ):
             self._pending_state = None
-            self._fit_overlay_inflight = None
             self._active_kind = None
 
     def _emit_initial_ready(self) -> None:
@@ -565,8 +529,6 @@ class DataFigureWindow(FrozenRasterWindow):
         if renderer is None or not self._submit_surface_future(
             "grid_focus",
             renderer,
-            None,
-            None,
             request,
             self._request_revision,
             self._cancelled,
@@ -591,11 +553,6 @@ class DataFigureWindow(FrozenRasterWindow):
         self._surface_host.clear()
         self._display = None
         self._typed_contract = None
-        self._visible_fit_result_identity = None
-        self._visible_transient_fit_result_owner = None
-        self._fit_sources = ()
-        self._fit_axis_roles = ()
-        self._fit_overlay_desired = None
         self._visible_figure = overview.figure
         self._view_family = f"{overview.intent.value.lower()}-overview"
         overview_board = self._boards[0]
@@ -649,7 +606,6 @@ class DataFigureWindow(FrozenRasterWindow):
         return bool(
             self._future is None
             and self._fit_future is None
-            and self._fit_overlay_pending is None
             and self._surface_job is None
             and self._surface_retry is None
             and not self._surface_refresh_pending
@@ -661,7 +617,7 @@ class DataFigureWindow(FrozenRasterWindow):
 
     @property
     def draft_ready(self) -> bool:
-        return self._fit_draft is not None
+        return self._fit_execution is not None and self._fit_result is not None
 
     @property
     def saved_reference(self) -> FitResultArtifactRef | None:
@@ -702,6 +658,12 @@ class DataFigureWindow(FrozenRasterWindow):
             return payload.viewport.count_limits
         return None
 
+    def _display_plot_kind(self):
+        context = self._surface_host.context
+        if context is None:
+            raise RuntimeError("typed display has no admitted Figure context")
+        return context.contract.figure.kind
+
     def _runtime_placeholders(self):
         display = self._display
         if isinstance(display, ImageDisplayState):
@@ -733,8 +695,8 @@ class DataFigureWindow(FrozenRasterWindow):
         if self._edit_display is not None or self._setting_display is not None:
             if (
                 self._display is not None
-                and display_state_intent(self._display)
-                is not display_state_intent(state)
+                and panel_display_state_intent(self._display)
+                is not panel_display_state_intent(state)
             ):
                 raise RuntimeError("typed window cannot change family")
             return
@@ -754,7 +716,9 @@ class DataFigureWindow(FrozenRasterWindow):
         else:
             runtime_fields = ("count_min", "count_max")
             subject = "histogram display"
-        spec = data_figure_display_form_spec(state)
+        spec = panel_display_form_spec(self._display_plot_kind())
+        if spec is None:
+            raise ValueError("current Figure kind has no authored display form")
         edit = None
         setting = None
         try:
@@ -823,7 +787,7 @@ class DataFigureWindow(FrozenRasterWindow):
             self._editors(),
             revision=display.revision,
             semantic_identity=display,
-            values=data_figure_display_form_values(display),
+            values=panel_display_form_values(self._display_plot_kind(), display),
             runtime_placeholders=self._runtime_placeholders(),
             accepted_editor=accepted_editor,
             accepted_base_revision=accepted_base_revision,
@@ -870,7 +834,7 @@ class DataFigureWindow(FrozenRasterWindow):
         editor.load(
             revision=display.revision,
             semantic_identity=display,
-            values=data_figure_display_form_values(display),
+            values=panel_display_form_values(self._display_plot_kind(), display),
             runtime_placeholders=self._runtime_placeholders(),
         )
 
@@ -960,8 +924,6 @@ class DataFigureWindow(FrozenRasterWindow):
             return "render"
         if (
             self._future is not None
-            or self._fit_overlay_pending is not None
-            or self._fit_overlay_inflight is not None
             or self._deferred_fit_reload is not None
         ):
             return "render"
@@ -975,11 +937,11 @@ class DataFigureWindow(FrozenRasterWindow):
             busy = self._fit_authoring_busy_kind()
             pane.set_busy(
                 busy,
-                draft_ready=self._fit_draft is not None,
+                draft_ready=self.draft_ready,
             )
             if self._fit_save_button is not None:
                 self._fit_save_button.setEnabled(
-                    busy is None and self._fit_draft is not None
+                    busy is None and self.draft_ready
                 )
 
     def _open_fit_pane(self) -> None:
@@ -1010,7 +972,7 @@ class DataFigureWindow(FrozenRasterWindow):
         if self._fit_future is not None:
             raise RuntimeError("Fit worker already has active work")
         try:
-            future = _FIT_WORK_EXECUTOR.submit(function, *args)
+            future = submit_compute(function, *args)
         except BaseException as error:
             self._status.setText("FIT SUBMISSION FAILED")
             self._diagnostic.setText(error_summary(error))
@@ -1027,7 +989,6 @@ class DataFigureWindow(FrozenRasterWindow):
             bindings is None
             or pane is None
             or self._closing
-            or not self._fit_sources
             or not self._fit_pane_is_open()
         ):
             return
@@ -1038,14 +999,14 @@ class DataFigureWindow(FrozenRasterWindow):
             self._fit_prepare_pending = True
             return
         self._fit_prepare_pending = False
-        pane.set_busy("prepare", draft_ready=self._fit_draft is not None)
+        pane.set_busy("prepare", draft_ready=self.draft_ready)
         self._status.setText("PREPARING FIT")
         self._diagnostic.setText("")
         self._fit_job_revision = self._fit_editor_revision
         visible_figure = self._visible_figure
         visible_payload = self._visible_typed_payload()
         if visible_figure is None or visible_payload is None:
-            pane.set_busy(None, draft_ready=self._fit_draft is not None)
+            pane.set_busy(None, draft_ready=self.draft_ready)
             self._status.setText("FIT SOURCE NOT READY")
             return
         histogram_projection = (
@@ -1058,21 +1019,16 @@ class DataFigureWindow(FrozenRasterWindow):
             _prepare_fit_options,
             bindings.prepare,
             visible_figure,
-            self._fit_sources,
-            self._fit_axis_roles,
             self._fit_selection_candidate,
             histogram_projection,
-            bindings.allow_prepared_transform,
         ):
             self._fit_job_revision = None
-            pane.set_busy(None, draft_ready=self._fit_draft is not None)
+            pane.set_busy(None, draft_ready=self.draft_ready)
 
-    def _discard_fit_draft(self) -> None:
-        draft, self._fit_draft = self._fit_draft, None
-        self._fit_draft_summary = None
-        authority = self._fit_authority
-        if draft is not None and authority is not None:
-            authority.discard(draft)
+    def _discard_snapshot_fit(self) -> None:
+        self._fit_execution = None
+        self._fit_result = None
+        self._fit_result_summary = None
 
     def _capture_fit_authoring_draft(self) -> None:
         """Retain the pane's reversible model/args text before option refresh."""
@@ -1090,7 +1046,7 @@ class DataFigureWindow(FrozenRasterWindow):
         # A saved-result reload belongs to the exact editor revision that
         # requested the save; never occupy the lane with stale authority.
         self._deferred_fit_reload = None
-        self._discard_fit_draft()
+        self._discard_snapshot_fit()
         if self._fit_job_kind == "fit" and self._fit_cancelled is not None:
             self._fit_cancelled.set()
         if prepare:
@@ -1124,11 +1080,9 @@ class DataFigureWindow(FrozenRasterWindow):
 
     def _start_fit(self, _pane_revision: int, spec: FitSpec) -> None:
         pane = self._fit_pane
-        authority = self._fit_authority
         bindings = self._fit_bindings
         if (
             pane is None
-            or authority is None
             or bindings is None
             or self._closing
             or self._fit_future is not None
@@ -1152,19 +1106,32 @@ class DataFigureWindow(FrozenRasterWindow):
             self._diagnostic.setText(error_summary(error))
             return
 
-        self._discard_fit_draft()
+        visible_figure = self._visible_figure
+        source_frame = self._surface_host.front_frame
+        if visible_figure is None or source_frame is None:
+            self._status.setText("FIT SOURCE NOT READY")
+            return
+        self._discard_snapshot_fit()
         self._fit_cancelled = threading.Event()
         self._fit_job_revision = self._fit_editor_revision
+        self._fit_invocation += 1
+        result_identity = (
+            f"snapshot-fit:r{self._fit_editor_revision}:i{self._fit_invocation}"
+        )
         deadline = time.monotonic() + bindings.timeout_seconds
         pane.set_busy("fit", draft_ready=False)
         self._status.setText("FITTING")
         self._summary.setText(pane.axis_summary_text)
         self._diagnostic.setText("")
-        self._queue_fit_overlay(None, None)
+        self._surface_host.clear_fit_overlays()
         if not self._submit_fit_future(
             "fit",
-            _execute_fit_draft,
-            authority,
+            _execute_snapshot_fit,
+            bindings.execute,
+            bindings.result,
+            visible_figure,
+            source_frame,
+            result_identity,
             spec,
             deadline,
             self._cancelled,
@@ -1176,14 +1143,16 @@ class DataFigureWindow(FrozenRasterWindow):
 
     def _save_fit(self) -> None:
         pane = self._fit_pane
-        authority = self._fit_authority
         bindings = self._fit_bindings
-        draft = self._fit_draft
+        execution = self._fit_execution
+        result = self._fit_result
+        summary = self._fit_result_summary
         if (
             pane is None
-            or authority is None
             or bindings is None
-            or draft is None
+            or execution is None
+            or result is None
+            or summary is None
             or self._fit_future is not None
             or self._closing
         ):
@@ -1205,7 +1174,8 @@ class DataFigureWindow(FrozenRasterWindow):
                 destination = Path(selected)
                 if not destination.suffix:
                     destination = destination.with_suffix(".npz")
-        self._fit_save_inflight = draft
+        self._fit_save_inflight = (execution, result, summary)
+        self._discard_snapshot_fit()
         self._fit_job_revision = self._fit_editor_revision
         pane.set_busy("save", draft_ready=True)
         if self._fit_save_button is not None:
@@ -1219,12 +1189,15 @@ class DataFigureWindow(FrozenRasterWindow):
         self._diagnostic.setText("")
         if not self._submit_fit_future(
             "save",
-            authority.save,
-            draft,
+            bindings.save,
+            execution,
             destination,
             self._display,
         ):
             self._fit_save_inflight = None
+            self._fit_execution = execution
+            self._fit_result = result
+            self._fit_result_summary = summary
             self._fit_job_revision = None
             pane.set_busy(None, draft_ready=True)
             if self._fit_save_button is not None:
@@ -1239,8 +1212,8 @@ class DataFigureWindow(FrozenRasterWindow):
         self._fit_editor_revision += 1
         if fitting and self._fit_cancelled is not None:
             self._fit_cancelled.set()
-        self._discard_fit_draft()
-        self._queue_fit_overlay(None, None)
+        self._discard_snapshot_fit()
+        self._surface_host.clear_fit_overlays()
         pane = self._fit_pane
         if pane is not None:
             pane.set_busy("fit" if fitting else None, draft_ready=False)
@@ -1249,65 +1222,6 @@ class DataFigureWindow(FrozenRasterWindow):
         self._status.setText("CLEARING FIT" if fitting else "FIT CLEARED")
         self._summary.setText("Source view preserved; selection remains a draft candidate")
         self._diagnostic.setText("")
-
-    def _queue_fit_overlay(
-        self,
-        result: FitResultBatch | None,
-        result_identity: str | None,
-    ) -> None:
-        if self._fit_overlay_renderer is None or self._display is None:
-            return
-        request = FitOverlayRequest(
-            self._fit_editor_revision,
-            result,
-            result_identity,
-        )
-        self._fit_overlay_desired = request
-        if (
-            self._fit_overlay_inflight is None
-            and self._fit_overlay_pending is None
-            and self._visible_fit_result_identity == result_identity
-        ):
-            return
-        self._fit_overlay_pending = request
-        self._start_pending_fit_overlay()
-
-    def _start_pending_fit_overlay(self) -> None:
-        request = self._fit_overlay_pending
-        display = self._display
-        renderer = self._fit_overlay_renderer
-        if (
-            request is None
-            or display is None
-            or renderer is None
-            or self._future is not None
-            or self._closing
-            or self._completion_handoff_active
-        ):
-            return
-        candidate = replace(display, revision=display.revision + 1)
-        self._request_revision += 1
-        self._active_kind = "fit_overlay"
-        self._pending_state = candidate
-        self._fit_overlay_inflight = request
-        self._fit_overlay_pending = None
-        self._status.setText("RENDERING FIT OVERLAY")
-        self._set_typed_controls_enabled(False)
-        if not self._submit_surface_future(
-            "fit_overlay",
-            renderer,
-            request.result,
-            request.result_identity,
-            candidate,
-            self._request_revision,
-            self._cancelled,
-        ):
-            self._fit_overlay_inflight = None
-            self._pending_state = None
-            self._active_kind = None
-            self._set_typed_controls_enabled(True)
-        else:
-            self._sync_fit_authoring_busy()
 
     def _reapply_fit_candidate(self) -> None:
         selection = self._fit_selection_candidate
@@ -1361,7 +1275,8 @@ class DataFigureWindow(FrozenRasterWindow):
                 )
             if not isinstance(values, dict):
                 raise TypeError("typed display form must emit one exact mapping")
-            candidate = data_figure_display_state_from_form(
+            candidate, _rolling_distribution = panel_display_state_from_form(
+                self._display_plot_kind(),
                 display,
                 values,
                 current_value_limits=self._visible_value_limits(),
@@ -1519,13 +1434,16 @@ class DataFigureWindow(FrozenRasterWindow):
             return
         if command.viewport.display_revision != display.revision + 1:
             raise RuntimeError("numeric viewport commit must advance once")
-        self._start_typed_render(
-            data_figure_display_state_with_x_view(
-                display,
-                command.viewport.x_limits,
-            ),
-            origin=origin,
+        candidate = (
+            curve_display_with_x_view(display, command.viewport.x_limits)
+            if isinstance(display, CurveDisplayState)
+            else histogram_display_with_x_view(display, command.viewport.x_limits)
+            if isinstance(display, HistogramDisplayState)
+            else None
         )
+        if candidate is None:
+            raise TypeError("numeric viewport requires CURVE or HISTOGRAM state")
+        self._start_typed_render(candidate, origin=origin)
 
     def _start_typed_render(
         self,
@@ -1549,7 +1467,7 @@ class DataFigureWindow(FrozenRasterWindow):
             raise RuntimeError("typed figure is not ready")
         if self._future is not None or self._closing:
             raise RuntimeError("typed render is already active")
-        if display_state_intent(candidate) is not display_state_intent(display):
+        if panel_display_state_intent(candidate) is not panel_display_state_intent(display):
             raise TypeError("candidate belongs to another typed family")
         if candidate == display:
             if origin is not None:
@@ -1570,21 +1488,14 @@ class DataFigureWindow(FrozenRasterWindow):
         self._status.setText(f"RENDERING {self._view_family.upper()}")
         self._diagnostic.setText("")
         self._set_typed_controls_enabled(False)
-        overlay = self._fit_overlay_desired
-        overlay_result = None if overlay is None else overlay.result
-        overlay_identity = None if overlay is None else overlay.result_identity
-        self._fit_overlay_inflight = overlay
         submitted = self._submit_surface_future(
             "typed",
             self._typed_renderer,
-            overlay_result,
-            overlay_identity,
             candidate,
             self._request_revision,
             self._cancelled,
         )
         if not submitted:
-            self._fit_overlay_inflight = None
             self._discard_pending_typed()
         else:
             self._sync_fit_authoring_busy()
@@ -1592,7 +1503,6 @@ class DataFigureWindow(FrozenRasterWindow):
     def _discard_pending_typed(self) -> None:
         origin = self._pending_origin
         family = self._view_family
-        self._fit_overlay_inflight = None
         self._pending_state = None
         self._pending_origin = None
         self._pending_editor = None
@@ -1618,19 +1528,20 @@ class DataFigureWindow(FrozenRasterWindow):
             self._diagnostic.setText(suffix if not existing else f"{existing} | {suffix}")
 
     @staticmethod
-    def _validate_authored_front(
-        front: DataFigureFront,
+    def _validate_authored_frame(
+        frame: BoardFrame,
+        context: FigureSurfaceContext,
         expected_state: DataFigureDisplayState,
     ) -> tuple[tuple[object, ...], tuple[object, ...]]:
         # The worker validates the semantic payload.  Qt repeats only compact
         # display fields and immutable object identities; it never rescans a
         # coordinate vector or trusts a token detached from the current frame.
-        if (
-            front.state != expected_state
-            or front.intent is not display_state_intent(expected_state)
-        ):
+        if context.display != expected_state:
             raise ValueError("typed worker returned conflicting authored state")
-        payload = front.frame.panels[0].display_payload
+        if context.figure is None:
+            raise ValueError("typed worker returned no exact DataFigure")
+        intent = panel_display_state_intent(expected_state)
+        payload = frame.panels[0].display_payload
         assert isinstance(
             payload,
             (
@@ -1643,20 +1554,47 @@ class DataFigureWindow(FrozenRasterWindow):
         validate_rendered_data_figure_payload(
             payload,
             expected_state,
-            front.fit_result_identity,
+            None,
         )
-        current = data_figure_front_contract(front.intent, front.frame)
-        frozen_identity, frozen_data = front.data_contract
-        identity, exact_data = current
-        if identity != frozen_identity:
-            raise ValueError("typed worker changed frozen source provenance")
-        if not same_exact_data_owners(exact_data, frozen_data):
-            raise ValueError("typed worker changed frozen evaluated data")
-        return current
+        return data_figure_frame_contract(intent, frame)
+
+    @staticmethod
+    def _typed_completion(
+        result: object,
+    ) -> tuple[BoardFrame, FigureSurfaceContext, object | None]:
+        if (
+            isinstance(result, tuple)
+            and len(result) == 3
+            and isinstance(result[0], BoardFrame)
+            and isinstance(result[1], FigureSurfaceContext)
+        ):
+            return result
+        raise TypeError("typed Figure worker returned another completion")
+
+    def _install_initial_fit_overlays(
+        self,
+        frame: BoardFrame,
+        context: FigureSurfaceContext,
+        overlays: object | None,
+    ) -> None:
+        if overlays is None:
+            return
+        if context.figure is None:
+            raise RuntimeError("Fit overlay has no exact source Figure")
+        status = self._surface_host.install_fit_overlays(
+            context.figure,
+            frame,
+            overlays,
+        )
+        if status != "CURRENT":
+            raise RuntimeError(
+                "saved Fit overlay was not current with its admitted base"
+            )
 
     def _present_typed_front(
         self,
-        front: DataFigureFront,
+        frame: BoardFrame,
+        context: FigureSurfaceContext,
         *,
         expected_state: DataFigureDisplayState,
         request_revision: int,
@@ -1665,54 +1603,44 @@ class DataFigureWindow(FrozenRasterWindow):
             request_revision,
             "typed request revision",
         )
-        if front.frame.sequence != request_revision:
+        if frame.sequence != request_revision:
             raise ValueError("typed worker returned another request sequence")
-        if front.raster_size != self._surface_geometry.raster_size:
+        contract = context.contract
+        figure = context.figure
+        if figure is None:
+            raise ValueError("typed worker returned no exact DataFigure")
+        if contract.pixel_size != self._surface_geometry.raster_size:
             raise ValueError("typed worker returned another raster surface geometry")
-        contract = self._validate_authored_front(front, expected_state)
+        if figure.has_fit_overlays:
+            raise ValueError("DataFigure base renderer returned a composed Fit result")
+        frame_contract = self._validate_authored_frame(
+            frame,
+            context,
+            expected_state,
+        )
         expected_contract = self._typed_contract
         if expected_contract is not None:
             expected_identity, expected_data = expected_contract
-            identity, exact_data = contract
+            identity, exact_data = frame_contract
             if identity[0] != expected_identity[0]:
                 raise ValueError("typed worker changed frozen source provenance")
             if not same_exact_data_owners(exact_data, expected_data):
                 raise ValueError("typed worker changed frozen evaluated data")
 
         self._surface_host.present_frame(
-            front.frame,
-            context=FigureSurfaceContext.for_frame(
-                front.frame,
-                figure=front.figure,
-                display=expected_state,
-                contract=front.surface_contract,
-            ),
-            logical_size=front.surface_contract.logical_size,
+            frame,
+            context=context,
+            logical_size=contract.logical_size,
         )
         # The admitted board front is the transaction boundary.  Commit the
         # exact Figure/authored state/contract before cache release or any
         # optional Qt chrome work.
         if expected_contract is None:
-            self._typed_contract = contract
+            self._typed_contract = frame_contract
         self._display = expected_state
-        self._visible_figure = front.figure
-        self._view_family = front.intent.value.lower()
-        self._fit_sources = front.fit_sources
-        self._fit_axis_roles = front.axis_roles
-        self._visible_fit_result_identity = front.fit_result_identity
-        self._visible_transient_fit_result_owner = (
-            front.transient_fit_result_owner
-        )
-        if self._typed_front_committed is not None:
-            self._typed_front_committed(
-                front.release_initial_canonical_on_commit
-            )
-        if front.intent is not ViewIntent.METER and self._fit_overlay_desired is None:
-            self._fit_overlay_desired = FitOverlayRequest(
-                self._fit_editor_revision,
-                None,
-                front.fit_result_identity,
-            )
+        self._visible_figure = figure
+        intent = panel_display_state_intent(expected_state)
+        self._view_family = intent.value.lower()
         # Page/chrome and controls are ancillary to the already-admitted
         # immutable data front.  Their faults can disable UI, never roll it back.
         try:
@@ -1725,20 +1653,20 @@ class DataFigureWindow(FrozenRasterWindow):
             if not self._typed_pages_admitted:
                 if self._grid_overview is None:
                     self._retire_tab_pages()
-                self._tabs.addTab(self._typed_page, front.intent.value.title())
+                self._tabs.addTab(self._typed_page, intent.value.title())
                 self._tabs.tabBar().setVisible(False)
                 self._typed_page.show()
                 self._typed_pages_admitted = True
             self._tabs.setCurrentWidget(self._typed_page)
-            fit_capable = self._fit_available_for_intent(front.intent)
+            fit_capable = self._fit_available_for_intent(intent)
             self._mode.setText(
-                f"EXACT {front.intent.value} · DISPLAY ONLY"
-                if front.intent is ViewIntent.METER
-                else f"EXACT {front.intent.value} · INTERACTIVE"
+                f"EXACT {intent.value} · DISPLAY ONLY"
+                if intent is ViewIntent.METER
+                else f"EXACT {intent.value} · INTERACTIVE"
                 + ("" if fit_capable else " · DISPLAY ONLY")
             )
             self._status.setText("READY")
-            self._summary.setText(front.summary)
+            self._summary.setText(data_figure_summary(figure))
             self._diagnostic.setText("")
         except BaseException as error:
             self._typed_ui_faulted = True
@@ -1747,7 +1675,7 @@ class DataFigureWindow(FrozenRasterWindow):
             self._status.setText("TYPED CONTROLS FAILED")
             self._diagnostic.setText(error_summary(error))
             return
-        if front.intent is ViewIntent.METER:
+        if intent is ViewIntent.METER:
             for widget in (
                 self._interaction_switch,
                 self._settings_button,
@@ -1773,7 +1701,7 @@ class DataFigureWindow(FrozenRasterWindow):
             ):
                 widget.show()
             self._overview_button.setVisible(self._grid_overview is not None)
-            if self._fit_available_for_intent(front.intent):
+            if self._fit_available_for_intent(intent):
                 self._fit_button.show()
                 if not self._fit_initial_selection_consumed:
                     initial = self._fit_bindings.initial_selection
@@ -1793,7 +1721,7 @@ class DataFigureWindow(FrozenRasterWindow):
                 if (
                     self._grid_overview is not None
                     and self._fit_bindings is not None
-                    and front.intent is ViewIntent.CURVE
+                    and intent is ViewIntent.CURVE
                 ):
                     self._diagnostic.setText(
                         "Fit unavailable: grid focus is a display projection; "
@@ -1889,8 +1817,12 @@ class DataFigureWindow(FrozenRasterWindow):
         if kind == "save":
             self._close_deferred_during_fit_save = False
         pane = self._fit_pane
-        completed_draft: FitDraftResult | None = None
+        completed_execution: object | None = None
+        completed_result: FitResultBatch | None = None
         completed_summary: str | None = None
+        completed_figure: DataFigure | None = None
+        completed_source_frame: object | None = None
+        completed_overlays: object | None = None
         try:
             result = future.result()
             if kind == "prepare":
@@ -1900,14 +1832,22 @@ class DataFigureWindow(FrozenRasterWindow):
             elif kind == "fit":
                 if (
                     not isinstance(result, tuple)
-                    or len(result) != 2
-                    or not isinstance(result[0], FitDraftResult)
-                    or not isinstance(result[1], str)
+                    or len(result) != 6
+                    or result[0] is None
+                    or not isinstance(result[1], FitResultBatch)
+                    or not isinstance(result[2], str)
+                    or not isinstance(result[3], DataFigure)
+                    or result[4] is None
+                    or result[5] is None
                 ):
-                    raise TypeError("Fit worker returned another draft type")
+                    raise TypeError("Fit worker returned another snapshot result")
                 (
-                    completed_draft,
+                    completed_execution,
+                    completed_result,
                     completed_summary,
+                    completed_figure,
+                    completed_source_frame,
+                    completed_overlays,
                 ) = result
                 if fit_cancelled is not None and fit_cancelled.is_set():
                     raise CancelledError()
@@ -1922,8 +1862,6 @@ class DataFigureWindow(FrozenRasterWindow):
             else:
                 raise RuntimeError(f"unknown Fit worker completion {kind!r}")
         except (CancelledError, FitCancelled):
-            if completed_draft is not None and self._fit_authority is not None:
-                self._fit_authority.discard(completed_draft)
             if not self._closing:
                 self._status.setText("FIT CANCELLED")
                 self._diagnostic.setText("")
@@ -1932,8 +1870,6 @@ class DataFigureWindow(FrozenRasterWindow):
                 self._status.setText("FIT DEADLINE EXCEEDED")
                 self._diagnostic.setText(error_summary(error))
         except BaseException as error:
-            if completed_draft is not None and self._fit_authority is not None:
-                self._fit_authority.discard(completed_draft)
             if not self._closing:
                 label = {
                     "prepare": "FIT PREPARATION FAILED",
@@ -1945,15 +1881,16 @@ class DataFigureWindow(FrozenRasterWindow):
                 self._diagnostic.setText(error_summary(error))
                 if kind == "save" and save_inflight is not None:
                     if job_revision == self._fit_editor_revision:
-                        self._fit_draft = save_inflight
+                        (
+                            self._fit_execution,
+                            self._fit_result,
+                            self._fit_result_summary,
+                        ) = save_inflight
                     else:
-                        if self._fit_authority is not None:
-                            self._fit_authority.discard(save_inflight)
                         self._status.setText("FIT SAVE FAILED · EDITOR CHANGED")
         else:
             if self._closing:
-                if completed_draft is not None and self._fit_authority is not None:
-                    self._fit_authority.discard(completed_draft)
+                pass
             elif kind == "prepare":
                 if job_revision != self._fit_editor_revision:
                     self._fit_prepare_pending = True
@@ -1995,28 +1932,33 @@ class DataFigureWindow(FrozenRasterWindow):
                         "Fit submits the displayed named axes; zoom is presentation only."
                     )
             elif kind == "fit":
-                assert completed_draft is not None
+                assert completed_execution is not None
+                assert completed_result is not None
                 assert completed_summary is not None
+                assert completed_figure is not None
+                assert completed_source_frame is not None
+                assert completed_overlays is not None
                 if job_revision != self._fit_editor_revision:
-                    assert self._fit_authority is not None
-                    self._fit_authority.discard(completed_draft)
                     self._status.setText("STALE FIT DISCARDED")
                 else:
-                    self._fit_draft = completed_draft
-                    self._fit_draft_summary = completed_summary
-                    identity = (
-                        f"draft-fit:r{job_revision}:g{completed_draft.generation}"
-                    )
-                    self._queue_fit_overlay(
-                        completed_draft.result,
-                        identity,
+                    self._fit_execution = completed_execution
+                    self._fit_result = completed_result
+                    self._fit_result_summary = completed_summary
+                    overlay_status = self._surface_host.install_fit_overlays(
+                        completed_figure,
+                        completed_source_frame,
+                        completed_overlays,
                     )
                     self._status.setText("DRAFT FIT READY")
                     self._summary.setText(completed_summary)
-                    self._diagnostic.setText("")
+                    self._diagnostic.setText(
+                        ""
+                        if overlay_status == "CURRENT"
+                        else f"Fit overlay {overlay_status.lower()} for the current view"
+                    )
             elif kind == "save":
-                # The persistence receipt is accepted before any later overlay
-                # rendering.  Nothing after this assignment may erase it.
+                # Persistence authority is independent of the already-painted
+                # vector layer.  Nothing after this assignment may erase it.
                 self._saved_fit_receipt = receipt
                 artifact_reference = receipt.artifact_reference
                 if artifact_reference is not None and not isinstance(
@@ -2030,16 +1972,11 @@ class DataFigureWindow(FrozenRasterWindow):
                 saved_path = getattr(receipt.handle, "path", None)
                 if saved_path is not None:
                     self._fit_save_path = Path(saved_path)
-                self._fit_draft = None
-                self._fit_draft_summary = None
+                self._discard_snapshot_fit()
                 self.fitSaved.emit(receipt.handle)
                 if job_revision != self._fit_editor_revision:
                     self._status.setText("FIT SAVED · EDITOR CHANGED")
                 elif receipt.reloaded_result is not None and not close_after_save:
-                    self._queue_fit_overlay(
-                        receipt.reloaded_result,
-                        receipt.identity,
-                    )
                     self._status.setText("FIT SAVED")
                 else:
                     self._status.setText("FIT SAVED · REOPENING")
@@ -2068,10 +2005,6 @@ class DataFigureWindow(FrozenRasterWindow):
                 if receipt is None:
                     raise RuntimeError("saved Fit reload lost its persistence receipt")
                 if job_revision == self._fit_editor_revision:
-                    self._queue_fit_overlay(
-                        reloaded_result,
-                        receipt.identity,
-                    )
                     self._status.setText("FIT SAVED")
                     self._diagnostic.setText("")
                 else:
@@ -2096,14 +2029,22 @@ class DataFigureWindow(FrozenRasterWindow):
                         self._diagnostic.text()
                         or "initial encoded figure could not be presented"
                     )
-            elif isinstance(result, DataFigureFront):
+            elif (
+                isinstance(result, tuple)
+                and len(result) == 3
+                and isinstance(result[0], BoardFrame)
+                and isinstance(result[1], FigureSurfaceContext)
+            ):
+                frame, context, overlays = self._typed_completion(result)
                 self._present_typed_front(
-                    result,
-                    expected_state=result.state,
+                    frame,
+                    context,
+                    expected_state=context.display,
                     request_revision=self._request_revision,
                 )
+                self._install_initial_fit_overlays(frame, context, overlays)
                 if (
-                    result.intent is not ViewIntent.METER
+                    panel_display_state_intent(context.display) is not ViewIntent.METER
                     and not self._typed_ui_faulted
                 ):
                     self._sync_committed_typed_controls()
@@ -2121,8 +2062,7 @@ class DataFigureWindow(FrozenRasterWindow):
             self._active_kind = None
             return
         if kind == "grid_focus":
-            if not isinstance(result, DataFigureFront):
-                raise TypeError("typed grid focus worker returned another result")
+            frame, context, overlays = self._typed_completion(result)
             pending = self._grid_focus_pending
             if pending is None:
                 raise RuntimeError("typed grid focus completed without a pending panel")
@@ -2136,19 +2076,22 @@ class DataFigureWindow(FrozenRasterWindow):
                 self._set_typed_controls_enabled(True)
                 return
             self._present_typed_front(
-                result,
+                frame,
+                context,
                 expected_state=pending.display,
                 request_revision=self._request_revision,
             )
+            self._install_initial_fit_overlays(frame, context, overlays)
             if (
-                result.intent is not ViewIntent.METER
+                panel_display_state_intent(context.display) is not ViewIntent.METER
                 and not self._typed_ui_faulted
             ):
                 self._sync_committed_typed_controls()
             return
         if kind == "typed":
-            if not isinstance(result, DataFigureFront):
-                raise TypeError("typed worker returned another result")
+            frame, context, overlays = self._typed_completion(result)
+            if overlays is not None:
+                raise ValueError("ordinary display commit returned Fit overlays")
             pending = self._pending_state
             editor = self._pending_editor
             editor_revision = self._pending_editor_revision
@@ -2156,43 +2099,12 @@ class DataFigureWindow(FrozenRasterWindow):
                 raise RuntimeError("typed worker completed without pending state")
             if self._discard_grid_focus_sequence == self._request_revision:
                 self._discard_grid_focus_sequence = None
-                self._fit_overlay_inflight = None
                 self._discard_pending_typed()
                 self._show_grid_overview()
                 return
-            rendered_overlay = self._fit_overlay_inflight
-            self._fit_overlay_inflight = None
-            if not same_fit_overlay_request(
-                rendered_overlay,
-                self._fit_overlay_desired,
-            ):
-                if same_fit_overlay_request(
-                    self._fit_overlay_pending,
-                    self._fit_overlay_desired,
-                ):
-                    self._fit_overlay_pending = None
-                editor = self._pending_editor
-                editor_revision = self._pending_editor_revision
-                origin = self._pending_origin
-                self._active_kind = None
-                self._start_typed_render(
-                    pending,
-                    editor=editor,
-                    editor_revision=editor_revision,
-                    origin=origin,
-                )
-                return
-            expected_overlay_identity = (
-                None
-                if rendered_overlay is None
-                else rendered_overlay.result_identity
-            )
-            if result.fit_result_identity != expected_overlay_identity:
-                raise ValueError(
-                    "typed worker returned another Fit result identity"
-                )
             self._present_typed_front(
-                result,
+                frame,
+                context,
                 expected_state=pending,
                 request_revision=self._request_revision,
             )
@@ -2205,61 +2117,22 @@ class DataFigureWindow(FrozenRasterWindow):
                 self._sync_committed_typed_controls(
                     accepted_editor=editor,
                     accepted_base_revision=editor_revision,
-                )
-            return
-        if kind == "fit_overlay":
-            if not isinstance(result, DataFigureFront):
-                raise TypeError("Fit overlay worker returned another result")
-            pending = self._pending_state
-            request = self._fit_overlay_inflight
-            if pending is None or request is None:
-                raise RuntimeError("Fit overlay completed without an admitted request")
-            self._pending_state = None
-            self._fit_overlay_inflight = None
-            self._active_kind = None
-            if not same_fit_overlay_request(
-                request,
-                self._fit_overlay_desired,
-            ):
-                self._set_typed_controls_enabled(True)
-                return
-            if result.fit_result_identity != request.result_identity:
-                raise ValueError("Fit overlay worker returned another result identity")
-            self._present_typed_front(
-                result,
-                expected_state=pending,
-                request_revision=self._request_revision,
             )
-            if self._fit_job_kind == "fit":
-                self._status.setText("FITTING")
-            elif self._fit_draft is not None:
-                self._status.setText("DRAFT FIT READY")
-                if self._fit_draft_summary is None:
-                    raise RuntimeError("Fit draft summary was not returned by its worker")
-                self._summary.setText(self._fit_draft_summary)
-            elif self._saved_fit_receipt is not None and request.result is not None:
-                self._status.setText("FIT SAVED")
-            else:
-                self._status.setText("READY")
-            self._set_typed_controls_enabled(True)
             return
         if kind == "surface":
-            if not isinstance(result, DataFigureFront):
-                raise TypeError("surface worker returned another typed front")
+            frame, context, overlays = self._typed_completion(result)
+            if overlays is not None:
+                raise ValueError("surface resize returned Fit overlays")
             pending = self._pending_state
-            overlay = self._fit_overlay_inflight
             if pending is None:
                 raise RuntimeError("surface worker completed without display state")
-            expected_identity = None if overlay is None else overlay.result_identity
-            if result.fit_result_identity != expected_identity:
-                raise ValueError("surface worker returned another Fit result identity")
             self._present_typed_front(
-                result,
+                frame,
+                context,
                 expected_state=pending,
                 request_revision=self._request_revision,
             )
             self._pending_state = None
-            self._fit_overlay_inflight = None
             self._active_kind = None
             self._set_typed_controls_enabled(True)
             return
@@ -2296,7 +2169,6 @@ class DataFigureWindow(FrozenRasterWindow):
             family = (self._view_family or "typed").upper()
             self._status.setText(f"{family} DISPLAY FAILED")
             self._diagnostic.setText(error_summary(error))
-            self._fit_overlay_inflight = None
             self._discard_pending_typed()
             if return_to_overview:
                 self._show_grid_overview()
@@ -2305,7 +2177,7 @@ class DataFigureWindow(FrozenRasterWindow):
             intent = (
                 None
                 if self._grid_focus_pending is None
-                else display_state_intent(self._grid_focus_pending.display)
+                else panel_display_state_intent(self._grid_focus_pending.display)
             )
             self._grid_focus_pending = None
             self._discard_grid_focus_sequence = None
@@ -2314,18 +2186,10 @@ class DataFigureWindow(FrozenRasterWindow):
             self._status.setText("READY" if discarded else f"{label} FOCUS FAILED")
             self._diagnostic.setText("" if discarded else error_summary(error))
             self._set_typed_controls_enabled(True)
-        elif kind == "fit_overlay":
-            self._status.setText("FIT OVERLAY FAILED")
-            self._diagnostic.setText(error_summary(error))
-            self._pending_state = None
-            self._fit_overlay_inflight = None
-            self._active_kind = None
-            self._set_typed_controls_enabled(True)
         elif kind == "surface":
             self._status.setText("SURFACE UPDATE FAILED")
             self._diagnostic.setText(error_summary(error))
             self._pending_state = None
-            self._fit_overlay_inflight = None
             self._active_kind = None
         elif kind == "surface_overview":
             self._status.setText("GRID SURFACE UPDATE FAILED")
@@ -2457,9 +2321,8 @@ class DataFigureWindow(FrozenRasterWindow):
 
     @QtCore.pyqtSlot()
     def _owner_cycle(self) -> None:
-        # Raster owns the currently visible front, so accept it first.  Fit may
-        # then enqueue the newest overlay against that accepted viewport in the
-        # same Qt-owner turn without either future touching a QWidget.
+        # Raster owns the visible front, so accept it before a Fit completion;
+        # the latter installs only already-materialized vector primitives.
         consumed_completion = False
         self._completion_handoff_active = True
         try:
@@ -2507,8 +2370,6 @@ class DataFigureWindow(FrozenRasterWindow):
                     editor_revision=editor_revision,
                     origin=origin,
                 )
-            if self._future is None:
-                self._start_pending_fit_overlay()
             deferred_reload = self._deferred_fit_reload
             if deferred_reload is not None and self._fit_future is None:
                 receipt, revision = deferred_reload
@@ -2534,8 +2395,7 @@ class DataFigureWindow(FrozenRasterWindow):
         if self._fit_future is not None:
             return
         if self._closing and self._future is None and not self._closed:
-            self._fit_draft = None
-            self._fit_draft_summary = None
+            self._discard_snapshot_fit()
             self._fit_save_inflight = None
             self._saved_fit_receipt = None
             self._fit_selection_candidate = None
@@ -2543,22 +2403,15 @@ class DataFigureWindow(FrozenRasterWindow):
             pane = self._fit_pane
             if pane is not None:
                 pane.clear_options()
-            self._fit_authority = None
             self._initial_loader = None
             self._typed_renderer = None
-            self._typed_front_committed = None
             self._typed_contract = None
-            self._fit_overlay_renderer = None
             self._surface_job = None
             self._surface_retry = None
             self._fit_bindings = None
             self._fit_save_path = None
-            self._fit_overlay_pending = None
-            self._fit_overlay_inflight = None
-            self._fit_overlay_desired = None
             self._deferred_fit_reload = None
             self._deferred_typed_retry = None
-            self._visible_transient_fit_result_owner = None
         super()._finish_close_if_ready()
 
     def shutdown(self) -> None:
@@ -2575,13 +2428,9 @@ class DataFigureWindow(FrozenRasterWindow):
             cancelled=self._cancelled,
             commit_lock=self._export_commit_lock,
         )
-        authority = self._fit_authority
-        if authority is not None:
-            authority.close()
         if self._fit_cancelled is not None:
             self._fit_cancelled.set()
         self._fit_prepare_pending = False
-        self._fit_overlay_pending = None
         self._surface_observer.detach()
         super().shutdown()
         fit_future = self._fit_future

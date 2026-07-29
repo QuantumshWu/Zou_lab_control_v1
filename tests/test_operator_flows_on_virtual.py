@@ -15,6 +15,7 @@ from pathlib import Path
 import tempfile
 
 import Zou_lab_control.api as zlc
+from zlc_data.axis import AxisSourceRef, SPATIAL_X, SPATIAL_Y
 from zlc_data.fit_model import fit_model_catalog
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.logic_nodes.mot_field import MotFieldTaskIntent
@@ -32,23 +33,52 @@ def test_fit_and_figure_run_on_the_virtual_installation() -> None:
 
             # The axes come from the committed capture rather than being guessed
             # from array rank or copied into a Camera Measurement request.
-            frame_axes = exp.readout.load_capture(capture).frame_source.schema.cell_schema.data_axes
+            source_schema = exp.readout.load_capture(capture).frame_source.schema
+            frame_axes = source_schema.cell_schema.data_axes
             assert len(frame_axes) == 2, "a camera frame carries two spatial axes"
-            _y_axis, x_axis = frame_axes
+            axes_by_role = {axis.role: axis for axis in frame_axes}
+            x_axis = axes_by_role[SPATIAL_X]
+            y_axis = axes_by_role[SPATIAL_Y]
+            common_batch_sources = (
+                *(
+                    (AxisSourceRef.tensor(source_schema.repeat_axis.axis_id),)
+                    if source_schema.repeat_axis.size > 1
+                    else ()
+                ),
+                *(
+                    (AxisSourceRef.point_rows(),)
+                    if source_schema.point_table.row_count > 1
+                    else ()
+                ),
+            )
 
             # --- fitting.  A 2-D model resolves its own axes on a frame; a 1-D model
             # is AMBIGUOUS there and must be told which axis, which is the domain
             # refusing to silently pick one rather than a gap.
             models = {model.model_id for model in fit_model_catalog()}
             assert {"radial_gaussian_center", "gaussian_offset"} <= models
-            assert exp.fit(capture, model="radial_gaussian_center") is not None
             assert exp.fit(
-                capture, model="gaussian_offset", fit_axis_ids=(x_axis.axis_id,)
+                capture,
+                model="radial_gaussian_center",
+                independent_sources=(
+                    AxisSourceRef.tensor(x_axis.axis_id),
+                    AxisSourceRef.tensor(y_axis.axis_id),
+                ),
+                batch_sources=common_batch_sources,
+            ) is not None
+            assert exp.fit(
+                capture,
+                model="gaussian_offset",
+                independent_sources=(AxisSourceRef.tensor(x_axis.axis_id),),
+                batch_sources=(
+                    *common_batch_sources,
+                    AxisSourceRef.tensor(y_axis.axis_id),
+                ),
             ) is not None
 
             # --- and the same capture projected into a figure: what the viewer shows
             # is a view OF this artifact, not a document reopened from disk.
-            figure = exp.figure(capture)
+            figure = exp.figure(capture, point_ordinals=(0,))
             assert figure.document.datasets, "a figure names the data it draws"
 
 

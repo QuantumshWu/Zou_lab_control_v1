@@ -471,7 +471,7 @@ Saved Fit Grid是保留的结果浏览产品，但其navigation model只拥有ty
 
 Frontend 同时拥有每个 plot intent 的唯一 canonical display form。Setting、Edit、DataFigure、FigureViewer、Calibration 和 Grid cell都消费相同 `PlotDisplayFormSpec`、handler 和 authored state；Workbench只放置 editor、绑定 panel 与提交 Apply/Cancel。
 
-Matplotlib的canonical字体固定为其随发行、许可明确且覆盖实验glyph的`DejaVu Sans`；Qt Windows UI固定使用共享token中的Segoe UI。仓库不捆绑无许可字体，也不允许leaf/report用glyph workaround、局部font family或第二style表改变同一FigureIntent的像素。
+Matplotlib的canonical字体与main产品视觉合同一致：由`zlc_frontend`/`[render]`打包并注册仓库内唯一的`Helvetica Light` TTF；Qt Windows UI固定使用共享token中的Segoe UI。字体文件必须作为正式产品资产跟随wheel/sdist并在启动时校验family；不允许leaf/report用局部font family、glyph workaround或第二style表改变同一FigureIntent的像素。
 
 控件投影规则：
 
@@ -573,7 +573,7 @@ atomic publish exact canonical manifest + durability barrier
 
 ## 8. 依赖闭合的实现顺序
 
-不得逐文件打补丁并长期保留双模型。顺序固定如下：
+不得逐文件打补丁并长期保留双模型。每个 M1–M6 cut 替换生产 owner、public contract 或 codec 时，直接依赖旧语义的测试源码必须在同一 cut 改写为当前物理/public contract，或与被删行为一起删除；M7 只执行 broad suite、补跨 cut E2E 和做最终总清点，不接收此前遗留的旧测试。顺序固定如下：
 
 ### M0：规范冻结
 
@@ -585,7 +585,7 @@ atomic publish exact canonical manifest + durability barrier
 
 - 先在现有data owner内原位替换point truth：P row ordinal是identity，coordinate是相关column，GridTopology只作可选metadata；不得在旧`point_axes/PointLayout`旁新增第二套resolver/descriptor/codec。
 - 在同一未完成cut内先用一个真实非grid producer→Dataset→Figure/Fit和一个真实grid producer证明同一模型；核心owner闭合后，其它producer/consumer只做机械call-site迁移，不再各自增加source wrapper。
-- 最后一个生产reader迁走时，同一cut删除被替代的Dataset point writer/reader；不得为了历史/phase tests保留compatibility。历史测试只在M7按当前物理/public contract重写或删除。上述纵切只是实现顺序，不是可提交的兼容阶段；Git checkpoint/commit与产品验收点均不得有新旧public模型并存，也不得增加migration adapter。
+- 最后一个生产reader迁走时，同一cut删除被替代的Dataset point writer/reader；不得为了历史/phase tests保留compatibility。直接依赖被替代模型的测试也必须在同一cut按当前物理/public contract重写，或与旧行为一起删除；不能把旧测试源码拖到M7。上述纵切只是实现顺序，不是可提交的兼容阶段；Git checkpoint/commit与产品验收点均不得有新旧public模型并存，也不得增加migration adapter。
 
 ### M2：Signal transaction
 
@@ -625,8 +625,8 @@ atomic publish exact canonical manifest + durability barrier
 
 - 完成 point/source-binding/group property tests、same-shot SignalFront/transaction tests、fixed-cardinality/association tests、live/snapshot Fit隔离与nested ROI replay、regular-raster profile、calibration canonical-raster parity、complete-blocker admission/lease-release、semantic widget projection、SAFE retry、manifest pending/lost-ack matrix、E0 full-envelope camera contract和正式product E2E。
 - 对M1–M6每个slice记录旧树等价能力生产行数比和抽象consumer/invariant清单；>约3倍的slice必须在合并前完成压缩或给出逐项物理/边界理由，不能用测试/codec/历史兼容凑解释。
-- 清除 phase/private/history tests、过期 tutorial、重复架构文档、无许可字体和所有死 symbol。
-- 最后才跑 broad suite；测试失败按仍有效的物理/public contract 判断，绝不恢复旧架构迎合历史测试。
+- 总清点此前各cut已经同步改写/删除的测试，补齐跨cut property/product E2E；不得在M7才首次处理旧owner测试。清除过期tutorial、重复架构文档和所有死symbol；保留与main视觉合同一致且由唯一style owner注册的Helvetica Light正式资产。
+- 最后才跑 broad suite；这里延期的是整套执行，不是测试源码迁移。失败按仍有效的物理/public contract 判断，绝不恢复旧架构迎合历史测试。
 
 ## 9. 最终验收门
 

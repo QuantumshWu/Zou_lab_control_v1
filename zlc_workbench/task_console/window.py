@@ -6,6 +6,7 @@ their own module; this file owns only the application window and their wiring.
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError, Future
 import inspect
 import os
 import threading
@@ -39,6 +40,7 @@ from zlc_frontend.qt_widgets import (
     WINDOW_SCREEN_FRACTION,
     YELLOW,
     ensure_qt_app,
+    error_summary,
     fluent_message,
     fluent_widget_stylesheet,
     launch_fluent_window,
@@ -46,6 +48,7 @@ from zlc_frontend.qt_widgets import (
     scaled_px,
     screen_fit_window_size,
     set_fluent_scale,
+    wait_for_owner_retirement,
     window_pad,
 )
 from .console_state import (
@@ -63,6 +66,7 @@ from .console_records import (
     panel_signal_key,
 )
 from zlc_frontend.shape_text import describe_dataset_shape, indexed_unique_name
+from zlc_frontend.plot_kind import PlotKind
 from zlc_frontend.figure_outputs import (
     AREA_DATA_OUTPUT,
     CROSS_DATA_OUTPUT,
@@ -75,6 +79,7 @@ from zlc_frontend.figure_outputs import (
     figure_selector_identity,
     fit_parameter_output_presentation,
     materialize_fit_outputs,
+    source_identity_matches_snapshot,
 )
 from zlc_storage.paths import user_output_path
 from .panel_board import (
@@ -95,14 +100,13 @@ from zlc_neutral_atom.runtime.hosted_run import HostedRun
 from .panel_card import PanelCard
 from .panel_editor import PanelEditor
 from zlc_frontend.qt_widgets import (
-    FigureFitLane,
     FigureSurfaceCompletion,
     FigureSurfaceLane,
 )
 from .logic_node_editor import LogicNodeEditor
 from .logic_node_row import LogicNodeRow
 from .published_signal_row import PublishedSignalRow
-from zlc_workbench.window_runtime import wait_for_owner_retirement
+from zlc_workbench.window_runtime import submit_compute
 from zlc_neutral_atom.logic_node_declaration import (
     ArtifactOutputPresentation,
     OutputPresentation,
@@ -151,6 +155,51 @@ class _SignalTopologyProjection:
     axis_labels: Mapping[str, str]
     short_names: Mapping[str, str]
 
+
+def _execute_figure_fit(request):
+    """Solve/output one Fit; materialize its optional overlay independently."""
+
+    from zlc_data import FitResultBatch
+    from zlc_data.fit import bind_fit
+    from zlc_frontend import FigureSource
+
+    def raise_if_cancelled() -> None:
+        if request.cancelled.is_set():
+            raise CancelledError()
+
+    snapshot = request.source.snapshot
+    result = request.cached_result
+    outputs = None
+    if result is None:
+        result = bind_fit(request.spec, snapshot.block.schema).run(
+            snapshot,
+            cancel_check=request.cancelled.is_set,
+        )
+        raise_if_cancelled()
+        if request.surface_id == request.panel_id:
+            outputs = materialize_fit_outputs(FigureSource(snapshot), result)
+    if not isinstance(result, FitResultBatch):
+        raise TypeError("Fit engine returned another result type")
+    raise_if_cancelled()
+    overlays = None
+    overlay_error = None
+    try:
+        if request.overlay_figure is not None:
+            overlays = request.overlay_figure.materialize_transient_fit_overlays(
+                result,
+                request.source_frame,
+                result_identity=(
+                    f"fit:{request.surface_id}:{request.request_revision}"
+                ),
+                check_cancelled=raise_if_cancelled,
+            )
+    except CancelledError:
+        raise
+    except Exception as error:
+        overlay_error = error_summary(error)
+    return result, outputs, overlays, overlay_error
+
+
 # ====================================================================== console
 class TaskConsole(QtWidgets.QWidget):
     """The dashboard window body: header bar + drag-and-snap panel board."""
@@ -182,6 +231,16 @@ class TaskConsole(QtWidgets.QWidget):
         self._owner_event_lock = threading.Lock()
         self._lifecycle_wake_pending = False
         self._data_wake_pending = False
+        self._fit_wake_pending = False
+        self._fit_lock = threading.Lock()
+        self._fit_active: dict[str, tuple[Future, object]] = {}
+        self._fit_pending: dict[str, object] = {}
+        self._fit_completions: list[tuple[str, Future]] = []
+        # One published EVENT_RESULT route per panel.  The surface id retained
+        # in each entry makes Clear/Edit retirement withdraw only the surface
+        # that actually committed the current parameter bundle.
+        self._fit_output_routes: dict[str, tuple[str, object, object, object]] = {}
+        self._fit_closing = False
         self._owner_close_lock = threading.Lock()
         self._owner_retiring = False
         self._permanently_closed = False
@@ -293,11 +352,7 @@ class TaskConsole(QtWidgets.QWidget):
             self,
             accept_completion=self._accept_render_completion,
             request_shutdown_wake=self.request_owner_wake,
-        )
-        self._fit_lane = FigureFitLane(
-            self,
-            accept_completion=self._accept_fit_completion,
-            request_shutdown_wake=self.request_owner_wake,
+            submit_compute=submit_compute,
         )
         self._raster_pixel_ratio_observer = RasterPixelRatioObserver(
             self,
@@ -651,10 +706,11 @@ class TaskConsole(QtWidgets.QWidget):
     def _presentation_for(self, value, publication: SignalPublication):
         """Project optional leaf presentation from this exact publication.
 
-        Ordinary Dataset outputs return ``None``.  A leaf may contribute a
-        generation-static SiteMap intent, but the projection is always rebuilt
-        from the exact parent/result bundle retained with the panel; there is
-        no revision index or latest-name lookup.
+        Ordinary Dataset outputs return ``None``.  A SiteMap leaf pairs its
+        generation-static ``FigureIntent`` with the revision-specific
+        ``SiteMapPresentation`` rebuilt from the exact parent/result bundle
+        retained with the panel; there is no revision index or latest-name
+        lookup.
         """
 
         if not isinstance(publication, SignalPublication):
@@ -705,10 +761,16 @@ class TaskConsole(QtWidgets.QWidget):
             lambda c=card: self._card_figure_outputs_changed(c)
         )
         card.fit_requested.connect(
-            lambda c=card: self._request_card_fit(c)
+            lambda surface, c=card: self._request_card_fit(c, surface)
         )
         card.fit_cancel_requested.connect(
-            lambda c=card: self._fit_lane.forget(c.panel_id)
+            self._forget_fit_surface
+        )
+        card.fit_output_clear_requested.connect(
+            lambda surface_id, c=card: self._clear_card_fit_output(
+                c,
+                surface_id,
+            )
         )
         # a panel added (or loaded) while the header's "Selectors" switch is ON inherits it --
         # the guard covers construction order (state panels may attach before the header exists).
@@ -734,7 +796,7 @@ class TaskConsole(QtWidgets.QWidget):
 
         if card not in self.cards or self._render_lane.closing:
             return
-        _painted_publication, _painted_value, area, cross = (
+        painted_publication, painted_value, area, cross = (
             card.frozen_figure_output_state()
         )
         source_name = str(card.config.signal or "").strip()
@@ -748,25 +810,62 @@ class TaskConsole(QtWidgets.QWidget):
                 self._render_lane.forget_selector(owner_id)
                 self._data.withdraw_derived(owner_id)
                 continue
-            publication = self._data.latest_publication(source_name)
-            value = None if publication is None else publication.value(source_name)
-            if publication is None or value is None:
+            # Bind the route from the exact frame that authored the selector.
+            # A free-running producer may already have advanced beyond it, so
+            # deriving the transform from ``latest`` would pair the gesture
+            # from N with the data from N+1.  Once N has been admitted, later
+            # compatible parents may advance independently of paint cadence.
+            publication = painted_publication
+            value = painted_value
+            if (
+                publication is None
+                or value is None
+                or str(getattr(value, "name", "")) != source_name
+            ):
+                continue
+            latest_publication = self._data.latest_publication(source_name)
+            latest_value = (
+                None
+                if latest_publication is None
+                else latest_publication.value(source_name)
+            )
+            if (
+                latest_publication is None
+                or latest_value is None
+                or not source_identity_matches_snapshot(
+                    commit.source_identity,
+                    latest_value.snapshot,
+                )
+            ):
+                # The producer has retired/restarted while the old frame is
+                # still painted.  Never bind that old gesture to the new
+                # generation; the surface clears its authority when the new
+                # context is presented.
+                self._render_lane.forget_selector(owner_id)
+                self._data.withdraw_derived(owner_id)
                 continue
             from zlc_frontend.plot_panel import plot_panel_input
 
             try:
-                source = plot_panel_input(
+                painted_source = plot_panel_input(
                     card.config.kind,
                     value.snapshot,
                     self._presentation_for(value, publication),
                 )
                 try:
-                    transform = figure_event_transform(source, commit)
+                    transform = figure_event_transform(painted_source, commit)
                 except ValueError:
                     transform = None
                     preserves_association = False
                 else:
-                    preserves_association = True
+                    # Replayability is necessary but not sufficient for a
+                    # formal hardware-event association.  A plain monitor may
+                    # still publish continuous Area/Cross values, but it must
+                    # not acquire a capability that its upstream source never
+                    # exposed.
+                    preserves_association = self._data.has_event_association(
+                        source_name
+                    )
                     if not transform.operations:
                         transform = None
                 route_identity = figure_selector_identity(commit)
@@ -798,7 +897,23 @@ class TaskConsole(QtWidgets.QWidget):
                     generation,
                     publication,
                 ):
-                    continue
+                    if (
+                        not self._data.continuous_needs_publication(
+                            owner_id,
+                            generation,
+                            latest_publication,
+                        )
+                    ):
+                        continue
+                    publication = latest_publication
+                    value = latest_value
+                    source = plot_panel_input(
+                        card.config.kind,
+                        value.snapshot,
+                        self._presentation_for(value, publication),
+                    )
+                else:
+                    source = painted_source
                 token = (
                     owner_id,
                     generation,
@@ -817,14 +932,24 @@ class TaskConsole(QtWidgets.QWidget):
                 card.set_status(f"Figure output: {error}", error=True)
 
     def _card_figure_outputs_changed(self, card: PanelCard) -> None:
-        """Admit changed selector declarations and retire a cleared Fit event."""
+        """Admit changed continuous selector declarations."""
 
         self._sync_card_continuous_routes(card)
-        _publication, _source, fit_result = card.frozen_fit_output_state()
-        if fit_result is None:
-            self._data.withdraw_derived(
-                self._figure_route_owner(card, "fit")
-            )
+        self._promote_data_front(self._data.freeze())
+        self._signal_topology_changed()
+
+    def _clear_card_fit_output(
+        self,
+        card: PanelCard,
+        surface_id: str,
+    ) -> None:
+        """Withdraw a Fit bundle only when this surface currently owns it."""
+
+        route = self._fit_output_routes.get(card.panel_id)
+        if route is None or route[0] != str(surface_id):
+            return
+        self._fit_output_routes.pop(card.panel_id, None)
+        self._data.withdraw_derived(self._figure_route_owner(card, "fit"))
         self._promote_data_front(self._data.freeze())
         self._signal_topology_changed()
 
@@ -889,6 +1014,7 @@ class TaskConsole(QtWidgets.QWidget):
         return accepted
 
     def _withdraw_panel_outputs(self, panel_id: str) -> None:
+        self._fit_output_routes.pop(str(panel_id), None)
         for output_name in (AREA_DATA_OUTPUT, CROSS_DATA_OUTPUT, "fit"):
             owner_id = f"figure/{panel_id}/{output_name}"
             self._render_lane.forget_selector(owner_id)
@@ -1066,9 +1192,8 @@ class TaskConsole(QtWidgets.QWidget):
             progressed = False
             for card in tuple(unresolved):
                 publication, value, area, cross = card.frozen_figure_output_state()
-                fit_publication, fit_source, fit_result = (
-                    card.frozen_fit_output_state()
-                )
+                fit_route = self._fit_output_routes.get(card.panel_id)
+                fit_result = None if fit_route is None else fit_route[3]
                 if all(
                     item is None
                     for item in (area, cross, fit_result)
@@ -1757,10 +1882,10 @@ class TaskConsole(QtWidgets.QWidget):
     def _card_topology_identity(card: "PanelCard") -> tuple[str, str, str]:
         """Card facts consumed by signal and Figure-output topology."""
 
-        kind = str(card.config.kind)
+        kind = card.config.kind
         return (
             str(card.config.signal or ""),
-            kind,
+            kind.value,
             str(card.config.title or PANEL_KINDS[kind]),
         )
 
@@ -1788,6 +1913,11 @@ class TaskConsole(QtWidgets.QWidget):
         self._signal_info_dirty = True
         if not self._building:
             self._refresh_signal_info()
+            for card in self.cards:
+                card.refresh_open_signal_topology()
+            for editor in self._logic_editors.values():
+                if editor.isVisible():
+                    editor.refresh_on_show()
 
     def _current_signal_projection(self) -> _SignalTopologyProjection:
         """Return the sole projection, reconciling one explicit dirty edge."""
@@ -1931,7 +2061,7 @@ class TaskConsole(QtWidgets.QWidget):
             self._data.reserve(node)
         try:
             node.start()
-        except BaseException:
+        except Exception:
             if reserved:
                 self._data.retire(node)
             raise
@@ -2192,21 +2322,23 @@ class TaskConsole(QtWidgets.QWidget):
             return
         # Otherwise a PLOT kind -> a BLANK pure-view panel on the Monitor board
         # (decoupled: it shows nothing until a signal is picked in its Setting).
-        kind = data or "1d"
+        kind = data or PlotKind.CURVE
+        if not isinstance(kind, PlotKind):
+            raise TypeError("Add Panel plot selection must be PlotKind")
         # Every new panel gets a unique "<kind> #N" title so two defaults never share
         # one name in the card header / Edit tab / frame title.
-        title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
+        title = indexed_unique_name(PANEL_KINDS[kind], {c.config.title for c in self.cards})
         # PanelConfig owns the ordinary stock 2x2 default.  Do not restate a
         # shell-specific size here; Pulse and a resolved Grid are the only
         # plot families with topology-derived initial-size policies.
-        config = PanelConfig(kind=str(kind), title=title, row=GAP, col=GAP)
+        config = PanelConfig(kind=kind, title=title, row=GAP, col=GAP)
         # APPEND the new card LAST in order (``_attach_card`` adds it to the end of ``self.cards``);
         # the order-driven :func:`pack` in ``_arrange`` then lands it in the next free BOTTOM slot,
         # never a middle hole.  No pixel seed needed -- pack recomputes every card's position from
         # the order alone.
         card = self._new_panel_card(
             config,
-            initial_grid_size_pending=str(kind) == "grid",
+            initial_grid_size_pending=kind is PlotKind.GRID,
         )
         self._attach_card(card)
         self._arrange()
@@ -2535,13 +2667,7 @@ class TaskConsole(QtWidgets.QWidget):
             # admitted value, not from catalog stage metadata.
             if value is None:
                 continue
-            kind = default.kind
-            if kind == "auto":
-                from zlc_frontend import automatic_panel_kind
-
-                kind = automatic_panel_kind(value.schema)
-                if kind is None:
-                    continue
+            kind = PlotKind(default.kind)
             card = self._new_panel_card(
                 PanelConfig(
                     kind=kind,
@@ -2551,7 +2677,7 @@ class TaskConsole(QtWidgets.QWidget):
                     signal=key,
                     params=default.params,
                 ),
-                initial_grid_size_pending=kind == "grid",
+                initial_grid_size_pending=kind is PlotKind.GRID,
             )
             self._attach_card(card)
             if value.transient:
@@ -2805,27 +2931,151 @@ class TaskConsole(QtWidgets.QWidget):
                 self._signal_topology_changed()
         return reset
 
-    def _request_card_fit(self, card: PanelCard) -> None:
-        """Freeze one active Figure fit and hand it to the solver owner."""
+    def _request_card_fit(self, card: PanelCard, surface=None) -> None:
+        """Freeze one surface request; replace only that surface's pending Fit."""
 
-        if card not in self.cards or self._fit_lane.closing:
+        if card not in self.cards or self._fit_closing:
             return
-        frozen = card.freeze_fit_request()
-        if frozen is None:
-            return
-        request, publication = frozen
-        self._fit_lane.enqueue(request, publication)
-
-    def _accept_fit_completion(self, completion: object) -> None:
-        """Route one immutable fit result back to its exact panel/source."""
-
-        publication, request, result, error = completion
+        request = card.freeze_fit_request(surface)
         if request is None:
-            self.status_strip.show_message(
-                f"Fit failed: {error}",
-                severity="error",
-            )
             return
+        surface_id = request.surface_id
+        with self._fit_lock:
+            active = self._fit_active.get(surface_id)
+            if active is not None:
+                previous = self._fit_pending.get(surface_id)
+                self._fit_pending[surface_id] = request
+                if previous is not None:
+                    previous.cancelled.set()
+                return
+        self._start_fit_request(request)
+
+    def _start_fit_request(self, request) -> None:
+        """Submit through the one Workbench compute seam."""
+
+        if self._fit_closing:
+            request.cancelled.set()
+            return
+        future = submit_compute(_execute_figure_fit, request)
+        with self._fit_lock:
+            if self._fit_closing:
+                request.cancelled.set()
+                future.cancel()
+                return
+            if request.surface_id in self._fit_active:
+                request.cancelled.set()
+                future.cancel()
+                raise RuntimeError("Figure Fit surface admitted overlapping work")
+            self._fit_active[request.surface_id] = (future, request)
+        future.add_done_callback(
+            lambda completed, surface_id=request.surface_id: self._fit_finished(
+                surface_id,
+                completed,
+            )
+        )
+
+    def _fit_finished(self, surface_id: str, future: Future) -> None:
+        """Transfer a completed Future identity without touching QWidget state."""
+
+        with self._fit_lock:
+            self._fit_completions.append((surface_id, future))
+        self._request_fit_owner_wake()
+
+    def _drain_fit_completions(self) -> None:
+        """Accept completed Fit results and fairly advance each latest mailbox."""
+
+        with self._fit_lock:
+            completions = tuple(self._fit_completions)
+            self._fit_completions.clear()
+        for surface_id, future in completions:
+            with self._fit_lock:
+                active = self._fit_active.get(surface_id)
+                if active is None or active[0] is not future:
+                    continue
+                _active_future, request = self._fit_active.pop(surface_id)
+                pending = (
+                    None
+                    if self._fit_closing
+                    else self._fit_pending.pop(surface_id, None)
+                )
+            if request.cancelled.is_set():
+                result = None
+                outputs = None
+                overlays = None
+                overlay_error = None
+                error = None
+            else:
+                try:
+                    result, outputs, overlays, overlay_error = future.result()
+                except CancelledError:
+                    request.cancelled.set()
+                    result = None
+                    outputs = None
+                    overlays = None
+                    overlay_error = None
+                    error = None
+                except Exception as fit_error:
+                    result = None
+                    outputs = None
+                    overlays = None
+                    overlay_error = None
+                    error = error_summary(fit_error)
+                else:
+                    error = None
+            if not request.cancelled.is_set():
+                self._accept_fit_completion(
+                    request,
+                    result,
+                    outputs,
+                    overlays,
+                    error,
+                    overlay_error,
+                )
+            if pending is not None:
+                self._start_fit_request(pending)
+
+    def _forget_fit_surface(self, surface_id: str) -> None:
+        """Cancel one surface without disturbing another panel or snapshot."""
+
+        identity = str(surface_id).strip()
+        with self._fit_lock:
+            active = self._fit_active.get(identity)
+            pending = self._fit_pending.pop(identity, None)
+        if active is not None:
+            active[1].cancelled.set()
+        if pending is not None:
+            pending.cancelled.set()
+
+    def _shutdown_fit_compute(self) -> bool:
+        """Stop new Fit admission and wait only for already-running compute."""
+
+        with self._fit_lock:
+            if not self._fit_closing:
+                self._fit_closing = True
+                active = tuple(self._fit_active.values())
+                pending = tuple(self._fit_pending.values())
+                self._fit_pending.clear()
+            else:
+                active = tuple(self._fit_active.values())
+                pending = ()
+        for _future, request in active:
+            request.cancelled.set()
+        for request in pending:
+            request.cancelled.set()
+        return not active
+
+    def _accept_fit_completion(
+        self,
+        request,
+        result,
+        outputs,
+        overlays,
+        error: str | None,
+        overlay_error: str | None,
+    ) -> None:
+        """Atomically publish one surface result; overlay remains optional."""
+
+        publication = request.publication
         card = next(
             (item for item in self.cards if item.panel_id == request.panel_id),
             None,
@@ -2838,32 +3088,46 @@ class TaskConsole(QtWidgets.QWidget):
             or publication.value(source_value.name) is not source_value
         ):
             return
-        if not card.accept_fit_completion(
-            request,
-            publication,
-            result,
-            error,
-        ):
-            return
-        owner_id = self._figure_route_owner(card, "fit")
         if error is not None or result is None:
-            self._data.withdraw_derived(owner_id)
-            self._promote_data_front(self._data.freeze())
-            self._signal_topology_changed()
-            return
-        from zlc_frontend.plot_panel import plot_panel_input
-
-        try:
-            source = plot_panel_input(
-                card.config.kind,
-                source_value.snapshot,
-                self._presentation_for(source_value, publication),
+            card.accept_fit_completion(
+                request,
+                result,
+                None,
+                error or "Fit worker returned no result",
             )
-            outputs = materialize_fit_outputs(source, result)
+            return
+        if request.surface_id != card.panel_id:
+            # Snapshot/Edit Fit belongs only to that frozen surface.  It may
+            # paint an overlay and retain a local result, but it never owns or
+            # replaces the live panel's EVENT_RESULT route.
+            card.accept_fit_completion(
+                request,
+                result,
+                overlays,
+                None,
+                overlay_error,
+            )
+            return
+        if outputs is None:
+            card.accept_fit_completion(
+                request,
+                result,
+                overlays,
+                None,
+                overlay_error,
+            )
+            return
+        if not card._fit_completion_is_current(request):
+            return
+
+        owner_id = self._figure_route_owner(card, "fit")
+        try:
             qualified = {
                 panel_signal_key(card.panel_id, output_name): output
                 for output_name, output in outputs.items()
             }
+            if not qualified:
+                raise ValueError("Fit produced no parameter outputs")
             generation = self._data.bind_event_derived(
                 owner_id,
                 source_name=str(source_value.name),
@@ -2885,14 +3149,35 @@ class TaskConsole(QtWidgets.QWidget):
                 },
             )
             if published is None:
-                self._data.withdraw_derived(owner_id)
-                return
+                raise RuntimeError("Fit parameter publication was not accepted")
         except (KeyError, LookupError, TypeError, ValueError, RuntimeError) as publish_error:
             self._data.withdraw_derived(owner_id)
-            card.set_status(f"Fit output: {publish_error}", error=True)
+            self._fit_output_routes.pop(card.panel_id, None)
+            card.accept_fit_completion(
+                request,
+                None,
+                None,
+                f"Fit output: {error_summary(publish_error)}",
+            )
             self._promote_data_front(self._data.freeze())
             self._signal_topology_changed()
             return
+        if not card.accept_fit_completion(
+            request,
+            result,
+            overlays,
+            None,
+            overlay_error,
+        ):
+            self._data.withdraw_derived(owner_id)
+            self._fit_output_routes.pop(card.panel_id, None)
+            return
+        self._fit_output_routes[card.panel_id] = (
+            request.surface_id,
+            publication,
+            source_value,
+            result,
+        )
         self._promote_data_front(self._data.freeze())
         self._signal_topology_changed()
 
@@ -2905,13 +3190,14 @@ class TaskConsole(QtWidgets.QWidget):
         editor = self._panel_editors.get(id(card))
         if editor is not None:
             self._render_lane.forget(editor.render_surface_id)
-        self._fit_lane.forget(card.panel_id)
+            self._forget_fit_surface(editor.render_surface_id)
+        self._forget_fit_surface(card.panel_id)
 
     def _shutdown_presentation_workers(self) -> bool:
         """Begin both worker retirements and report their joint completion."""
 
         render_complete = self._render_lane.shutdown()
-        fit_complete = self._fit_lane.shutdown()
+        fit_complete = self._shutdown_fit_compute()
         return render_complete and fit_complete
 
     def _retire_logic_node_publications(
@@ -2935,7 +3221,8 @@ class TaskConsole(QtWidgets.QWidget):
                 name.startswith(output_prefix) for name in retired_names
             )
             if self._card_reads(card).intersection(retired_names) or owns_retired_output:
-                # A worker may already hold the old exact source component.
+                self._fit_output_routes.pop(card.panel_id, None)
+                # A worker may already retain the old exact publication.
                 # Revoke all old work first.  The card retirement below emits
                 # the one overlay-clear presentation for any open frozen Edit
                 # surface; forgetting after that emission would discard the
@@ -3288,6 +3575,15 @@ class TaskConsole(QtWidgets.QWidget):
             self._data_wake_pending = True
         self._owner_wake.request_owner_wake()
 
+    def _request_fit_owner_wake(self) -> None:
+        """Wake only the owner path that accepts completed Fit compute."""
+
+        with self._owner_event_lock:
+            if self._permanently_closed:
+                return
+            self._fit_wake_pending = True
+        self._owner_wake.request_owner_wake()
+
     def _owner_cycle(self) -> None:
         """Admit lifecycle/data-plane events on the sole Qt owner."""
 
@@ -3296,8 +3592,12 @@ class TaskConsole(QtWidgets.QWidget):
         with self._owner_event_lock:
             lifecycle = self._lifecycle_wake_pending
             data = self._data_wake_pending
+            fit = self._fit_wake_pending
             self._lifecycle_wake_pending = False
             self._data_wake_pending = False
+            self._fit_wake_pending = False
+        if fit:
+            self._drain_fit_completions()
         if lifecycle:
             self._poll_logic_nodes()
         if (lifecycle or data) and not getattr(self, "_shut", False):
@@ -3494,26 +3794,6 @@ class TaskConsole(QtWidgets.QWidget):
                 continue
             self._enqueue_render_batch(
                 batch,
-                self._tick_data,
-                force=True,
-            )
-        editor = self.tabs.currentWidget()
-        if isinstance(editor, PanelEditor):
-            editor.refresh_limit_hints()  # only the grey placeholder, never editable text
-        self._update_summary()
-
-    def refresh_once(self) -> None:
-        """Request one unconditional worker refresh of every current card."""
-
-        self._poll_logic_nodes()
-        self._refresh_signal_info()
-        self._promote_data_front(self._data.freeze())
-        for cards in self._panel_render_groups(self._tick_data):
-            self._enqueue_render_batch(
-                tuple(
-                    (card, self._panel_frame_key(card, self._tick_data))
-                    for card in cards
-                ),
                 self._tick_data,
                 force=True,
             )
@@ -3805,10 +4085,7 @@ class TaskConsole(QtWidgets.QWidget):
         if state == "WAITING_RENDER" or self._shutdown_state == "WAITING_RENDER":
             if not self._shutdown_presentation_workers():
                 return False
-            failures = (
-                *self._render_lane.shutdown_failures,
-                *self._fit_lane.shutdown_failures,
-            )
+            failures = tuple(self._render_lane.shutdown_failures)
             if failures and not getattr(self, "_render_shutdown_reported", False):
                 self._render_shutdown_reported = True
                 self.status_strip.show_message(
@@ -3825,7 +4102,7 @@ class TaskConsole(QtWidgets.QWidget):
                     close_result = on_close()
                     if close_result is False:
                         raise RuntimeError("resource close reported unresolved ownership")
-                except BaseException as exc:
+                except Exception as exc:
                     self._shutdown_error = exc
                     self._shutdown_state = "BLOCKED_RESOURCE_CLOSE"
                     self.status_strip.show_message(
@@ -3850,7 +4127,7 @@ class TaskConsole(QtWidgets.QWidget):
                     continue
                 card.shutdown()
                 completed_cards.add(id(card))
-        except BaseException as exc:
+        except Exception as exc:
             self._shutdown_error = exc
             self._shutdown_state = "BLOCKED_UI_TEARDOWN"
             self.status_strip.show_message(

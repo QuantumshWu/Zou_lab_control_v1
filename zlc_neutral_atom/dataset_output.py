@@ -10,7 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Protocol, runtime_checkable
 
-from zlc_data import OwnedSnapshot, dataset_revision_ref_to_tree
+from zlc_data import OwnedSnapshot
+from zlc_data.codec import dataset_revision_ref_to_tree
 from zlc_neutral_atom.runtime.dataset import (
     DatasetCoverage,
     DatasetPreviewSnapshot,

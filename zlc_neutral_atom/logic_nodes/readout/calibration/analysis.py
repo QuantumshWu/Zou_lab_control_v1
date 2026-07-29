@@ -22,8 +22,8 @@ from zlc_data import (
     ComponentValidity,
     DatasetSchema,
     ValidityMode,
-    expand_value_validity,
 )
+from zlc_data.value import expand_value_validity
 from zlc_neutral_atom.capture.frames import CaptureFrameSource
 from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 from zlc_storage import (

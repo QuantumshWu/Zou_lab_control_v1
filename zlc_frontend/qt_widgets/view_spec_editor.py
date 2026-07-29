@@ -1,4 +1,4 @@
-"""Qt projection of the frontend-owned typed :class:`ViewSpec`."""
+"""Qt authoring surface for the frontend-owned typed :class:`ViewSpec`."""
 
 from __future__ import annotations
 
@@ -8,25 +8,70 @@ from PyQt5 import QtCore, QtWidgets
 
 from zlc_data import AxisSourceRef
 from zlc_frontend.figure import (
+    GRID_INTENTS,
     AxisViewRole,
     FixedIndex,
+    SourceViewBinding,
+    ViewIntent,
+    ViewPreferences,
     ViewSpec,
     evaluate_axis,
+    grid_facet_source,
+    grid_facet_sources,
+    resolve_grid_view,
     validate_view_spec,
 )
-from zlc_frontend.figure.contract import _resolve_selected_point_ordinals
+from zlc_frontend.figure.contract import (
+    _dataset_sources,
+    _resolve_selected_point_ordinals,
+    _source_cardinality,
+    _source_name,
+)
+from zlc_frontend.figure.suggest import (
+    _repeat_authoring_candidates,
+    _view_authoring_candidates,
+    _view_preferences_from_spec,
+)
+from zlc_frontend.form import FormChoice, FormFieldProps, FormSpec
 
-from .fluent import FluentComboBox, FluentSettingRow, signals_blocked
+from .form import FluentParameterForm
 
 __all__ = ["ViewSpecEditor"]
+
+
+_GRID_INTENT_LABELS = {
+    ViewIntent.CURVE: "1d",
+    ViewIntent.HISTOGRAM: "hist",
+    ViewIntent.IMAGE: "2d",
+}
+_DISPLAY_ROLE_LABELS = {
+    AxisViewRole.X: "x",
+    AxisViewRole.IMAGE_X: "image x",
+    AxisViewRole.IMAGE_Y: "image y",
+}
+def _choice_field(key, label, choices, current, description=""):
+    choices = tuple(choices)
+    unavailable = not choices
+    return FormFieldProps(
+        key,
+        "choice",
+        label,
+        default=None if unavailable else current,
+        choices=tuple(FormChoice(text, value) for text, value in choices),
+        description=description,
+        required=unavailable,
+        unavailable_reason=(
+            f"No declared {label} is available for this Dataset."
+            if unavailable
+            else ""
+        ),
+    )
 
 
 def _coordinate_text(axis, position: int) -> str:
     coordinate = axis.coordinates[int(position)]
     source_index = axis.indices[int(position)]
-    text = str(coordinate)
-    if axis.unit:
-        text = f"{text} {axis.unit}"
+    text = f"{coordinate} {axis.unit}" if axis.unit else str(coordinate)
     return f"{int(source_index)}: {text}"
 
 
@@ -39,27 +84,25 @@ def _grid_choice_text(schema, sources, indices) -> str:
         position = topology.dimension_ids.index(source.axis_id)
         column = schema.point_table.column(source.axis_id)
         text = str(topology.coordinate_domains[position][index])
-        if column.unit:
-            text = f"{text} {column.unit}"
-        labels.append(f"{column.name}={text}")
+        labels.append(f"{column.name}={text} {column.unit}" if column.unit else f"{column.name}={text}")
     return ", ".join(labels)
 
 
+def _source_key(source: AxisSourceRef) -> str:
+    axis = "" if source.axis_id is None else source.axis_id.value
+    return f"{source.kind}:{axis}"
+
+
+def _repeat_text(binding: SourceViewBinding) -> str:
+    if binding.role is AxisViewRole.REDUCED:
+        return binding.reduction.method.value.title()
+    if binding.role is AxisViewRole.SELECTED:
+        return "Index" if isinstance(binding.selector, FixedIndex) else "Latest"
+    return "Overlay" if binding.role is AxisViewRole.BATCH else "Pool as samples"
+
+
 class ViewSpecEditor(QtWidgets.QWidget):
-    """Edit only the named axis selections an operator can actually change.
-
-    X/Y, reduction, batch, facet, and automatic-latest roles are resolved
-    presentation state, not controls.  Showing those as disabled combo boxes
-    made an internal ``ViewSpec`` look like a broken form (for example
-    ``Reduce``, ``ROI X`` and ``ROI Y`` rows that could not be edited).  Repeat
-    and Grid facet have their own explicit controls; this editor owns only a
-    finite ``FixedIndex`` choice on a ``SELECTED`` source.
-
-    The owner supplies the exact effective ``ViewSpec`` produced by frontend
-    policy.  Rows are reconciled by AxisSourceRef: ordinary data revisions update
-    nothing, while a true schema change adds, removes, or reorders only the
-    affected editable rows.
-    """
+    """Expose resolver-owned typed view choices through the keyed Fluent form."""
 
     viewChanged = QtCore.pyqtSignal(object)
 
@@ -67,214 +110,369 @@ class ViewSpecEditor(QtWidgets.QWidget):
         super().__init__(parent)
         self._label_width = label_width
         self._schema = None
-        self._view = None
-        self._rows: dict[
-            tuple[AxisSourceRef, ...],
-            tuple[FluentSettingRow, FluentComboBox],
-        ] = {}
-        self._updating = False
-        self._layout = QtWidgets.QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(0)
+        self._view: ViewSpec | None = None
+        self._intent: ViewIntent | None = None
+        self._faceted = False
+        self._preferences = ViewPreferences()
+        self._controls_dirty = True
+        self._form: FluentParameterForm | None = None
+        self._selection_fields: dict[str, tuple[AxisSourceRef, ...]] = {}
+        self._role_fields = {}
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self._layout = layout
         self.hide()
 
-    def reconcile(self, schema, view: ViewSpec | None) -> None:
-        if schema is None or view is None:
-            self._schema = None
-            self._view = None
-            for row, _combo in self._rows.values():
-                row.hide()
+    def reconcile(
+        self,
+        schema,
+        view: ViewSpec | None,
+        *,
+        intent: ViewIntent | None = None,
+        faceted: bool = False,
+    ) -> None:
+        if schema is None:
+            self._schema = self._view = self._intent = None
+            self._faceted = False
+            self._preferences = ViewPreferences()
+            self._controls_dirty = False
+            if self._form is not None:
+                self._form.hide()
             self.hide()
             return
-        if not isinstance(view, ViewSpec):
-            raise TypeError("view editor requires ViewSpec or None")
-        validate_view_spec(schema, view)
+        if view is not None:
+            if not isinstance(view, ViewSpec):
+                raise TypeError("view editor requires ViewSpec or None")
+            validate_view_spec(schema, view)
+            if intent is not None and intent is not view.intent:
+                raise ValueError("view and requested intent disagree")
+            intent = view.intent
+            faceted = any(binding.role is AxisViewRole.FACET
+                          for binding in view.source_bindings)
+        elif intent is not None and not isinstance(intent, ViewIntent):
+            raise TypeError("intent must be ViewIntent or None")
+        if not isinstance(faceted, bool):
+            raise TypeError("faceted must be bool")
+        if view is None and intent is None and not faceted:
+            raise ValueError("an unresolved non-Grid view requires its intent")
+        same_schema = (
+            self._schema is not None
+            and self._schema.fingerprint == schema.fingerprint
+        )
+        if (same_schema and self._view == view and self._intent is intent
+                and self._faceted is faceted and not self._controls_dirty):
+            return
+        same_draft = (
+            same_schema
+            and self._view is None
+            and self._intent is intent
+            and self._faceted is faceted
+        )
+        self._schema, self._view = schema, view
+        self._intent, self._faceted = intent, faceted
+        if view is not None:
+            self._preferences = _view_preferences_from_spec(schema, view)
+        elif not same_draft:
+            self._preferences = ViewPreferences()
+
+        fields, values, selections = self._project_form()
+        self._selection_fields = selections
+        self._controls_dirty = False
+        if not fields:
+            if self._form is not None:
+                self._form.hide()
+            self.hide()
+            return
+        spec = FormSpec(tuple(fields))
+        if self._form is None:
+            self._form = FluentParameterForm(
+                spec,
+                values,
+                self,
+                label_width=self._label_width,
+            )
+            self._form.changed.connect(self._commit_field)
+            self._layout.addWidget(self._form)
+        else:
+            self._form.reconcile(spec, values)
+        self._form.show()
+        self.show()
+
+    def _project_form(self):
+        assert self._schema is not None
+        fields, values = [], {}
+
+        def add(field, value):
+            fields.append(field)
+            values[field.key] = value
+
+        if self._faceted:
+            facet = None if self._view is None else grid_facet_source(self._view)
+            if self._intent is not None:
+                choices = self._grid_facet_choices(self._intent)
+                add(
+                    _choice_field("grid.facet", "facet", choices, facet,
+                                  "Expand exactly one declared source into Grid cells."),
+                    facet,
+                )
+            intents = tuple(
+                (_GRID_INTENT_LABELS[candidate], candidate)
+                for candidate in GRID_INTENTS
+                if grid_facet_sources(self._schema, candidate, current_view=self._view)
+            )
+            add(
+                _choice_field("grid.intent", "sub plot", intents, self._intent,
+                              "What each Grid cell draws under the same typed ViewSpec."),
+                self._intent,
+            )
+
+        if self._view is not None:
+            repeat = AxisSourceRef.tensor(self._schema.repeat_axis.axis_id)
+            bindings = _repeat_authoring_candidates(self._schema, self._view)
+            choices = tuple((_repeat_text(binding), binding) for binding in bindings)
+            if len(choices) > 1:
+                current = self._view.binding(repeat)
+                add(_choice_field("repeat", "repeat", choices, current), current)
+
+        self._role_fields = {}
+        rows = () if self._intent is None else _view_authoring_candidates(
+            self._schema,
+            self._intent,
+            current_view=self._view,
+            preferences=self._preferences,
+            faceted=self._faceted,
+        )
+        for role, current, candidates in rows:
+            key = f"role.{role.value}"
+            label = _DISPLAY_ROLE_LABELS.get(role, role.value.lower())
+            self._role_fields[key] = {
+                value: (preferences, candidate)
+                for value, preferences, candidate in candidates
+            }
+            labelled = tuple(
+                (self._role_value_text(value), value)
+                for value, _preferences, _candidate in candidates
+            )
+            add(_choice_field(key, label, labelled, current,
+                              f"Choose the declared source used as {role.value}."), current)
+
+        selections = {}
+        for sources, label, choices, current, tooltip in self._selection_projection():
+            key = "selected." + "|".join(_source_key(source) for source in sources)
+            selections[key] = sources
+            add(_choice_field(key, label, choices, current, tooltip), current)
+        return fields, values, selections
+
+    def _role_value_text(self, value) -> str:
+        if not value:
+            return "None"
+        sources = value if isinstance(value, tuple) else (value,)
+        all_sources = _dataset_sources(self._schema)
+        names = tuple(_source_name(self._schema, source) for source in all_sources)
+        labels = []
+        for source in sources:
+            name = _source_name(self._schema, source)
+            labels.append(f"{name} [{_source_key(source)}]"
+                          if names.count(name) > 1 else name)
+        return " + ".join(labels)
+
+    def _selection_projection(self):
+        if self._schema is None or self._view is None:
+            return ()
         editable = []
         grid_bindings = tuple(
             binding
-            for binding in view.source_bindings
+            for binding in self._view.source_bindings
             if binding.source.kind == AxisSourceRef.GRID_DIMENSION
             and binding.role is AxisViewRole.SELECTED
             and isinstance(binding.selector, FixedIndex)
         )
         if grid_bindings:
-            topology = schema.grid_topology
+            topology = self._schema.grid_topology
             if topology is None:
                 raise ValueError("selected Grid source is absent from GridTopology")
             selected = {binding.source: binding for binding in grid_bindings}
-            grid_sources = tuple(
-                AxisSourceRef.grid_dimension(dimension_id)
-                for dimension_id in topology.dimension_ids
-                if AxisSourceRef.grid_dimension(dimension_id) in selected
+            sources = tuple(
+                AxisSourceRef.grid_dimension(axis_id)
+                for axis_id in topology.dimension_ids
+                if AxisSourceRef.grid_dimension(axis_id) in selected
             )
-            base_ordinals = _resolve_selected_point_ordinals(
-                schema,
-                view,
-                ignore_selected_sources=grid_sources,
+            ordinals = _resolve_selected_point_ordinals(
+                self._schema,
+                self._view,
+                ignore_selected_sources=sources,
             )
-            positions = tuple(
-                topology.dimension_ids.index(source.axis_id)
-                for source in grid_sources
-            )
+            positions = tuple(topology.dimension_ids.index(source.axis_id) for source in sources)
             choices = tuple(
                 dict.fromkeys(
-                    tuple(
-                        topology.row_to_cell[ordinal][position]
-                        for position in positions
-                    )
-                    for ordinal in base_ordinals
+                    tuple(topology.row_to_cell[ordinal][position] for position in positions)
+                    for ordinal in ordinals
                 )
             )
-            current = tuple(
-                selected[source].selector.index for source in grid_sources
-            )
+            current = tuple(selected[source].selector.index for source in sources)
             if current not in choices:
                 raise ValueError("current Grid selection has no physical row")
             if len(choices) > 1:
                 label = (
-                    schema.point_table.column(grid_sources[0].axis_id).name
-                    if len(grid_sources) == 1
+                    self._schema.point_table.column(sources[0].axis_id).name
+                    if len(sources) == 1
                     else "Grid cell"
                 )
                 editable.append(
                     (
-                        grid_sources,
+                        sources,
                         label,
-                        tuple(
-                            (_grid_choice_text(schema, grid_sources, choice), choice)
-                            for choice in choices
-                        ),
+                        tuple((_grid_choice_text(self._schema, sources, item), item) for item in choices),
                         current,
                         "Choose one physical Grid cell; sparse holes are not offered.",
                     )
                 )
-        for binding in view.source_bindings:
+        axes = (self._schema.repeat_axis, *self._schema.cell_schema.data_axes)
+        by_id = {axis.axis_id: axis for axis in axes}
+        for binding in self._view.source_bindings:
             if (
-                binding.role is not AxisViewRole.SELECTED
+                binding.source.kind != AxisSourceRef.TENSOR
+                or binding.role is not AxisViewRole.SELECTED
                 or not isinstance(binding.selector, FixedIndex)
             ):
                 continue
-            source = binding.source
-            if source.kind != AxisSourceRef.TENSOR:
+            declared = by_id[binding.source.axis_id]
+            if declared.size <= 1:
                 continue
-            axes = (schema.repeat_axis, *schema.cell_schema.data_axes)
-            declared = next(
-                axis for axis in axes if axis.axis_id == source.axis_id
-            )
-            size = declared.size
-            if size > 1:
-                axis = evaluate_axis(schema, source, tuple(range(size)))
-                editable.append(
-                    (
-                        (source,),
-                        axis.name,
-                        tuple(
-                            (_coordinate_text(axis, position), (index,))
-                            for position, index in enumerate(axis.indices)
-                        ),
-                        (binding.selector.index,),
-                        f"Choose which {axis.name} coordinate this panel displays.",
-                    )
+            axis = evaluate_axis(self._schema, binding.source, tuple(range(declared.size)))
+            editable.append(
+                (
+                    (binding.source,),
+                    axis.name,
+                    tuple(
+                        (_coordinate_text(axis, position), (index,))
+                        for position, index in enumerate(axis.indices)
+                    ),
+                    (binding.selector.index,),
+                    f"Choose which {axis.name} coordinate this panel displays.",
                 )
-        row_keys = {sources for sources, _label, _choices, _current, _tip in editable}
-        self._updating = True
-        try:
-            for sources in tuple(self._rows):
-                if sources in row_keys:
-                    continue
-                row, _combo = self._rows.pop(sources)
-                self._layout.removeWidget(row)
-                row.hide()
-                row.deleteLater()
-            for position, (sources, label, choices, current, tooltip) in enumerate(editable):
-                pair = self._rows.get(sources)
-                if pair is None:
-                    combo = FluentComboBox()
-                    row = FluentSettingRow(
-                        label,
-                        combo,
-                        label_width=self._label_width,
-                        parent=self,
-                    )
-                    combo.currentIndexChanged.connect(
-                        lambda index, sources=sources: self._commit_choice(
-                            sources,
-                            index,
-                        )
-                    )
-                    self._rows[sources] = (row, combo)
-                else:
-                    row, combo = pair
-                    row.set_label(label, width=self._label_width)
-                self._layout.insertWidget(position, row)
-                self._seed_combo(choices, current, combo)
-                row.setToolTip(tooltip)
-                row.show()
-        finally:
-            self._updating = False
-        self._schema = schema
-        self._view = view
-        self.setVisible(bool(editable))
+            )
+        return tuple(editable)
 
     @staticmethod
-    def _seed_combo(choices, current, combo) -> None:
-        if len(choices) <= 1:
-            raise ValueError("view editor received a non-editable choice set")
-        with signals_blocked(combo):
-            combo.clear()
-            for label, value in choices:
-                combo.addItem(label, value)
-            position = next(
-                (
-                    index
-                    for index in range(combo.count())
-                    if combo.itemData(index) == current
-                ),
-                -1,
-            )
-            if position < 0:
-                raise ValueError("current selection is absent from its physical choices")
-            combo.setCurrentIndex(position)
-            combo.setEnabled(True)
+    def _replace_binding(view: ViewSpec, binding: SourceViewBinding) -> ViewSpec:
+        return replace(
+            view,
+            source_bindings=tuple(
+                binding if item.source == binding.source else item
+                for item in view.source_bindings
+            ),
+        )
 
-    def _commit_choice(
-        self,
-        sources: tuple[AxisSourceRef, ...],
-        combo_index: int,
-    ) -> None:
-        if self._updating or self._schema is None or self._view is None:
-            return
-        pair = self._rows.get(sources)
-        if pair is None:
-            return
-        _row, combo = pair
-        selected = combo.itemData(int(combo_index))
-        if (
-            not isinstance(selected, tuple)
-            or len(selected) != len(sources)
-            or any(
-                isinstance(index, bool) or not isinstance(index, int)
-                for index in selected
+    def _grid_facet_choices(self, intent: ViewIntent):
+        assert self._schema is not None
+        sources = grid_facet_sources(self._schema, intent, current_view=self._view)
+        names = tuple(_source_name(self._schema, source) for source in sources)
+        return tuple(
+            (
+                f"{name} ({_source_cardinality(self._schema, source)})"
+                + (f" [{_source_key(source)}]" if names.count(name) > 1 else ""),
+                source,
             )
+            for source, name in zip(sources, names, strict=True)
+        )
+
+    def _commit_field(self, key: str) -> None:
+        if self._form is None or self._schema is None:
+            return
+        value = self._form.read_value(key)
+        if key == "grid.intent":
+            self._commit_grid_intent(value)
+        elif key == "grid.facet":
+            self._commit_grid_facet(value)
+        elif key == "repeat":
+            self._commit_repeat(value)
+        elif key in self._role_fields:
+            self._commit_role(key, value)
+        elif key in self._selection_fields:
+            self._commit_selection(self._selection_fields[key], value)
+
+    def _commit_role(self, key, value) -> None:
+        commit = self._role_fields.get(key, {}).get(value)
+        if commit is None:
+            return
+        preferences, candidate = commit
+        self._preferences = preferences
+        if candidate is None:
+            if self._view is None:
+                self._controls_dirty = True
+                self.reconcile(
+                    self._schema,
+                    None,
+                    intent=self._intent,
+                    faceted=self._faceted,
+                )
+            return
+        self._emit(candidate)
+
+    def _commit_grid_intent(self, intent) -> None:
+        if not isinstance(intent, ViewIntent) or intent not in GRID_INTENTS:
+            return
+        current = None if self._view is None else grid_facet_source(self._view)
+        legal = tuple(value for _label, value in self._grid_facet_choices(intent))
+        preferred = current if current in legal else legal[0] if len(legal) == 1 else None
+        self._intent = intent
+        if preferred is not None:
+            self._commit_grid_view(intent, preferred)
+            return
+        self._view = None
+        self._controls_dirty = True
+        self.reconcile(self._schema, None, intent=intent, faceted=True)
+
+    def _commit_grid_facet(self, source) -> None:
+        if self._intent in GRID_INTENTS and isinstance(source, AxisSourceRef):
+            self._commit_grid_view(self._intent, source)
+
+    def _commit_grid_view(self, intent: ViewIntent, source: AxisSourceRef) -> None:
+        suggestion = resolve_grid_view(
+            self._schema,
+            intent,
+            source,
+            current_view=self._view,
+        )
+        if suggestion.spec is None:
+            raise ValueError("selected Grid cell/facet pair has no complete view")
+        self._emit(suggestion.spec)
+
+    def _commit_selection(self, sources, selected) -> None:
+        if self._view is None or not isinstance(selected, tuple):
+            return
+        if len(selected) != len(sources) or any(
+            isinstance(index, bool) or not isinstance(index, int) for index in selected
         ):
             return
-        current = tuple(
-            self._view.binding(source).selector.index for source in sources
-        )
-        if current == selected:
-            return
         replacements = {
-            source: replace(
-                self._view.binding(source),
-                selector=FixedIndex(index),
-            )
+            source: replace(self._view.binding(source), selector=FixedIndex(index))
             for source, index in zip(sources, selected, strict=True)
         }
-        bindings = tuple(
-            replacements.get(item.source, item)
-            for item in self._view.source_bindings
+        candidate = replace(
+            self._view,
+            source_bindings=tuple(
+                replacements.get(binding.source, binding)
+                for binding in self._view.source_bindings
+            ),
         )
-        candidate = replace(self._view, source_bindings=bindings)
         validate_view_spec(self._schema, candidate)
+        self._emit(candidate)
+
+    def _commit_repeat(self, binding) -> None:
+        if self._view is None or not isinstance(binding, SourceViewBinding):
+            return
+        candidate = self._replace_binding(self._view, binding)
+        validate_view_spec(self._schema, candidate)
+        self._emit(candidate)
+
+    def _emit(self, candidate: ViewSpec) -> None:
+        if candidate == self._view:
+            return
         self._view = candidate
+        self._intent = candidate.intent
+        self._preferences = _view_preferences_from_spec(self._schema, candidate)
+        self._controls_dirty = True
         self.viewChanged.emit(candidate)

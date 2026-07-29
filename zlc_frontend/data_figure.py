@@ -14,9 +14,9 @@ from zlc_data import (
     FitResultBatch,
     HISTOGRAM_BIN,
     HistogramSpec,
-    axis_source_ref_to_tree,
-    validate_fit_result_source_binding,
 )
+from zlc_data.codec import axis_source_ref_to_tree
+from zlc_data.fit import validate_fit_result_source_binding
 from zlc_storage import canonical_digest, canonical_text
 
 from .figure import (
@@ -46,7 +46,57 @@ from .render import PanelPresentationIdentity, RasterBuffer
 
 if TYPE_CHECKING:
     from .fit_curve_projection import CurveFitOverlayPlan
-    from .render import RadialGaussianImageFitOverlay
+    from .render import (
+        BoardFrame,
+        PanelFrame,
+        RadialGaussianImageFitOverlay,
+    )
+
+
+def _fit_overlay_projection_keys(
+    document: FigureDocument,
+    evaluated: EvaluatedFigureData,
+) -> tuple[tuple[object, ...], tuple[object, ...]]:
+    """Freeze static compatibility separately from resolved live selectors.
+
+    A valid ``ViewSpec`` plus its schema fingerprint already determines every
+    facet and batch address.  Keeping those immutable values directly avoids
+    rebuilding and hashing the complete evaluated cell/series tree whenever a
+    live source revision advances.
+    """
+
+    if (
+        document.document_id != evaluated.document_id
+        or document.revision != evaluated.document_revision
+        or len(document.layers) != len(evaluated.layers)
+    ):
+        raise ValueError("Figure document and evaluation identity differ")
+
+    semantic_layers = []
+    exact_layers = []
+    for source_layer, layer in zip(
+        document.layers,
+        evaluated.layers,
+        strict=True,
+    ):
+        if (
+            source_layer.layer_id != layer.layer_id
+            or source_layer.dataset_id != layer.dataset_id
+        ):
+            raise ValueError("Figure document and evaluated layer identity differ")
+        semantic_layers.append(
+            (layer.layer_id, layer.dataset_id, source_layer.view)
+        )
+        exact_layers.append(
+            (
+                layer.layer_id,
+                tuple(
+                    (resolution.source, resolution.selector, resolution.index)
+                    for resolution in layer.resolutions
+                ),
+            )
+        )
+    return tuple(semantic_layers), tuple(exact_layers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,12 +159,9 @@ class FigurePanelRegion:
 
 def _validated_fit_result_mapping(
     document: FigureDocument,
-    evaluated,
+    evaluated: EvaluatedFigureData,
     source_schemas: tuple[tuple[DatasetId, DatasetSchema], ...],
     fit_results: Mapping[str, FitResultBatch] | None,
-    *,
-    source_refs=(),
-    source_and_view_validated: bool = False,
 ) -> tuple[tuple[str, FitResultBatch], ...]:
     """Validate overlays entirely from frozen schema/ref/evaluation facts."""
 
@@ -123,19 +170,16 @@ def _validated_fit_result_mapping(
         raise TypeError("fit_results keys must be non-empty layer ids")
     if any(not isinstance(value, FitResultBatch) for value in supplied.values()):
         raise TypeError("fit_results values must be FitResultBatch")
-    if evaluated is not None and (
+    if not isinstance(evaluated, EvaluatedFigureData):
+        raise TypeError("fit result validation requires evaluated Figure data")
+    if (
         document.document_id != evaluated.document_id
         or document.revision != evaluated.document_revision
     ):
         raise ValueError("document and evaluated data identities differ")
 
     layers = {layer.layer_id: layer for layer in document.layers}
-    evaluated_inputs = (
-        {}
-        if evaluated is None
-        else {item.dataset_id: item for item in evaluated.inputs}
-    )
-    refs = dict(source_refs)
+    evaluated_inputs = {item.dataset_id: item for item in evaluated.inputs}
     schemas = dict(source_schemas)
     fit_layers = {}
     for layer_id, result in supplied.items():
@@ -147,55 +191,25 @@ def _validated_fit_result_mapping(
             ) from exc
         try:
             source_schema = schemas[layer.dataset_id]
-            source_ref = (
-                refs[layer.dataset_id]
-                if evaluated is None
-                else evaluated_inputs[layer.dataset_id].ref
-            )
+            source_ref = evaluated_inputs[layer.dataset_id].ref
         except KeyError as exc:
             raise ValueError("fit layer source metadata is absent") from exc
-        if not source_and_view_validated:
-            validate_fit_result_source_binding(result, source_ref, source_schema)
-        if not source_and_view_validated:
-            transform = result.spec.committed_transform
-            operations = tuple(transform.spec.operations)
-            view_point_ordinals = tuple(
-                range(source_schema.point_table.row_count)
-                if layer.view.point_ordinals is None
-                else layer.view.point_ordinals
-            )
-            if view_point_ordinals != transform.exact_point_ordinals:
-                raise ValueError(
-                    "Fit authority and Figure view select different point rows"
-                )
-            histogram = operations[-1] if operations else None
-            if isinstance(histogram, HistogramSpec):
-                if layer.view.intent is not ViewIntent.HISTOGRAM:
-                    raise ValueError(
-                        "histogram Fit authority requires a HISTOGRAM Figure"
-                    )
-                sample_sources = {
-                    binding.source
-                    for binding in layer.view.source_bindings
-                    if binding.role is AxisViewRole.SAMPLE
-                }
-                if set(histogram.sources) != sample_sources:
-                    raise ValueError(
-                        "histogram Fit sample axes differ from the Figure view"
-                    )
-            else:
-                _fit_display_selection_indices(source_schema, result)
+        validate_fit_result_source_binding(result, source_ref, source_schema)
         fit_layers[layer_id] = (layer, result)
 
-    if evaluated is None:
-        return tuple(sorted(supplied.items()))
-
+    evaluated_layers = {item.layer_id: item for item in evaluated.layers}
     allowed_batch_roles = {
         AxisViewRole.BATCH,
         AxisViewRole.FACET,
         AxisViewRole.SELECTED,
     }
     for layer, result in fit_layers.values():
+        _fit_display_selection_indices(
+            schemas[layer.dataset_id],
+            layer.view,
+            evaluated_layers[layer.layer_id].resolutions,
+            result,
+        )
         fit_axes = result.fit_axis_specs
         if len(fit_axes) == 1:
             if layer.view.intent is ViewIntent.HISTOGRAM:
@@ -235,9 +249,7 @@ def _validated_fit_result_mapping(
             strict=True,
         ):
             role = layer.view.binding(source).role
-            if role not in allowed_batch_roles and not (
-                role is AxisViewRole.REDUCED and axis.size == 1
-            ):
+            if role not in allowed_batch_roles:
                 raise ValueError(
                     f"fit batch axis {axis.axis_id} is not uniquely displayed or selected"
                 )
@@ -258,6 +270,8 @@ class DataFigure:
         "_datasets",
         "_document",
         "_evaluated",
+        "_fit_overlay_exact_key",
+        "_fit_overlay_semantic_key",
         "_fit_results",
         "_source_schemas",
     )
@@ -280,28 +294,21 @@ class DataFigure:
         source_schemas = tuple(
             (dataset_id, snapshot.block.schema) for dataset_id, snapshot in sources
         )
-        source_refs = tuple(
-            (dataset_id, snapshot.ref) for dataset_id, snapshot in sources
-        )
-        _validated_fit_result_mapping(
-            document,
-            None,
-            source_schemas,
-            fit_results,
-            source_refs=source_refs,
-        )
         evaluated = FigureEvaluator().evaluate(document, datasets)
         validated_fit_results = _validated_fit_result_mapping(
             document,
             evaluated,
             source_schemas,
             fit_results,
-            source_and_view_validated=True,
         )
 
         self._datasets = datasets
         self._document = document
         self._evaluated = evaluated
+        (
+            self._fit_overlay_semantic_key,
+            self._fit_overlay_exact_key,
+        ) = _fit_overlay_projection_keys(document, evaluated)
         self._fit_results = validated_fit_results
         self._source_schemas = source_schemas
 
@@ -332,6 +339,95 @@ class DataFigure:
         """Whether this immutable figure carries an exact saved or draft fit."""
         return bool(self._fit_results)
 
+    def _transient_fit_projection_key(
+        self,
+        frame: BoardFrame,
+    ) -> tuple[object, ...]:
+        """Validate one typed frame and return its precomputed overlay key."""
+
+        from .render import (
+            BoardFrame,
+            CurvePanelPayload,
+            HistogramPanelPayload,
+            ImagePanelPayload,
+            MeterPanelPayload,
+        )
+
+        if not isinstance(frame, BoardFrame) or len(frame.panels) != 1:
+            raise TypeError("typed Figure projection requires one BoardFrame panel")
+        document = self._document
+        evaluated = self._evaluated
+        if (
+            len(document.layers) != 1
+            or len(evaluated.layers) != 1
+            or len(evaluated.inputs) != 1
+            or len(evaluated.layers[0].cells) != 1
+        ):
+            raise ValueError("typed Figure projection requires one exact layer/input")
+        source_layer = document.layers[0]
+        layer = evaluated.layers[0]
+        source_input = evaluated.inputs[0]
+
+        panel = frame.panels[0]
+        presentation = next(
+            item for item in panel.coherence_stamp.presentations
+            if item.panel_id == panel.panel_id
+        )
+        assert isinstance(presentation, PanelPresentationIdentity)
+        if (
+            presentation.document_id != document.document_id
+            or presentation.document_revision != document.revision
+        ):
+            raise ValueError("typed Figure frame belongs to another document revision")
+
+        payload = panel.display_payload
+        payload_types = (
+            ImagePanelPayload,
+            CurvePanelPayload,
+            HistogramPanelPayload,
+            MeterPanelPayload,
+        )
+        if not isinstance(payload, payload_types):
+            raise TypeError("typed Figure frame has another display payload")
+        if payload.evaluated_input is not source_input:
+            raise ValueError("typed Figure frame has another evaluated input")
+        expected_intent = {
+            ImagePanelPayload: ViewIntent.IMAGE,
+            CurvePanelPayload: ViewIntent.CURVE,
+            HistogramPanelPayload: ViewIntent.HISTOGRAM,
+            MeterPanelPayload: ViewIntent.METER,
+        }[type(payload)]
+        if source_layer.view.intent is not expected_intent:
+            raise ValueError("typed Figure frame and view intent differ")
+
+        cell_series = evaluated.layers[0].cells[0].series
+        if isinstance(payload, ImagePanelPayload):
+            if len(cell_series) != 1 or payload.image is not cell_series[0].data:
+                raise ValueError("IMAGE frame differs from its exact evaluated cell")
+        elif len(payload.series) != len(cell_series) or any(
+            displayed.data is not evaluated_series.data
+            or displayed.batch_address != evaluated_series.batch_address
+            for displayed, evaluated_series in zip(
+                payload.series,
+                cell_series,
+                strict=True,
+            )
+        ):
+            raise ValueError("typed Figure payload differs from its evaluated cell")
+
+        histogram = isinstance(payload, HistogramPanelPayload)
+        return (
+            (
+                self._fit_overlay_semantic_key,
+                type(payload).__name__,
+                payload.bin_projection.requested_bin_count if histogram else None,
+            ),
+            (
+                self._fit_overlay_exact_key,
+                payload.bin_projection.projection_digest if histogram else None,
+            ),
+        )
+
     def with_fit_results(
         self,
         fit_results: Mapping[str, FitResultBatch] | None,
@@ -346,27 +442,18 @@ class DataFigure:
         authority becomes reachable through ``DataFigure``.
         """
 
-        source_refs = tuple(
-            (item.dataset_id, item.ref) for item in self._evaluated.inputs
-        )
-        _validated_fit_result_mapping(
-            self._document,
-            None,
-            self._source_schemas,
-            fit_results,
-            source_refs=source_refs,
-        )
         validated = _validated_fit_result_mapping(
             self._document,
             self._evaluated,
             self._source_schemas,
             fit_results,
-            source_and_view_validated=True,
         )
         clone = object.__new__(type(self))
         clone._datasets = self._datasets
         clone._document = self._document
         clone._evaluated = self._evaluated
+        clone._fit_overlay_semantic_key = self._fit_overlay_semantic_key
+        clone._fit_overlay_exact_key = self._fit_overlay_exact_key
         clone._fit_results = validated
         clone._source_schemas = self._source_schemas
         return clone
@@ -631,6 +718,10 @@ class DataFigure:
         clone._datasets = self._datasets
         clone._document = focused_document
         clone._evaluated = focused_evaluated
+        (
+            clone._fit_overlay_semantic_key,
+            clone._fit_overlay_exact_key,
+        ) = _fit_overlay_projection_keys(focused_document, focused_evaluated)
         # A focused panel is a display-only projection of the same immutable
         # Figure, not a new Fit result.  Retain the exact result owner so
         # the focused typed host can resolve the matching batch row from the
@@ -729,117 +820,6 @@ class DataFigure:
         )
         return payload, regions
 
-    def to_panel_png_bytes_with_panel_regions(
-        self,
-        *,
-        size: str,
-        width: int,
-        height: int,
-        dpi: float,
-        display_state: object,
-        title: str,
-        value_label: str,
-    ) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
-        """Encode a live grid into one named panel's fixed raster geometry.
-
-        The ordinary ``to_png_bytes_with_panel_regions`` remains the archival
-        page renderer.  A TaskConsole grid instead has a pre-existing panel
-        size: every cell must subdivide that exact data box and the returned
-        hit regions must come from the very same draw.
-        """
-
-        from .matplotlib_render import (
-            encode_evaluated_panel_with_regions,
-        )
-        display_state, projection, overlays = self._histogram_render_values(
-            display_state
-        )
-
-        return encode_evaluated_panel_with_regions(
-            self._document,
-            self._evaluated,
-            dict(self._fit_results),
-            size=size,
-            width=width,
-            height=height,
-            dpi=dpi,
-            display_state=display_state,
-            title=title,
-            value_label=value_label,
-            histogram_projection=projection,
-            histogram_fit_overlays=overlays,
-        )
-
-    def transient_fit_to_panel_png_bytes_with_panel_regions(
-        self,
-        result: FitResultBatch,
-        *,
-        size: str,
-        width: int,
-        height: int,
-        dpi: float,
-        display_state: object,
-        title: str,
-        value_label: str,
-    ) -> tuple[bytes, tuple[FigurePanelRegion, ...]]:
-        """Encode one draft Fit grid without attaching it to this DataFigure."""
-
-        if not isinstance(result, FitResultBatch):
-            raise TypeError("transient grid fit must be FitResultBatch")
-        if len(self._document.layers) != 1:
-            raise ValueError("transient grid fit requires exactly one layer")
-        layer = self._document.layers[0]
-        validated = dict(
-            _validated_fit_result_mapping(
-                self._document,
-                self._evaluated,
-                self._source_schemas,
-                {layer.layer_id: result},
-            )
-        )
-        from .matplotlib_render import encode_evaluated_panel_with_regions
-
-        projection = None
-        overlays = ()
-        if self._document.layers[0].view.intent is ViewIntent.HISTOGRAM:
-            display_state, projection, overlays = self._histogram_fit_presentation(
-                result,
-                result_identity=f"transient-fit:{id(result):x}",
-                display_state=display_state,
-            )
-
-        return encode_evaluated_panel_with_regions(
-            self._document,
-            self._evaluated,
-            validated,
-            size=size,
-            width=width,
-            height=height,
-            dpi=dpi,
-            display_state=display_state,
-            title=title,
-            value_label=value_label,
-            histogram_projection=projection,
-            histogram_fit_overlays=overlays,
-        )
-
-    def single_panel_curve_fit_overlay_plan(
-        self,
-        *,
-        result_identity: str,
-    ) -> CurveFitOverlayPlan:
-        """Freeze canonical CURVE overlay work without evaluating a model."""
-
-        from .fit_curve_projection import single_panel_curve_fit_overlay_plan
-
-        return single_panel_curve_fit_overlay_plan(
-            self._document,
-            self._evaluated,
-            dict(self._fit_results),
-            self._single_panel_source_schema(),
-            result_identity=result_identity,
-        )
-
     def transient_single_panel_curve_fit_overlay_plan(
         self,
         result: FitResultBatch,
@@ -886,6 +866,8 @@ class DataFigure:
         *,
         result_identity: str,
         display_state,
+        bin_projection=None,
+        maximum_prediction_points=None,
         check_cancelled=None,
     ):
         """Build the exact committed Histogram projection and cell overlays."""
@@ -899,7 +881,120 @@ class DataFigure:
             result,
             result_identity=result_identity,
             display_state=display_state,
+            bin_projection=bin_projection,
+            maximum_prediction_points=maximum_prediction_points,
             check_cancelled=check_cancelled,
+        )
+
+    def materialize_transient_fit_overlays(
+        self,
+        result: FitResultBatch,
+        source_frame: BoardFrame | None,
+        *,
+        result_identity: str,
+        check_cancelled=None,
+    ) -> PanelFrame | None:
+        """Materialize one overlay-bearing panel over an unchanged base raster.
+
+        This pure worker-side entry is shared by live and snapshot surfaces.
+        It never invokes Matplotlib or creates replacement pixels.  Replacing
+        only the panel payload runs the renderer's canonical overlay validators
+        on the worker before the Qt owner sees the bounded primitives.  A grid
+        overview or encoded fallback has no single-panel geometry and returns
+        ``None`` without affecting the independently published Fit parameters.
+        """
+
+        from .display_range import RelimMode
+        from .fit_curve_projection import materialize_curve_fit_overlay_plan
+        from .histogram_display import HistogramDisplayState
+        from .render import (
+            BoardFrame,
+            CurvePanelPayload,
+            HistogramPanelPayload,
+            ImagePanelPayload,
+        )
+
+        if not isinstance(result, FitResultBatch):
+            raise TypeError("transient Fit overlay requires FitResultBatch")
+        if source_frame is None or (
+            isinstance(source_frame, BoardFrame)
+            and (
+                len(source_frame.panels) != 1
+                or len(self._evaluated.layers) != 1
+                or len(self._evaluated.layers[0].cells) != 1
+            )
+        ):
+            return None
+        if not isinstance(source_frame, BoardFrame):
+            raise TypeError("source_frame must be BoardFrame or None")
+        self._transient_fit_projection_key(source_frame)
+        panel = source_frame.panels[0]
+        payload = panel.display_payload
+        if not isinstance(
+            payload,
+            (ImagePanelPayload, CurvePanelPayload, HistogramPanelPayload),
+        ):
+            return None
+        if result.source_ref != payload.evaluated_input.ref:
+            raise ValueError("Fit result belongs to another exact Figure revision")
+        prediction_point_budget = max(2, 2 * panel.raster.width)
+        if isinstance(payload, ImagePanelPayload):
+            if payload.fit_overlay is not None:
+                raise ValueError("transient IMAGE Fit requires an uncomposed base")
+            overlay = self.transient_single_panel_radial_fit_overlay(
+                result,
+                result_identity=result_identity,
+                check_cancelled=check_cancelled,
+            )
+            return replace(panel, display_payload=replace(payload, fit_overlay=overlay))
+        if isinstance(payload, CurvePanelPayload):
+            if payload.fit_overlays:
+                raise ValueError("transient CURVE Fit requires an uncomposed base")
+            plan = self.transient_single_panel_curve_fit_overlay_plan(
+                result,
+                result_identity=result_identity,
+            )
+            overlays = materialize_curve_fit_overlay_plan(
+                plan,
+                maximum_prediction_points=prediction_point_budget,
+                check_cancelled=check_cancelled,
+            )
+            return replace(
+                panel,
+                display_payload=replace(payload, fit_overlays=overlays),
+            )
+
+        if payload.fit_overlays:
+            raise ValueError("transient HISTOGRAM Fit requires an uncomposed base")
+        viewport = payload.viewport
+        state = HistogramDisplayState(
+            revision=viewport.display_revision,
+            relim_mode=viewport.relim_mode,
+            log_count_axis=viewport.log_count_axis,
+            bin_count=viewport.bin_count,
+            x_view=None if viewport.x_limits_are_auto else viewport.x_limits,
+            fixed_count_limits=(
+                viewport.count_limits
+                if viewport.relim_mode is RelimMode.FIXED
+                else None
+            ),
+            thresholds=payload.thresholds,
+        )
+        _state, projection, overlays_by_cell = self._histogram_fit_presentation(
+            result,
+            result_identity=result_identity,
+            display_state=state,
+            bin_projection=payload.bin_projection,
+            maximum_prediction_points=prediction_point_budget,
+            check_cancelled=check_cancelled,
+        )
+        if len(overlays_by_cell) != 1:
+            raise ValueError("single-panel Histogram Fit produced multiple cells")
+        if projection is not payload.bin_projection:
+            raise RuntimeError("Histogram Fit replaced the frozen base projection")
+        return replace(
+            panel,
+            display_payload=replace(payload, fit_overlays=overlays_by_cell[0]),
         )
 
     def _histogram_render_values(self, display_state):

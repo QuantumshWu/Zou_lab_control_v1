@@ -1,18 +1,4 @@
-"""The tree signal picker's data layer moved in with the widget it fills.
-
-`FluentTreeComboBox` was migrated into `zlc_frontend.qt_widgets`, but the helpers
-that turn a set of signal names into its collapsible groups - and that read a
-selection back out - stayed behind in the old monolith's
-`Zou_lab_control/frontend/param_widgets.py`.  A new consumer could therefore get
-the widget from the new package and then had to reach into the old tree to fill
-it, which is the reverse of this migration's package direction.  That is the
-concrete reason no window under `Zou_lab_control/workbench/` uses the picker at
-all, and it blocks the TaskConsole's per-panel source picker.
-
-The cluster is pure Qt-combo + plain data (no domain types, no hub, no
-ParamDecl), so it moved as a unit.  The old module re-exports it rather than
-keeping a copy: one owner, no drift.
-"""
+"""Current contracts for the one frontend-owned grouped signal picker."""
 
 from __future__ import annotations
 
@@ -177,4 +163,44 @@ def test_nested_signal_leaf_is_selected_by_the_real_popup_click():
     assert combo.current_signal() == "camera_frame"
     body.close()
     body.deleteLater()
+    application.processEvents()
+
+
+def test_explicit_topology_delta_preserves_items_selection_and_expansion():
+    """Adding a Figure output mutates the model, not the picker widget tree."""
+
+    from PyQt5 import QtCore, QtWidgets
+
+    configure_offscreen_fast_path()
+    application = ensure_qt_app()
+    combo = FluentTreeComboBox()
+    combo.set_signal_tree(
+        (("Camera", (("frame", "camera.frame", "Camera · frame"),)),),
+        current="camera.frame",
+    )
+    view = combo.view()
+    assert isinstance(view, QtWidgets.QTreeView)
+    camera_parent = combo.model().item(0)
+    frame_item = camera_parent.child(0)
+    view.setExpanded(camera_parent.index(), True)
+
+    combo.set_signal_tree(
+        (
+            (
+                "Camera",
+                (
+                    ("frame [1x1x(32,32)]", "camera.frame", "Camera · frame"),
+                    ("center x", "fit.center_x", "Camera · center x"),
+                ),
+            ),
+        ),
+        current="camera.frame",
+    )
+
+    assert combo.model().item(0) is camera_parent
+    assert camera_parent.child(0) is frame_item
+    assert camera_parent.child(1).data(QtCore.Qt.UserRole) == "fit.center_x"
+    assert combo.current_signal() == "camera.frame"
+    assert view.isExpanded(camera_parent.index())
+    combo.deleteLater()
     application.processEvents()

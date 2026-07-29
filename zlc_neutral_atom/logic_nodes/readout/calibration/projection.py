@@ -33,9 +33,9 @@ from zlc_data import (
     StreamGenerationId,
     ValidityContract,
     ValueSchema,
-    expand_dataset_validity,
-    immutable_array,
 )
+from zlc_data._arrays import immutable_array
+from zlc_data.value import expand_dataset_validity
 from zlc_neutral_atom.dataset_output import (
     DatasetOutputDeclaration,
     FinalDatasetOutput,

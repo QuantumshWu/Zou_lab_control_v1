@@ -12,7 +12,9 @@ import textwrap
 import numpy as np
 import pytest
 
-from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, REPEAT, SCAN_POINT
+from zlc_data.axis import REPEAT, SCAN_POINT, AxisId, AxisSpec
+from zlc_data.schema import PointColumn, PointTable
+from zlc_data.value import BlockId
 from zlc_neutral_atom.devices.simulation.installation import create_virtual_installation
 from zlc_neutral_atom.capture.binding import (
     TriggeredCameraLayout,
@@ -252,8 +254,18 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
         scan_layout = TriggeredCameraLayout(
             repeat_axis,
             AxisId("scan.event"),
-            scan_axes=(scan_axis,),
-            scan_point_layout=PointLayout.rect_c((3,)),
+            scan_point_table=PointTable(
+                scan_axis.size,
+                (
+                    PointColumn(
+                        scan_axis.axis_id,
+                        scan_axis.name,
+                        scan_axis.role,
+                        PointColumn.NUMERIC,
+                        scan_axis.coordinates,
+                    ),
+                ),
+            ),
             readout_events_per_repeat=1,
         )
         with pytest.raises(ValueError, match="requires a finite pulse form"):
@@ -346,7 +358,7 @@ def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation
                     artifact.frame_source.schema.cell_schema.data_shape
                 ),
                 "cells": [
-                    [cell.repeat_index, cell.point_storage_index]
+                    [cell.repeat_index, cell.point_ordinal]
                     for cell in schedule
                 ],
                 "produced": artifact.terminal.produced_count,

@@ -5,7 +5,8 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
-from zlc_data import BlockId, DatasetSchema, dataset_revision_ref_to_tree
+from zlc_data import BlockId, DatasetSchema
+from zlc_data.codec import dataset_revision_ref_to_tree
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration, FinalDatasetOutput, final_dataset_join_digest
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import ResolvedCalibration
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import calibration_artifact_ref_to_tree

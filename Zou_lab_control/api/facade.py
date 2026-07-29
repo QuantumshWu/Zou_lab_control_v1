@@ -26,8 +26,8 @@ from zlc_data import (
     FitSpec,
     HistogramSpec,
     Selection,
-    fit_spec_for,
 )
+from zlc_data.fit import fit_spec_for
 from zlc_neutral_atom.artifacts import (
     AdmittedFitResult,
     FitExecution,
@@ -408,6 +408,7 @@ class Experiment:
         model: str | None = None,
         committed_transform: CommittedTransform | None = None,
         independent_sources: tuple[AxisSourceRef, ...] | None = None,
+        batch_sources: tuple[AxisSourceRef, ...] | None = None,
         constraints: tuple[FitParameterConstraint, ...] = (),
         numeric_policy: FitNumericPolicy | None = None,
     ) -> FitExecution:
@@ -438,6 +439,9 @@ class Experiment:
                     model,
                     committed_transform=committed_transform,
                     independent_sources=tuple(independent_sources),
+                    batch_sources=(
+                        () if batch_sources is None else tuple(batch_sources)
+                    ),
                     constraints=constraints,
                     numeric_policy=(
                         FitNumericPolicy()
@@ -451,6 +455,7 @@ class Experiment:
                 for value in (
                     committed_transform,
                     independent_sources,
+                    batch_sources,
                     numeric_policy,
                 )
             ) or constraints:
@@ -602,13 +607,16 @@ class Experiment:
             return admitted.result
 
         def figure_factory(source, *, intent, point_ordinals, preferences):
-            return self.figure(
-                source,
-                intent=intent,
-                point_ordinals=point_ordinals,
-                preferences=preferences,
-                output=artifact_output,
-            )
+            with _service_guard(self._services) as services:
+                return _data_figure_for_services(
+                    services,
+                    self._artifact_operations,
+                    source,
+                    intent=intent,
+                    point_ordinals=point_ordinals,
+                    preferences=preferences,
+                    artifact_output=artifact_output,
+                )
 
         if direct_fit_single_panel:
             if display_source != fit_source:
@@ -628,7 +636,7 @@ class Experiment:
                 if source != fit_source:
                     raise ValueError("direct Fit Figure loader received another source")
                 with _service_guard(self._services) as services:
-                    figure = _data_figure_for_services(
+                    figure, figure_intent = _data_figure_for_services(
                         services,
                         self._artifact_operations,
                         source,
@@ -644,9 +652,9 @@ class Experiment:
 
                 panels = evaluated_figure_panels(figure.evaluated)
                 if len(panels) <= 1:
-                    return figure
+                    return figure, figure_intent
                 layer, cell, series_group = panels[0]
-                return figure.focused_typed_panel(
+                focused = figure.focused_typed_panel(
                     0,
                     expected_address=panel_focus_address(
                         layer,
@@ -654,6 +662,13 @@ class Experiment:
                         series_group,
                     ),
                     expected_intent=figure.document.layers[0].view.intent,
+                )
+                from zlc_frontend.plot_panel import figure_intent_from_view
+
+                return focused, figure_intent_from_view(
+                    focused.document.layers[0].view,
+                    title=figure_intent.title,
+                    value_label=figure_intent.value_label,
                 )
 
         from Zou_lab_control.workbench import open_figure_workbench
@@ -727,7 +742,7 @@ class Experiment:
         """
 
         with _service_guard(self._services) as services:
-            document, _datasets, _fit = _project_figure(
+            document, _datasets, _figure_intent, _fit = _project_figure(
                 services,
                 self._artifact_operations,
                 source,
@@ -751,7 +766,7 @@ class Experiment:
         """Resolve one frozen source and return its optional-render DataFigure."""
 
         with _service_guard(self._services) as services:
-            return _data_figure_for_services(
+            figure, _figure_intent = _data_figure_for_services(
                 services,
                 self._artifact_operations,
                 source,
@@ -760,6 +775,7 @@ class Experiment:
                 preferences=preferences,
                 artifact_output=output,
             )
+            return figure
 
     def figure_gui(
         self,
@@ -846,13 +862,16 @@ class Experiment:
         from Zou_lab_control.workbench import open_figure_workbench
 
         def figure_factory(current_source, *, intent, point_ordinals, preferences):
-            return self.figure(
-                current_source,
-                intent=intent,
-                point_ordinals=point_ordinals,
-                preferences=preferences,
-                output=output,
-            )
+            with _service_guard(self._services) as services:
+                return _data_figure_for_services(
+                    services,
+                    self._artifact_operations,
+                    current_source,
+                    intent=intent,
+                    point_ordinals=point_ordinals,
+                    preferences=preferences,
+                    artifact_output=output,
+                )
 
         return open_figure_workbench(
             figure_factory,

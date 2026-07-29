@@ -20,6 +20,8 @@ from zlc_data import (
     DatasetRevisionRef,
     DatasetSchema,
     OwnedSnapshot,
+)
+from zlc_data.codec import (
     dataset_revision_ref_from_tree,
     dataset_revision_ref_to_tree,
     dataset_schema_from_tree,

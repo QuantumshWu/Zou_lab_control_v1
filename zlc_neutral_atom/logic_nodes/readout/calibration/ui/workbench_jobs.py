@@ -6,8 +6,9 @@ from concurrent.futures import CancelledError
 from dataclasses import replace
 import threading
 
-from zlc_frontend import PlotReportDocument, render_plot_report
+from zlc_frontend import PlotReportDocument
 from zlc_frontend.encoded_raster import EncodedRasterDocument
+from zlc_frontend.plot_report import render_plot_report
 from zlc_neutral_atom.logic_nodes.readout.calibration.application import (
     calibration_request_from_computation,
 )
@@ -123,7 +124,7 @@ def _prepare_calibration_editor(
     except BaseException as error:
         if cancelled.is_set() or isinstance(error, CancelledError):
             raise CancelledError() from error
-        from zlc_workbench.window_runtime import error_summary
+        from zlc_frontend.qt_widgets import error_summary
 
         return request, None, error_summary(error)
     return request, document, None

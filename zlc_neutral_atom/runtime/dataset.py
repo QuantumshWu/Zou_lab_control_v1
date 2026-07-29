@@ -42,10 +42,9 @@ from zlc_data import (
     ValidityMode,
     Value,
     ValueSchema,
-    axis_to_tree,
-    expand_component_validity,
-    point_table_to_tree,
 )
+from zlc_data.codec import axis_to_tree, point_table_to_tree
+from zlc_data.value import expand_component_validity
 
 from ._failure import record_secondary_failure
 

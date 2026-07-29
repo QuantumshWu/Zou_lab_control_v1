@@ -305,14 +305,7 @@ class CalibrationApi:
             folder=folder,
             frame_export_policy=frame_export_policy,
             expected_camera_role=None if binding is None else binding.value,
-            render_report=self._render_calibration_report,
         )
-
-    @staticmethod
-    def _render_calibration_report(view):
-        from .ui.report_projection import render_calibration_plot_report
-
-        return render_calibration_plot_report(view)
 
     def calibration_request(
         self,

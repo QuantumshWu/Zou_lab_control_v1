@@ -32,7 +32,6 @@ from .histogram_display import (
     DEFAULT_HISTOGRAM_BINS,
     FacetedHistogramDisplayState,
     HistogramBinProjection,
-    HistogramCountScale,
     HistogramDisplayState,
     HistogramViewportTransform,
     histogram_count_limits,
@@ -110,6 +109,7 @@ from ._mpl_curve import (
 )
 from ._mpl_histogram import (
     _histogram,
+    _histogram_analysis_cache,
     _histogram_projection,
     _update_histogram_artist,
     _update_histogram_presentation,
@@ -130,6 +130,7 @@ class SinglePanelAggRenderer:
         "_gauss_artist",
         "_gauss_text",
         "_hist_fit_artists",
+        "_hist_analysis_cache",
         "_hist_stats_text",
         "_hist_threshold_artists",
         "_latest_text",
@@ -238,6 +239,7 @@ class SinglePanelAggRenderer:
         self._gauss_artist = None
         self._gauss_text = None
         self._hist_fit_artists = ()
+        self._hist_analysis_cache = None
         self._hist_stats_text = None
         self._hist_threshold_artists = []
         self._latest_text = None
@@ -532,7 +534,7 @@ class SinglePanelAggRenderer:
         side.set_xlim(0.0, self._side_count_ceiling)
         side.set_ylim(*y_limits)
 
-        from zlc_data import (
+        from zlc_data.fit import (
             evaluate_fit_model_components,
             histogram_gaussian_display_diagnostic,
         )
@@ -583,7 +585,7 @@ class SinglePanelAggRenderer:
         *,
         current_count_limits: tuple[float, float] | None,
         previous_relim_mode: RelimMode | None,
-        previous_count_scale: HistogramCountScale | None,
+        previous_log_count_axis: bool | None,
         projection_value_range: tuple[float, float] | None = None,
         bin_projection: HistogramBinProjection | None = None,
         fit_overlays: tuple[HistogramFitOverlay, ...] = (),
@@ -596,7 +598,7 @@ class SinglePanelAggRenderer:
                 state,
                 current_count_limits=current_count_limits,
                 previous_relim_mode=previous_relim_mode,
-                previous_count_scale=previous_count_scale,
+                previous_log_count_axis=previous_log_count_axis,
                 projection_value_range=projection_value_range,
                 bin_projection=bin_projection,
                 fit_overlays=fit_overlays,
@@ -609,7 +611,7 @@ class SinglePanelAggRenderer:
         *,
         current_count_limits: tuple[float, float] | None,
         previous_relim_mode: RelimMode | None,
-        previous_count_scale: HistogramCountScale | None,
+        previous_log_count_axis: bool | None,
         projection_value_range: tuple[float, float] | None,
         bin_projection: HistogramBinProjection | None,
         fit_overlays: tuple[HistogramFitOverlay, ...],
@@ -671,9 +673,9 @@ class SinglePanelAggRenderer:
             peak_count,
             current_count_limits=current_count_limits,
             previous_relim_mode=previous_relim_mode,
-            previous_count_scale=previous_count_scale,
+            previous_log_count_axis=previous_log_count_axis,
         )
-        axis.set_yscale(state.count_scale.value)
+        axis.set_yscale("log" if state.log_count_axis else "linear")
         axis.set_xlim(*x_limits)
         axis.set_ylim(*count_limits)
         effective_thresholds = self._update_histogram_presentation(
@@ -704,7 +706,7 @@ class SinglePanelAggRenderer:
             actual_x_limits,
             actual_count_limits,
             home_x_limits,
-            state.count_scale,
+            state.log_count_axis,
             state.relim_mode,
             state.x_view is None,
             state.bin_count,
@@ -742,6 +744,15 @@ class SinglePanelAggRenderer:
     ) -> tuple[float, ...]:
         """Update the shared full-panel presentation in place."""
 
+        automatic_analysis = None
+        if not fit_overlays:
+            self._hist_analysis_cache = _histogram_analysis_cache(
+                self._hist_analysis_cache,
+                projection.bin_counts,
+                projection.bin_edges,
+            )
+            automatic_analysis = self._hist_analysis_cache[1]
+
         (
             self._hist_fit_artists,
             threshold_artists,
@@ -758,6 +769,7 @@ class SinglePanelAggRenderer:
             stats_text=self._hist_stats_text,
             show_stats=True,
             threshold_linewidth=1.9,
+            automatic_analysis=automatic_analysis,
         )
         self._hist_threshold_artists = list(threshold_artists)
         return thresholds
@@ -971,11 +983,14 @@ class SinglePanelAggRenderer:
                 curve = series.data
                 assert isinstance(curve, EvaluatedCurve)
                 start, stop = overlay.source_sample_span
-                fit_artist.set_data(
-                    np.asarray(
+                coordinates = overlay.coordinates
+                if coordinates is None:
+                    coordinates = np.asarray(
                         curve.x_axis.coordinates[start:stop],
                         dtype=np.float64,
-                    ),
+                    )
+                fit_artist.set_data(
+                    coordinates,
                     overlay.predicted_y,
                 )
                 fit_artist.set_visible(True)
@@ -1077,6 +1092,7 @@ class SinglePanelAggRenderer:
         self._artists = ()
         self._fit_artists = ()
         self._fit_diagnostic_artists = ()
+        self._hist_analysis_cache = None
         self._topology = None
         self._blit_cache.clear()
         # Collect before the worker reports done so the FINAL renderer cannot

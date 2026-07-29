@@ -8,6 +8,7 @@ from PyQt5 import QtCore, QtWidgets
 
 from zlc_frontend import PlotReportDocument
 from zlc_frontend.encoded_raster import EncodedRasterDocument
+from zlc_frontend.form import project_authoring_form
 from zlc_frontend.qt_widgets import (
     FluentButton,
     FluentLabel,
@@ -16,6 +17,7 @@ from zlc_frontend.qt_widgets import (
     GREEN,
     GREY,
     ORANGE,
+    error_summary,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.application import (
     CalibrationArtifactRequest,
@@ -29,10 +31,7 @@ from zlc_neutral_atom.runtime.run import RunCancelled, RunHandle
 from .view_projection import (
     calibration_authority_summary,
 )
-from zlc_workbench.form_projection import project_authoring_form
 from zlc_neutral_atom.runtime.owner_mailbox import RunOwnerMailbox
-
-from zlc_workbench.window_runtime import error_summary
 
 from .report_window import CalibrationReportSurfaceWindow
 from .workbench_jobs import (

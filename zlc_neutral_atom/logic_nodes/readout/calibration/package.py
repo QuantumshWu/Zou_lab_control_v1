@@ -50,11 +50,14 @@ def _bind_api(host: object, _dependencies: tuple[object, ...]) -> CalibrationApi
         calibration_repository,
         **kwargs,
     ):
+        from .ui.report_projection import render_calibration_plot_report
+
         return write_calibration_task_outputs(
             source,
             calibration,
             capture_repository=capture_repository,
             calibration_repository=calibration_repository,
+            render_report=render_calibration_plot_report,
             **kwargs,
         )
 
@@ -105,7 +108,7 @@ def _bind_task_console(api: CalibrationApi, _catalog: object, projection):
     from zlc_neutral_atom.processing.signal_plane import SignalPublication
     from zlc_neutral_atom.runtime.hosted_run import HostedRun
     from .projection import CALIBRATION_FINAL_OUTPUT_DECLARATIONS
-    from .ui.view_projection import project_calibration_site_map
+    from .ui.view_projection import calibration_site_map_figure
     from .workbench_adapter import start_calibration_task_command
 
     site_map_name = CALIBRATION_FINAL_OUTPUT_DECLARATIONS[0].name
@@ -124,7 +127,15 @@ def _bind_task_console(api: CalibrationApi, _catalog: object, projection):
         value = publication.value(node.signal_key(output_name))
         if command is None or result is None or value is None:
             return None
-        return project_calibration_site_map(command, result, value)
+        context = command.site_map_context(result)
+        figure, source = calibration_site_map_figure(
+            value.snapshot,
+            context,
+            coherence_identity=value.join_digest,
+            run_id=value.run_id,
+            provenance_epoch_id=value.epoch_id,
+        )
+        return figure, source.site_map
 
     return projection.run(
         CALIBRATION_LOGIC_NODE,

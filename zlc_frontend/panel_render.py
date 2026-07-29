@@ -272,7 +272,7 @@ class PanelComposer:
         self._curve_relim_mode = None
         self._histogram_count_limits = None
         self._histogram_relim_mode = None
-        self._histogram_count_scale = None
+        self._histogram_log_count_axis = None
         self._sequence = 0
 
     # ----------------------------------------------------------------- view
@@ -774,7 +774,7 @@ class PanelComposer:
             self._curve_relim_mode = None
             self._histogram_count_limits = None
             self._histogram_relim_mode = None
-            self._histogram_count_scale = None
+            self._histogram_log_count_axis = None
             self._image_home_viewport = None
             self._image_color_cache_key = None
             self._image_color_cache_value = None
@@ -1136,13 +1136,13 @@ class PanelComposer:
                     display,
                     current_count_limits=self._histogram_count_limits,
                     previous_relim_mode=self._histogram_relim_mode,
-                    previous_count_scale=self._histogram_count_scale,
+                    previous_log_count_axis=self._histogram_log_count_axis,
                     bin_projection=projection,
                     fit_overlays=overlays,
                 )
                 self._histogram_count_limits = payload.viewport.count_limits
                 self._histogram_relim_mode = display.relim_mode
-                self._histogram_count_scale = display.count_scale
+                self._histogram_log_count_axis = display.log_count_axis
                 return raster, payload
             if self._intent is ViewIntent.METER:
                 if not isinstance(display, MeterDisplayState):
@@ -1377,13 +1377,13 @@ class PanelComposer:
             display,
             current_count_limits=self._histogram_count_limits,
             previous_relim_mode=self._histogram_relim_mode,
-            previous_count_scale=self._histogram_count_scale,
+            previous_log_count_axis=self._histogram_log_count_axis,
             bin_projection=projection,
             fit_overlays=fit_overlays,
         )
         self._histogram_count_limits = payload.viewport.count_limits
         self._histogram_relim_mode = display.relim_mode
-        self._histogram_count_scale = display.count_scale
+        self._histogram_log_count_axis = display.log_count_axis
         return raster, payload
 
     @staticmethod

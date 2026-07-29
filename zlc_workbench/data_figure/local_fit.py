@@ -10,22 +10,21 @@ explicitly saved result by rebuilding that same immutable figure with
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
 from pathlib import Path
 
 from zlc_data import (
     FitResultBatch,
     FitSpec,
     Selection,
-    bind_fit,
-    encode_fit_result_batch,
 )
+from zlc_data.fit import bind_fit, encode_fit_result_batch
 from zlc_frontend import (
     DataFigure,
     FitAuthoringOption,
-    FigurePresentationContract,
     prepare_fit_authoring_options,
 )
+from zlc_frontend.fit_editor import _fit_selection_from_result
+from zlc_frontend.plot_panel import FigureIntent
 
 from .archive_repository import (
     LoadedFigureArchive,
@@ -47,13 +46,7 @@ def _saved_seed(
     if result is None:
         return None, None
     spec = result.spec
-    transform = spec.committed_transform
-    if transform is None:
-        return spec, None
-    operations = tuple(transform.spec.operations)
-    if len(operations) == 1 and isinstance(operations[0], Selection):
-        return spec, operations[0]
-    return spec, None
+    return spec, _fit_selection_from_result(figure, result)
 
 
 def local_fit_bindings(
@@ -62,7 +55,8 @@ def local_fit_bindings(
     initial_selection: Selection | None = None,
     open_fit: bool = False,
     archive_path: str | Path | None = None,
-    archive_presentation: FigurePresentationContract,
+    archive_figure_intent: FigureIntent,
+    archive_size_name: str,
     archive_metadata: Mapping[str, object] | None = None,
     timeout_seconds: float = DEFAULT_FIT_TIMEOUT_SECONDS,
 ) -> FitWorkbenchBindings:
@@ -74,9 +68,13 @@ def local_fit_bindings(
         raise TypeError("initial_selection must be Selection or None")
     if archive_metadata is not None and not isinstance(archive_metadata, Mapping):
         raise TypeError("archive_metadata must be a mapping or None")
-    if not isinstance(archive_presentation, FigurePresentationContract):
-        raise TypeError("archive_presentation must be FigurePresentationContract")
-    archive_presentation.validate_figure(figure)
+    if not isinstance(archive_figure_intent, FigureIntent):
+        raise TypeError("archive_figure_intent must be FigureIntent")
+    if (
+        len(figure.document.layers) != 1
+        or archive_figure_intent.view != figure.document.layers[0].view
+    ):
+        raise ValueError("local Fit FigureIntent differs from its DataFigure")
     if len(figure.document.layers) != 1:
         raise ValueError("local Fit requires exactly one Figure layer")
     layer = figure.document.layers[0]
@@ -140,7 +138,9 @@ def local_fit_bindings(
         saved_path = save_figure_archive(
             fitted,
             Path(destination),
-            presentation=replace(archive_presentation, display=display),
+            figure_intent=archive_figure_intent,
+            size_name=archive_size_name,
+            display=display,
             metadata=frozen_metadata,
         )
         reopened = load_figure_archive(saved_path)
@@ -177,7 +177,6 @@ def local_fit_bindings(
         timeout_seconds=timeout_seconds,
         save_requires_path=True,
         initial_save_path=archive_path,
-        allow_prepared_transform=True,
     )
 
 

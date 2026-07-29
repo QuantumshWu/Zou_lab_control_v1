@@ -150,13 +150,12 @@ class SinglePanelHost(QtWidgets.QWidget):
     def set_range_candidate(self, x_span) -> None:
         """Echo one completed numeric Area on this exact binding."""
 
-        if self._bound_kind == "curve":
-            self._board.set_curve_range_candidate(x_span)
-            return
-        if self._bound_kind == "histogram":
-            self._board.set_histogram_range_candidate(x_span)
-            return
-        raise RuntimeError("range candidate requires a numeric binding")
+        if self._bound_kind not in ("curve", "histogram"):
+            raise RuntimeError("range candidate requires a numeric binding")
+        self._board.set_numeric_range_candidate(
+            x_span,
+            panel_id=self._panel_id,
+        )
 
     def set_selectors_enabled(self, on: bool) -> None:
         """The Selectors switch, same semantics as every console card: remember
@@ -182,14 +181,10 @@ class SinglePanelHost(QtWidgets.QWidget):
     def _unbind_current_interaction(self) -> None:
         """Retire only the current gesture family, preserving the raster front."""
 
-        if self._bound_kind == "pulse":
-            self._board.unbind_pulse_interaction(self._panel_id)
-        elif self._bound_kind == "curve":
-            self._board.unbind_curve_interaction(self._panel_id)
-        elif self._bound_kind == "histogram":
-            self._board.unbind_histogram_interaction(self._panel_id)
-        elif self._bound_kind == "image":
+        if self._bound_kind == "image":
             self._board.unbind_rectangle_selector(self._panel_id)
+        elif self._bound_kind is not None:
+            self._board.unbind_numeric_interaction(self._panel_id)
         self._bound_kind = None
 
     def unbind_interaction(self) -> None:
@@ -207,12 +202,8 @@ class SinglePanelHost(QtWidgets.QWidget):
 
         if self._bound_kind == "image":
             return self._board.visible_image_origin(self._panel_id)
-        if self._bound_kind == "curve":
-            return self._board.visible_curve_origin(self._panel_id)
-        if self._bound_kind == "histogram":
-            return self._board.visible_histogram_origin(self._panel_id)
-        if self._bound_kind == "pulse":
-            return self._board.visible_pulse_origin(self._panel_id)
+        if self._bound_kind is not None:
+            return self._board.visible_numeric_origin(self._panel_id)
         return None
 
     def selection_for_rectangle_gesture(self, gesture):
@@ -312,12 +303,8 @@ class SinglePanelHost(QtWidgets.QWidget):
             raise TypeError("origin must be PanelInteractionOrigin")
         if self._bound_kind == "image":
             return self._board.discard_pending_image_interaction(origin)
-        if self._bound_kind == "curve":
-            return self._board.discard_pending_curve_interaction(origin)
-        if self._bound_kind == "histogram":
-            return self._board.discard_pending_histogram_interaction(origin)
-        if self._bound_kind == "pulse":
-            return self._board.discard_pending_pulse_interaction(origin)
+        if self._bound_kind is not None:
+            return self._board.discard_pending_numeric_interaction(origin)
         return False
 
     def present_panel(self, raster: RasterBuffer, payload, *,
@@ -492,12 +479,11 @@ class SinglePanelHost(QtWidgets.QWidget):
         return None
 
     def _echo_range_candidate(self, x_span) -> None:
-        if self._bound_kind == "pulse":
-            self._board.set_pulse_range_candidate(x_span)
-        elif self._bound_kind == "curve":
-            self._board.set_curve_range_candidate(x_span)
-        elif self._bound_kind == "histogram":
-            self._board.set_histogram_range_candidate(x_span)
+        if self._bound_kind in ("pulse", "curve", "histogram"):
+            self._board.set_numeric_range_candidate(
+                x_span,
+                panel_id=self._panel_id,
+            )
 
     def _on_intent(self, intent) -> None:
         if isinstance(intent, (CurveRangeGesture, HistogramRangeGesture)):

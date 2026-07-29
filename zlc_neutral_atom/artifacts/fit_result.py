@@ -18,6 +18,8 @@ from zlc_data import (
     FitCancelled,
     FitDeadlineExceeded,
     FitSpec,
+)
+from zlc_data.fit import (
     bind_fit,
     decode_fit_result_batch,
     encode_fit_result_batch,

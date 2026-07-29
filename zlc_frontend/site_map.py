@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Mapping, Protocol, runtime_checkable
 
 import numpy as np
 
-from zlc_data import immutable_array
+from zlc_data._arrays import immutable_array
 
 if TYPE_CHECKING:
     from zlc_data import AxisSpec, CoordinateFrameId, Selection

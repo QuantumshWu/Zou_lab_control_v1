@@ -252,31 +252,36 @@ def test_framework_and_device_owners_do_not_import_concrete_logic_nodes(
     )
 
 
-def test_task_console_does_not_reconstruct_figure_output_presentation():
-    """Figure owns derived-output vocabulary; Workbench only namespaces it."""
+def test_task_console_consumes_but_does_not_recreate_figure_output_vocabulary():
+    """Workbench may import frontend names, but may not define a second copy."""
 
     owner_path, _owner = _sole_definition("FigureOutputPresentation")
     assert owner_path.relative_to(ROOT) == Path(
         "zlc_frontend/figure_outputs.py"
     )
-    forbidden = (
-        "FitParameterMetadata",
-        "figure_output_contract_id",
-        "AREA_DATA_OUTPUT",
-        "CROSS_DATA_OUTPUT",
-        "FIT_OUTPUT_PREFIX",
-        "area.range.",
-    )
     violations = []
     task_console = ROOT / "zlc_workbench" / "task_console"
     for source in sorted(task_console.rglob("*.py")):
-        text = source.read_text(encoding="utf-8")
-        for token in forbidden:
-            if token in text:
-                violations.append(f"{source.relative_to(ROOT)} contains {token}")
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in {
+                "FitParameterMetadata",
+                "figure_output_contract_id",
+            }:
+                violations.append(
+                    f"{source.relative_to(ROOT)}:{node.lineno} defines {node.name}"
+                )
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and (
+                node.value in {"area.data", "cross.data"}
+                or node.value.startswith("area.range.")
+            ):
+                violations.append(
+                    f"{source.relative_to(ROOT)}:{node.lineno} recreates "
+                    f"Figure output literal {node.value!r}"
+                )
     assert not violations, (
-        "TaskConsole may adapt FigureOutputPresentation into its panel namespace, "
-        "but must not parse or recreate Figure output names/contracts/labels:\n"
+        "TaskConsole may consume frontend-owned constants/presentations, but must "
+        "not define or spell a second Figure output vocabulary:\n"
         + "\n".join(violations)
     )
 
@@ -549,46 +554,6 @@ def test_zlc_data_codecs_delegate_leaf_invariants_to_typed_owners():
     assert not violations, (
         "codec owns wire structure; typed constructors own their leaf invariants:\n"
         + "\n".join(violations)
-    )
-
-
-def test_dataset_cell_layout_and_source_transform_schema_have_one_owner():
-    violations = []
-    for source in (
-        *(ROOT / "zlc_data").rglob("*.py"),
-        ROOT / "zlc_frontend/figure/evaluate.py",
-    ):
-        relative = source.relative_to(ROOT)
-        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(relative))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "TransformedSchema"
-                and relative != Path("zlc_data/transform.py")
-            ):
-                violations.append(
-                    f"{relative}:{node.lineno} reconstructs TransformedSchema outside its owner"
-                )
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "AxisLayout"
-                and node.func.attr == "product"
-                and relative != Path("zlc_data/schema.py")
-                and any(
-                    isinstance(descendant, ast.Attribute)
-                    and descendant.attr == "point_layout"
-                    for descendant in ast.walk(node)
-                )
-            ):
-                violations.append(
-                    f"{relative}:{node.lineno} reconstructs DatasetSchema.cell_layout"
-                )
-    assert not violations, (
-        "DatasetSchema.cell_layout and zlc_data.transform own source layout/schema "
-        "projection respectively:\n" + "\n".join(violations)
     )
 
 

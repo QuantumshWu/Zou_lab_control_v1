@@ -13,9 +13,8 @@ from numbers import Integral
 from zlc_data import (
     AxisSourceRef,
     FitResultBatch,
-    SCALAR_AXIS,
-    exact_integer_text,
 )
+from zlc_data._diagnostic import exact_integer_text
 
 from .figure import (
     AxisAddress,
@@ -195,11 +194,17 @@ def fit_batch_multi_index(
         not isinstance(source, AxisSourceRef) for source in projected
     ):
         raise ValueError("projected_sources must contain unique AxisSourceRef values")
+    effective = result.spec.committed_transform.effective_output_schema
+    singleton_tensors = {
+        AxisSourceRef.tensor(axis.axis_id)
+        for axis in (effective.repeat_axis, *effective.cell_schema.data_axes)
+        if axis.size == 1
+    }
     extras = (
         set(by_source)
         - expected
         - projected
-        - {AxisSourceRef.tensor(SCALAR_AXIS.axis_id)}
+        - singleton_tensors
     )
     if extras:
         raise RuntimeError(

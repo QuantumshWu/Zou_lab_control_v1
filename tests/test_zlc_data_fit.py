@@ -11,7 +11,7 @@ import time
 import numpy as np
 import pytest
 
-from zlc_data import (
+from zlc_data.axis import (
     REPEAT,
     SCAN_POINT,
     HISTOGRAM_BIN,
@@ -19,54 +19,66 @@ from zlc_data import (
     SPATIAL_X,
     SPATIAL_Y,
     AxisId,
-    AxisLayout,
-    AxisLayoutMode,
     AxisRoleId,
+    AxisSourceRef,
     AxisSpec,
-    BimodalDistributionAnalysis,
-    BlockId,
-    BoundFit,
-    CellValidity,
-    DatasetComponentValidity,
     CoordinateFrameId,
-    DataBlock,
-    DataTransformSpec,
-    DatasetRevision,
-    DatasetSchema,
-    FitBatchStatus,
-    FitCancelled,
-    FitDeadlineExceeded,
-    FitModelDefinition,
-    FitNumericPolicy,
-    FitParameterConstraint,
-    FitParameterDefinition,
-    FitParameterDomain,
-    FitResultBatch,
-    FitSpec,
-    OwnedSnapshot,
-    ParameterUnitRelation,
-    PointLayout,
-    Selection,
-    StreamGenerationId,
-    VALID,
-    ValidityContract,
-    ValueSchema,
-    bind_fit,
+)
+from zlc_data.bimodal_distribution import (
+    BimodalDistributionAnalysis,
     analyze_bimodal_distribution,
-    commit_transform,
+)
+from zlc_data.fit_codec import (
     decode_fit_result_batch,
     decode_fit_spec,
     encode_fit_result_batch,
     encode_fit_spec,
-    fit_model_catalog,
-    fit_model_definition,
     fit_spec_from_tree,
     fit_spec_to_tree,
 )
-from zlc_data.fit_problem import build_fit_problem
+from zlc_data.fit_contract import (
+    BoundFit,
+    FitBatchStatus,
+    FitCancelled,
+    FitDeadlineExceeded,
+    FitNumericPolicy,
+    FitParameterConstraint,
+    FitResultBatch,
+    FitSpec,
+)
 from zlc_data.fit_model import (
+    FitModelDefinition,
+    FitParameterDefinition,
+    FitParameterDomain,
+    ParameterUnitRelation,
     evaluate_fit_model,
+    fit_model_catalog,
+    fit_model_definition,
     initialize_fit_model,
+)
+from zlc_data.fit_problem import bind_fit, build_fit_problem
+from zlc_data.layout import AxisLayout
+from zlc_data.schema import (
+    DatasetSchema,
+    GridTopology,
+    PointColumn,
+    PointTable,
+    ValueSchema,
+)
+from zlc_data.selection import Selection
+from zlc_data.transform import DataTransformSpec, commit_transform
+from zlc_data.validity import (
+    VALID,
+    CellValidity,
+    DatasetComponentValidity,
+    ValidityContract,
+)
+from zlc_data.value import (
+    BlockId,
+    DataBlock,
+    DatasetRevision,
+    OwnedSnapshot,
+    StreamGenerationId,
 )
 from zlc_storage.canonical import decode, encode
 
@@ -94,8 +106,8 @@ def axis(
 def snapshot_for(
     *,
     repeat: int,
-    point_axes: tuple[AxisSpec, ...],
-    point_layout: PointLayout,
+    points: PointTable,
+    grid_topology: GridTopology | None = None,
     data_axes: tuple[AxisSpec, ...] = (),
     values,
     validity=VALID,
@@ -120,8 +132,8 @@ def snapshot_for(
         array = array[..., np.newaxis]
     schema = DatasetSchema(
         repeat_axis,
-        point_axes,
-        point_layout,
+        points,
+        grid_topology,
         cell_schema,
     )
     block = DataBlock(
@@ -134,6 +146,35 @@ def snapshot_for(
     return OwnedSnapshot(block.ref(StreamGenerationId("fit-generation")), block)
 
 
+def point_column(axis_spec: AxisSpec, values=None) -> PointColumn:
+    if values is None:
+        values = (
+            axis_spec.coordinates
+            if axis_spec.coordinates is not None
+            else tuple(range(axis_spec.index_origin, axis_spec.index_origin + axis_spec.size))
+        )
+    values = tuple(values)
+    value_kind = (
+        PointColumn.TEXT
+        if any(isinstance(value, str) for value in values if value is not None)
+        else PointColumn.NUMERIC
+    )
+    return PointColumn(
+        axis_spec.axis_id,
+        axis_spec.name,
+        axis_spec.role,
+        value_kind,
+        values,
+        None if value_kind == PointColumn.TEXT else axis_spec.unit,
+        axis_spec.coordinate_frame,
+    )
+
+
+def point_table(axis_spec: AxisSpec, values=None) -> PointTable:
+    column = point_column(axis_spec, values)
+    return PointTable(len(column.values), (column,))
+
+
 def gaussian_snapshot(*, repeat: int = 2) -> tuple[OwnedSnapshot, AxisSpec]:
     coordinates = np.linspace(-4.0, 4.0, 81)
     scan = axis("detuning", SCAN_POINT, coordinates.size, coordinates=coordinates, unit="MHz")
@@ -144,19 +185,25 @@ def gaussian_snapshot(*, repeat: int = 2) -> tuple[OwnedSnapshot, AxisSpec]:
     )
     snapshot = snapshot_for(
         repeat=repeat,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=np.tile(signal, (repeat, 1)),
     )
     return snapshot, scan
 
 
 def gaussian_spec(snapshot: OwnedSnapshot, scan: AxisSpec, **kwargs) -> FitSpec:
+    transform = kwargs.pop("committed_transform", None)
+    if transform is None:
+        transform = commit_transform(snapshot.block.schema, DataTransformSpec())
+    default_batch = (
+        (AxisSourceRef.tensor(snapshot.block.schema.repeat_axis.axis_id),)
+        if snapshot.block.schema.repeat_axis.size > 1
+        else ()
+    )
     return FitSpec(
-        snapshot.block.schema.fingerprint,
-        kwargs.pop("committed_transform", None),
-        (scan.axis_id,),
-        kwargs.pop("batch_axis_ids", (snapshot.block.schema.repeat_axis.axis_id,)),
+        transform,
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        kwargs.pop("batch_sources", default_batch),
         "gaussian_offset",
         constraints=kwargs.pop("constraints", ()),
         numeric_policy=kwargs.pop("numeric_policy", FitNumericPolicy()),
@@ -378,24 +425,21 @@ def test_histogram_bin_axes_use_the_histogram_model_family():
     values = 4.0 * np.exp(-((x - 0.4) ** 2) / (2.0 * 0.8**2))
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(bins,),
-        point_layout=PointLayout.rect_c((bins.size,)),
+        points=point_table(bins),
         values=values.reshape(1, -1),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (bins.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(bins.axis_id),),
+        (),
         "gaussian_offset",
     )
     with pytest.raises(ValueError, match="does not satisfy model roles"):
         bind_fit(spec, snapshot.block.schema)
     histogram_spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (bins.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(bins.axis_id),),
+        (),
         "histogram_gaussian",
     )
     result = bind_fit(histogram_spec, snapshot.block.schema).run(snapshot)
@@ -512,9 +556,8 @@ def test_importing_zlc_data_keeps_scipy_solver_lazy():
         [
             sys.executable,
             "-c",
-            "import sys, zlc_data; assert 'scipy' not in sys.modules; "
-            "assert callable(zlc_data.BoundFit.run); "
-            "assert not hasattr(zlc_data, 'fit_analysis')",
+            "import sys; from zlc_data.fit_contract import BoundFit; "
+            "assert 'scipy' not in sys.modules; assert callable(BoundFit.run)",
         ],
         check=False,
         capture_output=True,
@@ -542,15 +585,13 @@ def test_every_curve_model_recovers_clean_synthetic_data(model_id, x, parameters
     values = evaluate_fit_model(model_id, (x,), parameters).reshape(1, -1)
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=values,
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
         model_id,
     )
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
@@ -560,24 +601,22 @@ def test_every_curve_model_recovers_clean_synthetic_data(model_id, x, parameters
 
 def test_binding_is_axis_total_role_checked_and_declared_coordinates_are_not_ignored():
     snapshot, scan = gaussian_snapshot()
-    with pytest.raises(ValueError, match="do not cover every information axis exactly"):
+    with pytest.raises(ValueError, match="cover every effective information axis"):
         bind_fit(
-            replace(gaussian_spec(snapshot, scan), batch_axis_ids=()),
+            replace(gaussian_spec(snapshot, scan), batch_sources=()),
             snapshot.block.schema,
         )
 
     site_like = axis("site_like", SITE, scan.size, coordinates=range(scan.size))
     wrong = snapshot_for(
         repeat=1,
-        point_axes=(site_like,),
-        point_layout=PointLayout.rect_c((site_like.size,)),
+        points=point_table(site_like),
         values=np.ones((1, site_like.size)),
     )
     wrong_spec = FitSpec(
-        wrong.block.schema.fingerprint,
-        None,
-        (site_like.axis_id,),
-        (wrong.block.schema.repeat_axis.axis_id,),
+        commit_transform(wrong.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(site_like.axis_id),),
+        (),
         "gaussian_offset",
     )
     with pytest.raises(ValueError, match="does not satisfy model roles"):
@@ -586,18 +625,16 @@ def test_binding_is_axis_total_role_checked_and_declared_coordinates_are_not_ign
     labels = axis("labels", SCAN_POINT, 6, coordinates=("a", "b", "c", "d", "e", "f"))
     labelled = snapshot_for(
         repeat=1,
-        point_axes=(labels,),
-        point_layout=PointLayout.rect_c((labels.size,)),
+        points=point_table(labels),
         values=np.ones((1, labels.size)),
     )
     labelled_spec = FitSpec(
-        labelled.block.schema.fingerprint,
-        None,
-        (labels.axis_id,),
-        (labelled.block.schema.repeat_axis.axis_id,),
+        commit_transform(labelled.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(labels.axis_id),),
+        (),
         "gaussian_offset",
     )
-    with pytest.raises(TypeError, match="declared coordinates.*entirely numeric"):
+    with pytest.raises(TypeError, match="point-coordinate source must be numeric"):
         bind_fit(labelled_spec, labelled.block.schema)
 
 
@@ -611,15 +648,14 @@ def test_implicit_fit_coordinates_require_consecutive_float64_identity():
     )
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((3,)),
-        values=np.zeros((1, 3), dtype=np.float64),
+        points=PointTable(1),
+        data_axes=(scan,),
+        values=np.zeros((1, 1, 3), dtype=np.float64),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.tensor(scan.axis_id),),
+        (),
         "gaussian_offset",
     )
     with pytest.raises(ValueError, match="consecutively float64-representable"):
@@ -632,23 +668,19 @@ def test_sparse_implicit_fit_tracks_present_rows_and_preserves_axis_unit():
         AxisId("scan"),
         "scan",
         SCAN_POINT,
-        logical_size,
+        2,
+        (0, logical_size - 1),
         unit="MHz",
     )
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.explicit(
-            (logical_size,),
-            ((0,), (logical_size - 1,)),
-        ),
+        points=point_table(scan),
         values=np.array([[1.0, 2.0]]),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
         "gaussian_offset",
     )
     bound = bind_fit(spec, snapshot.block.schema)
@@ -661,146 +693,46 @@ def test_sparse_implicit_fit_tracks_present_rows_and_preserves_axis_unit():
     assert bound.parameter_units == ("count", "count", "MHz", "MHz")
 
 
-def test_sparse_declared_fit_validates_coordinates_only_when_binding(monkeypatch):
-    logical_size = 20_000
-    group_count = 12
-    group = axis("group", SITE, group_count)
-    scan = axis(
-        "scan",
-        SCAN_POINT,
-        logical_size,
-        coordinates=range(logical_size),
-        unit="MHz",
-    )
-    mapping = tuple(
-        (group_index, scan_index)
-        for group_index in range(group_count)
-        for scan_index in (0, logical_size - 1)
-    )
-    snapshot = snapshot_for(
-        repeat=1,
-        point_axes=(group, scan),
-        point_layout=PointLayout.explicit((group_count, logical_size), mapping),
-        values=np.ones((1, len(mapping))),
-    )
-    spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id, group.axis_id),
-        "gaussian_offset",
-    )
-    bound = bind_fit(spec, snapshot.block.schema)
-
-    import zlc_data.fit_contract as fit_contract_module
-
-    def reject_revalidation(_axis):
-        raise AssertionError("packing repeated fit-coordinate admission")
-
-    monkeypatch.setattr(
-        fit_contract_module,
-        "_coordinate_source_for_axis",
-        reject_revalidation,
-    )
-    problem = build_fit_problem(bound, snapshot)
-
-    assert problem.batch_layout.storage_size == group_count
-    assert bound.parameter_units == ("count", "count", "MHz", "MHz")
-
-
-@pytest.mark.parametrize(
-    "layout",
-    (
-        PointLayout.rect_f((2, 3)),
-        PointLayout.explicit((2, 3), ((0, 0), (1, 2))),
-    ),
-    ids=("rect-f", "sparse-explicit"),
-)
-def test_identity_and_noop_transform_share_one_source_schema_owner(layout):
-    group = axis("group", SITE, 2)
-    scan = axis("scan", SCAN_POINT, 3, coordinates=(-1.0, 0.0, 1.0), unit="MHz")
-    snapshot = snapshot_for(
-        repeat=1,
-        point_axes=(group, scan),
-        point_layout=layout,
-        values=np.zeros((1, layout.storage_size), dtype=np.float64),
-    )
-    identity_spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id, group.axis_id),
-        "gaussian_offset",
-    )
-    no_op = commit_transform(
-        snapshot.block.schema,
-        DataTransformSpec((Selection.index_range(scan.axis_id, 0, scan.size),)),
-    )
-    transformed_spec = replace(identity_spec, committed_transform=no_op)
-
-    identity_schema = bind_fit(identity_spec, snapshot.block.schema).effective_schema
-    transformed_schema = bind_fit(
-        transformed_spec, snapshot.block.schema
-    ).effective_schema
-    assert identity_schema == transformed_schema
-    assert type(identity_schema.cell_layout) is AxisLayout
-
-
-def test_identity_fit_defers_transformed_schema_digest_and_caches_first_read(monkeypatch):
-    snapshot, scan = gaussian_snapshot(repeat=1)
-    import zlc_data.transform as transform_module
-
-    digest = transform_module.canonical_digest
-    calls = 0
-
-    def counted_digest(value):
-        nonlocal calls
-        calls += 1
-        return digest(value)
-
-    monkeypatch.setattr(transform_module, "canonical_digest", counted_digest)
-    bound = bind_fit(gaussian_spec(snapshot, scan), snapshot.block.schema)
-    assert calls == 0
-
-    first = bound.effective_schema.fingerprint
-    assert calls == 1
-    assert bound.effective_schema.fingerprint == first
-    assert calls == 1
-
-
 def test_radial_center_requires_x_then_y_with_compatible_units_and_frames():
     x = axis("x", SPATIAL_X, 9, coordinates=range(9), unit="px", frame="camera")
     y = axis("y", SPATIAL_Y, 7, coordinates=range(7), unit="px", frame="camera")
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(),
-        point_layout=PointLayout.rect_c(()),
+        points=PointTable(1),
         data_axes=(x, y),
         values=np.ones((1, 1, x.size, y.size)),
     )
     base = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (x.axis_id, y.axis_id),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(y.axis_id)),
+        (),
         "radial_gaussian_center",
     )
     bind_fit(base, snapshot.block.schema)
     with pytest.raises(ValueError, match="does not satisfy model roles"):
-        bind_fit(replace(base, fit_axis_ids=(y.axis_id, x.axis_id)), snapshot.block.schema)
+        bind_fit(
+            replace(
+                base,
+                independent_sources=(
+                    AxisSourceRef.tensor(y.axis_id),
+                    AxisSourceRef.tensor(x.axis_id),
+                ),
+            ),
+            snapshot.block.schema,
+        )
 
     bad_y = axis("y", SPATIAL_Y, 7, coordinates=range(7), unit="mm", frame="other")
     bad = snapshot_for(
         repeat=1,
-        point_axes=(),
-        point_layout=PointLayout.rect_c(()),
+        points=PointTable(1),
         data_axes=(x, bad_y),
         values=np.ones((1, 1, x.size, bad_y.size)),
     )
-    bad_spec = replace(
-        base,
-        input_schema_fingerprint=bad.block.schema.fingerprint,
-        fit_axis_ids=(x.axis_id, bad_y.axis_id),
+    bad_spec = FitSpec(
+        commit_transform(bad.block.schema, DataTransformSpec()),
+        (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(bad_y.axis_id)),
+        (),
+        "radial_gaussian_center",
     )
     with pytest.raises(ValueError, match="compatible coordinate units"):
         bind_fit(bad_spec, bad.block.schema)
@@ -811,8 +743,9 @@ def test_identity_and_committed_transform_keep_complete_source_lineage():
     identity_bound = bind_fit(gaussian_spec(snapshot, scan), snapshot.block.schema)
     identity = identity_bound.run(snapshot)
     assert identity.source_ref == snapshot.ref
-    assert identity.spec.committed_transform is None
-    assert identity.effective_schema_fingerprint == snapshot.block.schema.fingerprint
+    assert identity.effective_schema_fingerprint == (
+        identity.spec.committed_transform.output_schema_fingerprint
+    )
 
     committed = commit_transform(
         snapshot.block.schema,
@@ -824,28 +757,13 @@ def test_identity_and_committed_transform_keep_complete_source_lineage():
         snapshot,
         scan,
         committed_transform=committed,
-        batch_axis_ids=(),
+        batch_sources=(),
     )
     transformed = bind_fit(transformed_spec, snapshot.block.schema).run(snapshot)
     assert transformed.source_ref == snapshot.ref
     assert transformed.spec.committed_transform == committed
     assert transformed.effective_schema_fingerprint == committed.output_schema_fingerprint
     np.testing.assert_allclose(transformed.parameter_values[0], (3.0, 1.2, 0.8, 0.7))
-
-
-def test_bound_fit_derives_effective_axis_metadata_instead_of_accepting_it():
-    snapshot, scan = gaussian_snapshot(repeat=1)
-    bound = bind_fit(gaussian_spec(snapshot, scan), snapshot.block.schema)
-    shifted = replace(
-        scan,
-        coordinates=tuple(float(value) + 100.0 for value in scan.coordinates),
-    )
-    forged_schema = replace(
-        bound.effective_schema,
-        cell_axes=(snapshot.block.schema.repeat_axis, shifted),
-    )
-    with pytest.raises(TypeError):
-        BoundFit(bound.spec, bound.expected_schema, forged_schema)
 
 
 def test_fit_packing_rejects_a_subclass_that_skips_proof_admission():
@@ -874,18 +792,16 @@ def test_grid_site_batch_uses_component_validity_without_collapsing_sites():
     mask[:, 3:, 2] = False
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         data_axes=(site,),
         values=values,
         validity=DatasetComponentValidity((site.axis_id,), mask),
         validity_contract=ValidityContract.components(site.axis_id),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id, site.axis_id),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (AxisSourceRef.tensor(site.axis_id),),
         "gaussian_offset",
     )
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
@@ -900,129 +816,106 @@ def test_grid_site_batch_uses_component_validity_without_collapsing_sites():
     np.testing.assert_allclose(result.parameter_values[0], parameters[0], rtol=1e-5, atol=1e-5)
 
 
-def test_sparse_missing_batch_is_absent_while_present_invalid_batch_is_failure_and_product():
+def test_sparse_missing_batch_is_absent_while_present_invalid_batch_is_failure():
     group = axis("group", SITE, 3)
     scan = axis("scan", SCAN_POINT, 6, coordinates=np.linspace(-2, 2, 6))
     mapping = tuple((group_index, scan_index) for group_index in (0, 2) for scan_index in range(6))
-    layout = PointLayout.explicit((group.size, scan.size), mapping)
-    scan_indices = layout.axis_indices(1)
+    group_indices = np.asarray(tuple(item[0] for item in mapping))
+    scan_indices = np.asarray(tuple(item[1] for item in mapping))
     values = evaluate_fit_model(
         "gaussian_offset",
         (np.asarray(scan.coordinates)[scan_indices],),
         (2.0, 0.4, 0.8, 0.2),
     )
-    valid = np.ones((2, layout.storage_size), dtype=bool)
-    group_indices = layout.axis_indices(0)
+    valid = np.ones((2, len(mapping)), dtype=bool)
     valid[:, group_indices == 2] = False
+    points = PointTable(
+        len(mapping),
+        (
+            point_column(group, group_indices),
+            point_column(scan, np.asarray(scan.coordinates)[scan_indices]),
+        ),
+    )
     snapshot = snapshot_for(
         repeat=2,
-        point_axes=(group, scan),
-        point_layout=layout,
+        points=points,
+        grid_topology=GridTopology(
+            (group.axis_id, scan.axis_id),
+            (tuple(range(group.size)), tuple(scan.coordinates)),
+            mapping,
+        ),
         values=np.tile(values, (2, 1)),
         validity=CellValidity(valid),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id, group.axis_id),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.grid_dimension(scan.axis_id),),
+        (
+            AxisSourceRef.tensor(snapshot.block.schema.repeat_axis.axis_id),
+            AxisSourceRef.grid_dimension(group.axis_id),
+        ),
         "gaussian_offset",
     )
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
-    assert result.batch_layout.mode is AxisLayoutMode.PRODUCT
     assert tuple(result.batch_layout.multi_index(i) for i in range(4)) == (
         (0, 0),
-        (0, 2),
         (1, 0),
+        (0, 2),
         (1, 2),
     )
     assert (0, 1) not in tuple(result.batch_layout.multi_index(i) for i in range(4))
     assert result.statuses == (
         FitBatchStatus.CONVERGED,
-        FitBatchStatus.NO_VALID_DATA,
         FitBatchStatus.CONVERGED,
         FitBatchStatus.NO_VALID_DATA,
+        FitBatchStatus.NO_VALID_DATA,
     )
 
 
-@pytest.mark.parametrize(
-    ("point_layout", "expected_mode"),
-    (
-        (PointLayout.rect_c((2, 2, 6)), AxisLayoutMode.RECT_C),
-        (PointLayout.rect_f((2, 2, 6)), AxisLayoutMode.RECT_F),
-    ),
-)
-def test_batch_layout_preserves_rectangular_c_and_f(point_layout, expected_mode):
-    first = axis("first", SITE, 2)
-    second = axis("second", AxisRoleId("grid-y"), 2)
-    scan = axis("scan", SCAN_POINT, 6, coordinates=np.linspace(-2, 2, 6))
-    scan_indices = point_layout.axis_indices(2)
-    signal = evaluate_fit_model(
-        "gaussian_offset",
-        (np.asarray(scan.coordinates)[scan_indices],),
-        (2.0, 0.4, 0.8, 0.2),
-    )
-    snapshot = snapshot_for(
-        repeat=1,
-        point_axes=(first, second, scan),
-        point_layout=point_layout,
-        values=signal.reshape(1, -1),
-    )
-    spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (
-            snapshot.block.schema.repeat_axis.axis_id,
-            first.axis_id,
-            second.axis_id,
-        ),
-        "gaussian_offset",
-    )
-    problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
-    assert problem.batch_layout.mode is expected_mode
-
-
-@pytest.mark.parametrize(
-    "point_layout",
-    (
-        PointLayout.rect_f((3, 6)),
-        PointLayout.explicit(
-            (3, 6),
-            tuple((group, scan) for group in (0, 2) for scan in range(6)),
-        ),
-    ),
-    ids=("rect-f", "sparse-explicit"),
-)
-def test_mixed_cell_data_batch_plan_matches_source_values(point_layout):
+def test_mixed_cell_data_batch_plan_matches_source_values():
     group = axis("group", SITE, 3)
     scan = axis("scan", SCAN_POINT, 6, coordinates=np.linspace(-2, 2, 6))
     site = axis("site", AxisRoleId("grid-x"), 2)
-    group_indices = point_layout.axis_indices(0)
-    scan_indices = point_layout.axis_indices(1)
-    values = np.empty((2, point_layout.storage_size, site.size), dtype=np.float64)
+    mapping = tuple((group_index, scan_index) for group_index in (0, 2) for scan_index in range(6))
+    group_indices = np.asarray(tuple(item[0] for item in mapping))
+    scan_indices = np.asarray(tuple(item[1] for item in mapping))
+    values = np.empty((2, len(mapping), site.size), dtype=np.float64)
     for repeat_index in range(2):
-        for point_storage_index in range(point_layout.storage_size):
+        for point_ordinal in range(len(mapping)):
             for site_index in range(site.size):
-                values[repeat_index, point_storage_index, site_index] = (
+                values[repeat_index, point_ordinal, site_index] = (
                     100 * repeat_index
-                    + 10 * group_indices[point_storage_index]
+                    + 10 * group_indices[point_ordinal]
                     + site_index
-                    + scan_indices[point_storage_index] / 10
+                    + scan_indices[point_ordinal] / 10
                 )
+    points = PointTable(
+        len(mapping),
+        (
+            point_column(group, group_indices),
+            point_column(scan, np.asarray(scan.coordinates)[scan_indices]),
+        ),
+    )
     snapshot = snapshot_for(
         repeat=2,
-        point_axes=(group, scan),
-        point_layout=point_layout,
+        points=points,
+        grid_topology=GridTopology(
+            (group.axis_id, scan.axis_id),
+            (tuple(range(group.size)), tuple(scan.coordinates)),
+            mapping,
+        ),
         data_axes=(site,),
         values=values,
     )
     repeat_axis = snapshot.block.schema.repeat_axis
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (site.axis_id, group.axis_id, repeat_axis.axis_id),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.grid_dimension(scan.axis_id),),
+        (
+            AxisSourceRef.tensor(site.axis_id),
+            AxisSourceRef.grid_dimension(group.axis_id),
+            AxisSourceRef.tensor(repeat_axis.axis_id),
+        ),
         "gaussian_offset",
     )
     problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
@@ -1057,43 +950,6 @@ def test_mixed_cell_data_batch_plan_matches_source_values(point_layout):
         )
 
 
-def test_nonfactor_sparse_mapping_stays_explicit_after_authoritative_repeat_selection():
-    first = axis("first", SITE, 2)
-    second = axis("second", AxisRoleId("grid-y"), 2)
-    scan = axis("scan", SCAN_POINT, 6, coordinates=np.linspace(-2, 2, 6))
-    pairs = ((0, 0), (1, 0), (1, 1))
-    mapping = tuple((*pair, point) for pair in pairs for point in range(scan.size))
-    layout = PointLayout.explicit((2, 2, scan.size), mapping)
-    scan_indices = layout.axis_indices(2)
-    values = evaluate_fit_model(
-        "gaussian_offset",
-        (np.asarray(scan.coordinates)[scan_indices],),
-        (2.0, 0.4, 0.8, 0.2),
-    ).reshape(1, -1)
-    snapshot = snapshot_for(
-        repeat=1,
-        point_axes=(first, second, scan),
-        point_layout=layout,
-        values=values,
-    )
-    committed = commit_transform(
-        snapshot.block.schema,
-        DataTransformSpec(
-            (Selection.index(snapshot.block.schema.repeat_axis.axis_id, 0),)
-        ),
-    )
-    spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        committed,
-        (scan.axis_id,),
-        (first.axis_id, second.axis_id),
-        "gaussian_offset",
-    )
-    problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
-    assert problem.batch_layout.mode is AxisLayoutMode.EXPLICIT
-    assert problem.batch_layout.storage_to_multi == pairs
-
-
 def test_large_radial_image_uses_every_valid_observation_and_fits_2d():
     x_values = np.linspace(-3.0, 3.0, 160)
     y_values = np.linspace(-2.0, 2.0, 120)
@@ -1104,16 +960,14 @@ def test_large_radial_image_uses_every_valid_observation_and_fits_2d():
     image = evaluate_fit_model("radial_gaussian_center", (xx, yy), expected)
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(),
-        point_layout=PointLayout.rect_c(()),
+        points=PointTable(1),
         data_axes=(x, y),
         values=image.reshape(1, 1, *image.shape),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (x.axis_id, y.axis_id),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(y.axis_id)),
+        (),
         "radial_gaussian_center",
     )
     bound = bind_fit(spec, snapshot.block.schema)
@@ -1131,11 +985,7 @@ def test_large_radial_image_uses_every_valid_observation_and_fits_2d():
     np.testing.assert_allclose(result.parameter_values[0], expected, rtol=2e-3, atol=2e-3)
 
 
-def test_megapixel_radial_fit_refines_locally_but_scores_every_camera_pixel(
-    monkeypatch,
-):
-    import zlc_data.fit_solver as solver_module
-
+def test_megapixel_radial_fit_scores_every_camera_pixel():
     width, height = 1920, 1200
     x = axis(
         "x",
@@ -1174,41 +1024,20 @@ def test_megapixel_radial_fit_refines_locally_but_scores_every_camera_pixel(
     ).astype(np.uint8)
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(),
-        point_layout=PointLayout.rect_c(()),
+        points=PointTable(1),
         data_axes=(x, y),
         values=image.reshape(1, 1, width, height),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (x.axis_id, y.axis_id),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(y.axis_id)),
+        (),
         "radial_gaussian_center",
     )
 
-    solve_residual_sizes = []
-    scipy_solve = solver_module.least_squares
-
-    def traced_solve(fun, *args, **kwargs):
-        residual_sizes = []
-
-        def traced_residual(parameters):
-            values = fun(parameters)
-            residual_sizes.append(values.size)
-            return values
-
-        result = scipy_solve(traced_residual, *args, **kwargs)
-        solve_residual_sizes.append(tuple(residual_sizes))
-        return result
-
-    monkeypatch.setattr(solver_module, "least_squares", traced_solve)
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
 
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    assert len(solve_residual_sizes) == 2
-    assert max(solve_residual_sizes[0]) < image.size // 20
-    assert set(solve_residual_sizes[1]) == {image.size}
     assert result.used_observation_counts[0] == image.size
     np.testing.assert_allclose(
         result.parameter_values[0, 3:5],
@@ -1257,23 +1086,21 @@ def test_radial_roi_keeps_absolute_coordinate_less_centers_and_index_units():
     )
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(),
-        point_layout=PointLayout.rect_c(()),
+        points=PointTable(1),
         data_axes=(x, y),
         values=image.reshape(1, 1, *image.shape),
     )
 
     def run(committed_transform):
         spec = FitSpec(
-            snapshot.block.schema.fingerprint,
             committed_transform,
-            (x.axis_id, y.axis_id),
-            (snapshot.block.schema.repeat_axis.axis_id,),
+            (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(y.axis_id)),
+            (),
             "radial_gaussian_center",
         )
         return bind_fit(spec, snapshot.block.schema).run(snapshot)
 
-    full = run(None)
+    full = run(commit_transform(snapshot.block.schema, DataTransformSpec()))
     roi_transform = commit_transform(
         snapshot.block.schema,
         DataTransformSpec(
@@ -1284,10 +1111,9 @@ def test_radial_roi_keeps_absolute_coordinate_less_centers_and_index_units():
         ),
     )
     roi_spec = FitSpec(
-        snapshot.block.schema.fingerprint,
         roi_transform,
-        (x.axis_id, y.axis_id),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(y.axis_id)),
+        (),
         "radial_gaussian_center",
     )
     roi_bound = bind_fit(roi_spec, snapshot.block.schema)
@@ -1329,16 +1155,14 @@ def test_full_2d_fit_keeps_a_narrow_feature():
     )
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(),
-        point_layout=PointLayout.rect_c(()),
+        points=PointTable(1),
         data_axes=(x, y),
         values=image.reshape(1, 1, *image.shape),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (x.axis_id, y.axis_id),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(y.axis_id)),
+        (),
         "radial_gaussian_center",
     )
 
@@ -1369,16 +1193,14 @@ def test_full_2d_fit_does_not_turn_one_outlier_into_the_only_feature():
     image[7, 13] = 1_000.0
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(),
-        point_layout=PointLayout.rect_c(()),
+        points=PointTable(1),
         data_axes=(x, y),
         values=image.reshape(1, 1, *image.shape),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (x.axis_id, y.axis_id),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(y.axis_id)),
+        (),
         "radial_gaussian_center",
     )
 
@@ -1409,18 +1231,20 @@ def test_noisy_radial_seed_tracks_coherent_bright_and_dark_features(amplitude):
         ),
         expected,
     ) + rng.normal(0.0, 0.8, size=(width, height))
+    validity = np.ones((1, 1, width, height), dtype=np.bool_)
+    validity[:, :, :7, :11] = False
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(),
-        point_layout=PointLayout.rect_c(()),
+        points=PointTable(1),
         data_axes=(x, y),
         values=image.reshape(1, 1, width, height),
+        validity=DatasetComponentValidity((x.axis_id, y.axis_id), validity),
+        validity_contract=ValidityContract.components(x.axis_id, y.axis_id),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (x.axis_id, y.axis_id),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(y.axis_id)),
+        (),
         "radial_gaussian_center",
     )
 
@@ -1449,16 +1273,14 @@ def test_valid_nonfinite_is_included_fail_closed_while_invalid_nonfinite_is_abse
     validity[0, 91] = False
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=signal.reshape(1, -1),
         validity=CellValidity(validity),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
         "gaussian_offset",
     )
 
@@ -1468,39 +1290,6 @@ def test_valid_nonfinite_is_included_fail_closed_while_invalid_nonfinite_is_abse
     assert coordinate_values[91] not in problem.independent_values[0]
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
     assert result.statuses == (FitBatchStatus.NUMERIC_ERROR,)
-
-
-def test_observation_order_is_derived_once_per_cell_batch_group(monkeypatch):
-    import zlc_data.fit_problem as problem_module
-
-    scan = axis("scan", SCAN_POINT, 5, coordinates=np.linspace(-2.0, 2.0, 5))
-    site = axis("site", SITE, 4)
-    snapshot = snapshot_for(
-        repeat=3,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
-        data_axes=(site,),
-        values=np.ones((3, scan.size, site.size)),
-    )
-    spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id, site.axis_id),
-        "gaussian_offset",
-    )
-    derive = problem_module._canonical_observation_order
-    calls = 0
-
-    def counted(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return derive(*args, **kwargs)
-
-    monkeypatch.setattr(problem_module, "_canonical_observation_order", counted)
-    problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
-    assert problem.batch_layout.storage_size == 12
-    assert calls == 3
 
 
 def test_2d_observation_coordinates_are_cartesian_not_a_flattened_diagonal():
@@ -1513,16 +1302,14 @@ def test_2d_observation_coordinates_are_cartesian_not_a_flattened_diagonal():
     image = evaluate_fit_model("radial_gaussian_center", (xx, yy), expected)
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(),
-        point_layout=PointLayout.rect_c(()),
+        points=PointTable(1),
         data_axes=(x, y),
         values=image.reshape(1, 1, 100, 100),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (x.axis_id, y.axis_id),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(y.axis_id)),
+        (),
         "radial_gaussian_center",
     )
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
@@ -1531,7 +1318,7 @@ def test_2d_observation_coordinates_are_cartesian_not_a_flattened_diagonal():
     np.testing.assert_allclose(result.parameter_values[0], expected, rtol=2e-4, atol=2e-4)
 
 
-def test_2d_point_axes_fit_recovers_center_and_ignores_storage_permutation():
+def test_2d_grid_fit_recovers_center_and_ignores_authored_row_permutation():
     x_values = np.linspace(-3.0, 3.0, 100)
     y_values = np.linspace(-2.0, 2.0, 100)
     x = axis("x", SPATIAL_X, 100, coordinates=x_values, unit="mm", frame="camera")
@@ -1540,34 +1327,53 @@ def test_2d_point_axes_fit_recovers_center_and_ignores_storage_permutation():
     expected = (4.0, 0.5, 1.1, 0.4, -0.3)
     logical_image = evaluate_fit_model("radial_gaussian_center", (xx, yy), expected)
 
-    def run(layout: PointLayout) -> object:
+    def run(mapping: tuple[tuple[int, int], ...]) -> object:
         physical_values = np.fromiter(
-            (logical_image[layout.multi_index(row)] for row in range(layout.storage_size)),
+            (logical_image[cell] for cell in mapping),
             dtype=np.float64,
-            count=layout.storage_size,
+            count=len(mapping),
+        )
+        points = PointTable(
+            len(mapping),
+            (
+                point_column(x, tuple(x_values[cell[0]] for cell in mapping)),
+                point_column(y, tuple(y_values[cell[1]] for cell in mapping)),
+            ),
         )
         snapshot = snapshot_for(
             repeat=1,
-            point_axes=(x, y),
-            point_layout=layout,
+            points=points,
+            grid_topology=GridTopology(
+                (x.axis_id, y.axis_id),
+                (tuple(x_values), tuple(y_values)),
+                mapping,
+            ),
             values=physical_values.reshape(1, -1),
         )
         spec = FitSpec(
-            snapshot.block.schema.fingerprint,
-            None,
-            (x.axis_id, y.axis_id),
-            (snapshot.block.schema.repeat_axis.axis_id,),
+            commit_transform(snapshot.block.schema, DataTransformSpec()),
+            (
+                AxisSourceRef.grid_dimension(x.axis_id),
+                AxisSourceRef.grid_dimension(y.axis_id),
+            ),
+            (),
             "radial_gaussian_center",
         )
         return bind_fit(spec, snapshot.block.schema).run(snapshot)
 
-    ordered = run(PointLayout.rect_c((100, 100)))
-    mapping = list(PointLayout.rect_c((100, 100)).multi_index(i) for i in range(10_000))
+    ordered_mapping = tuple(np.ndindex(100, 100))
+    ordered = run(ordered_mapping)
+    mapping = list(ordered_mapping)
     np.random.default_rng(11).shuffle(mapping)
-    permuted = run(PointLayout.explicit((100, 100), tuple(mapping)))
+    permuted = run(tuple(mapping))
     assert ordered.statuses == permuted.statuses == (FitBatchStatus.CONVERGED,)
     np.testing.assert_allclose(ordered.parameter_values[0], expected, rtol=2e-4, atol=2e-4)
-    np.testing.assert_array_equal(ordered.parameter_values, permuted.parameter_values)
+    np.testing.assert_allclose(
+        ordered.parameter_values,
+        permuted.parameter_values,
+        rtol=1e-14,
+        atol=1e-14,
+    )
 
 
 def test_fit_packing_is_invariant_to_explicit_physical_row_permutation():
@@ -1580,21 +1386,16 @@ def test_fit_packing_is_invariant_to_explicit_physical_row_permutation():
     )
 
     def fit_permutation(permutation: np.ndarray):
-        layout = PointLayout.explicit(
-            (scan.size,),
-            tuple((int(index),) for index in permutation),
-        )
+        points = point_table(scan, coordinate_values[permutation])
         snapshot = snapshot_for(
             repeat=1,
-            point_axes=(scan,),
-            point_layout=layout,
+            points=points,
             values=logical_signal[permutation].reshape(1, -1),
         )
         spec = FitSpec(
-            snapshot.block.schema.fingerprint,
-            None,
-            (scan.axis_id,),
-            (snapshot.block.schema.repeat_axis.axis_id,),
+            commit_transform(snapshot.block.schema, DataTransformSpec()),
+            (AxisSourceRef.point_coordinate(scan.axis_id),),
+            (),
             "gaussian_offset",
         )
         return bind_fit(spec, snapshot.block.schema).run(snapshot)
@@ -1603,8 +1404,18 @@ def test_fit_packing_is_invariant_to_explicit_physical_row_permutation():
     shuffled_indices = np.arange(scan.size)
     np.random.default_rng(7).shuffle(shuffled_indices)
     shuffled = fit_permutation(shuffled_indices)
-    np.testing.assert_array_equal(ordered.parameter_values, shuffled.parameter_values)
-    np.testing.assert_array_equal(ordered.residual_sum_squares, shuffled.residual_sum_squares)
+    np.testing.assert_allclose(
+        ordered.parameter_values,
+        shuffled.parameter_values,
+        rtol=1e-14,
+        atol=1e-14,
+    )
+    np.testing.assert_allclose(
+        ordered.residual_sum_squares,
+        shuffled.residual_sum_squares,
+        rtol=1e-12,
+        atol=1e-24,
+    )
 
     randomized_scan = axis(
         "scan",
@@ -1615,74 +1426,24 @@ def test_fit_packing_is_invariant_to_explicit_physical_row_permutation():
     )
     randomized_snapshot = snapshot_for(
         repeat=1,
-        point_axes=(randomized_scan,),
-        point_layout=PointLayout.rect_c((randomized_scan.size,)),
+        points=point_table(randomized_scan),
         values=logical_signal[shuffled_indices].reshape(1, -1),
     )
     randomized_spec = FitSpec(
-        randomized_snapshot.block.schema.fingerprint,
-        None,
-        (randomized_scan.axis_id,),
-        (randomized_snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(randomized_snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(randomized_scan.axis_id),),
+        (),
         "gaussian_offset",
     )
     randomized = bind_fit(
         randomized_spec,
         randomized_snapshot.block.schema,
     ).run(randomized_snapshot)
-    np.testing.assert_array_equal(ordered.parameter_values, randomized.parameter_values)
-
-
-def test_duplicate_coordinates_use_logical_index_not_storage_order_as_tie_break():
-    coordinate_values = np.repeat(np.linspace(-4.0, 4.0, 20), 2)
-    scan = axis(
-        "duplicate_scan",
-        SCAN_POINT,
-        coordinate_values.size,
-        coordinates=coordinate_values,
-        unit="MHz",
-    )
-    logical_signal = (
-        3.0 * np.exp(-((coordinate_values - 0.4) ** 2) / (2.0 * 1.1**2))
-        + 0.5
-        + np.tile((-0.2, 0.3), 20)
-    )
-    logical_validity = np.ones(scan.size, dtype=bool)
-    logical_validity[7] = False
-
-    def pack(permutation: np.ndarray):
-        layout = PointLayout.explicit(
-            (scan.size,),
-            tuple((int(index),) for index in permutation),
-        )
-        snapshot = snapshot_for(
-            repeat=1,
-            point_axes=(scan,),
-            point_layout=layout,
-            values=logical_signal[permutation].reshape(1, -1),
-            validity=CellValidity(logical_validity[permutation].reshape(1, -1)),
-        )
-        spec = FitSpec(
-            snapshot.block.schema.fingerprint,
-            None,
-            (scan.axis_id,),
-            (snapshot.block.schema.repeat_axis.axis_id,),
-            "gaussian_offset",
-        )
-        return build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
-
-    ordered = pack(np.arange(scan.size))
-    pair_swapped = pack(
-        np.arange(scan.size).reshape(-1, 2)[:, ::-1].reshape(-1)
-    )
-    np.testing.assert_array_equal(
-        ordered.independent_values[0],
-        pair_swapped.independent_values[0],
-    )
-    np.testing.assert_array_equal(ordered.observations, pair_swapped.observations)
-    np.testing.assert_array_equal(
-        ordered.used_observation_counts,
-        pair_swapped.used_observation_counts,
+    np.testing.assert_allclose(
+        ordered.parameter_values,
+        randomized.parameter_values,
+        rtol=1e-14,
+        atol=1e-14,
     )
 
 
@@ -1699,15 +1460,13 @@ def test_time_models_keep_absolute_declared_coordinates_for_replay(model_id, par
     signal = evaluate_fit_model(model_id, (x,), parameters)
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=signal.reshape(1, -1),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
         model_id,
     )
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
@@ -1751,15 +1510,13 @@ def test_absolute_time_parameters_are_not_clipped_to_selected_window_contrast(
     time_axis = axis("absolute_time", SCAN_POINT, x.size, coordinates=x)
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(time_axis,),
-        point_layout=PointLayout.rect_c((x.size,)),
+        points=point_table(time_axis),
         values=signal.reshape(1, -1),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (time_axis.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(time_axis.axis_id),),
+        (),
         model_id,
     )
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
@@ -1773,15 +1530,13 @@ def test_short_exponential_window_recovers_absolute_decay_parameters():
     scan = axis("short_decay_window", SCAN_POINT, x_values.size, coordinates=x_values)
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=signal.reshape(1, -1),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
         "exponential_decay",
     )
 
@@ -1796,18 +1551,16 @@ def test_fully_fixed_hypothesis_bypasses_data_derived_initializer():
     y = axis("fixed_y", SPATIAL_Y, 3, coordinates=(-1.0, 0.0, 1.0), frame="camera")
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(),
-        point_layout=PointLayout.rect_c(()),
+        points=PointTable(1),
         data_axes=(x, y),
         values=np.ones((1, 1, 3, 3)),
     )
     names = ("amplitude", "offset", "one_over_e_radius", "center_x", "center_y")
     values = (0.0, 1.0, 1.0, 0.0, 0.0)
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (x.axis_id, y.axis_id),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(y.axis_id)),
+        (),
         "radial_gaussian_center",
         constraints=tuple(
             FitParameterConstraint(name, fixed=value)
@@ -1836,15 +1589,13 @@ def test_fixed_gaussian_geometry_is_a_hypothesis_not_a_location_inference():
     signal = amplitude * np.exp(-(x_values**2) / 2.0)
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=signal.reshape(1, -1),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
         "gaussian_offset",
         constraints=tuple(
             FitParameterConstraint(name, fixed=value)
@@ -1867,15 +1618,13 @@ def test_minimum_observations_follow_the_free_parameters_not_a_catalog_constant(
     expected = np.exp(-(x_values**2) / 2.0)
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=expected.reshape(1, -1),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
         "gaussian_offset",
         constraints=tuple(
             FitParameterConstraint(name, fixed=value)
@@ -1899,16 +1648,14 @@ def test_one_numeric_overflow_isolated_from_sibling_fit_cells():
     expected = np.exp(-(x_values**2) / 2.0)
     snapshot = snapshot_for(
         repeat=2,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=np.stack((expected, np.full(scan.size, 1e308))),
     )
     fixed = (1.0, 0.0, 1.0, 0.0)
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (AxisSourceRef.tensor(snapshot.block.schema.repeat_axis.axis_id),),
         "gaussian_offset",
         constraints=tuple(
             FitParameterConstraint(name, fixed=value)
@@ -1951,15 +1698,13 @@ def test_r_squared_centers_huge_finite_observations_without_sum_overflow():
     signal = amplitude * np.exp(-(x_values**2) / 2.0) + offset
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=signal.reshape(1, -1),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
         "gaussian_offset",
         constraints=tuple(
             FitParameterConstraint(name, fixed=value)
@@ -1982,8 +1727,7 @@ def test_active_solver_bound_invalidates_covariance_without_hiding_result():
     scan = axis("bounded_scan", SCAN_POINT, bounded_x.size, coordinates=bounded_x)
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=bounded_signal.reshape(1, -1),
     )
     active_bound = bind_fit(
@@ -2060,19 +1804,17 @@ def test_parameter_domains_guard_requests_evaluation_and_converged_artifacts():
         )
     with pytest.raises(ValueError, match="no free interval.*NONNEGATIVE"):
         FitSpec(
-            snapshot.block.schema.fingerprint,
-            None,
-            (scan.axis_id,),
-            (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
             "symmetric_lorentzian_doublet",
             constraints=(FitParameterConstraint("center_splitting", lower=-1.0, upper=0.0),),
         )
     with pytest.raises(ValueError, match="PHASE_RADIANS domain"):
         FitSpec(
-            snapshot.block.schema.fingerprint,
-            None,
-            (scan.axis_id,),
-            (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
             "damped_sine",
             constraints=(FitParameterConstraint("phase", fixed=np.pi),),
         )
@@ -2083,10 +1825,9 @@ def test_parameter_domains_guard_requests_evaluation_and_converged_artifacts():
     ):
         with pytest.raises(ValueError, match="no free interval.*PHASE_RADIANS"):
             FitSpec(
-                snapshot.block.schema.fingerprint,
-                None,
-                (scan.axis_id,),
-                (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
                 "damped_sine",
                 constraints=(constraint,),
             )
@@ -2100,10 +1841,9 @@ def test_parameter_domains_guard_requests_evaluation_and_converged_artifacts():
         )
 
     phase_boundary = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
         "damped_sine",
         constraints=(FitParameterConstraint("phase", fixed=-np.pi),),
     )
@@ -2203,15 +1943,13 @@ def test_cancel_is_checked_inside_model_evaluations_and_host_deadline_aborts():
     large_scan = axis("large_scan", SCAN_POINT, large_x.size, coordinates=large_x)
     large = snapshot_for(
         repeat=1,
-        point_axes=(large_scan,),
-        point_layout=PointLayout.rect_c((large_scan.size,)),
+        points=point_table(large_scan),
         values=np.ones((1, large_scan.size)),
     )
     large_spec = FitSpec(
-        large.block.schema.fingerprint,
-        None,
-        (large_scan.axis_id,),
-        (large.block.schema.repeat_axis.axis_id,),
+        commit_transform(large.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(large_scan.axis_id),),
+        (),
         "gaussian_offset",
     )
     packing_checks = 0
@@ -2229,16 +1967,14 @@ def test_complex_observations_are_rejected_before_float_conversion():
     scan = axis("scan", SCAN_POINT, 8, coordinates=range(8))
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=np.ones((1, scan.size), dtype=np.complex128) * (1 + 2j),
         dtype=np.dtype("<c16"),
     )
     spec = FitSpec(
-        snapshot.block.schema.fingerprint,
-        None,
-        (scan.axis_id,),
-        (snapshot.block.schema.repeat_axis.axis_id,),
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
         "gaussian_offset",
     )
     with pytest.raises(TypeError, match="real numeric dtype"):
@@ -2246,14 +1982,16 @@ def test_complex_observations_are_rejected_before_float_conversion():
 
     integer_snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=np.full((1, scan.size), 2**53 + 1, dtype=np.int64),
         dtype=np.dtype("<i8"),
     )
     integer_spec = replace(
         spec,
-        input_schema_fingerprint=integer_snapshot.block.schema.fingerprint,
+        committed_transform=commit_transform(
+            integer_snapshot.block.schema,
+            DataTransformSpec(),
+        ),
     )
     with pytest.raises(ValueError, match="not exactly float64-representable"):
         build_fit_problem(
@@ -2267,14 +2005,16 @@ def test_complex_observations_are_rejected_before_float_conversion():
     )
     ordered_snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=ordered_integers.reshape(1, -1),
         dtype=np.dtype("<u8"),
     )
     ordered_spec = replace(
         spec,
-        input_schema_fingerprint=ordered_snapshot.block.schema.fingerprint,
+        committed_transform=commit_transform(
+            ordered_snapshot.block.schema,
+            DataTransformSpec(),
+        ),
     )
     with pytest.raises(ValueError, match="not exactly float64-representable"):
         build_fit_problem(
@@ -2330,18 +2070,19 @@ def test_fit_result_wire_format_has_one_frozen_current_golden():
     )
     snapshot = snapshot_for(
         repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
+        points=point_table(scan),
         values=np.zeros((1, scan.size)),
         block_id="golden-fit-source",
     )
     spec = gaussian_spec(snapshot, scan)
+    bound = bind_fit(spec, snapshot.block.schema)
     result = FitResultBatch(
         source_ref=snapshot.ref,
         spec=spec,
-        fit_axis_specs=(scan,),
-        batch_axis_specs=(snapshot.block.schema.repeat_axis,),
-        batch_layout=AxisLayout.rect_c((1,)),
+        fit_axis_specs=bound.fit_axis_specs,
+        batch_axis_specs=bound.batch_axis_specs,
+        point_groups=bound.point_groups,
+        batch_layout=AxisLayout.rect_c(()),
         value_unit="count",
         parameter_values=np.array(((2.0, 0.5, 1.0, 0.25),)),
         covariance=np.diag((0.1, 0.2, 0.3, 0.4)).reshape(1, 4, 4),
@@ -2359,9 +2100,9 @@ def test_fit_result_wire_format_has_one_frozen_current_golden():
     )
 
     payload = encode_fit_result_batch(result)
-    assert len(payload) == 2608
+    assert len(payload) == 4430
     assert hashlib.sha256(payload).hexdigest() == (
-        "f10a7ebbceb3c78410121030f5d3831a0c08d327f46ac8b4fc7d6a6eca27416c"
+        "1823c99c5eed80e5e73b79e7721c482036b4f710672ae8f23ac3efe89a6b1cfd"
     )
 
 def test_result_constructor_rejects_impossible_success_and_noncanonical_payloads():

@@ -10,10 +10,10 @@ import threading
 import numpy as np
 
 from zlc_frontend import (
-    PlotPanelComposeRequest,
     PlotPanelSession,
-    render_plot_report,
 )
+from zlc_frontend.plot_panel import PlotPanelComposeRequest
+from zlc_frontend.plot_report import render_plot_report
 from zlc_frontend.encoded_raster import encode_raster_buffer_png
 from zlc_frontend.plot_layout import (
     PANEL_EXPORT_PIXEL_RATIO,

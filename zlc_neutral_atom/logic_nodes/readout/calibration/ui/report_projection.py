@@ -11,7 +11,8 @@ import math
 
 import numpy as np
 
-from zlc_data import AxisSourceRef, OwnedSnapshot
+from zlc_data.axis import AxisSourceRef
+from zlc_data.value import OwnedSnapshot
 from zlc_frontend import (
     AxisViewRole,
     CurveDisplayState,
@@ -19,27 +20,27 @@ from zlc_frontend import (
     FixedIndex,
     HistogramCellThresholds,
     HistogramDisplayState,
-    ImageColormap,
-    ImageDisplayState,
     FigureSource,
+    FigureIntent,
     PanelProvenance,
+    PlotKind,
     PlotReportDocument,
     SourceViewBinding,
     ViewIntent,
     ViewSpec,
     plot_report_page,
-    render_plot_report,
 )
 from zlc_frontend.display_range import RelimMode
 from zlc_frontend.histogram_display import histogram_display_with_thresholds
-from zlc_frontend.site_map_view import build_site_map_snapshot_view
 from zlc_storage import canonical_digest
 
 from ..projection import (
     CalibrationModelReportProjection,
     CalibrationReportProjection,
+    CalibrationSiteMapContext,
     materialize_calibration_report_datasets,
 )
+from .view_projection import calibration_site_map_figure
 
 
 def _format_metric(value: float) -> str:
@@ -69,27 +70,24 @@ def _provenance(
 
 
 def _site_map_page(view: CalibrationReportProjection, snapshot: OwnedSnapshot):
-    site_map = build_site_map_snapshot_view(
+    figure, source = calibration_site_map_figure(
         snapshot,
-        site_axis=view.site_axis,
-        coordinate_frame=view.coordinate_frame,
-        centers_xy=view.actual_centers_xy,
-        site_validity=view.site_validity,
-        site_geometry_identity=view.calibration_identity,
+        CalibrationSiteMapContext(
+            view.site_axis,
+            view.coordinate_frame,
+            view.actual_centers_xy,
+            view.site_validity,
+            view.calibration_identity,
+        ),
         coherence_identity=view.source_capture_identity,
         run_id=f"calibration-report-{view.calibration_identity}",
         provenance_epoch_id=snapshot.ref.stream_generation.value,
-        summary="Reference average and calibrated sites",
-        presentation_kind="calibration-report",
     )
     return plot_report_page(
         "overview",
-        "Reference average | calibrated sites",
-        kind="sites",
-        source=FigureSource(snapshot, site_map),
-        display=ImageDisplayState(colormap=ImageColormap.GRAY),
+        figure=figure,
+        source=source,
         provenance=_provenance(view, "overview", snapshot),
-        value_label=view.frame_schema.value_unit or "Signal",
     )
 
 
@@ -151,13 +149,15 @@ def _histogram_page(
     )
     return plot_report_page(
         f"hist-{model.label}",
-        f"{model.label} | per-site readout distributions",
-        kind="grid" if faceted else "hist",
+        figure=FigureIntent(
+            PlotKind.GRID if faceted else PlotKind.HISTOGRAM,
+            f"{model.label} | per-site readout distributions",
+            view.frame_schema.value_unit or "Signal",
+            view=spec,
+        ),
         source=FigureSource(snapshot),
         display=display,
         provenance=_provenance(view, f"hist-{model.label}", snapshot),
-        value_label=view.frame_schema.value_unit or "Signal",
-        view=spec,
     )
 
 
@@ -190,20 +190,22 @@ def _pooled_page(
     )
     return plot_report_page(
         f"pooled-{model.label}",
-        f"{model.label} | threshold-centred populations",
-        kind="hist",
+        figure=FigureIntent(
+            PlotKind.HISTOGRAM,
+            f"{model.label} | threshold-centred populations",
+            (
+                f"{view.frame_schema.value_unit} - runtime threshold"
+                if view.frame_schema.value_unit
+                else "Signal - runtime threshold"
+            ),
+            view=spec,
+        ),
         source=FigureSource(snapshot),
         display=HistogramDisplayState(
             bin_count=60,
             thresholds=(0.0,),
         ),
         provenance=_provenance(view, f"pooled-{model.label}", snapshot),
-        value_label=(
-            f"{view.frame_schema.value_unit} - runtime threshold"
-            if view.frame_schema.value_unit
-            else "Signal - runtime threshold"
-        ),
-        view=spec,
     )
 
 
@@ -234,16 +236,18 @@ def _fidelity_page(view: CalibrationReportProjection, snapshot: OwnedSnapshot):
     )
     return plot_report_page(
         "fidelity",
-        "Per-site model fidelity",
-        kind="1d",
+        figure=FigureIntent(
+            PlotKind.CURVE,
+            "Per-site model fidelity",
+            "Fidelity",
+            view=spec,
+        ),
         source=FigureSource(snapshot),
         display=CurveDisplayState(
             relim_mode=RelimMode.FIXED,
             fixed_y_limits=(0.45, 1.01),
         ),
         provenance=_provenance(view, "fidelity", snapshot),
-        value_label="Fidelity",
-        view=spec,
     )
 
 
@@ -283,13 +287,14 @@ def _psf_page(
     )
     return plot_report_page(
         "psf-kernels",
-        "Empirical PSF kernels",
-        kind="grid" if len(view.site_labels) > 1 else "2d",
+        figure=FigureIntent(
+            PlotKind.GRID if len(view.site_labels) > 1 else PlotKind.IMAGE,
+            "Empirical PSF kernels",
+            "Normalized weight",
+            view=spec,
+        ),
         source=FigureSource(snapshot),
-        display=ImageDisplayState(colormap=ImageColormap.INFERNO),
         provenance=_provenance(view, "psf-kernels", snapshot),
-        value_label="Normalized weight",
-        view=spec,
     )
 
 
@@ -330,7 +335,9 @@ def project_calibration_plot_report(
 
 
 def render_calibration_plot_report(view: CalibrationReportProjection):
-    """Render through the same frontend report owner used by every caller."""
+    """Render through the frontend owner at the optional UI adapter boundary."""
+
+    from zlc_frontend.plot_report import render_plot_report
 
     return render_plot_report(project_calibration_plot_report(view))
 

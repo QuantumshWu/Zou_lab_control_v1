@@ -799,7 +799,7 @@ def _collect_event(
         trace=TraceContext(
             context.run_id.value,
             _COLLECTOR_SOURCE_ID,
-            f"cell:{address.repeat_index}:{address.point_storage_index}",
+            f"cell:{address.repeat_index}:{address.point_ordinal}",
             causation_refs=(event.event_ref, *event.trace.causation_refs),
         ),
         join_key=address,
@@ -920,7 +920,7 @@ def _execute_scan(
             accumulator = None
             for address in schedule:
                 context.checkpoint()
-                pulse_request = pulse_requests[address.point_storage_index]
+                pulse_request = pulse_requests[address.point_ordinal]
                 session = pulse_port.open_session(pulse_request)
                 prepared.current_api_session = session
                 session.prepare(context)
@@ -942,7 +942,7 @@ def _execute_scan(
                     pulse_request.artifact,
                     group=(
                         f"cell:{address.repeat_index}:"
-                        f"{address.point_storage_index}"
+                        f"{address.point_ordinal}"
                     ),
                     expected_event_count=1,
                 )
@@ -972,7 +972,7 @@ def _execute_scan(
                 segments.append(
                     ApiSegmentEvidence(
                         address.repeat_index,
-                        address.point_storage_index,
+                        address.point_ordinal,
                         pulse_request.artifact,
                         terminal,
                     )

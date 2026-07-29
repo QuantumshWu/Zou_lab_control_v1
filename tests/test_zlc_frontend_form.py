@@ -156,7 +156,7 @@ def test_choice_values_are_typed_and_invalid_specs_fail_closed() -> None:
 
 
 def test_shared_number_leaf_preserves_authored_type_and_rejects_expressions() -> None:
-    from zlc_frontend import parse_number_text
+    from zlc_frontend.form import parse_number_text
 
     assert type(parse_number_text("1", "cell")) is int
     assert type(parse_number_text("1.0", "cell")) is float

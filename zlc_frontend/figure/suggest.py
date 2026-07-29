@@ -23,7 +23,6 @@ from .contract import (
     CURVE_CONTRACT,
     HISTOGRAM_CONTRACT,
     IMAGE_CONTRACT,
-    _fit_display_selection_indices,
     _source_cardinality,
     _source_name,
     _source_role,
@@ -41,7 +40,6 @@ from .model import (
     LatestNonempty,
     SourceViewBinding,
     SuggestionStatus,
-    ViewAlternative,
     ViewIntent,
     ViewPreferences,
     ViewSpec,
@@ -54,13 +52,11 @@ def _needs(
     message: str,
     *,
     source: AxisSourceRef | None = None,
-    alternatives=(),
 ) -> ViewSuggestion:
     return ViewSuggestion(
         None,
         SuggestionStatus.NEEDS_INPUT,
         (DecisionReason(code, message, source),),
-        tuple(alternatives),
     )
 
 
@@ -173,6 +169,18 @@ def _suggest_view(
                 AxisSourceRef.POINT_COORDINATE,
             }
         )
+    else:
+        # A GridTopology is optional presentation metadata over the same
+        # authored point rows.  Its dimensions must not compete with the
+        # declared row coordinates unless the caller explicitly chooses a
+        # grid-dimension source.  Otherwise a one-dimensional grid exposes the
+        # same physical axis twice and makes an ordinary curve spuriously
+        # ambiguous.
+        available = tuple(
+            source
+            for source in available
+            if source.kind != AxisSourceRef.GRID_DIMENSION
+        )
     available_set = set(available)
     reserved = {
         *preferences.batch_sources,
@@ -181,7 +189,6 @@ def _suggest_view(
     }
     bindings: dict[AxisSourceRef, SourceViewBinding] = {}
     reasons: list[DecisionReason] = []
-    alternatives: list[ViewAlternative] = []
     chosen_display: list[AxisSourceRef] = []
 
     for slot in contract.display_slots:
@@ -212,7 +219,7 @@ def _suggest_view(
         else:
             chosen = None
             for preferred_role in slot.preferred_axis_roles:
-                candidates = tuple(
+                role_candidates = tuple(
                     source
                     for source in available
                     if source not in bindings
@@ -225,22 +232,24 @@ def _suggest_view(
                         tuple(chosen_display),
                     )
                 )
+                # Point ordinal is a fallback for an otherwise unlabelled
+                # authored row sequence.  It never competes with a declared
+                # numeric coordinate of the same preferred role.
+                declared = tuple(
+                    source
+                    for source in role_candidates
+                    if source.kind != AxisSourceRef.POINT_ORDINAL
+                )
+                candidates = declared or role_candidates
                 if not candidates:
                     continue
-                chosen = candidates[0]
                 if len(candidates) > 1:
-                    alternatives.extend(
-                        ViewAlternative(source, slot.binding_role, _source_name(schema, source))
-                        for source in candidates
+                    return _needs(
+                        "AMBIGUOUS_DISPLAY_SOURCE",
+                        f"multiple declared sources can fill {slot.binding_role.value}: "
+                        + ", ".join(_source_name(schema, source) for source in candidates),
                     )
-                    reasons.append(
-                        DecisionReason(
-                            "DISPLAY_SOURCE_DEFAULT",
-                            f"{_source_name(schema, chosen)} is the first declared "
-                            f"source eligible for {slot.binding_role.value}",
-                            chosen,
-                        )
-                    )
+                chosen = candidates[0]
                 break
             if chosen is None:
                 return _needs(
@@ -387,7 +396,6 @@ def _suggest_view(
         spec,
         SuggestionStatus.RESOLVED,
         tuple(reasons),
-        tuple(alternatives),
     )
 
 
@@ -406,6 +414,248 @@ def suggest_view(
         preferences,
         contract=dataset_contract_for(intent),
     )
+
+
+_AUTHORING_ROLE_FIELDS = {
+    AxisViewRole.X: "x_source",
+    AxisViewRole.IMAGE_X: "image_x_source",
+    AxisViewRole.IMAGE_Y: "image_y_source",
+    AxisViewRole.SAMPLE: "sample_sources",
+    AxisViewRole.BATCH: "batch_sources",
+}
+_AUTHORING_DISPLAY_ROLES = frozenset(
+    {AxisViewRole.X, AxisViewRole.IMAGE_X, AxisViewRole.IMAGE_Y}
+)
+
+
+def _view_preferences_from_spec(
+    schema: DatasetSchema,
+    view: ViewSpec,
+) -> ViewPreferences:
+    """Project one valid view back to the preferences that reproduce it."""
+
+    validate_view_spec(schema, view)
+    repeat = view.binding(AxisSourceRef.tensor(schema.repeat_axis.axis_id))
+    display = {
+        binding.role: binding.source
+        for binding in view.source_bindings
+        if binding.role in _AUTHORING_DISPLAY_ROLES
+    }
+    grouped = {
+        role: tuple(binding.source for binding in view.source_bindings
+                    if binding.role is role)
+        for role in (AxisViewRole.SAMPLE, AxisViewRole.BATCH, AxisViewRole.FACET)
+    }
+    return ViewPreferences(
+        repeat_binding=(
+            None if repeat.role in grouped else repeat
+        ),
+        x_source=display.get(AxisViewRole.X),
+        image_x_source=display.get(AxisViewRole.IMAGE_X),
+        image_y_source=display.get(AxisViewRole.IMAGE_Y),
+        sample_sources=grouped[AxisViewRole.SAMPLE],
+        batch_sources=grouped[AxisViewRole.BATCH],
+        facet_sources=grouped[AxisViewRole.FACET],
+    )
+
+
+def _with_authoring_role(
+    preferences: ViewPreferences,
+    role: AxisViewRole,
+    value: AxisSourceRef | tuple[AxisSourceRef, ...],
+) -> ViewPreferences:
+    fields = {
+        field: getattr(preferences, field)
+        for field in (*_AUTHORING_ROLE_FIELDS.values(), "facet_sources")
+    }
+    if role in _AUTHORING_DISPLAY_ROLES:
+        for field, existing in tuple(fields.items()):
+            fields[field] = (
+                tuple(item for item in existing if item != value)
+                if isinstance(existing, tuple)
+                else None if existing == value else existing
+            )
+        fields[_AUTHORING_ROLE_FIELDS[role]] = value
+    else:
+        selected = tuple(value)
+        target = _AUTHORING_ROLE_FIELDS[role]
+        for field, existing in tuple(fields.items()):
+            if field != target:
+                fields[field] = (
+                    tuple(item for item in existing if item not in selected)
+                    if isinstance(existing, tuple)
+                    else None if existing in selected else existing
+                )
+        fields[target] = selected
+    return replace(preferences, **fields)
+
+
+def _view_authoring_candidates(
+    schema: DatasetSchema,
+    intent: ViewIntent,
+    *,
+    current_view: ViewSpec | None = None,
+    preferences: ViewPreferences | None = None,
+    faceted: bool = False,
+):
+    """Return legal adjacent role edits using only existing Figure values."""
+
+    if not isinstance(schema, DatasetSchema) or not isinstance(intent, ViewIntent):
+        raise TypeError("view authoring requires DatasetSchema and ViewIntent")
+    if not isinstance(faceted, bool):
+        raise TypeError("faceted must be bool")
+    if current_view is not None:
+        if current_view.intent is not intent:
+            raise ValueError("current view and authoring intent disagree")
+        preferences = _view_preferences_from_spec(schema, current_view)
+    else:
+        preferences = ViewPreferences() if preferences is None else preferences
+        if not isinstance(preferences, ViewPreferences):
+            raise TypeError("preferences must be ViewPreferences or None")
+
+    roles = []
+    if current_view is not None or not faceted:
+        roles.extend(slot.binding_role for slot in dataset_contract_for(intent).display_slots)
+    roles.extend((AxisViewRole.SAMPLE, AxisViewRole.BATCH))
+    repeat = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+    protected = {
+        source
+        for source in (
+            preferences.x_source,
+            preferences.image_x_source,
+            preferences.image_y_source,
+            *preferences.facet_sources,
+        )
+        if source is not None
+    }
+    invalid = {
+        "INVALID_DISPLAY_SOURCE",
+        "DISPLAY_ROLE_MISMATCH",
+        "UNKNOWN_SOURCE",
+        "EXPLICIT_ROLE_CONFLICT",
+    }
+    exact = {} if current_view is None else {
+        binding.source: binding
+        for binding in current_view.source_bindings
+        if binding.role in {AxisViewRole.SELECTED, AxisViewRole.REDUCED}
+    }
+    rows = []
+    for role in roles:
+        grouped = role in {AxisViewRole.SAMPLE, AxisViewRole.BATCH}
+        authored = getattr(preferences, _AUTHORING_ROLE_FIELDS[role])
+        current = tuple(source for source in authored if source != repeat) if grouped else authored
+        sources = tuple(
+            source for source in _dataset_sources(schema)
+            if source != repeat and (not grouped or source not in protected)
+        )
+        values = (
+            (current,) + tuple(
+                tuple(item for item in current if item != source)
+                if source in current else (*current, source)
+                for source in sources
+            ) if grouped else sources
+        )
+        choices = []
+        for value in dict.fromkeys(values):
+            requested = value
+            if grouped and repeat in authored:
+                requested = (repeat, *value)
+            try:
+                candidate_preferences = _with_authoring_role(
+                    preferences, role, requested
+                )
+                suggestion = suggest_view(
+                    schema,
+                    intent,
+                    None if current_view is None else current_view.point_ordinals,
+                    candidate_preferences,
+                )
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            candidate = suggestion.spec
+            if candidate is None:
+                if current_view is not None or role not in _AUTHORING_DISPLAY_ROLES:
+                    continue
+                if any(reason.code in invalid for reason in suggestion.reasons):
+                    continue
+            else:
+                if sum(binding.role is AxisViewRole.FACET
+                       for binding in candidate.source_bindings) != int(faceted):
+                    continue
+                if current_view is not None:
+                    candidate = replace(
+                        candidate,
+                        source_bindings=tuple(
+                            previous
+                            if (previous := exact.get(binding.source)) is not None
+                            and previous.role is binding.role else binding
+                            for binding in candidate.source_bindings
+                        ),
+                    )
+                    try:
+                        validate_view_spec(schema, candidate)
+                    except (KeyError, TypeError, ValueError, IndexError):
+                        continue
+                    if candidate == current_view and value != current:
+                        continue
+            choices.append((value, candidate_preferences, candidate))
+        has_current = any(value == current for value, *_rest in choices)
+        if choices and (
+            not has_current
+            or current
+            or len(choices) > 1
+            or role in _AUTHORING_DISPLAY_ROLES
+        ):
+            selected = current if has_current else None
+            rows.append((role, selected, tuple(choices)))
+    return tuple(rows)
+
+
+def _repeat_authoring_candidates(
+    schema: DatasetSchema,
+    view: ViewSpec,
+) -> tuple[SourceViewBinding, ...]:
+    """Return every legal adjacent repeat binding for one valid view."""
+
+    validate_view_spec(schema, view)
+    source = AxisSourceRef.tensor(schema.repeat_axis.axis_id)
+    current = view.binding(source)
+    if current.role is AxisViewRole.FACET:
+        return ()
+    fixed = current.selector.index if isinstance(current.selector, FixedIndex) else 0
+    candidates = (
+        SourceViewBinding(
+            source,
+            AxisViewRole.REDUCED,
+            reduction=DisplayReduction(DisplayReductionMethod.MEAN),
+        ),
+        SourceViewBinding(
+            source,
+            AxisViewRole.REDUCED,
+            reduction=DisplayReduction(DisplayReductionMethod.SUM),
+        ),
+        SourceViewBinding(source, AxisViewRole.SELECTED, selector=LatestNonempty()),
+        SourceViewBinding(source, AxisViewRole.SELECTED, selector=FixedIndex(fixed)),
+        SourceViewBinding(source, AxisViewRole.BATCH),
+        SourceViewBinding(source, AxisViewRole.SAMPLE),
+    )
+    legal = []
+    for binding in candidates:
+        candidate = replace(
+            view,
+            source_bindings=tuple(
+                binding if item.source == source else item
+                for item in view.source_bindings
+            ),
+        )
+        try:
+            validate_view_spec(schema, candidate)
+        except (ValueError, IndexError):
+            continue
+        legal.append(binding)
+    if current not in legal:
+        raise ValueError("current repeat binding is absent from legal view choices")
+    return tuple(legal)
 
 
 def _suggest_histogram_fit_view(
@@ -600,7 +850,6 @@ def _suggest_histogram_fit_view(
                 "Histogram view is derived from its committed samples and bins",
             ),
         ),
-        (),
     )
 
 
@@ -629,13 +878,6 @@ def suggest_fit_view(
         HistogramSpec,
     ):
         return _suggest_histogram_fit_view(schema, result, preferences)
-    try:
-        _fit_display_selection_indices(schema, result)
-    except (KeyError, TypeError, ValueError, IndexError) as exc:
-        return _needs(
-            "TRANSFORMED_FIT_REQUIRES_AUTHORITY_TRANSLATOR",
-            str(exc),
-        )
     available = set(_dataset_sources(schema))
     fit_sources = result.spec.independent_sources
     if any(source not in available for source in fit_sources):
@@ -730,11 +972,7 @@ def suggest_fit_view(
     )
     if suggestion.spec is None:
         return suggestion
-    allowed_batch_roles = {
-        AxisViewRole.BATCH,
-        AxisViewRole.FACET,
-        AxisViewRole.SELECTED,
-    }
+    allowed_batch_roles = {AxisViewRole.BATCH, AxisViewRole.FACET}
     for source, axis in zip(
         result.spec.batch_sources,
         result.batch_axis_specs,

@@ -98,9 +98,6 @@ def test_run_attachment_calls_the_capability_live_output_starter() -> None:
     from zlc_workbench.task_console.declaration_projection import (
         project_declaration_spec,
     )
-    from zlc_workbench.task_console.presentation_index import (
-        ConsolePresentationIndex,
-    )
 
     key = DefinitionKey("tests", "live-output-start")
     declaration = LogicNodeDeclaration(
@@ -129,7 +126,6 @@ def test_run_attachment_calls_the_capability_live_output_starter() -> None:
     plane = SignalDataPlane()
     host = ConsoleNodeHost(
         data_plane=plane,
-        presentation_index=ConsolePresentationIndex(),
         resolve_inputs=lambda _spec, _values: {},
         request_owner_wake=lambda: None,
     )

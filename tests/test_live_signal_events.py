@@ -1,8 +1,6 @@
-"""Future-only stream following and source-neutral Camera output events."""
+"""Future-only stream following and exact event-association routing."""
 
 from __future__ import annotations
-
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,6 +10,7 @@ from zlc_data import (
     SPATIAL_Y,
     VALID,
     AxisId,
+    AxisSourceRef,
     AxisSpec,
     DataTransformSpec,
     IndexRangeSelection,
@@ -23,16 +22,16 @@ from zlc_data import (
     ValuePayloadContract,
     ValueSchema,
 )
+from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
+from zlc_neutral_atom.catalog import DefinitionKey, ProcessorDefinition
+from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
 from zlc_neutral_atom.devices.camera.contract import (
     CameraFrameMetadata,
     CameraSample,
     CameraSampleContract,
 )
-from zlc_neutral_atom.catalog import DefinitionKey, ProcessorDefinition
-from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
-from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
-from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.input_spec import DatasetInputSpec
+from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.logic_node_declaration import (
     LogicNodeDeclaration,
     OutputPresentation,
@@ -43,6 +42,12 @@ from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
 from zlc_neutral_atom.logic_nodes.camera_measurement.signal_source import (
     camera_signal_event_source,
 )
+from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
+from zlc_neutral_atom.runtime.signal_source import (
+    SignalOutputProjection,
+    StreamSignalEventSource,
+    authoritative_signal_event_source,
+)
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
     SourceFailed,
@@ -50,31 +55,16 @@ from zlc_neutral_atom.runtime.streams import (
     StreamId,
     TraceContext,
 )
-from zlc_neutral_atom.runtime.run import RunId, RunState
-from zlc_neutral_atom.runtime.signal_source import (
-    SignalAssociationScheduleRequirement,
-    SignalEventAssociationSource,
-    SignalOutputProjection,
-    StreamSignalEventSource,
-    authoritative_signal_event_source,
+from zlc_workbench.task_console import attachment_builders
+from zlc_workbench.task_console.capability import ConsoleNodeHost
+from zlc_workbench.task_console.declaration_projection import (
+    project_declaration_spec,
 )
 from zlc_workbench.task_console.input_binding import (
     ConsoleDatasetProducerBinding,
     DatasetInputSelection,
     ResolvedDatasetInput,
 )
-from zlc_workbench.task_console import attachment_builders
-from zlc_workbench.task_console.capability import (
-    ConsoleNodeHost,
-    ConsoleSignalEventSourceProvider,
-)
-from zlc_workbench.task_console.declaration_projection import (
-    project_declaration_spec,
-)
-from zlc_workbench.task_console.presentation_index import ConsolePresentationIndex
-from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
-from zlc_neutral_atom.processing.hosted_processor import HostedProcessor
-from zlc_neutral_atom.runtime.hosted_run import HostedRun
 
 
 SCHEMA = ValueSchema.scalar(np.dtype("<f8"))
@@ -190,7 +180,10 @@ def test_authoritative_signal_projection_commits_multidimensional_area_and_reduc
                 )
             ),
             ReductionSpec(
-                (y_axis.axis_id, x_axis.axis_id),
+                (
+                    AxisSourceRef.tensor(y_axis.axis_id),
+                    AxisSourceRef.tensor(x_axis.axis_id),
+                ),
                 ReductionMethod.SUM,
             ),
         )
@@ -220,254 +213,14 @@ def test_authoritative_signal_projection_commits_multidimensional_area_and_reduc
     producer.finish()
 
 
-def test_console_processor_starts_and_owns_the_optional_event_source() -> None:
-    """The generic host exposes owner-derived events without owning upstream."""
-
-    output_names = ("counts", "occupied", "rate")
-    schemas = {
-        name: ValueSchema.scalar(np.dtype("<f8"))
-        for name in output_names
-    }
-    lifecycle: list[str] = []
-
-    class Upstream:
-        cancel_calls = 0
-
-        @staticmethod
-        def value_schema(_output_name: str) -> ValueSchema:
-            return SCHEMA
-
-        @staticmethod
-        def open_signal_cursor(output_name: str):
-            return ("upstream", output_name)
-
-        def cancel(self) -> None:
-            self.cancel_calls += 1
-
-    class Derived:
-        error = None
-
-        def __init__(self) -> None:
-            self.output_names = output_names
-            self.worker_idle = False
-            self.request_close_calls = 0
-            self.join_calls = 0
-
-        @staticmethod
-        def value_schema(output_name: str) -> ValueSchema:
-            return schemas[output_name]
-
-        @staticmethod
-        def open_signal_cursor(output_name: str):
-            return ("derived", output_name)
-
-        @staticmethod
-        def open_associated_signal_cursor(output_name: str):
-            return ("derived-associated", output_name)
-
-        @staticmethod
-        def signal_association_schedule_requirement(output_name: str):
-            return SignalAssociationScheduleRequirement()
-
-        def request_close(self) -> None:
-            lifecycle.append("derived.request_close")
-            self.request_close_calls += 1
-
-        def join_closed(self) -> None:
-            assert self.worker_idle
-            lifecycle.append("derived.join_closed")
-            self.join_calls += 1
-
-        def finish_worker(self) -> None:
-            self.worker_idle = True
-
-    upstream = Upstream()
-    derived = Derived()
-
-    class Application:
-        @staticmethod
-        def evaluate(*_args, **_kwargs):
-            return None
-
-        @staticmethod
-        def start_signal_events(source):
-            assert source is upstream
-            lifecycle.append("derived.start")
-            return derived
-
-    class DataPlane:
-        @staticmethod
-        def cancel_latest_only_processor(_node) -> bool:
-            lifecycle.append("latest.cancel")
-            return True
-
-        @staticmethod
-        def withdraw_processor(_node) -> None:
-            lifecycle.append("latest.withdraw")
-
-    node = object.__new__(HostedProcessor)
-    node._run_id = RunId("processor-test")
-    node._state = RunState.RUNNING
-    node._cancel_requested = False
-    node._phase = "preparing"
-    node._error = None
-    node._output_names = output_names
-    node._source_event_source = upstream
-    node._signal_event_source = None
-    node._signal_events_close_requested = False
-    node._signal_events_closed = False
-    node._processor_lane_retired = False
-    node._pending_terminal_state = None
-    node._pending_terminal_error = None
-    node._data_plane = DataPlane()
-
-    node.processor_application_ready(Application())
-
-    assert lifecycle == ["derived.start"]
-    assert node.output_names == output_names
-    assert node.value_schema("counts") is schemas["counts"]
-    assert node.open_signal_cursor("occupied") == ("derived", "occupied")
-    assert isinstance(node, ConsoleSignalEventSourceProvider)
-    exposed = node.signal_event_source()
-    assert exposed is derived
-    assert isinstance(exposed, SignalEventAssociationSource)
-    assert exposed.open_associated_signal_cursor("rate") == (
-        "derived-associated",
-        "rate",
-    )
-    assert exposed.signal_association_schedule_requirement(
-        "occupied"
-    ) == SignalAssociationScheduleRequirement()
-    assert not node.worker_idle
-
-    node.cancel()
-
-    assert lifecycle == [
-        "derived.start",
-        "derived.request_close",
-        "latest.cancel",
-        "latest.withdraw",
-    ]
-    assert derived.request_close_calls == 1
-    assert derived.join_calls == 0
-    assert upstream.cancel_calls == 0
-    assert not node.worker_idle
-    assert node._state is RunState.RUNNING
-    assert isinstance(node, ConsoleSignalEventSourceProvider)
-    with pytest.raises(RuntimeError, match="not running"):
-        node.signal_event_source()
-
-    derived.finish_worker()
-    assert node.poll().state is RunState.CANCELLED
-    assert lifecycle[-1] == "derived.join_closed"
-    assert derived.join_calls == 1
-    assert node.worker_idle
-
-    node.shutdown()
-    assert derived.request_close_calls == 1
-    assert derived.join_calls == 1
-
-
-def test_console_run_node_exposes_one_stable_typed_source_provider() -> None:
-    class AssociatedCommand:
-        @staticmethod
-        def value_schema(_output_name: str) -> ValueSchema:
-            return SCHEMA
-
-        @staticmethod
-        def open_signal_cursor(output_name: str):
-            return ("ordered", output_name)
-
-        @staticmethod
-        def open_associated_signal_cursor(output_name: str):
-            return ("associated", output_name)
-
-        @staticmethod
-        def signal_association_schedule_requirement(output_name: str):
-            return SignalAssociationScheduleRequirement()
-
-    class OrderingOnlyCommand:
-        @staticmethod
-        def value_schema(_output_name: str) -> ValueSchema:
-            return SCHEMA
-
-        @staticmethod
-        def open_signal_cursor(output_name: str):
-            return ("ordered", output_name)
-
-    node = object.__new__(HostedRun)
-    node._start_pending = True
-    node._snapshot = None
-    node._handle = None
-    node._prepared_command = AssociatedCommand()
-
-    assert isinstance(node, ConsoleSignalEventSourceProvider)
-    exposed = node.signal_event_source()
-    assert isinstance(exposed, SignalEventAssociationSource)
-    assert exposed.open_associated_signal_cursor("frame_0") == (
-        "associated",
-        "frame_0",
-    )
-    assert exposed.signal_association_schedule_requirement(
-        "frame_0"
-    ) == SignalAssociationScheduleRequirement()
-
-    node._prepared_command = OrderingOnlyCommand()
-    exposed = node.signal_event_source()
-    assert not isinstance(exposed, SignalEventAssociationSource)
-
-
-def test_console_processor_keeps_live_events_optional() -> None:
-    class Application:
-        @staticmethod
-        def evaluate(*_args, **_kwargs):
-            return None
-
-    node = object.__new__(HostedProcessor)
-    node._state = RunState.RUNNING
-    node._cancel_requested = False
-    node._phase = "preparing"
-    node._output_names = ("result",)
-    node._source_event_source = None
-    node._signal_event_source = None
-    node._signal_events_close_requested = False
-    node._signal_events_closed = False
-
-    node.processor_application_ready(Application())
-
-    assert node._phase == "waiting for a new source revision"
-    assert node.worker_idle
-    with pytest.raises(TypeError, match="does not expose live signal events"):
-        node.open_signal_cursor("result")
-
-
-def test_processor_attachment_injects_only_the_structural_source_capability(
+def test_processor_attachment_binds_the_exact_publication_not_an_event_provider(
     monkeypatch,
 ) -> None:
     input_spec = DatasetInputSpec("camera", "Camera", ("test.frame",))
     camera_output = DatasetOutputDeclaration("frame", "test.frame")
 
-    class ActualSource:
-        @staticmethod
-        def value_schema(_output_name: str) -> ValueSchema:
-            raise AssertionError("attachment must not inspect physical schemas")
-
-        @staticmethod
-        def open_signal_cursor(_output_name: str):
-            raise AssertionError("attachment must not subscribe")
-
-    actual_source = ActualSource()
-
     class SourceNode:
         running = True
-
-        @staticmethod
-        def cancel() -> None:
-            raise AssertionError("attachment must not stop its source")
-
-        @staticmethod
-        def signal_event_source():
-            return actual_source
 
     source_node = SourceNode()
     resolved = ResolvedDatasetInput(
@@ -490,14 +243,7 @@ def test_processor_attachment_injects_only_the_structural_source_capability(
             ),
             description="test processor",
             authoring_schema=AuthoringSchema(
-                (
-                    AuthoringField(
-                        "threshold",
-                        "float",
-                        "Threshold",
-                        default=1.0,
-                    ),
-                )
+                (AuthoringField("threshold", "float", "Threshold", default=1.0),)
             ),
             input_specs=(input_spec,),
             outputs=(
@@ -515,11 +261,11 @@ def test_processor_attachment_injects_only_the_structural_source_capability(
     plane = SignalDataPlane()
     host = ConsoleNodeHost(
         data_plane=plane,
-        presentation_index=ConsolePresentationIndex(),
         resolve_inputs=lambda _spec, _values: {"camera": resolved},
         request_owner_wake=lambda: None,
     )
     captured = {}
+    exact_publication = object()
 
     class CapturingProcessorNode:
         def __init__(self, *_args, **kwargs) -> None:
@@ -527,8 +273,8 @@ def test_processor_attachment_injects_only_the_structural_source_capability(
 
     monkeypatch.setattr(
         ConsoleNodeHost,
-        "current_value",
-        lambda _host, _binding: object(),
+        "current_publication",
+        lambda _host, _binding: exact_publication,
     )
     monkeypatch.setattr(
         attachment_builders,
@@ -550,112 +296,7 @@ def test_processor_attachment_injects_only_the_structural_source_capability(
     finally:
         plane.close()
 
-    assert captured["source_event_source"] is actual_source
-
-
-def test_pulse_scan_picker_admits_associated_area_but_excludes_fit() -> None:
-    """Capability filtering happens before binding, without shape guesses."""
-
-    from zlc_neutral_atom.logic_nodes.pulse_scan.authoring import (
-        PULSE_SCAN_SOURCE_INPUT_SPEC,
-    )
-    from zlc_workbench.task_console.window import TaskConsole
-
-    source_presentation = OutputPresentation(
-        DatasetOutputDeclaration("frame", "test.camera-frame"),
-        "frame",
-        "Frame",
-    )
-    area_presentation = OutputPresentation(
-        DatasetOutputDeclaration("area_data", "test.area-data"),
-        "area",
-        "Area",
-    )
-    fit_presentation = OutputPresentation(
-        DatasetOutputDeclaration("center", "test.fit-center"),
-        "center",
-        "Center",
-    )
-
-    class AssociatedSource:
-        @staticmethod
-        def value_schema(_output_name):
-            return SCHEMA
-
-        @staticmethod
-        def open_signal_cursor(_output_name):
-            raise AssertionError("candidate filtering must not open a cursor")
-
-        @staticmethod
-        def signal_association_schedule_requirement(_output_name):
-            raise AssertionError("candidate filtering must not arm association")
-
-        @staticmethod
-        def open_associated_signal_cursor(_output_name):
-            raise AssertionError("candidate filtering must not open a cursor")
-
-    associated_source = AssociatedSource()
-
-    class AssociatedNode:
-        @staticmethod
-        def signal_event_source():
-            return associated_source
-
-    producer = SimpleNamespace(run_node=AssociatedNode(), running=True)
-    direct = "camera/frame"
-    area = "@panel/area/area_data"
-    fit = "@panel/fit/center"
-    area_transform = DataTransformSpec(
-        (
-            Selection(
-                (IndexRangeSelection(AxisId("image.x"), 0, 1),)
-            ),
-        )
-    )
-    values = {
-        area: SimpleNamespace(source_transform=area_transform),
-        fit: SimpleNamespace(source_transform=None),
-    }
-
-    class Surface:
-        _input_signal_names = TaskConsole._input_signal_names
-        _signal_event_association_available = (
-            TaskConsole._signal_event_association_available
-        )
-
-        cards = (
-            SimpleNamespace(
-                panel_id="area",
-                config=SimpleNamespace(signal=direct),
-            ),
-            SimpleNamespace(
-                panel_id="fit",
-                config=SimpleNamespace(signal=direct),
-            ),
-        )
-        _card_output_presentations = {
-            "area": frozenset((area_presentation,)),
-            "fit": frozenset((fit_presentation,)),
-        }
-        _tick_data = SimpleNamespace(value=lambda key: values.get(key))
-
-        @staticmethod
-        def resolve_console_producer(key):
-            if key == direct:
-                return producer
-            raise LookupError(key)
-
-        @staticmethod
-        def _current_signal_projection():
-            return SimpleNamespace(
-                topology={
-                    direct: SimpleNamespace(declaration=source_presentation),
-                    area: SimpleNamespace(declaration=area_presentation),
-                    fit: SimpleNamespace(declaration=fit_presentation),
-                }
-            )
-
-    assert Surface()._input_signal_names(PULSE_SCAN_SOURCE_INPUT_SPEC) == [
-        area,
-        direct,
-    ]
+    assert captured["source_signal"] == "camera/frame"
+    assert captured["source_node"] is source_node
+    assert captured["initial_publication"] is exact_publication
+    assert "source_event_source" not in captured

@@ -9,6 +9,7 @@ import numpy as np
 from zlc_data import (
     COMPONENT,
     AxisId,
+    AxisSourceRef,
     AxisSpec,
     ComponentValidity,
     CoordinateFrameId,
@@ -22,15 +23,14 @@ from zlc_data import (
     Selection,
     Value,
     ValueSchema,
-    dataset_cell_value,
-    dataset_revision_ref_to_tree,
-    expand_value_validity,
-    materialize_component_dataset,
-    selection_to_tree,
 )
+from zlc_data.codec import dataset_revision_ref_to_tree
+from zlc_data.selection import selection_to_tree
+from zlc_data.snapshot_projection import materialize_component_dataset
+from zlc_data.value import dataset_cell_value, expand_value_validity
 from zlc_storage import canonical_digest, canonical_text, positive_real
 
-from zlc_frontend.figure import DatasetId, EvaluatedImage, EvaluatedInput, evaluate_axis
+from zlc_frontend.figure import DatasetId, EvaluatedAxis, EvaluatedImage, EvaluatedInput
 from zlc_frontend.figure_outputs import (
     AREA_DATA_OUTPUT,
     FigureDerivedSignal,
@@ -226,9 +226,21 @@ def _evaluated_image_cell(
     x_position, y_position = x_positions[0], y_positions[0]
     x_axis, y_axis = axes[x_position], axes[y_position]
     order_yx = (y_position, x_position)
+    def evaluated_tensor_axis(axis: AxisSpec) -> EvaluatedAxis:
+        indices = tuple(range(axis.size))
+        return EvaluatedAxis(
+            AxisSourceRef.tensor(axis.axis_id),
+            axis.name,
+            axis.role,
+            axis.unit,
+            indices,
+            tuple(axis.coordinate_at(index) for index in indices),
+            axis.coordinate_frame,
+        )
+
     image = EvaluatedImage(
-        evaluate_axis(x_axis, tuple(range(x_axis.size))),
-        evaluate_axis(y_axis, tuple(range(y_axis.size))),
+        evaluated_tensor_axis(x_axis),
+        evaluated_tensor_axis(y_axis),
         np.transpose(values, order_yx),
         np.transpose(validity, order_yx),
         schema.value_unit,
@@ -239,13 +251,13 @@ def _evaluated_image_cell(
 def _image_cell(
     snapshot: OwnedSnapshot,
     repeat_index: int,
-    point_storage_index: int,
+    point_ordinal: int,
 ) -> tuple[EvaluatedImage, ImageViewportTransform, AxisSpec, AxisSpec]:
     return _image_value(
         dataset_cell_value(
             snapshot.block,
             repeat_index,
-            point_storage_index,
+            point_ordinal,
         )
     )
 

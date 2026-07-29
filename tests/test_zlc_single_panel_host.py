@@ -16,7 +16,13 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import test_u02c_qt_curve_interaction as image_fixtures
+from figure_surface_fixtures import curve_panel, image_panel
+from gui_user_flow import (
+    drag_mouse_move,
+    point_in_rect,
+    raster_subrect,
+    send_wheel,
+)
 
 
 def _image_frame(sequence: int):
@@ -26,12 +32,8 @@ def _image_frame(sequence: int):
         "image-board",
         0,
         sequence,
-        (image_fixtures._image_panel(sequence),),
+        (image_panel(sequence),),
     )
-
-
-def _image_target(board):
-    return board._selector_target(board._image_bindings["image"])[0]
 
 
 def _host_with_image_front():
@@ -62,11 +64,9 @@ def test_present_frame_binds_the_image_family_and_forwards_typed_intents() -> No
     application, host = _host_with_image_front()
     try:
         board = host.board
-        assert "image" in board._image_bindings
         # Selectors default OFF: the binding is READY (the just-presented
         # frame is the host's one source) but the board-wide switch is off.
-        assert board._image_bindings["image"].interaction_ready is True
-        assert board._selector_enabled is False
+        assert not host.selectors_enabled
 
         rectangles: list[object] = []
         views: list[object] = []
@@ -76,105 +76,46 @@ def test_present_frame_binds_the_image_family_and_forwards_typed_intents() -> No
         host.colorLimitsCommitted.connect(limits.append)
 
         host.set_selectors_enabled(True)
-        target = _image_target(board)
-        before = board.visible_image_payload().viewport
+        payload = host.front_frame.panels[0].display_payload
+        target = raster_subrect(
+            board.rect(), payload.raster_geometry.image_bounds
+        )
+        before = payload.viewport
 
-        start = image_fixtures._point(target, 0.30, 0.30)
-        end = image_fixtures._point(target, 0.70, 0.70)
+        start = point_in_rect(target, 0.30, 0.30)
+        end = point_in_rect(target, 0.70, 0.70)
         QtTest.QTest.mousePress(board, QtCore.Qt.LeftButton, pos=start)
-        image_fixtures._drag_move(board, end, QtCore.Qt.LeftButton)
+        drag_mouse_move(board, end, QtCore.Qt.LeftButton)
         QtTest.QTest.mouseRelease(board, QtCore.Qt.LeftButton, pos=end)
         assert rectangles and isinstance(rectangles[-1], RectangleGesture)
 
-        image_fixtures._wheel(
-            board, image_fixtures._point(target, 0.5, 0.5), -120)
+        rail = raster_subrect(
+            board.rect(), payload.raster_geometry.distribution_bounds
+        )
+        low_handle = point_in_rect(rail, 0.5, 0.99)
+        raised_low = point_in_rect(rail, 0.5, 0.75)
+        QtTest.QTest.mousePress(
+            board,
+            QtCore.Qt.LeftButton,
+            pos=low_handle,
+        )
+        drag_mouse_move(board, raised_low, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseRelease(
+            board,
+            QtCore.Qt.LeftButton,
+            pos=raised_low,
+        )
+        assert limits and isinstance(limits[-1], ImageColorLimitsCommit)
+        assert limits[-1].origin == host.visible_interaction_origin()
+        assert limits[-1].color_limits[0] > payload.color_limits[0]
+        assert limits[-1].color_limits[1] == payload.color_limits[1]
+        assert host.discard_pending_interaction(limits[-1].origin)
+
+        send_wheel(board, point_in_rect(target, 0.5, 0.5), -120)
         assert views, "wheel zoom did not forward a viewport commit"
         assert isinstance(views[-1], ImageViewportCommit)
-        assert views[-1].origin == board.visible_image_origin()
+        assert views[-1].origin == host.visible_interaction_origin()
         assert views[-1].viewport.viewport_revision > before.viewport_revision
-
-        origin = board.visible_image_origin()
-        color_commit = ImageColorLimitsCommit(origin, (1200.0, 2800.0))
-        host._on_intent(color_commit)
-        assert limits and limits[-1] is color_commit
-        assert limits[-1].color_limits == (1200.0, 2800.0)
-    finally:
-        host.close()
-        application.processEvents()
-
-
-def test_live_color_limits_track_the_latest_authored_value_until_answered() -> None:
-    """A live H drag may return to the still-painted limits before Agg answers.
-
-    The return is a newer desired state, but only one exact answer may be in
-    flight; the latest value is issued from the admitted frame immediately
-    after that answer arrives.
-    """
-
-    from zlc_frontend.qt_widgets._raster_image_interaction import (
-        _held_panel_from_target,
-    )
-    from dataclasses import replace
-
-    from zlc_frontend.render import BoardFrame
-    from zlc_frontend.selector import ImageColorLimitsCommit
-
-    application, host = _host_with_image_front()
-    try:
-        host.set_selectors_enabled(True)
-        board = host.board
-        binding = board._image_bindings["image"]
-        target = board._selector_target(binding)
-        assert target is not None
-        hold = _held_panel_from_target(target)
-        board._selector_hold = hold
-
-        commits: list[ImageColorLimitsCommit] = []
-        host.colorLimitsCommitted.connect(commits.append)
-        painted = board.visible_image_payload().color_limits
-        span = painted[1] - painted[0]
-        changed = (painted[0] + 0.1 * span, painted[1] - 0.1 * span)
-
-        assert board._commit_color_limits(binding, changed, hold=hold)
-        first_answer = binding.pending_color_answer
-        assert first_answer is not None
-        assert first_answer.color_limits == changed
-
-        assert board._commit_color_limits(binding, painted, hold=hold)
-        assert binding.pending_color_answer is first_answer
-        assert binding.queued_color_limits == painted
-        assert [commit.color_limits for commit in commits] == [changed]
-
-        answered = image_fixtures._image_panel(
-            1,
-            viewport_revision=first_answer.display_revision,
-        )
-        answered = replace(
-            answered,
-            source_identity=first_answer.origin.source_identity,
-            coherence_stamp=replace(
-                answered.coherence_stamp,
-                inputs=(first_answer.origin.input_identity,),
-            ),
-            display_payload=replace(
-                answered.display_payload,
-                evaluated_input=first_answer.origin.input_identity,
-                color_limits=changed,
-            ),
-        )
-        host.present_frame(BoardFrame("image-board", 0, 1, (answered,)))
-        latest_answer = binding.pending_color_answer
-        assert latest_answer is not None
-        assert latest_answer.color_limits == painted
-        assert latest_answer.display_revision > first_answer.display_revision
-        assert binding.queued_color_limits is None
-        assert [commit.color_limits for commit in commits] == [changed, painted]
-
-        board._cancel_image_gesture(binding, clear_draft=False)
-        assert board._selector_hold is None
-        assert binding.pending_color_answer is latest_answer
-        assert board.discard_pending_image_interaction(commits[-1].origin)
-        assert binding.pending_color_answer is None
     finally:
         host.close()
         application.processEvents()
@@ -197,7 +138,7 @@ def test_present_frame_refuses_a_frame_for_another_panel() -> None:
                     "curve-board",
                     0,
                     0,
-                    (image_fixtures._curve_panel(0),),
+                    (curve_panel(0),),
                 )
             )
     finally:

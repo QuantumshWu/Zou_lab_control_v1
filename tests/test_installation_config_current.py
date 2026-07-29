@@ -14,11 +14,11 @@ from zlc_neutral_atom.installation_config import (
 )
 from zlc_neutral_atom.devices.sequencer.config import RemotePulseInstallationConfig
 from zlc_neutral_atom.devices.simulation.config import VirtualInstallationConfig
+from zlc_frontend.form import project_authoring_form
 from zlc_workbench.device_manager.editor_session import (
     DeviceConfigEditorSession,
     form_spec,
 )
-from zlc_workbench.form_projection import project_authoring_form
 
 
 def _virtual(seed=7):

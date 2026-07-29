@@ -36,14 +36,12 @@ from zlc_frontend.qt_widgets import (
     scaled_px,
     signals_blocked as _signals_blocked,
 )
-from zlc_frontend.form import choice_value_from_tree
-from zlc_frontend.panel_params import panel_param_decls as _panel_param_decls
-from zlc_frontend import RELIM_PARAM as _RELIM_PARAM
+from zlc_frontend.plot_kind import PlotKind
+from zlc_frontend.figure.model import ViewIntent
+from zlc_frontend.panel_params import panel_display_value_range_keys
 from zlc_frontend.render_style import panel_display_size
 from zlc_storage.paths import display_path, user_output_path
 
-
-FORM_WIDGET_HANDLERS = _qt_widgets.FORM_WIDGET_HANDLERS
 
 #: Containers the Save row offers.  A container is a DATA-layer choice (which file
 #: the same picture lands in), never an art knob: geometry, dpi and typography are
@@ -109,15 +107,10 @@ class PanelEditor(QtWidgets.QWidget):
         card.selectors_enabled_changed.connect(
             self._sync_snapshot_selectors
         )
-        card.fit_presentation_changed.connect(
-            self._request_snapshot_render
-        )
         # A plot panel's Edit never carries a measurement form or Start/Stop: a plot is a
         # pure VIEW, and the node that produces its data lives on the Logic tab.
         self.meas_panel = None
         self._node = None                       # the node that produces this panel's data
-        self.xmin = self.xmax = self.ymin = self.ymax = None
-        self.clo = self.chi = None
         self._fit_pane = None
 
         outer = QtWidgets.QVBoxLayout(self)
@@ -169,54 +162,20 @@ class PanelEditor(QtWidgets.QWidget):
         # ---- Display: the same view knobs the Setting popup renders, through the card's
         # SHARED row emitter and writing the SAME config.params through the card's one
         # writer -- the two surfaces are views of one state and cannot drift.
-        self.ed_cmap = self.ed_relim = self.ed_unit_label = self.ed_fixed_row = None
-        self.ed_fixed_lo = self.ed_fixed_hi = None
-        self.ed_params = {}
+        self.ed_unit_label = None
         section("Display")
-        display_specs = list(_panel_param_decls(card.config.kind)) + [_RELIM_PARAM]
-        self.ed_params = card._emit_param_rows(
-            display_specs,
-            col.addWidget,
+        self.display_form_surface = card._make_display_form_surface(
             self._edit_param,
             label_w,
             parent=page,
         )
-        card._mount_grid_row_inventory(
-            self,
-            col.addWidget,
-            view_apply=self._edit_grid_facet,
-            param_apply=self._edit_param,
-            label_w=label_w,
-            form_widgets=self.ed_params,
-            parent=page,
-        )
+        col.addWidget(self.display_form_surface)
         self.view_spec_editor = ViewSpecEditor(
             label_width=label_w,
             parent=page,
         )
         self.view_spec_editor.viewChanged.connect(self._edit_view_spec)
         col.addWidget(self.view_spec_editor)
-        self.repeat_mode_row, self.repeat_mode_combo = card._make_repeat_mode_row(
-            self._edit_repeat_mode,
-            label_w,
-            parent=page,
-        )
-        col.addWidget(self.repeat_mode_row)
-        self.ed_cmap = self.ed_params.get("colormap")
-        self.ed_relim = self.ed_params.get("relim")
-        # An image's VALUE axis is its colour limit, pinned by the "colour range" row in
-        # Limits; a second fixed lo/hi here would put two inputs on one source.
-        if card.config.kind not in ("2d", "sites"):
-            self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = card._make_fixed_lim_row(
-                self._edit_fixed_lim,
-                label_w,
-                parent=page,
-            )
-            col.addWidget(self.ed_fixed_row)
-            # The row stays PERMANENTLY in the layout; only its inputs enable in fixed
-            # mode.  A visibility toggle above the snapshot reflowed everything below it
-            # by the row's height on every relim change -- the reported Edit-tab jump.
-            self._sync_fixed_lim_enabled(card._relim())
         unit_row, self.ed_unit_label = card._make_unit_readout_row(
             label_w,
             parent=page,
@@ -242,47 +201,10 @@ class PanelEditor(QtWidgets.QWidget):
                 page,
                 label_width=label_w,
                 context_provider=self._fit_context,
+                host_provider=lambda: self._board,
+                surface_id=self.render_surface_id,
             )
             col.addWidget(self._fit_pane)
-
-        # ---- Limits: the view-window pins.  A box holds the STORED pin (empty =
-        # autoscale) and is re-seeded only on build / show / Clear, so the refresh tick
-        # can never clobber typing; the live window shows as the grey placeholder.
-        section("Limits")
-        self.xmin = FluentLineEdit("")
-        self.xmax = FluentLineEdit("")
-        if card.config.kind in ("2d", "sites"):
-            # An image's x AND y are pixel coordinates: pinning both is what makes a crop
-            # real.  A curve's y is owned by the relim family instead, so it gets no row.
-            self.ymin = FluentLineEdit("")
-            self.ymax = FluentLineEdit("")
-            self.clo = FluentLineEdit("")
-            self.chi = FluentLineEdit("")
-        boxes = (self.xmin, self.xmax) + ((self.ymin, self.ymax) if self.ymin is not None else ())
-        for widget in boxes:
-            widget.setFixedWidth(scaled_px(88, minimum=68))
-            widget.returnPressed.connect(self.apply_limits)
-        apply_button = FluentButton("Apply lim", color=ACCENT)
-        apply_button.clicked.connect(self.apply_limits)
-        clear_button = FluentButton("Clear", color=GREY)
-        clear_button.clicked.connect(self.clear_limits)
-        lim_row = inline(self.xmin, self.xmax, trailing=apply_button)
-        lim_row.layout().addWidget(clear_button, 0)
-        col.addWidget(FluentSettingRow("x range", lim_row, label_width=label_w))
-        if self.ymin is not None:
-            col.addWidget(FluentSettingRow("y range", inline(self.ymin, self.ymax),
-                                           label_width=label_w))
-        if self.clo is not None:
-            for widget in (self.clo, self.chi):
-                widget.setFixedWidth(scaled_px(88, minimum=68))
-                widget.returnPressed.connect(self.apply_clim)
-            clim_apply = FluentButton("Apply", color=ACCENT)
-            clim_apply.clicked.connect(self.apply_clim)
-            clim_auto = FluentButton("Auto", color=GREY)
-            clim_auto.clicked.connect(self.clear_clim)
-            clim_row = inline(self.clo, self.chi, trailing=clim_apply)
-            clim_row.layout().addWidget(clim_auto, 0)
-            col.addWidget(FluentSettingRow("colour range", clim_row, label_width=label_w))
 
         # ---- Save: the figure this panel is showing.  Only the picture is written here:
         # the DATA behind it is already owned by the run's repository, and a second copy
@@ -369,7 +291,7 @@ class PanelEditor(QtWidgets.QWidget):
             publication = card.frozen_render_publication()
             contract = card.frozen_plot_panel_contract()
             size_name = contract.size_name
-            if card.config.kind == "sites":
+            if card.config.kind is PlotKind.SITE_MAP:
                 figure = None
                 display = card.frozen_display_state()
             else:
@@ -527,7 +449,7 @@ class PanelEditor(QtWidgets.QWidget):
             )
             self.status.setText(str(error))
             return True
-        if request.contract.faceted:
+        if request.contract.figure.faceted:
             from zlc_frontend.panel_render import FacetedPanelResult
 
             if not isinstance(faceted_result, FacetedPanelResult):
@@ -537,7 +459,7 @@ class PanelEditor(QtWidgets.QWidget):
                 self.status.setText("faceted render lost its exact DataFigure")
                 return False
         elif frame is None or (
-            self.card.config.kind != "sites" and figure is None
+            self.card.config.kind is not PlotKind.SITE_MAP and figure is None
         ):
             self.status.setText("render worker returned no complete front")
             return False
@@ -572,7 +494,7 @@ class PanelEditor(QtWidgets.QWidget):
         selector_figure = None
         if faceted is not None:
             if faceted.focus is not None:
-                intent = request.contract.intent
+                intent = request.contract.figure.view_intent
                 if figure is None or intent is None:
                     raise RuntimeError(
                         "focused Edit front lost its typed Figure context"
@@ -629,7 +551,7 @@ class PanelEditor(QtWidgets.QWidget):
     def _ensure_snapshot_surface(self):
         """Construct the one host type this panel needs, at most once."""
 
-        wanted_faceted = self.card.config.kind == "grid"
+        wanted_faceted = self.card.config.kind is PlotKind.GRID
         board = self._board
         if isinstance(board, FigureSurfaceHost) and board.faceted == wanted_faceted:
             return board
@@ -716,12 +638,6 @@ class PanelEditor(QtWidgets.QWidget):
         self._snapshot_publication = None
         if self.card is not None:
             try:
-                self.card.fit_presentation_changed.disconnect(
-                    self._request_snapshot_render
-                )
-            except (TypeError, RuntimeError):
-                pass
-            try:
                 self.card.selectors_enabled_changed.disconnect(
                     self._sync_snapshot_selectors
                 )
@@ -733,73 +649,17 @@ class PanelEditor(QtWidgets.QWidget):
         changed = False
         if self.card is not None:
             changed = self.card._set_param(key, value)
-        if key == "relim" and getattr(self, "ed_fixed_row", None) is not None:
-            self._sync_fixed_lim_enabled(str(value))   # enable lo/hi in fixed WITHOUT moving the page
-            if str(value) == "fixed" and self.card is not None:
-                # mirror the freeze-current-view seed _set_param just wrote (config.params is the
-                # one source) into THIS tab's lo/hi inputs -- setText does not re-fire editingFinished
-                for edit, pkey in ((self.ed_fixed_lo, "fixed_lo"), (self.ed_fixed_hi, "fixed_hi")):
-                    if edit is not None and pkey in self.card.config.params:
-                        with _signals_blocked(edit):
-                            edit.setValue(float(self.card.config.params[pkey]))
-        if key == "relim":
-            # a 2D image has no Display fixed row (its clim lives in the Limits colour-range row):
-            # re-seed THOSE boxes here so picking relim in the chooser fills/empties them to match the
-            # pin -- runs even when ed_fixed_row is None, unlike the colour-range block above.
-            self._seed_clim_boxes()
         if changed:
+            self.card._refresh_display_form_surface(self.display_form_surface)
             self._request_snapshot_render()
-
-    def _edit_repeat_mode(self, mode) -> None:
-        if self.card is None:
-            return
-        if self.card._commit_repeat_mode(mode):
-            self.card._refresh_view_spec_control_surface(self)
-            self._request_snapshot_render()
-
-    def _edit_grid_facet(self, intent, axis_id) -> bool:
-        if self.card is None:
-            return False
-        changed = self.card._commit_grid_facet(intent, axis_id)
-        if changed:
-            self.card._refresh_grid_control_surface(self)
-            self.card._refresh_view_spec_control_surface(self)
-            self._request_snapshot_render()
-        return changed
 
     def _edit_view_spec(self, view) -> None:
         if self.card is None:
             return
         if self.card._commit_view_spec(view):
+            self.card._refresh_grid_control_surface(self)
             self.card._refresh_view_spec_control_surface(self)
             self._request_snapshot_render()
-
-    def _sync_fixed_lim_enabled(self, relim: str) -> None:
-        """The Edit tab's fixed lo/hi row is ALWAYS in the layout -- only its INPUTS enable when
-        ``relim == "fixed"``.  A ``setVisible`` toggle on a row that sits above the snapshot canvas in
-        the shared scroll page reflowed the unit row + the whole canvas down by the row's height on
-        every relim change (the reported Edit-tab jump); greying the inputs in place leaves every
-        widget put.  (The Setting popup keeps its reveal-and-grow-down: it is a compact floating card
-        with nothing beneath the row, so growing downward moves nothing.)"""
-        if self.ed_fixed_row is not None:
-            # ALWAYS shown here (the shared _make_fixed_lim_row hides it by default for the Setting
-            # popup's reveal-on-fixed) -- so the footprint is constant and the canvas never moves.
-            self.ed_fixed_row.setVisible(True)
-        fixed = str(relim) == "fixed"
-        for w in (self.ed_fixed_lo, self.ed_fixed_hi):
-            if w is not None:
-                w.setEnabled(fixed)
-
-    def _edit_fixed_lim(self) -> None:
-        """Commit the Edit tab's fixed lo/hi to the live card through its one
-        ``apply_fixed_lims`` path (config.params + local display commit), then let the next accepted
-        front update this tab.  It never re-reads acquisition merely because a limit changed."""
-        if self.card is None:
-            return
-        lo = float(self.ed_fixed_lo.value())
-        hi = float(self.ed_fixed_hi.value())
-        self.card.apply_fixed_lims(lo, hi)
-        self._request_snapshot_render()
 
     def _refresh_unit_readout(self) -> None:
         if self.ed_unit_label is None:
@@ -834,53 +694,14 @@ class PanelEditor(QtWidgets.QWidget):
             if self._fit_pane is not None:
                 card.refresh_fit_authoring_pane(self._fit_pane)
             card._refresh_grid_control_surface(self)
-            card._seed_repeat_mode_control(
-                self.repeat_mode_combo,
-                self.repeat_mode_row,
-            )
             card._refresh_view_spec_control_surface(self)
-        self._seed_limit_boxes()        # re-seed the pin from config.params (may have changed in Setting)
         self.refresh_limit_hints()
 
     def _refresh_display_params(self) -> None:
-        """Re-seed the Edit tab's display-knob controls (``ed_params``) from the live card's
-        ``config.params`` -- the SINGLE source of truth -- so switching back to this tab shows the
-        CURRENT values even when they were changed in the Setting popup (which writes the same
-        config.params).  Each control is re-seeded through its frontend form handler (the card
-        records the kinds while building both surfaces' rows), signals blocked so re-seeding does not
-        re-fire ``_edit_param``.  Like ``PanelCard.refresh_on_show``, both surfaces are a
-        VIEW of config.params, refreshed on show, never private copies that drift."""
+        """Re-seed Edit from the card's sole frontend-authored display state."""
         if self.card is None:
             return
-        fields = getattr(self.card, "_param_fields", {})
-        params = self.card.config.params
-        for key, widget in self.ed_params.items():
-            field = fields.get(key)
-            if field is None or key not in params:
-                continue
-            with _signals_blocked(widget):
-                FORM_WIDGET_HANDLERS[field.kind].write(
-                    field,
-                    widget,
-                    (
-                        choice_value_from_tree(field, params[key])
-                        if field.kind == "choice"
-                        else params[key]
-                    ),
-                )
-
-    def _limit_axes(self):
-        """The view-window rows this editor built, as ``(param key, lo box, hi box)``.
-
-        One list drives seeding, applying and clearing, so a kind that has no y
-        row simply contributes no y triple instead of every reader repeating the
-        same "does this kind have y?" test.
-        """
-
-        rows = [("view_xlim", self.xmin, self.xmax)]
-        if self.ymin is not None:
-            rows.append(("view_ylim", self.ymin, self.ymax))
-        return tuple(rows)
+        self.card._reconcile_display_form_surface(self.display_form_surface)
 
     def _visible_snapshot_pixels(self):
         """Return the immutable front or overview artifact actually on screen."""
@@ -915,161 +736,45 @@ class PanelEditor(QtWidgets.QWidget):
         left, top, right, bottom = (float(value) for value in bounds)
         return (left * x_size, right * x_size, top * y_size, bottom * y_size)
 
-    def _seed_limit_boxes(self) -> None:
-        """Put the STORED x-window pin (``view_xlim`` in ``config.params``) into the boxes.  The boxes
-        EDIT THE PIN, never the live autoscaled range, so their text never wanders on its own: empty
-        boxes mean 'no pin' (autoscale), a value means 'pinned there'.  Called on build / tab-show /
-        after Clear -- NEVER on the refresh tick.  The live range is shown separately as a
-        non-destructive grey hint (:meth:`refresh_limit_hints`)."""
-        if self.xmin is None:
-            return                          # no Limits controls on this editor instance
-        for key, lo_box, hi_box in self._limit_axes():
-            pin = self.card.config.params.get(key) if self.card is not None else None
-            lo = hi = ""
-            if pin is not None:
-                try:
-                    lo, hi = f"{float(pin[0]):.6g}", f"{float(pin[1]):.6g}"
-                except (TypeError, ValueError, IndexError):
-                    lo = hi = ""
-            with _signals_blocked(lo_box, hi_box):
-                lo_box.setText(lo); hi_box.setText(hi)
-        self._seed_clim_boxes()          # keep the 2D colour-range boxes in step with the clim pin
-
     def refresh_limit_hints(self) -> None:
-        """Refresh ONLY the grey PLACEHOLDER of the x-range boxes to the panel's current x-window -- a
-        non-destructive live reference.  Qt shows a placeholder ONLY while the box is empty, so this can
-        never overwrite a pinned value or the operator's in-progress typing.  The
-        tick updates only this hint, so the boxes stay a live view of the x-window
-        while remaining freely editable."""
-        if self.xmin is None:
-            return                          # no Limits controls on this editor instance
-        # Colour-range live hint: show the current clim as the grey placeholder so an empty
-        # box (= Auto) still tells the operator what range the image is using -- the clim counterpart of
-        # the x-window hint below.  Non-destructive: Qt draws a placeholder only while the box is empty,
-        # so a pinned/typed value is never overwritten.
-        if getattr(self, "clo", None) is not None and self.card is not None:
-            shown = self.card._shown_limits()      # None until something has been composed
-            if shown is not None:
-                self.clo.setPlaceholderText(f"{shown[0]:.6g}")
-                self.chi.setPlaceholderText(f"{shown[1]:.6g}")
+        """Project accepted runtime ranges into canonical form placeholders."""
+
+        widgets = getattr(
+            getattr(self, "display_form_surface", None),
+            "_zlc_display_widgets",
+            {},
+        )
+        if not widgets:
+            return
+        shown = None if self.card is None else self.card._shown_limits()
+        contract = None if self.card is None else self.card._display_contract_for_authoring()
+        if shown is not None and contract is not None:
+            keys = panel_display_value_range_keys(
+                self.card._display_state(contract)
+            )
+            if keys is not None:
+                for key, value in zip(keys, shown, strict=True):
+                    widget = widgets.get(key)
+                    if isinstance(widget, QtWidgets.QLineEdit) and not widget.text():
+                        widget.setPlaceholderText(f"{float(value):.6g}")
         bounds = self._front_view_bounds()
         if bounds is None:
             return
         xlo, xhi, ylo, yhi = bounds
-        self.xmin.setPlaceholderText(f"{xlo:.6g}"); self.xmax.setPlaceholderText(f"{xhi:.6g}")
-        if self.ymin is not None:           # y hint only where y is a view axis (an image family)
-            self.ymin.setPlaceholderText(f"{ylo:.6g}"); self.ymax.setPlaceholderText(f"{yhi:.6g}")
+        for key, value in (("x_min", xlo), ("x_max", xhi)):
+            widget = widgets.get(key)
+            if isinstance(widget, QtWidgets.QLineEdit) and not widget.text():
+                widget.setPlaceholderText(f"{value:.6g}")
+        for key, value in (("y_min", ylo), ("y_max", yhi)):
+            widget = widgets.get(key)
+            if (
+                isinstance(widget, QtWidgets.QLineEdit)
+                and not widget.text()
+                and contract is not None
+                and contract.figure.view_intent is ViewIntent.IMAGE
+            ):
+                widget.setPlaceholderText(f"{value:.6g}")
 
-
-    def apply_limits(self) -> None:
-        """Apply the typed view-window pins -- PER AXIS: a filled pair pins that axis, an empty pair
-        releases it (so 'clear the y boxes + Apply' un-pins y while keeping x).  Each pin is an ORDINARY
-        display knob (``view_xlim``/``view_ylim``) applied through the SAME ``_edit_param`` entry as
-        bins / relim -> the live card + accepted front + ``config.params`` + save."""
-        if self.xmin is None:
-            return
-        applied, cleared, updates = [], [], {}
-        for key, lo_box, hi_box in self._limit_axes():
-            lo_text, hi_text = lo_box.text().strip(), hi_box.text().strip()
-            if not lo_text and not hi_text:
-                updates[key] = None                  # empty pair = release THIS axis's pin
-                cleared.append(key[5])               # 'x' / 'y'
-                continue
-            try:
-                lo, hi = float(lo_text), float(hi_text)
-            except ValueError as exc:
-                self.status.setText(f"bad limits: {exc}")
-                return
-            updates[key] = (lo, hi)
-            applied.append(key[5])
-        if self.card is not None:
-            if self.card._set_params(updates):
-                self._request_snapshot_render()
-        parts = ([f"{'/'.join(applied)} range applied"] if applied else []) + \
-                ([f"{'/'.join(cleared)} range cleared"] if cleared else [])
-        self.status.setText("; ".join(parts) + " (all subplots)")
-
-    def clear_limits(self) -> None:
-        """Release EVERY view-window pin -> autoscale.  ``None`` is the SAME stored display knob
-        ``apply_limits`` writes, routed through the ONE ``_edit_param`` entry: BaseLivePlot.apply_param /
-        GridCell.consume_param already read ``None`` as 'no pin', so the live card, the snapshot, and the
-        save all drop the pin.  EMPTIES the boxes (empty = no pin) so the grey placeholder hint takes
-        over showing the now-auto range -- the Limits counterpart of :meth:`clear_fit`."""
-        if self.xmin is None:
-            return
-        updates = {}
-        for key, lo_box, hi_box in self._limit_axes():
-            updates[key] = None
-            with _signals_blocked(lo_box, hi_box):
-                lo_box.setText(""); hi_box.setText("")
-        if self.card is not None:
-            if self.card._set_params(updates):
-                self._request_snapshot_render()
-        self.refresh_limit_hints()
-        self.status.setText("view range cleared (auto)")
-
-    def _sync_relim_combo(self, value: str) -> None:
-        """Reflect a PROGRAMMATIC relim change (the colour-range Apply/Auto) in the Display relim combo
-        WITHOUT re-firing its handler, so the chooser and the colour-range row always agree on whether
-        the clim is pinned.  No-op when the combo is absent (a non-image Edit that has no relim row)."""
-        combo = self.ed_params.get("relim") if getattr(self, "ed_params", None) else None
-        if combo is None:
-            return
-        idx = combo.findText(value)
-        if idx >= 0:
-            with _signals_blocked(combo):
-                combo.setCurrentIndex(idx)
-
-    def apply_clim(self) -> None:
-        """Pin a 2D panel's colour limit to the typed lo/hi.  Routes through the ONE clim source the
-        relim family owns (relim="fixed" + the card's ``apply_fixed_lims``), so the live card (every cell,
-        re-asserted each tick), this tab's snapshot, ``config.params`` and Save all move together -- there
-        is no second hand-copied clim path.  Both boxes empty = Auto (release the pin)."""
-        if self.clo is None:
-            return
-        if not self.clo.text().strip() and not self.chi.text().strip():
-            self.clear_clim()
-            return
-        try:
-            lo, hi = float(self.clo.text()), float(self.chi.text())
-        except ValueError as exc:
-            self.status.setText(f"bad colour range: {exc}")
-            return
-        if self.card is not None:
-            self.card.apply_fixed_lims(lo, hi)
-            self._request_snapshot_render()
-        self._sync_relim_combo("fixed")
-        self._seed_clim_boxes()
-        self.status.setText("colour range applied")
-
-    def clear_clim(self) -> None:
-        """Release the colour-limit pin back to the autoscaled clim (relim="normal") -- the image
-        counterpart of :meth:`clear_limits`.  Empties the boxes so the grey placeholder hint takes over
-        showing the now-auto clim."""
-        if self.clo is None:
-            return
-        self._edit_param("relim", "normal")
-        with _signals_blocked(self.clo, self.chi):
-            self.clo.setText(""); self.chi.setText("")
-        self._sync_relim_combo("normal")
-        self.refresh_limit_hints()
-        self.status.setText("colour range cleared (auto)")
-
-    def _seed_clim_boxes(self) -> None:
-        """Put the STORED clim pin (``fixed_lo/hi``, in force only while relim=="fixed") into the
-        colour-range boxes.  Like :meth:`_seed_limit_boxes` for x: the boxes edit the PIN, so empty = Auto
-        and a value = pinned; re-seeded on build / tab-show / relim change, NEVER on the tick."""
-        if getattr(self, "clo", None) is None:
-            return
-        p = self.card.config.params if self.card is not None else {}
-        lo = hi = ""
-        if str(p.get("relim")) == "fixed":
-            lo, hi = (
-                f"{float(p.get('fixed_lo')):.6g}",
-                f"{float(p.get('fixed_hi')):.6g}",
-            )
-        with _signals_blocked(self.clo, self.chi):
-            self.clo.setText(lo); self.chi.setText(hi)
 
     def _save_stem(self, timestamp: str | None) -> Path:
         """The output file stem (no extension) the Save section resolves to.
@@ -1079,8 +784,10 @@ class PanelEditor(QtWidgets.QWidget):
         yields the literal ``<time>`` placeholder for the read-only preview.  With auto-name
         OFF the base is used VERBATIM (its extension stripped), so the operator sets the exact
         name.  ONE resolver, shared by :meth:`save` and :meth:`_update_save_preview`."""
-        title = (self.card.config.title or self.card.config.kind).strip() or "panel"
-        kind = self.card.config.kind
+        title = (
+            self.card.config.title or self.card.config.kind.value
+        ).strip() or "panel"
+        kind = self.card.config.kind.value
         text = self.save_dir_edit.text().strip() if hasattr(self, "save_dir_edit") else ""
         base = Path(text) if text else Path(
             self.console._last_save_dir
@@ -1109,7 +816,9 @@ class PanelEditor(QtWidgets.QWidget):
         """Show the actual file (full path) the next Save writes -- not just the folder."""
         if not hasattr(self, "save_preview"):
             return
-        archive_suffix = "" if self.card.config.kind == "sites" else " + .npz"
+        archive_suffix = (
+            "" if self.card.config.kind is PlotKind.SITE_MAP else " + .npz"
+        )
         self.save_preview.setText(
             f"{display_path(str(self._save_stem(None)))}."
             f"{self._save_image_ext()}{archive_suffix}")
@@ -1134,7 +843,7 @@ class PanelEditor(QtWidgets.QWidget):
             )
             if image is None or not image.save(str(target)):
                 raise RuntimeError("Qt refused to write %s" % target.name)
-            if self.card.config.kind == "sites":
+            if self.card.config.kind is PlotKind.SITE_MAP:
                 self.console._last_save_dir = str(stem.parent)
                 self._update_save_preview()
                 self.status.setText("saved %s" % target.name)
@@ -1145,18 +854,14 @@ class PanelEditor(QtWidgets.QWidget):
             contract = self._snapshot_contract
             if figure is None or display is None or contract is None:
                 raise RuntimeError("the editor has no exact typed figure to save")
-            from zlc_frontend import FigurePresentationContract
             from zlc_workbench.data_figure.archive_repository import save_figure_archive
-
-            presentation = FigurePresentationContract.from_plot_panel(
-                contract,
-                display,
-            )
 
             save_figure_archive(
                 figure,
                 stem.with_suffix(".npz"),
-                presentation=presentation,
+                figure_intent=contract.figure,
+                size_name=contract.size_name,
+                display=display,
             )
             self.console._last_save_dir = str(stem.parent)
             self._update_save_preview()

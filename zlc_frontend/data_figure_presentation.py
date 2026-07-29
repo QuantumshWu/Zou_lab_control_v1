@@ -11,8 +11,8 @@ from zlc_data import (
     AxisSourceRef,
     FitBatchStatus,
     FitResultBatch,
-    dataset_revision_ref_to_tree,
 )
+from zlc_data.codec import dataset_revision_ref_to_tree
 from .data_figure import DataFigure, FigurePanelRegion
 from .meter_display import MeterDisplayState
 from .render import (
@@ -24,17 +24,12 @@ from .render import (
 )
 from .curve_display import (
     CurveDisplayState,
-    curve_display_form_spec,
-    curve_display_form_values,
-    curve_display_from_form,
     curve_home_x_limits,
-    curve_display_with_x_view,
     numeric_curve_coordinates,
 )
 from .display_range import RelimMode, validated_display_range
 from .encoded_raster import EncodedRasterDocument
 from .figure import (
-    AxisViewRole,
     EvaluatedCurve,
     EvaluatedHistogram,
     EvaluatedImage,
@@ -43,24 +38,16 @@ from .figure import (
 )
 from .histogram_display import (
     FacetedHistogramDisplayState,
-    HistogramCountScale,
     HistogramDisplayState,
-    histogram_display_form_spec,
-    histogram_display_form_values,
-    histogram_display_from_form,
-    histogram_display_with_x_view,
 )
 from .fit_projection import canonical_panel_focus_address
 from .image_display import (
     ImageDisplayState,
-    image_display_form_spec,
-    image_display_form_values,
-    image_display_from_form,
 )
 from .image_view import image_viewport_for_evaluated_image
 from .panel_size import DEFAULT_PANEL_SIZE
+from .panel_params import panel_display_state_intent
 from .plot_layout import optimal_grid_size_for_view
-from .plot_panel import PlotPanelContract
 from zlc_storage import canonical_digest
 
 DATA_FIGURE_PANEL_ID = "generic-typed"
@@ -331,7 +318,10 @@ class DataFigureGridOverview:
         if len(set(addresses)) != len(addresses):
             raise ValueError("typed grid addresses must identify unique panels")
         display = self.display_state
-        if display is not None and grid_display_state_intent(display) is not self.intent:
+        if (
+            display is not None
+            and panel_display_state_intent(display) is not self.intent
+        ):
             raise ValueError("typed grid display state does not match its intent")
         object.__setattr__(self, "regions", regions)
         home = self.histogram_home_x_limits
@@ -379,7 +369,7 @@ class DataFigureGridFocusRequest:
             "expected_address",
             canonical_panel_focus_address(self.expected_address),
         )
-        if display_state_intent(self.display) not in (
+        if panel_display_state_intent(self.display) not in (
             ViewIntent.IMAGE,
             ViewIntent.CURVE,
             ViewIntent.METER,
@@ -400,22 +390,6 @@ class DataFigureGridFocusRequest:
         elif home is not None:
             raise ValueError("METER focus cannot carry a histogram home x range")
 
-def display_state_intent(state: DataFigureDisplayState) -> ViewIntent:
-    if isinstance(state, ImageDisplayState):
-        return ViewIntent.IMAGE
-    if isinstance(state, CurveDisplayState):
-        return ViewIntent.CURVE
-    if isinstance(state, HistogramDisplayState):
-        return ViewIntent.HISTOGRAM
-    if isinstance(state, MeterDisplayState):
-        return ViewIntent.METER
-    raise TypeError("typed display state must be IMAGE, CURVE, HISTOGRAM, or METER")
-
-def grid_display_state_intent(state: DataFigureGridDisplayState) -> ViewIntent:
-    if isinstance(state, FacetedHistogramDisplayState):
-        return ViewIntent.HISTOGRAM
-    return display_state_intent(state)
-
 def default_data_figure_display_state(intent: ViewIntent) -> DataFigureDisplayState:
     if intent is ViewIntent.IMAGE:
         return ImageDisplayState()
@@ -427,68 +401,6 @@ def default_data_figure_display_state(intent: ViewIntent) -> DataFigureDisplaySt
         return MeterDisplayState(0, None)
     raise ValueError("typed intent must be IMAGE, CURVE, HISTOGRAM, or METER")
 
-def data_figure_display_form_spec(state: DataFigureDisplayState):
-    if isinstance(state, ImageDisplayState):
-        return image_display_form_spec()
-    if isinstance(state, CurveDisplayState):
-        return curve_display_form_spec()
-    if isinstance(state, HistogramDisplayState):
-        return histogram_display_form_spec()
-    if isinstance(state, MeterDisplayState):
-        raise ValueError("METER has no authored display form")
-    raise TypeError("unknown typed display state")
-
-def data_figure_display_form_values(
-    state: DataFigureDisplayState,
-) -> dict[str, object]:
-    if isinstance(state, ImageDisplayState):
-        return image_display_form_values(state)
-    if isinstance(state, CurveDisplayState):
-        return curve_display_form_values(state)
-    if isinstance(state, HistogramDisplayState):
-        return histogram_display_form_values(state)
-    if isinstance(state, MeterDisplayState):
-        raise ValueError("METER has no authored display form")
-    raise TypeError("unknown typed display state")
-
-def data_figure_display_state_from_form(
-    state: DataFigureDisplayState,
-    values: dict[str, object],
-    *,
-    current_value_limits: tuple[float, float] | None,
-) -> DataFigureDisplayState:
-    if isinstance(state, ImageDisplayState):
-        return image_display_from_form(
-            state,
-            values,
-            current_color_limits=current_value_limits,
-        )
-    if isinstance(state, CurveDisplayState):
-        return curve_display_from_form(
-            state,
-            values,
-            current_y_limits=current_value_limits,
-        )
-    if isinstance(state, HistogramDisplayState):
-        return histogram_display_from_form(
-            state,
-            values,
-            current_count_limits=current_value_limits,
-        )
-    if isinstance(state, MeterDisplayState):
-        raise ValueError("METER has no authored display form")
-    raise TypeError("unknown typed display state")
-
-def data_figure_display_state_with_x_view(
-    state: DataFigureDisplayState,
-    x_view: tuple[float, float] | None,
-) -> DataFigureDisplayState:
-    if isinstance(state, CurveDisplayState):
-        return curve_display_with_x_view(state, x_view)
-    if isinstance(state, HistogramDisplayState):
-        return histogram_display_with_x_view(state, x_view)
-    raise TypeError("x-view commits require CURVE or HISTOGRAM state")
-
 def data_figure_payload_intent(payload: DataFigurePanelPayload) -> ViewIntent:
     if isinstance(payload, ImagePanelPayload):
         return ViewIntent.IMAGE
@@ -499,135 +411,6 @@ def data_figure_payload_intent(payload: DataFigurePanelPayload) -> ViewIntent:
     if isinstance(payload, MeterPanelPayload):
         return ViewIntent.METER
     raise TypeError("unknown typed payload")
-
-@dataclass(frozen=True, slots=True)
-class DataFigureFront:
-    intent: ViewIntent
-    figure: DataFigure
-    state: DataFigureDisplayState
-    summary: str
-    frame: BoardFrame
-    data_contract: tuple[tuple[object, ...], tuple[object, ...]]
-    fit_sources: tuple[AxisSourceRef, ...]
-    axis_roles: tuple[tuple[AxisSourceRef, AxisViewRole], ...]
-    fit_result_identity: str | None
-    transient_fit_result_owner: FitResultBatch | None
-    release_initial_canonical_on_commit: bool
-    raster_size: tuple[int, int]
-    surface_contract: PlotPanelContract
-
-    def __post_init__(self) -> None:
-        if self.intent not in (
-            ViewIntent.IMAGE,
-            ViewIntent.CURVE,
-            ViewIntent.HISTOGRAM,
-            ViewIntent.METER,
-        ):
-            raise ValueError("typed figure front has another intent")
-        if not isinstance(self.figure, DataFigure):
-            raise TypeError("typed figure front requires one exact DataFigure")
-        figure_intent, unavailable_reason = classify_single_data_figure(self.figure)
-        if figure_intent is not self.intent:
-            raise ValueError(
-                "typed figure front DataFigure does not match its intent"
-                + (
-                    ""
-                    if unavailable_reason is None
-                    else f": {unavailable_reason}"
-                )
-            )
-        if self.figure.has_fit_overlays != (self.fit_result_identity is not None):
-            raise ValueError(
-                "typed figure front Fit overlay and result identity disagree"
-            )
-        if display_state_intent(self.state) is not self.intent:
-            raise ValueError("typed figure front state belongs to another intent")
-        if not isinstance(self.summary, str) or not self.summary:
-            raise ValueError("typed figure summary must be non-empty")
-        if not isinstance(self.frame, BoardFrame) or len(self.frame.panels) != 1:
-            raise TypeError("typed figure front requires one BoardFrame panel")
-        if not isinstance(self.surface_contract, PlotPanelContract):
-            raise TypeError("typed figure front requires PlotPanelContract")
-        if (
-            self.surface_contract.panel_id != DATA_FIGURE_PANEL_ID
-            or self.surface_contract.intent is not self.intent
-            or self.surface_contract.faceted
-        ):
-            raise ValueError("typed figure front has another surface contract")
-        if (
-            not isinstance(self.data_contract, tuple)
-            or len(self.data_contract) != 2
-            or not isinstance(self.data_contract[0], tuple)
-            or not isinstance(self.data_contract[1], tuple)
-        ):
-            raise TypeError(
-                "typed figure data_contract must be identity/exact-owner tuples"
-            )
-        fit_sources = tuple(self.fit_sources)
-        if any(not isinstance(source, AxisSourceRef) for source in fit_sources):
-            raise TypeError("typed fit_sources must contain AxisSourceRef values")
-        if len(set(fit_sources)) != len(fit_sources):
-            raise ValueError("typed fit_sources must be unique")
-        roles = tuple(self.axis_roles)
-        if any(
-            not isinstance(source, AxisSourceRef)
-            or not isinstance(role, AxisViewRole)
-            for source, role in roles
-        ):
-            raise TypeError(
-                "typed axis_roles must contain AxisSourceRef/AxisViewRole pairs"
-            )
-        if len({source for source, _role in roles}) != len(roles):
-            raise ValueError("typed axis_roles repeat a source")
-        if self.fit_result_identity is not None and (
-            not isinstance(self.fit_result_identity, str)
-            or not self.fit_result_identity.strip()
-        ):
-            raise ValueError("typed fit result identity must be non-empty text or None")
-        if self.transient_fit_result_owner is not None and not isinstance(
-            self.transient_fit_result_owner,
-            FitResultBatch,
-        ):
-            raise TypeError("transient_fit_result_owner must be FitResultBatch or None")
-        if not isinstance(self.release_initial_canonical_on_commit, bool):
-            raise TypeError("release_initial_canonical_on_commit must be bool")
-        raster_size = tuple(self.raster_size)
-        if (
-            len(raster_size) != 2
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value <= 0
-                for value in raster_size
-            )
-        ):
-            raise ValueError("typed figure raster_size must contain two positive integers")
-        object.__setattr__(self, "fit_sources", fit_sources)
-        object.__setattr__(self, "axis_roles", roles)
-        object.__setattr__(self, "raster_size", raster_size)
-        panel = self.frame.panels[0]
-        payload = panel.display_payload
-        if (
-            panel.panel_id != DATA_FIGURE_PANEL_ID
-            or not isinstance(
-                payload,
-                (
-                    ImagePanelPayload,
-                    CurvePanelPayload,
-                    HistogramPanelPayload,
-                    MeterPanelPayload,
-                ),
-            )
-            or data_figure_payload_intent(payload) is not self.intent
-        ):
-            raise ValueError("typed figure front has another payload")
-        if payload.evaluated_input is not self.figure.evaluated.inputs[0]:
-            raise ValueError(
-                "typed figure front DataFigure has another evaluated input"
-            )
-        raster = panel.raster
-        if (raster.width, raster.height) != raster_size:
-            raise ValueError("typed front has another panel-raster geometry")
 
 def data_figure_join_digest(
     figure: DataFigure,
@@ -652,7 +435,7 @@ def data_figure_join_digest(
         }
     )
 
-def data_figure_front_contract(
+def data_figure_frame_contract(
     intent: ViewIntent,
     frame: BoardFrame,
 ) -> tuple[tuple[object, ...], tuple[object, ...]]:
@@ -799,7 +582,7 @@ def validate_rendered_data_figure_payload(
         return
     assert isinstance(payload, HistogramPanelPayload)
     if (
-        viewport.count_scale is not expected_state.count_scale
+        viewport.log_count_axis is not expected_state.log_count_axis
         or viewport.relim_mode is not expected_state.relim_mode
         or viewport.bin_count != expected_state.bin_count
         or viewport.x_limits_are_auto != (expected_state.x_view is None)
@@ -823,26 +606,19 @@ def validate_rendered_data_figure_payload(
 __all__ = [
     "DATA_FIGURE_PANEL_ID",
     "DataFigureDisplayState",
-    "DataFigureFront",
     "DataFigureGridDisplayState",
     "DataFigureGridFocusRequest",
     "DataFigureGridOverview",
     "DataFigurePanelPayload",
     "classify_faceted_data_figure",
     "classify_single_data_figure",
-    "data_figure_display_form_spec",
-    "data_figure_display_form_values",
-    "data_figure_display_state_from_form",
-    "data_figure_display_state_with_x_view",
     "data_figure_initial_size_name",
-    "data_figure_front_contract",
+    "data_figure_frame_contract",
     "data_figure_join_digest",
     "data_figure_payload_intent",
     "data_figure_summary",
     "default_data_figure_display_state",
-    "display_state_intent",
     "fit_result_draft_summary",
-    "grid_display_state_intent",
     "same_exact_data_owners",
     "validate_rendered_data_figure_payload",
 ]

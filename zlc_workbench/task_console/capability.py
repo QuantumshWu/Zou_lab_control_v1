@@ -29,6 +29,7 @@ from .input_binding import (
 )
 
 from .catalog_bridge import ConsoleNodeSpec
+from .console_records import console_signal_key
 @dataclass(frozen=True, slots=True)
 class ConsoleNodeInputs:
     """One resolution transaction in routing and domain vocabularies.
@@ -128,6 +129,12 @@ class ConsoleNodeHost:
         if publication.value(signal_key) is not value:
             raise RuntimeError("signal value and publication are not one front")
         return publication
+
+    @staticmethod
+    def qualify_output(instance_id: str, output_name: str) -> str:
+        """Delegate persisted output identity to the Workbench record owner."""
+
+        return console_signal_key(instance_id, output_name)
 
 
 ConsoleNodeFactory = Callable[

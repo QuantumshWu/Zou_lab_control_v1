@@ -15,13 +15,16 @@ from zlc_data import (
     HistogramSpec,
     ReductionSpec,
     Selection,
+)
+from zlc_data.fit import (
     evaluate_fit_model_components,
     validate_fit_result_source_binding,
 )
 from zlc_storage import canonical_text
 
 from .figure import AxisViewRole, EvaluatedHistogram, ViewIntent
-from .fit_editor import histogram_fit_transform
+from .figure.contract import _fit_authority_selection
+from .fit_curve_projection import _panel_prediction_point_share
 from .fit_projection import fit_batch_storage_index
 from .histogram_display import (
     FacetedHistogramDisplayState,
@@ -89,6 +92,8 @@ def _histogram_fit_presentation(
     *,
     result_identity: str,
     display_state: HistogramDisplayState | FacetedHistogramDisplayState,
+    bin_projection: HistogramBinProjection | None = None,
+    maximum_prediction_points: int | None = None,
     check_cancelled: Callable[[], None] | None = None,
 ) -> tuple[
     HistogramDisplayState | FacetedHistogramDisplayState,
@@ -155,24 +160,42 @@ def _histogram_fit_presentation(
         for series in cell.series
         if isinstance(series.data, EvaluatedHistogram)
     )
-    projection = HistogramBinProjection._from_committed_edges(
-        samples,
-        bins=display.bin_count,
-        bin_edges=histogram.bin_edges,
-    )
-    painted_transform = histogram_fit_transform(figure, projection)
-    authority = result.spec.committed_transform
-    if (
-        painted_transform.source_schema_fingerprint
-        != authority.source_schema_fingerprint
-        or painted_transform.spec != authority.spec
-        or not set(painted_transform.exact_point_ordinals).issubset(
-            authority.exact_point_ordinals
+    if bin_projection is None:
+        projection = HistogramBinProjection._from_committed_edges(
+            samples,
+            bins=display.bin_count,
+            bin_edges=histogram.bin_edges,
         )
-    ):
-        raise ValueError(
-            "histogram Fit authority differs from the exact painted Figure view"
-        )
+    else:
+        if not isinstance(bin_projection, HistogramBinProjection):
+            raise TypeError("bin_projection must be HistogramBinProjection or None")
+        if (
+            len(bin_projection.series_samples) != len(samples)
+            or any(
+                projected is not sample
+                for projected, sample in zip(
+                    bin_projection.series_samples,
+                    samples,
+                    strict=True,
+                )
+            )
+            or bin_projection.requested_bin_count != display.bin_count
+            or not np.array_equal(
+                bin_projection.bin_edges,
+                np.asarray(histogram.bin_edges, dtype=np.dtype("<f8")),
+            )
+        ):
+            raise ValueError(
+                "supplied histogram projection differs from the committed Fit bins"
+            )
+        projection = bin_projection
+    if _fit_authority_selection(
+        source_schema,
+        document_layer.view,
+        layer.resolutions,
+        result,
+    ) is not None:
+        raise ValueError("histogram Fit cannot carry an independent range ROI")
     fit_axis = result.fit_axis_specs[0]
     if histogram.bin_axis_id != fit_axis.axis_id:
         raise ValueError("histogram Fit axis differs from its committed projection")
@@ -192,12 +215,6 @@ def _histogram_fit_presentation(
     if sum(len(cell.series) for cell in layer.cells) != len(projection.bin_counts):
         raise ValueError("histogram Fit series differ from painted bars")
 
-    coordinates = np.linspace(
-        float(projection.bin_edges[0]),
-        float(projection.bin_edges[-1]),
-        400,
-        dtype=np.dtype("<f8"),
-    )
     projected_sources = set(histogram.sources)
     for operation in operations[:-1]:
         if isinstance(operation, Selection):
@@ -208,9 +225,9 @@ def _histogram_fit_presentation(
             projected_sources.update(operation.sources)
 
     used_storage: set[int] = set()
-    overlays_by_cell = []
+    projected_cells = []
     for cell in layer.cells:
-        cell_overlays = []
+        projected_series = []
         for series in cell.series:
             if check_cancelled is not None:
                 check_cancelled()
@@ -226,8 +243,6 @@ def _histogram_fit_presentation(
             if storage_index is None:
                 status = None
                 diagnostic = "NOT_PRESENT"
-                overlay_coordinates = np.empty((0,), dtype=np.dtype("<f8"))
-                components = ()
             else:
                 if storage_index in used_storage:
                     raise ValueError("two histogram series map to one Fit storage row")
@@ -236,17 +251,76 @@ def _histogram_fit_presentation(
                 diagnostic = status.value
                 if result.errors[storage_index]:
                     diagnostic = f"{diagnostic}: {result.errors[storage_index]}"
-                if status is FitBatchStatus.CONVERGED:
-                    overlay_coordinates = coordinates
-                    components = evaluate_fit_model_components(
-                        result.spec.model_id,
-                        (coordinates,),
-                        result.parameter_values[storage_index],
-                    )
-                    diagnostic = ""
-                else:
-                    overlay_coordinates = np.empty((0,), dtype=np.dtype("<f8"))
-                    components = ()
+            projected_series.append((series, storage_index, status, diagnostic))
+        projected_cells.append(tuple(projected_series))
+
+    converged_count = sum(
+        status is FitBatchStatus.CONVERGED
+        for cell in projected_cells
+        for _series, _storage, status, _diagnostic in cell
+    )
+    component_count = 0
+    if converged_count:
+        first_converged_storage = next(
+            storage
+            for cell in projected_cells
+            for _series, storage, status, _diagnostic in cell
+            if status is FitBatchStatus.CONVERGED
+        )
+        assert first_converged_storage is not None
+        # Ask the model owner for its visual-component arity without creating
+        # any prediction vertices.  This avoids copying a model-id/component
+        # lookup into the presentation layer while still allocating the real
+        # panel budget before evaluating a plotted coordinate vector.
+        component_count = len(
+            evaluate_fit_model_components(
+                result.spec.model_id,
+                (np.empty((0,), dtype=np.dtype("<f8")),),
+                result.parameter_values[first_converged_storage],
+            )
+        )
+        if component_count < 1:
+            raise ValueError("converged histogram Fit exposed no visual components")
+    point_share = _panel_prediction_point_share(
+        maximum_prediction_points,
+        converged_count * component_count,
+    )
+    point_count = (
+        0
+        if converged_count == 0
+        else 400
+        if point_share is None
+        else min(400, point_share)
+    )
+    coordinates = (
+        np.empty((0,), dtype=np.dtype("<f8"))
+        if point_count == 0
+        else np.linspace(
+            float(projection.bin_edges[0]),
+            float(projection.bin_edges[-1]),
+            point_count,
+            dtype=np.dtype("<f8"),
+        )
+    )
+
+    overlays_by_cell = []
+    for projected_series in projected_cells:
+        cell_overlays = []
+        for series, storage_index, status, diagnostic in projected_series:
+            if check_cancelled is not None:
+                check_cancelled()
+            if status is FitBatchStatus.CONVERGED:
+                assert storage_index is not None
+                overlay_coordinates = coordinates
+                components = evaluate_fit_model_components(
+                    result.spec.model_id,
+                    (coordinates,),
+                    result.parameter_values[storage_index],
+                )
+                diagnostic = ""
+            else:
+                overlay_coordinates = np.empty((0,), dtype=np.dtype("<f8"))
+                components = ()
             cell_overlays.append(
                 HistogramFitOverlay(
                     result.source_ref,

@@ -16,7 +16,8 @@ from zlc_data import (
     DataBlock,
     DatasetRevision,
     DatasetSchema,
-    PointLayout,
+    PointColumn,
+    PointTable,
     REPEAT,
     SPATIAL_X,
     StreamGenerationId,
@@ -595,7 +596,25 @@ def test_stream_rejects_materialized_dataset_payloads():
     repeat = AxisSpec(AxisId("repeat"), "repeat", REPEAT, 1)
     point = AxisSpec(AxisId("point"), "point", SPATIAL_X, 1)
     scalar = ValueSchema.scalar(np.dtype("<f8"))
-    schema = DatasetSchema(repeat, (point,), PointLayout.rect_c((1,)), scalar)
+    schema = DatasetSchema(
+        repeat,
+        PointTable(
+            1,
+            (
+                PointColumn(
+                    point.axis_id,
+                    point.name,
+                    point.role,
+                    PointColumn.NUMERIC,
+                    (0,),
+                    point.unit,
+                    point.coordinate_frame,
+                ),
+            ),
+        ),
+        None,
+        scalar,
+    )
     block = DataBlock(
         BlockId("block"),
         DatasetRevision(0),

@@ -9,6 +9,7 @@ import pytest
 
 from zlc_data import (
     AxisId,
+    AxisSourceRef,
     BlockId,
     DatasetRevision,
     DatasetRevisionRef,
@@ -29,7 +30,6 @@ from zlc_frontend.display_range import (
     target_display_range,
 )
 from zlc_frontend.figure import (
-    AxisViewBinding,
     AxisViewRole,
     DatasetDescriptor,
     DatasetId,
@@ -42,6 +42,7 @@ from zlc_frontend.figure import (
     EvaluatedSeries,
     FigureDocument,
     FigureLayer,
+    SourceViewBinding,
     ViewIntent,
     ViewSpec,
 )
@@ -56,7 +57,7 @@ _SCHEMA = "a" * 64
 
 def _axis(coordinates=(0.0, 1.0, 2.0)) -> EvaluatedAxis:
     return EvaluatedAxis(
-        AxisId("history"),
+        AxisSourceRef.point_coordinate(AxisId("history")),
         "Shots ago",
         MONITOR_HISTORY,
         "shot",
@@ -72,7 +73,12 @@ def _document_and_data(
     view = ViewSpec(
         _SCHEMA,
         ViewIntent.CURVE,
-        (AxisViewBinding(curves[0].x_axis.axis_id, AxisViewRole.X),),
+        (
+            SourceViewBinding(
+                curves[0].x_axis.source,
+                AxisViewRole.X,
+            ),
+        ),
     )
     document = FigureDocument(
         "curve-document",

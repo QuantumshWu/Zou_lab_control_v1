@@ -16,13 +16,16 @@ import uuid
 import numpy as np
 
 from zlc_frontend import (
-    FIGURE_ARCHIVE_SCHEMA,
     DataFigure,
     FigureArchive,
-    FigurePresentationContract,
+)
+from zlc_frontend.figure_archive import (
+    FIGURE_ARCHIVE_SCHEMA,
     decode_figure_archive_payload,
     encode_figure_archive_payload,
 )
+from zlc_frontend.figure_archive import FigureDisplayState
+from zlc_frontend.plot_panel import FigureIntent
 from zlc_storage import flush_directory
 
 
@@ -57,7 +60,9 @@ def save_figure_archive(
     figure: DataFigure,
     path: str | os.PathLike[str],
     *,
-    presentation: FigurePresentationContract,
+    figure_intent: FigureIntent,
+    size_name: str,
+    display: FigureDisplayState,
     metadata: Mapping[str, object] | None = None,
 ) -> Path:
     """Atomically replace one exact current Figure archive."""
@@ -67,7 +72,9 @@ def save_figure_archive(
         raise FileNotFoundError(f"figure archive directory does not exist: {target.parent}")
     payload = encode_figure_archive_payload(
         figure,
-        presentation=presentation,
+        figure_intent=figure_intent,
+        size_name=size_name,
+        display=display,
         metadata=metadata,
     )
     schema_array = np.frombuffer(

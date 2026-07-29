@@ -98,7 +98,7 @@ class _CalibrationCaptureJoin:
     repeat_count: int
     context_axis_ids: tuple[AxisId, ...]
     _context_indices: tuple[tuple[int, ...], ...]
-    _selected_point_storage_rows: tuple[tuple[int, ...], ...]
+    _selected_point_ordinals: tuple[tuple[int, ...], ...]
 
     @property
     def group_count(self) -> int:
@@ -106,7 +106,7 @@ class _CalibrationCaptureJoin:
 
     def rows(self) -> Iterator[tuple[int, tuple[int, ...], int]]:
         for repeat_index in range(self.repeat_count):
-            for selected_rows in self._selected_point_storage_rows:
+            for selected_rows in self._selected_point_ordinals:
                 yield (
                     repeat_index,
                     selected_rows[:-1],

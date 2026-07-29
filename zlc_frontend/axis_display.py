@@ -9,14 +9,11 @@ def axis_label(axis) -> str:
     unit = axis.unit
     if unit is None:
         return name
-    # Storage uses the canonical physical spelling; Main's authored plot
-    # chrome uses the established compact display spelling.
-    # Helvetica Light does not contain U+0393.  Keep the canonical data unit
-    # ``Γ`` untouched, but render its established scientific symbol through
-    # mathtext so raster/vector outputs cannot silently substitute tofu.
+    # Storage uses the canonical physical spelling; authored plot chrome uses
+    # only main's established compact alias for pixel.  This is a vocabulary
+    # rule, not a per-renderer font workaround.
     visible_unit = {
         "pixel": "px",
-        "Γ": r"$\Gamma$",
     }.get(str(unit), str(unit))
     return f"{name} ({visible_unit})"
 __all__ = ["axis_label"]

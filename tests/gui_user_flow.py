@@ -114,11 +114,7 @@ def close_task_console(
         raise AssertionError(
             "TaskConsole did not close: "
             f"state={getattr(body, '_shutdown_state', None)!r}, "
-            f"render_complete={body._render_lane.shutdown_complete}, "
-            f"fit_complete={body._fit_lane.shutdown_complete}, "
-            f"render_wake_fault={body._render_lane._wake.fault!r}, "
-            f"fit_wake_fault={body._fit_lane._wake.fault!r}, "
-            f"owner_wake_fault={body._owner_wake.fault!r}"
+            f"window_visible={body.isVisible()!r}"
         )
 
 
@@ -136,6 +132,177 @@ def click_tab(body, page) -> None:
     )
 
 
+def choose_combo_data(
+    combo: QtWidgets.QComboBox,
+    value: object,
+    application: QtWidgets.QApplication,
+) -> None:
+    """Choose a typed combo entry through its visible popup and keyboard."""
+
+    row = combo.findData(value)
+    if row < 0:
+        row = next(
+            (
+                index
+                for index in range(combo.count())
+                if combo.itemData(index) == value
+            ),
+            -1,
+        )
+    assert row >= 0, (
+        value,
+        [combo.itemData(index) for index in range(combo.count())],
+    )
+    QtTest.QTest.mouseClick(combo, QtCore.Qt.LeftButton)
+    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+    view = combo.view()
+    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Home)
+    for _ in range(row):
+        QtTest.QTest.keyClick(view, QtCore.Qt.Key_Down)
+    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Return)
+    assert combo.currentData() == value
+
+
+def choose_combo_text(
+    combo: QtWidgets.QComboBox,
+    value: str,
+    application: QtWidgets.QApplication,
+) -> None:
+    """Choose one visible combo label without QVariant coercion."""
+
+    row = combo.findText(value)
+    assert row >= 0, (
+        value,
+        [combo.itemText(index) for index in range(combo.count())],
+    )
+    QtTest.QTest.mouseClick(combo, QtCore.Qt.LeftButton)
+    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+    view = combo.view()
+    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Home)
+    for _ in range(row):
+        QtTest.QTest.keyClick(view, QtCore.Qt.Key_Down)
+    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Return)
+    assert combo.currentText() == value
+
+
+def current_logic_editor(body, application: QtWidgets.QApplication):
+    """Resolve the Logic Edit page reached through the visible Add/Edit flow."""
+
+    from zlc_workbench.task_console.logic_node_editor import LogicNodeEditor
+
+    until(
+        application,
+        lambda: isinstance(body.tabs.currentWidget(), LogicNodeEditor),
+    )
+    editor = body.tabs.currentWidget()
+    assert editor.isVisible() and not editor.isWindow()
+    return editor
+
+
+def visible_form_widgets(editor) -> dict[str, QtWidgets.QWidget]:
+    """Resolve a visible generated form through its public form API."""
+
+    candidates = tuple(
+        widget
+        for widget in editor.form.findChildren(QtWidgets.QWidget)
+        if (
+            widget.parentWidget() is editor.form
+            and widget.isVisible()
+            and hasattr(widget, "spec")
+            and callable(getattr(widget, "widget_for", None))
+        )
+    )
+    assert len(candidates) == 1, candidates
+    form = candidates[0]
+    return {key: form.widget_for(key) for key in form.spec.keys}
+
+
+def replace_spin_value(spin: QtWidgets.QWidget, text: str) -> None:
+    """Edit a visible numeric form control exactly as an operator would."""
+
+    edit = spin.lineEdit() if hasattr(spin, "lineEdit") else spin
+    QtTest.QTest.mouseClick(edit, QtCore.Qt.LeftButton)
+    QtTest.QTest.keyClick(edit, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
+    QtTest.QTest.keyClicks(edit, str(text))
+    QtTest.QTest.keyClick(edit, QtCore.Qt.Key_Return)
+
+
+def replace_path_value(path_widget: QtWidgets.QWidget, text: str) -> None:
+    """Edit the text field of the shared visible path control."""
+
+    edit = path_widget.edit
+    QtTest.QTest.mouseClick(edit, QtCore.Qt.LeftButton)
+    QtTest.QTest.keyClick(edit, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
+    QtTest.QTest.keyClicks(edit, str(text))
+    QtTest.QTest.keyClick(edit, QtCore.Qt.Key_Return)
+
+
+def point_in_rect(
+    rect: QtCore.QRect | QtCore.QRectF,
+    x_fraction: float,
+    y_fraction: float,
+) -> QtCore.QPoint:
+    """Resolve a fractional hit target in one painted Qt rectangle."""
+
+    return QtCore.QPoint(
+        int(round(rect.left() + float(x_fraction) * rect.width())),
+        int(round(rect.top() + float(y_fraction) * rect.height())),
+    )
+
+
+def normalized_subrect(
+    rect: QtCore.QRect | QtCore.QRectF,
+    bounds: tuple[float, float, float, float],
+) -> QtCore.QRectF:
+    """Map top-origin normalized bounds into one painted Qt rectangle."""
+
+    left, top, right, bottom = (float(value) for value in bounds)
+    if not 0.0 <= left < right <= 1.0 or not 0.0 <= top < bottom <= 1.0:
+        raise ValueError("normalized bounds must be a nonempty unit rectangle")
+    return QtCore.QRectF(
+        rect.x() + left * rect.width(),
+        rect.y() + top * rect.height(),
+        (right - left) * rect.width(),
+        (bottom - top) * rect.height(),
+    )
+
+
+def raster_subrect(
+    rect: QtCore.QRect,
+    bounds: tuple[float, float, float, float],
+) -> QtCore.QRect:
+    """Map worker-authored raster bounds to the exact integer Qt hit box."""
+
+    normalized_subrect(rect, bounds)
+    left, top, right, bottom = (float(value) for value in bounds)
+    x0 = rect.x() + round(left * rect.width())
+    y0 = rect.y() + round(top * rect.height())
+    x1 = rect.x() + round(right * rect.width())
+    y1 = rect.y() + round(bottom * rect.height())
+    return QtCore.QRect(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
+def send_wheel(
+    widget: QtWidgets.QWidget,
+    position: QtCore.QPoint,
+    delta: int,
+) -> QtGui.QWheelEvent:
+    """Deliver one real wheel event at a widget-local painted position."""
+
+    event = QtGui.QWheelEvent(
+        QtCore.QPointF(position),
+        QtCore.QPointF(widget.mapToGlobal(position)),
+        QtCore.QPoint(),
+        QtCore.QPoint(0, int(delta)),
+        QtCore.Qt.NoButton,
+        QtCore.Qt.NoModifier,
+        QtCore.Qt.ScrollUpdate,
+        False,
+    )
+    QtWidgets.QApplication.sendEvent(widget, event)
+    return event
+
+
 def drag_mouse_move(widget, position, button) -> None:
     """Deliver one real Qt mouse-move while ``button`` remains held."""
 
@@ -143,6 +310,19 @@ def drag_mouse_move(widget, position, button) -> None:
         QtCore.QEvent.MouseMove,
         QtCore.QPointF(position),
         QtCore.Qt.NoButton,
+        button,
+        QtCore.Qt.NoModifier,
+    )
+    QtWidgets.QApplication.sendEvent(widget, event)
+
+
+def send_mouse_double_click(widget, position, button) -> None:
+    """Deliver only the double-click phase at a widget-local position."""
+
+    event = QtGui.QMouseEvent(
+        QtCore.QEvent.MouseButtonDblClick,
+        QtCore.QPointF(position),
+        button,
         button,
         QtCore.Qt.NoModifier,
     )
@@ -227,11 +407,22 @@ def capture_offscreen_window(
 
 __all__ = [
     "capture_offscreen_window",
+    "choose_combo_data",
+    "choose_combo_text",
     "click_tab",
     "close_pulse_editor",
     "close_task_console",
     "configure_offscreen_fast_path",
+    "current_logic_editor",
     "drag_mouse_move",
+    "normalized_subrect",
+    "point_in_rect",
+    "raster_subrect",
+    "replace_path_value",
+    "replace_spin_value",
     "require_offscreen_platform",
+    "send_mouse_double_click",
+    "send_wheel",
     "until",
+    "visible_form_widgets",
 ]

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 import math
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping
 
 import numpy as np
 
@@ -510,9 +510,8 @@ def _radial_gaussian_center_jacobian(
 ) -> np.ndarray:
     """Exact residual Jacobian for the full-image radial polish."""
 
-    x, y = (
-        np.asarray(values, dtype=np.float64).reshape(-1)
-        for values in coordinates
+    x, y = np.broadcast_arrays(
+        *(np.asarray(values, dtype=np.float64) for values in coordinates)
     )
     amplitude, _offset, radius, center_x, center_y = np.asarray(
         parameters,
@@ -524,12 +523,38 @@ def _radial_gaussian_center_jacobian(
     exponential = np.exp(-squared_radius / radius**2)
     scaled = amplitude * exponential
     jacobian = np.empty((x.size, 5), dtype=np.float64)
-    jacobian[:, 0] = exponential
+    jacobian[:, 0] = exponential.reshape(-1)
     jacobian[:, 1] = 1.0
-    jacobian[:, 2] = scaled * (2.0 * squared_radius / radius**3)
-    jacobian[:, 3] = scaled * (2.0 * delta_x / radius**2)
-    jacobian[:, 4] = scaled * (2.0 * delta_y / radius**2)
+    jacobian[:, 2] = (scaled * (2.0 * squared_radius / radius**3)).reshape(-1)
+    jacobian[:, 3] = (scaled * (2.0 * delta_x / radius**2)).reshape(-1)
+    jacobian[:, 4] = (scaled * (2.0 * delta_y / radius**2)).reshape(-1)
     return jacobian
+
+
+def _radial_gaussian_center_axis_basis(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    parameters: np.ndarray,
+) -> tuple[np.ndarray, ...]:
+    """Return the exact separable model/derivative basis on regular axes."""
+
+    x = np.asarray(x_values, dtype=np.float64).reshape(-1)
+    y = np.asarray(y_values, dtype=np.float64).reshape(-1)
+    _amplitude, _offset, radius, center_x, center_y = np.asarray(
+        parameters, dtype=np.float64
+    )
+    delta_x = x - center_x
+    delta_y = y - center_y
+    radial_x = np.exp(-(delta_x**2) / radius**2)
+    radial_y = np.exp(-(delta_y**2) / radius**2)
+    return (
+        radial_x,
+        radial_y,
+        radial_x * (2.0 * delta_x**2 / radius**3),
+        radial_y * (2.0 * delta_y**2 / radius**3),
+        radial_x * (2.0 * delta_x / radius**2),
+        radial_y * (2.0 * delta_y / radius**2),
+    )
 
 
 def _init_lorentzian(x: np.ndarray, y: np.ndarray) -> tuple[tuple[float, ...], ...]:
@@ -756,81 +781,183 @@ def _spatial_radial_center_seeds(
     x: np.ndarray,
     y: np.ndarray,
     z: np.ndarray,
+    validity: np.ndarray | None = None,
+    check_abort: Callable[[], None] | None = None,
 ) -> tuple[tuple[float, ...], ...]:
-    """Find coherent bright/dark image features before nonlinear refinement.
+    """Find coherent extrema from packed observations or a regular image view."""
 
-    A camera image can contain millions of background pixels.  Raw positive
-    moments then measure the camera rectangle and its read noise rather than a
-    small cloud.  Here the complete image still establishes the background,
-    noise scale, and moments, while a 3x3 spatial median rejects isolated hot
-    pixels before connected signal support is identified.  This is a model
-    initializer, not a lossy data transform: the solver later validates the
-    fitted parameters against every authoritative observation.
-    """
-
-    cartesian = _radial_cartesian_grid(x, y, z)
-    if cartesian is None:
-        return ()
-    x_values, y_values, image, _observation_indices = cartesian
+    image = np.asarray(z)
+    if image.ndim == 2:
+        x_values = np.asarray(x, dtype=np.float64).reshape(-1)
+        y_values = np.asarray(y, dtype=np.float64).reshape(-1)
+        if image.shape != (x_values.size, y_values.size):
+            return ()
+        valid = np.broadcast_to(
+            True if validity is None else np.asarray(validity, dtype=bool),
+            image.shape,
+        )
+    else:
+        cartesian = _radial_cartesian_grid(x, y, z)
+        if cartesian is None:
+            return ()
+        x_values, y_values, image, _observation_indices = cartesian
+        valid = np.broadcast_to(True, image.shape)
     if x_values.size < 5 or y_values.size < 5:
         return ()
-    from scipy.ndimage import generate_binary_structure, label, median_filter
-
-    filtered = median_filter(image, size=3, mode="nearest")
-    offset = float(np.median(image))
-    noise_scale = 1.4826 * float(np.median(np.abs(image - offset)))
-    numeric_floor = np.finfo(np.float64).eps * max(
-        abs(offset),
-        float(np.max(image) - np.min(image)),
-        1.0,
+    sample_x = np.linspace(
+        0, x_values.size - 1, min(x_values.size, 257), dtype=np.int64
     )
-    x_grid = x_values[:, None]
-    y_grid = y_values[None, :]
-    connectivity = generate_binary_structure(2, 2)
-    coordinate_steps = tuple(
-        float(np.min(differences))
+    sample_y = np.linspace(
+        0, y_values.size - 1, min(y_values.size, 257), dtype=np.int64
+    )
+    sampled = image[np.ix_(sample_x, sample_y)]
+    background = np.asarray(sampled[valid[np.ix_(sample_x, sample_y)]], dtype=np.float64)
+    if background.size < 2:
+        return ()
+    offset = float(np.median(background))
+    noise_floor = 3.0 * 1.4826 * float(np.median(np.abs(background - offset)))
+    maximum = -math.inf
+    minimum = math.inf
+    maximum_index = (0, 0)
+    minimum_index = (0, 0)
+    for start, filtered in _median_filtered_image_stripes(
+        image,
+        valid,
+        offset=offset,
+        check_abort=check_abort,
+    ):
+        local_maximum_flat = int(np.argmax(filtered))
+        local_minimum_flat = int(np.argmin(filtered))
+        local_maximum = float(filtered.reshape(-1)[local_maximum_flat])
+        local_minimum = float(filtered.reshape(-1)[local_minimum_flat])
+        if local_maximum > maximum:
+            local_row, local_column = np.unravel_index(
+                local_maximum_flat,
+                filtered.shape,
+            )
+            maximum = local_maximum
+            maximum_index = (start + int(local_row), int(local_column))
+        if local_minimum < minimum:
+            local_row, local_column = np.unravel_index(
+                local_minimum_flat,
+                filtered.shape,
+            )
+            minimum = local_minimum
+            minimum_index = (start + int(local_row), int(local_column))
+    steps = tuple(
+        float(np.min(difference[difference > 0.0]))
         for values in (x_values, y_values)
-        if (differences := np.diff(values))[differences > 0.0].size
+        if np.any((difference := np.abs(np.diff(values))) > 0.0)
     )
-    radius_floor = min(coordinate_steps, default=1.0)
+    radius_floor = min(steps, default=1.0)
+    numeric_floor = np.finfo(np.float64).eps * max(
+        abs(offset), abs(minimum), abs(maximum), 1.0
+    )
+
+    candidates = tuple(
+        (sign, index, sign * (extreme - offset))
+        for sign, index, extreme in (
+            (1.0, maximum_index, maximum),
+            (-1.0, minimum_index, minimum),
+        )
+        if sign * (extreme - offset) > max(noise_floor, numeric_floor)
+    )
+    if not candidates:
+        return ()
+
+    row_profiles = {
+        row: np.empty(image.shape[1], dtype=np.float64)
+        for row in {index[0] for _sign, index, _peak in candidates}
+    }
+    column_profiles = {
+        column: np.empty(image.shape[0], dtype=np.float64)
+        for column in {index[1] for _sign, index, _peak in candidates}
+    }
+    for start, filtered in _median_filtered_image_stripes(
+        image,
+        valid,
+        offset=offset,
+        check_abort=check_abort,
+    ):
+        stop = start + filtered.shape[0]
+        for column, profile in column_profiles.items():
+            profile[start:stop] = filtered[:, column]
+        for row, profile in row_profiles.items():
+            if start <= row < stop:
+                profile[:] = filtered[row - start, :]
 
     seeds: list[tuple[float, ...]] = []
-    for sign in (1.0, -1.0):
-        contrast = sign * (filtered - offset)
-        peak = float(np.max(contrast))
-        support_floor = max(3.0 * noise_scale, 0.05 * peak, numeric_floor)
-        if peak <= support_floor:
-            continue
-        components, component_count = label(
-            contrast > support_floor,
-            structure=connectivity,
+    for sign, (row, column), peak in candidates:
+        level = peak / math.e
+        center_x, center_y = float(x_values[row]), float(y_values[column])
+        radius = radius_floor
+        profiles = (
+            sign * (column_profiles[column] - offset),
+            sign * (row_profiles[row] - offset),
         )
-        if component_count == 0:
-            continue
-        excess = np.maximum(contrast - support_floor, 0.0)
-        component_weights = np.bincount(
-            components.reshape(-1),
-            weights=excess.reshape(-1),
-            minlength=component_count + 1,
-        )
-        component_id = 1 + int(np.argmax(component_weights[1:]))
-        component = components == component_id
-        weights = np.where(component, excess, 0.0)
-        total = float(np.sum(weights))
-        if total <= 0.0:
-            continue
-        center_x = float(np.sum(weights * x_grid) / total)
-        center_y = float(np.sum(weights * y_grid) / total)
-        squared_radius = (x_grid - center_x) ** 2 + (y_grid - center_y) ** 2
-        one_over_e_radius = max(
-            float(np.sqrt(np.sum(weights * squared_radius) / total)),
-            radius_floor,
-        )
-        amplitude = sign * float(np.max(contrast[component]))
-        seeds.append(
-            (amplitude, offset, one_over_e_radius, center_x, center_y)
-        )
+        for profile, peak_index, values, center in zip(
+            profiles,
+            (row, column),
+            (x_values, y_values),
+            (center_x, center_y),
+        ):
+            below_left = np.flatnonzero(profile[:peak_index] < level)
+            below_right = np.flatnonzero(profile[peak_index + 1 :] < level)
+            left = int(below_left[-1] + 1) if below_left.size else 0
+            right = (
+                # ``below_right`` starts one sample after the peak; the
+                # radius endpoint is the last sample still at/above the
+                # one-over-e level, immediately before that crossing.
+                int(peak_index + below_right[0])
+                if below_right.size
+                else profile.size - 1
+            )
+            radius = max(
+                radius,
+                abs(float(values[left]) - center),
+                abs(float(values[right]) - center),
+            )
+        seeds.append((sign * peak, offset, radius, center_x, center_y))
     return tuple(seeds)
+
+
+def _median_filtered_image_stripes(
+    image: np.ndarray,
+    validity: np.ndarray,
+    *,
+    offset: float,
+    check_abort: Callable[[], None] | None,
+):
+    """Yield exact 3x3-median rows without materializing an image-sized copy."""
+
+    from scipy.ndimage import median_filter
+
+    stripe_rows = 64
+    height = image.shape[0]
+    for start in range(0, height, stripe_rows):
+        if check_abort is not None:
+            check_abort()
+        stop = min(height, start + stripe_rows)
+        halo_start = max(0, start - 1)
+        halo_stop = min(height, stop + 1)
+        source = np.asarray(image[halo_start:halo_stop])
+        valid = np.asarray(validity[halo_start:halo_stop], dtype=bool)
+        if bool(np.all(valid)):
+            seed = source
+        else:
+            # The sampled background median can lie between integer camera
+            # codes.  Invalid cells therefore need a floating tile; writing
+            # the median into an integer scratch would bias the initializer.
+            # This remains stripe-bounded rather than image-sized.
+            seed = np.empty(source.shape, dtype=np.float64)
+            seed.fill(offset)
+            np.copyto(seed, source, where=valid)
+        if seed.dtype.kind == "f" and seed.dtype.itemsize == 2:
+            seed = seed.astype(np.float32)
+        filtered = median_filter(seed, size=3, mode="nearest")
+        core_start = start - halo_start
+        core_stop = core_start + stop - start
+        yield start, np.asarray(filtered[core_start:core_stop])
 
 
 def _radial_cartesian_grid(

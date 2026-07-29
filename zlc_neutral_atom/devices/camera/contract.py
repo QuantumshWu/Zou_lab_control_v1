@@ -30,8 +30,8 @@ from zlc_data import (
     Value,
     ValuePayloadContract,
     ValueSchema,
-    immutable_array,
 )
+from zlc_data._arrays import immutable_array
 from zlc_storage import (
     canonical_digest,
     canonical_text,

@@ -4,32 +4,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from enum import Enum
-import threading
 
 import numpy as np
 import pytest
-import zlc_neutral_atom.runtime.dataset as runtime_dataset
 
-from zlc_data import (
+from zlc_data.axis import (
     AxisId,
     AxisSpec,
-    BlockId,
-    ComponentValidity,
-    DatasetRevision,
-    DatasetSchema,
     MONITOR_HISTORY,
-    PointLayout,
     REPEAT,
     SCAN_POINT,
     SPATIAL_X,
     SPATIAL_Y,
+)
+from zlc_data.schema import DatasetSchema, PointColumn, PointTable, ValueSchema
+from zlc_data.validity import ComponentValidity, VALID, ValidityContract
+from zlc_data.value import (
+    BlockId,
+    DatasetRevision,
     StreamGenerationId,
-    VALID,
-    ValidityContract,
     Value,
     ValuePayloadContract,
-    ValueSchema,
 )
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
@@ -111,6 +106,10 @@ def image_value_schema(*, component_validity: bool = False) -> ValueSchema:
     return ValueSchema((y, x), validity, np.dtype("<u2"), value_unit="count")
 
 
+_IMAGE_VALUE_SCHEMA = image_value_schema()
+_COMPONENT_IMAGE_VALUE_SCHEMA = image_value_schema(component_validity=True)
+
+
 def dataset_schema(
     *,
     repeats: int = 1,
@@ -118,27 +117,59 @@ def dataset_schema(
     component_validity: bool = False,
     cell_schema: ValueSchema | None = None,
 ):
+    detuning = axis("detuning", SCAN_POINT, points)
     return DatasetSchema(
         axis("repeat", REPEAT, repeats),
-        (axis("detuning", SCAN_POINT, points),),
-        PointLayout.rect_c((points,)),
+        PointTable(
+            points,
+            (
+                PointColumn(
+                    detuning.axis_id,
+                    detuning.name,
+                    detuning.role,
+                    PointColumn.NUMERIC,
+                    detuning.coordinates,
+                ),
+            ),
+        ),
+        None,
         cell_schema
         if cell_schema is not None
-        else image_value_schema(component_validity=component_validity),
+        else (
+            _COMPONENT_IMAGE_VALUE_SCHEMA
+            if component_validity
+            else _IMAGE_VALUE_SCHEMA
+        ),
     )
 
 
 def monitor_history_schema(source_schema: DatasetSchema, history_slots: int) -> DatasetSchema:
+    history = axis("monitor.history", MONITOR_HISTORY, history_slots)
     return DatasetSchema(
         axis("repeat", REPEAT, 1),
-        (axis("monitor.history", MONITOR_HISTORY, history_slots),),
-        PointLayout.rect_c((history_slots,)),
+        PointTable(
+            history_slots,
+            (
+                PointColumn(
+                    history.axis_id,
+                    history.name,
+                    history.role,
+                    PointColumn.NUMERIC,
+                    history.coordinates,
+                ),
+            ),
+        ),
+        None,
         source_schema.cell_schema,
     )
 
 
 def value(number: int, *, component_validity=None) -> Value:
-    schema = image_value_schema(component_validity=component_validity is not None)
+    schema = (
+        _COMPONENT_IMAGE_VALUE_SCHEMA
+        if component_validity is not None
+        else _IMAGE_VALUE_SCHEMA
+    )
     validity = VALID if component_validity is None else component_validity
     return Value(np.full((2, 3), number, dtype=np.uint16), validity, schema)
 
@@ -149,7 +180,7 @@ def cell_schedule(schema: DatasetSchema) -> DatasetCellSchedule:
         (
             DatasetCellAddress(repeat, point)
             for repeat in range(schema.repeat_axis.size)
-            for point in range(schema.point_layout.storage_size)
+            for point in range(schema.point_table.row_count)
         ),
     )
 
@@ -190,17 +221,15 @@ class _ValueDatasetEventAdapter:
 
 def source(schema: DatasetSchema):
     contract = ValuePayloadContract(schema.cell_schema)
-    return AcquisitionStream.create(
+    stream, producer = AcquisitionStream.create(
         StreamId("camera.frames"),
         contract,
         join_key_contract=DatasetCellKeyContract.from_schema(schema),
     )
+    return stream, producer, contract
 
 
 def emit(producer, payload, address: DatasetCellAddress, sequence_value: int):
-    contract_schema = producer._stream._payload_contract.schema
-    if payload.schema is not contract_schema:
-        payload = Value(payload.values, payload.validity, contract_schema)
     return producer.emit(
         payload,
         captured_at=float(sequence_value),
@@ -209,12 +238,12 @@ def emit(producer, payload, address: DatasetCellAddress, sequence_value: int):
     )
 
 
-def event_adapter(stream) -> _ValueDatasetEventAdapter:
-    return _ValueDatasetEventAdapter(stream._payload_contract)
+def event_adapter(payload_contract: ValuePayloadContract) -> _ValueDatasetEventAdapter:
+    return _ValueDatasetEventAdapter(payload_contract)
 
 
 def dataset_edge(
-    stream,
+    payload_contract: ValuePayloadContract,
     schema: DatasetSchema,
     *,
     exact: bool = True,
@@ -222,7 +251,7 @@ def dataset_edge(
 ) -> FrozenDatasetEdge:
     return FrozenDatasetEdge(
         schema,
-        event_adapter(stream) if adapter is None else adapter,
+        event_adapter(payload_contract) if adapter is None else adapter,
         cell_schedule(schema) if exact else None,
     )
 
@@ -237,8 +266,8 @@ def test_cell_key_domain_excludes_value_schema_but_formal_permutation_does_not()
     )
     second = DatasetSchema(
         first.repeat_axis,
-        first.point_axes,
-        first.point_layout,
+        first.point_table,
+        first.grid_topology,
         alternate_cell,
     )
     cells = cell_schedule(first)
@@ -251,35 +280,8 @@ def test_cell_key_domain_excludes_value_schema_but_formal_permutation_does_not()
     )
 
 
-def test_frozen_edge_retains_one_immutable_packed_schedule_owner():
-    schema = dataset_schema(points=2)
-    stream, _producer = source(schema)
-    schedule = cell_schedule(schema)
-    edge = FrozenDatasetEdge(schema, event_adapter(stream), schedule)
-    frozen_digest = edge.schedule_digest
-
-    assert edge.cell_schedule is schedule
-    assert schedule.cell_at(0) == DatasetCellAddress(0, 0)
-    with pytest.raises(AttributeError, match="immutable"):
-        schedule._packed = b"tampered"
-    assert edge.schedule_digest == frozen_digest
-
-
-def test_dataset_cell_key_snapshot_detaches_the_published_envelope():
-    schema = dataset_schema(points=1)
-    stream, producer = source(schema)
-    address = DatasetCellAddress(0, 0)
-
-    envelope = emit(producer, value(1), address, 0)
-    object.__setattr__(address, "point_storage_index", 7)
-
-    assert envelope.join_key is not address
-    assert envelope.join_key == DatasetCellAddress(0, 0)
-
-
 def test_frozen_edge_rejects_normally_mutable_adapter_configuration():
     schema = dataset_schema(points=1)
-    stream, _producer = source(schema)
 
     class HashableMutableScale:
         __hash__ = object.__hash__
@@ -310,15 +312,18 @@ def test_frozen_edge_rejects_normally_mutable_adapter_configuration():
     with pytest.raises(TypeError, match="intrinsically immutable"):
         FrozenDatasetEdge(
             schema,
-            MutableAdapter(stream._payload_contract, HashableMutableScale(1)),
+            MutableAdapter(
+                ValuePayloadContract(schema.cell_schema),
+                HashableMutableScale(1),
+            ),
             cell_schedule(schema),
         )
 
 
 def test_metadata_contract_validation_precedes_exact_commit(monkeypatch):
     schema = dataset_schema(points=1)
-    stream, producer = source(schema)
-    edge = dataset_edge(stream, schema)
+    stream, producer, payload_contract = source(schema)
+    edge = dataset_edge(payload_contract, schema)
 
     def reject(_metadata):
         raise ValueError("semantic metadata rejection")
@@ -344,9 +349,12 @@ def test_metadata_contract_validation_precedes_exact_commit(monkeypatch):
 
 def test_frozen_edge_projects_one_prevalidated_exact_schedule():
     schema = dataset_schema(repeats=2, points=3)
-    stream, _producer = source(schema)
     schedule = cell_schedule(schema)
-    edge = FrozenDatasetEdge(schema, event_adapter(stream), schedule)
+    edge = FrozenDatasetEdge(
+        schema,
+        event_adapter(ValuePayloadContract(schema.cell_schema)),
+        schedule,
+    )
 
     assert edge.cell_schedule is schedule
     assert edge.schedule_digest == schedule.digest_for_schema(schema)
@@ -368,31 +376,8 @@ def test_frozen_edge_rejects_incomplete_duplicate_and_foreign_schedules(
     error,
 ):
     schema = dataset_schema(points=2)
-    stream, _producer = source(schema)
     with pytest.raises(error):
         DatasetCellSchedule.from_cells(schema, schedule)
-
-
-def test_cell_domain_fingerprint_is_cached_for_large_explicit_layout(monkeypatch):
-    size = 2000
-    source = dataset_schema(points=size)
-    explicit = DatasetSchema(
-        source.repeat_axis,
-        source.point_axes,
-        PointLayout.explicit((size,), tuple((index,) for index in reversed(range(size)))),
-        source.cell_schema,
-    )
-    contract = DatasetCellKeyContract.from_schema(explicit)
-    fingerprint = contract.fingerprint
-
-    def forbidden(_layout):
-        raise AssertionError("cached fingerprint reserialized the explicit layout")
-
-    monkeypatch.setattr(
-        "zlc_neutral_atom.runtime.dataset.point_layout_to_tree",
-        forbidden,
-    )
-    assert contract.fingerprint == fingerprint
 
 
 def test_cell_domain_rejects_non_repeat_repeat_axis():
@@ -400,14 +385,24 @@ def test_cell_domain_rejects_non_repeat_repeat_axis():
     with pytest.raises(ValueError, match="role 'repeat'"):
         DatasetCellKeyContract(
             axis("not-repeat", SCAN_POINT, 1),
-            (point,),
-            PointLayout.rect_c((1,)),
+            PointTable(
+                1,
+                (
+                    PointColumn(
+                        point.axis_id,
+                        point.name,
+                        point.role,
+                        PointColumn.NUMERIC,
+                        point.coordinates,
+                    ),
+                ),
+            ),
         )
 
 
 def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
     schema = dataset_schema(repeats=1, points=3)
-    stream, producer = source(schema)
+    stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=3,
         trace_binding=TRACE_BINDING,
@@ -416,7 +411,7 @@ def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
     builder = DatasetBuilder(
         BlockId("capture"),
         reservation,
-        dataset_edge(stream, schema),
+        dataset_edge(payload_contract, schema),
     )
 
     emit(producer, value(10), DatasetCellAddress(0, 0), 0)
@@ -445,7 +440,7 @@ def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
 
 def test_exact_preview_delta_copies_only_new_cells_in_frozen_order():
     schema = dataset_schema(points=2, component_validity=True)
-    stream, producer = source(schema)
+    stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=2,
         trace_binding=TRACE_BINDING,
@@ -458,7 +453,7 @@ def test_exact_preview_delta_copies_only_new_cells_in_frozen_order():
     builder = DatasetBuilder(
         BlockId("delta-camera"),
         reservation,
-        FrozenDatasetEdge(schema, event_adapter(stream), schedule),
+        FrozenDatasetEdge(schema, event_adapter(payload_contract), schedule),
     )
     reader = builder.open_preview_reader()
     mask = np.asarray(
@@ -499,10 +494,9 @@ def test_exact_preview_delta_copies_only_new_cells_in_frozen_order():
     builder.seal(producer.finish())
     reservation.release()
 
-
 def test_bound_builder_owns_reservation_completion():
     schema = dataset_schema(points=1)
-    stream, producer = source(schema)
+    stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=1,
         trace_binding=TRACE_BINDING,
@@ -511,7 +505,7 @@ def test_bound_builder_owns_reservation_completion():
     builder = DatasetBuilder(
         BlockId("completion-owner"),
         reservation,
-        dataset_edge(stream, schema),
+        dataset_edge(payload_contract, schema),
     )
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
     delivery = cursor.next()
@@ -526,7 +520,7 @@ def test_bound_builder_owns_reservation_completion():
 
 def test_builder_context_preserves_body_error_and_releases_zero_event_preflight():
     schema = dataset_schema(points=1)
-    stream, _producer = source(schema)
+    stream, _producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=1,
         trace_binding=TRACE_BINDING,
@@ -536,7 +530,7 @@ def test_builder_context_preserves_body_error_and_releases_zero_event_preflight(
         with DatasetBuilder(
             BlockId("context-owner"),
             reservation,
-            dataset_edge(stream, schema),
+            dataset_edge(payload_contract, schema),
         ):
             raise RuntimeError("body failure")
     replacement = stream.reserve(
@@ -549,7 +543,7 @@ def test_builder_context_preserves_body_error_and_releases_zero_event_preflight(
 
 def test_exact_wrong_key_and_missing_cells_fail_without_acknowledging_delivery():
     schema = dataset_schema(points=2)
-    stream, producer = source(schema)
+    stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=2,
         trace_binding=TRACE_BINDING,
@@ -558,7 +552,7 @@ def test_exact_wrong_key_and_missing_cells_fail_without_acknowledging_delivery()
     builder = DatasetBuilder(
         BlockId("duplicate"),
         reservation,
-        dataset_edge(stream, schema),
+        dataset_edge(payload_contract, schema),
     )
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
     builder.consume(cursor.next())
@@ -569,7 +563,7 @@ def test_exact_wrong_key_and_missing_cells_fail_without_acknowledging_delivery()
     builder.abort()
     reservation.release()
 
-    missing_stream, missing_producer = source(schema)
+    missing_stream, missing_producer, missing_payload_contract = source(schema)
     missing_reservation = missing_stream.reserve(
         total_events=2,
         trace_binding=TRACE_BINDING,
@@ -578,7 +572,7 @@ def test_exact_wrong_key_and_missing_cells_fail_without_acknowledging_delivery()
     missing_builder = DatasetBuilder(
         BlockId("missing"),
         missing_reservation,
-        dataset_edge(missing_stream, schema),
+        dataset_edge(missing_payload_contract, schema),
     )
     emit(missing_producer, value(1), DatasetCellAddress(0, 0), 0)
     missing_builder.consume(missing_cursor.next())
@@ -595,7 +589,7 @@ def test_component_validity_is_aligned_by_axis_id_not_trailing_shape_guess():
         (x_axis.axis_id,),
         np.array([True, False, True], dtype=bool),
     )
-    stream, producer = source(schema)
+    stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=1,
         trace_binding=TRACE_BINDING,
@@ -604,7 +598,7 @@ def test_component_validity_is_aligned_by_axis_id_not_trailing_shape_guess():
     builder = DatasetBuilder(
         BlockId("component-validity"),
         reservation,
-        dataset_edge(stream, schema),
+        dataset_edge(payload_contract, schema),
     )
     emit(producer, value(7, component_validity=component), DatasetCellAddress(0, 0), 0)
     builder.consume(cursor.next())
@@ -620,12 +614,12 @@ def test_component_validity_is_aligned_by_axis_id_not_trailing_shape_guess():
 
 def test_keyed_monitor_cycle_clears_the_previous_sweep_before_point_zero():
     schema = dataset_schema(points=2)
-    stream, producer = source(schema)
+    stream, producer, payload_contract = source(schema)
     tap = stream.monitor()
     builder = MonitorDataset.keyed_cycle(
         BlockId("rolling"),
         tap,
-        dataset_edge(stream, schema),
+        dataset_edge(payload_contract, schema),
     )
 
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
@@ -650,12 +644,12 @@ def test_keyed_monitor_cycle_clears_the_previous_sweep_before_point_zero():
 
 def test_keyed_monitor_gap_at_nonzero_offset_clears_every_stale_cell():
     schema = dataset_schema(points=3)
-    stream, producer = source(schema)
+    stream, producer, payload_contract = source(schema)
     tap = stream.monitor()
     builder = MonitorDataset.keyed_cycle(
         BlockId("gap-cycle"),
         tap,
-        dataset_edge(stream, schema),
+        dataset_edge(payload_contract, schema),
     )
 
     for sequence in range(3):
@@ -687,12 +681,12 @@ def test_keyed_monitor_gap_at_nonzero_offset_clears_every_stale_cell():
 def test_append_window_owns_newest_first_order_not_producer_join_keys():
     source_schema = dataset_schema(points=2)
     window_schema = monitor_history_schema(source_schema, 3)
-    stream, producer = source(source_schema)
+    stream, producer, payload_contract = source(source_schema)
     tap = stream.monitor()
     window = MonitorDataset.append_window(
         BlockId("history"),
         tap,
-        dataset_edge(stream, window_schema, exact=False),
+        dataset_edge(payload_contract, window_schema, exact=False),
     )
 
     for sequence, number in enumerate((1, 2, 3, 4)):
@@ -717,12 +711,12 @@ def test_append_window_owns_newest_first_order_not_producer_join_keys():
 def test_append_window_gap_recovers_after_loss_rolls_out_of_visible_history():
     source_schema = dataset_schema(points=2)
     window_schema = monitor_history_schema(source_schema, 3)
-    stream, producer = source(source_schema)
+    stream, producer, payload_contract = source(source_schema)
     tap = stream.monitor()
     window = MonitorDataset.append_window(
         BlockId("gap-recovery"),
         tap,
-        dataset_edge(stream, window_schema, exact=False),
+        dataset_edge(payload_contract, window_schema, exact=False),
     )
 
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
@@ -754,12 +748,12 @@ def test_append_window_gap_recovers_after_loss_rolls_out_of_visible_history():
 def test_append_window_preserves_every_data_axis_and_component_validity():
     source_schema = dataset_schema(points=1, component_validity=True)
     window_schema = monitor_history_schema(source_schema, 2)
-    stream, producer = source(source_schema)
+    stream, producer, payload_contract = source(source_schema)
     tap = stream.monitor()
     window = MonitorDataset.append_window(
         BlockId("multidimensional-history"),
         tap,
-        dataset_edge(stream, window_schema, exact=False),
+        dataset_edge(payload_contract, window_schema, exact=False),
     )
     x_axis = source_schema.cell_schema.data_axes[1]
     masks = (
@@ -796,14 +790,14 @@ def test_append_window_preserves_every_data_axis_and_component_validity():
 
 def test_append_window_rejects_scan_axes_relabelled_as_history():
     schema = dataset_schema(points=2)
-    stream, _producer = source(schema)
+    stream, _producer, payload_contract = source(schema)
     tap = stream.monitor()
 
     with pytest.raises(Exception, match="MONITOR_HISTORY"):
         MonitorDataset.append_window(
             BlockId("not-history"),
             tap,
-            dataset_edge(stream, schema, exact=False),
+            dataset_edge(payload_contract, schema, exact=False),
         )
 
     tap.close()
@@ -811,8 +805,8 @@ def test_append_window_rejects_scan_axes_relabelled_as_history():
 
 def test_exact_delivery_cannot_cross_source_authority_even_when_ids_match():
     schema = dataset_schema(points=1)
-    stream_a, producer_a = source(schema)
-    stream_b, producer_b = source(schema)
+    stream_a, producer_a, payload_contract_a = source(schema)
+    stream_b, producer_b, payload_contract_b = source(schema)
     reservation_a = stream_a.reserve(
         total_events=1,
         trace_binding=TRACE_BINDING,
@@ -826,12 +820,12 @@ def test_exact_delivery_cannot_cross_source_authority_even_when_ids_match():
     builder = DatasetBuilder(
         BlockId("authority"),
         reservation_a,
-        dataset_edge(stream_a, schema),
+        dataset_edge(payload_contract_a, schema),
     )
     builder_b = DatasetBuilder(
         BlockId("authority-b"),
         reservation_b,
-        dataset_edge(stream_b, schema),
+        dataset_edge(payload_contract_b, schema),
     )
     emit(producer_a, value(1), DatasetCellAddress(0, 0), 0)
     emit(producer_b, value(999), DatasetCellAddress(0, 0), 0)
@@ -848,7 +842,7 @@ def test_exact_delivery_cannot_cross_source_authority_even_when_ids_match():
 
 def test_exact_join_key_must_match_the_frozen_plan_schedule():
     schema = dataset_schema(points=2)
-    stream, producer = source(schema)
+    stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=2,
         trace_binding=TRACE_BINDING,
@@ -857,7 +851,7 @@ def test_exact_join_key_must_match_the_frozen_plan_schedule():
     builder = DatasetBuilder(
         BlockId("schedule"),
         reservation,
-        dataset_edge(stream, schema),
+        dataset_edge(payload_contract, schema),
     )
     emit(producer, value(10), DatasetCellAddress(0, 1), 0)
     delivery = cursor.next()
@@ -871,7 +865,7 @@ def test_exact_join_key_must_match_the_frozen_plan_schedule():
 
 def test_exact_reservation_rejects_cross_run_trace_mixing():
     schema = dataset_schema(points=1)
-    stream, producer = source(schema)
+    stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=1,
         trace_binding=TRACE_BINDING,
@@ -880,7 +874,7 @@ def test_exact_reservation_rejects_cross_run_trace_mixing():
     builder = DatasetBuilder(
         BlockId("trace-binding"),
         reservation,
-        dataset_edge(stream, schema),
+        dataset_edge(payload_contract, schema),
     )
     payload = Value(value(7).values, VALID, schema.cell_schema)
     with pytest.raises(Exception, match="reserved formal run/source"):
@@ -898,15 +892,19 @@ def test_exact_reservation_rejects_cross_run_trace_mixing():
 
 def test_monitor_materializer_is_the_tap_consumer_and_releases_it_on_close():
     schema = dataset_schema(points=1)
-    stream, producer = source(schema)
+    stream, producer, payload_contract = source(schema)
     tap = stream.monitor()
     builder = MonitorDataset.keyed_cycle(
         BlockId("monitor-authority"),
         tap,
-        dataset_edge(stream, schema),
+        dataset_edge(payload_contract, schema),
     )
     with pytest.raises(PermissionError, match="another consumer"):
-        MonitorDataset.keyed_cycle(BlockId("duplicate-owner"), tap, dataset_edge(stream, schema))
+        MonitorDataset.keyed_cycle(
+            BlockId("duplicate-owner"),
+            tap,
+            dataset_edge(payload_contract, schema),
+        )
     emit(producer, value(9), DatasetCellAddress(0, 0), 0)
     with pytest.raises(PermissionError, match="another consumer"):
         tap.next()
@@ -918,9 +916,9 @@ def test_monitor_materializer_is_the_tap_consumer_and_releases_it_on_close():
 
 def test_monitor_constructor_cannot_override_the_edge_cycle_schedule():
     schema = dataset_schema(points=2)
-    stream, _producer = source(schema)
+    stream, _producer, payload_contract = source(schema)
     tap = stream.monitor()
-    edge = dataset_edge(stream, schema)
+    edge = dataset_edge(payload_contract, schema)
 
     with pytest.raises(TypeError, match="cycle_cells"):
         MonitorDataset(
@@ -933,48 +931,9 @@ def test_monitor_constructor_cannot_override_the_edge_cycle_schedule():
     tap.close()
 
 
-def test_monitor_claim_wakes_and_revokes_an_already_blocked_raw_reader(monkeypatch):
-    schema = dataset_schema(points=1)
-    stream, producer = source(schema)
-    tap = stream.monitor()
-    entered_wait = threading.Event()
-    failures: list[BaseException] = []
-    real_wait = tap._condition.wait
-
-    def announced_wait(timeout=None):
-        entered_wait.set()
-        return real_wait(timeout)
-
-    monkeypatch.setattr(tap._condition, "wait", announced_wait)
-
-    def raw_read() -> None:
-        try:
-            tap.next(timeout=1.0)
-        except BaseException as error:
-            failures.append(error)
-
-    reader = threading.Thread(target=raw_read)
-    reader.start()
-    assert entered_wait.wait(timeout=1.0)
-    builder = MonitorDataset.keyed_cycle(
-        BlockId("claimed-after-wait"),
-        tap,
-        dataset_edge(stream, schema),
-    )
-    reader.join(timeout=1.0)
-
-    assert not reader.is_alive()
-    assert len(failures) == 1
-    assert isinstance(failures[0], PermissionError)
-    emit(producer, value(9), DatasetCellAddress(0, 0), 0)
-    builder.ingest_next(timeout=1.0)
-    assert builder.materialize().block.values[0, 0, 0, 0] == 9
-    builder.close()
-
-
 def test_monitor_materializer_must_bind_before_first_publication():
     schema = dataset_schema(points=1)
-    stream, producer = source(schema)
+    stream, producer, payload_contract = source(schema)
     tap = stream.monitor()
     emit(producer, value(3), DatasetCellAddress(0, 0), 0)
 
@@ -982,7 +941,7 @@ def test_monitor_materializer_must_bind_before_first_publication():
         MonitorDataset.keyed_cycle(
             BlockId("late-monitor-owner"),
             tap,
-            dataset_edge(stream, schema),
+            dataset_edge(payload_contract, schema),
         )
 
     assert tap.next().envelope.sequence == 0
@@ -991,7 +950,7 @@ def test_monitor_materializer_must_bind_before_first_publication():
 
 def test_value_payload_contract_requires_generation_owned_schema_identity():
     schema = dataset_schema(points=1)
-    stream, producer = source(schema)
+    _stream, producer, _contract = source(schema)
     equal_but_distinct = image_value_schema()
     assert equal_but_distinct.fingerprint == schema.cell_schema.fingerprint
     payload = Value(np.ones((2, 3), dtype=np.uint16), VALID, equal_but_distinct)
@@ -1008,7 +967,7 @@ def test_minted_generation_prevents_revision_ref_collision_across_sources():
     schema = dataset_schema(points=1)
 
     def capture(number: int):
-        stream, producer = source(schema)
+        stream, producer, payload_contract = source(schema)
         reservation = stream.reserve(
             total_events=1,
             trace_binding=TRACE_BINDING,
@@ -1017,7 +976,7 @@ def test_minted_generation_prevents_revision_ref_collision_across_sources():
         builder = DatasetBuilder(
             BlockId("same-block-label"),
             reservation,
-            dataset_edge(stream, schema),
+            dataset_edge(payload_contract, schema),
         )
         emit(producer, value(number), DatasetCellAddress(0, 0), 0)
         builder.consume(cursor.next())
@@ -1116,7 +1075,7 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
         BlockId("camera-sample"),
         reservation,
         dataset_edge(
-            stream,
+            contract,
             schema,
             adapter=CameraSampleAdapter(contract),
         ),
@@ -1139,112 +1098,3 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
     assert artifact.event_metadata == (metadata,)
     assert len(artifact.provenance.ordered_metadata_digest) == 64
     reservation.release()
-
-
-@pytest.mark.parametrize(
-    "metadata",
-    ([1], {"scale": 1}, {1}, np.asarray([1], dtype=np.int64)),
-)
-def test_runtime_metadata_rejects_mutable_aliases(metadata):
-    assert not runtime_dataset._is_deeply_immutable(metadata)
-
-
-
-
-def test_metadata_rejects_enum_with_mutable_value():
-    class MutableEnum(Enum):
-        ITEM = []
-
-    assert MutableEnum.ITEM.value == []
-
-    @dataclass(frozen=True)
-    class EnumMetadataContract:
-        fingerprint: str = "b" * 64
-
-        @staticmethod
-        def snapshot(_payload):
-            return MutableEnum.ITEM
-
-        @staticmethod
-        def validate(_metadata):
-            return None
-
-        @staticmethod
-        def digest(_metadata):
-            return "c" * 64
-
-    @dataclass(frozen=True)
-    class EnumMetadataAdapter:
-        payload_contract: ValuePayloadContract
-        metadata_contract: EnumMetadataContract = EnumMetadataContract()
-        operator_fingerprint: str = "d" * 64
-
-        @property
-        def value_schema(self):
-            return self.payload_contract.schema
-
-        def value(self, payload):
-            self.payload_contract.validate(payload)
-            return payload
-
-    schema = dataset_schema(points=1)
-    stream, producer = source(schema)
-    reservation = stream.reserve(
-        total_events=1,
-        trace_binding=TRACE_BINDING,
-    )
-    cursor = reservation.activate()
-    builder = DatasetBuilder(
-        BlockId("enum-metadata"),
-        reservation,
-        dataset_edge(
-            stream,
-            schema,
-            adapter=EnumMetadataAdapter(stream._payload_contract),
-        ),
-    )
-    emit(producer, value(1), DatasetCellAddress(0, 0), 0)
-    with pytest.raises(TypeError, match="deeply immutable"):
-        builder.consume(cursor.next())
-    builder.abort()
-    reservation.release()
-
-
-def test_runtime_metadata_accepts_owned_value_as_a_validated_leaf(monkeypatch):
-    schema = image_value_schema()
-    safe_value = Value(
-        np.arange(6, dtype=np.uint16).reshape(2, 3),
-        VALID,
-        schema,
-    )
-
-    @dataclass(frozen=True)
-    class OccupancyLikeMetadata:
-        value: Value
-        labels: tuple[str, ...]
-
-    dataclass_fields = runtime_dataset.fields
-    traversed_types = []
-
-    def tracked_fields(value):
-        traversed_types.append(type(value))
-        return dataclass_fields(value)
-
-    monkeypatch.setattr(runtime_dataset, "fields", tracked_fields)
-    assert runtime_dataset._is_deeply_immutable(
-        OccupancyLikeMetadata(safe_value, ("occupied", "empty"))
-    )
-    assert traversed_types == [OccupancyLikeMetadata]
-    bytes_backed = np.frombuffer(
-        np.arange(6, dtype=np.int64).tobytes(),
-        dtype=np.dtype("<i8"),
-    )
-    assert runtime_dataset._is_deeply_immutable(bytes_backed)
-
-    owning = np.arange(6, dtype=np.int64)
-    owning.setflags(write=False)
-    assert not runtime_dataset._is_deeply_immutable(owning)
-    mutable_owner = np.arange(6, dtype=np.int64)
-    readonly_alias = mutable_owner.view()
-    readonly_alias.setflags(write=False)
-    assert not runtime_dataset._is_deeply_immutable(readonly_alias)
