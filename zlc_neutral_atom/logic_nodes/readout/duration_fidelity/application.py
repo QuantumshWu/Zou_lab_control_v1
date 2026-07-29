@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import math
 import threading
 import uuid
-from typing import Callable, Protocol
+from typing import Callable
 
 import numpy as np
 
@@ -55,7 +55,6 @@ from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
 from zlc_neutral_atom.logic_nodes.readout.duration_fidelity.measurement import (
     BoundReadoutDurationFidelity,
-    ReadoutDurationFidelityIntent,
     READOUT_DURATION_FIDELITY_OUTPUT_DECLARATIONS,
     ReadoutDurationFidelityRequest,
     bind_readout_duration_fidelity,
@@ -63,6 +62,7 @@ from zlc_neutral_atom.logic_nodes.readout.duration_fidelity.measurement import (
 from zlc_neutral_atom.devices.camera.capture_port import (
     BoundCapturePort,
     CaptureTerminalAck,
+    capture_terminal_ack_to_tree,
     configure_camera_exposure,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport, run_cleanup_steps
@@ -71,6 +71,7 @@ from zlc_neutral_atom.devices.sequencer.port import (
     BoundPulsePort,
     PulseSession,
     PulseTerminalAck,
+    pulse_terminal_ack_to_tree,
 )
 from zlc_storage import canonical_digest, sha256_text
 from zlc_pulse import PulseExecutionForm
@@ -121,95 +122,19 @@ class ReadoutDurationFidelityResult:
                 "model_kind": self.model_kind.value,
                 "site": self.site,
                 "program": self.program_fingerprint,
+                "point_terminals": tuple(
+                    {
+                        "capture": capture_terminal_ack_to_tree(capture),
+                        "pulse": pulse_terminal_ack_to_tree(pulse),
+                    }
+                    for capture, pulse in zip(
+                        self.capture_terminals,
+                        self.pulse_terminals,
+                        strict=True,
+                    )
+                ),
             }
         )
-
-
-def readout_duration_fidelity_final_outputs(
-    result: ReadoutDurationFidelityResult,
-) -> dict[str, FinalDatasetOutput]:
-    """Publish the admitted fidelity curve without shell-side wrapping."""
-
-    if not isinstance(result, ReadoutDurationFidelityResult):
-        raise TypeError("result must be ReadoutDurationFidelityResult")
-    declaration = READOUT_DURATION_FIDELITY_OUTPUT_DECLARATIONS[0]
-    output = FinalDatasetOutput(
-        declaration,
-        result.snapshot,
-        final_dataset_join_digest(
-            owner="readout-duration-fidelity",
-            declaration=declaration,
-            source_identity=result.identity,
-            snapshot=result.snapshot,
-        ),
-    )
-    return {output.name: output}
-
-
-class ReadoutDurationFidelityApplicationPort(Protocol):
-    """Installed readout surface required by this one Measurement."""
-
-    def readout_duration_fidelity_request(
-        self,
-        pulse: str,
-        *,
-        duration_seconds: tuple[float, ...],
-        shots: int,
-        calibration_ref: CalibrationArtifactRef,
-        site: int | None = None,
-    ) -> ReadoutDurationFidelityRequest: ...
-
-    def start_readout_duration_fidelity(
-        self,
-        request: ReadoutDurationFidelityRequest,
-        *,
-        lifecycle_owner: object | None = None,
-    ) -> RunHandle: ...
-
-
-@dataclass(frozen=True, slots=True)
-class ReadoutDurationFidelityApplicationCommand:
-    request: ReadoutDurationFidelityRequest
-    _application: ReadoutDurationFidelityApplicationPort
-
-    def __post_init__(self) -> None:
-        if type(self.request) is not ReadoutDurationFidelityRequest:
-            raise TypeError("request must be ReadoutDurationFidelityRequest")
-
-    def start(self) -> RunHandle:
-        return self._application.start_readout_duration_fidelity(
-            self.request,
-            lifecycle_owner=self,
-        )
-
-    def final_dataset_outputs(
-        self,
-        result: ReadoutDurationFidelityResult,
-    ) -> dict[str, FinalDatasetOutput]:
-        return readout_duration_fidelity_final_outputs(result)
-
-
-def prepare_readout_duration_fidelity_application(
-    intent: ReadoutDurationFidelityIntent,
-    calibration_ref: CalibrationArtifactRef,
-    application: ReadoutDurationFidelityApplicationPort,
-) -> ReadoutDurationFidelityApplicationCommand:
-    """Bind one device-independent duration intent through Readout."""
-
-    if not isinstance(intent, ReadoutDurationFidelityIntent):
-        raise TypeError("intent must be ReadoutDurationFidelityIntent")
-    if not isinstance(calibration_ref, CalibrationArtifactRef):
-        raise TypeError("calibration_ref must be CalibrationArtifactRef")
-    request = application.readout_duration_fidelity_request(
-        intent.pulse,
-        duration_seconds=intent.duration_seconds,
-        shots=intent.shots,
-        calibration_ref=calibration_ref,
-        site=intent.site,
-    )
-    if type(request) is not ReadoutDurationFidelityRequest:
-        raise TypeError("Readout application returned another duration request")
-    return ReadoutDurationFidelityApplicationCommand(request, application)
 
 
 @dataclass(slots=True)
@@ -235,17 +160,36 @@ class PreparedReadoutDurationFidelity:
         self._started = False
         self._lock = threading.Lock()
 
-    def start(self, *, lifecycle_owner: object | None = None) -> RunHandle:
+    def start(self) -> RunHandle:
         with self._lock:
             if self._started:
                 raise RuntimeError("PreparedReadoutDurationFidelity is one-shot")
             self._started = True
         return self._start_run(
             self._plan.with_lifecycle(
-                owner=self if lifecycle_owner is None else lifecycle_owner,
+                owner=self,
                 preemptible=False,
             )
         )
+
+    def final_dataset_outputs(
+        self,
+        result: ReadoutDurationFidelityResult,
+    ) -> dict[str, FinalDatasetOutput]:
+        if not isinstance(result, ReadoutDurationFidelityResult):
+            raise TypeError("result must be ReadoutDurationFidelityResult")
+        declaration = READOUT_DURATION_FIDELITY_OUTPUT_DECLARATIONS[0]
+        output = FinalDatasetOutput(
+            declaration,
+            result.snapshot,
+            final_dataset_join_digest(
+                owner="readout-duration-fidelity",
+                declaration=declaration,
+                source_identity=result.identity,
+                snapshot=result.snapshot,
+            ),
+        )
+        return {output.name: output}
 
 
 def _point_samples(model, site: int | None, block: DataBlock) -> np.ndarray:
@@ -518,10 +462,6 @@ def prepare_readout_duration_fidelity(
 
 __all__ = [
     "PreparedReadoutDurationFidelity",
-    "ReadoutDurationFidelityApplicationCommand",
-    "ReadoutDurationFidelityApplicationPort",
     "ReadoutDurationFidelityResult",
     "prepare_readout_duration_fidelity",
-    "prepare_readout_duration_fidelity_application",
-    "readout_duration_fidelity_final_outputs",
 ]

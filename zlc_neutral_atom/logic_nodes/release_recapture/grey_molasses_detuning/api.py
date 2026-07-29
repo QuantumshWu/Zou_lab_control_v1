@@ -11,11 +11,6 @@ from zlc_neutral_atom.runtime.run import RunHandle
 from zlc_pulse import PulseDocument
 
 from ..application import PreparedReleaseRecapture
-from .application import (
-    GreyMolassesDetuningApplicationCommand,
-    GreyMolassesDetuningIntent,
-    prepare_grey_molasses_detuning_application,
-)
 from .measurement import (
     GreyMolassesDetuningRequest,
 )
@@ -28,6 +23,7 @@ class GreyMolassesDetuningApi:
         "_resolve_camera_ref",
         "_resolve_rf_role_operation",
         "_resolve_sequencer_ref",
+        "_wait_run",
     )
 
     def __init__(
@@ -38,6 +34,7 @@ class GreyMolassesDetuningApi:
         resolve_sequencer_ref: Callable,
         resolve_rf_role: Callable,
         bind_request: Callable,
+        wait_run: Callable,
     ) -> None:
         operations = (
             load_pulse,
@@ -45,6 +42,7 @@ class GreyMolassesDetuningApi:
             resolve_sequencer_ref,
             resolve_rf_role,
             bind_request,
+            wait_run,
         )
         if any(not callable(operation) for operation in operations):
             raise TypeError("grey-molasses API operations must be callable")
@@ -53,8 +51,9 @@ class GreyMolassesDetuningApi:
         self._resolve_sequencer_ref = resolve_sequencer_ref
         self._resolve_rf_role_operation = resolve_rf_role
         self._bind_request = bind_request
+        self._wait_run = wait_run
 
-    def _resolve_rf_role(self, requested: str) -> str:
+    def _resolve_rf_role(self, requested: str | None) -> str:
         return self._resolve_rf_role_operation(requested)
 
     def grey_molasses_detuning_request(
@@ -64,7 +63,7 @@ class GreyMolassesDetuningApi:
         detuning_gamma: tuple[float, ...],
         trap_off_seconds: float,
         shots: int,
-        rf_role: str,
+        rf_role: str | None = None,
         calibration_ref: CalibrationArtifactRef,
         model_kind: ReadoutModelKind | None = None,
         per_site: bool = False,
@@ -89,29 +88,25 @@ class GreyMolassesDetuningApi:
     def start_grey_molasses_detuning(
         self,
         request: GreyMolassesDetuningRequest,
-        *,
-        lifecycle_owner: object | None = None,
     ) -> RunHandle:
         if not isinstance(request, GreyMolassesDetuningRequest):
             raise TypeError("request must be GreyMolassesDetuningRequest")
-        return self._bind(request).start(lifecycle_owner=lifecycle_owner)
+        return self.prepare_grey_molasses_detuning(request).start()
 
-    def _bind(
+    def prepare_grey_molasses_detuning(
         self,
         request: GreyMolassesDetuningRequest,
     ) -> PreparedReleaseRecapture:
+        if not isinstance(request, GreyMolassesDetuningRequest):
+            raise TypeError("request must be GreyMolassesDetuningRequest")
         return self._bind_request(request)
 
-    def prepare_grey_molasses_detuning_application(
+    def grey_molasses_detuning(
         self,
-        intent: GreyMolassesDetuningIntent,
-        calibration_ref: CalibrationArtifactRef,
-    ) -> GreyMolassesDetuningApplicationCommand:
-        return prepare_grey_molasses_detuning_application(
-            intent,
-            calibration_ref,
-            self,
-        )
+        request: GreyMolassesDetuningRequest,
+    ):
+        handle = self.prepare_grey_molasses_detuning(request).start()
+        return self._wait_run(handle)
 
 
 __all__ = [

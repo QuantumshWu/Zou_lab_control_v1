@@ -11,6 +11,7 @@ request fields: display selection must never reconfigure acquisition.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 
@@ -155,3 +156,44 @@ def test_mot_task_analyzes_once_and_reuses_that_result_for_every_output(
     assert first["scan"].snapshot is projected[0][1].snapshot
     assert second["scan"].snapshot is projected[0][1].snapshot
     assert (report_folder / "mot_field_scan.npz").is_file()
+
+
+def test_readout_duration_uses_the_public_experiment_path(tmp_path: Path) -> None:
+    """One current API flow proves the coupled duration Measurement end to end."""
+
+    with zlc.connect("virtual", workspace=_workspace(tmp_path / "duration")) as exp:
+        calibration = exp.nodes.calibration.sitemap(frames=4)
+        request = (
+            exp.nodes.readout_duration_fidelity.readout_duration_fidelity_request(
+                "probe_template.json",
+                duration_seconds=(2e-6, 4e-6),
+                shots=2,
+                calibration_ref=calibration,
+            )
+        )
+        prepared = (
+            exp.nodes.readout_duration_fidelity
+            .prepare_readout_duration_fidelity(request)
+        )
+        result = prepared.start().result()
+
+    block = result.snapshot.block
+    assert block.schema.physical_shape == (1, 2, 1)
+    assert block.schema.point_table.columns[0].values == (2e-6, 4e-6)
+    assert len(result.capture_terminals) == len(result.pulse_terminals) == 2
+    capture_reordered = replace(
+        result,
+        capture_terminals=tuple(reversed(result.capture_terminals)),
+    )
+    pulse_reordered = replace(
+        result,
+        pulse_terminals=tuple(reversed(result.pulse_terminals)),
+    )
+    assert capture_reordered.identity != result.identity
+    assert pulse_reordered.identity != result.identity
+    final = prepared.final_dataset_outputs(result)["fidelity"]
+    assert all(
+        prepared.final_dataset_outputs(reordered)["fidelity"].join_digest
+        != final.join_digest
+        for reordered in (capture_reordered, pulse_reordered)
+    )

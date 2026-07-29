@@ -5,47 +5,56 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
-from zlc_data import BlockId, DatasetSchema
+from zlc_data import BlockId
 from zlc_data.codec import dataset_revision_ref_to_tree
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration, FinalDatasetOutput, final_dataset_join_digest
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import ResolvedCalibration
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import calibration_artifact_ref_to_tree
-from zlc_neutral_atom.logic_nodes.release_recapture.pipeline import ReleaseRecapturePipelineSpec, release_recapture_output_schema
-from zlc_neutral_atom.logic_nodes.release_recapture.timing import TriggeredReleaseRecaptureResult, TriggeredReleaseRecaptureSpec, compile_triggered_release_recapture_pipeline
+from zlc_neutral_atom.logic_nodes.release_recapture.pipeline import ReleaseRecapturePipelineSpec
+from zlc_neutral_atom.logic_nodes.release_recapture.timing import TriggeredReleaseRecaptureResult, compile_triggered_release_recapture_pipeline
+from zlc_neutral_atom.devices.rf import rf_table_terminal_to_tree
 from zlc_neutral_atom.runtime.run import RunHandle, RunPlan
 from zlc_neutral_atom.runtime.streams import StreamId
+from zlc_neutral_atom.timing.lineage import pulse_capture_evidence_to_tree
 from zlc_storage import canonical_digest
 
 
 class PreparedReleaseRecapture:
     """One immutable, one-shot flat survival pipeline."""
 
-    __slots__ = ("_schema", "_spec", "_start_run", "_started", "_lock")
+    __slots__ = (
+        "_declaration",
+        "_final_owner",
+        "_spec",
+        "_start_run",
+        "_started",
+        "_lock",
+    )
 
     def __init__(
         self,
-        spec: TriggeredReleaseRecaptureSpec,
+        spec: ReleaseRecapturePipelineSpec,
         *,
-        output_schema: DatasetSchema,
+        declaration: DatasetOutputDeclaration,
+        final_owner: str,
         start_run: Callable[[RunPlan], RunHandle],
     ) -> None:
-        if not isinstance(spec, TriggeredReleaseRecaptureSpec):
-            raise TypeError("spec must be TriggeredReleaseRecaptureSpec")
-        if not isinstance(output_schema, DatasetSchema):
-            raise TypeError("output_schema must be DatasetSchema")
+        if not isinstance(spec, ReleaseRecapturePipelineSpec):
+            raise TypeError("spec must be ReleaseRecapturePipelineSpec")
+        if not isinstance(declaration, DatasetOutputDeclaration):
+            raise TypeError("declaration must be DatasetOutputDeclaration")
+        if not isinstance(final_owner, str) or not final_owner:
+            raise ValueError("final_owner must be non-empty")
         if not callable(start_run):
             raise TypeError("start_run must be callable")
         self._spec = spec
-        self._schema = output_schema
+        self._declaration = declaration
+        self._final_owner = final_owner
         self._start_run = start_run
         self._started = False
         self._lock = threading.Lock()
 
-    @property
-    def output_schema(self) -> DatasetSchema:
-        return self._schema
-
-    def start(self, *, lifecycle_owner: object | None = None) -> RunHandle:
+    def start(self) -> RunHandle:
         with self._lock:
             if self._started:
                 raise RuntimeError(
@@ -55,13 +64,23 @@ class PreparedReleaseRecapture:
         plan = compile_triggered_release_recapture_pipeline(self._spec)
         return self._start_run(
             plan.with_lifecycle(
-                owner=self if lifecycle_owner is None else lifecycle_owner,
+                owner=self,
                 preemptible=False,
             )
         )
 
+    def final_dataset_outputs(
+        self,
+        result: TriggeredReleaseRecaptureResult,
+    ) -> dict[str, FinalDatasetOutput]:
+        return _final_release_recapture_output(
+            result,
+            declaration=self._declaration,
+            owner=self._final_owner,
+        )
 
-def final_release_recapture_output(
+
+def _final_release_recapture_output(
     result: TriggeredReleaseRecaptureResult,
     *,
     declaration: DatasetOutputDeclaration,
@@ -70,7 +89,7 @@ def final_release_recapture_output(
     if type(result) is not TriggeredReleaseRecaptureResult:
         raise TypeError("result must be TriggeredReleaseRecaptureResult")
     snapshot = result.survival
-    pipeline = result.release_recapture.pipeline
+    pipeline = result.pipeline
     output = FinalDatasetOutput(
         declaration,
         snapshot,
@@ -81,6 +100,10 @@ def final_release_recapture_output(
                 "run_id": pipeline.run_id,
                 "dataset": dataset_revision_ref_to_tree(snapshot.ref),
                 "chain": pipeline.chain_contract_digest,
+                "pulse": pulse_capture_evidence_to_tree(
+                    result.lineage.evidence()
+                ),
+                "rf": rf_table_terminal_to_tree(result.rf_terminal),
             },
             snapshot=snapshot,
         ),
@@ -97,6 +120,8 @@ def prepare_release_recapture(
     calibration: ResolvedCalibration,
     model_kind,
     per_site: bool,
+    declaration: DatasetOutputDeclaration,
+    final_owner: str,
     start_run: Callable[[RunPlan], RunHandle],
     rf_port=None,
     rf_table=None,
@@ -119,29 +144,22 @@ def prepare_release_recapture(
     )
     pipeline = ReleaseRecapturePipelineSpec(
         name,
-        camera_binding.capture,
+        camera_binding,
         calibration,
-        selected.kind,
+        selected,
         per_site,
         StreamId(f"release-recapture-{identity}"),
         f"release-recapture-{identity}",
         BlockId(f"release-recapture-{identity[:20]}"),
-    )
-    output_schema = release_recapture_output_schema(pipeline)
-    triggered = TriggeredReleaseRecaptureSpec(
-        pipeline,
-        camera_binding.pulse_port,
-        camera_binding.pulse_request,
-        camera_binding.trigger_channel,
-        camera_binding.cell_plan,
         rf_port=rf_port,
         rf_table=rf_table,
     )
     return PreparedReleaseRecapture(
-        triggered,
-        output_schema=output_schema,
+        pipeline,
+        declaration=declaration,
+        final_owner=final_owner,
         start_run=start_run,
     )
 
 
-__all__ = ["PreparedReleaseRecapture", "final_release_recapture_output", "prepare_release_recapture"]
+__all__ = ["PreparedReleaseRecapture", "prepare_release_recapture"]

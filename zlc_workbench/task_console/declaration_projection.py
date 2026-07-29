@@ -174,8 +174,9 @@ def project_run_declaration(
 
     if not callable(prepare):
         raise TypeError("prepare must be callable")
-    if bind_request is not None and not callable(bind_request):
-        raise TypeError("bind_request must be callable or None")
+    request_binder = declaration.bind_request if bind_request is None else bind_request
+    if not callable(request_binder):
+        raise TypeError("run declaration requires one request binder")
     spec = project_declaration_spec(
         declaration,
         dynamic_choices=dynamic_choices,
@@ -184,9 +185,7 @@ def project_run_declaration(
     )
     return run_attachment(
         spec,
-        bind_request=(
-            declaration.bind_request if bind_request is None else bind_request
-        ),
+        bind_request=request_binder,
         prepare=prepare,
         start_prepared=start_prepared,
         project_signal_presentation=project_signal_presentation,
@@ -201,6 +200,7 @@ def project_processor_declaration(
     declaration: LogicNodeDeclaration,
     *,
     prepare: Callable[[object], object],
+    bind_request: Callable[[object, object], object] | None = None,
     project_signal_presentation: Callable[
         [object, str, SignalPublication], object | None
     ]
@@ -214,6 +214,9 @@ def project_processor_declaration(
 
     if not callable(prepare):
         raise TypeError("Processor prepare must be callable")
+    request_binder = declaration.bind_request if bind_request is None else bind_request
+    if not callable(request_binder):
+        raise TypeError("Processor declaration requires one request binder")
     if project_signal_presentation is not None and not callable(
         project_signal_presentation
     ):
@@ -225,7 +228,7 @@ def project_processor_declaration(
     )
     return processor_attachment(
         spec,
-        bind_request=declaration.bind_request,
+        bind_request=request_binder,
         prepare=prepare,
         project_signal_presentation=project_signal_presentation,
         resolve_artifact_reference=_artifact_resolver(

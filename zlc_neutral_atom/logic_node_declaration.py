@@ -145,7 +145,7 @@ class LogicNodeDeclaration:
     input_specs: tuple[NodeInputSpec, ...]
     outputs: tuple[OutputPresentation, ...]
     build_request: Callable[[Mapping[str, object]], object]
-    bind_request: Callable[[object, BoundNodeInputs], object]
+    bind_request: Callable[[object, BoundNodeInputs], object] | None
     artifact_outputs: tuple[ArtifactOutputPresentation, ...] = ()
     resolve_outputs: Callable[[object], tuple[OutputPresentation, ...]] | None = None
     default_views: tuple[DefaultOutputView, ...] = ()
@@ -267,8 +267,8 @@ class LogicNodeDeclaration:
             )
         if not callable(self.build_request):
             raise TypeError("build_request must be callable")
-        if not callable(self.bind_request):
-            raise TypeError("bind_request must be callable")
+        if self.bind_request is not None and not callable(self.bind_request):
+            raise TypeError("bind_request must be callable or None")
 
     def outputs_for(self, request: object) -> tuple[OutputPresentation, ...]:
         """Return the complete output vocabulary owned by this declaration.

@@ -40,6 +40,11 @@ def test_fixed_namespace_packages_are_unique_and_complete() -> None:
     assert len({package.declaration.definition.key for package in packages}) == len(
         packages
     )
+    assert all(
+        (package.declaration.bind_request is None)
+        != (package.bind_hosted_request is None)
+        for package in packages
+    )
     assert (ROOT / "Zou_lab_control" / "api").is_dir()
     assert "zlc_neutral_atom.logic_nodes." not in (
         ROOT / "Zou_lab_control" / "workbench" / "_composition.py"

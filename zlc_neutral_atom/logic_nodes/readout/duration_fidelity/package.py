@@ -8,7 +8,10 @@ from .api import ReadoutDurationFidelityApi
 from .application import (
     prepare_readout_duration_fidelity,
 )
-from .measurement import READOUT_DURATION_FIDELITY_LOGIC_NODE
+from .measurement import (
+    READOUT_DURATION_FIDELITY_LOGIC_NODE,
+    bind_readout_duration_fidelity_inputs,
+)
 
 
 def _bind_api(
@@ -47,9 +50,14 @@ def _bind_api(
 def _prepare_hosted(api, value, event_source):
     if event_source is not None:
         raise ValueError("Readout Duration Fidelity has no event-associated input")
-    return api.prepare_readout_duration_fidelity_application(
-        value.intent,
-        value.calibration_ref,
+    return api.prepare_readout_duration_fidelity(value)
+
+
+def _bind_hosted_request(api, intent, inputs):
+    return bind_readout_duration_fidelity_inputs(
+        intent,
+        inputs,
+        request_builder=api.readout_duration_fidelity_request,
     )
 
 
@@ -68,6 +76,7 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
     bind_api=_bind_api,
     prepare_hosted=_prepare_hosted,
     api_dependencies=("calibration",),
+    bind_hosted_request=_bind_hosted_request,
 )
 
 __all__ = ["LOGIC_NODE_PACKAGE"]

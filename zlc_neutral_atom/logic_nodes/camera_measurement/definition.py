@@ -26,7 +26,6 @@ from zlc_neutral_atom.logic_node_declaration import (
     LogicNodeDeclaration,
     OutputPresentation,
 )
-from zlc_neutral_atom.node_input import bind_no_node_inputs
 from zlc_neutral_atom.capture.reference import (
     CaptureArtifactRef,
     capture_artifact_ref_to_tree,
@@ -614,7 +613,7 @@ CAMERA_MEASUREMENT_LOGIC_NODE = LogicNodeDeclaration(
     input_specs=(),
     outputs=(),
     build_request=build_camera_measurement_intent_from_authoring,
-    bind_request=bind_no_node_inputs,
+    bind_request=None,
     resolve_outputs=_camera_request_outputs,
     resolve_dynamic_choices=_camera_role_choices,
 )

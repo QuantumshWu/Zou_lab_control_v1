@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from zlc_data import (
@@ -309,20 +309,26 @@ def bind_temperature_release_recapture(
     return BoundTemperatureReleaseRecapture(request, program, binding)
 
 
-@dataclass(frozen=True, slots=True)
-class CalibratedTemperatureReleaseRecaptureIntent:
-    intent: TemperatureReleaseRecaptureIntent
-    calibration_ref: CalibrationArtifactRef
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.intent, TemperatureReleaseRecaptureIntent):
-            raise TypeError("intent must be TemperatureReleaseRecaptureIntent")
-        if not isinstance(self.calibration_ref, CalibrationArtifactRef):
-            raise TypeError("calibration_ref must be CalibrationArtifactRef")
-
-
-def bind_temperature_release_recapture_inputs(intent: TemperatureReleaseRecaptureIntent, inputs: BoundNodeInputs) -> CalibratedTemperatureReleaseRecaptureIntent:
-    return CalibratedTemperatureReleaseRecaptureIntent(intent, calibration_reference(inputs))
+def bind_temperature_release_recapture_inputs(
+    intent: TemperatureReleaseRecaptureIntent,
+    inputs: BoundNodeInputs,
+    *,
+    request_builder: Callable[..., object],
+) -> TemperatureReleaseRecaptureRequest:
+    if not isinstance(intent, TemperatureReleaseRecaptureIntent):
+        raise TypeError("intent must be TemperatureReleaseRecaptureIntent")
+    if not callable(request_builder):
+        raise TypeError("request_builder must be callable")
+    request = request_builder(
+        intent.pulse,
+        trap_off_seconds=intent.trap_off_seconds,
+        shots=intent.shots,
+        calibration_ref=calibration_reference(inputs),
+        per_site=intent.per_site,
+    )
+    if not isinstance(request, TemperatureReleaseRecaptureRequest):
+        raise TypeError("request_builder returned another request type")
+    return request
 
 
 TEMPERATURE_RELEASE_RECAPTURE_LOGIC_NODE = LogicNodeDeclaration(
@@ -342,7 +348,7 @@ TEMPERATURE_RELEASE_RECAPTURE_LOGIC_NODE = LogicNodeDeclaration(
         ),
     ),
     build_request=build_temperature_intent_from_authoring,
-    bind_request=bind_temperature_release_recapture_inputs,
+    bind_request=None,
     path_presentations=(
         PathPresentationHint(
             "pulse",
@@ -354,4 +360,4 @@ TEMPERATURE_RELEASE_RECAPTURE_LOGIC_NODE = LogicNodeDeclaration(
 
 
 
-__all__ = ["BoundTemperatureReleaseRecapture", "CalibratedTemperatureReleaseRecaptureIntent", "DEFAULT_TEMPERATURE_PER_SITE", "DEFAULT_TEMPERATURE_SHOTS", "DEFAULT_TEMPERATURE_TRAP_OFF_MICROSECONDS_RANGE", "TEMPERATURE_RELEASE_RECAPTURE_DEFINITION", "TEMPERATURE_RELEASE_RECAPTURE_KEY", "TEMPERATURE_RELEASE_RECAPTURE_LOGIC_NODE", "TEMPERATURE_RELEASE_RECAPTURE_OUTPUT_DECLARATIONS", "TemperatureReleaseRecaptureIntent", "TemperatureReleaseRecaptureRequest", "bind_temperature_release_recapture", "bind_temperature_release_recapture_inputs", "build_temperature_intent_from_authoring", "build_temperature_release_recapture_intent", "build_temperature_release_recapture_program", "temperature_release_recapture_authoring_schema"]
+__all__ = ["BoundTemperatureReleaseRecapture", "DEFAULT_TEMPERATURE_PER_SITE", "DEFAULT_TEMPERATURE_SHOTS", "DEFAULT_TEMPERATURE_TRAP_OFF_MICROSECONDS_RANGE", "TEMPERATURE_RELEASE_RECAPTURE_DEFINITION", "TEMPERATURE_RELEASE_RECAPTURE_KEY", "TEMPERATURE_RELEASE_RECAPTURE_LOGIC_NODE", "TEMPERATURE_RELEASE_RECAPTURE_OUTPUT_DECLARATIONS", "TemperatureReleaseRecaptureIntent", "TemperatureReleaseRecaptureRequest", "bind_temperature_release_recapture", "bind_temperature_release_recapture_inputs", "build_temperature_intent_from_authoring", "build_temperature_release_recapture_intent", "build_temperature_release_recapture_program", "temperature_release_recapture_authoring_schema"]

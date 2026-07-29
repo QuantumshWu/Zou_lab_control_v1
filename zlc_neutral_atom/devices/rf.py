@@ -136,6 +136,23 @@ class RfTableTerminal:
         )
 
 
+def rf_table_terminal_to_tree(
+    value: RfTableTerminal | None,
+) -> dict[str, object] | None:
+    """Project completed RF-table evidence for cross-owner provenance."""
+
+    if value is None:
+        return None
+    if not isinstance(value, RfTableTerminal):
+        raise TypeError("value must be RfTableTerminal or None")
+    return {
+        "session_id": value.session_id,
+        "table_digest": value.table_digest,
+        "advanced_points": value.advanced_points,
+        "advancement_digest": value.advancement_digest,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class BoundRfTablePort:
     capability_attestation: VerifiedDeviceCapability
@@ -230,4 +247,5 @@ __all__ = [
     "RfDetuningTable",
     "RfTableCapabilitySnapshot",
     "RfTableTerminal",
+    "rf_table_terminal_to_tree",
 ]

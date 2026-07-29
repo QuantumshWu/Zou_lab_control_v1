@@ -7,6 +7,7 @@ inspect the resulting typed fronts, but never bypass a button to create them.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import threading
 import time
@@ -19,6 +20,7 @@ from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 
 from zlc_data import (
     CellValidity,
+    DatasetComponentValidity,
     MONITOR_HISTORY,
     READOUT_EVENT,
     REPEAT,
@@ -1753,6 +1755,45 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
         assert not camera_row.stop_button.isEnabled()
         assert camera_row.status_label.text() == "stopped"
         assert _resolved_artifact(console, calibration_signal) is not None
+
+        # The same generic admission path also hands a live Camera owner to a
+        # coupled Measurement.  There is no TaskConsole retry or leaf-specific
+        # conflict command between the frozen request and the admitted Run.
+        QtTest.QTest.mouseClick(
+            camera_editor.form.start_button,
+            QtCore.Qt.LeftButton,
+        )
+        until(
+            application,
+            lambda: camera_row.status_label.text() == "running",
+            timeout=15.0,
+        )
+        _choose_combo_text(
+            console.kind_combo,
+            "Measurement: Temperature",
+            application,
+        )
+        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
+        temperature_row = console.logic_nodes[-1]
+        temperature_editor = _current_logic_editor(console, application)
+        temperature_widgets = _visible_form_widgets(temperature_editor)
+        _replace_axis_range(temperature_widgets["t_off"], "20", "40", "2")
+        _replace_spin_value(temperature_widgets["shots"], "1")
+        _choose_signal_leaf(
+            temperature_widgets["calibration"],
+            calibration_signal,
+            application,
+        )
+        QtTest.QTest.mouseClick(
+            temperature_editor.form.start_button,
+            QtCore.Qt.LeftButton,
+        )
+        until(
+            application,
+            lambda: temperature_row.status_label.text().startswith("done"),
+            timeout=25.0,
+        )
+        assert camera_row.status_label.text() == "stopped"
     finally:
         if not widget_gone(console_wrapper):
             console_wrapper.close()
@@ -1761,10 +1802,10 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
 
-def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
+def test_live_occupancy_consumes_camera_and_saved_calibration_in_console(
     tmp_path,
 ) -> None:
-    """The remaining Main readout chain runs only through formal Qt controls."""
+    """The live Camera -> Occupancy product chain uses formal Qt controls."""
 
     configure_offscreen_fast_path()
     application = ensure_qt_app()
@@ -1831,123 +1872,6 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
                 )
             ),
             timeout=25.0,
-        )
-
-        # Temperature takes only the explicit calibration Artifact in addition
-        # to Main's visible physics parameters.  A Measurement never auto-opens
-        # a panel; the operator creates and wires the 1-D view afterwards.
-        _choose_combo_text(console.kind_combo, "Measurement: Temperature", application)
-        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
-        temperature_row = console.logic_nodes[-1]
-        temperature_editor = _current_logic_editor(console, application)
-        temperature_widgets = _visible_form_widgets(temperature_editor)
-        assert set(temperature_widgets) == {
-            "pulse",
-            "t_off",
-            "shots",
-            "per_site",
-            "calibration",
-        }
-        assert _signal_leaf_keys(temperature_widgets["calibration"]) == {
-            calibration_signal
-        }
-        _replace_axis_range(temperature_widgets["t_off"], "20", "40", "2")
-        # Dataset R is the authored shot sweep; the release pulse template has
-        # no competing RepeatRegion authority.
-        _replace_spin_value(temperature_widgets["shots"], "2")
-        _choose_signal_leaf(
-            temperature_widgets["calibration"],
-            calibration_signal,
-            application,
-        )
-        cards_before = tuple(console.cards)
-        QtTest.QTest.mouseClick(
-            temperature_editor.form.start_button,
-            QtCore.Qt.LeftButton,
-        )
-        temperature_signal = console_signal_key(
-            temperature_row.node.node_id,
-            "survival",
-        )
-        until(
-            application,
-            lambda: temperature_row.status_label.text().startswith("done"),
-            timeout=25.0,
-        )
-        assert tuple(console.cards) == cards_before
-        temperature_card = _add_plot_and_bind(
-            console,
-            add,
-            "1d",
-            temperature_signal,
-            application,
-        )
-        until(
-            application,
-            lambda: temperature_card.board is not None
-            and temperature_card.board.front_frame is not None,
-            timeout=15.0,
-        )
-        temperature_value = temperature_card.frozen_render_value()
-        temperature_axis = temperature_value.snapshot.block.schema.point_table.columns[0]
-        assert (temperature_axis.name, temperature_axis.unit) == (
-            "Trap-off time",
-            "s",
-        )
-
-        # Readout-duration fidelity uses the same exact Calibration output.  It
-        # performs its supported camera API update only between duration points;
-        # every point's shots remain one hardware-timed FPGA run.
-        _choose_combo_text(
-            console.kind_combo,
-            "Measurement: Fidelity vs duration",
-            application,
-        )
-        QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
-        fidelity_row = console.logic_nodes[-1]
-        fidelity_editor = _current_logic_editor(console, application)
-        fidelity_widgets = _visible_form_widgets(fidelity_editor)
-        assert set(fidelity_widgets) == {
-            "pulse",
-            "duration",
-            "shots",
-            "site",
-            "calibration",
-        }
-        assert _signal_leaf_keys(fidelity_widgets["calibration"]) == {
-            calibration_signal
-        }
-        _replace_axis_range(fidelity_widgets["duration"], "2", "4", "2")
-        _replace_spin_value(fidelity_widgets["shots"], "2")
-        _choose_signal_leaf(
-            fidelity_widgets["calibration"],
-            calibration_signal,
-            application,
-        )
-        cards_before = tuple(console.cards)
-        QtTest.QTest.mouseClick(
-            fidelity_editor.form.start_button,
-            QtCore.Qt.LeftButton,
-        )
-        fidelity_signal = console_signal_key(fidelity_row.node.node_id, "fidelity")
-        until(
-            application,
-            lambda: fidelity_row.status_label.text().startswith("done"),
-            timeout=25.0,
-        )
-        assert tuple(console.cards) == cards_before
-        fidelity_card = _add_plot_and_bind(
-            console,
-            add,
-            "1d",
-            fidelity_signal,
-            application,
-        )
-        until(
-            application,
-            lambda: fidelity_card.board is not None
-            and fidelity_card.board.front_frame is not None,
-            timeout=15.0,
         )
 
         # The science Camera is externally triggered.  Use the real Pulse GUI
@@ -2069,7 +1993,6 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             "box",
             application,
         )
-        cards_before = tuple(console.cards)
         QtTest.QTest.mouseClick(
             occupancy_editor.form.start_button,
             QtCore.Qt.LeftButton,
@@ -2081,15 +2004,23 @@ def test_calibration_coupled_measurements_and_live_occupancy_share_one_console(
             lambda: occupancy_row.status_label.text() == "running",
             timeout=20.0,
         )
-        assert tuple(console.cards) == cards_before
-
-        sites_card = _add_plot_and_bind(
-            console,
-            add,
-            "sites",
-            occupied_signal,
+        until(
             application,
+            lambda: any(
+                card.config.signal == occupied_signal
+                and card.config.kind == PlotKind.SITE_MAP
+                for card in console.cards
+            ),
+            timeout=20.0,
         )
+        occupancy_cards = tuple(
+            card
+            for card in console.cards
+            if card.config.signal == occupied_signal
+            and card.config.kind == PlotKind.SITE_MAP
+        )
+        assert len(occupancy_cards) == 1
+        sites_card = occupancy_cards[0]
         until(
             application,
             lambda: (
@@ -2287,6 +2218,51 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
         assert (
             card.frozen_plot_panel_contract().figure.value_label
             == "Recapture rate"
+        )
+
+        # The public Experiment API is the same prepared owner used by the
+        # hosted row.  A single installed RF role is inferred, and per-site
+        # output retains the complete trailing component axis and validity.
+        api = flow.experiment.nodes.grey_molasses_detuning
+        calibration_ref = flow.experiment.nodes.calibration.current_calibration_ref
+        request = api.grey_molasses_detuning_request(
+            "release_recapture.json",
+            detuning_gamma=(0.0,),
+            trap_off_seconds=20e-6,
+            shots=1,
+            calibration_ref=calibration_ref,
+            per_site=True,
+        )
+        prepared = api.prepare_grey_molasses_detuning(request)
+        result = prepared.start().result()
+        per_site = result.survival.block
+        assert per_site.schema.physical_shape[:2] == (1, 1)
+        assert per_site.schema.cell_schema.data_shape[0] > 1
+        assert isinstance(per_site.validity, DatasetComponentValidity)
+        assert result.rf_terminal is not None
+        assert result.rf_terminal.advanced_points == 1
+        final = prepared.final_dataset_outputs(result)["recapture"]
+        changed_pulse = replace(
+            result,
+            lineage=replace(
+                result.lineage,
+                terminal=replace(
+                    result.lineage.terminal,
+                    session_id=result.lineage.terminal.session_id + "-other",
+                ),
+            ),
+        )
+        changed_rf = replace(
+            result,
+            rf_terminal=replace(
+                result.rf_terminal,
+                session_id=result.rf_terminal.session_id + "-other",
+            ),
+        )
+        assert all(
+            prepared.final_dataset_outputs(changed)["recapture"].join_digest
+            != final.join_digest
+            for changed in (changed_pulse, changed_rf)
         )
     finally:
         if not widget_gone(console_wrapper):

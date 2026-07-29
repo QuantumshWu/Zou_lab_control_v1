@@ -442,12 +442,11 @@ class HostedProcessor:
         if state is None:
             raise RuntimeError("Processor has not started")
         return RunSnapshot(
-            self._run_id,
-            state,
-            self._phase,
-            False,
-            None,
-            self._error,
-            (),
-            (),
+            run_id=self._run_id,
+            state=state,
+            phase=self._phase,
+            final_committed=False,
+            commit_publication_warning=None,
+            primary_error=self._error,
+            cleanup_errors=(),
         )

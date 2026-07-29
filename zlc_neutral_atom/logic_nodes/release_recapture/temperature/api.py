@@ -13,11 +13,6 @@ from zlc_neutral_atom.runtime.run import RunHandle
 from zlc_pulse import PulseDocument
 
 from ..application import PreparedReleaseRecapture
-from .application import (
-    TemperatureReleaseRecaptureApplicationCommand,
-    TemperatureReleaseRecaptureIntent,
-    prepare_temperature_release_recapture_application,
-)
 from .measurement import TemperatureReleaseRecaptureRequest
 
 
@@ -82,29 +77,18 @@ class TemperatureReleaseRecaptureApi:
     def start_temperature_release_recapture(
         self,
         request: TemperatureReleaseRecaptureRequest,
-        *,
-        lifecycle_owner: object | None = None,
     ) -> RunHandle:
         if not isinstance(request, TemperatureReleaseRecaptureRequest):
             raise TypeError("request must be TemperatureReleaseRecaptureRequest")
-        return self._bind(request).start(lifecycle_owner=lifecycle_owner)
+        return self.prepare_temperature_release_recapture(request).start()
 
-    def _bind(
+    def prepare_temperature_release_recapture(
         self,
         request: TemperatureReleaseRecaptureRequest,
     ) -> PreparedReleaseRecapture:
+        if not isinstance(request, TemperatureReleaseRecaptureRequest):
+            raise TypeError("request must be TemperatureReleaseRecaptureRequest")
         return self._bind_request(request)
-
-    def prepare_temperature_release_recapture_application(
-        self,
-        intent: TemperatureReleaseRecaptureIntent,
-        calibration_ref: CalibrationArtifactRef,
-    ) -> TemperatureReleaseRecaptureApplicationCommand:
-        return prepare_temperature_release_recapture_application(
-            intent,
-            calibration_ref,
-            self,
-        )
 
     def temperature_release_recapture(
         self,
@@ -112,7 +96,7 @@ class TemperatureReleaseRecaptureApi:
     ):
         if not isinstance(request, TemperatureReleaseRecaptureRequest):
             raise TypeError("request must be TemperatureReleaseRecaptureRequest")
-        handle = self._bind(request).start()
+        handle = self.prepare_temperature_release_recapture(request).start()
         return self._wait_run(handle)
 
 

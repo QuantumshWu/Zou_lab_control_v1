@@ -14,9 +14,6 @@ from zlc_pulse import PulseDocument
 
 from .application import (
     PreparedReadoutDurationFidelity,
-    ReadoutDurationFidelityApplicationCommand,
-    ReadoutDurationFidelityIntent,
-    prepare_readout_duration_fidelity_application,
 )
 from .measurement import ReadoutDurationFidelityRequest
 
@@ -82,29 +79,18 @@ class ReadoutDurationFidelityApi:
     def start_readout_duration_fidelity(
         self,
         request: ReadoutDurationFidelityRequest,
-        *,
-        lifecycle_owner: object | None = None,
     ) -> RunHandle:
         if not isinstance(request, ReadoutDurationFidelityRequest):
             raise TypeError("request must be ReadoutDurationFidelityRequest")
-        return self._bind(request).start(lifecycle_owner=lifecycle_owner)
+        return self.prepare_readout_duration_fidelity(request).start()
 
-    def _bind(
+    def prepare_readout_duration_fidelity(
         self,
         request: ReadoutDurationFidelityRequest,
     ) -> PreparedReadoutDurationFidelity:
+        if not isinstance(request, ReadoutDurationFidelityRequest):
+            raise TypeError("request must be ReadoutDurationFidelityRequest")
         return self._bind_request(request)
-
-    def prepare_readout_duration_fidelity_application(
-        self,
-        intent: ReadoutDurationFidelityIntent,
-        calibration_ref: CalibrationArtifactRef,
-    ) -> ReadoutDurationFidelityApplicationCommand:
-        return prepare_readout_duration_fidelity_application(
-            intent,
-            calibration_ref,
-            self,
-        )
 
     def readout_duration_fidelity(
         self,
@@ -112,7 +98,7 @@ class ReadoutDurationFidelityApi:
     ):
         if not isinstance(request, ReadoutDurationFidelityRequest):
             raise TypeError("request must be ReadoutDurationFidelityRequest")
-        handle = self._bind(request).start()
+        handle = self.prepare_readout_duration_fidelity(request).start()
         return self._wait_run(handle)
 
 

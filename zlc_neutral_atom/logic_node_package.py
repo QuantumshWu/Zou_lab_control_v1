@@ -116,6 +116,12 @@ class LogicNodePackage:
             value = getattr(self, name)
             if value is not None and not callable(value):
                 raise TypeError(f"{name} must be callable or None")
+        if (self.declaration.bind_request is None) == (
+            self.bind_hosted_request is None
+        ):
+            raise ValueError(
+                "exactly one declaration or package request binder is required"
+            )
         contributions = tuple(self.ui_contributions)
         if any(
             not isinstance(value, UiContributionDescriptor)

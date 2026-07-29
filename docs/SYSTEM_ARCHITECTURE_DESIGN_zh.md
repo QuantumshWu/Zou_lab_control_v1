@@ -57,6 +57,8 @@ Zou_lab_control   -> 上述 public contracts
 
 叶包边界也固定：默认表单、choice、API、resource 与 signal requirements 都在 inert descriptor 中声明；composition 在 Experiment 可用前一次解析成 frozen narrow facts。普通 UI 完全由通用 declaration projector 生成。确实无法由声明表达的可选 `ui/**` 只导出 lazy `UiContributionDescriptor(module, symbol)`；headless只验证它位于本leaf namespace且descriptor canonical，不加载Qt；Workbench product启动时在窗口可用前解析并类型校验factory，再通过frontend-owned generic UI context实例化。leaf UI不导入Workbench、catalog或service graph，失败则该product启动失败而不是静默回退。
 
+Request binding 也只有一个 owner：若 authored intent 只需 `BoundNodeInputs` 即可冻结，binder 属于 inert declaration；若还需要已安装 device/API facts，declaration 不伪造一个不可调用或仅转发的 binder，唯一 binder 属于同一 `LogicNodePackage`。composition 在产品启动前拒绝 binder 缺失或双 owner。
+
 ## 3. 数据与 point domain 的唯一终态
 
 ### 3.1 物理 shape

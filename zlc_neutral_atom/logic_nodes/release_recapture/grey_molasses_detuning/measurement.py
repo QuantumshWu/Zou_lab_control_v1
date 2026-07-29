@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from zlc_data import (
@@ -302,7 +302,6 @@ class _GreyMolassesDetuningProgram:
     document: PulseDocument
     point_table: PointTable
     grid_topology: GridTopology | None
-    shots: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.document, PulseDocument):
@@ -323,7 +322,6 @@ class _GreyMolassesDetuningProgram:
             GridTopology,
         ):
             raise TypeError("grid_topology must be GridTopology or None")
-        object.__setattr__(self, "shots", positive_integer(self.shots, "shots"))
         table = self.document.scan_table
         if table is None or len(table.rows) != self.point_table.row_count:
             raise ValueError("pulse scan rows must match the RF detuning rows")
@@ -335,7 +333,7 @@ class _GreyMolassesDetuningProgram:
         ).values
         return tuple(
             float(value)
-            for _repeat in range(self.shots)
+            for _repeat in range(self.document.scan_sweep_count)
             for value in coordinates
         )
 
@@ -351,7 +349,6 @@ class _GreyMolassesDetuningProgram:
                     if self.grid_topology is None
                     else grid_topology_to_tree(self.grid_topology)
                 ),
-                "shots": self.shots,
             }
         )
 
@@ -396,7 +393,6 @@ def _build_grey_molasses_detuning_program(
         document,
         point_table,
         grid_topology,
-        request.shots,
     )
 
 
@@ -458,7 +454,6 @@ def bind_grey_molasses_detuning(
         logical_document,
         program.point_table,
         program.grid_topology,
-        program.shots,
     )
     table = RfDetuningTable(
         binding.compiled_artifact.fingerprint,
@@ -486,10 +481,6 @@ def bind_grey_molasses_detuning(
     )
 
 
-class AutonomousMeasurementUnavailable(RuntimeError):
-    """The typed request is valid but the installed synchronous capability is absent."""
-
-
 GREY_MOLASSES_CAPABILITY_GAP = (
     "grey-molasses detuning requires an RF Port that can preload and advance the "
     "complete two-photon-detuning table from the same hardware scan clock; the "
@@ -497,20 +488,28 @@ GREY_MOLASSES_CAPABILITY_GAP = (
 )
 
 
-@dataclass(frozen=True, slots=True)
-class CalibratedGreyMolassesDetuningIntent:
-    intent: GreyMolassesDetuningIntent
-    calibration_ref: CalibrationArtifactRef
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.intent, GreyMolassesDetuningIntent):
-            raise TypeError("intent must be GreyMolassesDetuningIntent")
-        if not isinstance(self.calibration_ref, CalibrationArtifactRef):
-            raise TypeError("calibration_ref must be CalibrationArtifactRef")
-
-
-def bind_grey_molasses_detuning_inputs(intent: GreyMolassesDetuningIntent, inputs: BoundNodeInputs) -> CalibratedGreyMolassesDetuningIntent:
-    return CalibratedGreyMolassesDetuningIntent(intent, calibration_reference(inputs))
+def bind_grey_molasses_detuning_inputs(
+    intent: GreyMolassesDetuningIntent,
+    inputs: BoundNodeInputs,
+    *,
+    request_builder: Callable[..., object],
+) -> GreyMolassesDetuningRequest:
+    if not isinstance(intent, GreyMolassesDetuningIntent):
+        raise TypeError("intent must be GreyMolassesDetuningIntent")
+    if not callable(request_builder):
+        raise TypeError("request_builder must be callable")
+    request = request_builder(
+        intent.pulse,
+        detuning_gamma=intent.detuning_gamma,
+        trap_off_seconds=intent.trap_off_seconds,
+        shots=intent.shots,
+        rf_role=intent.rf_role,
+        calibration_ref=calibration_reference(inputs),
+        per_site=intent.per_site,
+    )
+    if not isinstance(request, GreyMolassesDetuningRequest):
+        raise TypeError("request_builder returned another request type")
+    return request
 
 
 def _grey_rf_choices(context: object) -> tuple[DynamicChoicePresentation, ...]:
@@ -544,7 +543,7 @@ GREY_MOLASSES_DETUNING_LOGIC_NODE = LogicNodeDeclaration(
         ),
     ),
     build_request=build_grey_molasses_intent_from_authoring,
-    bind_request=bind_grey_molasses_detuning_inputs,
+    bind_request=None,
     path_presentations=(
         PathPresentationHint(
             "pulse",
@@ -557,4 +556,4 @@ GREY_MOLASSES_DETUNING_LOGIC_NODE = LogicNodeDeclaration(
 
 
 
-__all__ = ["AutonomousMeasurementUnavailable", "BoundGreyMolassesDetuning", "CalibratedGreyMolassesDetuningIntent", "DEFAULT_GREY_MOLASSES_DETUNING_GAMMA_RANGE", "DEFAULT_GREY_MOLASSES_PER_SITE", "DEFAULT_GREY_MOLASSES_RF_ROLE", "DEFAULT_GREY_MOLASSES_SHOTS", "DEFAULT_GREY_MOLASSES_TRAP_OFF_MICROSECONDS", "GREY_MOLASSES_CAPABILITY_GAP", "GREY_MOLASSES_DETUNING_DEFINITION", "GREY_MOLASSES_DETUNING_KEY", "GREY_MOLASSES_DETUNING_LOGIC_NODE", "GREY_MOLASSES_DETUNING_OUTPUT_DECLARATIONS", "GreyMolassesDetuningIntent", "GreyMolassesDetuningRequest", "bind_grey_molasses_detuning", "bind_grey_molasses_detuning_inputs", "build_grey_molasses_detuning_intent", "build_grey_molasses_intent_from_authoring", "grey_molasses_default_rf_role", "grey_molasses_detuning_authoring_schema"]
+__all__ = ["BoundGreyMolassesDetuning", "DEFAULT_GREY_MOLASSES_DETUNING_GAMMA_RANGE", "DEFAULT_GREY_MOLASSES_PER_SITE", "DEFAULT_GREY_MOLASSES_RF_ROLE", "DEFAULT_GREY_MOLASSES_SHOTS", "DEFAULT_GREY_MOLASSES_TRAP_OFF_MICROSECONDS", "GREY_MOLASSES_CAPABILITY_GAP", "GREY_MOLASSES_DETUNING_DEFINITION", "GREY_MOLASSES_DETUNING_KEY", "GREY_MOLASSES_DETUNING_LOGIC_NODE", "GREY_MOLASSES_DETUNING_OUTPUT_DECLARATIONS", "GreyMolassesDetuningIntent", "GreyMolassesDetuningRequest", "bind_grey_molasses_detuning", "bind_grey_molasses_detuning_inputs", "build_grey_molasses_detuning_intent", "build_grey_molasses_intent_from_authoring", "grey_molasses_default_rf_role", "grey_molasses_detuning_authoring_schema"]

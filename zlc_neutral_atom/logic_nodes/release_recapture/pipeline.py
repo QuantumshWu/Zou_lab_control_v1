@@ -8,7 +8,7 @@ generic workflow or configurable grouping framework.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 
 import numpy as np
@@ -34,15 +34,14 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraSample,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
+    ReadoutModel,
     ResolvedCalibration,
     apply_readout_model,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
-    CalibrationArtifactRef,
     calibration_artifact_input_ref,
     calibration_artifact_ref_to_tree,
 )
-from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.runtime._failure import (
     record_secondary_failure,
     safe_error_summary,
@@ -62,10 +61,11 @@ from zlc_neutral_atom.runtime.dataset import (
     FrozenDatasetEdge,
 )
 from zlc_neutral_atom.capture.pipeline import (
-    BoundCameraCapture,
     PipelineResult,
     finalize_pipeline_result,
 )
+from zlc_neutral_atom.capture.binding import TriggeredCameraBinding
+from zlc_neutral_atom.devices.rf import BoundRfTablePort, RfDetuningTable
 from zlc_neutral_atom.runtime.run import RunContext
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionCursor,
@@ -165,18 +165,20 @@ _RELEASE_RECAPTURE_METADATA_CONTRACT = ReleaseRecaptureMetadataContract()
 @dataclass(frozen=True, slots=True)
 class ReleaseRecaptureSampleContract:
     value_schema: ValueSchema
+    value_contract: ValuePayloadContract = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.value_schema, ValueSchema):
             raise TypeError("value_schema must be ValueSchema")
+        object.__setattr__(
+            self,
+            "value_contract",
+            ValuePayloadContract(self.value_schema),
+        )
 
     @property
     def metadata_contract(self) -> ReleaseRecaptureMetadataContract:
         return _RELEASE_RECAPTURE_METADATA_CONTRACT
-
-    @property
-    def value_contract(self) -> ValuePayloadContract:
-        return ValuePayloadContract(self.value_schema)
 
     @property
     def fingerprint(self) -> str:
@@ -250,23 +252,30 @@ class ReleaseRecaptureDatasetEventAdapter:
 @dataclass(frozen=True, slots=True)
 class ReleaseRecapturePipelineSpec:
     name: str
-    camera_capture: BoundCameraCapture
+    camera_binding: TriggeredCameraBinding
     calibration: ResolvedCalibration
-    model_kind: ReadoutModelKind
+    model: ReadoutModel
     per_site: bool
     output_stream_id: StreamId
     output_source_id: str
     block_id: BlockId
+    rf_port: BoundRfTablePort | None = None
+    rf_table: RfDetuningTable | None = None
 
     def __post_init__(self) -> None:
         canonical_text(self.name, "name")
-        if not isinstance(self.camera_capture, BoundCameraCapture):
-            raise TypeError("camera_capture must be BoundCameraCapture")
+        if not isinstance(self.camera_binding, TriggeredCameraBinding):
+            raise TypeError("camera_binding must be TriggeredCameraBinding")
         if type(self.calibration) is not ResolvedCalibration:
             raise TypeError("calibration must be an admitted ResolvedCalibration")
         self.calibration._require_authority()
-        if not isinstance(self.model_kind, ReadoutModelKind):
-            raise TypeError("model_kind must be ReadoutModelKind")
+        if not isinstance(self.model, ReadoutModel):
+            raise TypeError("model must be ReadoutModel")
+        if not any(
+            model is self.model
+            for model in self.calibration.artifact.models
+        ):
+            raise ValueError("model must belong to the admitted calibration")
         if type(self.per_site) is not bool:
             raise TypeError("per_site must be bool")
         if not isinstance(self.output_stream_id, StreamId):
@@ -274,31 +283,18 @@ class ReleaseRecapturePipelineSpec:
         canonical_text(self.output_source_id, "output_source_id")
         if not isinstance(self.block_id, BlockId):
             raise TypeError("block_id must be BlockId")
-
-
-@dataclass(frozen=True, slots=True)
-class ReleaseRecapturePipelineResult:
-    pipeline: PipelineResult
-    calibration_reference: CalibrationArtifactRef
-    model_kind: ReadoutModelKind
-    per_site: bool
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.pipeline, PipelineResult):
-            raise TypeError("pipeline must be PipelineResult")
-        if not isinstance(
-            self.calibration_reference,
-            CalibrationArtifactRef,
-        ):
-            raise TypeError("calibration_reference must be CalibrationArtifactRef")
-        if not isinstance(self.model_kind, ReadoutModelKind):
-            raise TypeError("model_kind must be ReadoutModelKind")
-        if type(self.per_site) is not bool:
-            raise TypeError("per_site must be bool")
-
-    @property
-    def survival(self):
-        return self.pipeline.dataset.snapshot
+        if (self.rf_port is None) != (self.rf_table is None):
+            raise ValueError("RF Port and table must be supplied together")
+        if self.rf_port is not None:
+            if not isinstance(self.rf_port, BoundRfTablePort):
+                raise TypeError("rf_port must be BoundRfTablePort")
+            if not isinstance(self.rf_table, RfDetuningTable):
+                raise TypeError("rf_table must be RfDetuningTable")
+            if (
+                self.rf_table.pulse_artifact_digest
+                != self.camera_binding.pulse_request.artifact_digest
+            ):
+                raise ValueError("RF table belongs to another pulse artifact")
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,8 +328,8 @@ def _readout_event_column(schema: DatasetSchema) -> PointColumn:
 def _remove_readout_event(
     source_schema: DatasetSchema,
     value_schema: ValueSchema,
+    event_column: PointColumn,
 ) -> DatasetSchema:
-    event_column = _readout_event_column(source_schema)
     selected_ordinals = tuple(range(0, source_schema.point_table.row_count, 2))
     point_table = PointTable(
         len(selected_ordinals),
@@ -402,8 +398,8 @@ def _pair_plan(
     source_schema: DatasetSchema,
     source_schedule: DatasetCellSchedule,
     output_schema: DatasetSchema,
+    event_column: PointColumn,
 ) -> tuple[_PairPlan, ...]:
-    event_column = _readout_event_column(source_schema)
     if len(source_schedule) != (
         output_schema.repeat_axis.size
         * output_schema.point_table.row_count
@@ -443,10 +439,6 @@ def _pair_plan(
                 ),
             )
         )
-    DatasetCellSchedule.from_cells(
-        output_schema,
-        (plan.output_key for plan in plans),
-    )
     return tuple(plans)
 
 
@@ -458,13 +450,10 @@ def _output_contract(
     tuple[_PairPlan, ...],
     DatasetCellSchedule,
 ]:
-    source = spec.camera_capture.capture_contract
+    source = spec.camera_binding.capture.capture_contract
     source_schema = source.dataset_schema
-    _readout_event_column(source_schema)
-    selected = spec.calibration.artifact.select_model(spec.model_kind)
-    if selected.kind is not spec.model_kind:
-        raise ValueError("release-recapture model selection changed")
-    site_axis = selected.feature.site_axis
+    event_column = _readout_event_column(source_schema)
+    site_axis = spec.model.feature.site_axis
     value_schema = (
         ValueSchema(
             (site_axis,),
@@ -475,24 +464,23 @@ def _output_contract(
         if spec.per_site
         else ValueSchema.scalar(np.dtype("<f8"), "survival")
     )
-    output_schema = _remove_readout_event(source_schema, value_schema)
-    plans = _pair_plan(source_schema, source.cell_schedule, output_schema)
+    output_schema = _remove_readout_event(
+        source_schema,
+        value_schema,
+        event_column,
+    )
+    plans = _pair_plan(
+        source_schema,
+        source.cell_schedule,
+        output_schema,
+        event_column,
+    )
     schedule = DatasetCellSchedule.from_cells(
         output_schema,
         (plan.output_key for plan in plans),
     )
     contract = ReleaseRecaptureSampleContract(value_schema)
     return output_schema, contract, plans, schedule
-
-
-def release_recapture_output_schema(
-    spec: ReleaseRecapturePipelineSpec,
-) -> DatasetSchema:
-    """Resolve the exact survival dataset schema without touching hardware."""
-
-    if not isinstance(spec, ReleaseRecapturePipelineSpec):
-        raise TypeError("spec must be ReleaseRecapturePipelineSpec")
-    return _output_contract(spec)[0]
 
 
 @dataclass(slots=True)
@@ -506,13 +494,12 @@ class ExactReleaseRecaptureTransaction:
     output_producer: AcquisitionProducer
     output_cursor: AcquisitionCursor
     output_builder: DatasetBuilder
-    output_edge: FrozenDatasetEdge
     pair_plan: tuple[_PairPlan, ...]
     readiness: ExactConsumerReadiness | None
     ordered_inputs: OrderedEventSpanHasher
     _next_source_index: int = 0
     _first: Envelope[CameraSample] | None = None
-    _result: ReleaseRecapturePipelineResult | None = None
+    _result: PipelineResult | None = None
     _error: BaseException | None = None
     _cancelled: bool = False
     _done: bool = False
@@ -523,7 +510,7 @@ class ExactReleaseRecaptureTransaction:
 
     def capture_all(self, context: RunContext) -> None:
         for _ordinal in range(
-            self.spec.camera_capture.capture_contract.total_events
+            self.spec.camera_binding.capture.capture_contract.total_events
         ):
             context.checkpoint()
             self.session.capture_next(context)
@@ -533,7 +520,7 @@ class ExactReleaseRecaptureTransaction:
         if self._done or self._cancelled:
             raise RuntimeError("release-recapture reducer is no longer live")
         call_bound = (
-            self.spec.camera_capture.capture_port.capability
+            self.spec.camera_binding.capture.capture_port.capability
             .max_blocking_call_seconds
         )
         delivery = self.source_cursor.next(timeout=call_bound)
@@ -615,9 +602,7 @@ class ExactReleaseRecaptureTransaction:
         first: Envelope[CameraSample],
         second: Envelope[CameraSample],
     ) -> ReleaseRecaptureSample:
-        model = self.spec.calibration.artifact.select_model(
-            self.spec.model_kind
-        )
+        model = self.spec.model
         frame_schema = self.spec.calibration.artifact.frame_contract.frame_schema
         initial = apply_readout_model(
             model,
@@ -646,7 +631,7 @@ class ExactReleaseRecaptureTransaction:
             initially_occupied
             & np.asarray(recaptured.occupied.values, dtype=bool)
         )
-        schema = self.output_edge.schema.cell_schema
+        schema = self.output_builder.schema.cell_schema
         if self.spec.per_site:
             values = survived.astype("<f8")
             validity = ComponentValidity(left.axis_ids, initially_occupied)
@@ -669,10 +654,10 @@ class ExactReleaseRecaptureTransaction:
             ),
         )
 
-    def complete(self, context: RunContext) -> ReleaseRecapturePipelineResult:
+    def complete(self, context: RunContext) -> PipelineResult:
         completion: CaptureCompletion = self.session.complete(context)
         if self._first is not None or self._next_source_index != (
-            self.spec.camera_capture.capture_contract.total_events
+            self.spec.camera_binding.capture.capture_contract.total_events
         ):
             raise RuntimeError("release-recapture reducer ended with an incomplete pair")
         self.source_reservation.validate_completion(
@@ -698,15 +683,9 @@ class ExactReleaseRecaptureTransaction:
             dataset=sealed,
             capture_completion=completion,
         )
-        result = ReleaseRecapturePipelineResult(
-            pipeline,
-            self.spec.calibration.reference,
-            self.spec.model_kind,
-            self.spec.per_site,
-        )
-        self._result = result
+        self._result = pipeline
         self._done = True
-        return result
+        return pipeline
 
     def fail(self, error: BaseException) -> None:
         self._error = error
@@ -781,7 +760,7 @@ class ExactReleaseRecaptureTransaction:
             raise RuntimeError("release-recapture reducer failed") from self._error
         if self._result is None:
             raise RuntimeError("release-recapture reducer is not complete")
-        return self._result.pipeline.dataset
+        return self._result.dataset
 
     def cancel(self, _reason: str | None = None) -> bool:
         changed = not self._cancelled
@@ -803,7 +782,7 @@ def open_exact_release_recapture(
 
     if not isinstance(spec, ReleaseRecapturePipelineSpec):
         raise TypeError("spec must be ReleaseRecapturePipelineSpec")
-    camera_capture = spec.camera_capture
+    camera_capture = spec.camera_binding.capture
     contract = camera_capture.capture_contract
     session = open_capture_session(
         camera_capture.capture_port,
@@ -866,7 +845,7 @@ def open_exact_release_recapture(
                 "calibration": calibration_artifact_ref_to_tree(
                     spec.calibration.reference
                 ),
-                "model_kind": spec.model_kind.value,
+                "model_kind": spec.model.kind.value,
                 "per_site": spec.per_site,
             }
         )
@@ -890,7 +869,6 @@ def open_exact_release_recapture(
             producer,
             output_cursor,
             output_builder,
-            output_edge,
             plans,
             readiness=None,
             ordered_inputs=OrderedEventSpanHasher(
@@ -984,8 +962,6 @@ def open_exact_release_recapture(
 
 __all__ = [
     "ExactReleaseRecaptureTransaction",
-    "ReleaseRecapturePipelineResult",
     "ReleaseRecapturePipelineSpec",
     "open_exact_release_recapture",
-    "release_recapture_output_schema",
 ]

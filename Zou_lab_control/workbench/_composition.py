@@ -89,6 +89,7 @@ def task_console_ports(experiment):
             attachments.append(
                 project_processor_declaration(
                     declaration,
+                    bind_request=bind_request,
                     prepare=(
                         lambda request, owner=package.prepare_hosted,
                         current_api=api: owner(current_api, request, None)

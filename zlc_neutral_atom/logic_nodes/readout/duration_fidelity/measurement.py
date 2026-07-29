@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from numbers import Integral
 
@@ -36,7 +36,7 @@ from zlc_neutral_atom.devices.sequencer.port import (
     BoundPulsePort,
     FinitePulseExecutionRequest,
 )
-from zlc_pulse import FIELD_DURATION, TIME_UNIT_TO_NS, PulseDocument, PulseExecutionForm, RepeatRegion, bind_pulse_document_target, compile_pulse_artifact, resolve_api_parameters
+from zlc_pulse import FIELD_DURATION, TIME_UNIT_TO_NS, PulseDocument, PulseExecutionForm, RepeatRegion, bind_pulse_document_target, compile_pulse_artifact
 from zlc_storage import integer, normalized_text, positive_integer
 
 
@@ -234,25 +234,6 @@ class ReadoutDurationFidelityRequest:
         )
 
 
-def _readout_duration_point_groups(
-    program: ApiSlotSegmentedProgram,
-) -> tuple[PulseDocument, ...]:
-    """Resolve owner-frozen rows while retaining the hardware shot repeat.
-
-    Generic API PulseScan repeats point segments through ``scan_sweep_count``.
-    This coupled Measurement has one host sweep per duration and lets the
-    sequencer execute its whole-document RepeatRegion under one FIRE.
-    """
-
-    return tuple(
-        resolve_api_parameters(
-            program.document,
-            dict(zip(program.table.columns, row, strict=True)),
-        )
-        for row in program.table.rows
-    )
-
-
 @dataclass(frozen=True)
 class BoundReadoutDurationFidelity:
     """Target-bound point pulses for the admitted API-slot exposure sweep."""
@@ -284,7 +265,7 @@ class BoundReadoutDurationFidelity:
             for value in requests
         ):
             raise ValueError("point_requests must cover every duration in order")
-        group_documents = _readout_duration_point_groups(self.program)
+        group_documents = self.program.resolved_point_documents
         if tuple(value.document for value in requests) != group_documents:
             raise ValueError("point requests differ from the frozen API program")
         object.__setattr__(self, "point_requests", requests)
@@ -462,7 +443,7 @@ def bind_readout_duration_fidelity(
         "camera integration time must be configured and read back at each API point",
     )
     point_requests = []
-    for point_document in _readout_duration_point_groups(program):
+    for point_document in program.resolved_point_documents:
         artifact = compile_pulse_artifact(
             point_document,
             clock_hz=pulse_port.capability.clock_hz,
@@ -492,20 +473,26 @@ def bind_readout_duration_fidelity(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class CalibratedReadoutDurationFidelityIntent:
-    intent: ReadoutDurationFidelityIntent
-    calibration_ref: CalibrationArtifactRef
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.intent, ReadoutDurationFidelityIntent):
-            raise TypeError("intent must be ReadoutDurationFidelityIntent")
-        if not isinstance(self.calibration_ref, CalibrationArtifactRef):
-            raise TypeError("calibration_ref must be CalibrationArtifactRef")
-
-
-def bind_readout_duration_fidelity_inputs(intent: ReadoutDurationFidelityIntent, inputs: BoundNodeInputs) -> CalibratedReadoutDurationFidelityIntent:
-    return CalibratedReadoutDurationFidelityIntent(intent, calibration_reference(inputs))
+def bind_readout_duration_fidelity_inputs(
+    intent: ReadoutDurationFidelityIntent,
+    inputs: BoundNodeInputs,
+    *,
+    request_builder: Callable[..., object],
+) -> ReadoutDurationFidelityRequest:
+    if not isinstance(intent, ReadoutDurationFidelityIntent):
+        raise TypeError("intent must be ReadoutDurationFidelityIntent")
+    if not callable(request_builder):
+        raise TypeError("request_builder must be callable")
+    request = request_builder(
+        intent.pulse,
+        duration_seconds=intent.duration_seconds,
+        shots=intent.shots,
+        calibration_ref=calibration_reference(inputs),
+        site=intent.site,
+    )
+    if not isinstance(request, ReadoutDurationFidelityRequest):
+        raise TypeError("request_builder returned another request type")
+    return request
 
 
 READOUT_DURATION_FIDELITY_LOGIC_NODE = LogicNodeDeclaration(
@@ -525,7 +512,7 @@ READOUT_DURATION_FIDELITY_LOGIC_NODE = LogicNodeDeclaration(
         ),
     ),
     build_request=build_readout_duration_intent_from_authoring,
-    bind_request=bind_readout_duration_fidelity_inputs,
+    bind_request=None,
     path_presentations=(
         PathPresentationHint(
             "pulse",
@@ -537,4 +524,4 @@ READOUT_DURATION_FIDELITY_LOGIC_NODE = LogicNodeDeclaration(
 
 
 
-__all__ = ["BoundReadoutDurationFidelity", "CalibratedReadoutDurationFidelityIntent", "DEFAULT_READOUT_DURATION_FIDELITY_PULSE_PATH", "DEFAULT_READOUT_DURATION_MICROSECONDS_RANGE", "DEFAULT_READOUT_DURATION_SHOTS", "DEFAULT_READOUT_DURATION_SITE", "READOUT_DURATION_FIDELITY_DEFINITION", "READOUT_DURATION_FIDELITY_KEY", "READOUT_DURATION_FIDELITY_LOGIC_NODE", "READOUT_DURATION_FIDELITY_OUTPUT_DECLARATIONS", "ReadoutDurationFidelityIntent", "ReadoutDurationFidelityRequest", "bind_readout_duration_fidelity", "bind_readout_duration_fidelity_inputs", "build_readout_duration_fidelity_intent", "build_readout_duration_intent_from_authoring", "readout_duration_fidelity_authoring_schema"]
+__all__ = ["BoundReadoutDurationFidelity", "DEFAULT_READOUT_DURATION_FIDELITY_PULSE_PATH", "DEFAULT_READOUT_DURATION_MICROSECONDS_RANGE", "DEFAULT_READOUT_DURATION_SHOTS", "DEFAULT_READOUT_DURATION_SITE", "READOUT_DURATION_FIDELITY_DEFINITION", "READOUT_DURATION_FIDELITY_KEY", "READOUT_DURATION_FIDELITY_LOGIC_NODE", "READOUT_DURATION_FIDELITY_OUTPUT_DECLARATIONS", "ReadoutDurationFidelityIntent", "ReadoutDurationFidelityRequest", "bind_readout_duration_fidelity", "bind_readout_duration_fidelity_inputs", "build_readout_duration_fidelity_intent", "build_readout_duration_intent_from_authoring", "readout_duration_fidelity_authoring_schema"]
